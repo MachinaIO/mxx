@@ -6436,6 +6436,12 @@ mod tests {
             SpecHash,
         };
         use std::{collections::BTreeSet, num::NonZeroUsize, time::Instant};
+        // Explicit benchmark capture boundaries exclude class discovery and
+        // input setup. Nsight can collect each profiled round trip separately.
+        unsafe extern "C" {
+            fn cudaProfilerStart() -> i32;
+            fn cudaProfilerStop() -> i32;
+        }
         let setting = |name: &str, default: usize| {
             std::env::var(name).map(|value| value.parse::<usize>().unwrap()).unwrap_or(default)
         };
@@ -6443,8 +6449,15 @@ mod tests {
         let wave = setting("MXX_PRIMITIVE_TEST_WAVE_BOUND", 4).max(2);
         let count = wave + 1;
         let wide_columns = setting("MXX_PRIMITIVE_TEST_MATRIX_SIZE", 256).max(4);
-        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
-        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        for &device in &devices {
+            crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+            println!(
+                "PERF_HARDWARE {:?}",
+                mxx_primitives::poly::dcrt::gpu::gpu_device_identity(device).unwrap()
+            );
+        }
+        let device = devices[0];
         let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
         let params = GpuDCRTPolyParams::new_with_gpu(
             n,
@@ -6454,10 +6467,6 @@ mod tests {
             Some(1),
             None,
             None,
-        );
-        println!(
-            "PERF_HARDWARE {:?}",
-            mxx_primitives::poly::dcrt::gpu::gpu_device_identity(device).unwrap()
         );
         let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
         let run_root = std::path::PathBuf::from("test_data/test_gpu_bounded_wave_performance")
@@ -6546,11 +6555,12 @@ mod tests {
             };
             for cap in [1, wave] {
                 let mut backend =
-                    crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+                    crate::backend::poly_gpu::gpu_backend_on([params.clone()], devices.clone());
                 drop(backend.prepare_graph_admission(&graph, false, &inputs, cap, true).unwrap());
                 let classes = (backend.trapdoor_plans.len(), backend.preimage_plans.len());
                 let mut admissions = BTreeSet::new();
                 let mut widths = BTreeSet::new();
+                let mut device_widths = BTreeSet::new();
                 let mut batches = 0usize;
                 let mut jobs = 0usize;
                 let mut peak_prepared = 0usize;
@@ -6574,6 +6584,9 @@ mod tests {
                         backend.set_admitted_measurement_sink(Some(Box::new(move |event| {
                             sender.send(event).unwrap();
                         })));
+                    }
+                    if profile {
+                        assert_eq!(unsafe { cudaProfilerStart() }, 0);
                     }
                     let start = Instant::now();
                     let mut result = execute_with_config(
@@ -6605,6 +6618,9 @@ mod tests {
                         })
                         .collect::<Vec<_>>();
                     let seconds = start.elapsed().as_secs_f64();
+                    if profile {
+                        assert_eq!(unsafe { cudaProfilerStop() }, 0);
+                    }
                     backend.set_admitted_measurement_sink(None);
                     for bytes in &canonical {
                         assert_eq!(bytes, &expected);
@@ -6624,6 +6640,7 @@ mod tests {
                             }
                             GpuAdmittedMeasurement::Invocation { plans, .. } => {
                                 for plan in plans {
+                                    device_widths.insert(plan.widths.clone());
                                     for width in plan.widths {
                                         widths.insert(width);
                                     }
@@ -6650,6 +6667,7 @@ mod tests {
                                 "workload": case, "wave_limit": cap, "instances": count,
                                 "ring_dimension": n, "rows": rows, "columns": columns,
                                 "admissions": admissions, "column_widths": widths,
+                                "device_ids": devices, "device_column_widths": device_widths,
                                 "round_trip_seconds": seconds, "outputs_per_second": count as f64 / seconds,
                                 "profiled_column_batches": batches, "profiled_column_jobs": jobs,
                                 "profiled_peak_prepared_device_bytes": peak_prepared,

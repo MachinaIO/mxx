@@ -1893,7 +1893,7 @@ impl GpuDcrtBackend {
                                 if wave == 1 && cap == 1 && assignments.iter().any(Option::is_none)
                                 {
                                     eprintln!(
-                                        "minimum wave device {device} unmatched claims: {:?}",
+                                        "minimum wave device {device} claims: {claims:?} slots: {slots:?} unmatched claims: {:?}",
                                         claims
                                             .iter()
                                             .zip(&assignments)

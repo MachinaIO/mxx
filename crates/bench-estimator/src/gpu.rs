@@ -5151,6 +5151,11 @@ mod tests {
             .filter(|batch| matches!(batch.request.kind, NodeKind::PreimageSample { .. }))
             .collect::<Vec<_>>();
         assert!(!samples.is_empty());
+        let collected = samples
+            .iter()
+            .find(|batch| batch.plans.as_ref().is_some_and(|plans| plans.len() == 2))
+            .expect("a collected preimage batch must retain two sibling plans");
+        assert_eq!(collected.plans.as_ref().unwrap().len(), 2);
         for sample in samples {
             let plans = sample.plans.as_ref().expect("Preimage must use cached native plans");
             assert_eq!(plans.len(), sample.owners.len());

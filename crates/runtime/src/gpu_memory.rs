@@ -780,6 +780,11 @@ impl GpuColumnFit {
         &self.schedule
     }
 
+    /// Exact native widths selected for this CPU-only fit.
+    pub(crate) fn widths(&self) -> GpuColumnWidths {
+        self.widths
+    }
+
     /// Describe the complete candidate with the same geometry/resource schema
     /// as an acquired plan. The description is CPU metadata, not a reservation.
     pub fn summary(&self) -> GpuAdmittedPlanSummary {

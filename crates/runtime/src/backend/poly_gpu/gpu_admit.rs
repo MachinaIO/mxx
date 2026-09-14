@@ -104,12 +104,33 @@ pub struct GpuMatrixLayoutPlan {
 }
 
 struct MatrixInvocationGeometry {
-    operation: &'static str,
+    operation: PreparedOperation,
     rows: usize,
     columns: usize,
     compact_output: bool,
     input_owners: Vec<usize>,
     compact_input_owner: Option<usize>,
+}
+
+fn preimage_replay_claims(
+    plan: &PreimageClaimPlan,
+    parameters: &GpuDCRTPolyParams,
+    public_rows: usize,
+    width: usize,
+    output_rows: usize,
+    bound: &num_bigint::BigUint,
+) -> Result<Vec<GpuTracedClaim>, GpuAdmissionError> {
+    let mut claims = plan.destination.clone();
+    claims.extend(
+        plan.tile_claims(parameters, public_rows, width).map_err(GpuAdmissionError::InvalidPlan)?,
+    );
+    claims.extend(
+        plan.attempt_claims(parameters, public_rows, width, output_rows, bound)
+            .map_err(GpuAdmissionError::InvalidPlan)?
+            .into_iter()
+            .flatten(),
+    );
+    Ok(claims)
 }
 
 impl GpuMatrixLayoutPlan {
@@ -170,7 +191,7 @@ impl GpuMatrixLayoutPlan {
     ) -> super::gpu_compiled::GpuAdmittedInvocationSummary {
         let invocation = &self.invocations[index];
         super::gpu_compiled::GpuAdmittedInvocationSummary {
-            operation: invocation.operation,
+            operation: invocation.operation.kind_name(),
             rows: invocation.rows,
             columns: invocation.columns,
             compact_output: invocation.compact_output,
@@ -186,6 +207,7 @@ impl GpuMatrixLayoutPlan {
     ) -> Result<Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>, GpuAdmissionError> {
         use std::collections::{BTreeMap, BTreeSet};
         let mut selected = Vec::<(GpuDCRTPolyParams, GpuPreparedRequest)>::new();
+        let mut extras = Vec::<(GpuDCRTPolyParams, GpuTracedClaim)>::new();
         let mut seen = BTreeSet::<(usize, usize, (u64, u64, usize))>::new();
         let mut add =
             |device: usize, parameters: GpuDCRTPolyParams, request: GpuPreparedRequest| {
@@ -236,6 +258,62 @@ impl GpuMatrixLayoutPlan {
                         }
                     }
                 }
+                if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } =
+                    &self.invocations[index].operation
+                {
+                    let width =
+                        if region.device == 0 { fit.widths().gpu0 } else { fit.widths().nonzero }
+                            .ok_or_else(|| {
+                            GpuAdmissionError::InvalidPlan(
+                                "preimage setup has no accepted device width".into(),
+                            )
+                        })?;
+                    let parameters = requirements
+                        .outputs
+                        .iter()
+                        .filter(|output| output.interval.device == region.device)
+                        .find(|output| {
+                            region.outputs.prepared.iter().any(|(_, requests)| {
+                                requests
+                                    .iter()
+                                    .any(|request| output.request.slot_key() == request.slot_key())
+                            })
+                        })
+                        .map(|output| output.sources.parameters.clone())
+                        .or_else(|| {
+                            requirements
+                                .resources
+                                .scratch
+                                .iter()
+                                .filter(|scratch| scratch.device == region.device)
+                                .find(|scratch| {
+                                    region.scratch.prepared.iter().any(|(_, requests)| {
+                                        requests.iter().any(|request| {
+                                            (
+                                                scratch.slot.storage_id(),
+                                                scratch.slot.slot_id(),
+                                                scratch.slot.slot_index(),
+                                            ) == request.slot_key()
+                                        })
+                                    })
+                                })
+                                .map(|scratch| scratch.parameters.clone())
+                        })
+                        .ok_or_else(|| {
+                            GpuAdmissionError::InvalidPlan(
+                                "preimage setup has no parameter context".into(),
+                            )
+                        })?;
+                    let claims = preimage_replay_claims(
+                        plan,
+                        &parameters,
+                        *public_rows,
+                        width,
+                        ty.rows,
+                        bound,
+                    )?;
+                    extras.extend(claims.into_iter().map(|claim| (parameters.clone(), claim)));
+                }
             }
         }
         let mut groups = BTreeMap::<ConcreteMatrixType, Vec<GpuTracedClaim>>::new();
@@ -264,6 +342,19 @@ impl GpuMatrixLayoutPlan {
                 },
                 columns: if request.kind() == GpuPreparedSlotKind::Matrix {
                     request.columns()
+                } else {
+                    1
+                },
+            };
+            groups.entry(ty).or_default().push(claim);
+        }
+        for (params, claim) in extras {
+            let ty = ConcreteMatrixType {
+                modulus: params.modulus().as_ref().clone().into(),
+                ring_dimension: params.ring_dimension() as usize,
+                rows: if claim.kind() == GpuPreparedSlotKind::Matrix { claim.rows() } else { 1 },
+                columns: if claim.kind() == GpuPreparedSlotKind::Matrix {
+                    claim.columns()
                 } else {
                     1
                 },
@@ -1278,7 +1369,7 @@ impl GpuDcrtBackend {
                 let left = invocation.operands.left.as_ref();
                 let right = &invocation.operands.right;
                 Ok(MatrixInvocationGeometry {
-                    operation: invocation.operation.kind_name(),
+                    operation: invocation.operation.clone(),
                     rows: invocation.operation.output_rows(left, right)?,
                     columns: invocation.operation.output_columns(left),
                     compact_output: invocation.operation.compact_bound().is_some(),
@@ -1692,7 +1783,7 @@ impl GpuDcrtBackend {
 mod tests {
     use super::{
         super::gpu_prepare::{MatrixInputLayout, PreparedMatrixSource},
-        GpuMatrixLayoutPlan, MatrixInputRequest,
+        GpuMatrixLayoutPlan, MatrixInputRequest, PreimageClaimPlan, preimage_replay_claims,
     };
     use mxx_primitives::{
         matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, GpuPreparedSlotSnapshot, GpuTracedClaim},
@@ -1749,5 +1840,44 @@ mod tests {
         assert!(setup[0].1.iter().all(|claim| {
             claim.kind() == GpuPreparedSlotKind::Matrix && claim.rows() == 1 && claim.columns() == 1
         }));
+    }
+
+    fn preimage_claim_plan_for_replay_test() -> PreimageClaimPlan {
+        PreimageClaimPlan {
+            destination: vec![GpuTracedClaim::matrix(1, 1, 0, false)],
+            tile: vec![GpuTracedClaim::matrix(1, 1, 0, false)],
+            attempt: std::array::from_fn(|_| vec![GpuTracedClaim::matrix(1, 1, 0, false)]),
+            attempts: 16,
+            bytes_per_poly: 0,
+        }
+    }
+
+    #[test]
+    fn test_gpu_preimage_replay_claims_use_accepted_width_for_tiles_and_attempts() {
+        let parameters = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let plan = preimage_claim_plan_for_replay_test();
+        let claims =
+            preimage_replay_claims(&plan, &parameters, 1, 2, 1, &num_bigint::BigUint::from(3u32))
+                .unwrap();
+        assert_eq!(claims.len(), 18);
+        assert_eq!(claims[0].columns(), 1, "destination keeps its traced shape");
+        assert!(claims[1..].iter().all(|claim| claim.columns() == 2));
+    }
+
+    #[test]
+    fn test_gpu_preimage_replay_claims_preserve_identical_sibling_multiplicity() {
+        let parameters = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let plan = preimage_claim_plan_for_replay_test();
+        let first =
+            preimage_replay_claims(&plan, &parameters, 1, 2, 1, &num_bigint::BigUint::from(3u32))
+                .unwrap();
+        let second =
+            preimage_replay_claims(&plan, &parameters, 1, 2, 1, &num_bigint::BigUint::from(3u32))
+                .unwrap();
+        assert_eq!(first, second);
+        let mut extras = Vec::new();
+        extras.extend(first.iter().copied());
+        extras.extend(second.iter().copied());
+        assert_eq!(extras.len(), first.len() * 2);
     }
 }

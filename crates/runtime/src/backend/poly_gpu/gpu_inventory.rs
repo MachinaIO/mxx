@@ -6097,6 +6097,12 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_eager_selection_reuses_existing_owner_inventory() {
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|value| value.parse::<u32>().unwrap())
             .unwrap_or(32);
@@ -6105,7 +6111,7 @@ mod tests {
         let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
         let input = DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 5, DistType::FinRingDist);
         let mut capacities = Vec::new();
-        for selection in 0..3 {
+        for selection in 0..4 {
             let params = GpuDCRTPolyParams::new_with_gpu(
                 n,
                 cpu.to_crt().0,
@@ -6122,16 +6128,51 @@ mod tests {
                 1 => mxx_dsl::Family::pack(vec![input_wire.clone(), input_wire.clone()])
                     .unwrap()
                     .at(0),
-                _ => mxx_dsl::select(0, vec![input_wire.clone(), input_wire.clone()]).unwrap(),
+                2 => mxx_dsl::select(0, vec![input_wire.clone(), input_wire.clone()]).unwrap(),
+                _ => mxx_dsl::Family::pack(vec![
+                    input_wire.clone(),
+                    ring.artifact_input(
+                        production.clone(),
+                        "unused",
+                        (2, 5),
+                        ArtifactConfidentiality::Private,
+                    ),
+                ])
+                .unwrap()
+                .at(0),
+            };
+            let manifest = Manifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([(
+                    "unused".into(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(ConcreteMatrixType {
+                            rows: 2,
+                            columns: 5,
+                            ring_dimension: n as usize,
+                            modulus: params.modulus().as_ref().clone().into(),
+                        }),
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Private,
+                        content_hash: None,
+                        layout: None,
+                    },
+                )]),
             };
             let graph = DslContext::new("eager-selection-owner")
                 .output("source", input_wire)
+                .unwrap()
+                .output("consumed", -selected.clone())
                 .unwrap()
                 .output("selected", selected)
                 .unwrap()
                 .build()
                 .unwrap()
-                .validate(&ParamEnv::default())
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production.clone(), manifest)]),
+                )
                 .unwrap();
             let matrix = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &input);
             let expected = matrix.to_compact_bytes();
@@ -6164,7 +6205,7 @@ mod tests {
                     .sum::<usize>(),
             );
         }
-        assert_eq!(capacities, vec![capacities[0]; 3]);
+        assert_eq!(capacities, vec![capacities[0]; 4]);
     }
 
     #[test]

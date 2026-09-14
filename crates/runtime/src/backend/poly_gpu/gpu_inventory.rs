@@ -2454,7 +2454,9 @@ impl GpuDcrtBackend {
                 }
                 layout.lazy = match kind {
                     NodeKind::Input { artifact, .. } => artifact.is_some(),
-                    NodeKind::FamilyPack { .. } => arguments
+                    NodeKind::FamilyPack { .. } |
+                    NodeKind::FamilyGetDynamic |
+                    NodeKind::Select { .. } => arguments
                         .iter()
                         .any(|wire| column_layouts.get(wire).is_some_and(|source| source.lazy)),
                     NodeKind::FamilyGetStatic { .. } => {
@@ -2472,13 +2474,6 @@ impl GpuDcrtBackend {
                         arguments.iter().any(|wire| {
                             column_layouts.get(wire).is_some_and(|source| source.packed_family)
                         }));
-                if matches!(output, ConcreteWireType::IndexedFamily { .. }) &&
-                    matches!(kind, NodeKind::FamilyGetDynamic | NodeKind::Select { .. })
-                {
-                    layout.lazy |= arguments
-                        .iter()
-                        .any(|wire| column_layouts.get(wire).is_some_and(|source| source.lazy));
-                }
                 // Exact inherited placement uses the same ordered source-range
                 // selection as native preflight. Each fragment retains its own
                 // device/context and format, including mixed-format inputs.
@@ -4924,6 +4919,95 @@ mod tests {
                     .any(|layout| layout.kind == GpuPreparedSlotKind::PinnedHost)),
                 "materialization still requires native import staging"
             );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_dynamic_staging_family_selection_is_owned_before_consumer() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(3);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 1, DistType::FinRingDist);
+        let expected = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original).to_compact_bytes();
+        for select in [false, true] {
+            let context = DslContext::new("dynamic-staging-selection");
+            let index = context.input::<mxx_dsl::Int>("index", mxx_dsl::IntType).unwrap();
+            let input = ring.input("input", (2, 1));
+            let family = mxx_dsl::parallel(count, |_| Ok(-input.clone())).unwrap();
+            let selected = if select {
+                mxx_dsl::select(index, (0..count).map(|i| family.at(i)).collect()).unwrap()
+            } else {
+                family.at(index)
+            };
+            let graph = context
+                .output("result", -selected)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            assert!(
+                graph.root_scope().execution_order.iter().any(|node| {
+                    if select {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::Select { .. })
+                    } else {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::FamilyGetDynamic)
+                    }
+                }),
+                "runtime selection must not lower to a static family access"
+            );
+            let inputs = BTreeMap::from([
+                (
+                    "input".into(),
+                    RuntimeValue::matrix(super::super::GpuFleetMatrix::from(
+                        GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original),
+                    )),
+                ),
+                (
+                    "index".into(),
+                    RuntimeValue::Int((rand::random::<u64>() as usize % count).into()),
+                ),
+            ]);
+            let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+            drop(backend.prepare_graph_admission(&graph, false, &inputs, 2, true).unwrap());
+            let mut store = MemoryArtifactStore::default();
+            let mut result = execute_with_config(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: std::num::NonZeroUsize::new(2).unwrap(),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .unwrap();
+            let RuntimeValue::Matrix(matrix) =
+                result.materialize_output("result", &mut backend, &mut store).unwrap()
+            else {
+                panic!("matrix")
+            };
+            assert_eq!(backend.matrix_to_bytes(matrix).unwrap(), expected);
         }
     }
 

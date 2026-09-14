@@ -4,7 +4,7 @@ This guide explains [PR #159](https://github.com/MachinaIO/mxx/pull/159) for a r
 who has not followed its implementation. It describes the complete PR, including
 changes already committed before the final GPU review.
 
-Comparison snapshot: `main` at `f3fe71efa301778f5ba178c985af919cfefa42c7`, PR branch
+Original comparison snapshot: `main` at `f3fe71efa301778f5ba178c985af919cfefa42c7`, PR branch
 `codex/public-runtime-gpu-optimizations` at
 `0a3d65b545551880866f6ec5a5b491f314fbe4d9`. Both refs were checked against the
 remote on September 13, 2026. The scope is `git diff f3fe71efa301778f5ba178c985af919cfefa42c7...HEAD`,
@@ -375,7 +375,7 @@ synchronization code and did not provision another remote pod.
 Normal execution now requests cached resource plans only. A missing polynomial
 readback, trapdoor or preimage plan is a warmup error, including in nested
 scopes; it never starts a replacement GPU discovery trial. Call
-`prepare_graph_admission(&graph, capture_trace, &inputs, true)` explicitly,
+`prepare_graph_admission(&graph, capture_trace, &inputs, wave_bound, true)` explicitly,
 drop its guard, and retain that backend for production. See
 `docs/benchmark-estimator.md` for the calling contract.
 
@@ -436,3 +436,69 @@ This is a runtime-only change. No application-specific checkpoint driver or
 private application crate is included. A successful full production checkpoint
 replay and production-size utilization measurements remain separate validation
 requirements; library tests do not establish either result.
+
+
+## 13. Bounded sibling batches and final fleet follow-up
+
+The later bounded-batch implementation replaces fixed sibling width one with
+admission of the largest supported group within `max_parallel_instances` and
+the number of remaining bodies. It tries widths in descending order; for each
+width, the shared scratch-column cap is successively halved with ceiling until
+one fits. This is maximum sibling width within the documented candidate set,
+not a claim that this width is always fastest. The caller can retain a smaller
+upper limit. The fleet remains one logical execution placement.
+
+Admission inspects metadata and existing typed slot availability before loading
+selected lazy inputs. Native matrix, compact, pinned, event and stream claims
+must fit together. The accepted region retains its owners through the existing
+completion dependencies. Rejected candidates perform no GPU trial, artifact
+load or sampling draw. Ordinary estimation consumes shared resource lowering
+and selected native batch measurements; final lookup does not execute the
+protocol. GPU warmup discovers distinct primitive/parameter classes, not one
+measurement for each graph occurrence.
+
+Trapdoor sampling is performed on GPU 0. Its computed fixed matrices are copied
+once to other execution contexts, where required covariance state is prepared.
+Preimage sampling distributes target columns through the existing fleet column
+scheduler, inventory and prepared input machinery. Each result retains its own
+seed, global column offset and rejection-attempt state. There is no additional
+sampler scheduler or independent memory manager. Algorithmic rejection attempts
+produce the requested result and are not calibration trials.
+
+Two four-GPU tests passed at `60369f821` on RTX 5090 x4: prepared Preimage execution
+and normal fleet Preimage estimation. The runtime test checks every requested
+target column and the trusted Preimage relation. The estimator test checks
+native plans and CPU-only final lookup across the configured contexts.
+
+The subsequent four-workload comparison exposed an inventory overcount for lazy
+imports: after a matrix was sharded over several GPUs, every device was charged
+for all global fragments. Commit `96789cddf` preserves the global execution cuts
+but bounds retained fragment capacities per physical device. Multiple fragments
+on the same device still count separately. The existing mixed-fragment,
+selection and child-call test passed locally; all four remote comparison cases
+then passed once. The final remote release GPU workspace library build was
+warning-free. Temporary diagnostic output was removed.
+
+The following single samples use RTX 5090 x4, ring dimension 1024, five outputs,
+and sibling caps one/four. Timing includes execution, output materialization and
+canonical readback, excluding warmup and input setup. Inputs and file-store
+boundaries are matched. The large case actually used all four devices. Lazy
+input was loaded once per execution.
+
+| Workload | Cap 1 seconds | Cap 4 seconds |
+| --- | ---: | ---: |
+| Small arithmetic | 0.046223005 | 0.048969675 |
+| Column-heavy matrix | 0.314579105 | 0.294002384 |
+| Preimage | 0.125039157 | 0.117394282 |
+| Lazy checkpoint | 0.072881298 | 0.069037151 |
+
+These samples establish successful execution and comparable measurement
+boundaries, not a repeatable speedup. Logical batch counts are distinct from
+CUDA kernel counts. Separate local Nsight captures report actual kernel/copy
+activity only during explicit benchmark ranges. They are not remote fleet
+measurements. Prepared pinned backing and per-store high-water upper bounds are
+reported separately from total process RSS and pageable staging memory.
+
+Logs from the completed remote comparison were retrieved before the pod was
+deleted; the existing network volume was preserved. No application-scale replay
+or universal performance claim follows from these unit benchmark results.

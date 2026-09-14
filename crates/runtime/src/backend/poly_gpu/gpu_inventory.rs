@@ -3336,16 +3336,15 @@ impl GpuDcrtBackend {
                     add_layouts(
                         &mut demand,
                         ty,
-                        PreimageClaimPlan::residual_batch_metadata(
-                            &params,
-                            public.rows,
-                            width,
-                            wave,
-                        )
-                        .map_err(PolyBackendError::GpuSubmission)?
-                        .into_iter()
-                        .map(|claim| claim.layout().expect("batch metadata"))
-                        .collect(),
+                        // Descriptor bytes depend on the sibling count, but a
+                        // wide result may embed them in its matrix allocation.
+                        // Split/tail results have less embedded space. Query the
+                        // smallest legal result to bound every admitted width.
+                        PreimageClaimPlan::residual_batch_metadata(&params, public.rows, 1, wave)
+                            .map_err(PolyBackendError::GpuSubmission)?
+                            .into_iter()
+                            .map(|claim| claim.layout().expect("batch metadata"))
+                            .collect(),
                     );
                     shared_layout.set(false);
                 }

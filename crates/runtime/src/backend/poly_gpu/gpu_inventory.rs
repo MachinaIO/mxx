@@ -4301,6 +4301,25 @@ mod tests {
         })
         .unwrap();
         assert_eq!(single, Some((1, 1, (1, 1))));
+        // Exhaust all feasibility sets for W=1..3 and caps 3,2,1. The
+        // reference maximizes the feasible (W, cap) pair directly, without
+        // reproducing the search's control flow or assuming monotonic fitting.
+        for mask in 0u16..(1 << 9) {
+            for bound in 1..=3 {
+                let feasible =
+                    |wave: usize, cap: usize| mask & (1 << ((wave - 1) * 3 + cap - 1)) != 0;
+                let expected = (1..=bound)
+                    .flat_map(|wave| (1..=3).map(move |cap| (wave, cap)))
+                    .filter(|&(wave, cap)| feasible(wave, cap))
+                    .max();
+                let selected = select_wave_and_width(bound, 3, |wave, cap| {
+                    Ok::<_, std::convert::Infallible>(feasible(wave, cap).then_some(()))
+                })
+                .unwrap()
+                .map(|(wave, cap, ())| (wave, cap));
+                assert_eq!(selected, expected, "feasibility mask {mask}, bound {bound}");
+            }
+        }
     }
 
     #[test]

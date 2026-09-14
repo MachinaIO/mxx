@@ -1785,7 +1785,11 @@ impl GpuDcrtBackend {
                     .enumerate()
                 {
                     let metadata = &operations[input.wire.node.0 as usize].0;
-                    if let Some(ty) = metadata.outputs()[input.wire.port.0 as usize].matrix_type() {
+                    let mut leaf = &metadata.outputs()[input.wire.port.0 as usize];
+                    while let ConcreteWireType::IndexedFamily { element, .. } = leaf {
+                        leaf = element;
+                    }
+                    if let Some(ty) = leaf.matrix_type() {
                         let mut layout = GpuInventoryValue::default();
                         layout.include_input(input.value, ty.columns);
                         if matches!(
@@ -2678,6 +2682,7 @@ impl GpuDcrtBackend {
                 })
                 .collect::<Vec<_>>();
             let mut imports = Vec::new();
+            let mut materialized_selection = false;
             for (wire, ty, end) in materialized {
                 until.set(if capture_trace { usize::MAX } else { end });
                 for (path, leaf) in family_leaves(&ty) {
@@ -2709,15 +2714,28 @@ impl GpuDcrtBackend {
             ) {
                 for (port, ty) in output_types.iter().enumerate() {
                     let wire = WireRef { node: id, port: Port(port as u32) };
+                    // Dynamic scalar selection materializes immediately in the
+                    // executor, even when its result has no later GPU consumer.
+                    let selected_lazy =
+                        matches!(kind, NodeKind::FamilyGetDynamic | NodeKind::Select { .. }) &&
+                            ty.matrix_type().is_some() &&
+                            column_layouts.get(&wire).is_some_and(|layout| layout.lazy);
+                    if selected_lazy {
+                        column_layouts.get_mut(&wire).unwrap().lazy = false;
+                        materialized_selection = true;
+                    }
                     if !column_layouts.get(&wire).is_some_and(|layout| layout.lazy) &&
                         !matches!(ty, ConcreteWireType::IndexedFamily { .. })
                     {
-                        if matches!(kind, NodeKind::Input { .. }) &&
-                            column_layouts.get(&wire).is_some_and(|layout| !layout.borrowed)
+                        if selected_lazy ||
+                            (matches!(kind, NodeKind::Input { .. }) &&
+                                column_layouts
+                                    .get(&wire)
+                                    .is_some_and(|layout| !layout.borrowed))
                         {
-                            // Placement creates this owner before body entry.
-                            // Charge it separately from the import's temporary
-                            // resources, even when lowering omits the Input node.
+                            // Placement or selection creates a retained owner,
+                            // separately from the import's temporary resources.
+                            // Input placement starts at position zero.
                             until.set(retained_until(port));
                             *owners.borrow_mut() = vec![(wire, Vec::new())];
                             if let ConcreteWireType::Matrix(ty) = ty {
@@ -3023,8 +3041,8 @@ impl GpuDcrtBackend {
             {
                 continue;
             }
-            // Retained operation outputs. Placement-created Input owners were
-            // charged above together with their import, and must not be counted twice.
+            // Retained operation outputs. Placement and selection imports were
+            // charged above with their owners, and must not be counted twice.
             for (port, path, output) in output_types
                 .iter()
                 .enumerate()
@@ -3032,7 +3050,9 @@ impl GpuDcrtBackend {
                     family_leaves(ty).map(move |(path, leaf)| (port, path, leaf))
                 })
                 .filter(|_| {
-                    !matches!(kind, NodeKind::Input { .. }) && !optimizer.omitted.contains(&id)
+                    !matches!(kind, NodeKind::Input { .. }) &&
+                        !materialized_selection &&
+                        !optimizer.omitted.contains(&id)
                 })
                 .filter(|(port, _, _)| {
                     !column_layouts
@@ -4920,6 +4940,153 @@ mod tests {
                 "materialization still requires native import staging"
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_broadcast_staged_family_dynamic_selection_has_import_capacity() {
+        use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(3)
+            .max(3);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 1,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let manifest = Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(
+                "members".into(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::Matrix(ty.clone()),
+                    family_count: Some(count),
+                    confidentiality: ArtifactConfidentiality::Private,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 1, DistType::FinRingDist);
+        let bytes = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original).to_compact_bytes();
+        let mut store = MemoryArtifactStore::default();
+        store.store_manifest(manifest.clone()).unwrap();
+        for index in 0..count {
+            store
+                .store(
+                    ArtifactKey {
+                        production: production.clone(),
+                        name: "members".into(),
+                        index: Some(index),
+                    },
+                    &ArtifactType::Matrix(ty.clone()),
+                    ArtifactConfidentiality::Private,
+                    None,
+                    ArtifactPayload::Matrix(bytes.clone()),
+                )
+                .unwrap();
+        }
+        let family = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            count,
+            (2, 1),
+            ArtifactConfidentiality::Private,
+        );
+        // Modulo prevents Zip lowering; no arithmetic consumer can hide a
+        // missing import by lending its own scratch to this selected output.
+        let output = mxx_dsl::parallel(2, |i| Ok(family.at(i % count))).unwrap();
+        let graph = DslContext::new("broadcast-lazy-family-selection")
+            .output("result", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .unwrap();
+        let (node, _) = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find(|(_, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(body)
+                if body.input_modes.contains(&mxx_ir_core::node::LoopInputMode::Broadcast))
+            })
+            .expect("family must be broadcast");
+        let child = graph
+            .source
+            .child_scope_id(&FrozenGraphScopeId::Root, mxx_ir_core::types::NodeId(node as u64))
+            .unwrap();
+        assert!(
+            graph
+                .scope(&child)
+                .unwrap()
+                .execution_order
+                .iter()
+                .any(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::FamilyGetDynamic))
+        );
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        drop(backend.prepare_graph_admission(&graph, false, &BTreeMap::new(), 2, true).unwrap());
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: std::num::NonZeroUsize::new(2).unwrap(),
+                ..ExecutionConfig::default()
+            },
+        )
+        .unwrap();
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("result", &mut backend, &mut store).unwrap()
+        else {
+            panic!("family")
+        };
+        assert_eq!(members.len(), 2);
+        for member in members {
+            let RuntimeValue::Matrix(matrix) = member else { panic!("matrix") };
+            assert_eq!(backend.matrix_to_bytes(matrix).unwrap(), bytes);
+        }
+        assert_eq!(
+            store.load_count(&ArtifactKey {
+                production,
+                name: "members".into(),
+                index: Some(count - 1)
+            }),
+            0,
+            "unselected family members must remain descriptors"
+        );
     }
 
     #[test]

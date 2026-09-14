@@ -739,8 +739,7 @@ pub struct GpuDcrtBackend {
     /// Traced claim plans for preimage and trapdoor sampling classes, derived
     /// before the inventory sealed.
     preimage_plans: HashMap<PreimagePlanKey, PreimageClaimPlan>,
-    trapdoor_plans:
-        HashMap<TrapdoorPlanKey, Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>>,
+    trapdoor_plans: HashMap<TrapdoorPlanKey, gpu_compiled::TrapdoorClaimPlan>,
     /// Traced claim plans for scalar polynomial value readback, keyed by
     /// modulus, ring dimension, requested domain and the input's format.
     polynomial_value_plans: HashMap<
@@ -1917,8 +1916,11 @@ mod tests {
                         let source = backend
                             .sample_hash(&ty, rand::random(), b"enqueue-worker-recovery")
                             .unwrap();
-                        let expected =
-                            -backend.gather_matrix_for_host(&source).unwrap().to_cpu_matrix();
+                        let expected = source
+                            .shards()
+                            .par_iter()
+                            .map(|shard| (shard.global_column_start, -shard.value.to_cpu_matrix()))
+                            .collect::<Vec<_>>();
                         let wave = (0..devices.len())
                             .map(|device| (device, device * 2, device * 2 + 2))
                             .collect::<Vec<_>>();
@@ -1939,7 +1941,13 @@ mod tests {
                         assert_eq!(backend.devices.len(), devices.len());
                         let output = backend.negate(&source).unwrap();
                         assert_eq!(
-                            backend.gather_matrix_for_host(&output).unwrap().to_cpu_matrix(),
+                            output
+                                .shards()
+                                .par_iter()
+                                .map(|shard| {
+                                    (shard.global_column_start, shard.value.to_cpu_matrix())
+                                })
+                                .collect::<Vec<_>>(),
                             expected
                         );
                         drop(independent_owner);
@@ -5308,19 +5316,16 @@ impl Backend for GpuDcrtBackend {
                 gadget_base: gadget_base.to_string(),
                 digit_count,
             };
-            let claims = self.trapdoor_plans.get(&key).cloned().ok_or_else(|| {
+            let plan = self.trapdoor_plans.get(&key).cloned().ok_or_else(|| {
                 PolyBackendError::GpuSubmission(
                     "trapdoor sampling has no derived claim plan for this shape".into(),
                 )
             })?;
-            if self.devices.len() != 1 {
-                return Err(PolyBackendError::UnsupportedPlacement);
-            }
             let params = self.devices[0].1.parameters(ty)?.clone();
             let broker = self.claim_broker(&params);
             let mut failure = None;
             let device = &mut self.devices[0].1;
-            let sampled = broker.hold_traced(&claims, || {
+            let sampled = broker.hold_traced(&plan.sample, || {
                 match device.sample_trapdoor(ty, sigma, gadget_base, digit_count) {
                     Ok((public, trapdoor)) => {
                         <GpuDCRTPolyTrapdoorSampler as mxx_primitives::sampler::PolyTrapdoorSampler>::new(&params, sigma)
@@ -5338,9 +5343,34 @@ impl Backend for GpuDcrtBackend {
                 (Err(_), Some(error)) => return Err(error),
                 (Err(message), None) => return Err(PolyBackendError::GpuSubmission(message)),
             };
+            let mut values = vec![trapdoor];
+            if self.devices.len() > 1 {
+                let snapshots = broker
+                    .hold_traced(&plan.export, || Ok(values[0].to_rns_snapshots()))
+                    .map_err(PolyBackendError::GpuSubmission)?;
+                let destinations = self
+                    .devices
+                    .iter()
+                    .skip(1)
+                    .map(|(_, device)| {
+                        let params = device.parameters(ty)?.clone();
+                        let broker = self.claim_broker(&params);
+                        Ok((params, broker))
+                    })
+                    .collect::<Result<Vec<_>, PolyBackendError>>()?;
+                let replicas = destinations.par_iter().map(|(params, broker)| {
+                    broker.hold_traced(&plan.import, || {
+                        let replica = mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(params, &snapshots);
+                        <GpuDCRTPolyTrapdoorSampler as mxx_primitives::sampler::PolyTrapdoorSampler>::new(params, sigma)
+                            .prepare_preimage_cache(params, &replica, ty.rows);
+                        Ok(replica)
+                    }).map_err(PolyBackendError::GpuSubmission)
+                }).collect::<Result<Vec<_>, _>>()?;
+                values.extend(replicas);
+            }
             return Ok((
                 GpuFleetMatrix::from_matrix(public),
-                GpuFleetTrapdoor { values: Arc::new(vec![trapdoor]) },
+                GpuFleetTrapdoor { values: Arc::new(values) },
             ));
         }
         let (public, first) =
@@ -5408,7 +5438,7 @@ impl Backend for GpuDcrtBackend {
                 seed: randomness_seed,
             };
             return self.execute_admitted_matrix(
-                &[],
+                &[public],
                 None,
                 ExecutionPayload::Preimage(Arc::new(payload)),
             );

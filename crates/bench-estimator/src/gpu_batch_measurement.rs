@@ -210,7 +210,16 @@ impl GpuNodeMeasurementBackend {
         backend
             .prepare_measurement_storage(claims)
             .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        let matrices = prepared.iter().map(|member| member.arguments.clone()).collect::<Vec<_>>();
+        let matrices = prepared
+            .iter()
+            .map(|member| {
+                let mut arguments = member.arguments.clone();
+                if let Some((public, ..)) = &member.preimage_trapdoor {
+                    arguments[0] = Some(Arc::new(public.clone()));
+                }
+                arguments
+            })
+            .collect::<Vec<_>>();
         let compact =
             prepared.iter().map(|member| member.small_arguments.clone()).collect::<Vec<_>>();
         let measurement_node = MeasurementNode {

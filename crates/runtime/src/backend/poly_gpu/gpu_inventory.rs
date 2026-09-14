@@ -1171,7 +1171,7 @@ impl GpuDcrtBackend {
         gadget_base: &num_bigint::BigInt,
         digit_count: usize,
         warm_up: bool,
-    ) -> Result<Vec<GpuTracedClaim>, PolyBackendError> {
+    ) -> Result<super::gpu_compiled::TrapdoorClaimPlan, PolyBackendError> {
         let key = TrapdoorPlanKey {
             modulus: matrix.modulus.to_string(),
             ring_dimension: matrix.ring_dimension,
@@ -1200,8 +1200,25 @@ impl GpuDcrtBackend {
             trace_native_claims(|| sampler.prepare_preimage_cache(&params, &trapdoor, matrix.rows))
                 .map_err(PolyBackendError::GpuSubmission)?;
         claims.extend(cache);
-        self.trapdoor_plans.insert(key, claims.clone());
-        Ok(claims)
+        let (export, import) = if self.devices.len() > 1 {
+            let (snapshots, export) = trace_native_claims(|| trapdoor.to_rns_snapshots())
+                .map_err(PolyBackendError::GpuSubmission)?;
+            let (_, import) = trace_native_claims(|| {
+                let replica =
+                    mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(
+                        &params, &snapshots,
+                    );
+                sampler.prepare_preimage_cache(&params, &replica, matrix.rows);
+                replica
+            })
+            .map_err(PolyBackendError::GpuSubmission)?;
+            (export, import)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let plan = super::gpu_compiled::TrapdoorClaimPlan { sample: claims, export, import };
+        self.trapdoor_plans.insert(key, plan.clone());
+        Ok(plan)
     }
 
     /// Trace the exact claims of scalar polynomial value readback for `ty` in
@@ -2544,6 +2561,19 @@ impl GpuDcrtBackend {
                         }
                     }
                 }
+                if matches!(kind, NodeKind::TrapdoorSample { .. }) {
+                    // Sampling creates the complete public owner on device 0;
+                    // Preimage admission selects any necessary consumer replicas.
+                    let params = self.devices[0].1.parameters(ty)?;
+                    layout.fragments = Some(Arc::from([super::gpu_prepare::MatrixInputFragment {
+                        device: self.devices[0].0,
+                        context: params.context_identity(),
+                        start: 0,
+                        end: ty.columns,
+                        level: params.crt_depth() - 1,
+                        evaluation: true,
+                    }]));
+                }
                 column_layouts.insert(wire, layout);
             }
             // Inputs already on the device keep their native owners.
@@ -3219,17 +3249,12 @@ impl GpuDcrtBackend {
                     let sigma = sigma
                         .evaluate_f64(bindings)
                         .map_err(|e| PolyBackendError::GpuSubmission(e.to_string()))?;
-                    // Prepared trapdoor/preimage sampling is single-device; refuse
-                    // here, before any domain is sealed, rather than at the node.
-                    if self.devices.len() != 1 {
-                        return Err(PolyBackendError::UnsupportedPlacement);
-                    }
                     until.set(retained_until(0).max(retained_until(1)));
                     *owners.borrow_mut() = vec![
                         (WireRef { node: id, port: Port(0) }, Vec::new()),
                         (WireRef { node: id, port: Port(1) }, Vec::new()),
                     ];
-                    let claims = self.trace_trapdoor_sampling(
+                    let plan = self.trace_trapdoor_sampling(
                         matrix,
                         sigma,
                         gadget_base,
@@ -3237,7 +3262,16 @@ impl GpuDcrtBackend {
                         warm_up,
                     )?;
                     let params = parameters(self, matrix)?;
-                    push_traced(&mut demand, matrix, &params, &claims, &add_matrix, &add_layouts);
+                    for claims in [&plan.sample, &plan.export, &plan.import] {
+                        push_traced(
+                            &mut demand,
+                            matrix,
+                            &params,
+                            claims,
+                            &add_matrix,
+                            &add_layouts,
+                        );
+                    }
                 }
                 NodeKind::PreimageSample { .. } => {
                     let (
@@ -3258,9 +3292,6 @@ impl GpuDcrtBackend {
                     let sigma = sigma
                         .evaluate_f64(bindings)
                         .map_err(|e| PolyBackendError::GpuSubmission(e.to_string()))?;
-                    if self.devices.len() != 1 {
-                        return Err(PolyBackendError::UnsupportedPlacement);
-                    }
                     let plan = self.trace_preimage_plan(
                         trapdoor_matrix,
                         public,
@@ -6369,19 +6400,25 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_graph_execution_admits_trapdoor_and_preimage_sampling() {
-        run_preimage_graph(None, 1);
+        run_preimage_graph(None, 1, false);
     }
 
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_preimage_range_scratch_handles_tail() {
-        run_preimage_graph(Some(2), 1);
+        run_preimage_graph(Some(2), 1, false);
     }
 
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_prepared_preimage_batch_preserves_every_sibling_relation() {
-        run_preimage_graph(None, 3);
+        run_preimage_graph(None, 3, false);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_preimage_fleet_preserves_every_target_column() {
+        run_preimage_graph(None, 3, true);
     }
 
     /// Explicit matched-boundary comparison. The profiled and unprofiled runs
@@ -6634,12 +6671,21 @@ mod tests {
         std::fs::remove_dir_all(run_root).unwrap();
     }
 
-    fn run_preimage_graph(scratch_columns: Option<usize>, instances: usize) {
+    fn run_preimage_graph(scratch_columns: Option<usize>, instances: usize, fleet: bool) {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|value| value.parse::<u32>().unwrap())
             .unwrap_or(32);
-        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
-        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let mut devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        if fleet {
+            assert!(devices.len() > 1, "remote multi-GPU test");
+        } else {
+            devices.truncate(1);
+        }
+        for &device in &devices {
+            crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        }
+        let device = devices[0];
+        let columns = if fleet { devices.len() + 1 } else { 3 };
         let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
         let params = GpuDCRTPolyParams::new_with_gpu(
             n,
@@ -6653,14 +6699,14 @@ mod tests {
         let digits = params.modulus_digits();
         let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
         let trapdoor = ring.sample_trapdoor(1, 5, 16, digits, 100_000_000);
-        let target = ring.input("t", (1, 3));
+        let target = ring.input("t", (1, columns));
         let context = DslContext::new("prepared-graph-preimage");
         let context = if instances == 1 {
-            let preimage = trapdoor.sample_preimage(target, (digits + 2, 3));
+            let preimage = trapdoor.sample_preimage(target, (digits + 2, columns));
             context.output("check", preimage.mul_small_rhs(trapdoor.public_matrix())).unwrap()
         } else {
             let checks = mxx_dsl::parallel(instances, |_| {
-                let preimage = trapdoor.sample_preimage(target.clone(), (digits + 2, 3));
+                let preimage = trapdoor.sample_preimage(target.clone(), (digits + 2, columns));
                 Ok(preimage.mul_small_rhs(trapdoor.public_matrix()))
             })
             .unwrap();
@@ -6668,7 +6714,7 @@ mod tests {
         };
         let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
         let sampler = DCRTPolyUniformSampler::new();
-        let target_value = sampler.sample_uniform(&cpu, 1, 3, DistType::FinRingDist);
+        let target_value = sampler.sample_uniform(&cpu, 1, columns, DistType::FinRingDist);
         let expected =
             GpuDCRTPolyMatrix::from_cpu_matrix(&params, &target_value).to_compact_bytes();
         let inputs = BTreeMap::from([(
@@ -6678,7 +6724,7 @@ mod tests {
                     modulus: num_bigint::BigInt::from(params.modulus().as_ref().clone()),
                     ring_dimension: n as usize,
                     rows: 1,
-                    columns: 3,
+                    columns,
                 },
                 bytes: std::sync::Arc::new(
                     GpuDCRTPolyMatrix::from_cpu_matrix(&params, &target_value)
@@ -6686,7 +6732,8 @@ mod tests {
                 ),
             },
         )]);
-        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+        let mut backend =
+            crate::backend::poly_gpu::gpu_backend_on([params.clone()], devices.clone());
         let error = execute_with_config(
             &graph,
             &mut backend,
@@ -6789,7 +6836,21 @@ mod tests {
                 }
             }
             assert_eq!(invocation_batch, instances, "observe actual batch multiplicity");
-            assert_eq!(submitted_jobs, instances, "observe grouped column submission");
+            if fleet {
+                assert!(submitted_jobs >= instances, "observe grouped fleet submission");
+            } else {
+                assert_eq!(submitted_jobs, instances, "observe grouped column submission");
+            }
+        }
+        if fleet {
+            let preimage = backend
+                .admitted_plan_log()
+                .iter()
+                .map(|(_, invocation)| invocation)
+                .find(|invocation| invocation.operation == "Preimage")
+                .unwrap();
+            assert_eq!(preimage.plan.widths.len(), devices.len());
+            assert!(preimage.plan.widths.iter().filter(|&&width| width > 0).count() > 1);
         }
         if let Some(width) = scratch_columns {
             let preimage = backend

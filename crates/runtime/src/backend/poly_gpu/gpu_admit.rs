@@ -40,8 +40,15 @@ impl MatrixPlacementInvocation {
         };
         let mut ordinary = Vec::new();
         let mut compact = None;
-        for (argument, ty) in arguments.into_iter().zip(node.arguments()) {
-            if operation.fresh_type().is_some() {
+        let input_count = if matches!(operation, PreparedMatrixOperation::Preimage { .. }) {
+            1
+        } else {
+            usize::MAX
+        };
+        for (argument, ty) in arguments.into_iter().zip(node.arguments()).take(input_count) {
+            if operation.fresh_type().is_some() &&
+                !matches!(operation, PreparedMatrixOperation::Preimage { .. })
+            {
                 continue;
             }
             match ty {
@@ -54,7 +61,13 @@ impl MatrixPlacementInvocation {
                 _ => {}
             }
         }
-        let operands = if operation.fresh_type().is_some() {
+        let operands = if matches!(operation, PreparedMatrixOperation::Preimage { .. }) {
+            InvocationOperands {
+                left: ordinary.into_iter().next(),
+                right: Vec::new(),
+                compact: None,
+            }
+        } else if operation.fresh_type().is_some() {
             InvocationOperands { left: None, right: Vec::new(), compact: None }
         } else if matches!(
             operation,
@@ -1262,7 +1275,8 @@ impl GpuDcrtBackend {
                     .flatten()
                     .map(|matrix| (matrix.id, matrix))
                     .collect::<HashMap<_, _>>();
-                let fresh = placement.operation.fresh_type().is_some();
+                let fresh = placement.operation.fresh_type().is_some() &&
+                    !matches!(placement.operation, PreparedMatrixOperation::Preimage { .. });
                 Ok(LoweredMatrixInvocation {
                     operation: placement.operation,
                     operands: InvocationOperands {

@@ -11,6 +11,7 @@ pub(super) struct PreparedPreimageJob<'a> {
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) payload: &'a PreimagePayload,
+    pub(super) public: &'a GpuDCRTPolyMatrix,
 }
 
 struct PhaseClaims<'a> {
@@ -97,17 +98,6 @@ impl PreparedMatrixOperation {
                 .iter()
                 .find(|trapdoor| trapdoor.r.params() == &parameters)
                 .ok_or("preimage trapdoor is not resident in this context")?;
-            let public = job
-                .payload
-                .public
-                .shards()
-                .iter()
-                .find(|shard| shard.value.params() == &parameters)
-                .filter(|shard| {
-                    shard.global_column_start == 0 &&
-                        shard.value.col_size() == job.payload.public.size().1
-                })
-                .ok_or("preimage public matrix is not resident in this context")?;
             let tile = broker
                 .hold_traced(&tile_claims, || {
                     materialize_preimage_tile(
@@ -127,7 +117,7 @@ impl PreparedMatrixOperation {
                     })
                     .map_err(|error| format!("preimage destination: {error}"))?;
             }
-            inputs.push((trapdoor, &public.value, tile));
+            inputs.push((trapdoor, job.public, tile));
         }
         let mut phases = PhaseClaims {
             broker,
@@ -205,11 +195,16 @@ impl GpuDcrtBackend {
                 seed: request.randomness_seed,
             };
             plans.push(invocation.plan);
-            invocations.push((invocation.operation, invocation.intervals, payload));
+            invocations.push((
+                invocation.operation,
+                invocation.intervals,
+                payload,
+                invocation.prepared,
+            ));
         }
         let brokers = invocations
             .iter()
-            .map(|(_, intervals, _)| {
+            .map(|(_, intervals, _, _)| {
                 intervals
                     .iter()
                     .map(|range| self.claim_broker(&range.parameters))
@@ -221,7 +216,7 @@ impl GpuDcrtBackend {
             let mut owners = HashMap::new();
             let layouts = invocations
                 .iter()
-                .map(|(operation, intervals, payload)| {
+                .map(|(operation, intervals, payload, _)| {
                     let next = owners.len();
                     let owner = *owners.entry(payload.public.id).or_insert(next);
                     let shapes = intervals
@@ -251,7 +246,7 @@ impl GpuDcrtBackend {
             GpuColumnMeasurement::new(
                 invocations
                     .iter()
-                    .flat_map(|(_, intervals, _)| intervals.iter())
+                    .flat_map(|(_, intervals, _, _)| intervals.iter())
                     .map(|range| (range.interval.device, range.parameters.clone()))
                     .collect(),
                 self.prepared_ledger.as_ref().unwrap().prepared_inventory().fold(
@@ -280,7 +275,7 @@ impl GpuDcrtBackend {
                         "unexpected physical Preimage output".into(),
                     ));
                 }
-                let (operation, intervals, _) = &initialize[instance];
+                let (operation, intervals, _, _) = &initialize[instance];
                 let rows = operation
                     .output_rows::<GpuFleetMatrix>(None, &[])
                     .map_err(|error| GpuAdmissionError::InvalidPlan(error.to_string()))?;
@@ -317,7 +312,7 @@ impl GpuDcrtBackend {
                             "unexpected physical Preimage scratch".into(),
                         ));
                     }
-                    let (operation, intervals, _) = &run[instance];
+                    let (operation, intervals, _, _) = &run[instance];
                     let PreparedMatrixOperation::Preimage {
                         ty,
                         bound,
@@ -352,7 +347,7 @@ impl GpuDcrtBackend {
                     let pending = jobs
                         .iter()
                         .map(|&(instance, job)| {
-                            let (_, intervals, payload) = &run[instance];
+                            let (operation, intervals, payload, prepared) = &run[instance];
                             let range = &intervals[job.source_interval];
                             let output = outputs[instance].as_mut().unwrap()[range.destination]
                                 .take()
@@ -369,6 +364,13 @@ impl GpuDcrtBackend {
                                 start: job.start,
                                 end: job.end,
                                 payload,
+                                public: &operation
+                                    .source(
+                                        prepared,
+                                        &payload.public,
+                                        range.left_source.expect("admitted Preimage public matrix"),
+                                    )
+                                    .value,
                             }
                         })
                         .collect();
@@ -396,7 +398,7 @@ impl GpuDcrtBackend {
         shards
             .into_par_iter()
             .zip(invocations.par_iter())
-            .map(|(mut shards, (operation, _, _))| {
+            .map(|(mut shards, (operation, _, _, _))| {
                 shards.par_sort_unstable_by_key(|shard| shard.global_column_start);
                 Ok(GpuFleetSmallMatrix::new(
                     operation.output_rows::<GpuFleetMatrix>(None, &[])?,

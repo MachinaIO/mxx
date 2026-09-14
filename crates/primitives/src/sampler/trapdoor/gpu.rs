@@ -163,6 +163,31 @@ impl PartialEq for GpuDCRTTrapdoor {
 impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
+    /// Materialize the fixed trapdoor matrices once for fanout to other devices.
+    /// Cached Gram matrices are transferred, rather than recomputed per replica.
+    pub fn to_rns_snapshots(&self) -> [crate::matrix::gpu_dcrt_poly::GpuDCRTMatrixRnsSnapshot; 5] {
+        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+            .map(GpuDCRTPolyMatrix::to_rns_snapshot)
+    }
+
+    /// Restore a trusted fixed-owner transfer in a destination parameter context.
+    pub fn from_rns_snapshots(
+        params: &GpuDCRTPolyParams,
+        snapshots: &[crate::matrix::gpu_dcrt_poly::GpuDCRTMatrixRnsSnapshot; 5],
+    ) -> Self {
+        let [r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff] = snapshots
+            .each_ref()
+            .map(|snapshot| GpuDCRTPolyMatrix::from_rns_snapshot(params, snapshot));
+        Self {
+            r,
+            e,
+            a_mat_coeff,
+            b_mat_coeff,
+            d_mat_coeff,
+            p1_covariance_cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
     /// Waits for every matrix required to consume this trapdoor.
     pub fn wait_until_ready(&self) {
         self.r.wait_until_ready();

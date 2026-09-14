@@ -363,6 +363,14 @@ pub(super) struct PreimagePlanKey {
     pub digit_count: usize,
 }
 
+/// Existing fixed-owner claim plan, split at the real transfer boundary.
+#[derive(Clone, Debug)]
+pub(super) struct TrapdoorClaimPlan {
+    pub sample: Vec<GpuTracedClaim>,
+    pub export: Vec<GpuTracedClaim>,
+    pub import: Vec<GpuTracedClaim>,
+}
+
 /// Identity of a trapdoor sampling class whose claim plan was traced.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TrapdoorPlanKey {
@@ -1208,6 +1216,9 @@ impl PreparedMatrixOperation {
     }
 
     pub(super) fn input_evaluation(&self, original: bool) -> bool {
+        if matches!(self, Self::Preimage { .. }) {
+            return true;
+        }
         if let Self::ImportMatrix { evaluation, .. } | Self::ImportStaging { evaluation, .. } = self
         {
             return *evaluation;
@@ -1925,6 +1936,7 @@ impl PreparedMatrixOperation {
                         start,
                         end,
                         payload,
+                        public: &left.expect("admitted Preimage public matrix").value,
                     }],
                     broker,
                 )
@@ -2683,12 +2695,12 @@ impl CompiledMatrixInvocation {
             GpuInvocation::TensorSumRows { left, right, .. } => {
                 (vec![ordinary(left), ordinary(right)], None)
             }
+            GpuInvocation::SamplePreimage { public, .. } => (vec![ordinary(public)], None),
             GpuInvocation::Constant { .. } |
             GpuInvocation::SampleUniform { .. } |
             GpuInvocation::SampleGaussian { .. } |
             GpuInvocation::SampleHash { .. } |
             GpuInvocation::SampleTrapdoor { .. } |
-            GpuInvocation::SamplePreimage { .. } |
             GpuInvocation::ImportMatrix { .. } |
             GpuInvocation::ImportSmallMatrix { .. } |
             GpuInvocation::ImportTrapdoor { .. } |
@@ -2703,6 +2715,13 @@ impl CompiledMatrixInvocation {
         request: &MatrixInvocation<'_>,
         backend: &GpuDcrtBackend,
     ) -> Result<InvocationOperands, PolyBackendError> {
+        if let GpuInvocation::SamplePreimage { public, .. } = request {
+            return Ok(InvocationOperands {
+                left: Some((*public).clone()),
+                right: Vec::new(),
+                compact: None,
+            });
+        }
         if let GpuInvocation::CenteredExtendSmall { value, destination } = request {
             if (destination.rows, destination.columns) != value.size() {
                 return Err(PolyBackendError::InvalidConstantShape);

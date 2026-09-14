@@ -812,10 +812,15 @@ impl GpuGraphInventory {
                 _ => return Ok(None),
             };
             let mut descriptors = Vec::with_capacity(arguments.len());
-            for (wire, ty) in arguments.iter().zip(operation.arguments()) {
-                // The traced sampler's fixed public/trapdoor/target resources
-                // are owned outside its column invocation, as in native lowering.
-                if matches!(operation.kind(), mxx_ir_core::node::NodeKind::PreimageSample { .. }) {
+            for (index, (wire, ty)) in arguments.iter().zip(operation.arguments()).enumerate() {
+                // Public replicas use ordinary fixed-input admission. The
+                // trapdoor and staged target retain their traced sampler claims.
+                if index != 0 &&
+                    matches!(
+                        operation.kind(),
+                        mxx_ir_core::node::NodeKind::PreimageSample { .. }
+                    )
+                {
                     descriptors.push(None);
                     continue;
                 }

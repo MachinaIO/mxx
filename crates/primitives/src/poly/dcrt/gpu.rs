@@ -300,11 +300,12 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_wait(mat: *const GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_is_ready(mat: *const GpuMatrixOpaque, out_ready: *mut c_int) -> c_int;
     pub(crate) fn gpu_matrix_copy(dst: *mut GpuMatrixOpaque, src: *const GpuMatrixOpaque) -> c_int;
-    pub(crate) fn gpu_matrix_copy_peer(
+    pub(crate) fn gpu_matrix_copy_device(
         dst: *mut GpuMatrixOpaque,
         src: *const GpuMatrixOpaque,
         out_copied: *mut c_int,
         view: *const GpuMatrixBatchView,
+        require_peer: c_int,
     ) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,

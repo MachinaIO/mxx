@@ -37,9 +37,12 @@ column schedule against the eligible typed inventory. Ordinary and compact
 matrix operations supported by IR lowering use this path. Preimage sampling
 binds the resource plan already discovered by explicit warmup and uses the same
 selector and schedule consumer. A missing Preimage plan is a warmup error, not
-permission to probe. Opaque operations retain the containing model. Prepared
-Trapdoor/Preimage graph execution currently requires a single device; this
-restriction must be resolved before claiming full multi-GPU sampler support.
+permission to probe. Opaque operations retain the containing model. Trapdoor generation runs once on device 0. Its fixed matrices are transferred
+once to the other execution contexts, including the cached Gram matrices;
+each context prepares its covariance cache using the warmed native claims.
+Preimage target columns use the existing fleet column scheduler. Public-matrix
+replicas use ordinary fixed-input admission and remain owned by the compiled
+invocations. This path introduces no separate sampler scheduler or inventory.
 
 Explicit warmup now provisions a native prepared inventory for each selected
 primitive fleet batch. Capacity comes from the node's typed claims;

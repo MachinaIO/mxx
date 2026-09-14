@@ -14,7 +14,7 @@ use crate::{
                 gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
                 gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_centered_rebase,
                 gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_copy_peer, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
+                gpu_matrix_copy_device, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
                 gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
                 gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
@@ -3812,9 +3812,10 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         let output =
             Self::new_empty_with_state(params, self.nrow, self.ncol, self.level, self.is_ntt, None);
         let mut copied = 0i32;
-        let status =
-            unsafe { gpu_matrix_copy_peer(output.raw, self.raw, &mut copied, std::ptr::null()) };
-        check_status(status, "gpu_matrix_copy_peer");
+        let status = unsafe {
+            gpu_matrix_copy_device(output.raw, self.raw, &mut copied, std::ptr::null(), 1)
+        };
+        check_status(status, "gpu_matrix_copy_device");
         (copied != 0).then_some(output)
     }
 
@@ -5431,11 +5432,12 @@ mod tests {
                 let mut copied = 0;
                 check_status(
                     unsafe {
-                        gpu_matrix_copy_peer(
+                        gpu_matrix_copy_device(
                             destination.raw,
                             source.raw,
                             &mut copied,
                             std::ptr::null(),
+                            1,
                         )
                     },
                     "peer copy with pending destination readers",
@@ -5447,11 +5449,12 @@ mod tests {
                 let new_reader = destination.transpose();
                 check_status(
                     unsafe {
-                        gpu_matrix_copy_peer(
+                        gpu_matrix_copy_device(
                             retained.raw,
                             destination.raw,
                             &mut copied,
                             std::ptr::null(),
+                            1,
                         )
                     },
                     "retain copied data before overwriting its owner",
@@ -5494,14 +5497,15 @@ mod tests {
             if peer_write {
                 let mut copied = 0;
                 let status = unsafe {
-                    gpu_matrix_copy_peer(
+                    gpu_matrix_copy_device(
                         destination.raw,
                         replacement.raw,
                         &mut copied,
                         std::ptr::null(),
+                        1,
                     )
                 };
-                check_status(status, "gpu_matrix_copy_peer reused destination");
+                check_status(status, "gpu_matrix_copy_device reused destination");
                 assert_eq!(copied, 1);
             } else {
                 destination.load_rns_bytes(&replacement_bytes, stride, GPU_POLY_FORMAT_EVAL);
@@ -5562,11 +5566,12 @@ mod tests {
                     // native peer-copy entry point on this test's one GPU.
                     let mut copied = 0;
                     let status = unsafe {
-                        gpu_matrix_copy_peer(
+                        gpu_matrix_copy_device(
                             source.raw,
                             replacement.raw,
                             &mut copied,
                             std::ptr::null(),
+                            1,
                         )
                     };
                     check_status(status, "overwrite host-observed destination");

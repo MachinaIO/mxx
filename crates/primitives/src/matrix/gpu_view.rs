@@ -598,8 +598,9 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
                 },
             };
             let mut copied = 0;
-            let status =
-                unsafe { gpu_matrix_copy_peer(output.raw, self.owner.raw, &mut copied, &view) };
+            let status = unsafe {
+                gpu_matrix_copy_device(output.raw, self.owner.raw, &mut copied, &view, 0)
+            };
             if status != 0 {
                 return Err(last_error_string());
             }

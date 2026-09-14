@@ -685,7 +685,17 @@ impl GpuGraphInventory {
                             .enumerate()
                             .map(|(node, handle)| {
                                 (0..handle.output_types().len())
-                                    .map(|port| liveness.output_end(node, port))
+                                    .map(|port| {
+                                        let wire = WireRef {
+                                            node: NodeId(node as u64),
+                                            port: mxx_ir_core::types::Port(port as u32),
+                                        };
+                                        if matches!(handle.kind(), NodeKind::Input { .. }) {
+                                            liveness.until(wire).unwrap_or(node)
+                                        } else {
+                                            liveness.output_end(node, port)
+                                        }
+                                    })
                                     .collect()
                             })
                             .collect())
@@ -1035,9 +1045,20 @@ impl GpuGraphInventory {
                 observed_physical_bytes: 0,
             })
             .collect::<Vec<_>>();
-        let plans = selected
-            .fit(&admissions, self.column_cap(), &inventories)
+        let (plans, mut setup) = selected
+            .fit_with_setup(&admissions, self.column_cap(), &inventories)
             .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        for (ty, demand) in self.frames.last().unwrap().resources.contexts.values() {
+            let shared = demand.shared_workspace_claims();
+            if shared.is_empty() {
+                continue;
+            }
+            if let Some(entry) = setup.iter_mut().find(|entry| entry.0 == *ty) {
+                entry.1.extend(shared);
+            } else {
+                setup.push((ty.clone(), shared));
+            }
+        }
         let outputs = instances
             .iter()
             .enumerate()
@@ -1063,34 +1084,6 @@ impl GpuGraphInventory {
                     slots[interval.device].insert(request.slot_key());
                 }
                 (instance.index, (BTreeMap::from([(output_keys[index].clone(), slots)]), layout))
-            })
-            .collect();
-        let setup = self
-            .frames
-            .last()
-            .unwrap()
-            .resources
-            .contexts
-            .iter()
-            .map(|(key, (ty, demand))| {
-                let claims = demand.claims(&available.contexts[key][0].parameters);
-                let selected = demand.retained_claim_indices(
-                    Some(node.0 as usize),
-                    available.contexts[key][0].parameters.crt_depth() - 1,
-                    |_| GpuScopeProgress::Issued(node.0 as usize),
-                );
-                (
-                    ty.clone(),
-                    selected
-                        .into_iter()
-                        .filter(|index| {
-                            !imported.get(key).is_some_and(|devices| {
-                                devices[0].iter().any(|(imported, _)| imported == index)
-                            })
-                        })
-                        .map(|index| claims[index])
-                        .collect(),
-                )
             })
             .collect();
         Ok(Some(GpuSelectedNode { node, plans, outputs, setup, inputs, imported, materialized }))
@@ -1683,10 +1676,100 @@ mod tests {
     use crate::dataflow::{ScopeAdmissionState, ValueStorage};
     use mxx_dsl::{DslContext, Family, Ring, parallel};
     use mxx_ir_core::{
+        artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        },
+        encoding,
         node::NodeKind,
-        types::{ConcreteWireType, Port},
+        types::{ConcreteMatrixType, ConcreteWireType, Port},
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_lazy_artifact_inputs_retire_after_single_scale_when_products_are_retained() {
+        let ring = Ring::new(257, 16);
+        let matrix =
+            ConcreteMatrixType { modulus: 257.into(), ring_dimension: 16, rows: 1, columns: 20 };
+        let production = ProductionId { spec_hash: SpecHash([41; 32]), execution_nonce: [42; 32] };
+        let manifest = Manifest {
+            ir_version: encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([
+                (
+                    "a".to_owned(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix.clone()),
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Public,
+                        content_hash: None,
+                        layout: None,
+                    },
+                ),
+                (
+                    "b".to_owned(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix.clone()),
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Public,
+                        content_hash: None,
+                        layout: None,
+                    },
+                ),
+            ]),
+        };
+        let a =
+            ring.artifact_input(production.clone(), "a", (1, 20), ArtifactConfidentiality::Public);
+        let b =
+            ring.artifact_input(production.clone(), "b", (1, 20), ArtifactConfidentiality::Public);
+        let graph = DslContext::new("lazy-artifact-input-retirement")
+            .output("a_product", 2 * a)
+            .unwrap()
+            .output("b_product", 3 * b)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let root = FrozenGraphScopeId::Root;
+        let optimizer = inventory_plan(&graph, false);
+        let liveness = owner_liveness(&graph, &root, &graph.bindings, &optimizer, false).unwrap();
+        let checked = graph.root_scope();
+        let source_scope = graph.source.scope(&root).unwrap();
+        let input_wires = checked
+            .execution_order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, handle)| {
+                matches!(handle.kind(), NodeKind::Input { artifact: Some(_), .. })
+                    .then_some((position, WireRef { node: NodeId(position as u64), port: Port(0) }))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(input_wires.len(), 2);
+        for wire in input_wires.into_iter().map(|entry| entry.1) {
+            let scale_position = checked
+                .execution_order
+                .iter()
+                .enumerate()
+                .find(|entry| {
+                    let handle = entry.1;
+                    matches!(handle.kind(), NodeKind::MatrixBinary(_)) &&
+                        source_scope
+                            .arguments(handle)
+                            .is_some_and(|arguments| arguments.contains(&wire))
+                })
+                .map(|entry| entry.0)
+                .expect("each artifact input has one scalar scale consumer");
+            assert_eq!(liveness.until(wire), Some(scale_position));
+            assert!(
+                liveness.output_end(wire.node.0 as usize, 0) > scale_position,
+                "the old child-input borrowing extension must not define root input retirement"
+            );
+        }
+    }
 
     #[test]
     fn test_gpu_retained_scopes_drop_dead_packed_members_and_preserve_aliases() {
@@ -1950,6 +2033,7 @@ mod tests {
         // allocation/dispatch is sealed while lowering and typed planning run.
         let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
         let mut matrix_counts = Vec::new();
+        let mut setup_counts = Vec::new();
         for id in [0, 1] {
             let inputs = BTreeMap::from([
                 (wires[0], first.clone()),
@@ -2126,8 +2210,11 @@ mod tests {
                     [GpuContextInventory { parameters: params.clone(), slots: slots.clone() }];
                 let capacity = super::GpuColumnContextInventory { contexts: &capacity };
                 let cap = columns.div_ceil(2);
-                let invocations =
-                    selected.fit(&admissions, cap, std::slice::from_ref(&capacity)).unwrap();
+                let (invocations, setup) = selected
+                    .fit_with_setup(&admissions, cap, std::slice::from_ref(&capacity))
+                    .unwrap();
+                assert!(!setup.is_empty(), "selected native resources must produce setup claims");
+                setup_counts.push(setup.iter().map(|entry| entry.1.len()).sum::<usize>());
                 assert_eq!(
                     invocations[0].plan.schedule.local_job_counts(),
                     &[columns.div_ceil(cap)]
@@ -2205,6 +2292,11 @@ mod tests {
             matrix_counts[1],
             matrix_counts[0] + 1,
             "equal-shaped independent inputs need one more normalization owner than a shared input"
+        );
+        assert_eq!(
+            setup_counts[1],
+            setup_counts[0] + 1,
+            "equal-shaped independent inputs need distinct setup claims"
         );
         // Negation preserves the artifact's payload format. Without reading
         // that payload, its returned format is unresolved and must stay unbound.

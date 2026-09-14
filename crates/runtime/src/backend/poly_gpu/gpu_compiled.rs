@@ -795,10 +795,24 @@ impl PreparedOperation {
             NodeKind::ModulusReduce { .. } => {
                 Some(Self::modulus_conversion(output()?, GpuMatrixModulusConversion::Reduce))
             }
-            NodeKind::CenteredExtend { .. } => Some(Self::modulus_conversion(
-                output()?,
-                GpuMatrixModulusConversion::CenteredExtend,
-            )),
+            NodeKind::CenteredExtend { .. } => {
+                let destination = output()?;
+                match arguments.first() {
+                    Some(
+                        ConcreteWireType::SmallMatrix { max_coefficient_bound, .. } |
+                        ConcreteWireType::Preimage { max_coefficient_bound, .. },
+                    ) => Some(Self::CenteredExtendCompact {
+                        destination,
+                        bound: max_coefficient_bound
+                            .to_biguint()
+                            .ok_or(PolyBackendError::InvalidInteger)?,
+                    }),
+                    _ => Some(Self::modulus_conversion(
+                        destination,
+                        GpuMatrixModulusConversion::CenteredExtend,
+                    )),
+                }
+            }
             NodeKind::BlockModSwitch { plaintext_modulus, .. } => {
                 let plaintext_modulus =
                     scalar(plaintext_modulus)?.to_u64().ok_or(PolyBackendError::InvalidInteger)?;
@@ -4353,6 +4367,55 @@ mod tests {
         poly::dcrt::params::DCRTPolyParams,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_ir_centered_extend_of_bounded_compact_value_uses_compact_operation() {
+        if mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().is_empty() {
+            return;
+        }
+        let high = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let low = high.select_modulus(&131_041u32.into()).unwrap();
+        let matrix = ConcreteMatrixType {
+            rows: 2,
+            columns: 1,
+            ring_dimension: 4,
+            modulus: BigInt::from(low.modulus().as_ref().clone()),
+        };
+        let destination = ConcreteMatrixType {
+            rows: 2,
+            columns: 1,
+            ring_dimension: 4,
+            modulus: BigInt::from(high.modulus().as_ref().clone()),
+        };
+        for source in [
+            ConcreteWireType::Preimage {
+                matrix: matrix.clone(),
+                max_coefficient_bound: BigInt::from(32_768u32),
+            },
+            ConcreteWireType::SmallMatrix {
+                matrix,
+                max_coefficient_bound: BigInt::from(32_768u32),
+            },
+        ] {
+            let operation = PreparedOperation::from_ir(
+                &NodeKind::CenteredExtend { modulus: destination.modulus.clone().into() },
+                std::slice::from_ref(&source),
+                &[ConcreteWireType::Matrix(destination.clone())],
+                &ParamEnv::default(),
+                &high,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                operation,
+                PreparedOperation::CenteredExtendCompact {
+                    destination: destination.clone(),
+                    bound: 32_768u32.into()
+                }
+            );
+        }
+    }
 
     #[test]
     #[serial_test::serial(gpu_context)]

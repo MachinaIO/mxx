@@ -207,9 +207,30 @@ impl GpuNodeMeasurementBackend {
         };
         let backend = self.prepared_backend.as_mut().expect("explicitly prepared fleet");
         let prepared = Self::prepare_batch(backend, request, &representative, batch)?;
+        let plans = batch.plans.as_ref().unwrap();
         backend
             .prepare_measurement_storage(claims)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
+            .map_err(|error| {
+                let setup_claim_counts = claims
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (ty, setup))| format!("type_{index}={ty:?}:{}", setup.len()))
+                    .collect::<Vec<_>>();
+                let nonzero_plan_summaries = plans
+                    .iter()
+                    .enumerate()
+                    .filter(|entry| entry.1.rows != 0 && entry.1.columns != 0)
+                    .map(|(index, plan)| format!("{index}:{}x{}", plan.rows, plan.columns))
+                    .collect::<Vec<_>>();
+                GpuMeasurementError(format!(
+                    "prepare_measurement_storage failed scope={:?} id={:?} kind={:?} setup_empty={} setup_claim_counts={setup_claim_counts:?} plan_count={} nonzero_plans={nonzero_plan_summaries:?}: {error}",
+                    request.scope,
+                    request.id,
+                    request.kind,
+                    claims.is_empty(),
+                    plans.len(),
+                ))
+            })?;
         let matrices = prepared
             .iter()
             .map(|member| {
@@ -277,7 +298,13 @@ impl GpuNodeMeasurementBackend {
             })));
             let result = (|| {
                 backend
-                    .admit_measurement_node(node, &matrices, &compact, batch.column_cap)
+                    .admit_measurement_node(
+                        node,
+                        &matrices,
+                        &compact,
+                        batch.column_cap,
+                        batch.plans.as_deref(),
+                    )
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
                 let outputs =
                     Self::run_node(backend, &measurement_node, &request.bindings, &prepared, None)?;
@@ -285,7 +312,16 @@ impl GpuNodeMeasurementBackend {
                 Ok::<_, GpuMeasurementError>(())
             })();
             backend.set_admitted_measurement_sink(None);
-            result?;
+            result.map_err(|error| {
+                GpuMeasurementError(format!(
+                    "native measurement admit/run failed scope={:?} id={:?} kind={:?} siblings={} plan_count={}: {error}",
+                    request.scope,
+                    request.id,
+                    request.kind,
+                    prepared.len(),
+                    batch.plans.as_ref().map_or(0, Vec::len),
+                ))
+            })?;
             let (mut observed, wave_latency, schedules) =
                 Arc::try_unwrap(state).unwrap().into_inner().unwrap();
             let selected = batch
@@ -297,8 +333,8 @@ impl GpuNodeMeasurementBackend {
                 .collect::<Vec<_>>();
             if schedules != selected {
                 return Err(GpuMeasurementError(format!(
-                    "native measured schedules differ from selected class at {:?} {:?}: native={schedules:?}, selected={selected:?}",
-                    request.scope, request.id
+                    "native measured schedules differ from selected class at {:?} {:?} kind {:?}: native={schedules:?}, selected={selected:?}",
+                    request.scope, request.id, request.kind
                 )));
             }
             if iteration < self.harness.warm_up_iterations {

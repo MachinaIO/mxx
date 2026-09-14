@@ -580,7 +580,20 @@ impl GpuContextDemand {
         let mut shared_matrices = HashMap::new();
         let mut workspaces = Vec::<WorkspaceDemand>::new();
         let mut shared_workspaces = HashMap::new();
+        let mut alternative_first_demands = HashMap::<(usize, usize), MatrixDemand>::new();
+        let mut alternative_extra_demands = Vec::<(usize, usize, MatrixDemand)>::new();
         for (source_instance, instance) in instances.into_iter().enumerate() {
+            // Untyped alternatives have no branch claim table. Their only
+            // marker is two overlapping demands mapped to one local capacity.
+            let has_alternative_capacity = !instance.matrix_alternative_claims.is_empty() ||
+                instance.matrix_demands.iter().enumerate().any(|(index, demand)| {
+                    instance.matrix_demands[..index].iter().any(|previous| {
+                        previous.capacity_slot == demand.capacity_slot &&
+                            previous.begin <= demand.end &&
+                            demand.begin <= previous.end
+                    })
+                });
+            let mut alternative_matrices = HashMap::<usize, usize>::new();
             let offset = merged.instance_count;
             merged.instance_count += instance.instance_count.max(1);
             if instance.aliases.is_empty() {
@@ -616,8 +629,29 @@ impl GpuContextDemand {
                         continue;
                     }
                 }
+                if has_alternative_capacity {
+                    let index =
+                        *alternative_matrices.entry(matrix.capacity_slot).or_insert(matrices.len());
+                    if let Some((_, _, _, previous)) = matrices.get_mut(index) {
+                        alternative_extra_demands.push((
+                            source_instance,
+                            source_demand,
+                            matrix.clone(),
+                        ));
+                        previous.rows = previous.rows.max(matrix.rows);
+                        previous.columns = previous.columns.max(matrix.columns);
+                        previous.begin = previous.begin.min(matrix.begin);
+                        previous.end = previous.end.max(matrix.end);
+                        source_demand_maps[source_instance][source_demand] = Some(index);
+                        continue;
+                    }
+                }
                 let index = matrices.len();
                 source_demand_maps[source_instance][source_demand] = Some(index);
+                if has_alternative_capacity {
+                    alternative_first_demands
+                        .insert((source_instance, matrix.capacity_slot), matrix.clone());
+                }
                 matrices.push((index, source_instance, source_demand, matrix));
             }
             let mut ordinals = HashMap::new();
@@ -660,7 +694,7 @@ impl GpuContextDemand {
                 ))
         });
         let mut pre_to_merged = vec![usize::MAX; matrices.len()];
-        for (pre_slot, _, _, matrix) in matrices {
+        for (pre_slot, source_instance, _, matrix) in matrices {
             let claim = matrix.claim;
             merged.matrix(matrix.begin, matrix.end, matrix.rows, matrix.columns);
             // Another enclosing sibling merge must still recognize this exact
@@ -671,12 +705,25 @@ impl GpuContextDemand {
             retained.origins = matrix.origins;
             retained.owners = matrix.owners;
             retained.claim = claim;
+            if let Some(original) =
+                alternative_first_demands.get(&(source_instance, matrix.capacity_slot))
+            {
+                let capacity_slot = retained.capacity_slot;
+                *retained = original.clone();
+                retained.capacity_slot = capacity_slot;
+            }
             pre_to_merged[pre_slot] = retained.capacity_slot;
         }
         for source_map in &mut source_demand_maps {
             for slot in source_map {
                 *slot = slot.map(|pre_slot| pre_to_merged[pre_slot]);
             }
+        }
+        for (source_instance, source_demand, mut demand) in alternative_extra_demands {
+            let slot = source_demand_maps[source_instance][source_demand]
+                .expect("alternative matrix demand must have a merged capacity slot");
+            demand.capacity_slot = slot;
+            merged.matrix_demands.push(demand);
         }
         let mut direct_claim_counts = HashMap::<TracedClaimKey, usize>::new();
         for (source_instance, claims) in source_claims.iter().enumerate() {
@@ -923,6 +970,21 @@ impl GpuContextDemand {
             }
         }
         self.matrix_alternative_claims = alternatives;
+    }
+
+    /// Add one locally enveloped alternative group to the existing timeline.
+    /// The group alternatives are mutually exclusive with each other, but all
+    /// resources already present in this demand remain simultaneous with it.
+    fn append_alternative_group(&mut self, group: Self) {
+        if group.matrices.is_empty() && group.layouts.is_empty() {
+            return;
+        }
+        if self.matrices.is_empty() && self.layouts.is_empty() {
+            *self = group;
+            return;
+        }
+        let existing = std::mem::take(self);
+        *self = Self::simultaneous([existing, group]);
     }
 
     fn matrix_claim_branches(&self) -> Vec<Vec<(usize, GpuTracedClaim)>> {
@@ -1321,6 +1383,18 @@ impl GpuContextDemand {
     /// reservation. This neither allocates backing nor acquires native leases.
     pub fn claims(&self, params: &GpuDCRTPolyParams) -> Vec<GpuTracedClaim> {
         self.claim_projection(params.crt_depth() - 1).claims
+    }
+
+    /// Shared native workspaces are allocated by the sibling batch rather than
+    /// by an individual matrix invocation. Preserve one claim for each merged
+    /// shared capacity slot when rebuilding a measurement class.
+    pub fn shared_workspace_claims(&self) -> Vec<GpuTracedClaim> {
+        let mut slots = std::collections::BTreeSet::new();
+        self.workspace_demands
+            .iter()
+            .filter(|demand| demand.shared && slots.insert(demand.capacity_slot))
+            .map(|demand| GpuTracedClaim::workspace(self.layouts[demand.capacity_slot]))
+            .collect()
     }
 
     fn missing(
@@ -2798,15 +2872,22 @@ impl GpuDcrtBackend {
             |demand: &mut BTreeMap<_, (ConcreteMatrixType, GpuContextDemand)>,
              ty: &ConcreteMatrixType,
              alternatives: &[Vec<GpuTracedClaim>]| {
+                let mut groups = BTreeMap::new();
                 for claims in alternatives {
                     let mut alternative = BTreeMap::new();
                     push_traced(&mut alternative, ty, claims, &add_typed_matrix, &add_layouts);
                     for (key, (alternative_ty, alternative_demand)) in alternative {
-                        let entry = demand.entry(key).or_insert_with(|| {
+                        let entry = groups.entry(key).or_insert_with(|| {
                             (alternative_ty.clone(), GpuContextDemand::default())
                         });
                         entry.1.include_alternative(alternative_demand);
                     }
+                }
+                for (key, (alternative_ty, alternative_demand)) in groups {
+                    let entry = demand
+                        .entry(key)
+                        .or_insert_with(|| (alternative_ty.clone(), GpuContextDemand::default()));
+                    entry.1.append_alternative_group(alternative_demand);
                 }
             };
         let parameters =
@@ -2861,6 +2942,13 @@ impl GpuDcrtBackend {
                     }
                     Some(PreparedOperation::MultiplyCompact { .. }) => vec![1],
                     Some(PreparedOperation::Slice { .. }) => vec![0],
+                    _ if matches!(
+                        kind,
+                        NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+                    ) =>
+                    {
+                        vec![0]
+                    }
                     None if matches!(
                         kind,
                         NodeKind::Input { .. } |
@@ -2975,6 +3063,47 @@ impl GpuDcrtBackend {
                         arguments.iter().any(|wire| {
                             column_layouts.get(wire).is_some_and(|source| source.packed_family)
                         }));
+                if matches!(output, ConcreteWireType::Matrix(_)) {
+                    let backend = &self.devices[0].1;
+                    if let Some(prepared) = prepared {
+                        let level_sources = match prepared {
+                            PreparedOperation::Transpose | PreparedOperation::Tensor { .. } => {
+                                vec![0]
+                            }
+                            _ => source_indices.clone(),
+                        };
+                        for index in level_sources {
+                            let Some(input_ty) = argument_types[index].matrix_type() else {
+                                continue;
+                            };
+                            let input_params = backend.parameters(input_ty)?;
+                            for level in source_levels(
+                                column_layouts.get(&arguments[index]),
+                                input_params.crt_depth() - 1,
+                            ) {
+                                for evaluation in [false, true] {
+                                    let output_layout = prepared.output_layout(
+                                        backend,
+                                        input_params,
+                                        level,
+                                        prepared.input_evaluation(evaluation),
+                                    )?;
+                                    layout.possible_levels.push(output_layout.1);
+                                }
+                            }
+                        }
+                    } else if matches!(
+                        kind,
+                        NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic
+                    ) {
+                        layout.possible_levels.extend(source_levels(
+                            column_layouts.get(&arguments[0]),
+                            parameters(self, ty)?.crt_depth() - 1,
+                        ));
+                    }
+                    layout.possible_levels.sort_unstable();
+                    layout.possible_levels.dedup();
+                }
                 // Exact inherited placement uses the same ordered source-range
                 // selection as native preflight. Each fragment retains its own
                 // device/context and format, including mixed-format inputs.
@@ -3594,11 +3723,44 @@ impl GpuDcrtBackend {
                 *owners.borrow_mut() = vec![(WireRef { node: id, port: Port(port as u32) }, path)];
                 match output {
                     ConcreteWireType::Matrix(ty) => {
-                        for &columns in &column_layouts
-                            [&WireRef { node: id, port: Port(port as u32) }]
-                            .capacities
-                        {
-                            add_matrix(&mut demand, ty, ty.rows, columns);
+                        let layout =
+                            &column_layouts[&WireRef { node: id, port: Port(port as u32) }];
+                        let full_level = parameters(self, ty)?.crt_depth() - 1;
+                        let possible_levels = source_levels(Some(layout), full_level);
+                        if possible_levels.iter().any(|level| *level != full_level) {
+                            let formats = layout
+                                .fragments
+                                .as_deref()
+                                .into_iter()
+                                .flatten()
+                                .map(|fragment| fragment.evaluation)
+                                .collect::<std::collections::BTreeSet<_>>();
+                            let formats = if formats.is_empty() {
+                                vec![false, true]
+                            } else {
+                                formats.into_iter().collect()
+                            };
+                            let mut alternatives = Vec::new();
+                            for level in possible_levels {
+                                for &evaluation in &formats {
+                                    alternatives.push(
+                                        layout
+                                            .capacities
+                                            .iter()
+                                            .map(|&columns| {
+                                                GpuTracedClaim::matrix(
+                                                    ty.rows, columns, level, evaluation,
+                                                )
+                                            })
+                                            .collect(),
+                                    );
+                                }
+                            }
+                            add_claim_alternatives(&mut demand, ty, &alternatives);
+                        } else {
+                            for &columns in &layout.capacities {
+                                add_matrix(&mut demand, ty, ty.rows, columns);
+                            }
                         }
                     }
                     ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. } => {
@@ -3783,8 +3945,44 @@ impl GpuDcrtBackend {
                 if let Some(operation) = &prepared {
                     let level = params.crt_depth() - 1;
                     let columns = ty.columns.min(scratch_columns);
-                    for rows in operation.scratch_rows()? {
-                        add_matrix(&mut demand, ty, rows, columns);
+                    let scratch_rows = operation.scratch_rows()?;
+                    let output_layout = column_layouts.get(&WireRef { node: id, port: Port(0) });
+                    let possible_levels = source_levels(output_layout, level);
+                    if possible_levels.iter().any(|possible| *possible != level) {
+                        let formats = output_layout
+                            .and_then(|layout| layout.fragments.as_deref())
+                            .into_iter()
+                            .flatten()
+                            .map(|fragment| fragment.evaluation)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let formats = if formats.is_empty() {
+                            vec![false, true]
+                        } else {
+                            formats.into_iter().collect()
+                        };
+                        let mut alternatives = Vec::new();
+                        for possible_level in possible_levels {
+                            for &evaluation in &formats {
+                                alternatives.push(
+                                    scratch_rows
+                                        .iter()
+                                        .map(|&rows| {
+                                            GpuTracedClaim::matrix(
+                                                rows,
+                                                columns,
+                                                possible_level,
+                                                evaluation,
+                                            )
+                                        })
+                                        .collect(),
+                                );
+                            }
+                        }
+                        add_claim_alternatives(&mut demand, ty, &alternatives);
+                    } else {
+                        for rows in scratch_rows {
+                            add_matrix(&mut demand, ty, rows, columns);
+                        }
                     }
                     add_layouts(&mut demand, ty, operation.fixed_workspaces(&params, level)?);
                     let workspaces = operation.width_workspaces(&params, level, columns)?;
@@ -4130,8 +4328,7 @@ impl GpuDcrtBackend {
 mod tests {
     #[test]
     fn test_inventory_alternative_layout_preserves_all_source_levels() {
-        use super::{GpuInventoryValue, source_levels};
-        use super::super::gpu_prepare::MatrixInputFragment;
+        use super::{super::gpu_prepare::MatrixInputFragment, GpuInventoryValue, source_levels};
 
         let layout = |level, evaluation| {
             let mut value = GpuInventoryValue::new(vec![0, 1]);
@@ -4153,6 +4350,71 @@ mod tests {
 
         assert!(alternatives.fragments.is_none());
         assert_eq!(source_levels(Some(&alternatives), 3), vec![1, 2]);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_selected_levels_survive_negate_and_readback() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let context = DslContext::new("selected-level-negate-readback");
+        let choice = context.int_family_input("choice", 1).at(0);
+        let selected = ring.input_family("members", 2, (1, 1)).at(choice.clone());
+        let factor = ring.input_family("factor", 2, (1, 1)).at(choice);
+        let graph = context
+            .output("coefficient", (-selected).transpose().tensor(factor).extract_coefficient(0))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let members = [0, params.crt_depth() - 1]
+            .into_iter()
+            .map(|level| {
+                RuntimeValue::matrix(
+                    GpuDCRTPolyMatrix::new_zero_with_state(&params, 1, 1, level, true).into(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        for choice in [0, 1] {
+            let inputs = BTreeMap::from([
+                ("members".into(), RuntimeValue::IndexedFamily(members.clone())),
+                (
+                    "choice".into(),
+                    RuntimeValue::IndexedFamily(vec![RuntimeValue::Int(choice.into())]),
+                ),
+                ("factor".into(), RuntimeValue::IndexedFamily(members.clone())),
+            ]);
+            drop(backend.prepare_graph_admission(&graph, false, &inputs, 1, true).unwrap());
+            let result = execute_with_config(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+            )
+            .unwrap();
+            assert!(matches!(
+                result.outputs["coefficient"],
+                RuntimeValue::Int(ref value) if value == &num_bigint::BigInt::from(0)
+            ));
+        }
     }
 
     #[test]
@@ -4183,6 +4445,16 @@ mod tests {
         {
             let indices =
                 coefficient.value_claim_indices(0, wire, &[], 3, GpuScopeProgress::Before(1));
+            assert_eq!(indices.len(), 1);
+            let claim = projection.claims[*indices.first().unwrap()];
+            assert_eq!(claim.level(), Some(level));
+            assert_eq!(claim.is_evaluation(), Some(evaluation));
+        }
+        let merged = GpuContextDemand::simultaneous([coefficient]);
+        let projection = merged.claim_projection(3);
+        for (wire, level, evaluation) in [(coefficient_wire, 1, false), (evaluation_wire, 2, true)]
+        {
+            let indices = merged.value_claim_indices(0, wire, &[], 3, GpuScopeProgress::Before(1));
             assert_eq!(indices.len(), 1);
             let claim = projection.claims[*indices.first().unwrap()];
             assert_eq!(claim.level(), Some(level));
@@ -4236,6 +4508,48 @@ mod tests {
                 (projection.claims[*index].level(), projection.claims[*index].is_evaluation()),
                 (Some(1), Some(false)) | (Some(2), Some(true))
             )
+        }));
+    }
+
+    #[test]
+    fn test_alternative_groups_compose_additively() {
+        use super::{GpuContextDemand, GpuTracedClaim};
+
+        let mut first_output = GpuContextDemand::default();
+        first_output.matrix_claim(0, 2, GpuTracedClaim::matrix(1, 1, 1, false));
+        let mut first_output_full = GpuContextDemand::default();
+        first_output_full.matrix_claim(0, 2, GpuTracedClaim::matrix(1, 1, 3, true));
+        first_output.include_alternative(first_output_full);
+
+        let mut second_output = GpuContextDemand::default();
+        second_output.matrix_claim(0, 2, GpuTracedClaim::matrix(1, 1, 1, false));
+        let mut second_output_full = GpuContextDemand::default();
+        second_output_full.matrix_claim(0, 2, GpuTracedClaim::matrix(1, 1, 3, true));
+        second_output.include_alternative(second_output_full);
+
+        first_output.append_alternative_group(second_output);
+        let claims = first_output.matrix_claim_envelope();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|claim| claim.level() == Some(1) && claim.is_evaluation() == Some(false))
+                .count(),
+            2,
+            "simultaneous lower-level outputs must retain two exact slots"
+        );
+
+        let mut scratch = GpuContextDemand::default();
+        scratch.matrix_claim(0, 2, GpuTracedClaim::matrix(2, 1, 1, false));
+        let mut scratch_full = GpuContextDemand::default();
+        scratch_full.matrix_claim(0, 2, GpuTracedClaim::matrix(2, 1, 3, true));
+        scratch.include_alternative(scratch_full);
+        first_output.append_alternative_group(scratch);
+        let claims = first_output.matrix_claim_envelope();
+        assert!(claims.iter().any(|claim| {
+            claim.rows() == 1 && claim.level() == Some(1) && claim.is_evaluation() == Some(false)
+        }));
+        assert!(claims.iter().any(|claim| {
+            claim.rows() == 2 && claim.level() == Some(1) && claim.is_evaluation() == Some(false)
         }));
     }
 
@@ -4318,13 +4632,16 @@ mod tests {
         }));
         let retained_indices =
             coefficient.retained_claim_indices(None, 3, |_| GpuScopeProgress::Before(1));
-        assert_eq!(retained_indices.len(), 1);
-        assert!(retained_indices.iter().all(|index| {
-            matches!(
-                (projection.claims[*index].level(), projection.claims[*index].is_evaluation()),
-                (Some(1), Some(false)) | (Some(2), Some(true))
-            )
-        }));
+        assert_eq!(retained_indices.len(), 2);
+        assert_eq!(
+            retained_indices
+                .iter()
+                .map(|index| {
+                    (projection.claims[*index].level(), projection.claims[*index].is_evaluation())
+                })
+                .collect::<std::collections::BTreeSet<_>>(),
+            [(Some(1), Some(false)), (Some(2), Some(true))].into_iter().collect()
+        );
 
         let mut ordinary = GpuContextDemand::default();
         ordinary.matrix(0, 2, 1, 1);
@@ -5034,10 +5351,13 @@ mod tests {
         );
         let mut escaping = phase(0, usize::MAX);
         escaping.include_alternative(phase(0, 0));
+        assert_eq!(escaping.matrix_demands.len(), 4);
+        let merged = GpuContextDemand::simultaneous([escaping, phase(1, 1)]);
+        assert_eq!(merged.matrices.len(), 4, "an unresolved alternative preserves escaping owners");
         assert_eq!(
-            GpuContextDemand::simultaneous([escaping, phase(1, 1)]).matrices.len(),
-            4,
-            "an unresolved alternative preserves escaping owners"
+            merged.matrix_demands.len(),
+            6,
+            "each alternative owner remains represented after capacity sharing"
         );
     }
 
@@ -5090,6 +5410,9 @@ mod tests {
     #[test]
     fn test_simultaneous_workspace_demand_matches_live_intervals() {
         use super::{GpuContextDemand, event};
+        use mxx_primitives::matrix::gpu_dcrt_poly::{
+            GpuPreparedSlotKind, GpuPreparedWorkspaceLayout,
+        };
         let intervals = [(0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)];
         // An independent occupancy oracle: count all inclusive live intervals
         // at each IR position, rather than reproducing slot reuse or matching.
@@ -5122,13 +5445,31 @@ mod tests {
             }
         }
         let mut shared = GpuContextDemand::default();
-        shared.workspace(0, 0, event(), true);
-        shared.workspace(0, 0, event(), true);
-        shared.workspace(1, 1, event(), true);
+        let batch_workspace = GpuPreparedWorkspaceLayout {
+            kind: GpuPreparedSlotKind::BatchWorkspace,
+            bytes: 64,
+            alignment: 8,
+        };
+        shared.workspace(0, 0, batch_workspace, true);
+        shared.workspace(0, 0, batch_workspace, true);
+        shared.workspace(1, 1, batch_workspace, true);
         assert_eq!(
-            GpuContextDemand::simultaneous([shared.clone(), shared]).layouts.len(),
+            GpuContextDemand::simultaneous([shared.clone(), shared.clone()]).layouts.len(),
             2,
             "distinct shared batch claims must not collapse within a body"
+        );
+        assert_eq!(
+            GpuContextDemand::simultaneous([shared.clone(), shared.clone()])
+                .shared_workspace_claims()
+                .len(),
+            2,
+            "shared setup extraction preserves both simultaneous workspace slots"
+        );
+        assert!(
+            GpuContextDemand::simultaneous([shared.clone(), shared])
+                .shared_workspace_claims()
+                .iter()
+                .all(|claim| claim.kind() == GpuPreparedSlotKind::BatchWorkspace)
         );
         let mut resolved = GpuContextDemand::default();
         resolved.workspace(1, 1, event(), false);

@@ -2717,6 +2717,25 @@ impl GpuDcrtBackend {
                     if !column_layouts.get(&wire).is_some_and(|layout| layout.lazy) &&
                         !matches!(ty, ConcreteWireType::IndexedFamily { .. })
                     {
+                        if matches!(kind, NodeKind::Input { .. }) &&
+                            column_layouts.get(&wire).is_some_and(|layout| !layout.borrowed)
+                        {
+                            // Placement creates this owner before body entry.
+                            // Charge it separately from the import's temporary
+                            // resources, even when lowering omits the Input node.
+                            until.set(retained_until(port));
+                            *owners.borrow_mut() = vec![(wire, Vec::new())];
+                            if let ConcreteWireType::Matrix(ty) = ty {
+                                add_matrix(&mut demand, ty, ty.rows, ty.columns);
+                            } else if let Some((ty, bound)) = bound_of(ty) {
+                                let params = parameters(self, ty)?;
+                                add_layouts(
+                                    &mut demand,
+                                    ty,
+                                    vec![compact_payload(&params, ty.rows, ty.columns, &bound)?],
+                                );
+                            }
+                        }
                         imports.extend(family_leaves(ty).map(|(_, leaf)| leaf.clone()));
                     }
                 }
@@ -3009,14 +3028,17 @@ impl GpuDcrtBackend {
             {
                 continue;
             }
-            // Retained outputs.
+            // Retained operation outputs. Placement-created Input owners were
+            // charged above together with their import, and must not be counted twice.
             for (port, path, output) in output_types
                 .iter()
                 .enumerate()
                 .flat_map(|(port, ty)| {
                     family_leaves(ty).map(move |(path, leaf)| (port, path, leaf))
                 })
-                .filter(|_| !optimizer.omitted.contains(&id))
+                .filter(|_| {
+                    !matches!(kind, NodeKind::Input { .. }) && !optimizer.omitted.contains(&id)
+                })
                 .filter(|(port, _, _)| {
                     !column_layouts
                         .get(&WireRef { node: id, port: Port(*port as u32) })
@@ -4902,6 +4924,87 @@ mod tests {
                     .any(|layout| layout.kind == GpuPreparedSlotKind::PinnedHost)),
                 "materialization still requires native import staging"
             );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_zip_staging_inputs_are_owned_before_body_execution() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(5)
+            .max(3);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 1,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let original =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 2, 1, DistType::FinRingDist);
+        let matrix = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original);
+        let expected = matrix.to_compact_bytes();
+        let bytes = std::sync::Arc::new(matrix.into_cpu_staging_bytes());
+        let input = ring.input_family("inputs", count, (2, 1));
+        let output = mxx_dsl::parallel(count, |i| Ok(input.at(i))).unwrap();
+        let graph = DslContext::new("zip-staging-owner-lifetime")
+            .output("result", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let inputs = BTreeMap::from([(
+            "inputs".into(),
+            RuntimeValue::IndexedFamily(
+                (0..count)
+                    .map(|_| RuntimeValue::HostMatrix {
+                        matrix_type: ty.clone(),
+                        bytes: bytes.clone(),
+                    })
+                    .collect(),
+            ),
+        )]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        drop(backend.prepare_graph_admission(&graph, false, &inputs, 2, true).unwrap());
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: std::num::NonZeroUsize::new(2).unwrap(),
+                ..ExecutionConfig::default()
+            },
+        )
+        .unwrap();
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("result", &mut backend, &mut store).unwrap()
+        else {
+            panic!("family")
+        };
+        assert_eq!(members.len(), count);
+        for member in members {
+            let RuntimeValue::Matrix(matrix) = member else { panic!("matrix") };
+            assert_eq!(backend.matrix_to_bytes(matrix).unwrap(), expected);
         }
     }
 

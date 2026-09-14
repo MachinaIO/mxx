@@ -36,7 +36,8 @@ use std::collections::BTreeMap;
 
 /// Possible source boundaries and a descending list of containing owner widths.
 /// Capacities are not execution intervals. For alternative family layouts, rank
-/// k contains the kth largest fragment of every possible selected member.
+/// k contains the kth largest per-device fragment of every possible selected
+/// member; without placement metadata the global fragment list is the bound.
 #[derive(Clone, Default)]
 pub struct GpuInventoryValue {
     pub cuts: Vec<usize>,
@@ -6723,6 +6724,22 @@ mod tests {
                         }
                     }
                     if !profile {
+                        // Prepared pinned backing is allocated during setup and
+                        // remains owned by the ledger throughout execution.
+                        // Independent high-water marks give an upper bound,
+                        // not a simultaneously observed sum across devices.
+                        let pinned = backend
+                            .prepared_ledger
+                            .as_ref()
+                            .unwrap()
+                            .prepared_inventory()
+                            .map(|(_, storage)| storage.occupancy().unwrap())
+                            .fold((0usize, 0usize), |(capacity, high_water), occupancy| {
+                                (
+                                    capacity + occupancy.pinned_capacity_bytes(),
+                                    high_water + occupancy.pinned_high_water_bytes(),
+                                )
+                            });
                         println!(
                             "PERF_RESULT {}",
                             serde_json::json!({
@@ -6736,6 +6753,8 @@ mod tests {
                                 "canonical_output_bytes": canonical.iter().map(Vec::len).sum::<usize>(),
                                 "lazy_input_payload_bytes": if case == "lazy_checkpoint" { input_bytes.len() } else { 0 },
                                 "lazy_input_loads": store.load_count(&key),
+                                "prepared_pinned_backing_bytes": pinned.0,
+                                "prepared_pinned_used_peak_upper_bound_bytes": pinned.1,
                                 "host_staging_peak_bytes": null, "cuda_kernel_launches": null,
                                 "total_dma_bytes": null,
                             })

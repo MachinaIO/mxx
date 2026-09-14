@@ -76,6 +76,25 @@ impl GpuInventoryValue {
         }
     }
 
+    // Demands are replicated per device. Preserve global cuts for execution,
+    // but bound simultaneous retained fragments on one device, not the sum
+    // of fragments already distributed over different devices.
+    fn bound_fragment_capacities(&mut self) {
+        let Some(fragments) = &self.fragments else { return };
+        let mut devices = BTreeMap::<i32, Vec<usize>>::new();
+        for fragment in fragments.iter() {
+            devices.entry(fragment.device).or_default().push(fragment.end - fragment.start);
+        }
+        self.capacities.clear();
+        for widths in devices.values_mut() {
+            widths.sort_unstable_by(|a, b| b.cmp(a));
+            self.capacities.resize(self.capacities.len().max(widths.len()), 0);
+            for (capacity, width) in self.capacities.iter_mut().zip(widths) {
+                *capacity = (*capacity).max(*width);
+            }
+        }
+    }
+
     /// Fold a containing member/selection envelope without equating distinct
     /// identities. The caller supplies complete, valid layout metadata.
     pub fn include_alternative(&mut self, other: Self) {
@@ -165,6 +184,7 @@ impl GpuInventoryValue {
                 RuntimeValue::LazyArtifactFamily { .. } |
                 RuntimeValue::StagedArtifactFamily { .. }
         );
+        layout.bound_fragment_capacities();
         self.include_alternative(layout);
     }
 }
@@ -1889,20 +1909,6 @@ impl GpuDcrtBackend {
                                 let assignments =
                                     GpuPreparedSlotSnapshot::assign(params, &slots, claims)
                                         .map_err(PolyBackendError::GpuSubmission)?;
-                                #[cfg(test)]
-                                if wave == 1 && cap == 1 && assignments.iter().any(Option::is_none)
-                                {
-                                    eprintln!(
-                                        "minimum wave device {device} claims: {claims:?} slots: {slots:?} unmatched claims: {:?}",
-                                        claims
-                                            .iter()
-                                            .zip(&assignments)
-                                            .filter_map(|(claim, assignment)| assignment
-                                                .is_none()
-                                                .then_some(claim))
-                                            .collect::<Vec<_>>()
-                                    );
-                                }
                                 let Some(assignment) =
                                     assignments.into_iter().collect::<Option<Vec<_>>>()
                                 else {
@@ -2588,6 +2594,7 @@ impl GpuDcrtBackend {
                         evaluation: true,
                     }]));
                 }
+                layout.bound_fragment_capacities();
                 column_layouts.insert(wire, layout);
             }
             // Inputs already on the device keep their native owners.

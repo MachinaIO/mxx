@@ -177,6 +177,11 @@ impl GpuInventoryValue {
             layout.owner = Some(matrix.id);
             layout.fragments = Some(matrix.input_layout.clone());
         }
+        if let RuntimeValue::SmallMatrix(matrix) = value {
+            let descriptor = super::gpu_prepare::MatrixDescriptor::from(matrix.as_ref());
+            layout.owner = Some(descriptor.id);
+            layout.fragments = Some(descriptor.input_layout);
+        }
         layout.lazy = matches!(
             value,
             RuntimeValue::LazyArtifact { .. } |
@@ -1798,6 +1803,17 @@ impl GpuDcrtBackend {
                             layout.borrowed = true;
                             layout.lazy = false;
                         }
+                        // Zip members are materialized by loop_child_inputs before
+                        // any child node executes, including staged descriptors.
+                        if matches!(
+                            request.input_modes()[index],
+                            LoopInputMode::Zip | LoopInputMode::ZipOffset { .. }
+                        ) && metadata.outputs()[input.wire.port.0 as usize]
+                            .matrix_type()
+                            .is_some()
+                        {
+                            layout.lazy = false;
+                        }
                         columns.insert(input.wire, layout);
                     }
                 }
@@ -2305,6 +2321,12 @@ impl GpuDcrtBackend {
             let argument_types = operation.arguments();
             let output_types = operation.outputs();
             let kind = handle.kind();
+            // The executor prepares all loop inputs before running any body
+            // node. Their owners and import scratch overlap even when the IR
+            // declares an input after another input's final consumer.
+            if matches!(kind, NodeKind::Input { .. }) {
+                position.set(0);
+            }
             // Stored fragments survive column-wise operations. Each interval
             // needs its own retained destination, even on the same device.
             for (port, output) in output_types.iter().enumerate() {
@@ -4880,6 +4902,213 @@ mod tests {
                     .any(|layout| layout.kind == GpuPreparedSlotKind::PinnedHost)),
                 "materialization still requires native import staging"
             );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_zip_compact_inputs_are_owned_before_body_execution() {
+        use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, ConcreteBoundedMatrixSchema, Manifest,
+            ManifestArtifact, ProductionId, SmallMatrixSemanticKind, SpecHash,
+        };
+        use mxx_primitives::matrix::{
+            PolyMatrixSmallRhs, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix,
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let count = 3usize;
+        let owners = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(5)
+            .max(5);
+        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        crate::backend::poly_gpu::wait_for_gpu_test_context_quiescence(device);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: ConcreteMatrixType {
+                rows: 2,
+                columns: 1,
+                ring_dimension: n as usize,
+                modulus: params.modulus().as_ref().clone().into(),
+            },
+            max_coefficient_bound: 7.into(),
+        };
+        let left_cpu =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 1, 2, DistType::FinRingDist);
+        let left_gpu = GpuDCRTPolyMatrix::from_cpu_matrix(&params, &left_cpu);
+        let payload =
+            (0..2 * n as usize).flat_map(|_| [1, rand::random::<u8>() % 7 + 1]).collect::<Vec<_>>();
+        let compact =
+            GpuSmallMatrix::from_canonical_coefficients(&params, 2, 1, 7u32.into(), &payload)
+                .unwrap();
+        let product = left_gpu.multiply_small_rhs(&compact).unwrap();
+        let expected =
+            (1..owners).fold(product.clone(), |sum, _| sum + product.clone()).to_compact_bytes();
+        let compact = super::super::GpuFleetSmallMatrix::from(compact);
+        let mut metadata = super::GpuInventoryValue::default();
+        metadata.include_input(&RuntimeValue::small_matrix(compact.clone()), 1);
+        assert!(metadata.owner.is_some());
+        assert_eq!(metadata.fragments.as_ref().unwrap().len(), 1);
+        for preimage in [false, true] {
+            let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+            let kind = if preimage {
+                SmallMatrixSemanticKind::Preimage
+            } else {
+                SmallMatrixSemanticKind::Generic
+            };
+            let bytes = backend.small_matrix_to_bytes(&compact, &schema, kind).unwrap();
+            let artifact_type = if preimage {
+                ArtifactType::Preimage {
+                    matrix: schema.matrix.clone(),
+                    max_coefficient_bound: 7.into(),
+                }
+            } else {
+                ArtifactType::SmallMatrix {
+                    matrix: schema.matrix.clone(),
+                    max_coefficient_bound: 7.into(),
+                }
+            };
+            let production = ProductionId {
+                spec_hash: SpecHash(rand::random()),
+                execution_nonce: rand::random(),
+            };
+            let names = (0..owners).map(|i| format!("compact-{i}")).collect::<Vec<_>>();
+            let manifest = Manifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: production.clone(),
+                artifacts: names
+                    .iter()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            ManifestArtifact {
+                                artifact_type: artifact_type.clone(),
+                                family_count: Some(count),
+                                confidentiality: ArtifactConfidentiality::Private,
+                                content_hash: None,
+                                layout: None,
+                            },
+                        )
+                    })
+                    .collect(),
+            };
+            let mut store = MemoryArtifactStore::default();
+            store.store_manifest(manifest.clone()).unwrap();
+            for name in &names {
+                for index in 0..count {
+                    store
+                        .store(
+                            ArtifactKey {
+                                production: production.clone(),
+                                name: name.clone(),
+                                index: Some(index),
+                            },
+                            &artifact_type,
+                            ArtifactConfidentiality::Private,
+                            None,
+                            ArtifactPayload::SmallMatrix(bytes.clone()),
+                        )
+                        .unwrap();
+                }
+            }
+            let left = ring.input("left", (1, 2));
+            let outputs = if preimage {
+                let staged = names
+                    .iter()
+                    .map(|name| {
+                        let input = ring.preimage_family_artifact_input(
+                            production.clone(),
+                            name.clone(),
+                            count,
+                            (2, 1),
+                            7,
+                            ArtifactConfidentiality::Private,
+                        );
+                        mxx_dsl::parallel(count, |i| Ok(input.at(i))).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                mxx_dsl::parallel(count, |i| {
+                    Ok(staged
+                        .iter()
+                        .map(|family| family.at(i.clone()).mul_small_rhs(left.clone()))
+                        .reduce(|a, b| a + b)
+                        .unwrap())
+                })
+                .unwrap()
+            } else {
+                let staged = names
+                    .iter()
+                    .map(|name| {
+                        let input = ring.small_matrix_family_artifact_input(
+                            production.clone(),
+                            name.clone(),
+                            count,
+                            (2, 1),
+                            7,
+                            ArtifactConfidentiality::Private,
+                        );
+                        mxx_dsl::parallel(count, |i| Ok(input.at(i))).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                mxx_dsl::parallel(count, |i| {
+                    Ok(staged
+                        .iter()
+                        .map(|family| left.clone().mul_small_rhs(family.at(i.clone())))
+                        .reduce(|a, b| a + b)
+                        .unwrap())
+                })
+                .unwrap()
+            };
+            let graph = DslContext::new("compact-zip-input-owners")
+                .output("result", outputs)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production, manifest)]),
+                )
+                .unwrap();
+            let inputs = BTreeMap::from([(
+                "left".into(),
+                RuntimeValue::matrix(super::super::GpuFleetMatrix::from(left_gpu.clone())),
+            )]);
+            drop(backend.prepare_graph_admission(&graph, false, &inputs, 2, true).unwrap());
+            let mut result = execute_with_config(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig {
+                    max_parallel_instances: std::num::NonZeroUsize::new(2).unwrap(),
+                    ..ExecutionConfig::default()
+                },
+            )
+            .unwrap();
+            let RuntimeValue::IndexedFamily(members) =
+                result.materialize_output("result", &mut backend, &mut store).unwrap()
+            else {
+                panic!("family")
+            };
+            assert_eq!(members.len(), count);
+            for member in members {
+                let RuntimeValue::Matrix(matrix) = member else { panic!("matrix") };
+                assert_eq!(backend.matrix_to_bytes(matrix).unwrap(), expected);
+            }
         }
     }
 

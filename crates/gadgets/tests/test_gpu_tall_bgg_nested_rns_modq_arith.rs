@@ -1357,6 +1357,7 @@ fn execution_config(
             NonZeroUsize::new(config.release_fence_interval)
                 .expect("validated nonzero fence interval"),
         ),
+        prepared_gpu_admission: true,
     })
 }
 

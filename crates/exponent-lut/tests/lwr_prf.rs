@@ -9,6 +9,7 @@ fn use_rns_bgg() -> bool {
         other => panic!("MXX_EXPONENT_LUT_TEST_SCHEME must be bgg or rns-bgg, got {other}"),
     }
 }
+use bigdecimal::BigDecimal;
 use mxx_bgg::BggSamplerLayout;
 
 use mxx_exponent_lut::{
@@ -923,7 +924,8 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
         use mxx_exponent_lut::noise_refresh::pbc::{PbcLayoutSeed, PbcPublicLayout};
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let meta = &report["numerical_run"];
+        let (encoding_error_sigma, encoding_error_bound) = rns_bgg::report_encoding_noise(&report);
+        let meta = report.get("numerical_run").unwrap_or(&report);
         let n = meta["n"].as_u64().unwrap() as u32;
         let primes: Vec<Vec<u64>> =
             serde_json::from_value(report["selected_candidate"]["level_primes"].clone()).unwrap();
@@ -941,9 +943,11 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
                     )
                 })
                 .collect(),
-            2,
+            encoding_error_sigma,
+            1,
         )
         .unwrap();
+        assert_eq!(parameters.encoding_error_bound(), &encoding_error_bound);
         let q = meta["lwr_q"].as_u64().unwrap() as usize;
         let p = meta["lwr_p"].as_u64().unwrap() as usize;
         let width_log2 = q.trailing_zeros() - 1;
@@ -1020,12 +1024,13 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             ring_dimension: n,
             widths: vec![1, n as usize],
             slots: vec![2, 1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: BigDecimal::from(4u8),
+            crt_bits: 32,
             terminal_depth: 2,
             max_crt_depth: 32,
             memory_budget_bytes: 1 << 30,
             terminal_value_bound: 4u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let vector =
@@ -1244,6 +1249,7 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
 }
 
 mod rns_bgg {
+    use bigdecimal::BigDecimal;
     use mxx_exponent_lut::rns_bgg::{RnsBggNoiseBound, RnsBggParameters};
     use mxx_ir_core::{
         ValidatedGraph,
@@ -1256,7 +1262,45 @@ mod rns_bgg {
         transcript::SamplingMode,
     };
     use num_bigint::BigUint;
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, str::FromStr};
+
+    pub(super) fn report_encoding_noise(report: &serde_json::Value) -> (BigDecimal, BigUint) {
+        let phase2 = report.get("phase2").filter(|value| value.is_object());
+        let sigma_value = phase2
+            .and_then(|value| value.get("error_sigma"))
+            .or_else(|| report.get("error_sigma"))
+            .and_then(serde_json::Value::as_str)
+            .expect("accepted report must contain error_sigma");
+        let bound_value = phase2
+            .and_then(|value| value.get("encoding_error_bound"))
+            .or_else(|| report.get("encoding_error_bound"))
+            .and_then(serde_json::Value::as_str)
+            .expect("accepted report must contain encoding_error_bound");
+        let sigma = BigDecimal::from_str(sigma_value)
+            .expect("accepted report must contain a valid error_sigma");
+        let bound = BigUint::from_str(bound_value)
+            .expect("accepted report must contain a valid encoding_error_bound");
+        let expected = mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma);
+        assert_eq!(bound, expected, "accepted report sigma/bound mismatch");
+        (sigma, bound)
+    }
+
+    #[test]
+    fn accepted_report_encoding_noise_round_trip_and_tamper_rejection() {
+        let report = serde_json::json!({
+            "phase2": {"error_sigma": "4", "encoding_error_bound": "26"}
+        });
+        let restored: serde_json::Value =
+            serde_json::from_slice(&serde_json::to_vec(&report).unwrap()).unwrap();
+        let (sigma, bound) = report_encoding_noise(&restored);
+        assert_eq!(sigma, BigDecimal::from(4u8));
+        assert_eq!(bound, BigUint::from(26u8));
+        let tampered = serde_json::json!({
+            "phase2": {"error_sigma": "4", "encoding_error_bound": "25"}
+        });
+        assert!(std::panic::catch_unwind(|| report_encoding_noise(&tampered)).is_err());
+    }
+
     pub struct RnsBggRoundTrip {
         pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
@@ -1265,18 +1309,30 @@ mod rns_bgg {
         pub noise_report: serde_json::Value,
     }
 
-    #[derive(serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
     struct OnlineCheckpoint {
         source: mxx_ir_core::Graph,
         bindings: mxx_ir_core::ParamEnv,
         levels: Vec<mxx_primitives::poly::dcrt::params::DCRTPolyParams>,
-        eta: usize,
+        encoding_error_sigma: String,
+        encoding_error_bound: String,
+        operations_per_drop: usize,
         production_id: ProductionId,
         bounds: BTreeMap<String, (BigUint, BigUint)>,
         noise_report: serde_json::Value,
         preprocess_seconds: f64,
         reopen_seconds: f64,
         online_graph_seconds: f64,
+    }
+
+    fn checkpoint_encoding_noise(checkpoint: &OnlineCheckpoint) -> (BigDecimal, BigUint) {
+        let sigma = BigDecimal::from_str(&checkpoint.encoding_error_sigma)
+            .expect("checkpoint must contain a valid encoding_error_sigma");
+        let bound = BigUint::from_str(&checkpoint.encoding_error_bound)
+            .expect("checkpoint must contain a valid encoding_error_bound");
+        let expected = mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&sigma);
+        assert_eq!(bound, expected, "checkpoint sigma/bound mismatch");
+        (sigma, bound)
     }
 
     #[test]
@@ -1296,7 +1352,11 @@ mod rns_bgg {
         let checkpoint: OnlineCheckpoint =
             serde_json::from_reader(std::io::BufReader::new(std::fs::File::open(&path).unwrap()))
                 .unwrap();
-        let parameters = RnsBggParameters::new(checkpoint.levels, checkpoint.eta).unwrap();
+        let (sigma, bound) = checkpoint_encoding_noise(&checkpoint);
+        let parameters =
+            RnsBggParameters::new(checkpoint.levels, sigma, checkpoint.operations_per_drop)
+                .unwrap();
+        assert_eq!(parameters.encoding_error_bound(), &bound);
         let mut store = FileArtifactStore::open(path.parent().unwrap()).unwrap();
         let manifest = store.load_manifest(&checkpoint.production_id).unwrap();
         let graph = mxx_ir_core::validate_with_manifests(
@@ -1497,7 +1557,9 @@ mod rns_bgg {
                     source: consumer.source,
                     bindings: consumer.bindings,
                     levels: fixture.parameters.levels().to_vec(),
-                    eta: fixture.parameters.eta(),
+                    encoding_error_sigma: fixture.parameters.encoding_error_sigma().to_string(),
+                    encoding_error_bound: fixture.parameters.encoding_error_bound().to_string(),
+                    operations_per_drop: fixture.parameters.operations_per_drop(),
                     production_id: production.clone(),
                     bounds: fixture.bounds.clone(),
                     noise_report: fixture.noise_report.clone(),
@@ -1523,9 +1585,26 @@ mod rns_bgg {
                 assert_eq!(restored.production_id, production);
                 assert_eq!(restored.bounds, fixture.bounds);
                 assert_eq!(restored.noise_report, fixture.noise_report);
-                let parameters = RnsBggParameters::new(restored.levels, restored.eta).unwrap();
+                let (sigma, bound) = checkpoint_encoding_noise(&restored);
+                let parameters = RnsBggParameters::new(
+                    restored.levels.clone(),
+                    sigma,
+                    restored.operations_per_drop,
+                )
+                .unwrap();
                 assert_eq!(parameters.levels(), fixture.parameters.levels());
-                assert_eq!(parameters.eta(), fixture.parameters.eta());
+                assert_eq!(
+                    parameters.encoding_error_sigma(),
+                    fixture.parameters.encoding_error_sigma()
+                );
+                assert_eq!(
+                    parameters.encoding_error_bound(),
+                    fixture.parameters.encoding_error_bound()
+                );
+                assert_eq!(bound, fixture.parameters.encoding_error_bound().clone());
+                let mut tampered = restored.clone();
+                tampered.encoding_error_bound = "25".to_owned();
+                assert!(std::panic::catch_unwind(|| checkpoint_encoding_noise(&tampered)).is_err());
                 let consumer = mxx_ir_core::validate_with_manifests(
                     &restored.source,
                     &restored.bindings,
@@ -1580,15 +1659,18 @@ mod rns_bgg {
             *execution.inputs().keys().next().unwrap(),
             mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
                 level: 0,
-                bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound {
+                    error: parameters.encoding_error_bound().clone(),
+                    payload_l1: 1u8.into(),
+                },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
                     mean_numerator: 0.into(),
                     mean_denominator: 1u8.into(),
                     mean_radius: mxx_exponent_lut::noise_utils::NonnegativeRational::zero(),
                     variance: mxx_exponent_lut::noise_utils::NonnegativeRational::new(
-                        parameters.eta().into(),
-                        2u8.into(),
+                        parameters.encoding_error_variance().numerator.clone(),
+                        parameters.encoding_error_variance().denominator.clone(),
                     )
                     .unwrap(),
                 }),

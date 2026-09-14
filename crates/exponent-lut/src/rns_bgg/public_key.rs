@@ -1229,7 +1229,13 @@ impl RnsBggScheme {
             use sha2::Digest;
             let mut hash = sha2::Sha256::new();
             hash.update(b"rns_bgg-prepared-parameters");
-            hash.update((self.parameters.eta() as u64).to_le_bytes());
+            let sigma = self.parameters.encoding_error_sigma.to_string();
+            hash.update((sigma.len() as u64).to_le_bytes());
+            hash.update(sigma.as_bytes());
+            let bound = self.parameters.encoding_error_bound.to_bytes_be();
+            hash.update((bound.len() as u64).to_le_bytes());
+            hash.update(bound);
+            hash.update((self.parameters.operations_per_drop() as u64).to_le_bytes());
             hash.update((self.parameters.levels().len() as u64).to_le_bytes());
             for level in self.parameters.levels() {
                 hash.update(level.ring_dimension().to_le_bytes());
@@ -2566,12 +2572,13 @@ pub(crate) mod terminal_artifact_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 2,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: value_bound.clone(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -2693,7 +2700,10 @@ pub(crate) mod terminal_artifact_tests {
                 scheme.import_input_material(descriptor, production.clone(), key.id, 0).unwrap()
             })
             .collect::<Vec<_>>();
-        let bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: 1u8.into(),
+        };
         let gain = BigUint::from(1u8);
         let noise = parameters
             .terminal_noise_bound(0, [(&bound, 2, &gain), (&bound, 2, &gain)], value_bound)
@@ -2834,12 +2844,13 @@ pub(crate) mod program_artifacts_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![4],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 16u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -3478,12 +3489,13 @@ mod linear_artifact_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -3752,7 +3764,8 @@ mod lut_artifact_tests {
         let high_parameters = DCRTPolyParams::new(n, 2, 17, 4, None, None);
         let prime = high_parameters.to_crt().0[0];
         let low_parameters = DCRTPolyParams::new(n, 1, 17, 4, Some(vec![prime]), None);
-        let parameters = RnsBggParameters::new(vec![high_parameters, low_parameters], 2).unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![high_parameters, low_parameters], 2, 1).unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let high = scheme.ring(0).unwrap();
         let seed = high.bytes_input("hash-key", 32);
@@ -4130,13 +4143,14 @@ pub(crate) mod readout_tests {
             ring_dimension: n,
             widths: vec![width],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::from(3u8) *
                 weight.iter().flatten().map(|x| x.magnitude()).max().unwrap().clone(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4322,7 +4336,10 @@ pub(crate) mod readout_tests {
             .terminal_noise_bound(
                 0,
                 [(
-                    &RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() },
+                    &RnsBggNoiseBound {
+                        error: parameters.encoding_error_bound.clone(),
+                        payload_l1: 1u8.into(),
+                    },
                     width,
                     &1u8.into(),
                 )],
@@ -4439,8 +4456,10 @@ pub(crate) mod readout_tests {
         for (name, value) in results.outputs {
             let RuntimeValue::Matrix(matrix) = value else { panic!("matrix") };
             let bound = if name == "aggregate-error" {
-                let input_bound =
-                    RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+                let input_bound = RnsBggNoiseBound {
+                    error: parameters.encoding_error_bound.clone(),
+                    payload_l1: 1u8.into(),
+                };
                 let gain = 1u8.into();
                 parameters
                     .terminal_noise_bound(
@@ -4512,12 +4531,13 @@ pub(crate) mod terminal_family_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![2],
-            eta: 2,
-            crt_bits: 29,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 2,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 18u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4695,7 +4715,7 @@ pub(crate) mod terminal_family_tests {
                 )
                 .unwrap();
             let input_bound = crate::rns_bgg::RnsBggNoiseBound {
-                error: parameters.eta().into(),
+                error: parameters.encoding_error_bound.clone(),
                 payload_l1: 1u8.into(),
             };
             let gain = 1u8.into();
@@ -4745,12 +4765,13 @@ pub(crate) mod terminal_family_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![2],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());

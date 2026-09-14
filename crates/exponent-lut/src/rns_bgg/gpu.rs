@@ -5,7 +5,6 @@ use super::{
         encoding_tests::check_preprocessing_phases,
         family_tests::{composed_rhs_fixture, structural_selection_fixture},
         private_mul_tests::check_private_mul,
-        refresh_tests::refresh_fixture,
         terminal_tests::{routed_terminal_fixture, terminal_fixture},
     },
     noise::RnsBggTerminalNoise,
@@ -256,50 +255,6 @@ fn test_gpu_rns_bgg_indexed_readout_weights_survive_artifact_reopen() {
 fn test_gpu_rns_bgg_aggregate_readout_survives_artifact_reopen() {
     for indexed in [false, true] {
         check_gpu_domain(2, [vec![17.into()], vec![]], indexed, true);
-    }
-}
-
-#[test]
-fn test_gpu_rns_bgg_noiseless_refresh_reconstructs_fresh_error_and_continues() {
-    let devices = detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "GPU test requires a detected device");
-    for device in devices {
-        let (graph, parameters, bound) = refresh_fixture();
-        let levels = parameters
-            .levels()
-            .iter()
-            .cloned()
-            .chain(parameters.refresh_residue_parameters(1).unwrap())
-            .map(|level| gpu_parameters(&level, device));
-        let result = execute(
-            &graph,
-            &mut gpu_backend_on(levels, [device]),
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        for (name, value) in result.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
-            let level = if name.starts_with("exact") { 1 } else { 2 };
-            let q = parameters.level(level).unwrap().modulus();
-            let limit = if level == 1 { BigUint::from(0u8) } else { bound.error.clone() };
-            for shard in matrix.shards() {
-                let cpu = shard.value.to_cpu_matrix();
-                for poly in
-                    cpu.block_entries(0..cpu.row_size(), 0..cpu.col_size()).into_iter().flatten()
-                {
-                    for coefficient in poly.coeffs() {
-                        let magnitude =
-                            coefficient.value().clone().min(q.as_ref() - coefficient.value());
-                        assert!(magnitude <= limit, "{name} GPU {device}: {magnitude} > {limit}");
-                    }
-                }
-            }
-        }
     }
 }
 

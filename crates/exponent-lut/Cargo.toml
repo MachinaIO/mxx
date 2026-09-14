@@ -8,6 +8,7 @@ description = "Private LUT programs over BGG+ and BFV encodings"
 [features]
 default = []
 gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+test-utils = []
 
 [dependencies]
 mxx-bgg.workspace = true

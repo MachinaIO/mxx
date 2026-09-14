@@ -144,21 +144,14 @@ impl RnsBggScheme {
         columns: usize,
     ) -> Result<Mat, RnsBggError> {
         let ring = self.ring(level)?;
-        if self.parameters.eta() == 0 {
+        if self.encoding_errors_noiseless {
             return Ok(ring.zero((rows, columns)));
         }
-        // Eta is a small scheme parameter, not an application family. Keep
-        // its independent Bernoulli differences in one scalar dataflow so the
-        // executor does not stage each summand through host RAM.
-        let difference = || {
-            ring.uniform_interval((rows, columns), 0, 1) -
-                ring.uniform_interval((rows, columns), 0, 1)
-        };
-        let mut error = difference();
-        for _ in 1..self.parameters.eta() {
-            error = error + difference();
-        }
-        Ok(error)
+        Ok(ring.gaussian(
+            (rows, columns),
+            self.parameters.encoding_error_sigma_expr(),
+            self.parameters.encoding_error_bound.clone(),
+        ))
     }
     pub fn sample_payload_secret(&self) -> Result<RnsBggPayloadSecret, RnsBggError> {
         let ring = self.ring(0)?;
@@ -214,7 +207,8 @@ impl RnsBggScheme {
         Ok(secret.row.clone().reduce_modulus(modulus))
     }
     /// Online input preparation needs only s and the preprocessing contribution.
-    /// Fresh error is sampled here exactly once, preserving the eta bound.
+    /// Fresh encoding error is sampled here exactly once with the canonical
+    /// Gaussian cutoff derived from the configured sigma.
     pub fn encode(
         &self,
         secret: &RnsBggMaskSecret,
@@ -1239,6 +1233,105 @@ pub(crate) mod private_mul_tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn test_rns_bgg_encoding_graph_uses_gaussian_sampler_contract() {
+        let n = 16;
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
+            ring_dimension: n,
+            widths: vec![1],
+            slots: vec![1],
+            encoding_error_sigma: bigdecimal::BigDecimal::from(4u8),
+            crt_bits: 32,
+            terminal_depth: 1,
+            max_crt_depth: 2,
+            memory_budget_bytes: u64::MAX,
+            terminal_value_bound: BigUint::one(),
+            operations_per_drop: 1,
+        })
+        .unwrap();
+        let scheme = RnsBggScheme::new(parameters.clone(), [7u8; 32]);
+        let error = scheme.small_error(0, 1, 1).unwrap();
+        let graph = DslContext::new("rns-gaussian-contract")
+            .output("error", error)
+            .unwrap()
+            .build()
+            .unwrap()
+            .graph;
+        let samplers = graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter_map(|node| match node.kind() {
+                NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
+                    Some((sigma, max_coefficient_bound))
+                }
+                NodeKind::UniformIntervalSample { .. } => {
+                    panic!("encoding error still uses CBD sampling")
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(samplers.len(), 1);
+        assert_eq!(samplers[0].0, &parameters.encoding_error_sigma_expr());
+        assert_eq!(samplers[0].1, &IntExpr::from(parameters.encoding_error_bound.clone()));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[test]
+    fn test_rns_bgg_noiseless_encoding_only_replaces_gaussian_error() {
+        let n = 16;
+        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
+            ring_dimension: n,
+            widths: vec![1],
+            slots: vec![1],
+            encoding_error_sigma: bigdecimal::BigDecimal::from(4u8),
+            crt_bits: 32,
+            terminal_depth: 1,
+            max_crt_depth: 2,
+            memory_budget_bytes: u64::MAX,
+            terminal_value_bound: BigUint::one(),
+            operations_per_drop: 1,
+        })
+        .unwrap();
+        let regular = RnsBggScheme::new(parameters.clone(), [7u8; 32]);
+        let noiseless = RnsBggScheme::new_noiseless_for_testing(parameters.clone(), [7u8; 32]);
+        assert_eq!(regular.parameter_identity(), noiseless.parameter_identity());
+        for (scheme, expected_gaussian) in [(&regular, true), (&noiseless, false)] {
+            let graph = DslContext::new(if expected_gaussian {
+                "rns-gaussian-contract"
+            } else {
+                "rns-noiseless-contract"
+            })
+            .output("error", scheme.small_error(0, 1, 1).unwrap())
+            .unwrap()
+            .build()
+            .unwrap()
+            .graph;
+            let gaussian_count = graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::GaussianSample { .. }))
+                .count();
+            assert_eq!(gaussian_count, usize::from(expected_gaussian));
+            let zero_count = graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| {
+                    matches!(
+                        node.kind(),
+                        NodeKind::ConstantMatrix {
+                            value: mxx_ir_core::node::ConstantMatrix::Zero,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            assert_eq!(zero_count, usize::from(!expected_gaussian));
+        }
+    }
+
+    #[test]
     fn test_rns_bgg_scalar_prepared_caches_cross_parallel_scope() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
@@ -1248,12 +1341,13 @@ pub(crate) mod private_mul_tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 10,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -1511,7 +1605,7 @@ pub(crate) mod private_mul_tests {
             .into_iter()
             .map(|depth| DCRTPolyParams::new(n, depth, 17, 4, Some(primes[..depth].to_vec()), None))
             .collect();
-        let parameters = RnsBggParameters::new(levels, 2).unwrap();
+        let parameters = RnsBggParameters::new(levels, 2, 1).unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
         let secrets = scheme.test_secrets().unwrap();
         let high = scheme.ring(0).unwrap();
@@ -1698,8 +1792,10 @@ pub(crate) mod private_mul_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let input_bound =
-            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: BigUint::from(2 * n) };
+        let input_bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: BigUint::from(2 * n),
+        };
         let bound = parameters
             .private_mul_noise_bound(0, &input_bound, &1u8.into(), BigUint::from(2 * n).pow(2))
             .unwrap();
@@ -1746,12 +1842,13 @@ pub(super) mod prf_tests {
             ring_dimension: 8,
             widths: vec![1, 1],
             slots: vec![2, 2],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -1859,12 +1956,13 @@ pub(super) mod prf_tests {
             ring_dimension: n,
             widths: vec![1, 1],
             slots: vec![2, 2],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -2027,12 +2125,13 @@ mod linear_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         };
         let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -2238,12 +2337,13 @@ pub(crate) mod encoding_tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -2408,7 +2508,10 @@ pub(crate) mod encoding_tests {
         let lut_bound = parameters
             .lut_noise_bound(
                 0,
-                &RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 5u8.into() },
+                &RnsBggNoiseBound {
+                    error: parameters.encoding_error_bound.clone(),
+                    payload_l1: 5u8.into(),
+                },
                 1,
                 &1u8.into(),
                 5u8.into(),
@@ -2496,7 +2599,7 @@ pub(crate) mod encoding_tests {
         for (name, output) in results.outputs {
             let RuntimeValue::Matrix(matrix) = output else { panic!("polynomial") };
             let (modulus, bound) = if name.starts_with("error-") {
-                (q.as_ref(), BigUint::from(parameters.eta()))
+                (q.as_ref(), parameters.encoding_error_bound.clone())
             } else {
                 (low_q.as_ref(), lut_bound.error.clone())
             };
@@ -2514,12 +2617,13 @@ pub(crate) mod encoding_tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         };
         let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -2610,7 +2714,10 @@ pub(crate) mod encoding_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let input_bound = RnsBggNoiseBound { error: request.eta.into(), payload_l1: n.into() };
+        let input_bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: n.into(),
+        };
         let selected_bound =
             parameters.lut_noise_bound(0, &input_bound, 1, &1u8.into(), n.into()).unwrap();
         assert_eq!(selected_bound.payload_l1, BigUint::from(n));
@@ -2644,6 +2751,7 @@ pub(crate) mod encoding_tests {
                 })
                 .collect(),
             2,
+            1,
         )
         .unwrap();
         assert_eq!(parameters.scale(3).unwrap(), &BigUint::one());
@@ -2763,8 +2871,10 @@ pub(crate) mod encoding_tests {
             SamplingMode::Fresh,
         )
         .unwrap();
-        let mut bound =
-            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: BigUint::one() };
+        let mut bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: BigUint::one(),
+        };
         bound = parameters.private_mul_noise_bound(0, &bound, &1u8.into(), BigUint::one()).unwrap();
         bound = parameters.lut_noise_bound(1, &bound, 4, &1u8.into(), BigUint::one()).unwrap();
         bound = parameters.lut_noise_bound(2, &bound, 2, &1u8.into(), BigUint::one()).unwrap();
@@ -2786,352 +2896,6 @@ pub(crate) mod encoding_tests {
                         "observed {magnitude}, bound {}",
                         bound.error
                     );
-                }
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod refresh_tests {
-    use super::*;
-    use crate::{
-        layout::ExpLayout,
-        noise_refresh::refresh::PreparedDirectRefreshSlot,
-        rns_bgg::{
-            RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggParameters,
-            RnsBggPublicProgramValue,
-        },
-    };
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
-    use mxx_primitives::{
-        element::PolyElem,
-        matrix::PolyMatrix,
-        poly::{Poly, dcrt::params::DCRTPolyParams},
-    };
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
-    use num_bigint::BigUint;
-    use std::collections::BTreeMap;
-
-    /// The same production terminal/decoder/CRT path used by the application.
-    /// Known digit values make this an arithmetic oracle, not a PRF claim.
-    pub(crate) fn refresh_fixture()
-    -> (mxx_ir_core::ValidatedGraph, RnsBggParameters, RnsBggNoiseBound) {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(4);
-        let bits = std::env::var("MXX_PRIMITIVE_TEST_CRT_BITS")
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(12);
-        let depth = std::env::var("MXX_PRIMITIVE_TEST_CRT_DEPTH")
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(4);
-        // Four refreshed coordinates need enough CRT spacing for every routed
-        // digit's rounding error; 12-bit primes suffice without weakening it.
-        let high = DCRTPolyParams::new(n, depth, bits, (bits / 2).min(31) as u32, None, None);
-        let primes = high.to_crt().0;
-        let middle =
-            high.select_modulus(&primes[..2].iter().copied().map(BigUint::from).product()).unwrap();
-        let last = high.select_modulus(&BigUint::from(primes[0])).unwrap();
-        // CBD(0) removes sampling errors. Exact RNS ModDown and its rounding
-        // residues remain part of the production arithmetic being tested.
-        let parameters = RnsBggParameters::new(vec![high, middle, last], 0).unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let high = scheme.ring(0).unwrap();
-        let low = scheme.ring(1).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let r = scheme.sample_payload_secret().unwrap();
-        let input_key = scheme
-            .sample_input_key(0, seed.clone(), b"refresh-input".as_slice(), rand::random())
-            .unwrap();
-        let output_key = scheme
-            .sample_input_key(1, seed.clone(), b"refresh-output".as_slice(), rand::random())
-            .unwrap();
-        let input =
-            scheme.prepare_input(&r, &input_key, high.polynomial([0.into(), 1.into()])).unwrap();
-        let public = RnsBggPublicProgramValue::Scalar((input_key.clone(), None));
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() },
-                seed.clone(),
-                b"refresh-bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let q = parameters.level(1).unwrap().modulus();
-        let columns = parameters.component_columns(1).unwrap();
-        let gadget = scheme.state_gadget(1).unwrap();
-        let payload = scheme.payload_at(&r, 1).unwrap().map(|entry| entry * gadget.clone());
-        use crate::{
-            noise_refresh::{
-                ExponentLUTRefreshDirectScheme,
-                prf::SparseLwrPrfProfile,
-                refresh::{RefreshDigitPlan, RefreshDigitRouting},
-            },
-            rns_bgg::RnsBggInputMaterial,
-        };
-        let plan = RefreshDigitPlan::new(
-            4,
-            &vec![16u8.into(); parameters.level(1).unwrap().crt_depth()],
-            &4u8.into(),
-        )
-        .unwrap();
-        let profile = SparseLwrPrfProfile::new(
-            ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() },
-            2,
-        )
-        .unwrap();
-        let readout = profile.canonical_readout().unwrap();
-        let digit_inputs = |count: usize, tag: &[u8]| {
-            let id = rand::random();
-            let entries = mxx_dsl::parallel(2 * columns * n as usize * count, |index| {
-                let mut tag = mxx_dsl::HashTag::from(tag);
-                tag.push(index);
-                let key = scheme.sample_input_key(0, seed.clone(), tag, id).unwrap();
-                let input =
-                    scheme.prepare_input(&r, &key, high.polynomial([0.into(), 1.into()])).unwrap();
-                Ok((key.matrix, input.row))
-            })
-            .unwrap();
-            let matrices = entries.field(|entry| entry.0).unwrap();
-            let input_rows = entries.field(|entry| entry.1).unwrap();
-            (
-                RnsBggPublicProgramValue::Family(
-                    mxx_dsl::parallel(matrices.count().clone(), |index| {
-                        Ok((
-                            RnsBggPublicKey {
-                                matrix: matrices.at(index),
-                                level: 0,
-                                id,
-                                context: scheme.context,
-                            },
-                            None,
-                        ))
-                    })
-                    .unwrap(),
-                ),
-                input_rows,
-            )
-        };
-        let (mask_public, mask_inputs) = digit_inputs(plan.mask_counts[0], b"mask-inputs");
-        let (fresh_public, fresh_inputs) = digit_inputs(plan.fresh_count, b"fresh-inputs");
-        let mut slots = Vec::new();
-        for prime in parameters.level(1).unwrap().to_crt().0 {
-            let h = q.as_ref() / prime;
-            let data = scheme
-                .sample_refresh_data_material(
-                    &r,
-                    ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() },
-                    &h,
-                    &bank,
-                    seed.clone(),
-                    b"refresh-data".as_slice(),
-                    rand::random(),
-                )
-                .unwrap();
-            let (mask, mask_offset) = scheme
-                .sample_refresh_digit_material(
-                    &r,
-                    &readout,
-                    &bank,
-                    &RefreshDigitRouting {
-                        base: plan.base,
-                        count: plan.mask_counts[0],
-                        scale: 1u8.into(),
-                        mask: true,
-                    },
-                    seed.clone(),
-                    b"refresh-mask".as_slice().into(),
-                    rand::random(),
-                )
-                .unwrap();
-            let (fresh, fresh_offset) = scheme
-                .sample_refresh_digit_material(
-                    &r,
-                    &readout,
-                    &bank,
-                    &RefreshDigitRouting {
-                        base: plan.base,
-                        count: plan.fresh_count,
-                        scale: h.clone(),
-                        mask: false,
-                    },
-                    seed.clone(),
-                    b"refresh-fresh".as_slice().into(),
-                    rand::random(),
-                )
-                .unwrap();
-            let slot = PreparedDirectRefreshSlot::new(
-                &scheme,
-                &[(&public, &data), (&mask_public, &mask), (&fresh_public, &fresh)],
-                output_key.matrix.clone(),
-                scheme.scalar(1, h.clone()).unwrap(),
-                RnsBggRefreshLevel { output_level: 1, prime: prime.into() },
-                mask_offset + fresh_offset,
-            )
-            .unwrap();
-            slots.push(slot);
-            let input_bound = RnsBggNoiseBound { error: 0u8.into(), payload_l1: 1u8.into() };
-            let bound = parameters
-                .terminal_noise_bound(
-                    0,
-                    [(
-                        &input_bound,
-                        n as usize +
-                            2 * columns *
-                                (n as usize) *
-                                (n as usize) *
-                                (plan.mask_counts[0] + plan.fresh_count),
-                        &1u8.into(),
-                    )],
-                    0u8.into(),
-                )
-                .unwrap();
-            // Every coefficient receives a centered base-4 two-digit mask.
-            // All digit ciphertexts contribute error even when routing one coefficient.
-            assert!(BigUint::from(8u8) + bound.error < h / 2u8);
-        }
-        let recomposition = scheme.prepare_refresh_recomposition(output_key.clone()).unwrap();
-        // Prepare a following identity transition, proving the restored scale
-        // is the next state's p_i rather than an arbitrary terminal marker.
-        let next_bank = scheme
-            .sample_mask_bank(
-                1,
-                ExpLayout { stride_log2: 0, width_log2: 0 },
-                seed.clone(),
-                b"next-bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let next_material = scheme
-            .sample_lut_material(
-                &r,
-                None,
-                None,
-                &next_bank,
-                seed,
-                b"next-identity".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let next = scheme.prepare_lut(&output_key, &next_material, rand::random()).unwrap();
-
-        // Online secret is first sampled after all public preparation above.
-        let s = scheme.sample_mask_secret().unwrap();
-        let encoding = scheme.encode(&s, &input_key, &input).unwrap();
-        let encoding = RnsBggEncodingProgramValue::Scalar((encoding, None));
-        let helpers = scheme.prepare_online_masks(&s, &bank).unwrap();
-        let encode_digits = |public: &RnsBggPublicProgramValue, rows: &Family<RnsBggRow>| {
-            let RnsBggPublicProgramValue::Family(keys) = public else { panic!("digit family") };
-            RnsBggEncodingProgramValue::Family(
-                mxx_dsl::parallel(rows.count().clone(), |index| {
-                    let (key, _) = keys.at(&index);
-                    let input = RnsBggInputMaterial {
-                        row: rows.at(index),
-                        level: 0,
-                        context: scheme.context,
-                        key_id: key.id,
-                    };
-                    Ok((scheme.encode(&s, &key, &input).unwrap(), None))
-                })
-                .unwrap(),
-            )
-        };
-        let masks = encode_digits(&mask_public, &mask_inputs);
-        let fresh = encode_digits(&fresh_public, &fresh_inputs);
-        let residues = slots
-            .iter()
-            .map(|slot| {
-                let decoder = slot.prepare_decoder(&scheme, &s, &0);
-                slot.evaluate(
-                    &scheme,
-                    &[(&encoding, &helpers), (&masks, &helpers), (&fresh, &helpers)],
-                    decoder,
-                )
-                .unwrap()
-            })
-            .collect();
-        let (value, _) = scheme.recompose_refresh_rows(residues, &recomposition);
-        let refreshed = value;
-        let digit = BigInt::from(2 / n as usize + 1);
-        let fresh_polynomial = low.polynomial((0..n).map(|_| digit.clone().into()));
-        let fresh_polynomial =
-            Mat::concat(mxx_ir_core::node::ConcatAxis::Columns, vec![fresh_polynomial; columns]);
-        let desired_fresh = RnsBggRow::new([[fresh_polynomial.clone(), fresh_polynomial]]).unwrap();
-        let relation = refreshed.row.clone() - scheme.mask_at(&s, 1).unwrap() * output_key.matrix +
-            scheme.scalar(1, parameters.scale(1).unwrap().clone()).unwrap() *
-                low.polynomial([0.into(), 1.into()]) *
-                payload -
-            desired_fresh;
-        let next_helpers = scheme.prepare_online_masks(&s, &next_bank).unwrap();
-        let continued = scheme.evaluate_lut(&refreshed, &next, &next_helpers).unwrap();
-        let next_ring = scheme.ring(2).unwrap();
-        let next_error = continued.row.clone() -
-            scheme.mask_at(&s, 2).unwrap() * next.output_key().matrix.clone() +
-            scheme.scalar(2, parameters.scale(2).unwrap().clone()).unwrap() *
-                next_ring.polynomial([0.into(), 1.into()]) *
-                scheme.payload_at(&r, 2).unwrap();
-        let mut graph = DslContext::new("rns_bgg-direct-refresh-and-continuation");
-        for column in 0..2 {
-            graph = graph
-                .output(format!("exact-{column}"), relation.entry(0, column).clone())
-                .unwrap()
-                .output(format!("next-{column}"), next_error.entry(0, column).clone())
-                .unwrap();
-        }
-        let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let bound = parameters
-            .lut_noise_bound(
-                1,
-                &RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
-                1,
-                &1u8.into(),
-                1u8.into(),
-            )
-            .unwrap();
-        (graph, parameters, bound)
-    }
-
-    #[test]
-    fn test_rns_bgg_noiseless_refresh_reconstructs_fresh_error_and_continues() {
-        let (graph, parameters, bound) = refresh_fixture();
-        let result = execute(
-            &graph,
-            &mut cpu_backend(
-                parameters
-                    .levels()
-                    .iter()
-                    .cloned()
-                    .chain(parameters.refresh_residue_parameters(1).unwrap()),
-            ),
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        for (name, value) in result.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial output") };
-            let level = if name.starts_with("exact") { 1 } else { 2 };
-            let q = parameters.level(level).unwrap().modulus();
-            let expected_bound = if level == 1 { BigUint::from(0u8) } else { bound.error.clone() };
-            for poly in matrix
-                .block_entries(0..matrix.row_size(), 0..matrix.col_size())
-                .into_iter()
-                .flatten()
-            {
-                for coefficient in poly.coeffs() {
-                    let magnitude =
-                        coefficient.value().clone().min(q.as_ref() - coefficient.value());
-                    assert!(magnitude <= expected_bound, "{name}: {magnitude} > {expected_bound}");
                 }
             }
         }
@@ -3233,12 +2997,13 @@ mod common_prf_tests {
             ring_dimension: n,
             widths: vec![1, 1, native_width],
             slots: widths.iter().copied().chain([1]).collect(),
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 24,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: (native_width - 1).into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -3352,7 +3117,10 @@ mod common_prf_tests {
             ));
         }
 
-        let mut bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let mut bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: 1u8.into(),
+        };
         for (block, count) in widths.iter().enumerate() {
             let branch =
                 parameters.private_mul_noise_bound(block, &bound, &1u8.into(), 1u8.into()).unwrap();
@@ -3624,12 +3392,13 @@ pub(crate) mod family_tests {
             ring_dimension: n,
             widths: vec![1, 4],
             slots: vec![2, 1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -3807,12 +3576,13 @@ pub(crate) mod family_tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4188,12 +3958,13 @@ mod program_tests {
             ring_dimension: n,
             widths: vec![1, 4],
             slots: vec![1, 1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 4u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4499,12 +4270,13 @@ pub(crate) mod terminal_tests {
             ring_dimension: n,
             widths: vec![4],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 29,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: value_bound.clone(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4575,7 +4347,10 @@ pub(crate) mod terminal_tests {
         }
         let public = prepared.public();
         assert_eq!(public.level(), 1);
-        let bound = RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: 1u8.into(),
+        };
         let gain = BigUint::from(1u8);
         let noise = parameters
             .terminal_noise_bound(0, [(&bound, 4, &gain), (&bound, 4, &gain)], value_bound)
@@ -4714,12 +4489,13 @@ pub(crate) mod terminal_tests {
             ring_dimension: n,
             widths: vec![2],
             slots: vec![1],
-            eta: 2,
-            crt_bits: 29,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 12,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: weight.magnitude().clone(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
@@ -4803,8 +4579,10 @@ pub(crate) mod terminal_tests {
             .unwrap()
             .validate(&ParamEnv::default())
             .unwrap();
-        let input_bound =
-            RnsBggNoiseBound { error: parameters.eta().into(), payload_l1: 1u8.into() };
+        let input_bound = RnsBggNoiseBound {
+            error: parameters.encoding_error_bound.clone(),
+            payload_l1: 1u8.into(),
+        };
         let gain = 1u8.into();
         let noise = parameters
             .terminal_noise_bound(0, [(&input_bound, 2, &gain)], weight.magnitude().clone())

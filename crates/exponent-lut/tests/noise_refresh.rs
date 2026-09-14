@@ -143,6 +143,7 @@ fn simulate_refresh() -> (SearchConfig, serde_json::Value) {
 // shapes from its preprocessing and online graphs. Measurement uses the
 // same production graphs, excluding correctness-oracle arithmetic.
 
+use bigdecimal::{BigDecimal, FromPrimitive};
 use mxx_bench_estimator::{
     CostReport, estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
 };
@@ -431,6 +432,8 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
     let universe = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_UNIVERSE", 8192);
     let weight = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_WEIGHT", 18);
     let q_lwr = optional_usize("MXX_EXPONENT_LUT_REFRESH_SPARSE_LWR_MODULUS", 4096);
+    let encoding_error_sigma = bigdecimal::BigDecimal::from(4u8);
+    let encoding_error_variance = NonnegativeRational::new(16u8.into(), 1u8.into()).unwrap();
     let average = AverageCaseConfig {
         failure_exponent: optional_usize("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", 100) as u32,
         allow_average_acceptance: true,
@@ -477,10 +480,7 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
         if levels[depth - 1].modulus().bits() > 1400 {
             continue;
         }
-        states.insert(
-            depth,
-            (NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap(), vec![depth]),
-        );
+        states.insert(depth, (encoding_error_variance.clone(), vec![depth]));
     }
     for (step, count) in selector_counts.iter().enumerate() {
         let mut next_states: BTreeMap<usize, (NonnegativeRational, Vec<usize>)> = BTreeMap::new();
@@ -489,7 +489,8 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
             for next in stages - step + 2..depth {
                 let parameters = RnsBggParameters::new(
                     vec![levels[depth - 1].clone(), levels[next - 1].clone()],
-                    2,
+                    encoding_error_sigma.clone(),
+                    1,
                 )
                 .unwrap();
                 let candidate = parameters
@@ -514,8 +515,12 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
         // Keep the remaining chain: continuation is a reusable state, not
         // merely the terminal two-column endpoint.
         path.extend((1..depth).rev());
-        let parameters =
-            RnsBggParameters::new(path.iter().map(|d| levels[d - 1].clone()).collect(), 2).unwrap();
+        let parameters = RnsBggParameters::new(
+            path.iter().map(|d| levels[d - 1].clone()).collect(),
+            encoding_error_sigma.clone(),
+            1,
+        )
+        .unwrap();
         let trace = rns_bgg::trace_prf(&parameters, &program.accumulation, &selector_counts);
         let output = &trace.wires[&program.accumulation.outputs()[0]];
         assert_eq!(output.moments.as_ref().unwrap().variance, variance);
@@ -611,6 +616,8 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
     }
     let report = serde_json::json!({
         "n": n, "crt_bits": bits, "base_bits": bits / 2, "max_crt_depth": max_depth,
+        "error_sigma": encoding_error_sigma.normalized().to_string(),
+        "encoding_error_bound": mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&encoding_error_sigma).to_string(),
         "initial_log2_q_limit": 1400,
         "lwr_q": q_lwr, "lwr_p": 32, "lwr_dimension": universe, "lwr_weight": weight,
         "pbc_blocks": stages, "pbc_seed": layout.seed, "pbc_layout_id": layout.layout_id, "selector_counts": selector_counts,
@@ -2642,6 +2649,9 @@ pub struct Phase2SearchReport {
     pub overall_target_policy: String,
     pub crt_base_bits_grid: Vec<(usize, u32)>,
     pub noise_model: NoiseSearchModel,
+    /// Canonical encoding-error distribution shared with RNS-BGG runtime.
+    pub error_sigma: String,
+    pub encoding_error_bound: String,
 }
 
 /// Persisted report wrapper for the parameter-search test.
@@ -2714,6 +2724,14 @@ pub fn search_report(
             overall_target_policy: "requested_target".to_owned(),
             crt_base_bits_grid: config.crt_base_bits_grid.clone(),
             noise_model: config.noise_model,
+            error_sigma: BigDecimal::from_f64(config.error_sigma)
+                .expect("finite SearchConfig.error_sigma")
+                .normalized()
+                .to_string(),
+            encoding_error_bound: mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(
+                &BigDecimal::from_f64(config.error_sigma).expect("finite SearchConfig.error_sigma"),
+            )
+            .to_string(),
         },
         result,
         profile_results: Vec::new(),
@@ -4296,6 +4314,20 @@ pub mod parameter_search_tests {
     use super::*;
     mod parameter_tests {
         use super::*;
+
+        #[test]
+        fn estimator_gaussian_stddev_matches_reviewed_encoding_sigma() {
+            let config = SearchConfig::reviewed();
+            let args =
+                super::super::bgg_estimator_args(1 << 16, &BigUint::from(2u8), config.error_sigma);
+            let error_distribution = args
+                .windows(2)
+                .find_map(|window| (window[0] == "--e-dist").then(|| &window[1]))
+                .expect("estimator error distribution");
+            let error_distribution: serde_json::Value =
+                serde_json::from_str(error_distribution).unwrap();
+            assert_eq!(error_distribution["stddev"].as_f64(), Some(config.error_sigma),);
+        }
 
         fn evaluate_universal_depth_case(
             config: &SearchConfig,
@@ -6203,6 +6235,8 @@ pub mod parameter_search_tests {
         json.contains("\"order\":\"crt_depth_ascending_then_log_ring_dimension_ascending_then_base_bits_descending_then_crt_bits_descending; profile_tuple_q_l_p_nu_h_ascending\"")
         );
             assert!(json.contains("\"crt_base_bits_grid\":[[50,25]"));
+            assert!(json.contains("\"error_sigma\":\"4\""));
+            assert!(json.contains("\"encoding_error_bound\":\"26\""));
             assert!(!json.contains("selected_slots"));
             assert!(!json.contains("support_coordinates"));
         }
@@ -7096,7 +7130,10 @@ mod bgg_refresh_artifact_tests {
                 let RuntimeValue::Matrix(value) = &result.outputs[name] else {
                     panic!("matrix output required")
                 };
-                DCRTPolyMatrix::from_compact_bytes(&params, &backend.matrix_to_bytes(value))
+                DCRTPolyMatrix::from_compact_bytes(
+                    &params,
+                    &backend.matrix_to_bytes(value).unwrap(),
+                )
             };
             let residual = matrix("residual");
             assert_eq!(
@@ -7262,6 +7299,7 @@ mod bgg_refresh_artifact_tests {
 
 mod rns_bgg {
     //! Shared graph fixtures for RNS-BGG integration and backend regression tests.
+    use bigdecimal::BigDecimal;
     use mxx_dsl::{DslContext, Family, Mat};
     use mxx_exponent_lut::{
         layout::ExpLayout,
@@ -7314,12 +7352,29 @@ mod rns_bgg {
         use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        let meta = &report["numerical_run"];
+        let meta = report.get("numerical_run").unwrap_or(&report);
         let candidate = &report["selected_candidate"];
         assert_eq!(candidate["correctness_accepted"], true);
         let n = meta["n"].as_u64().unwrap() as u32;
         let bits = meta["crt_bits"].as_u64().unwrap() as usize;
         let base_bits = meta["base_bits"].as_u64().unwrap() as u32;
+        let sigma_text = report["phase2"]["error_sigma"]
+            .as_str()
+            .or_else(|| report["error_sigma"].as_str())
+            .expect("accepted report must contain phase2.error_sigma");
+        let bound_text = report["phase2"]["encoding_error_bound"]
+            .as_str()
+            .or_else(|| report["encoding_error_bound"].as_str())
+            .expect("accepted report must contain phase2.encoding_error_bound");
+        let encoding_error_sigma: BigDecimal =
+            sigma_text.parse().expect("accepted report must contain a valid error_sigma");
+        let encoding_error_bound: BigUint =
+            bound_text.parse().expect("accepted report must contain a valid encoding_error_bound");
+        assert_eq!(
+            encoding_error_bound,
+            mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(&encoding_error_sigma),
+            "accepted report sigma/bound mismatch"
+        );
         let primes: Vec<Vec<u64>> =
             serde_json::from_value(candidate["level_primes"].clone()).unwrap();
         let parameters = RnsBggParameters::new(
@@ -7327,9 +7382,11 @@ mod rns_bgg {
                 .into_iter()
                 .map(|p| DCRTPolyParams::new(n, p.len(), bits, base_bits, Some(p), None))
                 .collect(),
-            2,
+            encoding_error_sigma,
+            1,
         )
         .unwrap();
+        assert_eq!(parameters.encoding_error_bound(), &encoding_error_bound);
         let counts: Vec<usize> = serde_json::from_value(meta["selector_counts"].clone()).unwrap();
         let terminal = counts.len();
         let output_level = terminal + 1;
@@ -7554,7 +7611,7 @@ mod rns_bgg {
             .map(|v| v.parse().unwrap())
             .unwrap_or(4);
         let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
-        let eta: usize = 2;
+        let encoding_error_sigma = BigDecimal::from(4u8);
         let profile = SparseLwrPrfProfile::new(layout, 2).unwrap();
         let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
         // Trace the exact frozen product schedule consumed by preparation and
@@ -7562,15 +7619,15 @@ mod rns_bgg {
         let execution = program.accumulation.clone();
         let data_noise = mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
             level: 1,
-            bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+            bound: RnsBggNoiseBound { error: 26u8.into(), payload_l1: 1u8.into() },
             payload_l2_squared: 1u8.into(),
             moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
                 mean_numerator: 0.into(),
                 mean_denominator: 1u8.into(),
                 mean_radius: mxx_exponent_lut::noise_utils::NonnegativeRational::zero(),
                 variance: mxx_exponent_lut::noise_utils::NonnegativeRational::new(
-                    eta.into(),
-                    2u8.into(),
+                    16u8.into(),
+                    1u8.into(),
                 )
                 .unwrap(),
             }),
@@ -7603,12 +7660,13 @@ mod rns_bgg {
                 ring_dimension: n,
                 widths: vec![1, n as usize, 1],
                 slots: vec![2, 1, 1],
-                eta,
-                crt_bits: 17,
+                encoding_error_sigma: encoding_error_sigma.clone(),
+                crt_bits: 30,
                 terminal_depth,
                 max_crt_depth: 32,
                 memory_budget_bytes: 1 << 30,
                 terminal_value_bound: 32u8.into(),
+                operations_per_drop: 1,
             });
             let (parameters, _) = match candidate {
                 Ok(value) => value,
@@ -8105,15 +8163,18 @@ mod rns_bgg {
             *execution.inputs().keys().next().unwrap(),
             mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
                 level: 0,
-                bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
+                bound: RnsBggNoiseBound {
+                    error: parameters.encoding_error_bound().clone(),
+                    payload_l1: 1u8.into(),
+                },
                 payload_l2_squared: 1u8.into(),
                 moments: Some(mxx_exponent_lut::noise_utils::NoiseMoments {
                     mean_numerator: 0.into(),
                     mean_denominator: 1u8.into(),
                     mean_radius: mxx_exponent_lut::noise_utils::NonnegativeRational::zero(),
                     variance: mxx_exponent_lut::noise_utils::NonnegativeRational::new(
-                        parameters.eta().into(),
-                        2u8.into(),
+                        parameters.encoding_error_variance().numerator.clone(),
+                        parameters.encoding_error_variance().denominator.clone(),
                     )
                     .unwrap(),
                 }),

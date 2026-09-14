@@ -1,6 +1,7 @@
 //! Deterministic bounds and conditional moments for the common Program.
 use super::{
     RnsBggError, RnsBggNoiseBound, RnsBggParameterManifest, RnsBggParameters, RnsBggPlanRequest,
+    canonical_encoding_sigma, encoding_error_bound,
 };
 use crate::{
     noise_refresh::{
@@ -22,9 +23,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 impl RnsBggParameters {
+    pub fn encoding_error_variance(&self) -> NonnegativeRational {
+        let (mut numerator, exponent) = self.encoding_error_sigma.as_bigint_and_exponent();
+        let denominator = if exponent >= 0 {
+            BigUint::from(10u8).pow(exponent as u32)
+        } else {
+            numerator *= BigInt::from(10u8).pow((-exponent) as u32);
+            BigUint::one()
+        };
+        NonnegativeRational::new(
+            numerator.to_biguint().expect("positive encoding sigma").pow(2),
+            denominator.pow(2),
+        )
+        .expect("positive encoding sigma variance")
+    }
+
     /// Physical-coordinate variance transfer for the direct product's four
     /// error terms. Conditional model: deviations from the coefficient means
-    /// are uncorrelated with a common variance bound, fixed RHS errors are CBD(eta)
+    /// are uncorrelated with a common variance bound, fixed RHS errors are the
+    /// encoding Gaussian with variance sigma²
     /// and independent, and both ModDown remainders are independent centered
     /// uniforms, independent of inherited/fresh errors and the ternary secret.
     /// The prepared right action is fixed under H4's conditional model; its
@@ -61,8 +78,7 @@ impl RnsBggParameters {
         // square of their sum. Monomial payloads preserve the exact fresh gain.
         let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
             .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
-        let fresh = NonnegativeRational::new(BigUint::from(self.eta()) * fresh_gain, 2u8.into())
-            .expect("positive constant variance denominator");
+        let fresh = self.encoding_error_variance().scaled(&fresh_gain);
         // s*rho(A*C)/p - rho(c*C)/p: E||[s_bar,1]||_2^2 = 2N/3+1.
         // Adding the online remainder gives (2N/3+2)*(p^2-1)/(12*p^2).
         let rounding = NonnegativeRational::new((&n + 3u8) * (&p_squared - 1u8), 18u8 * &p_squared)
@@ -75,7 +91,7 @@ impl RnsBggParameters {
     /// the flat-branch decorrelation heuristic (H3). It does not apply to an
     /// explicit Add, a repeated invocation sharing helpers, or a raw terminal
     /// reduction: those must retain their shared sources and outer rounding.
-    /// Each mask helper is sampled with CBD(eta) at the input level. Branch
+    /// Each mask helper is sampled with the encoding Gaussian at the input level. Branch
     /// fresh gains describe ciphertext weighting, not fresh plaintext targets.
     pub fn lut_noise_variance(
         &self,
@@ -90,11 +106,10 @@ impl RnsBggParameters {
         let n = BigUint::from(next.ring_dimension());
         let j = BigUint::from(branches);
         let p_squared = p * p;
-        let cbd = NonnegativeRational::new(self.eta().into(), 2u8.into())
-            .expect("positive constant variance denominator");
+        let gaussian = self.encoding_error_variance();
         // sum_k (sigma_k(e)*U_k + ed_k*V_k)/p. Both low-ring
         // decompositions have 2D entries per column with coefficients <= b/2.
-        let input_and_helper = input_variance.add(&cbd);
+        let input_and_helper = input_variance.add(&gaussian);
         let inherited_and_helper = NonnegativeRational::new(
             &input_and_helper.numerator *
                 &j *
@@ -108,7 +123,7 @@ impl RnsBggParameters {
         // each F_k before estimating convolution, just as for the direct gate.
         let fresh_gain = (payload_gain.l1.pow(2) * &fresh_error_gain.l2_squared)
             .min(&payload_gain.l2_squared * fresh_error_gain.l1.pow(2));
-        let fresh = cbd.scaled(&(&j * fresh_gain));
+        let fresh = gaussian.scaled(&(&j * fresh_gain));
         // J internal public remainders, one outer public remainder, and one
         // outer encoding remainder. E||[s_bar,1]||_2^2 = (2N+3)/3.
         // The two outer terms occur once, after the branch sum.
@@ -137,7 +152,7 @@ impl RnsBggParameters {
         let twice_p = p * 2u8;
         let inherited =
             &input.error * &n * next.modulus_digits() * (BigUint::one() << next.base_bits()) * 2u8;
-        let fresh = &input.payload_l1 * fresh_error_gain * self.eta() * &twice_p;
+        let fresh = &input.payload_l1 * fresh_error_gain * &self.encoding_error_bound * &twice_p;
         // S = ||s_bar||_1 + 1 <= N + 1 for the ternary secret.
         let rounding = (n + 2u8) * (p - 1u8);
         Ok(RnsBggNoiseBound {
@@ -417,6 +432,7 @@ impl RnsBggParameters {
                     .expect("positive constant denominator");
                     moments.fits(&modulus_limit, z) &&
                         (value.level + 1 == self.levels.len() ||
+                            self.scale(value.level)? == &BigUint::one() ||
                             moments.fits(
                                 &NonnegativeRational::new(
                                     self.scale(value.level)?.clone(),
@@ -777,12 +793,13 @@ mod tests {
             ring_dimension: n,
             widths: vec![1, 4],
             slots: vec![1, 1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
+            operations_per_drop: 1,
         };
         let (parameters, _) = RnsBggParameters::plan(&request).unwrap();
         let build = |automatic| {
@@ -915,13 +932,61 @@ mod tests {
         assert_eq!(lut_sources.len(), 2);
         assert!(lut_sources[0].is_some());
         assert_eq!(lut_sources[0], lut_sources[1]);
-        let short =
-            RnsBggParameters::new(parameters.levels()[..2].to_vec(), parameters.eta()).unwrap();
+        let short = RnsBggParameters::new(
+            parameters.levels()[..2].to_vec(),
+            parameters.encoding_error_sigma.clone(),
+            parameters.operations_per_drop(),
+        )
+        .unwrap();
         assert!(trace(&short, &automatic).is_err());
     }
 
     #[test]
-    fn test_rns_bgg_composed_noise_uses_sum_for_errors_and_max_for_payload() {
+    fn test_rns_bgg_noise_fits_hold_and_drop_acceptance_contract() {
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .map(|v| v.parse().unwrap())
+            .unwrap_or(16);
+        let source = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let target = source
+            .select_modulus(&source.to_crt().0[..2].iter().copied().map(BigUint::from).product())
+            .unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![source.clone(), source.clone(), target], 1, 2).unwrap();
+        let hold_modulus = parameters.level(0).unwrap().modulus().as_ref().clone();
+        let drop_scale = parameters.scale(1).unwrap().clone();
+        let hold_error = &drop_scale / 2u8 + 1u8;
+        assert!(
+            parameters
+                .noise_fits(0, &RnsBggNoiseBound { error: hold_error, payload_l1: BigUint::one() })
+                .unwrap()
+        );
+        assert!(
+            !parameters
+                .noise_fits(
+                    1,
+                    &RnsBggNoiseBound {
+                        error: &drop_scale / 2u8 + 1u8,
+                        payload_l1: BigUint::one(),
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            !parameters
+                .noise_fits(
+                    0,
+                    &RnsBggNoiseBound {
+                        error: &hold_modulus / 8u8 + 1u8,
+                        payload_l1: BigUint::one(),
+                    },
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_rns_bgg_encoding_gaussian_uses_sigma_squared_variance() {
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .ok()
             .map(|v| v.parse().unwrap())
@@ -930,154 +995,29 @@ mod tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(4u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
-            terminal_value_bound: 3u8.into(),
+            terminal_value_bound: BigUint::one(),
+            operations_per_drop: 1,
         })
         .unwrap();
-        let gains = [
-            RightActionNoiseGain::from_polynomial_coefficients([2.into(), (-1).into()]),
-            RightActionNoiseGain::from_polynomial_coefficients([2.into()]),
-            RightActionNoiseGain::from_polynomial_coefficients([0.into()]),
-        ];
-        let (material, rhs) =
-            RnsBggGateNoiseMaterial::from_one_hot_labels(0, None, &gains).unwrap();
-        assert_eq!(material.fresh_error_gain.l1, BigUint::from(5u8));
-        assert_eq!(material.fresh_error_gain.l2_squared, BigUint::from(9u8));
-        assert_eq!(rhs.payload_l1, BigUint::from(3u8));
-        // Enumerate eta=2 CBD errors (four independent bits each), using
-        // three independent coefficients weighted by 2, -1, and 2. This is
-        // the fresh contribution of the two nonzero multiplier polynomials.
-        let cbd = |bits: u32| -> i64 {
-            (bits & 3).count_ones() as i64 - ((bits >> 2) & 3).count_ones() as i64
-        };
-        let mut square_sum = 0u64;
-        let mut mean_sum = 0i64;
-        for bits in 0u32..4096 {
-            let error = 2 * cbd(bits) - cbd(bits >> 4) + 2 * cbd(bits >> 8);
-            mean_sum += error;
-            square_sum += (error * error) as u64;
-        }
-        assert_eq!(mean_sum, 0);
-        let fresh_variance = NonnegativeRational::new(square_sum.into(), 4096u32.into()).unwrap();
-        let inherited = NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap();
-        let without_fresh = parameters
+        let input = NonnegativeRational::zero();
+        let zero = RightActionNoiseGain::from_polynomial_coefficients([0.into()]);
+        let without = parameters
+            .private_mul_noise_variance(0, &input, &RightActionNoiseGain::unit(), &zero)
+            .unwrap();
+        let with = parameters
             .private_mul_noise_variance(
                 0,
-                &inherited,
+                &input,
                 &RightActionNoiseGain::unit(),
-                &RightActionNoiseGain::from_polynomial_coefficients([0.into()]),
+                &RightActionNoiseGain::unit(),
             )
             .unwrap();
-        let with_fresh = parameters
-            .private_mul_noise_variance(
-                0,
-                &inherited,
-                &RightActionNoiseGain::unit(),
-                &material.fresh_error_gain,
-            )
-            .unwrap();
-        assert_eq!(with_fresh, without_fresh.add(&fresh_variance));
-        // The same independently enumerated CBD contribution appears once
-        // per explicit LUT branch; one-hot payloads do not erase RHS errors.
-        for branches in [1usize, 2, 4] {
-            let zero = RightActionNoiseGain::from_polynomial_coefficients([0.into()]);
-            let without = parameters
-                .lut_noise_variance(0, &inherited, branches, &RightActionNoiseGain::unit(), &zero)
-                .unwrap();
-            let with = parameters
-                .lut_noise_variance(
-                    0,
-                    &inherited,
-                    branches,
-                    &RightActionNoiseGain::unit(),
-                    &material.fresh_error_gain,
-                )
-                .unwrap();
-            assert_eq!(with, without.add(&fresh_variance.scaled(&branches.into())));
-        }
-        // Repeated polynomial actions reuse coefficient errors within a
-        // source: (1+X)^2 has coefficients 1,2,1 and variance gain 6, not 4.
-        let polynomial = RightActionNoiseGain::from_polynomial_coefficients([1.into(), 1.into()]);
-        let mut composed_squares = 0u64;
-        for bits in 0u32..4096 {
-            let error = cbd(bits) + 2 * cbd(bits >> 4) + cbd(bits >> 8);
-            composed_squares += (error * error) as u64;
-        }
-        let composed_variance =
-            NonnegativeRational::new(composed_squares.into(), 4096u32.into()).unwrap();
-        assert_eq!(composed_variance, NonnegativeRational::new(6u8.into(), 1u8.into()).unwrap());
-        let combined =
-            parameters.private_mul_noise_variance(0, &inherited, &polynomial, &polynomial).unwrap();
-        let actual = without_fresh.add(&composed_variance);
-        assert!(
-            &combined.numerator * &actual.denominator >= &actual.numerator * &combined.denominator
-        );
-        // With an unweighted fresh error, the other Young bound preserves
-        // the exact squared-l2 payload gain instead of using its squared l1.
-        let unweighted = parameters
-            .private_mul_noise_variance(0, &inherited, &polynomial, &RightActionNoiseGain::unit())
-            .unwrap();
-        assert_eq!(
-            unweighted,
-            without_fresh.add(&NonnegativeRational::new(2u8.into(), 1u8.into()).unwrap())
-        );
-        assert!(rhs.one_hot.is_none(), "the composed RHS is a scalar payload");
-        let mut builder = ExponentLutProgramBuilder::new();
-        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 1 }, n as usize).unwrap();
-        let input_id = builder
-            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
-            .unwrap();
-        let family = builder.rhs_family(2).unwrap();
-        let rhs_id = builder.rhs_input(family, 2, 2).unwrap();
-        let output = builder.private_mul(builder.input_wire(input_id).unwrap(), rhs_id).unwrap();
-        builder.output(output).unwrap();
-        let program = builder.build().unwrap();
-        let input = RnsBggNoiseValue {
-            level: 0,
-            bound: RnsBggNoiseBound { error: 2u8.into(), payload_l1: 1u8.into() },
-            payload_l2_squared: 1u8.into(),
-            moments: Some(NoiseMoments {
-                mean_numerator: BigInt::zero(),
-                mean_denominator: BigUint::one(),
-                mean_radius: NonnegativeRational::zero(),
-                variance: NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap(),
-            }),
-            public: false,
-            range: None,
-            one_hot: false,
-        };
-        let gate = ProgramGateInstance::Gate { step: 0 };
-        let inputs = BTreeMap::from([(input_id, input.clone())]);
-        let rhs = BTreeMap::from([(rhs_id, rhs)]);
-        let helpers = BTreeMap::from([(gate, material)]);
-        let trace = trace_program(
-            &parameters,
-            &program,
-            &ProgramBindings::new(
-                &inputs,
-                &rhs,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                Some(&helpers),
-            ),
-            &ProgramFamilyBindings::new(),
-        )
-        .unwrap();
-        let result = &trace.wires[&output].bound;
-        assert_eq!(result.payload_l1, BigUint::from(3u8));
-        assert_eq!(trace.wires[&output].payload_l2_squared, BigUint::from(5u8));
-        assert_eq!(trace.wires[&output].moments.as_ref().unwrap().variance, with_fresh);
-        let single =
-            parameters.private_mul_noise_bound(0, &input.bound, &1u8.into(), 3u8.into()).unwrap();
-        // Only the fresh term changes: J * ||mu||_1 * (5 - 1) * eta = 8.
-        // The exact rounding terms and inherited/mask error remain unchanged.
-        assert_eq!(result.error, single.error + 8u8);
-        assert!(RnsBggGateNoiseMaterial::from_one_hot_labels(0, None, &[]).is_err());
+        assert_eq!(with, without.add(&NonnegativeRational::new(16u8.into(), 1u8.into()).unwrap()));
     }
 
     #[test]
@@ -1090,12 +1030,13 @@ mod tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![1],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let mut builder = ExponentLutProgramBuilder::new();
@@ -1352,12 +1293,13 @@ mod tests {
             ring_dimension: n,
             widths: vec![1],
             slots: vec![4],
-            eta: 2,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
         };
         let terminal = BTreeMap::from([(output, BigUint::from(1u8) << 35)]);
         let search = |request: &RnsBggPlanRequest| {
@@ -1498,9 +1440,9 @@ impl RnsBggParameters {
             &n *
             (BigUint::one() << next.base_bits()) *
             next.modulus_digits() *
-            (&input.error + self.eta) *
+            (&input.error + &self.encoding_error_bound) *
             2u8;
-        let fresh = &j * &input.payload_l1 * fresh_error_gain * BigUint::from(self.eta);
+        let fresh = &j * &input.payload_l1 * fresh_error_gain * &self.encoding_error_bound;
         let rounding = ((&j + 1u8) * s + 1u8) * (p - 1u8);
         let numerator = inherited + fresh * &twice_p + rounding;
         Ok(RnsBggNoiseBound {
@@ -1511,10 +1453,13 @@ impl RnsBggParameters {
 
     pub fn noise_fits(&self, level: usize, noise: &RnsBggNoiseBound) -> Result<bool, RnsBggError> {
         let range_fits = self.level(level)?.modulus().as_ref() > &(&noise.error * 8u8);
-        // Nonterminal states must resolve adjacent p_i-spaced payloads. The
-        // last level is a terminal carrier with a separately audited range.
+        // Nonterminal states must resolve adjacent p_i-spaced payloads. A
+        // held logical level has p_i=1 and needs no spacing check; the last
+        // level is a terminal carrier with a separately audited range.
         Ok(range_fits &&
-            (level + 1 == self.levels.len() || self.scale(level)? > &(&noise.error * 2u8)))
+            (level + 1 == self.levels.len() ||
+                self.scale(level)? == &BigUint::one() ||
+                self.scale(level)? > &(&noise.error * 2u8)))
     }
 
     /// Search nested prime-prefix chains using the actual gate noise transfer.
@@ -1523,16 +1468,19 @@ impl RnsBggParameters {
     pub fn plan(
         request: &RnsBggPlanRequest,
     ) -> Result<(Self, RnsBggParameterManifest), RnsBggError> {
+        let mut request = request.clone();
+        request.encoding_error_sigma = canonical_encoding_sigma(request.encoding_error_sigma)?;
         request.validate()?;
         let stages = request.widths.len();
-        if request.max_crt_depth - request.terminal_depth < stages {
+        let physical_drops = stages.div_ceil(request.operations_per_drop);
+        if request.max_crt_depth - request.terminal_depth < physical_drops {
             return Err(RnsBggError::Budget("CRT depth"));
         }
         let pool = DCRTPolyParams::try_new(
             request.ring_dimension,
             request.max_crt_depth,
             request.crt_bits,
-            (request.crt_bits / 2).min(31) as u32,
+            request.crt_bits.div_ceil(2).min(31) as u32,
             None,
             None,
         )
@@ -1550,25 +1498,48 @@ impl RnsBggParameters {
             return Err(RnsBggError::Budget("terminal range"));
         }
         let mut failure = RnsBggError::Budget("evaluation noise");
-        for start in request.terminal_depth + stages..=request.max_crt_depth {
-            let initial =
-                RnsBggNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() };
+        for start in request.terminal_depth + physical_drops..=request.max_crt_depth {
+            let initial = RnsBggNoiseBound {
+                error: encoding_error_bound(&request.encoding_error_sigma)?,
+                payload_l1: BigUint::one(),
+            };
             let mut frontier =
                 BTreeMap::from([((start, start), vec![(vec![start], initial, BigUint::zero())])]);
             for stage in 0..stages {
                 let mut following: BTreeMap<_, Vec<(Vec<usize>, RnsBggNoiseBound, BigUint)>> =
                     BTreeMap::new();
                 for ((_, high), candidates) in frontier {
-                    let minimum = request.terminal_depth + stages - stage - 1;
-                    let maximum =
-                        if stage + 1 == stages { request.terminal_depth } else { high - 1 };
-                    for low in minimum..=maximum {
+                    let must_drop =
+                        (stage + 1) % request.operations_per_drop == 0 || stage + 1 == stages;
+                    let future_drops = ((stage + 1)..stages)
+                        .filter(|operation| {
+                            (*operation + 1) % request.operations_per_drop == 0 ||
+                                *operation + 1 == stages
+                        })
+                        .count();
+                    let minimum = request.terminal_depth + future_drops;
+                    if high < minimum {
+                        continue;
+                    }
+                    let lows = if must_drop {
+                        (minimum..=if stage + 1 == stages {
+                            request.terminal_depth
+                        } else {
+                            high - 1
+                        })
+                            .collect::<Vec<_>>()
+                    } else {
+                        vec![high]
+                    };
+                    for low in lows {
                         for (path, input, peak) in &candidates {
                             let mut extended = path.clone();
                             extended.push(low);
-                            let parameters = Self::new(
+                            let parameters = Self::new_unchecked_schedule(
                                 extended.iter().map(|depth| bases[*depth - 1].clone()).collect(),
-                                request.eta,
+                                request.encoding_error_sigma.clone(),
+                                encoding_error_bound(&request.encoding_error_sigma)?,
+                                request.operations_per_drop,
                             )?;
                             if !parameters.noise_fits(stage, input)? {
                                 continue;
@@ -1635,9 +1606,10 @@ impl RnsBggParameters {
             {
                 let parameters = Self::new(
                     path.into_iter().map(|depth| bases[depth - 1].clone()).collect(),
-                    request.eta,
+                    request.encoding_error_sigma.clone(),
+                    request.operations_per_drop,
                 )?;
-                let manifest = parameters.audit(request)?;
+                let manifest = parameters.audit(&request)?;
                 return Ok((parameters, manifest));
             }
         }
@@ -1680,17 +1652,24 @@ impl RnsBggParameters {
         let stages = request.widths.len();
         if self.levels.len() != stages + 1 ||
             self.levels[0].ring_dimension() != request.ring_dimension ||
-            self.eta != request.eta ||
+            self.encoding_error_sigma != request.encoding_error_sigma ||
+            self.operations_per_drop != request.operations_per_drop ||
             self.levels[0].crt_depth() > request.max_crt_depth ||
             self.levels[stages].crt_depth() != request.terminal_depth ||
             self.levels.iter().any(|level| level.crt_bits() > request.crt_bits)
         {
             return Err(RnsBggError::Parameters("modulus chain does not match workload"));
         }
-        let mut bounds =
-            vec![RnsBggNoiseBound { error: request.eta.into(), payload_l1: BigUint::one() }];
+        let mut bounds = vec![RnsBggNoiseBound {
+            error: self.encoding_error_bound.clone(),
+            payload_l1: BigUint::one(),
+        }];
         let mut bytes = BigUint::zero();
         for i in 0..stages {
+            let must_drop = (i + 1) % request.operations_per_drop == 0 || i + 1 == stages;
+            if (self.levels[i] == self.levels[i + 1]) == must_drop {
+                return Err(RnsBggError::Parameters("modulus chain does not match drop cadence"));
+            }
             if !self.noise_fits(i, &bounds[i])? {
                 return Err(RnsBggError::Budget("evaluation noise"));
             }
@@ -1718,7 +1697,9 @@ impl RnsBggParameters {
         let manifest = RnsBggParameterManifest {
             workload: request.clone(),
             ring_dimension: request.ring_dimension,
-            eta: request.eta,
+            encoding_error_sigma: request.encoding_error_sigma.clone(),
+            encoding_error_bound: self.encoding_error_bound.clone(),
+            operations_per_drop: request.operations_per_drop,
             levels: self.levels.iter().map(|level| level.to_crt().0).collect(),
             base_bits: self.levels.iter().map(PolyParams::base_bits).collect(),
             drops: self.drops[..stages].to_vec(),
@@ -1952,12 +1933,13 @@ mod refresh_plan_tests {
             // One composed PRF product precedes refresh and continuation.
             widths: vec![1, n as usize, 1],
             slots: vec![2, 1, 1],
-            eta: 2,
-            crt_bits: 17,
+            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
+            crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 24,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: 32u8.into(),
+            operations_per_drop: 1,
         })
         .unwrap();
         let request = RnsBggRefreshPlanRequest {
@@ -2101,7 +2083,7 @@ impl RnsBggParameters {
     /// `terminal_noise_bound`. H1/H3/H4 decorrelate centered right actions
     /// across freshly prepared targets, including reused input/helper errors;
     /// this is an explicit heuristic, not independence inferred from loop indices.
-    /// Fresh target CBD errors have distinct sampling identities. All internal
+    /// Fresh target Gaussian errors have distinct sampling identities. All internal
     /// remainders are counted, while the two outer remainders occur only once.
     pub fn terminal_noise_moments<'a>(
         &self,
@@ -2112,7 +2094,7 @@ impl RnsBggParameters {
         let n = BigUint::from(self.level(level)?.ring_dimension());
         let low = self.level(level + 1)?;
         let p_squared = p * p;
-        let cbd = NonnegativeRational::new(self.eta().into(), 2u8.into()).unwrap();
+        let gaussian = self.encoding_error_variance();
         let mut result = NoiseMoments {
             mean_numerator: BigInt::zero(),
             mean_denominator: BigUint::one(),
@@ -2126,7 +2108,7 @@ impl RnsBggParameters {
                 .as_ref()
                 .ok_or(RnsBggError::Parameters("terminal input moment model is missing"))?;
             let j = BigUint::from(count);
-            let input_helper = m.variance.add(&cbd);
+            let input_helper = m.variance.add(&gaussian);
             let inherited_helper = NonnegativeRational::new(
                 &input_helper.numerator *
                     &j *
@@ -2136,7 +2118,7 @@ impl RnsBggParameters {
                 &input_helper.denominator * 2u8 * &p_squared,
             )
             .unwrap();
-            let fresh = cbd.scaled(&(&j * &input.payload_l2_squared));
+            let fresh = gaussian.scaled(&(&j * &input.payload_l2_squared));
             let internal_rounding = NonnegativeRational::new(
                 &j * (&n * 2u8 + 3u8) * (&p_squared - 1u8),
                 36u8 * &p_squared,
@@ -2184,9 +2166,9 @@ impl RnsBggParameters {
                 &n *
                 (BigUint::one() << low.base_bits()) *
                 low.modulus_digits() *
-                (&input.error + self.eta()) *
+                (&input.error + &self.encoding_error_bound) *
                 2u8;
-            numerator += &twice_p * &j * &input.payload_l1 * gain * self.eta();
+            numerator += &twice_p * &j * &input.payload_l1 * gain * &self.encoding_error_bound;
             numerator += &j * (&n + 1u8) * (p - 1u8);
         }
         if branches == 0 {

@@ -139,7 +139,7 @@ impl LutTable {
     /// Returns a stable commitment to this table's public contents and shape.
     /// Helper artifacts bind to this value, preventing accidental reuse across
     /// different tables with the same local LUT identifier or width.
-    pub(crate) fn commitment(&self) -> [u8; 32] {
+    pub fn commitment(&self) -> [u8; 32] {
         let bytes = serde_json::to_vec(self).expect("LutTable is serializable");
         let mut digest = Sha256::new();
         digest.update(b"mxx-exponent-lut/lut-table/v1");

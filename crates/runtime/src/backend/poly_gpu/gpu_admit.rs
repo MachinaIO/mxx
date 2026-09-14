@@ -101,6 +101,7 @@ pub struct GpuMatrixLayoutPlan {
     classes: Vec<GpuAllocationClass>,
     pub inputs: Vec<MatrixInputRequest>,
     invocations: Vec<MatrixInvocationGeometry>,
+    operations: Vec<PreparedOperation>,
 }
 
 struct MatrixInvocationGeometry {
@@ -186,6 +187,7 @@ impl GpuMatrixLayoutPlan {
     ) -> Result<Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>, GpuAdmissionError> {
         use std::collections::{BTreeMap, BTreeSet};
         let mut selected = Vec::<(GpuDCRTPolyParams, GpuPreparedRequest)>::new();
+        let mut extra = Vec::<(GpuDCRTPolyParams, GpuTracedClaim)>::new();
         let mut seen = BTreeSet::<(usize, usize, (u64, u64, usize))>::new();
         let mut add =
             |device: usize, parameters: GpuDCRTPolyParams, request: GpuPreparedRequest| {
@@ -237,6 +239,53 @@ impl GpuMatrixLayoutPlan {
                     }
                 }
             }
+            if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } =
+                &self.operations[index]
+            {
+                let widths = fit.widths();
+                for region in fit.regions() {
+                    let parameters = requirements
+                        .outputs
+                        .iter()
+                        .find(|output| output.interval.device == region.device)
+                        .map(|output| output.sources.parameters.clone())
+                        .or_else(|| {
+                            requirements
+                                .resources
+                                .scratch
+                                .iter()
+                                .find(|scratch| scratch.device == region.device)
+                                .map(|scratch| scratch.parameters.clone())
+                        })
+                        .ok_or_else(|| {
+                            GpuAdmissionError::InvalidPlan(
+                                "preimage setup has no parameter context".into(),
+                            )
+                        })?;
+                    let width = if region.device == 0 { widths.gpu0 } else { widths.nonzero }
+                        .ok_or_else(|| {
+                            GpuAdmissionError::InvalidPlan(
+                                "preimage setup has no accepted device width".into(),
+                            )
+                        })?;
+                    extra.extend(
+                        plan.destination.iter().copied().map(|claim| (parameters.clone(), claim)),
+                    );
+                    extra.extend(
+                        plan.tile_claims(&parameters, *public_rows, width)
+                            .map_err(GpuAdmissionError::InvalidPlan)?
+                            .into_iter()
+                            .map(|claim| (parameters.clone(), claim)),
+                    );
+                    extra.extend(
+                        plan.attempt_claims(&parameters, *public_rows, width, ty.rows, bound)
+                            .map_err(GpuAdmissionError::InvalidPlan)?
+                            .into_iter()
+                            .flatten()
+                            .map(|claim| (parameters.clone(), claim)),
+                    );
+                }
+            }
         }
         let mut groups = BTreeMap::<ConcreteMatrixType, Vec<GpuTracedClaim>>::new();
         for (params, request) in selected {
@@ -264,6 +313,19 @@ impl GpuMatrixLayoutPlan {
                 },
                 columns: if request.kind() == GpuPreparedSlotKind::Matrix {
                     request.columns()
+                } else {
+                    1
+                },
+            };
+            groups.entry(ty).or_default().push(claim);
+        }
+        for (params, claim) in extra {
+            let ty = ConcreteMatrixType {
+                modulus: params.modulus().as_ref().clone().into(),
+                ring_dimension: params.ring_dimension() as usize,
+                rows: if claim.kind() == GpuPreparedSlotKind::Matrix { claim.rows() } else { 1 },
+                columns: if claim.kind() == GpuPreparedSlotKind::Matrix {
+                    claim.columns()
                 } else {
                     1
                 },
@@ -1295,7 +1357,13 @@ impl GpuDcrtBackend {
                 })
             })
             .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        Ok(GpuMatrixLayoutPlan { layouts, classes, inputs: preparation, invocations })
+        Ok(GpuMatrixLayoutPlan {
+            layouts,
+            classes,
+            inputs: preparation,
+            invocations,
+            operations: lowered.iter().map(|invocation| invocation.operation.clone()).collect(),
+        })
     }
 
     /// Begin one explicit benchmark class with no live invocation/output leases.
@@ -1742,6 +1810,7 @@ mod tests {
             classes: Vec::new(),
             inputs: requests,
             invocations: Vec::new(),
+            operations: Vec::new(),
         };
         let setup = plan.setup_claims(&[]).unwrap();
         assert_eq!(setup.len(), 1);

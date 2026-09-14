@@ -20,19 +20,20 @@ use crate::{
 };
 #[cfg(test)]
 use crate::{program::WireId, scheme::PreparedProgram};
+use bigdecimal::BigDecimal;
 use mxx_dsl::{
     Bytes, DslContext, DslError, Family, FamilyType, GraphValue, GraphValueSchema, HashTag, Int,
     Mat, MatType, Preimage, Ring,
 };
 use mxx_ir_core::{
-    IntExpr, ParamEnv, ValueHandle,
+    IntExpr, ParamEnv, Rational, RealExpr, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     types::{MatrixType, WireType},
 };
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use noise::RnsBggNoiseValue;
 use num_bigint::{BigInt, BigUint};
-use num_traits::One;
+use num_traits::{One, Zero};
 pub use public_key::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -355,7 +356,9 @@ impl ExponentLUTFixedRhsScheme for RnsBggScheme {
 pub struct RnsBggParameters {
     levels: Vec<DCRTPolyParams>,
     drops: Vec<BigUint>,
-    eta: usize,
+    encoding_error_sigma: BigDecimal,
+    encoding_error_bound: BigUint,
+    operations_per_drop: usize,
 }
 
 /// Public workload inputs, independent of secret values and sampled noise.
@@ -364,12 +367,15 @@ pub struct RnsBggPlanRequest {
     pub ring_dimension: u32,
     pub widths: Vec<usize>,
     pub slots: Vec<usize>,
-    pub eta: usize,
+    #[serde(with = "bigdecimal_string")]
+    pub encoding_error_sigma: BigDecimal,
     pub crt_bits: usize,
     pub terminal_depth: usize,
     pub max_crt_depth: usize,
     pub memory_budget_bytes: u64,
     pub terminal_value_bound: BigUint,
+    /// Number of logical MulPrivate/LUT operations between physical drops.
+    pub operations_per_drop: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -396,7 +402,10 @@ impl RnsBggNoiseBound {
 pub struct RnsBggParameterManifest {
     pub workload: RnsBggPlanRequest,
     pub ring_dimension: u32,
-    pub eta: usize,
+    #[serde(with = "bigdecimal_string")]
+    pub encoding_error_sigma: BigDecimal,
+    pub encoding_error_bound: BigUint,
+    pub operations_per_drop: usize,
     pub levels: Vec<Vec<u64>>,
     pub base_bits: Vec<u32>,
     pub drops: Vec<BigUint>,
@@ -407,8 +416,67 @@ pub struct RnsBggParameterManifest {
     pub security_certified: bool,
 }
 
+mod bigdecimal_string {
+    use bigdecimal::BigDecimal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::str::FromStr;
+
+    pub fn serialize<S: Serializer>(value: &BigDecimal, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&value.normalized().to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BigDecimal, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        BigDecimal::from_str(&value)
+            .map(|value| value.normalized())
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn canonical_encoding_sigma(sigma: BigDecimal) -> Result<BigDecimal, RnsBggError> {
+    let sigma = sigma.normalized();
+    let (_, exponent) = sigma.as_bigint_and_exponent();
+    if sigma <= BigDecimal::zero() ||
+        exponent > i64::from(u32::MAX) ||
+        exponent < -i64::from(u32::MAX)
+    {
+        return Err(RnsBggError::Parameters("encoding_error_sigma must be positive"));
+    }
+    Ok(sigma)
+}
+
+fn encoding_error_bound(sigma: &BigDecimal) -> Result<BigUint, RnsBggError> {
+    let bound = std::panic::catch_unwind(|| {
+        mxx_primitives::sampler::bounds::hard_cutoff_from_sigma_bound(sigma)
+    })
+    .map_err(|_| RnsBggError::Parameters("encoding_error_sigma is unrepresentable"))?;
+    if bound.is_zero() {
+        return Err(RnsBggError::Parameters("encoding_error_sigma derives a zero cutoff"));
+    }
+    Ok(bound)
+}
+
 impl RnsBggParameters {
-    pub fn new(levels: Vec<DCRTPolyParams>, eta: usize) -> Result<Self, RnsBggError> {
+    pub fn new(
+        levels: Vec<DCRTPolyParams>,
+        encoding_error_sigma: impl Into<BigDecimal>,
+        operations_per_drop: usize,
+    ) -> Result<Self, RnsBggError> {
+        let sigma = canonical_encoding_sigma(encoding_error_sigma.into())?;
+        let bound = encoding_error_bound(&sigma)?;
+        let parameters = Self::new_unchecked_schedule(levels, sigma, bound, operations_per_drop)?;
+        parameters.validate_schedule()?;
+        Ok(parameters)
+    }
+
+    fn new_unchecked_schedule(
+        levels: Vec<DCRTPolyParams>,
+        encoding_error_sigma: BigDecimal,
+        encoding_error_bound: BigUint,
+        operations_per_drop: usize,
+    ) -> Result<Self, RnsBggError> {
+        if operations_per_drop == 0 {
+            return Err(RnsBggError::Parameters("operations_per_drop must be positive"));
+        }
         let first = levels.first().ok_or(RnsBggError::Parameters("empty modulus chain"))?;
         if levels.len() < 2 {
             return Err(RnsBggError::Parameters("need a modulus transition"));
@@ -420,15 +488,33 @@ impl RnsBggParameters {
         }
         let mut drops = Vec::with_capacity(levels.len());
         for pair in levels.windows(2) {
+            if pair[0] == pair[1] {
+                drops.push(BigUint::one());
+                continue;
+            }
             let source = pair[0].to_crt().0;
             let target = pair[1].to_crt().0;
             if target.len() >= source.len() || target.iter().any(|p| !source.contains(p)) {
-                return Err(RnsBggError::Parameters("levels must be strictly nested prime bases"));
+                return Err(RnsBggError::Parameters(
+                    "levels must be equal or strictly nested prime bases",
+                ));
             }
             drops.push(pair[0].modulus().as_ref() / pair[1].modulus().as_ref());
         }
         drops.push(BigUint::one());
-        Ok(Self { levels, drops, eta })
+        Ok(Self { levels, drops, encoding_error_sigma, encoding_error_bound, operations_per_drop })
+    }
+
+    fn validate_schedule(&self) -> Result<(), RnsBggError> {
+        let stages = self.levels.len() - 1;
+        for (operation, pair) in self.levels.windows(2).enumerate() {
+            let must_drop =
+                (operation + 1) % self.operations_per_drop == 0 || operation + 1 == stages;
+            if (pair[0] == pair[1]) == must_drop {
+                return Err(RnsBggError::Parameters("modulus chain does not match drop cadence"));
+            }
+        }
+        Ok(())
     }
 
     pub fn levels(&self) -> &[DCRTPolyParams] {
@@ -465,13 +551,37 @@ impl RnsBggParameters {
         self.level(level)?;
         Ok(self.levels.get(level + 1).map_or(1, PolyParams::modulus_digits))
     }
-    pub fn eta(&self) -> usize {
-        self.eta
+    pub fn encoding_error_sigma_expr(&self) -> RealExpr {
+        let (integer, exponent) = self.encoding_error_sigma.as_bigint_and_exponent();
+        if exponent >= 0 {
+            let denominator = BigInt::from(10u8).pow(exponent as u32);
+            RealExpr::Rational(Rational::new(integer, denominator).expect("positive denominator"))
+        } else {
+            RealExpr::Rational(
+                Rational::new(
+                    integer * BigInt::from(10u8).pow((-exponent) as u32),
+                    BigInt::from(1u8),
+                )
+                .expect("positive denominator"),
+            )
+        }
+    }
+    pub fn encoding_error_sigma(&self) -> &BigDecimal {
+        &self.encoding_error_sigma
+    }
+    pub fn encoding_error_bound(&self) -> &BigUint {
+        &self.encoding_error_bound
+    }
+    pub fn operations_per_drop(&self) -> usize {
+        self.operations_per_drop
     }
 }
 
 impl RnsBggPlanRequest {
     fn validate(&self) -> Result<(), RnsBggError> {
+        if self.operations_per_drop == 0 {
+            return Err(RnsBggError::Parameters("operations_per_drop must be positive"));
+        }
         let stages = self.widths.len();
         if stages == 0 ||
             self.slots.len() != stages ||
@@ -479,7 +589,7 @@ impl RnsBggPlanRequest {
             self.widths.iter().any(|w| !w.is_power_of_two() || *w > self.ring_dimension as usize) ||
             self.terminal_depth == 0 ||
             self.max_crt_depth < self.terminal_depth ||
-            self.eta == 0
+            canonical_encoding_sigma(self.encoding_error_sigma.clone()).is_err()
         {
             return Err(RnsBggError::Parameters("invalid public workload"));
         }
@@ -500,8 +610,13 @@ impl RnsBggParameterManifest {
     /// This verifies arithmetic consistency, not artifact authenticity.
     pub fn validate(&self) -> Result<RnsBggParameters, RnsBggError> {
         self.workload.validate()?;
+        let workload_sigma = canonical_encoding_sigma(self.workload.encoding_error_sigma.clone())?;
+        let manifest_sigma = canonical_encoding_sigma(self.encoding_error_sigma.clone())?;
         if self.ring_dimension != self.workload.ring_dimension ||
-            self.eta != self.workload.eta ||
+            self.encoding_error_sigma != manifest_sigma ||
+            self.encoding_error_sigma != workload_sigma ||
+            self.encoding_error_bound != encoding_error_bound(&workload_sigma)? ||
+            self.operations_per_drop != self.workload.operations_per_drop ||
             self.levels.len() != self.workload.widths.len() + 1 ||
             self.base_bits.len() != self.levels.len() ||
             self.levels
@@ -528,7 +643,22 @@ impl RnsBggParameterManifest {
                 .map_err(|_| RnsBggError::Parameters("invalid manifest prime basis"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let parameters = RnsBggParameters::new(levels, self.eta)?;
+        let parameters = RnsBggParameters::new(
+            levels,
+            self.encoding_error_sigma.clone(),
+            self.workload.operations_per_drop,
+        )?;
+        if parameters.encoding_error_bound != self.encoding_error_bound {
+            return Err(RnsBggError::Parameters("manifest encoding error cutoff mismatch"));
+        }
+        let stages = self.workload.widths.len();
+        for (operation, pair) in parameters.levels.windows(2).enumerate() {
+            let must_drop =
+                (operation + 1) % self.workload.operations_per_drop == 0 || operation + 1 == stages;
+            if (pair[0] == pair[1]) == must_drop {
+                return Err(RnsBggError::Parameters("manifest levels do not match drop cadence"));
+            }
+        }
         if parameters.audit(&self.workload)? != *self {
             return Err(RnsBggError::Parameters(
                 "manifest certificate does not match workload and bases",
@@ -551,12 +681,13 @@ mod parameter_tests {
                 .unwrap_or(16),
             widths: vec![1],
             slots: vec![1],
-            eta: 1,
-            crt_bits: 17,
+            encoding_error_sigma: BigDecimal::from(1u8),
+            crt_bits: 16,
             terminal_depth: 1,
             max_crt_depth: 16,
             memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::one(),
+            operations_per_drop: 1,
         }
     }
 
@@ -568,6 +699,7 @@ mod parameter_tests {
         let restored = decoded.validate().unwrap();
         assert_eq!(decoded, manifest);
         assert_eq!(restored.drops, parameters.drops);
+        assert_eq!(parameters.encoding_error_bound, BigUint::from(6u8));
         for (actual, expected) in restored.levels.iter().zip(&parameters.levels) {
             assert_eq!(actual.to_crt(), expected.to_crt());
             assert_eq!(actual.modulus(), expected.modulus());
@@ -607,7 +739,10 @@ mod parameter_tests {
         changed.ring_dimension *= 2;
         invalid.push(changed);
         let mut changed = manifest.clone();
-        changed.eta += 1;
+        changed.encoding_error_sigma = BigDecimal::from(2u8);
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.operations_per_drop += 1;
         invalid.push(changed);
         for (index, changed) in invalid.into_iter().enumerate() {
             assert!(changed.validate().is_err(), "accepted altered certificate {index}");
@@ -615,21 +750,50 @@ mod parameter_tests {
     }
 
     #[test]
-    fn test_rns_bgg_planner_supports_long_chain_without_modulus_sized_drops() {
+    fn test_rns_bgg_encoding_sigma_contract_and_manifest_tamper_detection() {
         let mut workload = request();
-        workload.widths = vec![1; 21];
-        workload.slots = vec![1; 21];
-        workload.max_crt_depth = workload.terminal_depth + workload.widths.len();
+        workload.encoding_error_sigma = "4.0".parse().unwrap();
         let (parameters, manifest) = RnsBggParameters::plan(&workload).unwrap();
-        // With exactly one prime available per step, the old output-modulus
-        // threshold could not construct this chain. All new gate bounds must
-        // still fit their actual next-state spacing and terminal modulus.
-        assert_eq!(parameters.level(0).unwrap().crt_depth(), workload.max_crt_depth);
-        assert!(manifest.base_bits.iter().all(|bits| *bits > 1));
-        for (level, bound) in manifest.noise_bounds.iter().enumerate() {
-            assert!(parameters.noise_fits(level, bound).unwrap());
-        }
-        manifest.validate().unwrap();
+        assert_eq!(parameters.encoding_error_sigma.to_string(), "4");
+        assert_eq!(parameters.encoding_error_bound, BigUint::from(26u8));
+        assert_eq!(manifest.encoding_error_bound, BigUint::from(26u8));
+
+        let mut changed = manifest.clone();
+        changed.encoding_error_sigma = "4.1".parse().unwrap();
+        assert!(changed.validate().is_err());
+        let mut changed = manifest;
+        changed.encoding_error_bound = BigUint::from(25u8);
+        assert!(changed.validate().is_err());
+        assert!(
+            RnsBggParameters::new(
+                parameters.levels().to_vec(),
+                "0.01".parse::<BigDecimal>().unwrap(),
+                1,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_rns_bgg_parameter_identity_binds_canonical_sigma_and_cutoff() {
+        let base = request();
+        let levels = RnsBggParameters::plan(&base).unwrap().0.levels().to_vec();
+        let four = RnsBggScheme::new(
+            RnsBggParameters::new(levels.clone(), BigDecimal::from(4u8), 1).unwrap(),
+            [7u8; 32],
+        );
+        let four_point_zero = RnsBggScheme::new(
+            RnsBggParameters::new(levels.clone(), "4.0".parse::<BigDecimal>().unwrap(), 1).unwrap(),
+            [7u8; 32],
+        );
+        let four_point_one = RnsBggScheme::new(
+            RnsBggParameters::new(levels, "4.1".parse::<BigDecimal>().unwrap(), 1).unwrap(),
+            [7u8; 32],
+        );
+        assert_eq!(four.parameter_identity(), four_point_zero.parameter_identity());
+        assert_ne!(four.parameter_identity(), four_point_one.parameter_identity());
+        assert_eq!(four.parameters().encoding_error_bound, BigUint::from(26u8));
+        assert_eq!(four_point_one.parameters().encoding_error_bound, BigUint::from(26u8));
     }
 
     #[test]
@@ -652,6 +816,47 @@ mod parameter_tests {
         assert!(matches!(
             RnsBggParameters::plan(&changed),
             Err(RnsBggError::Budget("evaluation noise"))
+        ));
+    }
+
+    #[test]
+    fn test_rns_bgg_cadence_repeats_bases_and_rejects_invalid_schedule() {
+        let mut workload = request();
+        workload.widths = vec![1; 3];
+        workload.slots = vec![1; 3];
+        workload.operations_per_drop = 2;
+        let (parameters, manifest) = RnsBggParameters::plan(&workload).unwrap();
+        assert_eq!(parameters.operations_per_drop(), 2);
+        assert_eq!(parameters.levels()[0], parameters.levels()[1]);
+        assert_ne!(parameters.levels()[1], parameters.levels()[2]);
+        assert_ne!(parameters.levels()[2], parameters.levels()[3]);
+        assert_eq!(parameters.scale(0).unwrap(), &BigUint::one());
+        manifest.validate().unwrap();
+
+        let mut invalid = manifest;
+        invalid.levels[2] = invalid.levels[1].clone();
+        assert!(invalid.validate().is_err());
+
+        workload.operations_per_drop = 0;
+        assert!(matches!(
+            RnsBggParameters::plan(&workload),
+            Err(RnsBggError::Parameters("operations_per_drop must be positive"))
+        ));
+
+        let mut short = request();
+        short.widths = vec![1; 2];
+        short.slots = vec![1; 2];
+        short.operations_per_drop = 3;
+        let (short_parameters, _) = RnsBggParameters::plan(&short).unwrap();
+        assert_eq!(short_parameters.levels()[0], short_parameters.levels()[1]);
+        assert_ne!(short_parameters.levels()[1], short_parameters.levels()[2]);
+
+        let n = workload.ring_dimension;
+        let source = DCRTPolyParams::new(n, 2, 17, 4, None, None);
+        let target = DCRTPolyParams::new(n, 2, 17, 3, Some(source.to_crt().0), None);
+        assert!(matches!(
+            RnsBggParameters::new(vec![source, target], 1, 2),
+            Err(RnsBggError::Parameters("levels must be equal or strictly nested prime bases"))
         ));
     }
 }
@@ -785,6 +990,9 @@ impl<const R: usize, const C: usize> Blocks<R, C> {
     }
     pub fn block_mod_switch(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
+        if self.entries[0][0].matrix_type().modulus == modulus {
+            return self;
+        }
         self.map(|value| value.block_mod_switch(modulus.clone(), 1))
     }
 }
@@ -1170,6 +1378,7 @@ pub struct RnsBggScheme {
     parameter_identity: std::sync::OnceLock<[u8; 32]>,
     parameters: Arc<RnsBggParameters>,
     pub(crate) context: [u8; 32],
+    encoding_errors_noiseless: bool,
 }
 
 impl RnsBggPublicKey {
@@ -1217,7 +1426,16 @@ impl RnsBggScheme {
             parameter_identity: std::sync::OnceLock::new(),
             parameters: Arc::new(parameters),
             context,
+            encoding_errors_noiseless: false,
         }
+    }
+    /// Construct a scheme with encoding noise disabled for isolated diagnostics.
+    /// This does not alter parameter identity or any production constructor.
+    #[cfg(feature = "test-utils")]
+    pub fn new_noiseless_for_testing(parameters: RnsBggParameters, context: [u8; 32]) -> Self {
+        let mut scheme = Self::new(parameters, context);
+        scheme.encoding_errors_noiseless = true;
+        scheme
     }
     pub fn parameters(&self) -> &RnsBggParameters {
         &self.parameters

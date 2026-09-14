@@ -7,6 +7,7 @@
 pub mod bgg;
 pub mod layout;
 pub mod lean;
+pub mod nand_circuit;
 pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
@@ -16,9 +17,10 @@ pub mod scheme;
 mod utils;
 
 pub use layout::{ExpLayout, LayoutError};
+pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
 pub use program::{
     AttributeKnowledge, FamilyAggregation, FamilyProgram, FamilyRhsSource, FamilyWireSource, Gate,
-    ProgramFamilyId, ProgramStep, ProgramWireType, RhsId, WireFamilyId, WireId,
+    ProgramFamilyId, ProgramInputId, ProgramStep, ProgramWireType, RhsId, WireFamilyId, WireId,
 };
 use thiserror::Error;
 

@@ -48,6 +48,14 @@ use std::{
 #[derive(Clone, Copy)]
 pub enum GpuColumnWidthPolicy<'a> {
     Native(GpuAllocationClass),
+    /// Recreate a previously selected native width vector exactly. The
+    /// allocation class supplies the operation's native resource bounds;
+    /// `widths` supplies the frozen per-device capacities from the original
+    /// admission.
+    NativeExact {
+        class: GpuAllocationClass,
+        widths: &'a [usize],
+    },
     Calibrated(&'a GpuCalibrationProfile),
 }
 
@@ -516,7 +524,8 @@ impl GpuColumnFit {
         }
         let class_for = |device: usize| -> Result<GpuAllocationClass, GpuAdmissionError> {
             match policy {
-                GpuColumnWidthPolicy::Native(class) => Ok(class),
+                GpuColumnWidthPolicy::Native(class) |
+                GpuColumnWidthPolicy::NativeExact { class, .. } => Ok(class),
                 GpuColumnWidthPolicy::Calibrated(profile) => {
                     let calibration = if device == 0 { profile.gpu0 } else { profile.nonzero };
                     calibration.map(|value| value.class()).ok_or_else(|| {
@@ -574,6 +583,63 @@ impl GpuColumnFit {
                         .map(|(_, width)| *width)
                         .min(),
                 }
+            }
+            GpuColumnWidthPolicy::NativeExact { class, widths } => {
+                if widths.len() != admissions.len() {
+                    return Err(GpuAdmissionError::InvalidPlan(
+                        "frozen native widths do not match device count".into(),
+                    ));
+                }
+                let gpu0 = (widths[0] != 0).then_some(widths[0]);
+                let nonzero = widths.iter().skip(1).copied().filter(|width| *width != 0).next();
+                if widths.iter().skip(1).any(|width| *width != 0 && Some(*width) != nonzero) {
+                    return Err(GpuAdmissionError::InvalidPlan(
+                        "frozen native widths differ between nonzero devices".into(),
+                    ));
+                }
+                let frozen = GpuColumnWidths { gpu0, nonzero };
+                for (device, &width) in widths.iter().enumerate() {
+                    if width == 0 {
+                        if largest_intervals[device] != 0 {
+                            return Err(GpuAdmissionError::InvalidPlan(format!(
+                                "frozen native width is zero on active device {device}"
+                            )));
+                        }
+                        continue;
+                    }
+                    if largest_intervals[device] < width ||
+                        width < class.minimum_columns ||
+                        width > class.maximum_columns
+                    {
+                        return Err(GpuAdmissionError::InvalidPlan(format!(
+                            "frozen native width {width} is outside device {device} or class bounds"
+                        )));
+                    }
+                    let temporary = requirements.temporary_allocations(device, &class, width)?;
+                    if !GpuColumnAllocations::combined(&[
+                        &fixed[device],
+                        &outputs[device],
+                        &temporary,
+                    ])
+                    .fits(
+                        device,
+                        admissions[device].available_bytes(),
+                        inventory,
+                    )? {
+                        return Err(GpuAdmissionError::Capacity {
+                            device,
+                            requested_bytes: GpuColumnAllocations::combined(&[
+                                &fixed[device],
+                                &outputs[device],
+                                &temporary,
+                            ])
+                            .managed_bytes()?,
+                            charged_bytes: admissions[device].charged_bytes(),
+                            budget_bytes: admissions[device].budget_bytes,
+                        });
+                    }
+                }
+                frozen
             }
             GpuColumnWidthPolicy::Calibrated(profile) => {
                 let owners = active
@@ -634,7 +700,10 @@ impl GpuColumnFit {
                 })?
             }
         };
-        let mut capacities = widths.device_capacities(admissions.len())?;
+        let mut capacities = match policy {
+            GpuColumnWidthPolicy::NativeExact { widths, .. } => widths.to_vec(),
+            _ => widths.device_capacities(admissions.len())?,
+        };
         for (capacity, count) in capacities.iter_mut().zip(&counts) {
             if *count == 0 {
                 *capacity = 0;
@@ -5228,6 +5297,41 @@ mod tests {
         assert_eq!(fit.devices[0].scratch.managed_bounds, vec![5, 10]);
         assert_eq!(ledger.devices(), before);
         assert!(ledger.allocations.is_empty());
+    }
+
+    #[test]
+    fn test_measurement_replay_preserves_width_five_for_eight_columns() {
+        let ledger = ledger_without_pool_slack(
+            &[GpuDeviceMemory { total_bytes: 100, resident_bytes: 10 }],
+            100,
+            None,
+        )
+        .unwrap();
+        let requirements = ColumnRequirements {
+            fixed: vec![4, 6],
+            payload: 4,
+            metadata: 0,
+            scratch: vec![1, 2],
+            invalid_ranges: false,
+            unavailable_device: None,
+        };
+        let class = GpuAllocationClass {
+            identity: [9; 32],
+            bound_identity: None,
+            minimum_columns: 1,
+            maximum_columns: 16,
+        };
+        let fit = ledger
+            .fit_columns(
+                8,
+                GpuOutputOwnership::Fresh,
+                GpuColumnWidthPolicy::NativeExact { class, widths: &[5] },
+                &requirements,
+            )
+            .unwrap();
+        assert_eq!(fit.summary().widths, vec![5]);
+        assert_eq!(fit.schedule().local_job_counts(), &[2]);
+        assert_eq!(fit.schedule().widths(), &[5]);
     }
 
     #[test]

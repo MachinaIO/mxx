@@ -4257,7 +4257,7 @@ impl Backend for GpuDcrtBackend {
                         CompiledMatrixInvocation::lower(request, node.as_ref(), self)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                self.admit_matrix_invocations(lowered, usize::MAX)
+                self.admit_matrix_invocations(lowered, usize::MAX, None)
             } else {
                 self.validate_admitted_matrix_invocations(&matrix_requests)
             }

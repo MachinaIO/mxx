@@ -1584,11 +1584,13 @@ impl GpuDCRTPolyMatrix {
 
     /// Convert this owner to coefficient format without replacing its storage.
     pub fn intt_all_in_place(&mut self) {
-        if self.nrow == 0 || self.ncol == 0 || !self.is_ntt {
+        if !self.is_ntt {
             return;
         }
-        let status = unsafe { gpu_matrix_intt_all(self.raw) };
-        check_status(status, "gpu_matrix_intt_all");
+        if self.nrow != 0 && self.ncol != 0 {
+            let status = unsafe { gpu_matrix_intt_all(self.raw) };
+            check_status(status, "gpu_matrix_intt_all");
+        }
         self.is_ntt = false;
     }
 
@@ -3990,6 +3992,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             self.is_ntt,
             None,
         );
+        if self.nrow == 0 || self.ncol == 0 {
+            return out;
+        }
         let status = unsafe { gpu_matrix_transpose(out.raw, self.raw, std::ptr::null()) };
         check_status(status, "gpu_matrix_transpose");
         out

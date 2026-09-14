@@ -20,7 +20,7 @@ use mxx_primitives::matrix::gpu_dcrt_poly::{
 
 /// Complete metadata consumed by shared destination/input/scratch selection.
 pub struct MatrixPlacementInvocation {
-    operation: PreparedMatrixOperation,
+    operation: PreparedOperation,
     operands: InvocationOperands<MatrixDescriptor, MatrixDescriptor>,
     input_layouts: super::gpu_prepare::MatrixInputLayouts,
 }
@@ -40,14 +40,11 @@ impl MatrixPlacementInvocation {
         };
         let mut ordinary = Vec::new();
         let mut compact = None;
-        let input_count = if matches!(operation, PreparedMatrixOperation::Preimage { .. }) {
-            1
-        } else {
-            usize::MAX
-        };
+        let input_count =
+            if matches!(operation, PreparedOperation::Preimage { .. }) { 1 } else { usize::MAX };
         for (argument, ty) in arguments.into_iter().zip(node.arguments()).take(input_count) {
             if operation.fresh_type().is_some() &&
-                !matches!(operation, PreparedMatrixOperation::Preimage { .. })
+                !matches!(operation, PreparedOperation::Preimage { .. })
             {
                 continue;
             }
@@ -61,7 +58,7 @@ impl MatrixPlacementInvocation {
                 _ => {}
             }
         }
-        let operands = if matches!(operation, PreparedMatrixOperation::Preimage { .. }) {
+        let operands = if matches!(operation, PreparedOperation::Preimage { .. }) {
             InvocationOperands {
                 left: ordinary.into_iter().next(),
                 right: Vec::new(),
@@ -71,18 +68,18 @@ impl MatrixPlacementInvocation {
             InvocationOperands { left: None, right: Vec::new(), compact: None }
         } else if matches!(
             operation,
-            PreparedMatrixOperation::MultiplyCompact { .. } |
-                PreparedMatrixOperation::CenteredExtendCompact { .. }
+            PreparedOperation::MultiplyCompact { .. } |
+                PreparedOperation::CenteredExtendCompact { .. }
         ) {
             let compact = compact.ok_or_else(|| {
                 PolyBackendError::GpuSubmission("compact input placement is unresolved".into())
             })?;
             InvocationOperands { left: None, right: ordinary, compact: Some(compact) }
         } else {
-            if matches!(operation, PreparedMatrixOperation::Multiply { scales_left: false }) {
+            if matches!(operation, PreparedOperation::Multiply { scales_left: false }) {
                 ordinary.swap(0, 1);
             }
-            if let PreparedMatrixOperation::Accumulate { products, .. } = &operation {
+            if let PreparedOperation::Accumulate { products, .. } = &operation {
                 for (index, (_, scales_left)) in products.iter().enumerate() {
                     if !scales_left {
                         ordinary.swap(2 * index, 2 * index + 1);
@@ -208,11 +205,11 @@ struct MatrixScratch {
     workspace: Option<GpuPreparedWorkspaceLayout>,
     /// Width-scaled native workspace: the operation, context, level and the
     /// index into its `width_workspaces` for the requested column count.
-    width: Option<(PreparedMatrixOperation, GpuDCRTPolyParams, usize, usize)>,
+    width: Option<(PreparedOperation, GpuDCRTPolyParams, usize, usize)>,
 }
 
 fn select_operation_scratch(
-    operation: &PreparedMatrixOperation,
+    operation: &PreparedOperation,
     inventory: &super::gpu_prepare::MatrixSlotInventory,
     deferred: &HashSet<u64>,
     chosen: &mut HashSet<MatrixSlotKey>,
@@ -293,7 +290,7 @@ pub struct GpuMatrixColumnContext {
     pub slots: Vec<(GpuPreparedSlotSnapshot, bool)>,
 }
 
-impl PreparedMatrixOperation {
+impl PreparedOperation {
     /// One CPU-only scratch assignment for both native and hypothetical plans.
     /// The caller supplies availability, including any explicitly accepted
     /// deferred upload resources. Selection never waits or acquires a lease.
@@ -673,17 +670,17 @@ impl GpuDcrtBackend {
             if columns != 0 &&
                 matches!(
                     operation,
-                    PreparedMatrixOperation::Constant { .. } |
-                        PreparedMatrixOperation::Sample { .. } |
-                        PreparedMatrixOperation::Hash { .. } |
-                        PreparedMatrixOperation::Decompose { hash: Some(_), .. } |
-                        PreparedMatrixOperation::ImportMatrix { .. } |
-                        PreparedMatrixOperation::ImportCompact { .. } |
-                        PreparedMatrixOperation::ImportStaging { .. } |
-                        PreparedMatrixOperation::Preimage { .. } |
-                        PreparedMatrixOperation::Polynomial { .. } |
-                        PreparedMatrixOperation::Transpose |
-                        PreparedMatrixOperation::Tensor { .. }
+                    PreparedOperation::Constant { .. } |
+                        PreparedOperation::Sample { .. } |
+                        PreparedOperation::Hash { .. } |
+                        PreparedOperation::Decompose { hash: Some(_), .. } |
+                        PreparedOperation::ImportMatrix { .. } |
+                        PreparedOperation::ImportCompact { .. } |
+                        PreparedOperation::ImportStaging { .. } |
+                        PreparedOperation::Preimage { .. } |
+                        PreparedOperation::Polynomial { .. } |
+                        PreparedOperation::Transpose |
+                        PreparedOperation::Tensor { .. }
                 )
             {
                 let first = left.and_then(|left| left.shards.first());
@@ -972,7 +969,7 @@ impl GpuDcrtBackend {
                     let mut rhs = Vec::with_capacity(right.len());
                     for (index, right) in operation.dependent_inputs(&right).iter().enumerate() {
                         let parameters =
-                            if matches!(operation, PreparedMatrixOperation::CrtRecompose { .. }) {
+                            if matches!(operation, PreparedOperation::CrtRecompose { .. }) {
                                 right
                                     .shards
                                     .first()
@@ -1081,9 +1078,7 @@ impl GpuDcrtBackend {
                 .map(|output| output.interval.end - output.interval.start)
                 .max()
                 .unwrap();
-            if let PreparedMatrixOperation::Preimage { ty, bound, public_rows, plan, .. } =
-                operation
-            {
+            if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } = operation {
                 // Step claims use the same accepted inventory as fixed and
                 // retained output owners. Bound the native allocation class
                 // before width selection, including the arbitrary-width tail.
@@ -1280,9 +1275,9 @@ impl GpuDcrtBackend {
                     .map(|matrix| (matrix.id, matrix))
                     .collect::<HashMap<_, _>>();
                 let fresh = placement.operation.fresh_type().is_some() &&
-                    !matches!(placement.operation, PreparedMatrixOperation::Preimage { .. });
+                    !matches!(placement.operation, PreparedOperation::Preimage { .. });
                 let caller_count =
-                    if matches!(placement.operation, PreparedMatrixOperation::Preimage { .. }) {
+                    if matches!(placement.operation, PreparedOperation::Preimage { .. }) {
                         1
                     } else {
                         usize::MAX

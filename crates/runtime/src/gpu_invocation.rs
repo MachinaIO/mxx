@@ -17,7 +17,7 @@ use num_bigint::BigInt;
 /// bindings of the instance that runs it.
 ///
 /// It is exactly the metadata the single operation lowering
-/// (`PreparedMatrixOperation::from_ir`) consumes, so admission and execution
+/// (`PreparedOperation::from_ir`) consumes, so admission and execution
 /// share one derivation from the validated IR. Actual operand owners and
 /// payloads are bound separately at execution.
 #[derive(Clone, Debug)]
@@ -280,6 +280,23 @@ pub enum GpuInvocation<'a, M, S, T> {
         ty: &'a ConcreteMatrixType,
         values: &'a [BigInt],
         evaluation: bool,
+    },
+    /// Host boundary for a scalar polynomial observation. The native readback
+    /// operation is shared with threshold decoding and coefficient extraction;
+    /// this request carries only the requested domain and resident owner.
+    PolynomialValues {
+        value: &'a M,
+        evaluation: bool,
+    },
+    /// Host threshold computation over the same polynomial readback operation.
+    ThresholdDecode {
+        value: &'a M,
+        plaintext_modulus: &'a BigInt,
+        length: usize,
+    },
+    ExtractCoefficient {
+        value: &'a M,
+        position: usize,
     },
     PackPolynomialCoefficients {
         ty: &'a ConcreteMatrixType,

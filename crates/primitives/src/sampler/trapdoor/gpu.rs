@@ -1324,6 +1324,8 @@ mod tests {
             drop(products);
             drop(caches);
             drop(trapdoors);
+            outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
+            expected.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
             assert_eq!(outputs, expected);
         }
     }

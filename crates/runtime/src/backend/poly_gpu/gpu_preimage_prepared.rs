@@ -72,7 +72,7 @@ impl GpuPreimageBatchResources for PhaseClaims<'_> {
     }
 }
 
-impl PreparedMatrixOperation {
+impl PreparedOperation {
     /// Jobs share the operation class, parameter context and actual column
     /// width. Owners, global offsets, seeds and acceptance remain per job.
     pub(super) fn run_preimage_batch(
@@ -176,7 +176,7 @@ impl GpuDcrtBackend {
         use crate::gpu_measurement::{GpuAdmittedMeasurement, GpuColumnMeasurement};
         if self.prepared_invocations.len() < requests.len() ||
             self.prepared_invocations.iter().take(requests.len()).any(|invocation| {
-                !matches!(invocation.operation, PreparedMatrixOperation::Preimage { .. })
+                !matches!(invocation.operation, PreparedOperation::Preimage { .. })
             })
         {
             return Err(PolyBackendError::GpuSubmission(
@@ -313,7 +313,7 @@ impl GpuDcrtBackend {
                         ));
                     }
                     let (operation, intervals, _, _) = &run[instance];
-                    let PreparedMatrixOperation::Preimage {
+                    let PreparedOperation::Preimage {
                         ty,
                         bound,
                         sigma_bits,

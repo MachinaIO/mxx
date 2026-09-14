@@ -1886,11 +1886,25 @@ impl GpuDcrtBackend {
                                         (*slot, eligible)
                                     })
                                     .collect::<Vec<_>>();
-                                let Some(assignment) =
+                                let assignments =
                                     GpuPreparedSlotSnapshot::assign(params, &slots, claims)
-                                        .map_err(PolyBackendError::GpuSubmission)?
-                                        .into_iter()
-                                        .collect::<Option<Vec<_>>>()
+                                        .map_err(PolyBackendError::GpuSubmission)?;
+                                #[cfg(test)]
+                                if wave == 1 && cap == 1 && assignments.iter().any(Option::is_none)
+                                {
+                                    eprintln!(
+                                        "minimum wave device {device} unmatched claims: {:?}",
+                                        claims
+                                            .iter()
+                                            .zip(&assignments)
+                                            .filter_map(|(claim, assignment)| assignment
+                                                .is_none()
+                                                .then_some(claim))
+                                            .collect::<Vec<_>>()
+                                    );
+                                }
+                                let Some(assignment) =
+                                    assignments.into_iter().collect::<Option<Vec<_>>>()
                                 else {
                                     return Ok(None);
                                 };

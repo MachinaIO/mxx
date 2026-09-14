@@ -1,33 +1,13 @@
-# AGENTS.md
+# Repository-Local Skills
 
-This file provides guidance to AI agents when working with code in this repository.
+These skills support mxx's Runpod workflows; this directory is part of the Rust/CUDA repository. Root `AGENTS.md` applies. The upstream Runpod material retains its license and author metadata.
 
-## Overview
+## Editing Skills
 
-This is a **skills repository** for AI agents (Claude Code, Cursor, Copilot, etc.) to manage GPU workloads on Runpod. It contains no application code — only skill definition files (`SKILL.md`) that teach AI agents how to use the `runpodctl` CLI.
+- Keep `name` and a short, discriminating `description` in YAML frontmatter. Preserve existing metadata and invocation policy unless the task changes them. Tool allowlists describe compatibility, not additional authorization.
+- Put workflow outcomes, applicable constraints, and completion evidence in `SKILL.md`. Move substantial conditional command examples to `guides/` and link them where needed. The repository's read-only `references` rule also applies here.
+- Do not duplicate global instructions or turn examples into default actions. Preserve task-specific hardware, budget, source, and cleanup choices.
+- Use existing tools and credentials where available. Editing or explaining skills does not authorize installations, cloud provisioning, uploads, or test runs.
+- Validate frontmatter, local links, and consistency after editing. For a behavior check, reason through a representative task and its stopping conditions; execute external workflows only when that execution is authorized.
 
-Skills are installed by users via `npx skills add runpod/skills` (see [skills.sh](https://skills.sh/)).
-
-## Repository Structure
-
-Each skill lives in its own directory with a `SKILL.md` file containing frontmatter metadata and CLI documentation:
-
-```
-runpodctl/SKILL.md   — runpodctl CLI skill definition
-```
-
-## Skill File Format
-
-`SKILL.md` files use YAML frontmatter with these fields:
-- `name`, `description` — skill identity
-- `allowed-tools` — tool permissions (e.g., `Bash(runpodctl:*)`)
-- `compatibility` — supported platforms
-- `metadata` — author, version
-- `license`
-
-The body is markdown documentation that agents consume to learn the CLI commands.
-
-## Conventions
-
-- **Spelling:** "Runpod" (capital R). The CLI command is `runpodctl` (lowercase).
-- **License:** Apache-2.0
+Use `.codex/skills/README.md` for the skill inventory. Spelling: Runpod; CLI: `runpodctl`.

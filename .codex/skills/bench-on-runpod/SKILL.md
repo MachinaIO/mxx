@@ -1,115 +1,40 @@
 ---
 name: bench-on-runpod
-description: Run mxx repository programs, tests, or benchmarks on Runpod instances with GPU machine selection, network volume setup, SSH/scp configuration, branch push and remote checkout synchronization, durable log capture, log retrieval, instance cleanup, and failed-test fix/push/pull/rerun loops. Use when Codex is asked to execute mxx work on a Runpod machine or instance, including requests that mention Runpod GPUs such as RTX5090, RTX PRO 6000, H200, remote benchmarking, remote tests, or running a command on a Runpod pod.
+description: Run mxx programs, tests, or benchmarks on Runpod pods with reproducible source, durable logs, and controlled cleanup.
 ---
 
 # Bench on Runpod
 
-## Overview
+Use for requested mxx execution on Runpod pods. For planning or editing this workflow, inspect relevant files without provisioning or running it. Use `.codex/skills/runpodctl/SKILL.md` only when CLI resource operations are needed.
 
-Use this workflow to run mxx commands on Runpod machines while keeping the local branch, remote checkout, logs, and instance lifecycle controlled.
+## Run Contract
 
-Prefer repo-local Runpod helper skills and CLIs when available, but keep the required state transitions below intact.
+Resolve the command, exact source, GPU type, GPUs per pod, pod count, storage, and any time/cost limit from the task and existing environment. Preserve explicit choices. Choose routine settings from existing mxx configuration; ask only for unresolved decisions that affect the requested result or resource authorization. Prefer an existing network volume named for mxx; creation or use of a non-mxx volume needs authorization already present in the task or a focused question.
 
-## Required Inputs
+Carry existing authorization through the run. A test-only request does not authorize changing cryptographic semantics or an unlimited fix/rerun loop. The repository's integration-test restriction still applies. If authorized resources are unavailable, report that constraint before substituting hardware or raising capacity.
 
-Before provisioning, determine these values from the user request or local context. Ask the user for any value that remains unclear.
+## Source and Setup
 
-- Machine type, such as `RTX5090`, `RTX PRO 6000`, or `H200`.
-- Machine count.
-- Container volume size.
-- Network volume. Prefer an existing Runpod network volume whose name contains `mxx`; ask before creating or using a non-mxx volume.
-- The exact program, test, benchmark, or command to run.
-- Whether the selected network volume is new for mxx setup purposes.
+- Inspect branch, commit, and dirty state. Use the user's branch; when a new branch is needed and none is specified, choose a descriptive `codex/` name.
+- For the normal Git workflow, commit only task-owned changes when committing is authorized, push when authorized, and record the exact commit. Prepare the scoped diff before asking about a missing commit/push authorization. Honor no-push requests; if transfer is authorized, a source archive with a manifest and hashes can identify the exact dirty source without publishing it.
+- Inspect remote dirty/untracked state before synchronization. Use an isolated checkout or preserve existing artifacts; do not blindly reset or clean a reused volume. Verify the checked-out commit or transferred manifest, including required submodule revisions, before execution.
+- Reuse a suitable existing pod when requested. Otherwise provision only the agreed configuration, with SSH and `scp` support. Record pod IDs and the volume mount.
+- For a new mxx volume, inspect `.codex/skills/bench-on-runpod/scripts/setup.sh` before running it remotely. It installs system dependencies and tools and expects the standard Runpod workspace mount; do not run it locally. Reuse an initialized environment when suitable. In the standard layout, source the mounted workspace's `env.sh` in each remote shell and enter its `mxx` checkout; verify actual paths rather than assuming a reused pod has this layout.
 
-## Local Preparation
+## Execution and Evidence
 
-1. Inspect the current branch name. If the checkout is detached or the current branch name is not decided, ask the user to choose a branch name before continuing.
-2. Ensure every local change needed for the remote run is committed and pushed. If there are uncommitted changes and the user has not already authorized committing them, ask before creating a commit.
-3. Push the current branch to the remote repository.
-4. Record the pushed branch name and latest commit SHA. The remote checkout must be synchronized to this exact commit before running the command.
+Run the requested command and parameters with a durable combined stdout/stderr log and explicit exit-status evidence. Use release builds and `RUST_LOG=debug` for benchmarks unless the task specifies otherwise. Record VRAM usage about every 3 seconds during GPU measurements.
 
-## Provision and Connect
+Record pod identity, GPU model/count, pod count, source commit or manifest, timestamp/timezone, command, non-secret environment overrides, remote paths, and exit code. Use a recognizable log filename with a short command summary. Do not log credentials.
 
-1. Launch the requested Runpod machine configuration with the chosen machine type, machine count, container volume size, and network volume.
-2. Ensure SSH is configured with `scp` support enabled. Do not proceed with a machine that cannot receive files through `scp`.
-3. SSH into the machine and confirm the mounted workspace path is `/workspace`.
-4. Record the machine or pod name because it must be included in the run log filename or metadata.
+For foreground pipelines, enable `pipefail` when using `tee`. For jobs that may outlive SSH, use `nohup` or an existing job manager, capture the PID/job ID, and persist the exit code separately. Reconnect to the same job rather than starting another copy. Follow root `AGENTS.md` for efficient waiting and progress updates.
 
-## Remote Setup
+Copy logs and relevant artifacts to `logs/` in the active local checkout, or the user's requested destination, and verify retrieval before cleanup. Missing exit status means the result is unknown, even when the log contains successful intermediate stages.
 
-1. If the network volume is new for this mxx environment, copy `scripts/setup.sh` from this skill to the remote `/workspace` directory with `scp`, then run it on the remote machine from `/workspace`.
-2. In every remote shell that runs commands, execute:
+## Failures and Cleanup
 
-```bash
-source /workspace/env.sh
-```
+When the task includes fixes, diagnose from evidence, implement the scoped repair locally, validate as appropriate, synchronize its exact source under the same authorization, and rerun affected commands with new logs. Stop retrying when the same blocker persists without new evidence, the agreed budget is reached, or a fix requires a new semantic or resource decision. Preserve the failure evidence and report the next action; finish independent authorized work.
 
-3. Move to `/workspace/mxx`.
-4. Align `/workspace/mxx` to the pushed local branch and commit:
+After retrieval, stop the pod promptly unless the user requested that it remain running or an authorized retry will use it imminently within the run budget. If blocked on user input, stop it unless the user explicitly requested that it remain running. Stopping and deleting are different actions: do not terminate/delete a pod or volume without explicit authorization. Verify the final state through Runpod, and report a cleanup failure rather than claiming the pod stopped.
 
-```bash
-git fetch origin
-git checkout <branch-name>
-git reset --hard <commit-sha>
-git submodule update --init --recursive
-```
-
-Use the actual pushed branch and commit from local preparation. Do not run against a stale remote checkout.
-
-## Run and Log
-
-Always write command output to a durable log file while the command runs.
-
-Construct a log filename or header that includes:
-
-- Machine name or pod name.
-- Machine count.
-- Git commit SHA.
-- Date and time, preferably in JST.
-- A command summary of seven words or fewer.
-
-Use `tee` for foreground commands. For long-running tests, benchmarks, or commands likely to outlive the SSH session, use `nohup` in the background and redirect both stdout and stderr to the log while preserving the command exit status where practical.
-
-Example foreground shape:
-
-```bash
-set -o pipefail
-<command> 2>&1 | tee <log-file>
-```
-
-Example background shape:
-
-```bash
-nohup bash -lc 'set -o pipefail; <command>' > <log-file> 2>&1 &
-echo $!
-```
-
-Poll or reconnect until the result is known. When a background command finishes, inspect the log tail and exit-status evidence before reporting success or failure.
-
-## Retrieve Logs
-
-After the run completes or reaches a useful failure point, copy the log back to the local machine under `~/codes/mxx/logs` in an appropriate subdirectory for the run type, date, branch, or command family. Preserve the original remote log name when practical.
-
-## Failure Loop
-
-When a test or benchmark fails and the user has not instructed otherwise, use this default loop:
-
-1. Diagnose from the retrieved log.
-2. Fix the issue locally in the mxx workspace.
-3. Commit and push the local fix.
-4. SSH to the same remote machine when it is still running.
-5. Pull or fetch the updated branch in `/workspace/mxx` and reset to the new commit.
-6. Rerun the command with a new durable log.
-
-Repeat until the run succeeds or user input is needed.
-
-## Instance Lifecycle
-
-After collecting logs:
-
-- Keep the Runpod instance running if a failure means the same machine is likely to be reused within one hour.
-- Stop or terminate the Runpod instance if the run succeeded.
-- Stop or terminate the instance if the run failed but progress is blocked on user help and reuse within one hour is uncertain.
-
-Report the final instance state, local log path, remote log path, branch, commit, and command result to the user.
+Completion means the requested command's result is known, logs are available locally, and the agreed pod state is verified. Report these with the source identity and any unmet correctness or performance target. A successful estimate or compile does not establish GPU runtime correctness.

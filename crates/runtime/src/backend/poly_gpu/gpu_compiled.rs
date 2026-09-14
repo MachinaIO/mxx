@@ -44,7 +44,7 @@ use mxx_primitives::{
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum PreparedMatrixOperation {
+pub(super) enum PreparedOperation {
     Constant {
         ty: ConcreteMatrixType,
         value: GpuMatrixRangeConstant,
@@ -59,6 +59,10 @@ pub(super) enum PreparedMatrixOperation {
         ty: ConcreteMatrixType,
         coefficients: Vec<BigInt>,
         evaluation: bool,
+    },
+    PolynomialReadback {
+        evaluation: bool,
+        claims: Vec<GpuTracedClaim>,
     },
     Hash {
         ty: ConcreteMatrixType,
@@ -167,6 +171,41 @@ pub(super) enum PreparedMatrixOperation {
         bias: bool,
         rows: usize,
     },
+}
+
+pub(super) type PolynomialReadbackKey = (String, usize, usize, bool, bool);
+
+pub(super) fn polynomial_readback_key(
+    parameters: &GpuDCRTPolyParams,
+    level: usize,
+    evaluation: bool,
+    input_ntt: bool,
+) -> PolynomialReadbackKey {
+    (
+        parameters.modulus().to_string(),
+        parameters.ring_dimension() as usize,
+        level,
+        evaluation,
+        input_ntt,
+    )
+}
+
+pub(super) fn polynomial_readback_claims(
+    plans: &std::collections::HashMap<PolynomialReadbackKey, Vec<GpuTracedClaim>>,
+    parameters: &GpuDCRTPolyParams,
+    level: usize,
+    evaluation: bool,
+    input_ntt: bool,
+) -> Option<Vec<GpuTracedClaim>> {
+    plans.get(&polynomial_readback_key(parameters, level, evaluation, input_ntt)).cloned()
+}
+
+pub(super) fn polynomial_readback_evaluation(kind: &NodeKind) -> Option<bool> {
+    match kind {
+        NodeKind::PolynomialValues { evaluation } => Some(*evaluation),
+        NodeKind::ThresholdDecode { .. } | NodeKind::ExtractCoefficient { .. } => Some(false),
+        _ => None,
+    }
 }
 
 /// One admitted, not yet consumed, invocation of the fleet backend for
@@ -355,7 +394,6 @@ pub(super) struct PreimagePlanKey {
     pub modulus: String,
     pub ring_dimension: usize,
     pub rows: usize,
-    pub columns: usize,
     pub public_rows: usize,
     pub bound: String,
     pub sigma_bits: u64,
@@ -477,7 +515,7 @@ fn rns_conversion_groups(
     }
 }
 
-impl PreparedMatrixOperation {
+impl PreparedOperation {
     /// Bind the plan discovered by explicit warmup. Metadata planning and real
     /// sampling use the same cache key; neither may probe on a cache miss.
     fn preimage(
@@ -493,7 +531,6 @@ impl PreparedMatrixOperation {
             modulus: ty.modulus.to_string(),
             ring_dimension: ty.ring_dimension,
             rows: ty.rows,
-            columns: ty.columns,
             public_rows,
             bound: bound.to_string(),
             sigma_bits: sigma.to_bits(),
@@ -521,6 +558,7 @@ impl PreparedMatrixOperation {
             Self::Constant { .. } => "Constant",
             Self::Sample { .. } => "Sample",
             Self::Polynomial { .. } => "Polynomial",
+            Self::PolynomialReadback { .. } => "PolynomialReadback",
             Self::Hash { .. } => "Hash",
             Self::ModulusConversion { .. } => "ModulusConversion",
             Self::CrtRecompose { .. } => "CrtRecompose",
@@ -2204,6 +2242,7 @@ impl PreparedMatrixOperation {
             Self::Sample { .. } |
             Self::Hash { .. } |
             Self::Polynomial { .. } |
+            Self::PolynomialReadback { .. } |
             Self::ConcatColumns { .. } => {
                 unreachable!("constant and column concatenation handled above")
             }
@@ -2374,7 +2413,7 @@ struct CompiledInterval {
 }
 
 pub(super) struct CompiledMatrixInvocation {
-    operation: PreparedMatrixOperation,
+    operation: PreparedOperation,
     left: Option<GpuFleetMatrix>,
     right: Vec<GpuFleetMatrix>,
     compact: Option<GpuFleetSmallMatrix>,
@@ -2420,7 +2459,7 @@ pub(super) struct AdmittedMatrixBinding {
 
 // CPU lowering of existing IR positions. No second schedule or instruction
 // stream: execution still traverses the validated scope in its original order.
-pub(super) type InventoryOperation = (GpuNodeOperation, Option<PreparedMatrixOperation>);
+pub(super) type InventoryOperation = (GpuNodeOperation, Option<PreparedOperation>);
 
 /// The exact bounded scope lowerings used by a committed wave's capacity fit.
 /// The reservation owns this record; the backend keeps only weak access to
@@ -2464,7 +2503,7 @@ pub(super) struct InheritedMatrixRange {
 /// boundary constructor), the real operand owners in the operation's own order,
 /// and the caller's operand identities used to reject a substituted operand.
 pub(super) struct LoweredMatrixInvocation {
-    pub(super) operation: PreparedMatrixOperation,
+    pub(super) operation: PreparedOperation,
     pub(super) operands: InvocationOperands,
     pub(super) input_layouts: MatrixInputLayouts,
     pub(super) caller_ids: Vec<u64>,
@@ -2472,6 +2511,33 @@ pub(super) struct LoweredMatrixInvocation {
 }
 
 impl CompiledMatrixInvocation {
+    pub(super) fn lower_polynomial_readback(
+        value: &GpuFleetMatrix,
+        evaluation: bool,
+        backend: &GpuDcrtBackend,
+    ) -> Result<PreparedOperation, PolyBackendError> {
+        let first = value.shards.first().ok_or(PolyBackendError::InvalidInteger)?;
+        let device = backend
+            .devices
+            .iter()
+            .position(|(id, _)| *id == first.device_id)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = backend.devices[device].1.parameters_for_matrix(&first.value)?;
+        let claims = polynomial_readback_claims(
+            &backend.polynomial_value_plans,
+            parameters,
+            first.value.level(),
+            evaluation,
+            first.value.is_ntt(),
+        )
+        .ok_or_else(|| {
+            PolyBackendError::GpuSubmission(
+                "polynomial readback has no admitted operation projection".into(),
+            )
+        })?;
+        Ok(PreparedOperation::PolynomialReadback { evaluation, claims })
+    }
+
     /// Single lowering of one preflight request into the resource operation
     /// admission and execution both consume.
     ///
@@ -2574,7 +2640,7 @@ impl CompiledMatrixInvocation {
     pub(super) fn lower_ir(
         node: &GpuNodeOperation,
         backend: &GpuDcrtBackend,
-    ) -> Result<Option<PreparedMatrixOperation>, PolyBackendError> {
+    ) -> Result<Option<PreparedOperation>, PolyBackendError> {
         let mut admitted_scope = false;
         for admitted in backend.admitted_scope_operations.iter().rev().filter_map(Weak::upgrade) {
             if &admitted.scope != node.scope() {
@@ -2609,7 +2675,7 @@ impl CompiledMatrixInvocation {
             let sigma = sigma
                 .evaluate_f64(node.bindings())
                 .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
-            return PreparedMatrixOperation::preimage(
+            return PreparedOperation::preimage(
                 backend,
                 matrix,
                 max_coefficient_bound.to_biguint().ok_or(PolyBackendError::InvalidInteger)?,
@@ -2626,7 +2692,7 @@ impl CompiledMatrixInvocation {
             .and_then(leaf_matrix_type)
             .ok_or(PolyBackendError::InvalidConstantShape)?;
         let parameters = backend.devices[0].1.parameters(output)?.clone();
-        PreparedMatrixOperation::from_ir(
+        PreparedOperation::from_ir(
             node.kind(),
             node.arguments(),
             node.outputs(),
@@ -2695,6 +2761,9 @@ impl CompiledMatrixInvocation {
                 (vec![ordinary(left), ordinary(right)], None)
             }
             GpuInvocation::SamplePreimage { public, .. } => (vec![ordinary(public)], None),
+            GpuInvocation::PolynomialValues { value, .. } |
+            GpuInvocation::ThresholdDecode { value, .. } |
+            GpuInvocation::ExtractCoefficient { value, .. } => (vec![ordinary(value)], None),
             GpuInvocation::Constant { .. } |
             GpuInvocation::SampleUniform { .. } |
             GpuInvocation::SampleGaussian { .. } |
@@ -2923,7 +2992,7 @@ impl CompiledMatrixInvocation {
             for (_, device) in &backend.devices {
                 let target = device.parameters(destination)?;
                 // Validate declared bases even when the matrix has no shards.
-                PreparedMatrixOperation::validate_rns_basis(target, source_moduli, conversion)?;
+                PreparedOperation::validate_rns_basis(target, source_moduli, conversion)?;
             }
             for shard in value.shards.iter() {
                 let device = backend
@@ -3049,6 +3118,15 @@ impl CompiledMatrixInvocation {
             GpuInvocation::ImportCpuStaging { .. } |
             GpuInvocation::PackPolynomialCoefficients { .. } |
             GpuInvocation::PolynomialFromValues { .. } => return Ok(InvocationOperands::none()),
+            GpuInvocation::PolynomialValues { value, .. } |
+            GpuInvocation::ThresholdDecode { value, .. } |
+            GpuInvocation::ExtractCoefficient { value, .. } => {
+                return Ok(InvocationOperands {
+                    left: Some((*value).clone()),
+                    right: Vec::new(),
+                    compact: None,
+                })
+            }
             _ => {}
         }
         let unary = match request {
@@ -3195,17 +3273,33 @@ impl CompiledMatrixInvocation {
         request: &MatrixInvocation<'_>,
         operands: &InvocationOperands,
         backend: &GpuDcrtBackend,
-    ) -> Result<PreparedMatrixOperation, PolyBackendError> {
+    ) -> Result<PreparedOperation, PolyBackendError> {
+        if matches!(
+            request,
+            GpuInvocation::PolynomialValues { .. } |
+                GpuInvocation::ThresholdDecode { .. } |
+                GpuInvocation::ExtractCoefficient { .. }
+        ) {
+            let (value, evaluation) = match request {
+                GpuInvocation::PolynomialValues { value, evaluation } => (*value, *evaluation),
+                // Threshold host rounding consumes coefficient-domain values;
+                // the shared readback projection preserves that request.
+                GpuInvocation::ThresholdDecode { value, .. } |
+                GpuInvocation::ExtractCoefficient { value, .. } => (*value, false),
+                _ => unreachable!(),
+            };
+            return Self::lower_polynomial_readback(value, evaluation, backend);
+        }
         if let GpuInvocation::CenteredExtendSmall { value, destination } = request {
             let bound =
                 value.shards.first().map(|shard| shard.value.bound().clone()).unwrap_or_default();
-            return Ok(PreparedMatrixOperation::CenteredExtendCompact {
+            return Ok(PreparedOperation::CenteredExtendCompact {
                 destination: (**destination).clone(),
                 bound,
             });
         }
         if let GpuInvocation::MultiplySmallRhs { right, .. } = request {
-            return Ok(PreparedMatrixOperation::MultiplyCompact {
+            return Ok(PreparedOperation::MultiplyCompact {
                 columns: right.columns,
                 inner: right.rows,
             });
@@ -3232,7 +3326,7 @@ impl CompiledMatrixInvocation {
                 .params()
                 .compact_decomposition_layout(small, digit_count)
                 .map_err(|e| PolyBackendError::GpuSubmission(e.to_string()))?;
-            let operation = PreparedMatrixOperation::decompose_with_layout(
+            let operation = PreparedOperation::decompose_with_layout(
                 small,
                 digit_count,
                 blocks.iter().map(|v| v.rows).collect(),
@@ -3254,7 +3348,7 @@ impl CompiledMatrixInvocation {
                 .map(|p| p.to_u64().filter(|p| *p != 0))
                 .collect::<Option<Vec<_>>>()
                 .ok_or(PolyBackendError::InvalidInteger)?;
-            return Ok(PreparedMatrixOperation::crt_recompose(
+            return Ok(PreparedOperation::crt_recompose(
                 (*destination).clone(),
                 plaintext_moduli,
                 reconstruction_coefficients.to_vec(),
@@ -3284,7 +3378,7 @@ impl CompiledMatrixInvocation {
             _ => None,
         };
         if let Some((value, destination, source_moduli, conversion)) = rns {
-            return Ok(PreparedMatrixOperation::rns_conversion(
+            return Ok(PreparedOperation::rns_conversion(
                 destination.clone(),
                 source_moduli.to_vec(),
                 conversion,
@@ -3310,13 +3404,10 @@ impl CompiledMatrixInvocation {
             _ => None,
         };
         if let Some((destination, conversion)) = conversion {
-            return Ok(PreparedMatrixOperation::modulus_conversion(
-                (**destination).clone(),
-                conversion,
-            ));
+            return Ok(PreparedOperation::modulus_conversion((**destination).clone(), conversion));
         }
         if let GpuInvocation::CenteredRebase { destination, .. } = request {
-            return Ok(PreparedMatrixOperation::centered_rebase((**destination).clone()));
+            return Ok(PreparedOperation::centered_rebase((**destination).clone()));
         }
         if let GpuInvocation::ImportMatrix { ty, bytes } = request {
             let (version, format, level, rows, columns, max_coefficient_bits, bytes_per, _) =
@@ -3336,7 +3427,7 @@ impl CompiledMatrixInvocation {
             {
                 return Err(PolyBackendError::UnsupportedPlacement);
             }
-            return Ok(PreparedMatrixOperation::ImportMatrix {
+            return Ok(PreparedOperation::ImportMatrix {
                 ty: (**ty).clone(),
                 evaluation,
                 max_coefficient_bits,
@@ -3369,7 +3460,7 @@ impl CompiledMatrixInvocation {
                 .max_coefficient_bound
                 .to_biguint()
                 .ok_or(PolyBackendError::InvalidInteger)?;
-            return PreparedMatrixOperation::preimage(
+            return PreparedOperation::preimage(
                 backend,
                 &schema.matrix,
                 bound,
@@ -3389,7 +3480,7 @@ impl CompiledMatrixInvocation {
             if layout.level != parameters.crt_depth() - 1 {
                 return Err(PolyBackendError::UnsupportedPlacement);
             }
-            return Ok(PreparedMatrixOperation::ImportStaging {
+            return Ok(PreparedOperation::ImportStaging {
                 ty: (**ty).clone(),
                 evaluation: layout.is_ntt,
                 bytes_per_poly: layout.bytes_per_poly,
@@ -3400,7 +3491,7 @@ impl CompiledMatrixInvocation {
             let (bound, _) =
                 crate::backend::poly::decode_small_matrix_artifact(schema, bytes, *semantic_kind)?;
             backend.devices[0].1.parameters(&schema.matrix)?;
-            return Ok(PreparedMatrixOperation::ImportCompact { ty: schema.matrix.clone(), bound });
+            return Ok(PreparedOperation::ImportCompact { ty: schema.matrix.clone(), bound });
         }
         if let GpuInvocation::SampleHash { ty, variant, gadget_base, digit_count, .. } = request {
             use mxx_ir_core::node::HashVariant;
@@ -3426,7 +3517,7 @@ impl CompiledMatrixInvocation {
                 {
                     return Err(PolyBackendError::InvalidConstantShape);
                 }
-                return Ok(PreparedMatrixOperation::decompose_with_layout(
+                return Ok(PreparedOperation::decompose_with_layout(
                     small,
                     Some(*count),
                     vec![source_rows],
@@ -3438,32 +3529,28 @@ impl CompiledMatrixInvocation {
                 return Err(PolyBackendError::InvalidInteger);
             }
             backend.devices[0].1.parameters(ty)?;
-            return Ok(PreparedMatrixOperation::Hash { ty: (**ty).clone() });
+            return Ok(PreparedOperation::Hash { ty: (**ty).clone() });
         }
         match request {
             GpuInvocation::SampleUniform { ty, range } => {
-                return PreparedMatrixOperation::uniform(
-                    ty,
-                    range,
-                    backend.devices[0].1.parameters(ty)?,
-                );
+                return PreparedOperation::uniform(ty, range, backend.devices[0].1.parameters(ty)?);
             }
             GpuInvocation::SampleGaussian { ty, sigma, max_coefficient_bound } => {
                 backend.devices[0].1.parameters(ty)?;
-                return PreparedMatrixOperation::gaussian(ty, *sigma, max_coefficient_bound);
+                return PreparedOperation::gaussian(ty, *sigma, max_coefficient_bound);
             }
             _ => {}
         }
         if let GpuInvocation::PolynomialFromValues { ty, values, evaluation } = request {
             backend.devices[0].1.parameters(ty)?;
-            return Ok(PreparedMatrixOperation::Polynomial {
+            return Ok(PreparedOperation::Polynomial {
                 ty: (**ty).clone(),
                 coefficients: values.to_vec(),
                 evaluation: *evaluation,
             });
         }
         if let GpuInvocation::Constant { ty, value, env } = request {
-            return PreparedMatrixOperation::constant(
+            return PreparedOperation::constant(
                 ty,
                 value,
                 env,
@@ -3472,26 +3559,26 @@ impl CompiledMatrixInvocation {
         }
         let unary = match request {
             GpuInvocation::Slice { value, rows, columns } => {
-                let operation = PreparedMatrixOperation::Slice {
+                let operation = PreparedOperation::Slice {
                     rows: rows.map(|r| r.start..r.end).unwrap_or(0..value.rows),
                     columns: columns.map(|r| r.start..r.end).unwrap_or(0..value.columns),
                 };
                 operation.output_rows(Some(*value), &[])?;
                 Some(operation)
             }
-            GpuInvocation::Transpose { .. } => Some(PreparedMatrixOperation::Transpose),
+            GpuInvocation::Transpose { .. } => Some(PreparedOperation::Transpose),
             GpuInvocation::SumRows { rows, .. } => {
-                let operation = PreparedMatrixOperation::SumRows(rows.to_vec());
+                let operation = PreparedOperation::SumRows(rows.to_vec());
                 operation.output_rows(operands.left.as_ref(), &[])?;
                 Some(operation)
             }
             GpuInvocation::ScaleInteger { scalar, .. } => {
-                Some(PreparedMatrixOperation::Scale((*scalar).clone()))
+                Some(PreparedOperation::Scale((*scalar).clone()))
             }
             GpuInvocation::RingAutomorphism { index, .. } => {
-                Some(PreparedMatrixOperation::Automorphism(*index))
+                Some(PreparedOperation::Automorphism(*index))
             }
-            GpuInvocation::Negate { .. } => Some(PreparedMatrixOperation::Negate),
+            GpuInvocation::Negate { .. } => Some(PreparedOperation::Negate),
             _ => None,
         };
         if let Some(operation) = unary {
@@ -3519,7 +3606,7 @@ impl CompiledMatrixInvocation {
                 rows = Some(output_rows);
                 products.push((coefficient.clone(), scales_left));
             }
-            let operation = PreparedMatrixOperation::Accumulate {
+            let operation = PreparedOperation::Accumulate {
                 products,
                 bias: accumulate.bias.is_some(),
                 rows: rows.expect("nonempty products"),
@@ -3528,9 +3615,7 @@ impl CompiledMatrixInvocation {
             return Ok(operation);
         }
         let operation = match request {
-            GpuInvocation::Concat { axis: ConcatAxis::Rows, .. } => {
-                PreparedMatrixOperation::ConcatRows
-            }
+            GpuInvocation::Concat { axis: ConcatAxis::Rows, .. } => PreparedOperation::ConcatRows,
             GpuInvocation::Concat { inputs, axis } => {
                 let first = inputs.first().ok_or(PolyBackendError::InvalidConstantShape)?;
                 let diagonal = *axis == ConcatAxis::Diagonal;
@@ -3549,16 +3634,16 @@ impl CompiledMatrixInvocation {
                     }
                     columns = end;
                 }
-                PreparedMatrixOperation::ConcatColumns {
+                PreparedOperation::ConcatColumns {
                     diagonal,
                     rows: if diagonal { rows } else { first.rows },
                     columns,
                     offsets,
                 }
             }
-            GpuInvocation::AddRowBlocks { .. } => PreparedMatrixOperation::AddRowBlocks,
+            GpuInvocation::AddRowBlocks { .. } => PreparedOperation::AddRowBlocks,
             GpuInvocation::Tensor { right, .. } | GpuInvocation::TensorSumRows { right, .. } => {
-                PreparedMatrixOperation::Tensor {
+                PreparedOperation::Tensor {
                     right_rows: right.rows,
                     right_columns: right.columns,
                     groups: match request {
@@ -3567,14 +3652,12 @@ impl CompiledMatrixInvocation {
                     },
                 }
             }
-            GpuInvocation::Binary { operation: MatrixBinaryOp::Add, .. } => {
-                PreparedMatrixOperation::Add
-            }
+            GpuInvocation::Binary { operation: MatrixBinaryOp::Add, .. } => PreparedOperation::Add,
             GpuInvocation::Binary { operation: MatrixBinaryOp::Subtract, .. } => {
-                PreparedMatrixOperation::Subtract
+                PreparedOperation::Subtract
             }
             GpuInvocation::Binary { operation: MatrixBinaryOp::Multiply, left, right } => {
-                PreparedMatrixOperation::Multiply {
+                PreparedOperation::Multiply {
                     scales_left: gpu_matrix_multiply_scales_left(
                         left.rows,
                         left.columns,
@@ -3703,20 +3786,20 @@ impl GpuDcrtBackend {
                 }
                 for (right, &index) in right.iter().zip(&right_source) {
                     let input = &operation.source(&prepared, right, index).value;
-                    let compatible =
-                        if matches!(operation, PreparedMatrixOperation::CrtRecompose { .. }) {
-                            backend.parameters_for_matrix(input)? == input.params() &&
-                                input.params().execution_owner_id() ==
-                                    parameters.execution_owner_id() &&
-                                input.params().ring_dimension() == parameters.ring_dimension() &&
-                                !input.is_ntt()
-                        } else {
-                            input.params() == &parameters &&
-                                input.params().execution_owner_id() ==
-                                    parameters.execution_owner_id() &&
-                                input.level() == level &&
-                                input.is_ntt() == evaluation
-                        };
+                    let compatible = if matches!(operation, PreparedOperation::CrtRecompose { .. })
+                    {
+                        backend.parameters_for_matrix(input)? == input.params() &&
+                            input.params().execution_owner_id() ==
+                                parameters.execution_owner_id() &&
+                            input.params().ring_dimension() == parameters.ring_dimension() &&
+                            !input.is_ntt()
+                    } else {
+                        input.params() == &parameters &&
+                            input.params().execution_owner_id() ==
+                                parameters.execution_owner_id() &&
+                            input.level() == level &&
+                            input.is_ntt() == evaluation
+                    };
                     if !compatible {
                         return Err(PolyBackendError::GpuSubmission(
                             "prepared inputs differ in parameters, ownership or format".into(),
@@ -4093,8 +4176,8 @@ impl GpuDcrtBackend {
                 })
                 .collect::<Vec<_>>();
             let sigma = match &operation {
-                PreparedMatrixOperation::Sample { sigma_bits, .. } |
-                PreparedMatrixOperation::Preimage { sigma_bits, .. } => Some(*sigma_bits),
+                PreparedOperation::Sample { sigma_bits, .. } |
+                PreparedOperation::Preimage { sigma_bits, .. } => Some(*sigma_bits),
                 _ => None,
             };
             let summary = plan.summary();
@@ -4127,13 +4210,13 @@ impl GpuDcrtBackend {
                 Some((self.active_operation, summary, operation.is_import(), scenario)),
                 matches!(
                     operation,
-                    PreparedMatrixOperation::Constant { .. } |
-                        PreparedMatrixOperation::Tensor { .. } |
-                        PreparedMatrixOperation::ConcatColumns { .. } |
-                        PreparedMatrixOperation::Preimage { .. } |
-                        PreparedMatrixOperation::ImportMatrix { .. } |
-                        PreparedMatrixOperation::ImportCompact { .. } |
-                        PreparedMatrixOperation::ImportStaging { .. }
+                    PreparedOperation::Constant { .. } |
+                        PreparedOperation::Tensor { .. } |
+                        PreparedOperation::ConcatColumns { .. } |
+                        PreparedOperation::Preimage { .. } |
+                        PreparedOperation::ImportMatrix { .. } |
+                        PreparedOperation::ImportCompact { .. } |
+                        PreparedOperation::ImportStaging { .. }
                 ),
             )
         });
@@ -5660,7 +5743,7 @@ mod tests {
             let layouts = if index == 0 {
                 (0..indices.len())
                     .flat_map(|j| {
-                        PreparedMatrixOperation::CrtRecompose {
+                        PreparedOperation::CrtRecompose {
                             destination: ty.clone(),
                             plaintext_moduli: plaintext[j]
                                 .iter()
@@ -5888,7 +5971,7 @@ mod tests {
                 .zip(&target_indices)
                 .filter(|(_, target)| **target == index)
                 .flat_map(|((conversion, ty), _)| {
-                    PreparedMatrixOperation::RnsConversion {
+                    PreparedOperation::RnsConversion {
                         destination: ty.clone(),
                         source_moduli: parameters[1 - index].moduli().to_vec(),
                         conversion: *conversion,
@@ -6132,7 +6215,7 @@ mod tests {
         for (index, parameters) in parameters.iter().enumerate() {
             let layouts = (0..conversions.len())
                 .flat_map(|_| {
-                    PreparedMatrixOperation::ModulusConversion {
+                    PreparedOperation::ModulusConversion {
                         destination: types[index].clone(),
                         conversion: GpuMatrixModulusConversion::Round,
                     }
@@ -6590,7 +6673,7 @@ mod tests {
             .iter()
             .map(|(_, poly)| DCRTPolyMatrix::from_poly_vec(&cpu, vec![vec![poly.clone()]]))
             .collect::<Vec<_>>();
-        let operation = PreparedMatrixOperation::Polynomial {
+        let operation = PreparedOperation::Polynomial {
             ty: ty.clone(),
             coefficients: Vec::new(),
             evaluation: false,

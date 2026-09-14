@@ -24,7 +24,7 @@ use mxx_primitives::{
         gpu_dcrt_poly::{
             GpuCompactTransferKind, GpuDCRTMatrixRnsSnapshot, GpuDCRTPolyMatrix,
             GpuPreparedSlotKind, GpuPreparedWorkspaceLayout, GpuRnsSnapshotTransfer,
-            GpuSmallMatrix,
+            GpuSmallMatrix, GpuTracedClaim,
         },
     },
     poly::{
@@ -40,7 +40,7 @@ use mxx_primitives::{
         trapdoor::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor},
     },
 };
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{
@@ -74,7 +74,7 @@ pub use gpu_admit::{
 pub use gpu_compiled::GpuAdmittedInvocationSummary;
 use gpu_compiled::{
     CompiledMatrixInvocation, ExecutionPayload, PreimageClaimPlan, PreimagePlanKey,
-    PreparedMatrixOperation, TrapdoorPlanKey,
+    PreparedOperation, TrapdoorPlanKey,
 };
 pub use gpu_inventory::{GpuContextDemand, GpuInventoryValue, GpuScopeProgress, GpuScopeResources};
 pub use gpu_prepare::{
@@ -100,13 +100,6 @@ static NEXT_FLEET_VALUE_ID: AtomicU64 = AtomicU64::new(1);
 
 type CompactMatrixEncoding = (u8, u8, u32, usize, usize, u16, u16, Vec<u8>);
 
-/// One readback resource an explicit export boundary claims from the accepted
-/// inventory, in the native codec's claim order.
-enum PreparedReadbackClaim {
-    Matrix { rows: usize, columns: usize, level: usize, evaluation: bool },
-    Workspace(GpuPreparedWorkspaceLayout),
-}
-
 impl GpuDcrtBackend {
     fn start_rns_snapshot<'a>(
         &mut self,
@@ -124,13 +117,13 @@ impl GpuDcrtBackend {
         self.prepared_readback(
             params,
             &[
-                PreparedReadbackClaim::Workspace(GpuPreparedWorkspaceLayout {
+                GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
                     kind: GpuPreparedSlotKind::PinnedHost,
                     bytes: transfer.bytes,
                     alignment: 1,
                 }),
-                PreparedReadbackClaim::Workspace(transfer),
-                PreparedReadbackClaim::Workspace(GpuPreparedWorkspaceLayout {
+                GpuTracedClaim::workspace(transfer),
+                GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
                     kind: GpuPreparedSlotKind::CompletionEvent,
                     bytes: 0,
                     alignment: 1,
@@ -147,27 +140,17 @@ impl GpuDcrtBackend {
     fn prepared_readback<T>(
         &self,
         parameters: &GpuDCRTPolyParams,
-        claims: &[PreparedReadbackClaim],
+        claims: &[GpuTracedClaim],
         run: impl FnOnce() -> Result<T, PolyBackendError>,
     ) -> Result<T, PolyBackendError> {
-        use mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim;
         if self.prepared_ledger.is_none() {
             return Err(PolyBackendError::GpuSubmission(
                 "prepared export requires an accepted ledger".into(),
             ));
         }
         let broker = self.claim_broker(parameters);
-        let claims = claims
-            .iter()
-            .map(|claim| match claim {
-                PreparedReadbackClaim::Matrix { rows, columns, level, evaluation } => {
-                    GpuTracedClaim::matrix(*rows, *columns, *level, *evaluation)
-                }
-                PreparedReadbackClaim::Workspace(layout) => GpuTracedClaim::workspace(*layout),
-            })
-            .collect::<Vec<_>>();
         let mut error = None;
-        let result = broker.hold(&claims, true, || {
+        let result = broker.hold(claims, true, || {
             run().map_err(|failure| {
                 error = Some(failure);
                 "export step failed".to_string()
@@ -178,6 +161,64 @@ impl GpuDcrtBackend {
             (Err(_), Some(error)) => Err(error),
             (Err(message), None) => Err(PolyBackendError::GpuSubmission(message)),
         }
+    }
+
+    /// Validate a boundary readback against the same typed trace used by the
+    /// native reader. Boundary requests do not enter the matrix invocation
+    /// queue: their host result is consumed immediately by the caller.
+    fn validate_polynomial_readback(
+        &self,
+        value: &GpuFleetMatrix,
+        claims: &[GpuTracedClaim],
+    ) -> Result<(), PolyBackendError> {
+        if value.size() != (1, 1) || value.shards.len() != 1 {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let shard = &value.shards[0];
+        let device = self
+            .devices
+            .iter()
+            .position(|(id, _)| *id == shard.device_id)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let params = self.devices[device].1.parameters_for_matrix(&shard.value)?;
+        self.claim_broker(params)
+            .assignment_with_reclaim_policy(claims)
+            .map_err(PolyBackendError::GpuSubmission)?
+            .ok_or_else(|| {
+                PolyBackendError::GpuSubmission(
+                    "prepared inventory cannot fit polynomial readback claims".into(),
+                )
+            })?;
+        Ok(())
+    }
+
+    fn validate_readback_invocation(
+        &self,
+        placement: usize,
+        node: Option<&crate::gpu_invocation::GpuNodeOperation>,
+        request: &crate::gpu_invocation::GpuInvocation<
+            '_,
+            GpuFleetMatrix,
+            GpuFleetSmallMatrix,
+            GpuFleetTrapdoor,
+        >,
+    ) -> Result<(), PolyBackendError> {
+        if placement != 0 {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let lowered = CompiledMatrixInvocation::lower(request, node, self)?;
+        let PreparedOperation::PolynomialReadback { claims, .. } = lowered.operation else {
+            return Err(PolyBackendError::GpuSubmission(
+                "host boundary did not lower to readback operation".into(),
+            ));
+        };
+        let value = match request {
+            crate::gpu_invocation::GpuInvocation::PolynomialValues { value, .. } |
+            crate::gpu_invocation::GpuInvocation::ThresholdDecode { value, .. } |
+            crate::gpu_invocation::GpuInvocation::ExtractCoefficient { value, .. } => value,
+            _ => unreachable!("readback validator called for a matrix operation"),
+        };
+        self.validate_polynomial_readback(value, &claims)
     }
 }
 
@@ -740,10 +781,15 @@ pub struct GpuDcrtBackend {
     /// before the inventory sealed.
     preimage_plans: HashMap<PreimagePlanKey, PreimageClaimPlan>,
     trapdoor_plans: HashMap<TrapdoorPlanKey, gpu_compiled::TrapdoorClaimPlan>,
+    /// Warmup-only sampled trapdoors reused when the same class also needs a
+    /// preimage resource trace. This prevents duplicate sample/cache launches.
+    warmup_trapdoors: HashMap<TrapdoorPlanKey, (GpuDCRTPolyMatrix, GpuDCRTTrapdoor)>,
+    #[cfg(test)]
+    pub(crate) warmup_trapdoor_sample_count: usize,
     /// Traced claim plans for scalar polynomial value readback, keyed by
     /// modulus, ring dimension, requested domain and the input's format.
     polynomial_value_plans: HashMap<
-        (String, usize, bool, bool),
+        gpu_compiled::PolynomialReadbackKey,
         Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
     >,
     /// Every admitted invocation of this fleet, keyed by the operation
@@ -819,6 +865,9 @@ impl GpuDcrtBackend {
             prepared_ledger: None,
             preimage_plans: HashMap::new(),
             trapdoor_plans: HashMap::new(),
+            warmup_trapdoors: HashMap::new(),
+            #[cfg(test)]
+            warmup_trapdoor_sample_count: 0,
             polynomial_value_plans: HashMap::new(),
             admitted_plan_log: Vec::new(),
             admitted_measurement_sink: None,
@@ -4114,21 +4163,15 @@ impl Backend for GpuDcrtBackend {
             // Explicit readback boundary holding the claims traced for this
             // class (clone, domain conversion, RNS store) before sealing.
             let params = self.devices[device].1.parameters_for_matrix(&first.value)?;
-            let key = (
-                params.modulus().to_string(),
-                params.ring_dimension() as usize,
-                evaluation,
-                first.value.is_ntt(),
-            );
-            let claims = self.polynomial_value_plans.get(&key).cloned().ok_or_else(|| {
-                PolyBackendError::GpuSubmission(
-                    "polynomial value readback has no derived claim plan for this shape".into(),
-                )
-            })?;
+            let operation =
+                CompiledMatrixInvocation::lower_polynomial_readback(value, evaluation, self)?;
+            let PreparedOperation::PolynomialReadback { claims, .. } = operation else {
+                unreachable!("readback projection returned another operation")
+            };
             let broker = self.claim_broker(params);
             let mut failure = None;
             let target = &mut self.devices[device].1;
-            let result = broker.hold_traced(&claims, || {
+            let result = broker.hold_traced_reclaim(&claims, || {
                 target.polynomial_values(&first.value, evaluation).map_err(|error| {
                     failure = Some(error);
                     "polynomial value readback failed".to_string()
@@ -4187,11 +4230,25 @@ impl Backend for GpuDcrtBackend {
                     other => vec![(*placement, node.clone(), other.clone())],
                 })
                 .collect::<Vec<_>>();
-            if expanded.is_empty() {
+            // Host-valued boundaries share the polynomial-readback operation
+            // but do not produce a matrix owner and therefore must not enter
+            // the compiled matrix invocation queue.
+            let mut matrix_requests = Vec::with_capacity(expanded.len());
+            for (placement, node, request) in expanded {
+                match &request {
+                    crate::gpu_invocation::GpuInvocation::PolynomialValues { .. } |
+                    crate::gpu_invocation::GpuInvocation::ThresholdDecode { .. } |
+                    crate::gpu_invocation::GpuInvocation::ExtractCoefficient { .. } => {
+                        self.validate_readback_invocation(placement, node.as_ref(), &request)?;
+                    }
+                    _ => matrix_requests.push((placement, node, request)),
+                }
+            }
+            if matrix_requests.is_empty() {
                 return Ok(());
             }
             if self.prepared_ledger.is_some() && self.prepared_invocations.is_empty() {
-                let lowered = expanded
+                let lowered = matrix_requests
                     .iter()
                     .map(|(placement, node, request)| {
                         if *placement != 0 {
@@ -4202,7 +4259,7 @@ impl Backend for GpuDcrtBackend {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.admit_matrix_invocations(lowered, usize::MAX)
             } else {
-                self.validate_admitted_matrix_invocations(&expanded)
+                self.validate_admitted_matrix_invocations(&matrix_requests)
             }
         } else {
             self.preflight_column_operations(requests)
@@ -4366,7 +4423,7 @@ impl Backend for GpuDcrtBackend {
                     .iter()
                     .map(|(left, right)| vec![left.as_ref(), right.as_ref()])
                     .collect::<Vec<_>>(),
-                vec![PreparedMatrixOperation::Add; inputs.len()],
+                vec![PreparedOperation::Add; inputs.len()],
             );
         }
         inputs.into_iter().map(|(left, right)| self.add(&left, &right)).collect()
@@ -4423,7 +4480,7 @@ impl Backend for GpuDcrtBackend {
                     .iter()
                     .map(|(left, right)| vec![left.as_ref(), right.as_ref()])
                     .collect::<Vec<_>>(),
-                vec![PreparedMatrixOperation::Subtract; inputs.len()],
+                vec![PreparedOperation::Subtract; inputs.len()],
             );
         }
         inputs.into_iter().map(|(left, right)| self.sub(&left, &right)).collect()
@@ -4494,7 +4551,7 @@ impl Backend for GpuDcrtBackend {
                     .collect::<Vec<_>>(),
                 inputs
                     .iter()
-                    .map(|(left, right)| PreparedMatrixOperation::Multiply {
+                    .map(|(left, right)| PreparedOperation::Multiply {
                         scales_left: gpu_matrix_multiply_scales_left(
                             left.rows,
                             left.columns,
@@ -4578,7 +4635,7 @@ impl Backend for GpuDcrtBackend {
                 .iter()
                 .map(|request| {
                     let (_, left, right) = &request.products[0];
-                    PreparedMatrixOperation::Accumulate {
+                    PreparedOperation::Accumulate {
                         products: request
                             .products
                             .iter()
@@ -4618,7 +4675,7 @@ impl Backend for GpuDcrtBackend {
         if !self.prepared_required || inputs.len() > 1 {
             return self.execute_matrix_batch(
                 &inputs.iter().map(|input| vec![input.as_ref()]).collect::<Vec<_>>(),
-                vec![PreparedMatrixOperation::Negate; inputs.len()],
+                vec![PreparedOperation::Negate; inputs.len()],
             );
         }
         inputs.into_iter().map(|input| self.negate(&input)).collect()
@@ -4643,10 +4700,7 @@ impl Backend for GpuDcrtBackend {
         if !self.prepared_required || inputs.len() > 1 {
             return self.execute_matrix_batch(
                 &inputs.iter().map(|(input, _)| vec![input.as_ref()]).collect::<Vec<_>>(),
-                inputs
-                    .iter()
-                    .map(|(_, scalar)| PreparedMatrixOperation::Scale(scalar.clone()))
-                    .collect(),
+                inputs.iter().map(|(_, scalar)| PreparedOperation::Scale(scalar.clone())).collect(),
             );
         }
         inputs.into_iter().map(|(input, scalar)| self.scale_integer(&input, &scalar)).collect()
@@ -4671,10 +4725,7 @@ impl Backend for GpuDcrtBackend {
         if !self.prepared_required || inputs.len() > 1 {
             return self.execute_matrix_batch(
                 &inputs.iter().map(|(input, _)| vec![input.as_ref()]).collect::<Vec<_>>(),
-                inputs
-                    .iter()
-                    .map(|(_, scalar)| PreparedMatrixOperation::Automorphism(*scalar))
-                    .collect(),
+                inputs.iter().map(|(_, scalar)| PreparedOperation::Automorphism(*scalar)).collect(),
             );
         }
         inputs.into_iter().map(|(input, scalar)| self.ring_automorphism(&input, scalar)).collect()
@@ -5631,6 +5682,10 @@ impl Backend for GpuDcrtBackend {
         value: &Self::Matrix,
         position: usize,
     ) -> Result<BigInt, Self::Error> {
+        if self.prepared_required {
+            let values = self.polynomial_values(value, false)?;
+            return values.get(position).cloned().ok_or(PolyBackendError::InvalidInteger);
+        }
         let first = value.shards.first().ok_or(PolyBackendError::InvalidInteger)?;
         let device = self
             .devices
@@ -5646,8 +5701,17 @@ impl Backend for GpuDcrtBackend {
         plaintext_modulus: &BigInt,
         length: usize,
     ) -> Result<Vec<BigInt>, Self::Error> {
-        let full = self.gather_matrix(value)?;
-        self.devices[0].1.threshold_decode(&full, plaintext_modulus, length)
+        let first = value.shards.first().ok_or(PolyBackendError::InvalidInteger)?;
+        let coefficients = self.polynomial_values(value, false)?;
+        let modulus: Arc<BigUint> = first.value.params().modulus().into();
+        let q = BigInt::from_biguint(num_bigint::Sign::Plus, modulus.as_ref().clone());
+        Ok(coefficients
+            .into_iter()
+            .take(length)
+            .map(|coefficient| {
+                ((plaintext_modulus * coefficient + &q / 2) / &q) % plaintext_modulus
+            })
+            .collect())
     }
 
     fn pack_polynomial_coefficients(
@@ -5720,18 +5784,18 @@ impl Backend for GpuDcrtBackend {
                 self.prepared_readback(
                     parameters,
                     &[
-                        PreparedReadbackClaim::Matrix {
-                            rows: shard.value.row_size(),
-                            columns: shard.value.col_size(),
-                            level: shard.value.level(),
-                            evaluation: shard.value.is_ntt(),
-                        },
-                        PreparedReadbackClaim::Workspace(GpuPreparedWorkspaceLayout {
+                        GpuTracedClaim::matrix(
+                            shard.value.row_size(),
+                            shard.value.col_size(),
+                            shard.value.level(),
+                            shard.value.is_ntt(),
+                        ),
+                        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
                             kind: GpuPreparedSlotKind::SubmissionStream,
                             bytes: 0,
                             alignment: 1,
                         }),
-                        PreparedReadbackClaim::Workspace(store),
+                        GpuTracedClaim::workspace(store),
                     ],
                     || Ok(shard.value.to_compact_bytes()),
                 )
@@ -5925,7 +5989,7 @@ impl Backend for GpuDcrtBackend {
             let local = if self.prepared_required {
                 self.prepared_readback(
                     params,
-                    &[PreparedReadbackClaim::Workspace(GpuPreparedWorkspaceLayout {
+                    &[GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
                         kind: GpuPreparedSlotKind::CompletionEvent,
                         bytes: 0,
                         alignment: 1,

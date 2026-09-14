@@ -172,12 +172,17 @@ pub trait Backend {
 
     /// Prepares isolated calibration and admission after actual materialization.
     /// Requests are ordered exactly as the following production batch, with each
-    /// destination placement explicit. No production sampling state is exposed.
+    /// destination placement explicit. A request whose invocation is a validated
+    /// IR node carries that node's metadata, which is the single authority for
+    /// the operation's resource identity; a request without it (fusion results,
+    /// sampler algorithm steps, artifact imports) is lowered from the invocation.
+    /// No production sampling state is exposed.
     #[cfg(feature = "gpu")]
     fn preflight_gpu_operations(
         &mut self,
         _requests: &[(
             usize,
+            Option<crate::gpu_invocation::GpuNodeOperation>,
             crate::gpu_invocation::GpuInvocation<
                 '_,
                 Self::Matrix,
@@ -210,11 +215,19 @@ pub trait Backend {
     /// With `warm_up = true`, explicitly allow resource-discovery GPU trials.
     /// Production passes false and requires every trial-derived plan to exist
     /// already on this backend for the graph's concrete parameters.
+    ///
+    /// `wave_bound` is the configured concurrency bound for sibling parallel
+    /// bodies (`ExecutionConfig::max_parallel_instances`), never the loop count
+    /// or the number of graph uses: production storage may be provisioned for
+    /// that many simultaneous bodies, and admission returns at most that wave.
+    /// Backing that scales with repeated iterations or graph occurrences is
+    /// forbidden; backing that scales with the configured bound is not.
     fn prepare_graph_admission(
         &mut self,
         _validated: &mxx_ir_core::ValidatedGraph,
         _capture_trace: bool,
         _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
+        _wave_bound: usize,
         _warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error>
     where
@@ -223,9 +236,29 @@ pub trait Backend {
         Ok(None)
     }
 
-    /// Limit sibling bodies when the backend parallelizes within primitives.
-    fn parallel_wave_size(&self, limit: usize) -> usize {
-        limit
+    /// Admit the bounded wave of sibling bodies to execute next for `request`.
+    /// Called once per wave, before that wave's lazy inputs are materialized.
+    ///
+    /// Admission is metadata-only: implementations must not materialize lazy
+    /// inputs, read artifact payloads, consume randomness, allocate dummy
+    /// values, or enqueue device work. The result is an internal input contract:
+    /// the executor consumes it verbatim, so an implementation must return
+    /// `1 <= wave_size <= request.caller_cap.min(request.remaining)` and one
+    /// frozen staging action per child output port. Build it through
+    /// `WaveAdmissionRequest::admission_of_size` (or `default_admission`) rather
+    /// than by hand. The default is the CPU policy: the whole remaining prefix
+    /// the caller allows, without reservation or discovery. A backend with
+    /// prepared storage commits exclusive capacity only after a metadata-only
+    /// candidate fits and returns its owned token in the admission. The token
+    /// survives nested execution and output publication, including error exits.
+    fn admit_wave(
+        &mut self,
+        request: &crate::executor::WaveAdmissionRequest<'_, Self>,
+    ) -> Result<crate::executor::WaveAdmission, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(request.default_admission())
     }
 
     fn placement_count(&self) -> usize {

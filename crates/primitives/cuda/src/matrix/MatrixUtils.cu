@@ -331,6 +331,11 @@ int matrix_track_limb_consumer(
     cudaStream_t consumer_stream,
     cudaEvent_t completion, bool device_already_selected)
 {
+    // This path folds a new reader into the producer event. A previous host
+    // observation only covered its old record, not this pending reader.
+    // Invalidate before either the same-stream or cross-stream event update,
+    // so prepared recycling and subsequent read-only waits join the new work.
+    if (src) src->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!src || !src->ctx || !consumer_stream || consumer_device < 0)
     {
         return set_error("invalid matrix_track_limb_consumer arguments");

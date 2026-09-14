@@ -116,6 +116,21 @@ struct GpuP1CovarianceCache
 
 namespace
 {
+struct MatrixSamplerSubmission {
+        GpuExecutionOwner *owner;
+        bool pending = false;
+        ~MatrixSamplerSubmission() {
+            if (pending) {
+                // After launch, only CUDA submission/retirement can fail: all
+                // capacity is acquired above. Without complete reader edges,
+                // retain owners rather than freeing a still-read cache/input.
+                owner->memory_release_failed.store(true, std::memory_order_release);
+                owner->unretired_work.store(true, std::memory_order_release);
+                gpu_execution_mark_allocation_unknown(owner);
+            }
+        }
+};
+
     // These are CUDA block-shape constants, not a preimage chunk limit. Every
     // kernel below receives the runtime column count selected by
     // AUX_SAMPLING_CHUNK_WIDTH and covers any final partial tile.
@@ -380,7 +395,16 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_add_correction_top_kernel(
+    constexpr size_t kPreimageCorrectionBatch = 64;
+    struct PreimageCorrectionBatch {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *r[kPreimageCorrectionBatch];
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *e[kPreimageCorrectionBatch];
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *z[kPreimageCorrectionBatch];
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out[kPreimageCorrectionBatch];
+    };
+    static_assert(sizeof(PreimageCorrectionBatch) + 128 < 4096, "bounded correction kernel arguments");
+
+    __device__ void matrix_preimage_add_correction_top_kernel_body(
         const uint8_t *r_base,
         const uint8_t *e_base,
         const uint8_t *z_base,
@@ -398,7 +422,7 @@ namespace
         uint8_t e_coeff_bytes,
         uint8_t z_coeff_bytes,
         uint8_t out_coeff_bytes,
-        uint64_t modulus)
+        uint64_t modulus, size_t coefficient_start, size_t coefficient_step, bool accumulate)
     {
         __shared__ uint64_t trapdoor_tile[kPreimageTileM][kPreimageTileK];
         __shared__ uint64_t z_tile[kPreimageTileK][kPreimageTileN];
@@ -411,12 +435,12 @@ namespace
         const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
         const int thread_count = blockDim.x * blockDim.y;
 
-        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+        for (size_t coeff_idx = coefficient_start;
              coeff_idx < n;
-             coeff_idx += static_cast<size_t>(gridDim.z))
+             coeff_idx += coefficient_step)
         {
             uint64_t acc = 0;
-            if (row < top_rows && col < out_cols)
+            if (accumulate && row < top_rows && col < out_cols)
             {
                 acc = matrix_load_limb_u64(
                     out_base,
@@ -507,7 +531,30 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_add_correction_bottom_kernel(
+    __global__ void matrix_preimage_add_correction_top_kernel(
+        const uint8_t *r_base,
+        const uint8_t *e_base,
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t d,
+        size_t inner,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t r_stride_bytes,
+        size_t e_stride_bytes,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t r_coeff_bytes,
+        uint8_t e_coeff_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        matrix_preimage_add_correction_top_kernel_body(r_base, e_base, z_base, out_base, d, inner, z_cols, out_cols, n, r_stride_bytes, e_stride_bytes, z_stride_bytes, out_stride_bytes, r_coeff_bytes, e_coeff_bytes, z_coeff_bytes, out_coeff_bytes, modulus, blockIdx.z, gridDim.z, true);
+    }
+
+    __device__ void matrix_preimage_add_correction_bottom_kernel_body(
         const uint8_t *z_base,
         uint8_t *out_base,
         size_t top_rows,
@@ -552,6 +599,72 @@ namespace
             out_coeff_bytes,
             add_mod_u64(base_value, z_value, modulus));
     }
+
+    __global__ void matrix_preimage_add_correction_bottom_kernel(
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t top_rows,
+        size_t z_rows,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        matrix_preimage_add_correction_bottom_kernel_body(z_base, out_base, top_rows, z_rows, z_cols, out_cols, n, z_stride_bytes, out_stride_bytes, z_coeff_bytes, out_coeff_bytes, modulus);
+    }
+
+    struct PreimageAssemblyBatch {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *top[64], *bottom[64], *out[64];
+    };
+    static_assert(sizeof(PreimageAssemblyBatch) + 128 < 4096, "bounded assembly arguments");
+    __global__ void matrix_preimage_assemble_batch_kernel(
+        PreimageAssemblyBatch jobs, size_t rows, size_t top_rows, size_t columns, size_t n)
+    {
+        const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+        if (index >= rows * columns * n) return;
+        const size_t poly = index / n, coefficient = index % n;
+        const size_t row = poly / columns;
+        const auto source = row < top_rows ? jobs.top[blockIdx.y][blockIdx.z]
+                                          : jobs.bottom[blockIdx.y][blockIdx.z];
+        const auto out = jobs.out[blockIdx.y][blockIdx.z];
+        const size_t source_poly = row < top_rows ? poly : poly - top_rows * columns;
+        const auto value = matrix_load_limb_u64(source.base, source_poly, coefficient, source.stride, source.width);
+        matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width, value);
+    }
+
+    __global__ void matrix_preimage_correction_top_batch_kernel(
+        PreimageCorrectionBatch jobs, size_t count, size_t limbs,
+        size_t d, size_t inner, size_t columns, size_t n, const uint64_t *moduli, bool accumulate)
+    {
+        const size_t job = blockIdx.z % count;
+        const size_t limb = (blockIdx.z / count) % limbs;
+        const auto r = jobs.r[job][limb];
+        const auto e = jobs.e[job][limb];
+        const auto z = jobs.z[job][limb];
+        const auto out = jobs.out[job][limb];
+        matrix_preimage_add_correction_top_kernel_body(
+            r.base, e.base, z.base, out.base, d, inner, columns, columns, n,
+            r.stride, e.stride, z.stride, out.stride,
+            r.width, e.width, z.width, out.width, moduli[limb],
+            blockIdx.z / (count * limbs), gridDim.z / (count * limbs), accumulate);
+    }
+
+    __global__ void matrix_preimage_correction_bottom_batch_kernel(
+        PreimageCorrectionBatch jobs,
+        size_t d, size_t inner, size_t columns, size_t n, const uint64_t *moduli)
+    {
+        const size_t limb = blockIdx.z;
+        const auto z = jobs.z[blockIdx.y][limb];
+        const auto out = jobs.out[blockIdx.y][limb];
+        matrix_preimage_add_correction_bottom_kernel_body(
+            z.base, out.base, 2 * d, inner, columns, columns, n,
+            z.stride, out.stride, z.width, out.width, moduli[limb]);
+    }
+
 
     int preimage_const_limb_view(
         const GpuMatrix *matrix,
@@ -713,7 +826,7 @@ __global__ void matrix_precompute_p1_covariance_kernel(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_small(
+__device__ void matrix_sample_p1_integer_cached_kernel_small_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -792,7 +905,25 @@ __global__ void matrix_sample_p1_integer_cached_kernel_small(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_large(
+__global__ void matrix_sample_p1_integer_cached_kernel_small(
+    const uint8_t *tp2_base,
+    size_t tp2_stride_bytes,
+    uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base,
+    const double *update_coeff_base,
+    size_t d,
+    size_t cols,
+    size_t n,
+    int64_t *sampled_out,
+    uint64_t modulus,
+    double c_scale,
+    GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_small_body(tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base, update_coeff_base, d, cols, n, sampled_out, modulus, c_scale, seed);
+}
+
+
+__device__ void matrix_sample_p1_integer_cached_kernel_large_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -874,6 +1005,28 @@ __global__ void matrix_sample_p1_integer_cached_kernel_large(
         sampled_out[out_idx] = sampled[row];
     }
 }
+
+__global__ void matrix_sample_p1_integer_cached_kernel_large(
+    const uint8_t *tp2_base,
+    size_t tp2_stride_bytes,
+    uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base,
+    const double *update_coeff_base,
+    size_t d,
+    size_t cols,
+    size_t n,
+    size_t sample_start,
+    size_t sample_count,
+    double *mean_workspace,
+    int64_t *sampled_workspace,
+    int64_t *sampled_out,
+    uint64_t modulus,
+    double c_scale,
+    GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_large_body(tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base, update_coeff_base, d, cols, n, sample_start, sample_count, mean_workspace, sampled_workspace, sampled_out, modulus, c_scale, seed);
+}
+
 
 __global__ void matrix_sample_p1_integer_kernel_small(
     const uint8_t *a_base,
@@ -1187,7 +1340,7 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     }
 }
 
-__global__ void matrix_scatter_p1_integer_to_limb_kernel(
+__device__ void matrix_scatter_p1_integer_to_limb_kernel_body(
     const int64_t *sampled_in,
     uint8_t *out_base,
     size_t out_stride_bytes,
@@ -1214,9 +1367,90 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
         signed_mod_i64(sampled_in[idx], modulus));
 }
 
-__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+__global__ void matrix_scatter_p1_integer_to_limb_kernel(
+    const int64_t *sampled_in,
+    uint8_t *out_base,
+    size_t out_stride_bytes,
+    uint8_t out_coeff_bytes,
+    size_t entry_count,
+    size_t n,
+    uint64_t modulus)
+{
+    matrix_scatter_p1_integer_to_limb_kernel_body(sampled_in, out_base, out_stride_bytes, out_coeff_bytes, entry_count, n, modulus);
+}
+
+
+constexpr size_t kP1BatchMatrices = 16;
+struct P1BatchJob {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *input, *output;
+    const double *sqrt_var, *update;
+    int64_t *samples, *sample_workspace;
+    double *mean_workspace;
+    uint64_t modulus;
+    double c_scale;
+    GpuRngSeed seed;
+};
+struct P1BatchDescriptors {
+    P1BatchJob jobs[kP1BatchMatrices];
+    uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+    uint64_t moduli[GPU_RUNTIME_MAX_LIMBS];
+};
+static_assert(sizeof(P1BatchDescriptors) + 128 < 4096, "bounded P1 sampling arguments");
+
+template<bool Large>
+__global__ void matrix_sample_p1_batch_kernel(
+    P1BatchDescriptors batch, size_t d, size_t columns, size_t n)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    const auto source = job.input[batch.indices[0]];
+    if constexpr (Large) {
+        matrix_sample_p1_integer_cached_kernel_large_body(
+            source.base, source.stride, source.width, job.sqrt_var, job.update,
+            d, columns, n, 0, columns * n, job.mean_workspace, job.sample_workspace,
+            job.samples, job.modulus, job.c_scale, job.seed);
+    } else {
+        matrix_sample_p1_integer_cached_kernel_small_body(
+            source.base, source.stride, source.width, job.sqrt_var, job.update,
+            d, columns, n, job.samples, job.modulus, job.c_scale, job.seed);
+    }
+}
+__global__ void matrix_scatter_p1_batch_kernel(
+    P1BatchDescriptors batch, size_t polynomials, size_t n)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    const auto output = job.output[batch.indices[blockIdx.z]];
+    matrix_scatter_p1_integer_to_limb_kernel_body(
+        job.samples, output.base, output.stride, output.width,
+        polynomials, n, batch.moduli[blockIdx.z]);
+}
+
+struct GadgetDigitBuffer {
+    int64_t *data;
+    size_t n;
+    uint32_t digits;
+    __device__ void write(size_t poly, size_t coefficient, uint32_t digit, int64_t value) const {
+        data[(poly * digits + digit) * n + coefficient] = value;
+    }
+};
+struct GadgetDigitOutput {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *output;
+    const uint64_t *moduli;
+    size_t limbs, n, columns;
+    uint32_t digits, tower;
+    __device__ void write(size_t poly, size_t coefficient, uint32_t digit, int64_t value) const {
+        const size_t row = ((poly / columns) * limbs + tower) * digits + digit;
+        const size_t destination = row * columns + poly % columns;
+        for (size_t limb = 0; limb < limbs; ++limb) {
+            const auto descriptor = output[limb];
+            matrix_store_limb_u64(descriptor.base, destination, coefficient,
+                descriptor.stride, descriptor.width, signed_mod_i64(value, moduli[limb]));
+        }
+    }
+};
+
+template<typename Store>
+__device__ void matrix_gauss_samp_gq_arb_base_sample_kernel_body(
     const uint8_t *src_base,
-    int64_t *sampled_digits,
     size_t poly_count,
     size_t n,
     size_t src_stride_bytes,
@@ -1226,7 +1460,7 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
     uint32_t digits_per_tower,
     double c,
     uint32_t tower_idx,
-    GpuRngSeed seed)
+    GpuRngSeed seed, Store store)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = poly_count * n;
@@ -1342,9 +1576,52 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
             out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
         }
 
+        store.write(poly_idx, coeff_idx, digit_idx, out_digit);
+    }
+}
+
+__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+    const uint8_t *src_base,
+    int64_t *sampled_digits,
+    size_t poly_count,
+    size_t n,
+    size_t src_stride_bytes,
+    uint8_t src_coeff_bytes,
+    uint64_t tower_modulus,
+    uint32_t base_bits,
+    uint32_t digits_per_tower,
+    double c,
+    uint32_t tower_idx,
+    GpuRngSeed seed)
+{
+    matrix_gauss_samp_gq_arb_base_sample_kernel_body(src_base, poly_count, n, src_stride_bytes, src_coeff_bytes, tower_modulus, base_bits, digits_per_tower, c, tower_idx, seed, GadgetDigitBuffer{sampled_digits, n, digits_per_tower});
+}
+
+
+__device__ void matrix_scatter_gadget_digits(
+    size_t idx, const int64_t *sampled_digits, uint8_t *dst_base,
+    size_t dst_stride, uint8_t dst_bytes, uint64_t out_modulus,
+    size_t n, size_t src_cols, size_t out_cols, size_t log_base_q,
+    size_t src_digit_offset, uint32_t digits_per_tower)
+{
+    const size_t poly_idx = idx / n;
+    const size_t coeff_idx = idx - poly_idx * n;
+    const size_t row = poly_idx / src_cols;
+    const size_t col = poly_idx - row * src_cols;
+    for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+    {
         const size_t sample_idx =
             (poly_idx * static_cast<size_t>(digits_per_tower) + static_cast<size_t>(digit_idx)) * n + coeff_idx;
-        sampled_digits[sample_idx] = out_digit;
+        const int64_t out_digit = sampled_digits[sample_idx];
+        const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
+        const size_t out_poly_idx = out_row * out_cols + col;
+        matrix_store_limb_u64(
+            dst_base,
+            out_poly_idx,
+            coeff_idx,
+            dst_stride,
+            dst_bytes,
+            signed_mod_i64(out_digit, out_modulus));
     }
 }
 
@@ -1392,25 +1669,31 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
         return;
     }
 
-    const size_t poly_idx = idx / n;
-    const size_t coeff_idx = idx - poly_idx * n;
-    const size_t row = poly_idx / src_cols;
-    const size_t col = poly_idx - row * src_cols;
-    for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
-    {
-        const size_t sample_idx =
-            (poly_idx * static_cast<size_t>(digits_per_tower) + static_cast<size_t>(digit_idx)) * n + coeff_idx;
-        const int64_t out_digit = sampled_digits[sample_idx];
-        const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
-        const size_t out_poly_idx = out_row * out_cols + col;
-        matrix_store_limb_u64(
-            dst_base,
-            out_poly_idx,
-            coeff_idx,
-            dst_stride,
-            dst_bytes,
-            signed_mod_i64(out_digit, out_modulus));
-    }
+    matrix_scatter_gadget_digits(idx, sampled_digits, dst_base, dst_stride,
+        dst_bytes, out_modulus, n, src_cols, out_cols, log_base_q,
+        src_digit_offset, digits_per_tower);
+}
+
+constexpr size_t kGadgetBatchMatrices = 64;
+struct GadgetBatchJob {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *input, *output;
+    GpuRngSeed seed;
+};
+struct GadgetBatchDescriptors { GadgetBatchJob jobs[kGadgetBatchMatrices]; };
+static_assert(sizeof(GadgetBatchDescriptors) + 128 < 4096, "bounded gadget sampler arguments");
+
+__global__ void matrix_sample_gadget_batch_kernel(
+    GadgetBatchDescriptors batch, const uint64_t *moduli,
+    size_t polynomials, size_t n, size_t columns, size_t limbs,
+    uint32_t base_bits, uint32_t digits, double c)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    const uint32_t tower = blockIdx.z;
+    const auto input = job.input[tower];
+    matrix_gauss_samp_gq_arb_base_sample_kernel_body(
+        input.base, polynomials, n, input.stride, input.width,
+        moduli[tower], base_bits, digits, c, tower, job.seed,
+        GadgetDigitOutput{job.output, moduli, limbs, n, columns, digits, tower});
 }
 
 int launch_gauss_samp_gq_arb_base_sample_kernel(
@@ -4632,5 +4915,335 @@ extern "C" int gpu_matrix_sample_p1_full(
     out->format = GPU_POLY_FORMAT_EVAL;
 
     cleanup();
+    return 0;
+}
+
+
+// Homogeneous evaluation-format owners. The Rust caller retains exclusive
+// output ownership and every source through submission. Immutable descriptors
+// travel as kernel arguments, with no per-batch GPU allocation or upload.
+extern "C" int gpu_matrix_preimage_assemble_batch(
+    GpuMatrix *const *outputs, const GpuMatrix *const *tops,
+    const GpuMatrix *const *bottoms, size_t count)
+{
+    if (count == 0) return 0;
+    auto *first = outputs[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    if (first->rows == 0 || first->cols == 0) return 0;
+    const dim3 id = first->ctx->limb_gpu_ids[0];
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_device(first, id, &device);
+    if (status == 0) status = matrix_limb_stream(first, id, &stream);
+    if (status != 0) return status;
+    auto error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    MatrixSamplerSubmission submission{first->ctx->execution.get()};
+    for (size_t offset = 0; offset < count; offset += 64) {
+        const size_t width = std::min<size_t>(64, count - offset);
+        PreimageAssemblyBatch batch{};
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            const GpuMatrix *owners[] = {outputs[index], tops[index], bottoms[index]};
+            for (const auto *owner : owners) {
+                status = matrix_wait_all_limb_streams(owner, device, stream, true);
+                if (status != 0) return status;
+            }
+            batch.out[local] = outputs[index]->shared_limb_buffers[id.x].device_descriptors;
+            batch.top[local] = tops[index]->shared_limb_buffers[id.x].device_descriptors;
+            batch.bottom[local] = bottoms[index]->shared_limb_buffers[id.x].device_descriptors;
+        }
+        const dim3 grid((first->rows * first->cols * first->ctx->N + 255) / 256, width, first->level + 1);
+        submission.pending = true;
+        matrix_preimage_assemble_batch_kernel<<<grid, 256, 0, stream>>>(
+            batch, first->rows, tops[0]->rows, first->cols, first->ctx->N);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            status = matrix_record_all_limb_writes(outputs[index], stream);
+            if (status != 0) return status;
+            const auto complete = outputs[index]->exec_limb_states[id.x][id.y].write_done;
+            for (size_t limb = 0; limb <= static_cast<size_t>(first->level); ++limb) {
+                for (const auto *input : {tops[index], bottoms[index]}) {
+                    status = matrix_track_limb_consumer_readonly(input,
+                        first->ctx->limb_gpu_ids[limb], device, stream, complete);
+                    if (status != 0) return status;
+                }
+            }
+        }
+    }
+    submission.pending = false;
+    return 0;
+}
+
+extern "C" int gpu_matrix_apply_trapdoor_batch(
+    GpuMatrix *const *outputs, const GpuMatrix *const *rs,
+    const GpuMatrix *const *es, const GpuMatrix *const *zs, size_t count, bool correction)
+{
+    if (count == 0) return 0;
+    GpuMatrix *first = outputs[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    if (first->rows == 0 || first->cols == 0) return 0;
+    const size_t n = first->ctx->N;
+    const size_t d = rs[0]->rows;
+    const size_t inner = zs[0]->rows;
+    const size_t limbs = first->level + 1;
+    const dim3 id = first->ctx->limb_gpu_ids[0];
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_device(first, id, &device);
+    if (status == 0) status = matrix_limb_stream(first, id, &stream);
+    if (status != 0) return status;
+    cudaError_t error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    // Fleet contexts keep all CRT limbs on one device with dense local indices.
+    const auto *moduli = first->ctx->ring_device_constants[id.x].moduli;
+    const size_t capacity = std::min(kPreimageCorrectionBatch, 65535 / limbs);
+    MatrixSamplerSubmission submission{first->ctx->execution.get()};
+    for (size_t offset = 0; offset < count; offset += capacity) {
+        const size_t width = std::min(capacity, count - offset);
+        PreimageCorrectionBatch jobs{};
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            const GpuMatrix *owners[] = {outputs[index], rs[index], es[index], zs[index]};
+            for (const auto *owner : owners) {
+                status = matrix_wait_all_limb_streams(owner, device, stream, true);
+                if (status != 0) return status;
+            }
+            jobs.out[local] = outputs[index]->shared_limb_buffers[id.x].device_descriptors;
+            jobs.r[local] = rs[index]->shared_limb_buffers[id.x].device_descriptors;
+            jobs.e[local] = es[index]->shared_limb_buffers[id.x].device_descriptors;
+            jobs.z[local] = zs[index]->shared_limb_buffers[id.x].device_descriptors;
+        }
+        const dim3 threads(kPreimageTileN, kPreimageTileM);
+        const dim3 blocks(
+            (first->cols + kPreimageTileN - 1) / kPreimageTileN,
+            (2 * d + kPreimageTileM - 1) / kPreimageTileM,
+            width * limbs * std::min<size_t>(n, 65535 / (width * limbs)));
+        submission.pending = true;
+        matrix_preimage_correction_top_batch_kernel<<<blocks, threads, 0, stream>>>(
+            jobs, width, limbs, d, inner, first->cols, n, moduli, correction);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        if (correction) {
+            const dim3 bottom((inner * first->cols * n + 255) / 256, width, limbs);
+            matrix_preimage_correction_bottom_batch_kernel<<<bottom, 256, 0, stream>>>(
+                jobs, d, inner, first->cols, n, moduli);
+            error = cudaGetLastError();
+            if (error != cudaSuccess) return set_error(error);
+        }
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            status = matrix_record_all_limb_writes(outputs[index], stream);
+            if (status != 0) return status;
+            const auto complete = outputs[index]->exec_limb_states[id.x][id.y].write_done;
+            const GpuMatrix *inputs[] = {rs[index], es[index], zs[index]};
+            for (size_t limb = 0; limb < limbs; ++limb) {
+                for (const auto *input : inputs) {
+                    status = matrix_track_limb_consumer_readonly(input,
+                        first->ctx->limb_gpu_ids[limb], device, stream, complete);
+                    if (status != 0) return status;
+                }
+            }
+        }
+    }
+    submission.pending = false;
+    return 0;
+}
+
+
+// Fleet owners keep all active CRT limbs on one device. Caches may differ per
+// job, but sources/destinations share a context and shape. No cache is created
+// here: this submits only actual output-producing work using resident caches.
+extern "C" int gpu_matrix_sample_p1_batch(
+    GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
+    const GpuP1CovarianceCache *const *caches, const GpuRngSeed *seeds, size_t count)
+{
+    if (count == 0) return 0;
+    auto *first = outputs[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    const size_t d = caches[0]->d_rows, columns = first->cols, n = first->ctx->N;
+    const size_t polynomials = 2 * d * columns;
+    if (polynomials == 0) {
+        for (size_t index = 0; index < count; ++index) outputs[index]->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t limbs = first->level + 1;
+    const dim3 ref_id = first->ctx->limb_gpu_ids[0];
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_device(first, ref_id, &device);
+    if (status == 0) status = matrix_limb_stream(first, ref_id, &stream);
+    if (status != 0) return status;
+    auto error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    GpuPreparedWorkspaceLayout layouts[2]{};
+    status = gpu_matrix_query_p1_workspaces(first->ctx, d, columns, 1, layouts);
+    if (status != 0) return status;
+    struct Workspace { GpuDeviceWorkspace samples, extra; };
+    std::vector<std::unique_ptr<Workspace>> workspaces;
+    workspaces.reserve(count);
+    // All workspaces precede all event claims, matching prepared expansion.
+    for (size_t index = 0; index < count; ++index) {
+        workspaces.emplace_back(new Workspace());
+        auto &workspace = *workspaces.back();
+        status = workspace.samples.acquire(first->ctx, device, layouts[0].kind,
+            layouts[0].bytes, layouts[0].alignment, stream);
+        if (status == 0 && layouts[1].bytes)
+            status = workspace.extra.acquire(first->ctx, device, layouts[1].kind,
+                layouts[1].bytes, layouts[1].alignment, stream);
+        if (status != 0) return status;
+    }
+    MatrixSamplerSubmission submission{first->ctx->execution.get()};
+    for (size_t offset = 0; offset < count; offset += kP1BatchMatrices) {
+        const size_t width = std::min(kP1BatchMatrices, count - offset);
+        P1BatchDescriptors batch{};
+        for (size_t limb = 0; limb < limbs; ++limb) {
+            batch.indices[limb] = first->ctx->limb_gpu_ids[limb].y;
+            batch.moduli[limb] = first->ctx->moduli[limb];
+        }
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            auto &workspace = *workspaces[index];
+            const auto *cache = caches[index];
+            status = matrix_wait_all_limb_streams(outputs[index], device, stream, true);
+            if (status == 0) status = matrix_wait_limb_stream(inputs[index], ref_id, device, stream);
+            if (status != 0) return status;
+            if (cache->ready_event) {
+                error = cudaStreamWaitEvent(stream, cache->ready_event, 0);
+                if (error != cudaSuccess) return set_error(error);
+            }
+            const double variance = cache->sigma * cache->sigma;
+            batch.jobs[local] = {
+                inputs[index]->shared_limb_buffers[ref_id.x].device_descriptors,
+                outputs[index]->shared_limb_buffers[ref_id.x].device_descriptors,
+                cache->sqrt_var, cache->update_coeff,
+                reinterpret_cast<int64_t *>(workspace.samples.data),
+                layouts[1].bytes ? reinterpret_cast<int64_t *>(
+                    workspace.extra.data + 2 * d * columns * n * sizeof(double)) : nullptr,
+                reinterpret_cast<double *>(workspace.extra.data),
+                cache->modulus, -variance / (cache->s * cache->s - variance), seeds[index]
+            };
+        }
+        submission.pending = true;
+        const dim3 sampling((columns * n + 255) / 256, width);
+        if (2 * d <= kSampleP1LocalMaxM)
+            matrix_sample_p1_batch_kernel<false><<<sampling, 256, 0, stream>>>(batch, d, columns, n);
+        else
+            matrix_sample_p1_batch_kernel<true><<<sampling, 256, 0, stream>>>(batch, d, columns, n);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        const dim3 scatter((polynomials * n + 255) / 256, width, limbs);
+        matrix_scatter_p1_batch_kernel<<<scatter, 256, 0, stream>>>(batch, polynomials, n);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            status = matrix_record_all_limb_writes(outputs[index], stream);
+            if (status != 0) return status;
+            const auto complete = outputs[index]->exec_limb_states[ref_id.x][ref_id.y].write_done;
+            status = matrix_track_limb_consumer_readonly(inputs[index], ref_id, device, stream, complete);
+            if (status != 0) return status;
+            // Capture the output event's current record before the NTT can
+            // record it again. The cache owner joins this stream on retirement.
+            error = cudaStreamWaitEvent(caches[index]->stream, complete, 0);
+            if (error != cudaSuccess) {
+                gpu_execution_mark_allocation_unknown(first->ctx->execution.get());
+                return set_error(error);
+            }
+        }
+        if (polynomials <= 65535 && width <= 65535 / limbs) {
+            status = gpu_matrix_ntt_in_place_batch(outputs + offset, width);
+            if (status != 0) return status;
+        } else {
+            for (size_t local = 0; local < width; ++local) {
+                status = gpu_matrix_ntt_all(outputs[offset + local]);
+                if (status != 0) return status;
+            }
+        }
+    }
+    submission.pending = false;
+    return 0;
+}
+
+
+// Sources are homogeneous coefficient owners in a single-device context.
+// Each source tower writes a disjoint digit-row block on every output limb;
+// together they define every semantic coefficient, so no zero fill is needed.
+extern "C" int gpu_matrix_sample_gadget_batch(
+    GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
+    const GpuRngSeed *seeds, size_t count, uint32_t base_bits, double c)
+{
+    if (count == 0) return 0;
+    auto *first = outputs[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    const size_t n = first->ctx->N, columns = inputs[0]->cols;
+    const size_t polynomials = inputs[0]->rows * columns;
+    if (polynomials == 0) {
+        for (size_t index = 0; index < count; ++index) outputs[index]->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t limbs = inputs[0]->level + 1;
+    const dim3 ref_id = first->ctx->limb_gpu_ids[0];
+    uint32_t bits = 0;
+    for (const auto modulus : first->ctx->moduli) bits = std::max(bits, bit_width_u64(modulus));
+    const uint32_t digits = (bits + base_bits - 1) / base_bits;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_device(first, ref_id, &device);
+    if (status == 0) status = matrix_limb_stream(first, ref_id, &stream);
+    if (status != 0) return status;
+    auto error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    GpuPreparedWorkspaceLayout layouts[5]{};
+    status = gpu_matrix_query_gaussian_gadget_workspaces(
+        first->ctx, inputs[0]->level, inputs[0]->rows, columns, base_bits, layouts);
+    if (status != 0) return status;
+    // A one-device context has dense local limb indices (build_limb_metadata).
+    const auto *moduli = first->ctx->ring_device_constants[ref_id.x].moduli;
+    MatrixSamplerSubmission submission{first->ctx->execution.get()};
+    for (size_t offset = 0; offset < count; offset += kGadgetBatchMatrices) {
+        const size_t width = std::min(kGadgetBatchMatrices, count - offset);
+        GadgetBatchDescriptors batch{};
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            status = matrix_wait_all_limb_streams(outputs[index], device, stream, true);
+            if (status == 0) status = matrix_wait_all_limb_streams(inputs[index], device, stream, true);
+            if (status != 0) return status;
+            batch.jobs[local] = {
+                inputs[index]->shared_limb_buffers[ref_id.x].device_descriptors,
+                outputs[index]->shared_limb_buffers[ref_id.x].device_descriptors,
+                seeds[index]
+            };
+        }
+        const dim3 sampling((polynomials * n + 255) / 256, width, limbs);
+        submission.pending = true;
+        matrix_sample_gadget_batch_kernel<<<sampling, 256, 0, stream>>>(
+            batch, moduli, polynomials, n, columns, limbs, base_bits, digits, c);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        for (size_t local = 0; local < width; ++local) {
+            const size_t index = offset + local;
+            status = matrix_record_all_limb_writes(outputs[index], stream);
+            if (status != 0) return status;
+            const auto complete = outputs[index]->exec_limb_states[ref_id.x][ref_id.y].write_done;
+            for (size_t limb = 0; limb < limbs; ++limb) {
+                status = matrix_track_limb_consumer_readonly(inputs[index],
+                    first->ctx->limb_gpu_ids[limb], device, stream, complete);
+                if (status != 0) return status;
+            }
+        }
+        if (first->rows * columns <= 65535 && width <= 65535 / limbs) {
+            status = gpu_matrix_ntt_in_place_batch(outputs + offset, width);
+            if (status != 0) return status;
+        } else {
+            for (size_t local = 0; local < width; ++local) {
+                status = gpu_matrix_ntt_all(outputs[offset + local]);
+                if (status != 0) return status;
+            }
+        }
+    }
+    submission.pending = false;
     return 0;
 }

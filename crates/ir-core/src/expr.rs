@@ -2,6 +2,7 @@ use crate::serde_support;
 use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, Signed, ToPrimitive, Zero};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 use thiserror::Error;
@@ -117,6 +118,34 @@ pub struct ParamEnv {
     pub reals: BTreeMap<String, Rational>,
     #[serde(default)]
     pub loop_indices: BTreeMap<u32, BigInt>,
+}
+
+impl ParamEnv {
+    /// Bind a child scope simultaneously against the parent environment with
+    /// its loop index installed. Sibling bindings cannot observe one another;
+    /// ordered insertion preserves the last binding for a repeated name.
+    pub fn child(
+        &self,
+        bindings: &[(String, IntExpr)],
+        loop_index: Option<(u32, usize)>,
+    ) -> Result<Self, ExprError> {
+        let mut child = self.clone();
+        if let Some((slot, index)) = loop_index {
+            child.loop_indices.insert(slot, index.into());
+        }
+        let values = bindings
+            .par_iter()
+            .map(|(name, expression)| {
+                expression.evaluate(&child).map(|value| (name.clone(), value))
+            })
+            .collect::<Vec<_>>();
+        // Keep both insertion and error selection in declaration order.
+        for value in values {
+            let (name, value) = value?;
+            child.integers.insert(name, value);
+        }
+        Ok(child)
+    }
 }
 
 /// A deterministic, typed index program used by rank-N family operations.
@@ -1556,6 +1585,41 @@ mod tests {
             branches: vec![IntExpr::constant(3), IntExpr::constant(11)],
         };
         assert!(expression.evaluate(&ParamEnv::default()).is_err());
+    }
+
+    #[test]
+    fn test_child_bindings_are_simultaneous_and_preserve_parent_scope() {
+        let parent = ParamEnv {
+            integers: BTreeMap::from([("size".into(), BigInt::from(7))]),
+            loop_indices: BTreeMap::from([(3, BigInt::from(99))]),
+            ..ParamEnv::default()
+        };
+        let child = parent
+            .child(
+                &[
+                    ("size".into(), IntExpr::LoopIndex(3)),
+                    ("original".into(), IntExpr::Var("size".into())),
+                    ("size".into(), IntExpr::constant(11)),
+                ],
+                Some((3, 5)),
+            )
+            .unwrap();
+        assert_eq!(child.integers["size"], BigInt::from(11));
+        assert_eq!(child.integers["original"], BigInt::from(7));
+        assert_eq!(child.loop_indices[&3], BigInt::from(5));
+        assert_eq!(parent.integers["size"], BigInt::from(7));
+        assert_eq!(parent.loop_indices[&3], BigInt::from(99));
+        assert_eq!(parent.child(&[], None).unwrap(), parent);
+        assert_eq!(
+            parent.child(
+                &[
+                    ("a".into(), IntExpr::Var("missing_first".into())),
+                    ("b".into(), IntExpr::Var("missing_second".into())),
+                ],
+                None,
+            ),
+            Err(ExprError::UnboundVariable("missing_first".into()))
+        );
     }
 
     #[test]

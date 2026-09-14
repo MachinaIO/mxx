@@ -170,6 +170,9 @@ struct PinnedHostReclaimer
                 record_failure_locked("pinned-host reclaimer is stopped");
                 return 1;
             }
+            // Publish the completion's retirement association while holding
+            // the queue lock. A selected waiter cannot observe an unqueued job.
+            if (resource && !pointers.empty()) resource->defer_to_pinned_release(pointers.front());
             pending.push_back(Job{device, completion, std::move(pointers), std::move(resource)});
         }
         catch (const std::exception &error)
@@ -201,6 +204,37 @@ struct PinnedHostReclaimer
     {
         std::lock_guard<std::mutex> lock(mutex);
         return failed ? -1 : (pending.empty() && active == 0 ? 1 : 0);
+    }
+
+    // Wait only for the job containing this pinned allocation. Completion
+    // notification uses the existing queue lock, not a device-wide fence.
+    int wait_pointer(void *pointer)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (failed) return 1;
+        for (auto it = pending.begin(); it != pending.end(); ++it) {
+            if (std::find(it->pointers.begin(), it->pointers.end(), pointer) == it->pointers.end()) continue;
+            // A needed queued transfer need not wait behind an unrelated
+            // active job. Claim it under the existing queue lock, then retire
+            // only its completion outside that lock on the requesting thread.
+            Job selected = std::move(*it);
+            pending.erase(it);
+            ++active;
+            lock.unlock();
+            const int status = process(selected);
+            lock.lock();
+            --active;
+            idle.notify_all();
+            return status;
+        }
+        idle.wait(lock, [&]() {
+            if (failed) return true;
+            if (active_pointers && std::find(active_pointers->begin(), active_pointers->end(), pointer) != active_pointers->end()) return false;
+            for (const auto &job : pending)
+                if (std::find(job.pointers.begin(), job.pointers.end(), pointer) != job.pointers.end()) return false;
+            return true;
+        });
+        return failed ? 1 : 0;
     }
 
     std::string failure_message()
@@ -319,6 +353,7 @@ private:
                 job = std::move(pending.front());
                 pending.pop_front();
                 ++active;
+                active_pointers = &job.pointers;
             }
 
             process(job);
@@ -326,10 +361,8 @@ private:
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 --active;
-                if (pending.empty() && active == 0)
-                {
-                    idle.notify_all();
-                }
+                active_pointers = nullptr;
+                idle.notify_all();
             }
         }
     }
@@ -340,12 +373,16 @@ private:
     std::condition_variable idle;
     std::deque<Job> pending;
     std::thread worker;
+    const std::vector<void *> *active_pointers = nullptr;
     size_t active = 0;
     bool stopping = false;
     bool joined = false;
     bool failed = false;
     std::string failure_message_text;
 };
+
+
+
 
 namespace
 {
@@ -1181,6 +1218,14 @@ void gpu_device_mark_allocation_unknown(int device)
     if (device >= 0 && static_cast<size_t>(device) < MAX_TRACKED_GPU_DEVICES)
         device_allocation_activity_unknown[static_cast<size_t>(device)].store(
             true, std::memory_order_seq_cst);
+}
+
+extern "C" int gpu_wait_pinned_release(GpuContext *ctx, void *pointer)
+{
+    if (!ctx || !ctx->execution || !ctx->execution->pinned_host_reclaimer) return 0;
+    auto *reclaimer = ctx->execution->pinned_host_reclaimer;
+    if (reclaimer->wait_pointer(pointer) == 0) return 0;
+    return set_error(reclaimer->failure_message().c_str());
 }
 
 extern "C" int gpu_context_admission_is_required(const GpuContext *ctx)

@@ -959,13 +959,13 @@ extern "C" int gpu_matrix_copy_block(
     return 0;
 }
 
-extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
-    const GpuMatrixBatchView *view)
+extern "C" int gpu_matrix_copy_device(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
+    const GpuMatrixBatchView *view, int require_peer)
 {
     if (dst) dst->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!dst || !src || !out_copied || !dst->ctx || !src->ctx)
     {
-        return set_error("invalid gpu_matrix_copy_peer arguments");
+        return set_error("invalid gpu_matrix_copy_device arguments");
     }
     // Peer copies submit dependencies on both owners, including same-device
     // copies between independent contexts. Neither scope serializes submissions.
@@ -975,7 +975,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     if ((!view && (dst->rows != src->rows || dst->cols != src->cols)) || dst->level != src->level ||
         dst->format != src->format || dst->ctx->N != src->ctx->N)
     {
-        return set_error("incompatible matrices in gpu_matrix_copy_peer");
+        return set_error("incompatible matrices in gpu_matrix_copy_device");
     }
     const GpuMatrixRange input = view ? view->left : GpuMatrixRange{0, src->rows, 0, src->cols};
     const GpuMatrixRange output = view ? view->output : GpuMatrixRange{0, dst->rows, 0, dst->cols};
@@ -994,7 +994,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     const size_t active_limbs = static_cast<size_t>(dst->level + 1);
     if (dst->ctx->moduli.size() < active_limbs || src->ctx->moduli.size() < active_limbs)
     {
-        return set_error("missing active CRT moduli in gpu_matrix_copy_peer");
+        return set_error("missing active CRT moduli in gpu_matrix_copy_device");
     }
     if (!std::equal(
             dst->ctx->moduli.begin(),
@@ -1035,11 +1035,10 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
         {
             return set_error(error);
         }
-        if (!can_access)
-        {
-            return 0;
-        }
-        error = cudaDeviceEnablePeerAccess(source_device, 0);
+        if (!can_access && require_peer) return 0;
+        // Explicit asynchronous copies also support devices without direct
+        // access. CUDA stages that transport; retain the same reader events.
+        error = can_access ? cudaDeviceEnablePeerAccess(source_device, 0) : cudaSuccess;
         if (error == cudaErrorPeerAccessAlreadyEnabled)
         {
             cudaGetLastError();
@@ -1055,12 +1054,12 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
         src->exec_limb_states[0].size() < active_limbs ||
         dst->ctx->limb_gpu_ids.size() < active_limbs)
     {
-        return set_error("missing matrix execution state in gpu_matrix_copy_peer");
+        return set_error("missing matrix execution state in gpu_matrix_copy_device");
     }
     cudaStream_t destination_stream = dst->exec_limb_states[0][0].stream;
     if (!destination_stream)
     {
-        return set_error("missing destination stream in gpu_matrix_copy_peer");
+        return set_error("missing destination stream in gpu_matrix_copy_device");
     }
     const auto fail_submitted_copy = [&](const char *message) {
         // A peer enqueue may already read the source when its completion
@@ -1082,7 +1081,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     for (size_t limb = 0; limb < active_limbs; ++limb)
     {
         auto &state = dst->exec_limb_states[0][limb];
-        if (!state.stream) return set_error("missing destination producer in gpu_matrix_copy_peer");
+        if (!state.stream) return set_error("missing destination producer in gpu_matrix_copy_device");
         bool seen = false;
         for (size_t index = 0; index < destination_producer_count; ++index)
             seen |= destination_producers[index] == state.stream;
@@ -1172,7 +1171,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     if (src->ctx->execution->release_streams_by_partition.empty() ||
         !src->ctx->execution->release_streams_by_partition[0])
     {
-        return fail_submitted_copy("missing source release stream in gpu_matrix_copy_peer");
+        return fail_submitted_copy("missing source release stream in gpu_matrix_copy_device");
     }
     error = cudaSetDevice(source_device);
     if (error == cudaSuccess)
@@ -1186,7 +1185,7 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     {
         if (error != cudaSuccess) break;
         const cudaStream_t producer = src->exec_limb_states[0][limb].stream;
-        if (!producer) return fail_submitted_copy("missing source producer in gpu_matrix_copy_peer");
+        if (!producer) return fail_submitted_copy("missing source producer in gpu_matrix_copy_device");
         if (producer == destination_stream ||
             producer == src->ctx->execution->release_streams_by_partition[0]) continue;
         bool seen = false;

@@ -510,6 +510,29 @@ where
         validate_regular_gadget_layout_for_params(parameters, gadget_base, digit_count)
     }
 
+    pub(crate) fn validate_gadget_layout_for_params(
+        parameters: &<M::P as Poly>::Params,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        small: bool,
+    ) -> Result<(), PolyBackendError> {
+        let (backend_base, backend_digits) = Self::expected_gadget_layout(parameters, small);
+        let valid_digits = if small {
+            digit_count == backend_digits
+        } else {
+            parameters.gadget_dropped_moduli(Some(digit_count)).is_some()
+        };
+        if gadget_base != &backend_base || !valid_digits {
+            return Err(PolyBackendError::GadgetLayoutMismatch {
+                declared_base: gadget_base.clone(),
+                declared_digits: digit_count,
+                backend_base,
+                backend_digits,
+            });
+        }
+        Ok(())
+    }
+
     fn expected_gadget_layout(parameters: &<M::P as Poly>::Params, small: bool) -> (BigInt, usize) {
         let base = BigInt::one() << parameters.base_bits() as usize;
         let digits = if small {
@@ -1328,22 +1351,12 @@ where
         digit_count: usize,
         small: bool,
     ) -> Result<(), Self::Error> {
-        let parameters = self.parameters(ty)?;
-        let (backend_base, backend_digits) = Self::expected_gadget_layout(parameters, small);
-        let valid_digits = if small {
-            digit_count == backend_digits
-        } else {
-            parameters.gadget_dropped_moduli(Some(digit_count)).is_some()
-        };
-        if gadget_base != &backend_base || !valid_digits {
-            return Err(PolyBackendError::GadgetLayoutMismatch {
-                declared_base: gadget_base.clone(),
-                declared_digits: digit_count,
-                backend_base,
-                backend_digits,
-            });
-        }
-        Ok(())
+        Self::validate_gadget_layout_for_params(
+            self.parameters(ty)?,
+            gadget_base,
+            digit_count,
+            small,
+        )
     }
 
     fn sample_trapdoor(

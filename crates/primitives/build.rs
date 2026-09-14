@@ -29,6 +29,8 @@ fn main() {
         println!("cargo::rerun-if-env-changed=CUDA_ARCH");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
         println!("cargo::rerun-if-changed=cuda/src/gpu_admission.cu");
+        println!("cargo::rerun-if-changed=cuda/src/gpu_test.cu");
+        println!("cargo::rerun-if-changed=cuda/include/gpu_test.cuh");
         println!("cargo::rerun-if-changed=cuda/include/gpu_admission.cuh");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
@@ -79,6 +81,7 @@ fn main() {
             .cuda(true)
             .file("cuda/src/Runtime.cu")
             .file("cuda/src/gpu_admission.cu")
+            .file("cuda/src/gpu_test.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .flag("-std=c++17")

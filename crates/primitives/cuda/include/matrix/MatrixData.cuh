@@ -46,8 +46,8 @@ extern "C"
     int gpu_matrix_wait(const GpuMatrix *mat);
     int gpu_matrix_is_ready(const GpuMatrix *mat, int *out_ready);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
-    int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
-        const GpuMatrixBatchView *view);
+    int gpu_matrix_copy_device(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
+        const GpuMatrixBatchView *view, int require_peer);
     int gpu_matrix_copy_block(
         GpuMatrix *out,
         const GpuMatrix *src,

@@ -93,8 +93,12 @@ use mxx_primitives::{
 
 mod fleet;
 pub use fleet::{
-    GpuAdmittedInvocationSummary, GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix,
-    GpuFleetSmallMatrix, GpuFleetTrapdoor,
+    GpuAdmittedInvocationSummary, GpuColumnShard, GpuContextDemand, GpuDcrtBackend, GpuFleetMatrix,
+    GpuFleetSmallMatrix, GpuFleetTrapdoor, GpuInventoryValue, GpuMatrixColumnContext,
+    GpuMatrixColumnRequirements, GpuMatrixDescriptor, GpuMatrixFragmentDescriptor,
+    GpuMatrixInputFragment, GpuMatrixInputLayout, GpuMatrixInputRequest, GpuMatrixInputSource,
+    GpuMatrixLayoutPlan, GpuMatrixPlacementInvocation, GpuMatrixSlotContext,
+    GpuMatrixSlotInventory, GpuScopeProgress, GpuScopeResources,
 };
 
 #[cfg(test)]

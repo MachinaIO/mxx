@@ -245,7 +245,7 @@ struct MatrixSampleDescriptors {
 };
 static_assert(sizeof(MatrixSampleDescriptors) + 128 < 4096, "bounded sampling arguments");
 
-__global__ void matrix_sample_distribution_multi_limb_kernel(
+__device__ void matrix_sample_distribution_multi_limb_kernel_body(
     MatrixSampleDescriptors layout,
     size_t poly_count,
     size_t local_ncol,
@@ -332,6 +332,41 @@ __global__ void matrix_sample_distribution_multi_limb_kernel(
                 sample);
         }
     }
+}
+
+__global__ void matrix_sample_distribution_multi_limb_kernel(
+    MatrixSampleDescriptors layout,
+    size_t poly_count,
+    size_t local_ncol,
+    size_t full_ncol,
+    size_t col_offset,
+    size_t n,
+    int dist_type,
+    double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
+    GpuRngSeed seed)
+{
+    matrix_sample_distribution_multi_limb_kernel_body(layout, poly_count, local_ncol, full_ncol, col_offset, n, dist_type, sigma, max_coefficient_bound, coefficient_modulus, seed);
+}
+
+
+constexpr size_t kGaussianBatchMatrices = 64;
+struct GaussianBatchDescriptors {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *outputs[kGaussianBatchMatrices];
+    GpuRngSeed seeds[kGaussianBatchMatrices];
+};
+static_assert(sizeof(GaussianBatchDescriptors) + sizeof(MatrixSampleDescriptors) + 128 < 4096,
+              "bounded Gaussian sampling kernel arguments");
+
+__global__ void matrix_sample_gaussian_batch_kernel(
+    GaussianBatchDescriptors jobs, MatrixSampleDescriptors layout,
+    size_t polynomials, size_t columns, size_t n, double sigma)
+{
+    layout.descriptors = jobs.outputs[blockIdx.y];
+    matrix_sample_distribution_multi_limb_kernel_body(
+        layout, polynomials, columns, columns, 0, n, GPU_MATRIX_DIST_GAUSS,
+        sigma, UINT64_MAX, 0, jobs.seeds[blockIdx.y]);
 }
 
 static int gpu_matrix_sample_distribution_impl(
@@ -468,4 +503,71 @@ extern "C" int gpu_matrix_sample_distribution_columns(
         full_ncol,
         col_offset,
         range);
+}
+
+
+// Fully write homogeneous coefficient owners with unbounded Gaussian samples,
+// then convert them to evaluation format. Seeds retain the scalar sampler's
+// exact logical coordinates and are independent of the batch ordinal.
+extern "C" int gpu_matrix_sample_gaussian_batch(
+    GpuMatrix *const *outputs, const GpuRngSeed *seeds, size_t count, double sigma)
+{
+    if (count == 0) return 0;
+    auto *first = outputs[0];
+    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
+    const size_t polynomials = first->rows * first->cols;
+    if (polynomials == 0) {
+        for (size_t index = 0; index < count; ++index)
+            outputs[index]->format = GPU_POLY_FORMAT_EVAL;
+        return 0;
+    }
+    const size_t n = first->ctx->N;
+    const size_t limbs = first->level + 1;
+    const size_t partition = first->ctx->limb_gpu_ids[0].x;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_device(first, first->ctx->limb_gpu_ids[0], &device);
+    if (status == 0) status = matrix_limb_stream(first, first->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    auto error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    MatrixSampleDescriptors layout{};
+    layout.pitch = first->cols;
+    for (size_t limb = 0; limb < limbs; ++limb) {
+        layout.indices[limb] = first->ctx->limb_gpu_ids[limb].y;
+        layout.moduli[limb] = first->ctx->moduli[limb];
+    }
+    const size_t chunks = polynomials * ((n + 3) / 4);
+    const size_t blocks = std::min<size_t>(65535, (chunks + 255) / 256);
+    for (size_t offset = 0; offset < count; offset += kGaussianBatchMatrices) {
+        const size_t width = std::min(kGaussianBatchMatrices, count - offset);
+        GaussianBatchDescriptors jobs{};
+        for (size_t local = 0; local < width; ++local) {
+            auto *output = outputs[offset + local];
+            status = matrix_wait_all_limb_streams(output, device, stream, true);
+            if (status != 0) return status;
+            jobs.outputs[local] = output->shared_limb_buffers[partition].device_descriptors;
+            jobs.seeds[local] = seeds[offset + local];
+        }
+        matrix_sample_gaussian_batch_kernel<<<dim3(blocks, width, limbs), 256, 0, stream>>>(
+            jobs, layout, polynomials, first->cols, n, sigma);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        for (size_t local = 0; local < width; ++local) {
+            status = matrix_record_all_limb_writes(outputs[offset + local], stream);
+            if (status != 0) return status;
+        }
+        if (polynomials <= 65535 && width <= 65535 / limbs) {
+            status = gpu_matrix_ntt_in_place_batch(outputs + offset, width);
+            if (status != 0) return status;
+        } else {
+            // Native scalar transforms support shapes outside the batch grid.
+            for (size_t local = 0; local < width; ++local) {
+                status = run_matrix_transform_u64<true>(outputs[offset + local], nullptr);
+                if (status != 0) return status;
+                outputs[offset + local]->format = GPU_POLY_FORMAT_EVAL;
+            }
+        }
+    }
+    return 0;
 }

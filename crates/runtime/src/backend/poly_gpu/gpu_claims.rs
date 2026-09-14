@@ -33,9 +33,10 @@ impl PreparedClaimBroker {
     pub(super) fn hold<T>(
         &self,
         claims: &[GpuTracedClaim],
+        reclaim_uploads: bool,
         run: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        self.hold_inner(claims, false, run)
+        self.hold_inner(claims, false, reclaim_uploads, run)
     }
 
     /// Hold recorded (traced) claims around `run`: the step executes with
@@ -45,7 +46,7 @@ impl PreparedClaimBroker {
         claims: &[GpuTracedClaim],
         run: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        self.hold_inner(claims, true, run)
+        self.hold_inner(claims, true, false, run)
     }
 
     fn match_claims(
@@ -129,28 +130,63 @@ impl PreparedClaimBroker {
         &self,
         claims: &[GpuTracedClaim],
         traced: bool,
+        reclaim_uploads: bool,
         run: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
-        let assignment =
-            self.assignment(claims, &HashSet::new(), &HashSet::new())?.ok_or_else(|| {
+        // Readback already completes on the host. As in matrix admission,
+        // only retire selected upload resources; compute-only steps never wait.
+        let mut pending = HashSet::new();
+        if reclaim_uploads {
+            for storage in &self.storages {
+                for index in storage.poll_releases(&[])? {
+                    let slot = storage.slot_identity(index).unwrap();
+                    if matches!(
+                        slot.kind(),
+                        GpuPreparedSlotKind::PinnedHost | GpuPreparedSlotKind::CompletionEvent
+                    ) {
+                        pending.insert(slot.slot_id());
+                    }
+                }
+            }
+        }
+        let mut assignment = self.assignment(claims, &HashSet::new(), &HashSet::new())?;
+        if assignment.is_none() && !pending.is_empty() {
+            assignment = self.assignment(claims, &HashSet::new(), &pending)?;
+        }
+        let assignment = assignment.ok_or_else(|| {
                 let missing = self.match_claims(claims, &HashSet::new(), &HashSet::new())
                     .map(|selected| claims.iter().zip(selected).filter_map(|(claim, request)| request.is_none().then_some(*claim)).collect::<Vec<_>>());
                 format!("prepared inventory cannot fit simultaneous admitted claims; missing: {missing:?}; requested: {claims:?}")
             })?;
+        if !pending.is_empty() {
+            for storage in &self.storages {
+                let selected = assignment
+                    .iter()
+                    .filter(|(owner, request)| {
+                        owner.identity() == storage.identity() &&
+                            pending.contains(&request.slot_key().1)
+                    })
+                    .map(|(_, request)| request.slot_key().2)
+                    .collect::<Vec<_>>();
+                if !selected.is_empty() {
+                    storage.poll_releases(&selected)?;
+                }
+            }
+        }
         // Do not activate a dispatch until every chosen slot has been reserved.
         // If availability changed, dropping the prefix rolls back the transaction.
-        // One native reservation per backing store, rather than per claim.
-        // Preserve first-use storage order and claim order inside each store;
-        // a failed store reservation drops and cancels every preceding group.
+        // Batch only consecutive claims from the same backing store. Native
+        // dispatch consumes claims in order; regrouping A, B, A into A, A, B
+        // would change the resource type seen by the second allocation.
         let mut groups = Vec::<(&Arc<GpuPreparedStorage>, Vec<GpuPreparedRequest>)>::new();
-        let mut group_indices = HashMap::new();
         for (storage, request) in assignment {
-            let index = *group_indices.entry(storage.identity()).or_insert_with(|| {
-                let index = groups.len();
-                groups.push((storage, Vec::new()));
-                index
-            });
-            groups[index].1.push(request);
+            if let Some((previous, requests)) = groups.last_mut() {
+                if previous.identity() == storage.identity() {
+                    requests.push(request);
+                    continue;
+                }
+            }
+            groups.push((storage, vec![request]));
         }
         let mut reservations = groups
             .into_iter()

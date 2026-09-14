@@ -167,7 +167,7 @@ impl GpuDcrtBackend {
             })
             .collect::<Vec<_>>();
         let mut error = None;
-        let result = broker.hold(&claims, || {
+        let result = broker.hold(&claims, true, || {
             run().map_err(|failure| {
                 error = Some(failure);
                 "export step failed".to_string()

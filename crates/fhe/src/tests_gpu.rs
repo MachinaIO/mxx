@@ -66,6 +66,9 @@ fn values(
 
 #[test]
 fn test_gpu_fhe_ring_gsw_runtime() {
+    if run_isolated("tests_gpu::test_gpu_fhe_ring_gsw_runtime") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let scheme =
@@ -140,6 +143,9 @@ fn test_gpu_fhe_ring_gsw_runtime() {
 
 #[test]
 fn test_gpu_fhe_bgv_simd_staged_runtime() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_simd_staged_runtime") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -311,6 +317,9 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
 
 #[test]
 fn test_gpu_fhe_bgv_short_slot_inputs() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_short_slot_inputs") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -370,6 +379,9 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
 
 #[test]
 fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_hybrid_multilimb_all_levels") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let depth = common.ring.crt_depth();
@@ -454,4 +466,24 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
         );
     }
     result.cleanup_staged(&mut store).unwrap();
+}
+
+/// Keep each test's allocation epoch exclusive within its process while the
+/// test harness remains free to run the independent GPU cases concurrently.
+fn run_isolated(test_name: &str) -> bool {
+    if std::env::args().any(|argument| argument == "--exact") {
+        return false;
+    }
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .output()
+        .expect("run isolated GPU unit test");
+    assert!(
+        result.status.success() &&
+            String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    true
 }

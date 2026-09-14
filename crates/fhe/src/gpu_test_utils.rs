@@ -3,6 +3,10 @@ use mxx_runtime::backend::poly_gpu::GpuDcrtBackend;
 use std::collections::BTreeMap;
 
 pub fn configure_widths(backend: &mut GpuDcrtBackend, graph: &mxx_ir_core::ValidatedGraph) {
+    // Polynomial readback and sampler resources are discovered only during
+    // explicit warmup, never by the production execute call below.
+    drop(backend.prepare_graph_admission(graph, false, &BTreeMap::new(), 1, true).unwrap());
+
     use mxx_runtime::gpu_calibration::{
         GpuColumnWidths, gpu_calibration_operation_identity,
         gpu_operation_is_column_separable_for_types, gpu_row_block_add_operation_identity,

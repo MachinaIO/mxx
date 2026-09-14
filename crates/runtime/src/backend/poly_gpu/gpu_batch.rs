@@ -771,7 +771,7 @@ impl GpuDcrtBackend {
                         })
                         .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
                     let results = brokers[first][first_job.source_interval]
-                        .hold(&claims, || {
+                        .hold(&claims, false, || {
                             if *expected == PreparedMatrixOperation::Negate {
                                 GpuDCRTPolyMatrixColumnView::negate_batch(destinations)
                             } else if matches!(expected, PreparedMatrixOperation::Scale(_)) {

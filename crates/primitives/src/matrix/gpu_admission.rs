@@ -1288,7 +1288,8 @@ impl GpuPreparedStorage {
     /// Poll idle external slots for pending readers. Only the explicitly
     /// selected `wait_for` indices may block the host. Admission uses an empty
     /// list first and waits only when no immediately eligible wave fits.
-    /// Region-owned storage retains its admitted event-ordered reuse instead.
+    /// Region-owned matrix readers retain admitted event-ordered reuse; deferred
+    /// upload resources are reported only to their owning region.
     /// Returns pending slot indices; a reservation must still recheck ownership.
     pub fn poll_releases(&self, wait_for: &[usize]) -> Result<Vec<usize>, String> {
         let mut pending = vec![0u8; self.slot_count()];
@@ -3596,39 +3597,53 @@ mod tests {
                 alignment: 1,
             },
         ];
-        let storage = GpuPreparedStorage::new(
-            None,
-            vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
-            None,
-            Some(&layouts),
-        )
-        .unwrap();
-        let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
-        // Declare the output first so panic unwinding releases the gate before
-        // destroying an output whose producer is still behind that gate.
-        let uploaded;
-        let gate = Gate(unsafe { gpu_test_context_stream_gate(params.ctx_raw()) });
-        assert!(!gate.0.is_null());
-        let dispatch = reserve(&storage, &[1, 2, 3]).unwrap().enter(Vec::new()).unwrap();
-        uploaded = GpuSmallMatrix::from_canonical_coefficients(
-            &params,
-            compact.rows(),
-            columns,
-            bound,
-            &payload,
-        )
-        .unwrap();
-        drop(dispatch.finish().unwrap());
-        assert_eq!(storage.poll_releases(&[]).unwrap(), vec![2, 3]);
-        let pinned = storage.slot_identity(2).unwrap().workspace_request(payload.len(), 1);
-        let event = storage.slot_identity(3).unwrap().workspace_request(0, 1);
-        assert!(!storage.fits(&[pinned]).unwrap());
-        assert!(!storage.fits(&[event]).unwrap());
-        drop(gate);
-        storage.poll_releases(&[3]).unwrap();
-        assert!(storage.fits(&[pinned, event]).unwrap());
-        drop(guard);
-        assert_eq!(uploaded.to_canonical_coefficients().unwrap(), payload);
+        for in_region in [false, true] {
+            let storage = GpuPreparedStorage::new(
+                None,
+                vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)],
+                None,
+                Some(&layouts),
+            )
+            .unwrap();
+            let backing = Arc::new(storage);
+            let storage = if in_region {
+                Arc::new(backing.reserve_region(&[1, 2, 3], None).unwrap().unwrap()).storage()
+            } else {
+                backing.clone()
+            };
+            let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
+            // Declare the output first so panic unwinding releases the gate before
+            // destroying an output whose producer is still behind that gate.
+            let uploaded;
+            let gate = Gate(unsafe { gpu_test_context_stream_gate(params.ctx_raw()) });
+            assert!(!gate.0.is_null());
+            let dispatch = reserve(&storage, &[1, 2, 3]).unwrap().enter(Vec::new()).unwrap();
+            uploaded = GpuSmallMatrix::from_canonical_coefficients(
+                &params,
+                compact.rows(),
+                columns,
+                bound.clone(),
+                &payload,
+            )
+            .unwrap();
+            drop(dispatch.finish().unwrap());
+            assert_eq!(storage.poll_releases(&[]).unwrap(), vec![2, 3]);
+            if in_region {
+                assert!(
+                    backing.poll_releases(&[2, 3]).unwrap().is_empty(),
+                    "another region cannot retire this upload"
+                );
+            }
+            let pinned = storage.slot_identity(2).unwrap().workspace_request(payload.len(), 1);
+            let event = storage.slot_identity(3).unwrap().workspace_request(0, 1);
+            assert!(!storage.fits(&[pinned]).unwrap());
+            assert!(!storage.fits(&[event]).unwrap());
+            drop(gate);
+            storage.poll_releases(&[3]).unwrap();
+            assert!(storage.fits(&[pinned, event]).unwrap());
+            drop(guard);
+            assert_eq!(uploaded.to_canonical_coefficients().unwrap(), payload);
+        }
     }
 
     #[test]

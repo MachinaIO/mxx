@@ -4826,6 +4826,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires remote multi-GPU hardware"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_normal_fleet_estimate_admits_families_without_production_trials() {
         let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
@@ -5055,6 +5056,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires remote multi-GPU hardware"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_normal_fleet_preimage_estimate_consumes_cached_column_plans() {
         check_preimage_estimate(true);

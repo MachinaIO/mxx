@@ -2738,14 +2738,26 @@ impl GpuDcrtBackend {
                             // Input placement starts at position zero.
                             until.set(retained_until(port));
                             *owners.borrow_mut() = vec![(wire, Vec::new())];
+                            let capacities = if selected_lazy {
+                                column_layouts[&wire].capacities.clone()
+                            } else {
+                                ty.matrix_type().map(|ty| vec![ty.columns]).unwrap_or_default()
+                            };
                             if let ConcreteWireType::Matrix(ty) = ty {
-                                add_matrix(&mut demand, ty, ty.rows, ty.columns);
+                                for columns in capacities {
+                                    add_matrix(&mut demand, ty, ty.rows, columns);
+                                }
                             } else if let Some((ty, bound)) = bound_of(ty) {
                                 let params = parameters(self, ty)?;
                                 add_layouts(
                                     &mut demand,
                                     ty,
-                                    vec![compact_payload(&params, ty.rows, ty.columns, &bound)?],
+                                    capacities
+                                        .into_iter()
+                                        .map(|columns| {
+                                            compact_payload(&params, ty.rows, columns, &bound)
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?,
                                 );
                             }
                         }
@@ -7080,6 +7092,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires remote multi-GPU hardware"]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_prepared_preimage_fleet_preserves_every_target_column() {
         run_preimage_graph(None, 3, true);

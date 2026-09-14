@@ -1411,9 +1411,10 @@ extern "C" int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
     if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
         return fail("prepared release observation has unretired work");
     std::fill_n(out_pending, backing.slots.size(), 0);
-    // Dependencies within a parent capacity reservation are already part of
-    // its admitted reuse order. This poll only excludes external readers.
-    if (region) return 0;
+    // Matrix readers inside a region are ordered by admission. Deferred host
+    // uploads still hold their pinned buffer/event leases and must be retired
+    // before these resources can be claimed again within that same region.
+    const uint64_t owner = region ? region->value->identity : 0;
     int previous = -1;
     cudaError_t error = cudaGetDevice(&previous);
     if (error != cudaSuccess) return fail(error);
@@ -1421,6 +1422,7 @@ extern "C" int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
     if (error != cudaSuccess) return fail(error);
     for (size_t index = 0; index < backing.slots.size(); ++index) {
         auto &slot = *backing.slots[index];
+        if (slot.region_owner.load(std::memory_order_acquire) != owner) continue;
         bool wait = false;
         for (size_t selected = 0; selected < wait_count; ++selected)
             wait |= wait_slots[selected] == index;
@@ -1430,7 +1432,7 @@ extern "C" int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
                 slot.pinned_deferred.load(std::memory_order_acquire)
                     ? slot.workspace : slot.deferred_resource_pointer.load(std::memory_order_acquire);
             if (expected == leased && retirement &&
-                slot.region_owner.load(std::memory_order_acquire) == 0 &&
+                slot.region_owner.load(std::memory_order_acquire) == owner &&
                 slot.reservation_owner.load(std::memory_order_acquire) == 0) {
                 if (wait) {
                     const int status = gpu_wait_pinned_release(backing.context, retirement);
@@ -1443,7 +1445,7 @@ extern "C" int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
             }
             continue;
         }
-        if (slot.region_owner.load(std::memory_order_acquire) == 0 &&
+        if (!region && slot.region_owner.load(std::memory_order_acquire) == 0 &&
             slot.reservation_owner.load(std::memory_order_acquire) == 0 &&
             slot.occupied_units != 0) {
             error = cudaEventQuery(slot.reusable);

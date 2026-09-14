@@ -1099,7 +1099,11 @@ impl GpuDcrtBackend {
                                     params.context_identity(),
                                     (id.storage_id(), id.slot_id(), id.slot_index()),
                                 );
-                                (slot, available && !chosen.contains(&key))
+                                (
+                                    slot,
+                                    (available || deferred.contains(&id.slot_id())) &&
+                                        !chosen.contains(&key),
+                                )
                             })
                         })
                         .collect::<Vec<_>>();

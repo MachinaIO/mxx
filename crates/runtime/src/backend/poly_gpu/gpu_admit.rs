@@ -1277,6 +1277,12 @@ impl GpuDcrtBackend {
                     .collect::<HashMap<_, _>>();
                 let fresh = placement.operation.fresh_type().is_some() &&
                     !matches!(placement.operation, PreparedMatrixOperation::Preimage { .. });
+                let caller_count =
+                    if matches!(placement.operation, PreparedMatrixOperation::Preimage { .. }) {
+                        1
+                    } else {
+                        usize::MAX
+                    };
                 Ok(LoweredMatrixInvocation {
                     operation: placement.operation,
                     operands: InvocationOperands {
@@ -1299,7 +1305,12 @@ impl GpuDcrtBackend {
                     caller_ids: if fresh {
                         Vec::new()
                     } else {
-                        matrices.iter().flatten().map(|matrix| matrix.id).collect()
+                        matrices
+                            .iter()
+                            .flatten()
+                            .take(caller_count)
+                            .map(|matrix| matrix.id)
+                            .collect()
                     },
                     caller_compact: if fresh {
                         None

@@ -1445,28 +1445,6 @@ impl GpuDcrtBackend {
         self.gather_matrix(value)
     }
 
-    fn scatter_matrix(
-        &mut self,
-        value: GpuDCRTPolyMatrix,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if !self
-            .active_operation
-            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
-        {
-            // Materialization outside a calibrated operation retains its real
-            // owner. Consumers derive their own operation-specific partition.
-            return Ok(GpuFleetMatrix::from_matrix(value));
-        }
-        let (rows, columns) = value.size();
-        let value = Arc::new(value);
-        let shards =
-            self.launch_column_operation(columns, None, move |_, backend, start, end| {
-                let local = value.slice_columns(start, end);
-                backend.matrix_to_active_placement_peer_only(&local)
-            })?;
-        Ok(GpuFleetMatrix::new(rows, columns, shards))
-    }
-
     fn diagonal_range_on_device(
         backend: &mut DeviceBackend,
         inputs: &[&GpuFleetMatrix],
@@ -3217,7 +3195,6 @@ mod tests {
             for restored in [
                 backend.matrix_from_bytes(&ty, &bytes).unwrap(),
                 backend.matrix_from_cpu_staging_bytes(&ty, &staged).unwrap(),
-                backend.scatter_matrix(source.clone()).unwrap(),
             ] {
                 assert_eq!(restored.size(), (2, 5));
                 assert_eq!(restored.shards().len(), 1);

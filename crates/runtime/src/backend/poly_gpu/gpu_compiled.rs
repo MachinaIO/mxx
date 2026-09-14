@@ -1230,8 +1230,7 @@ impl PreparedMatrixOperation {
                 Self::CrtRecompose { .. } |
                 Self::Decompose { .. } |
                 Self::CenteredExtendCompact { .. } |
-                Self::ImportCompact { .. } |
-                Self::Preimage { .. }
+                Self::ImportCompact { .. }
         ) || matches!(self,Self::ModulusConversion {conversion,..} if *conversion != GpuMatrixModulusConversion::Reduce)
         {
             false

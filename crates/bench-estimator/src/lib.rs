@@ -1,7 +1,10 @@
 //! Cost estimation over validated scoped execution plans.
 
+pub mod dataflow;
 #[cfg(feature = "gpu")]
 pub mod gpu;
+#[cfg(feature = "gpu")]
+pub mod gpu_admission;
 pub mod harness;
 
 use mxx_ir_core::{
@@ -13,20 +16,27 @@ use mxx_ir_core::{
     types::{ConcreteWireType, NodeId, WireRef, WireType},
 };
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
+    /// Backend work units. The GPU backend uses aggregate execution-owner CUDA-event
+    /// spans in device-seconds; the generic host harness uses host elapsed seconds.
     pub work_seconds: f64,
-    /// Dependency latency: one fleet wave for independently column-separable operations.
+    /// Ideal dependency latency: maximum measured class time for independent waves,
+    /// plus separately measured preparation/initialization prerequisites when present.
     pub latency_seconds: f64,
-    /// Sum of all production fleet wave latencies for the full logical operation.
+    /// Sum of production fleet wave latencies and their preparation/initialization
+    /// prerequisites for the full logical operation.
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
-    /// Measured scratch for one bounded execution wave, excluding resident inputs.
+    /// Measured incremental allocation, excluding the invocation's resident baseline.
+    /// Allocating GPU representatives include one wave's outputs, not scratch alone.
+    /// Native prepared measurements exclude already retained output/input owners.
     /// This is not the whole-graph runtime peak and is never multiplied by wave count.
     pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
@@ -62,6 +72,15 @@ pub struct MeasurementNode<'a> {
     pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
+/// Whether the measured inputs and placement establish a concrete runtime scenario.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurementScenario {
+    #[default]
+    BackendDefined,
+    /// Synthetic input values and fresh placement; retained runtime owners/budgets are absent.
+    SyntheticFreshPlacement,
+}
+
 pub trait MeasurementBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -71,6 +90,72 @@ pub trait MeasurementBackend {
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error>;
+
+    fn measurement_scenario(&self) -> MeasurementScenario {
+        MeasurementScenario::BackendDefined
+    }
+
+    /// GPU backends model runtime staging separately from GPU-resident primitive work.
+    fn models_dataflow(&self) -> bool {
+        false
+    }
+    /// Whole primitive cost for the currently admitted sibling batch. This is
+    /// a CPU-only lookup of explicit warmup observations, never a GPU trial.
+    /// A backend that supplies these costs must cover every non-structural node
+    /// (including zero-cost nodes), or return None for the entire traversal.
+    /// The caller charges the returned joint cost once, not once per member.
+    fn measure_dataflow_batch(
+        &mut self,
+        _graph: &ValidatedGraph,
+        _scope: &FrozenGraphScopeId,
+        _node: NodeId,
+        _instances: &[dataflow::ScopeSiblingState],
+    ) -> Result<Option<NodeMeasurement>, Self::Error> {
+        Ok(None)
+    }
+    /// Establish the graph's dataflow scenario before visiting any scope.
+    /// GPU implementations collect metadata here; disposable GPU work belongs
+    /// to explicit measurement/warmup, never the dataflow traversal.
+    fn prepare_dataflow(&mut self, _graph: &ValidatedGraph) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Observe actual CPU traversal boundaries to carry admission assignments
+    /// and returned owner bindings between scopes. Enter/Leave delimit every
+    /// bounded batch, including repeated invocations. AfterNode publishes one
+    /// sibling in host order. No event authorizes GPU execution or discovery.
+    /// An error aborts traversal; prepare_dataflow resets a subsequent estimate.
+    fn dataflow_step(
+        &mut self,
+        _graph: &ValidatedGraph,
+        _scope: &FrozenGraphScopeId,
+        _instances: &[dataflow::ScopeSiblingState],
+        _ancestors: &[dataflow::ScopeAdmissionState],
+        _step: dataflow::DataflowStep,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// CPU-only admission before any loop input materialization or body visit.
+    /// The request retains descriptor states, parent wire identities, input
+    /// modes and executor output-retention decisions. Implementations must not
+    /// execute a body or perform GPU discovery. Missing scenario information can
+    /// return an error; the estimator must not substitute a successful wave.
+    /// The default describes a serial synthetic scenario, not GPU admission.
+    fn family_wave_size(
+        &mut self,
+        _request: &dataflow::LoopAdmissionRequest<'_>,
+    ) -> Result<usize, Self::Error> {
+        Ok(1)
+    }
+    fn executor_dispatch_seconds(&self) -> f64 {
+        0.0
+    }
+    fn measure_transfer(
+        &mut self,
+        _kind: dataflow::TransferKind,
+        _ty: &ConcreteWireType,
+    ) -> Result<f64, Self::Error> {
+        Ok(0.0)
+    }
 
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
     fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
@@ -123,9 +208,17 @@ pub trait MeasurementBackend {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
+    /// Synthetic scenarios cannot establish runtime schedule agreement or memory admission.
+    pub measurement_scenario: MeasurementScenario,
+    /// Runtime boundary costs, added to total_time_seconds, not to GPU work.
+    #[serde(default)]
+    pub dataflow: dataflow::DataflowCost,
+    #[serde(default)]
+    pub transfers: Vec<dataflow::TransferCost>,
     pub total_work_seconds: f64,
-    /// Cumulative measured wave latencies including every logical invocation.
-    /// This work-like sum is distinct from the unlimited-resource critical path.
+    /// Cumulative primitive wave latencies plus measured runtime transfer boundaries and
+    /// modeled executor dispatch, including every logical invocation. This is distinct
+    /// from the unlimited-resource GPU critical path; dataflow costs are reported separately.
     pub total_time_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
@@ -252,6 +345,21 @@ pub fn estimate<B: MeasurementBackend>(
             );
         }
     }
+    if estimator.backend.models_dataflow() {
+        let (dataflow, transfers) = dataflow::estimate(validated, estimator.backend)?;
+        if let Some(primitives) = &dataflow.primitives {
+            report.total_work_seconds = primitives.work_seconds;
+            report.total_time_seconds = primitives.total_time_seconds;
+            report.preimage_sampling_work_seconds = primitives.preimage_sampling_work_seconds;
+            report.benchmark_roles = primitives.benchmark_roles.clone();
+            report.measured_wave_workspace_bytes = primitives.measured_wave_workspace_bytes;
+            report.chunk_count = primitives.wave_count;
+        }
+        report.total_time_seconds += dataflow.transfer_seconds + dataflow.executor_dispatch_seconds;
+        report.dataflow = dataflow;
+        report.transfers = transfers;
+    }
+    report.measurement_scenario = estimator.backend.measurement_scenario();
     Ok(report)
 }
 
@@ -490,14 +598,13 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
             let id = NodeId(position as u64);
             let arguments = scope.arguments(handle).expect("plan node belongs to scope");
             let concrete_argument_types = arguments
-                .iter()
+                .par_iter()
                 .map(|wire| {
-                    plan.wire_types
-                        .get(wire)
-                        .cloned()
-                        .expect("validated argument has a concrete type")
+                    self.validated
+                        .concrete_wire_type(scope_id, *wire, bindings)
+                        .map_err(|error| EstimateError::Expression(error.to_string()))
                 })
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()?;
             let argument_types = concrete_argument_types.clone();
             let argument_kinds = arguments
                 .iter()
@@ -506,13 +613,17 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 })
                 .collect::<Vec<_>>();
             let concrete_output_types = (0..handle.output_types().len())
+                .into_par_iter()
                 .map(|port| {
-                    plan.wire_types
-                        .get(&WireRef { node: id, port: mxx_ir_core::Port(port as u32) })
-                        .cloned()
-                        .expect("validated output has a concrete type")
+                    self.validated
+                        .concrete_wire_type(
+                            scope_id,
+                            WireRef { node: id, port: mxx_ir_core::Port(port as u32) },
+                            bindings,
+                        )
+                        .map_err(|error| EstimateError::Expression(error.to_string()))
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             let node = MeasurementNode {
                 scope: scope_id,
                 id,
@@ -621,12 +732,8 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 {
                     0 // Child input nodes borrow the caller's values.
                 } else {
-                    plan.wire_types
-                        .get(&wire)
-                        .map(|wire_type| {
-                            self.backend.persistent_bytes_for_node(handle.kind(), wire_type)
-                        })
-                        .unwrap_or(0)
+                    self.backend
+                        .persistent_bytes_for_node(handle.kind(), &node.concrete_output_types[port])
                 };
                 outputs.push((wire, bytes));
             }
@@ -983,18 +1090,7 @@ fn child_bindings(
     bindings: &[(String, mxx_ir_core::IntExpr)],
     loop_index: Option<(u32, usize)>,
 ) -> Result<ParamEnv, EstimateError> {
-    let mut child = parent.clone();
-    if let Some((slot, index)) = loop_index {
-        child.loop_indices.insert(slot, index.into());
-    }
-    let expression_env = child.clone();
-    for (name, expression) in bindings {
-        let value = expression
-            .evaluate(&expression_env)
-            .map_err(|error| EstimateError::Expression(error.to_string()))?;
-        child.integers.insert(name.clone(), value);
-    }
-    Ok(child)
+    parent.child(bindings, loop_index).map_err(|error| EstimateError::Expression(error.to_string()))
 }
 
 fn measured_cost_depends_on_loop_slots(
@@ -1293,6 +1389,61 @@ mod tests {
     use super::*;
     use mxx_dsl::{DslContext, Int, IntType, Ring, Subgraph, iterate, parallel};
     use std::{collections::BTreeSet, convert::Infallible};
+
+    #[test]
+    fn test_scope_measurements_resolve_types_from_invocation_bindings() {
+        #[derive(Default)]
+        struct TypedBackend(Vec<(Vec<ConcreteWireType>, Vec<ConcreteWireType>)>);
+        impl MeasurementBackend for TypedBackend {
+            type Error = Infallible;
+            fn measure(
+                &mut self,
+                _: &str,
+                node: &MeasurementNode<'_>,
+                _: &ParamEnv,
+            ) -> Result<NodeMeasurement, Infallible> {
+                self.0.push((
+                    node.concrete_argument_types.clone(),
+                    node.concrete_output_types.clone(),
+                ));
+                Ok(NodeMeasurement::default())
+            }
+            fn persistent_bytes(&self, ty: &ConcreteWireType) -> u64 {
+                ty.matrix_type().map_or(0, |matrix| (matrix.rows * matrix.columns) as u64)
+            }
+        }
+        let ring = Ring::new(257, 8);
+        let graph = DslContext::new("invocation-type-estimate")
+            .int_parameter("columns")
+            .output("value", -ring.input("input", (1, IntExpr::Var("columns".into()))))
+            .unwrap()
+            .build()
+            .unwrap();
+        let env = |columns| ParamEnv {
+            integers: BTreeMap::from([("columns".into(), num_bigint::BigInt::from(columns))]),
+            ..ParamEnv::default()
+        };
+        let original = graph.validate(&env(3)).unwrap();
+        let actual = env(7);
+        let revalidated = graph.validate(&actual).unwrap();
+        let mut observed = Vec::new();
+        for validated in [&original, &revalidated] {
+            let mut backend = TypedBackend::default();
+            let report = Estimator {
+                validated,
+                backend: &mut backend,
+                cache: HashMap::new(),
+                invocations: BTreeMap::new(),
+            }
+            .estimate_scope(&FrozenGraphScopeId::Root, &actual)
+            .unwrap();
+            observed.push((backend.0, report.peak_memory_bytes, report.persistent_storage_bytes));
+        }
+        assert_eq!(
+            observed[0], observed[1],
+            "resolving an invocation must agree with fresh type validation"
+        );
+    }
 
     struct UnitBackend;
 

@@ -315,6 +315,18 @@ impl PolyMatrix for DCRTPolyMatrix {
         Ok(Self::from_poly_vec(destination, polys))
     }
 
+    fn centered_extend(&self, destination: &DCRTPolyParams) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, None)
+    }
+
+    fn block_mod_switch(
+        &self,
+        destination: &DCRTPolyParams,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        self.exact_centered_conversion(destination, Some(plaintext_modulus))
+    }
+
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
         debug_assert_eq!(self.ncol, other.nrow * identity_size);
         let slice_width = other.nrow;
@@ -502,6 +514,49 @@ impl PolyMatrixSmallRhs for DCRTPolyMatrix {
 }
 
 impl DCRTPolyMatrix {
+    fn exact_centered_conversion(
+        &self,
+        destination: &DCRTPolyParams,
+        plaintext_modulus: Option<u64>,
+    ) -> Result<Self, String> {
+        if self.params.ring_dimension() != destination.ring_dimension() {
+            return Err("ring dimension mismatch".into());
+        }
+        let source = self.params.to_crt().0;
+        let target = destination.to_crt().0;
+        let valid = match plaintext_modulus {
+            Some(t) => {
+                t >= 1 &&
+                    target.len() < source.len() &&
+                    target.iter().all(|p| source.contains(p)) &&
+                    source.iter().all(|p| t % p != 0)
+            }
+            None => source.iter().all(|p| target.contains(p)),
+        };
+        if !valid || self.params.dropped_moduli() != 0 || destination.dropped_moduli() != 0 {
+            return Err("invalid exact centered conversion parameters".into());
+        }
+        if self.nrow == 0 || self.ncol == 0 {
+            return Ok(Self::new_empty(destination, self.nrow, self.ncol));
+        }
+        let entries = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| {
+                        let poly = self.entry(row, column);
+                        match plaintext_modulus {
+                            Some(t) => poly.block_mod_switch(destination, t),
+                            None => poly.centered_extend(destination),
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::from_poly_vec(destination, entries))
+    }
+
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
         let nrow = self.nrow;
         let ncol = self.ncol;
@@ -936,6 +991,10 @@ mod tests {
     impl SmallPolyMatrix for MetadataOnlySmallOwner {
         type Params = DCRTPolyParams;
 
+        fn centered_extend(&self, _destination: &Self::Params) -> Result<Self, String> {
+            Err("metadata-only test owner has no coefficient transport".into())
+        }
+
         fn params(&self) -> &Self::Params {
             &self.params
         }
@@ -1369,6 +1428,32 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(chunks[0].concat_rows(&chunks.iter().skip(1).collect::<Vec<_>>()), digits);
         }
+    }
+
+    #[test]
+    fn test_bounded_digits_centered_extension() {
+        use crate::sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler};
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let high = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let low_modulus = high.to_crt().0[..2].iter().map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_modulus).unwrap();
+        let input = DCRTPolyUniformSampler::new().sample_uniform(&low, 2, 3, DistType::FinRingDist);
+        let digits = input.clone().gadget_decompose(false, None).unwrap();
+        let extended = digits.centered_extend(&high).unwrap();
+        assert_eq!(extended.params(), &high);
+        assert_eq!(extended.max_coefficient_bound(), digits.max_coefficient_bound());
+        assert_eq!(
+            extended.to_canonical_coefficients().unwrap(),
+            digits.to_canonical_coefficients().unwrap()
+        );
+        let gadget = DCRTPolyMatrix::gadget_matrix(&low, 2, None);
+        assert_eq!(gadget.multiply_small_rhs(&digits).unwrap(), input);
+        let product = gadget.centered_extend(&high).unwrap().multiply_small_rhs(&extended).unwrap();
+        assert_eq!(
+            product,
+            gadget.centered_extend(&high).unwrap() * digits.value().centered_extend(&high).unwrap()
+        );
     }
 
     #[test]

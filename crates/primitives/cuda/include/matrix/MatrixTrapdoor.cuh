@@ -2,6 +2,7 @@
 
 #include "ChaCha.cuh"
 #include "matrix/Matrix.cuh"
+#include "gpu_admission.cuh"
 
 typedef struct GpuP1CovarianceCache GpuP1CovarianceCache;
 
@@ -45,7 +46,8 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
-    cudaEvent_t sampled_ready_event);
+    cudaEvent_t sampled_ready_event,
+    GpuContext *ctx, GpuDeviceWorkspace &sampled_owner);
 
 int launch_scatter_p1_integer_to_limb_kernel_device(
     const int64_t *sampled_in_device,
@@ -62,6 +64,10 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
 extern "C"
 {
 #endif
+
+    int gpu_matrix_sample_gadget_batch(
+        GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
+        const gpu_chacha::GpuRngSeed *seeds, size_t count, uint32_t base_bits, double c);
 
     int gpu_matrix_gauss_samp_gq_arb_base(
         GpuMatrix *src,
@@ -93,6 +99,11 @@ extern "C"
 
     void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cache);
 
+    int gpu_matrix_sample_p1_batch(
+        GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
+        const GpuP1CovarianceCache *const *caches, const gpu_chacha::GpuRngSeed *seeds,
+        size_t count);
+
     int gpu_matrix_sample_p1_full_cached(
         const GpuP1CovarianceCache *cache,
         const GpuMatrix *tp2,
@@ -118,6 +129,24 @@ extern "C"
         const GpuMatrix *e,
         const GpuMatrix *z);
 
+    int gpu_matrix_preimage_assemble_batch(
+        GpuMatrix *const *outputs, const GpuMatrix *const *tops,
+        const GpuMatrix *const *bottoms, size_t count);
+    int gpu_matrix_apply_trapdoor_batch(
+        GpuMatrix *const *outputs, const GpuMatrix *const *rs,
+        const GpuMatrix *const *es, const GpuMatrix *const *zs, size_t count, bool correction);
+
 #ifdef __cplusplus
 }
 #endif
+
+// Five exact logical spans in native claim order; excludes physical allocator
+// overhead and completion resources. Empty matrices return zero-byte layouts.
+extern "C" int gpu_matrix_query_gaussian_gadget_workspaces(
+    const GpuContext *ctx, int level, size_t rows, size_t cols,
+    uint32_t base_bits, GpuPreparedWorkspaceLayout *out);
+
+// Sampled integers and optional large-dimension scratch for a fixed column range.
+extern "C" int gpu_matrix_query_p1_workspaces(
+    const GpuContext *ctx, size_t rows, size_t columns, int cached,
+    GpuPreparedWorkspaceLayout *out);

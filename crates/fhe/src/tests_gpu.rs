@@ -47,7 +47,7 @@ fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
 fn values(
     result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
-    backend: &GpuDcrtBackend,
+    backend: &mut GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
 ) -> Vec<BigInt> {
     let RuntimeValue::IndexedFamily(values) =
@@ -66,6 +66,9 @@ fn values(
 
 #[test]
 fn test_gpu_fhe_ring_gsw_runtime() {
+    if run_isolated("tests_gpu::test_gpu_fhe_ring_gsw_runtime") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let scheme =
@@ -107,7 +110,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     )
     .unwrap();
     assert_eq!(
-        values(&mut result, "roundtrip", &backend, &mut store),
+        values(&mut result, "roundtrip", &mut backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(*v)
@@ -115,7 +118,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        values(&mut result, "sum", &backend, &mut store),
+        values(&mut result, "sum", &mut backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(2 * v)
@@ -128,7 +131,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     expected.rotate_right(1);
     expected[0] = -expected[0];
     assert_eq!(
-        values(&mut result, "product", &backend, &mut store),
+        values(&mut result, "product", &mut backend, &mut store),
         expected
             .into_iter()
             .map(|v| BigInt::from(v)
@@ -140,6 +143,9 @@ fn test_gpu_fhe_ring_gsw_runtime() {
 
 #[test]
 fn test_gpu_fhe_bgv_simd_staged_runtime() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_simd_staged_runtime") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -304,13 +310,16 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 BigInt::from(if name == "sum" { (2 * m) % t } else { (m * m) % t })
             })
             .collect::<Vec<_>>();
-        assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
+        assert_eq!(values(&mut result, name, &mut backend, &mut store), expected, "{name}");
     }
     result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
 fn test_gpu_fhe_bgv_short_slot_inputs() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_short_slot_inputs") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -354,22 +363,25 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     .unwrap();
     let mut expected = vec![BigInt::from(0); n];
     expected[0] = BigInt::from(t - 1);
-    assert_eq!(values(&mut result, "single", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "single", &mut backend, &mut store), expected);
     // Positive rotation moves slot zero to the last position of its row,
     // which was outside the single-value input. Decryption must still return it.
     expected[..n / 2].rotate_left(1);
-    assert_eq!(values(&mut result, "rotated", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "rotated", &mut backend, &mut store), expected);
     let mut expected = partial_values
         .into_iter()
         .map(|v| BigInt::from(v).mod_floor(&BigInt::from(t)))
         .collect::<Vec<_>>();
     expected.push(BigInt::from(0));
-    assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "partial", &mut backend, &mut store), expected);
     result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
 fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
+    if run_isolated("tests_gpu::test_gpu_fhe_bgv_hybrid_multilimb_all_levels") {
+        return;
+    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let depth = common.ring.crt_depth();
@@ -444,8 +456,34 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     rotated[..n / 2].rotate_left(1);
     rotated[n / 2..].rotate_left(1);
     for level in 0..depth {
-        assert_eq!(values(&mut result, &format!("product{level}"), &backend, &mut store), expected);
-        assert_eq!(values(&mut result, &format!("rotated{level}"), &backend, &mut store), rotated);
+        assert_eq!(
+            values(&mut result, &format!("product{level}"), &mut backend, &mut store),
+            expected
+        );
+        assert_eq!(
+            values(&mut result, &format!("rotated{level}"), &mut backend, &mut store),
+            rotated
+        );
     }
     result.cleanup_staged(&mut store).unwrap();
+}
+
+/// Keep each test's allocation epoch exclusive within its process while the
+/// test harness remains free to run the independent GPU cases concurrently.
+fn run_isolated(test_name: &str) -> bool {
+    if std::env::args().any(|argument| argument == "--exact") {
+        return false;
+    }
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test_name, "--nocapture"])
+        .output()
+        .expect("run isolated GPU unit test");
+    assert!(
+        result.status.success() &&
+            String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    true
 }

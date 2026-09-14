@@ -97,5 +97,5 @@ pub fn centered(value: &BigInt, modulus: &BigUint) -> BigInt {
 pub fn matrix_bytes(value: &RuntimeValue<GpuDcrtBackend>, backend: &GpuDcrtBackend) -> Vec<u8> {
     use mxx_runtime::backend::Backend;
     let RuntimeValue::Matrix(matrix) = value else { panic!("materialized matrix") };
-    backend.matrix_to_bytes(matrix)
+    backend.matrix_to_bytes(matrix).expect("export matrix bytes")
 }

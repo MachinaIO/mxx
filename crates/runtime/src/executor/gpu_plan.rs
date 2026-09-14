@@ -5,10 +5,13 @@ use crate::gpu_calibration::{
     gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
 };
 use mxx_ir_core::{
-    ValidatedGraph,
+    ParamEnv, ValidatedGraph,
     graph::FrozenGraphScopeId,
+    node::NodeKind,
     types::{NodeId, Port, WireRef},
 };
+use num_bigint::BigInt;
+use num_traits::ToPrimitive;
 use std::collections::BTreeMap;
 
 pub(super) type Operations = BTreeMap<NodeId, Result<Option<[u8; 32]>, String>>;
@@ -90,6 +93,279 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
     plan
 }
 
+/// Native owners introduced or retained by the actual dispatch optimizer.
+#[derive(Default)]
+pub struct InventoryPlan {
+    pub outputs: BTreeMap<NodeId, Vec<(mxx_ir_core::types::ConcreteMatrixType, Vec<WireRef>)>>,
+    pub aliases: BTreeMap<WireRef, WireRef>,
+    pub borrowed_until: BTreeMap<WireRef, usize>,
+    pub omitted: std::collections::BTreeSet<NodeId>,
+}
+
+pub fn inventory_plan(validated: &ValidatedGraph, capture_trace: bool) -> InventoryPlan {
+    let plan = super::root_block_aliases(validated, &FrozenGraphScopeId::Root, capture_trace);
+    let checked = validated.root_scope();
+    let scope = validated.source.scope(&FrozenGraphScopeId::Root).unwrap();
+    let mut result = InventoryPlan::default();
+    result.outputs = plan
+        .compact_products
+        .iter()
+        .map(|(&id, (_, _, blocks))| {
+            (
+                id,
+                blocks
+                    .iter()
+                    .map(|aliases| {
+                        (
+                            checked.wire_types[&aliases[0]].matrix_type().unwrap().clone(),
+                            aliases.clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    result.aliases.extend(plan.concats.values().flatten().copied());
+    for &concat in &plan.row_block_concats {
+        let wire = WireRef { node: concat, port: Port(0) };
+        let end = checked.liveness.last_use[&wire];
+        for argument in scope.arguments(&checked.execution_order[concat.0 as usize]).unwrap() {
+            result
+                .borrowed_until
+                .entry(argument)
+                .and_modify(|previous| *previous = (*previous).max(end))
+                .or_insert(end);
+        }
+    }
+    for (id, row_sum) in &plan.row_sums {
+        for source in row_sum
+            .tensor_operands
+            .as_ref()
+            .map(|sources| sources.as_slice())
+            .unwrap_or(std::slice::from_ref(&row_sum.source))
+        {
+            result
+                .borrowed_until
+                .entry(*source)
+                .and_modify(|previous| *previous = (*previous).max(id.0 as usize))
+                .or_insert(id.0 as usize);
+        }
+    }
+    result.omitted.extend(plan.slices.iter().copied());
+    result.omitted.extend(plan.concats.keys().copied());
+    result.omitted.extend(plan.row_block_concats.iter().copied());
+    result.omitted.extend(plan.row_sum_interiors.iter().copied());
+    result.omitted.extend(plan.compact_products.keys().copied());
+    result
+}
+
+/// Error of one scope's owner-lifetime derivation.
+#[derive(Debug)]
+pub enum LivenessError {
+    /// A loop count or family index expression did not evaluate to an integer.
+    InvalidInteger,
+}
+
+/// The single owner-lifetime authority for GPU admission.
+///
+/// It starts from the validated scope liveness (`last_use` / `retained`), then
+/// applies the native-owner rules the dispatch optimizer and the executor's
+/// structured execution add on top of plain wire use:
+///
+/// - arguments that a fused alias/row-sum dispatch only borrows,
+/// - alias outputs propagating their end back to their source owners,
+/// - packed families retaining their members, with known selections extending only the selected
+///   member and unresolved selections covering every alternative,
+/// - a zero-count sequential loop forwarding its carried aliases, and
+/// - a materialized child input staying borrowed until its body returns.
+///
+/// This is what GPU inventory charges and what a later whole-wave admission
+/// must consume, so it lives in the GPU planning module instead of in one
+/// caller. It is metadata only: it never loads an artifact or allocates a value.
+pub struct OwnerLiveness<'a> {
+    validated: &'a ValidatedGraph,
+    scope_id: &'a FrozenGraphScopeId,
+    capture_trace: bool,
+    until: BTreeMap<WireRef, usize>,
+    aliases: BTreeMap<WireRef, WireRef>,
+}
+
+impl<'a> OwnerLiveness<'a> {
+    /// A metadata-only selection that retains its source backing/descriptor.
+    pub fn alias_source(&self, wire: WireRef) -> Option<&WireRef> {
+        self.aliases.get(&wire)
+    }
+
+    /// Owner end of `wire`, or `None` when the wire has no derived end.
+    pub fn until(&self, wire: WireRef) -> Option<usize> {
+        self.until.get(&wire).copied()
+    }
+
+    /// Owner end of one output port of the node at `position`.
+    pub fn output_end(&self, position: usize, port: usize) -> usize {
+        let checked = self.validated.scope(self.scope_id).expect("validated scope");
+        let handle = &checked.execution_order[position];
+        let id = NodeId(position as u64);
+        let wire = WireRef { node: id, port: Port(port as u32) };
+        let mut end = if self.capture_trace {
+            usize::MAX
+        } else {
+            self.until.get(&wire).copied().unwrap_or(position)
+        };
+        if matches!(handle.kind(), NodeKind::Select { .. }) {
+            // Select materializes and caches only the chosen candidate. Its
+            // owner can outlive the selection output through a later use of that
+            // candidate; reserve one possible owner until the latest candidate
+            // use without importing all candidates.
+            let scope = self.validated.source.scope(self.scope_id).expect("validated scope");
+            for candidate in scope.arguments(handle).expect("validated arguments").iter().skip(1) {
+                end = end.max(self.until.get(candidate).copied().unwrap_or(position));
+            }
+        }
+        if matches!(handle.kind(), NodeKind::Input { .. }) {
+            // The executor borrows the complete child input map. A child input
+            // materialized from a staged family therefore stays alive until the
+            // body returns, even after its last wire use.
+            end.max(checked.execution_order.len())
+        } else {
+            end
+        }
+    }
+}
+
+/// Derive every native owner's last live position in one validated scope.
+///
+/// `capture_trace` keeps every owner until the scope ends, because a trace
+/// retains the whole value map.
+pub fn owner_liveness<'a>(
+    validated: &'a ValidatedGraph,
+    scope_id: &'a FrozenGraphScopeId,
+    bindings: &ParamEnv,
+    optimizer: &InventoryPlan,
+    capture_trace: bool,
+) -> Result<OwnerLiveness<'a>, LivenessError> {
+    let scope = validated.source.scope(scope_id).ok_or(LivenessError::InvalidInteger)?;
+    let checked = validated.scope(scope_id).ok_or(LivenessError::InvalidInteger)?;
+    let mut aliases = optimizer.aliases.clone();
+    for (position, handle) in checked.execution_order.iter().enumerate() {
+        let node = NodeId(position as u64);
+        match handle.kind() {
+            NodeKind::FamilyGetStatic { index } => {
+                let source = scope.arguments(handle).expect("validated arguments")[0];
+                let family = scope.node(source.node).expect("validated family source");
+                if matches!(family.kind(), NodeKind::FamilyPack { .. }) {
+                    let index = index
+                        .evaluate(bindings)
+                        .ok()
+                        .and_then(|index| index.to_usize())
+                        .ok_or(LivenessError::InvalidInteger)?;
+                    let members = scope.arguments(family).expect("validated packed members");
+                    aliases.insert(
+                        WireRef { node, port: Port(0) },
+                        *members.get(index).ok_or(LivenessError::InvalidInteger)?,
+                    );
+                }
+            }
+            NodeKind::SequentialLoop(body) => {
+                if body.count.evaluate(bindings).map_err(|_| LivenessError::InvalidInteger)? ==
+                    BigInt::from(0)
+                {
+                    for (port, source) in scope
+                        .arguments(handle)
+                        .expect("validated arguments")
+                        .into_iter()
+                        .take(body.carried_count)
+                        .enumerate()
+                    {
+                        aliases.insert(WireRef { node, port: Port(port as u32) }, source);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut until = checked.liveness.last_use.clone();
+    for wire in &checked.liveness.retained {
+        until.insert(*wire, usize::MAX);
+    }
+    for (&wire, &end) in &optimizer.borrowed_until {
+        until.entry(wire).and_modify(|previous| *previous = (*previous).max(end)).or_insert(end);
+    }
+    // Propagate alias lifetimes backwards, including nested packs/selections.
+    // Dynamic selections retain every candidate until the selection dies.
+    for (position, handle) in checked.execution_order.iter().enumerate().rev() {
+        for port in 0..handle.output_types().len() {
+            let wire = WireRef { node: NodeId(position as u64), port: Port(port as u32) };
+            if let Some(source) = aliases.get(&wire) {
+                let end = until.get(&wire).copied().unwrap_or(position);
+                until
+                    .entry(*source)
+                    .and_modify(|previous| *previous = (*previous).max(end))
+                    .or_insert(end);
+            }
+        }
+        if matches!(
+            handle.kind(),
+            NodeKind::FamilyPack { .. } |
+                NodeKind::FamilyGetStatic { .. } |
+                NodeKind::FamilyGetDynamic |
+                NodeKind::Select { .. }
+        ) {
+            let output = WireRef { node: NodeId(position as u64), port: Port(0) };
+            let end = until.get(&output).copied().unwrap_or(position);
+            // Resolved selections already propagated to their exact source;
+            // unresolved selections retain every possible source instead.
+            if aliases.contains_key(&output) {
+                continue;
+            }
+            let sources = scope.arguments(handle).expect("validated arguments");
+            for wire in sources {
+                until
+                    .entry(wire)
+                    .and_modify(|previous| *previous = (*previous).max(end))
+                    .or_insert(end);
+            }
+        }
+    }
+    Ok(OwnerLiveness { validated, scope_id, capture_trace, until, aliases })
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct ImportProbe {
+    events: Vec<(&'static str, usize)>,
+    reject: bool,
+}
+
+#[cfg(test)]
+impl ImportProbe {
+    pub(super) fn preflight<M, S, T>(
+        &mut self,
+        requests: &[(
+            usize,
+            Option<crate::gpu_invocation::GpuNodeOperation>,
+            crate::gpu_invocation::GpuInvocation<'_, M, S, T>,
+        )],
+    ) -> bool {
+        use crate::gpu_invocation::GpuInvocation;
+        for (placement, _, request) in requests {
+            let kind = match request {
+                GpuInvocation::ImportMatrix { .. } => "prepare matrix",
+                GpuInvocation::ImportSmallMatrix { .. } => "prepare small",
+                GpuInvocation::ImportTrapdoor { .. } => "prepare trapdoor",
+                GpuInvocation::ImportCpuStaging { .. } => "prepare staging",
+                _ => "prepare sampler or arithmetic",
+            };
+            self.events.push((kind, *placement));
+        }
+        !self.reject
+    }
+
+    pub(super) fn import(&mut self, kind: &'static str, placement: usize) {
+        self.events.push((kind, placement));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,10 +376,179 @@ mod tests {
     };
 
     #[test]
-    #[serial_test::serial]
+    fn test_known_packed_selection_extends_only_its_selected_owner() {
+        use mxx_dsl::{Family, Int};
+        use mxx_ir_core::IntExpr;
+        let ring = Ring::new(257, 16);
+        for keep_family in [false, true] {
+            for selected in 0..2 {
+                let family =
+                    Family::pack(vec![ring.uniform_residue((1, 1)), ring.uniform_residue((1, 1))])
+                        .unwrap();
+                let value = family.at(Int::evaluate(IntExpr::Var("member".into())));
+                let context = DslContext::new("packed-owner-lifetime")
+                    .int_parameter("member")
+                    .output("selected", value)
+                    .unwrap();
+                let context =
+                    if keep_family { context.output("family", family).unwrap() } else { context };
+                let env = ParamEnv {
+                    integers: [("member".into(), BigInt::from(selected))].into_iter().collect(),
+                    ..ParamEnv::default()
+                };
+                let validated = context.build().unwrap().validate(&env).unwrap();
+                let scope_id = FrozenGraphScopeId::Root;
+                let scope = validated.source.scope(&scope_id).unwrap();
+                let checked = validated.root_scope();
+                let (get_position, getter) = checked
+                    .execution_order
+                    .iter()
+                    .enumerate()
+                    .find(|(_, node)| matches!(node.kind(), NodeKind::FamilyGetStatic { .. }))
+                    .unwrap();
+                let family_wire = scope.arguments(getter).unwrap()[0];
+                let members = scope.arguments(scope.node(family_wire.node).unwrap()).unwrap();
+                let plan = InventoryPlan::default();
+                let lifetime = owner_liveness(&validated, &scope_id, &env, &plan, false).unwrap();
+                assert_eq!(lifetime.until(members[selected]), Some(usize::MAX));
+                assert_eq!(
+                    lifetime.until(members[1 - selected]),
+                    Some(if keep_family { usize::MAX } else { get_position })
+                );
+                let captured = owner_liveness(&validated, &scope_id, &env, &plan, true).unwrap();
+                for wire in members {
+                    assert_eq!(
+                        captured.output_end(wire.node.0 as usize, wire.port.0 as usize),
+                        usize::MAX
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpu_external_import_preflight_precedes_decode_and_rejection() {
+        use crate::{
+            MemoryArtifactStore, RuntimeValue,
+            artifact::ArtifactPayload,
+            backend::Backend,
+            executor::{ExecutionResult, decode_artifact, tests::PlacementProbeBackend},
+        };
+        use mxx_ir_core::{artifact::ArtifactType, types::ConcreteMatrixType};
+        use std::{collections::BTreeMap, sync::Arc};
+
+        let ty = ConcreteMatrixType { modulus: 97.into(), ring_dimension: 8, rows: 1, columns: 1 };
+        let mut backend = PlacementProbeBackend::default();
+        backend.import_probe = Some(ImportProbe::default());
+        assert!(backend.set_active_placement(1));
+        decode_artifact(
+            &mut backend,
+            ArtifactType::Matrix(ty.clone()),
+            ArtifactPayload::Matrix(vec![11]),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare matrix", 1), ("matrix", 1)]
+        );
+
+        let probe = backend.import_probe.as_mut().unwrap();
+        probe.events.clear();
+        probe.reject = true;
+        assert!(
+            decode_artifact(
+                &mut backend,
+                ArtifactType::Matrix(ty.clone()),
+                ArtifactPayload::Matrix(vec![11]),
+            )
+            .is_err()
+        );
+        assert_eq!(backend.import_probe.as_ref().unwrap().events, [("prepare matrix", 1)]);
+
+        let probe = backend.import_probe.as_mut().unwrap();
+        probe.events.clear();
+        probe.reject = false;
+        let mut result = ExecutionResult {
+            outputs: BTreeMap::from([(
+                "staged".into(),
+                RuntimeValue::HostMatrix { matrix_type: ty, bytes: Arc::new(vec![11]) },
+            )]),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+        };
+        let mut store = MemoryArtifactStore::default();
+        result.materialize_output("staged", &mut backend, &mut store).unwrap();
+        result.materialize_output("staged", &mut backend, &mut store).unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare staging", 1), ("staging", 1)]
+        );
+    }
+
+    #[test]
+    fn test_gpu_replay_preflights_only_the_import() {
+        use crate::{
+            MemoryArtifactStore,
+            executor::{execute, tests::PlacementProbeBackend},
+            transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptRecorder},
+        };
+        use mxx_ir_core::{
+            node::NodeKind,
+            types::{NodeId, Port, WireRef},
+        };
+        use std::collections::BTreeMap;
+
+        let ring = Ring::new(97u64, 8usize);
+        let graph = DslContext::new("preflight-replayed-import")
+            .output("sample", ring.gaussian((1, 1), 3, 19))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let node = graph
+            .source
+            .root_scope()
+            .nodes()
+            .iter()
+            .enumerate()
+            .find_map(|(index, node)| {
+                matches!(node.kind(), NodeKind::GaussianSample { .. })
+                    .then_some(NodeId(index as u64))
+            })
+            .unwrap();
+        let wire = WireRef { node, port: Port(0) };
+        let ty = graph.root_scope().wire_types[&wire].matrix_type().unwrap().clone();
+        let mut recorder = TranscriptRecorder::default();
+        recorder
+            .record(
+                DrawSite { instantiation_path: Vec::new(), node, port: Port(0) },
+                RecordedValue::Matrix { matrix_type: ty, bytes: vec![11] },
+            )
+            .unwrap();
+        let replayer = recorder.into_replayer();
+        let mut backend = PlacementProbeBackend::default();
+        backend.import_probe = Some(ImportProbe::default());
+        execute(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Replay(&replayer),
+        )
+        .unwrap();
+        assert_eq!(
+            backend.import_probe.as_ref().unwrap().events,
+            [("prepare matrix", 0), ("matrix", 0)]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
         use crate::{
-            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
+            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend_on, execute,
             gpu_calibration::GpuColumnWidths, transcript::SamplingMode,
         };
         use mxx_primitives::{
@@ -120,7 +565,8 @@ mod tests {
         let parameters = DCRTPolyParams::new(n, 4, 54, 8, None, None);
         let ring = Ring::new(parameters.modulus().as_ref().clone(), n as usize);
         let gpu_parameters = GpuDCRTPolyParams::new(n, parameters.to_crt().0, 8, None);
-        let mut backend = gpu_backend([gpu_parameters.clone()]);
+        let mut backend =
+            gpu_backend_on([gpu_parameters.clone()], [gpu_parameters.device_ids()[0]]);
         for (left_columns, right_columns) in [(1, 1), (3, 2)] {
             let tensor = ring
                 .input("left", (2, left_columns))
@@ -143,7 +589,7 @@ mod tests {
             let operation = plan.calibration[node].as_ref().unwrap().unwrap();
             backend.set_column_widths_for_operation(
                 operation,
-                GpuColumnWidths { gpu0: left_columns * right_columns, nonzero: None },
+                GpuColumnWidths { gpu0: Some(left_columns * right_columns), nonzero: None },
             );
             let sampler = DCRTPolyUniformSampler::new();
             let left = sampler.sample_uniform(&parameters, 2, left_columns, DistType::FinRingDist);
@@ -169,7 +615,7 @@ mod tests {
             let mut result =
                 execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
             let RuntimeValue::Matrix(output) =
-                result.materialize_output("out", &backend, &mut store).unwrap()
+                result.materialize_output("out", &mut backend, &mut store).unwrap()
             else {
                 panic!("matrix output")
             };

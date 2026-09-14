@@ -6,6 +6,11 @@ namespace
     {
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors;
         uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+        size_t offset, columns, pitch;
+        __device__ size_t polynomial(size_t index) const {
+            return columns == 0 || columns == pitch ? offset + index :
+                offset + (index / columns) * pitch + index % columns;
+        }
         __device__ size_t limb(size_t index) const { return index; }
         __device__ auto output(size_t index) const { return descriptors[indices[index]]; }
         __device__ auto input(size_t index) const { return output(index); }
@@ -60,7 +65,7 @@ namespace
         {
             return;
         }
-        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        const size_t poly_idx = layout.polynomial(poly_offset + static_cast<size_t>(blockIdx.y));
         const auto descriptor = layout.descriptors[layout.indices[limb_idx]];
         uint8_t *const base = descriptor.base;
         const size_t stride_bytes = descriptor.stride;
@@ -97,7 +102,7 @@ namespace
         {
             return;
         }
-        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        const size_t poly_idx = layout.polynomial(poly_offset + static_cast<size_t>(blockIdx.y));
         const auto descriptor = layout.descriptors[layout.indices[limb_idx]];
         uint8_t *const base = descriptor.base;
         const size_t stride_bytes = descriptor.stride;
@@ -144,7 +149,7 @@ namespace
         const uint32_t group = bfly_idx / half;
         const uint32_t j = bfly_idx - group * half;
         const uint32_t i = group * len + j;
-        const size_t poly_idx = poly_offset + static_cast<size_t>(blockIdx.y);
+        const size_t poly_idx = layout.polynomial(poly_offset + static_cast<size_t>(blockIdx.y));
         const auto descriptor = layout.descriptors[layout.indices[limb_idx]];
         uint8_t *const base = descriptor.base;
         const size_t stride_bytes = descriptor.stride;
@@ -348,7 +353,7 @@ namespace
         const size_t limb = layout.limb(blockIdx.z);
         const auto descriptor = layout.output(blockIdx.z);
         const auto source = layout.input(blockIdx.z);
-        const size_t poly = poly_offset + blockIdx.y;
+        const size_t poly = layout.polynomial(poly_offset + blockIdx.y);
         const uint32_t first = blockIdx.x * tile_size;
         const uint64_t modulus = moduli[limb];
         const size_t twiddle_base = limb * static_cast<size_t>(n);
@@ -429,7 +434,7 @@ namespace
     template <bool Forward, typename Layout>
     int launch_fused_local_stages(
         Layout layout,
-        const GpuNttDeviceConstants &constants,
+        const GpuRingDeviceConstants &constants,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
@@ -472,7 +477,7 @@ namespace
         const uint32_t column = thread / Width;
         const uint32_t coefficient = column + lane * kFusedNttCoefficients;
         const size_t limb = layout.limb(blockIdx.z);
-        const size_t poly = poly_offset + blockIdx.y;
+        const size_t poly = layout.polynomial(poly_offset + blockIdx.y);
         const auto descriptor = layout.output(blockIdx.z);
         const uint64_t modulus = moduli[limb];
         const size_t twiddle_base = limb * static_cast<size_t>(n);
@@ -524,7 +529,7 @@ namespace
     template <bool Forward, typename Layout>
     int launch_fused_top_stages(
         Layout layout,
-        const GpuNttDeviceConstants &constants,
+        const GpuRingDeviceConstants &constants,
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
@@ -556,7 +561,7 @@ namespace
     }
 
     template <bool Forward>
-    int run_matrix_transform_u64(GpuMatrix *mat)
+    int run_matrix_transform_u64(GpuMatrix *mat, const GpuMatrixRange *range = nullptr)
     {
         if (!mat || !mat->ctx)
         {
@@ -594,14 +599,25 @@ namespace
             return set_error("too many limbs in run_matrix_transform_u64");
         }
 
-        const size_t poly_count = matrix_poly_count(mat);
+        const GpuMatrixRange rectangle = range ? *range : GpuMatrixRange{0, mat->rows, 0, mat->cols};
+        if (rectangle.row_start > rectangle.row_end || rectangle.row_end > mat->rows ||
+            rectangle.column_start > rectangle.column_end || rectangle.column_end > mat->cols ||
+            (mat->rows && mat->cols > std::numeric_limits<size_t>::max() / mat->rows))
+            return set_error("invalid NTT rectangle");
+        const size_t columns = rectangle.column_end - rectangle.column_start;
+        const size_t poly_count = (rectangle.row_end - rectangle.row_start) * columns;
         if (poly_count == 0)
         {
-            mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+            if (!range) mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
             return 0;
         }
 
         MatrixNttDescriptorView layout{};
+        if (range) {
+            layout.offset = rectangle.row_start * mat->cols + rectangle.column_start;
+            layout.columns = columns;
+            layout.pitch = mat->cols;
+        }
 
         int dispatch_device = -1;
         size_t dispatch_slot = std::numeric_limits<size_t>::max();
@@ -680,11 +696,11 @@ namespace
             layout.indices[limb_idx] = limb_id.y;
         }
 
-        if (dispatch_slot >= mat->ctx->ntt_device_constants.size())
+        if (dispatch_slot >= mat->ctx->ring_device_constants.size())
         {
             return set_error("missing per-device NTT constants in run_matrix_transform_u64");
         }
-        const GpuNttDeviceConstants &device_constants = mat->ctx->ntt_device_constants[dispatch_slot];
+        const GpuRingDeviceConstants &device_constants = mat->ctx->ring_device_constants[dispatch_slot];
         if (device_constants.device != dispatch_device)
         {
             return set_error("NTT constants device mismatch in run_matrix_transform_u64");
@@ -777,7 +793,7 @@ namespace
         status = matrix_record_all_limb_writes(mat, dispatch_stream);
         if (status != 0) return status;
 
-        mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+        if (!range) mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
         return 0;
     }
 }
@@ -792,6 +808,7 @@ int gpu_matrix_ntt_all(GpuMatrix *mat)
     {
         return 0;
     }
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
     return run_matrix_transform_u64<true>(mat);
 }
 
@@ -805,5 +822,6 @@ int gpu_matrix_intt_all(GpuMatrix *mat)
     {
         return 0;
     }
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
     return run_matrix_transform_u64<false>(mat);
 }

@@ -133,7 +133,9 @@ impl PreparedClaimBroker {
     ) -> Result<T, String> {
         let assignment =
             self.assignment(claims, &HashSet::new(), &HashSet::new())?.ok_or_else(|| {
-                format!("prepared inventory cannot fit simultaneous admitted claims: {claims:?}")
+                let missing = self.match_claims(claims, &HashSet::new(), &HashSet::new())
+                    .map(|selected| claims.iter().zip(selected).filter_map(|(claim, request)| request.is_none().then_some(*claim)).collect::<Vec<_>>());
+                format!("prepared inventory cannot fit simultaneous admitted claims; missing: {missing:?}; requested: {claims:?}")
             })?;
         // Do not activate a dispatch until every chosen slot has been reserved.
         // If availability changed, dropping the prefix rolls back the transaction.

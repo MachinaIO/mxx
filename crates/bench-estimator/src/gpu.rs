@@ -5051,6 +5051,16 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_normal_preimage_estimate_consumes_cached_column_plans() {
+        check_preimage_estimate(false);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_normal_fleet_preimage_estimate_consumes_cached_column_plans() {
+        check_preimage_estimate(true);
+    }
+
+    fn check_preimage_estimate(fleet: bool) {
         use mxx_dsl::{DslContext, Ring, parallel};
         use mxx_primitives::matrix::gpu_dcrt_poly::GpuGraphAdmissionGuard;
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -5059,7 +5069,14 @@ mod tests {
         let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
             .map(|value| value.parse::<usize>().unwrap())
             .unwrap_or(3);
-        let device = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()[0];
+        let mut devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        if fleet {
+            assert!(devices.len() > 1, "remote multi-GPU test");
+        } else {
+            devices.truncate(1);
+        }
+        let device = devices[0];
+        let columns = columns.max(devices.len() + 1);
         let cpu = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(n, 3, 30, 4, None, None);
         let params = GpuDCRTPolyParams::new_with_gpu(
             n,
@@ -5084,9 +5101,16 @@ mod tests {
             .unwrap()
             .validate(&ParamEnv::default())
             .unwrap();
-        let backend = mxx_runtime::backend::poly::gpu::gpu_backend_on([params.clone()], [device]);
         let mut estimator = GpuNodeMeasurementBackend::new(
-            vec![(backend, device)],
+            devices
+                .iter()
+                .map(|&device| {
+                    (
+                        mxx_runtime::backend::poly::gpu::gpu_backend_on([params.clone()], [device]),
+                        device,
+                    )
+                })
+                .collect(),
             crate::harness::MeasurementHarnessConfig {
                 warm_up_iterations: 1,
                 measured_iterations: 1,
@@ -5097,7 +5121,10 @@ mod tests {
         crate::estimate(&graph, &mut estimator).unwrap();
         estimator.measure_collected().unwrap();
         let frozen = std::mem::take(&mut estimator.measured_batches);
-        let guard = GpuGraphAdmissionGuard::new(vec![params]).unwrap();
+        let guard = GpuGraphAdmissionGuard::new(
+            estimator.prepared_backend.as_ref().unwrap().device_parameters(),
+        )
+        .unwrap();
         estimator.batch_collection = true;
         crate::dataflow::estimate(&graph, &mut estimator).unwrap();
         let samples = estimator
@@ -5113,6 +5140,17 @@ mod tests {
                 plan.compact_output &&
                 plan.columns == columns &&
                 plan.plan.wave_count > 0));
+            if fleet {
+                assert!(
+                    plans.iter().all(|plan| plan
+                        .plan
+                        .widths
+                        .iter()
+                        .filter(|&&width| width > 0)
+                        .count() >
+                        1)
+                );
+            }
         }
         estimator.pending_batches.clear();
         estimator.batch_collection = false;

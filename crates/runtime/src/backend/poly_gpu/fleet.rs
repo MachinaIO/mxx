@@ -5375,18 +5375,17 @@ impl Backend for GpuDcrtBackend {
         }
         let (public, first) =
             self.devices[0].1.sample_trapdoor(ty, sigma, gadget_base, digit_count)?;
-        let bytes = self.devices[0].1.trapdoor_to_bytes(&first);
         let mut values = Vec::with_capacity(self.devices.len());
-        values.push(first);
-        values.extend(
-            self.devices
-                .par_iter_mut()
-                .skip(1)
-                .map(|(_, backend)| backend.trapdoor_from_bytes(ty, &bytes))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        let public = self.scatter_matrix(public)?;
-        Ok((public, GpuFleetTrapdoor { values: Arc::new(values) }))
+        if self.devices.len() > 1 {
+            let snapshots = first.to_rns_snapshots();
+            values.extend(self.devices.par_iter().skip(1).map(|(_, backend)| {
+                Ok(mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(
+                    backend.parameters(ty)?, &snapshots,
+                ))
+            }).collect::<Result<Vec<_>, PolyBackendError>>()?);
+        }
+        values.insert(0, first);
+        Ok((GpuFleetMatrix::from_matrix(public), GpuFleetTrapdoor { values: Arc::new(values) }))
     }
 
     fn sample_preimage_batch(

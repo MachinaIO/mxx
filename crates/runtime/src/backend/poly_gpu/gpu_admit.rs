@@ -2266,7 +2266,23 @@ mod tests {
             columns: 1,
         };
         let context = parameters[0].context_identity();
-        let mut backend = crate::backend::poly_gpu::gpu_backend_on(parameters, devices);
+        assert_ne!(context, parameters[1].context_identity());
+        let mut invalid_backend = crate::backend::poly_gpu::GpuDcrtBackend::new(
+            parameters.iter().cloned().map(|parameters| vec![parameters]).collect(),
+        );
+        let error = invalid_backend
+            .prepare_measurement_storage(&[(
+                0,
+                parameters[1].context_identity(),
+                matrix_type.clone(),
+                vec![GpuTracedClaim::matrix(1, 1, 0, true)],
+            )])
+            .unwrap_err();
+        assert!(error.to_string().contains("missing device 0 context"));
+
+        let mut backend = crate::backend::poly_gpu::GpuDcrtBackend::new(
+            parameters.into_iter().map(|parameters| vec![parameters]).collect(),
+        );
         backend
             .prepare_measurement_storage(&[(
                 0,
@@ -2277,11 +2293,19 @@ mod tests {
             .unwrap();
         let inventory =
             backend.prepared_ledger.as_ref().unwrap().prepared_inventory().collect::<Vec<_>>();
+        let registered = backend.device_parameters();
         assert_eq!(
             inventory.iter().map(|(device, _)| *device).collect::<Vec<_>>(),
             vec![0, 1, 2, 3]
         );
         assert_eq!(inventory[0].1.slot_count(), 2);
+        for (device, storage) in &inventory {
+            assert_eq!(
+                storage.context_identity(),
+                registered[*device as usize].context_identity(),
+                "storage context must match the registered context for device {device}"
+            );
+        }
         for device in 1..4 {
             let storage = inventory
                 .iter()

@@ -21,8 +21,13 @@ constexpr unsigned int leased = 2;
 constexpr unsigned int quarantined = 3;
 constexpr unsigned int inspecting = 4;
 constexpr size_t resetting = std::numeric_limits<size_t>::max();
+constexpr int acquisition_conflict = -2;
 
 int fail(const char *message) { return gpu_set_last_error(message); }
+int conflict(const char *message) {
+    gpu_set_last_error(message);
+    return acquisition_conflict;
+}
 int fail(cudaError_t error) { return fail(cudaGetErrorString(error)); }
 
 uint64_t next_identity() {
@@ -318,10 +323,15 @@ struct GpuMatrixReservation {
     std::shared_ptr<GpuExecutionOwner> execution;
     GpuAllocationActivity activity;
     std::shared_ptr<Storage> storage;
+    // Keep the authority that admitted these slots alive for the reservation.
+    // A validated claim handle may be dropped immediately after activation;
+    // slot ownership must still be checked against the same region until the
+    // reservation releases it.
+    std::shared_ptr<Region> region;
     uint64_t identity = next_identity();
     std::vector<size_t> slots;
     std::vector<GpuPreparedRequest> bounds;
-    std::vector<PreparedClaim> claims;
+    std::shared_ptr<const std::vector<PreparedClaim>> claims;
     size_t next = 0;
     size_t claimed = 0;
 
@@ -360,6 +370,15 @@ struct GpuMatrixReservation {
         storage->active_reservations.fetch_sub(1, std::memory_order_acq_rel);
         execution->prepared_active_reservations.fetch_sub(1, std::memory_order_acq_rel);
     }
+};
+
+// Layout validation is intentionally separated from slot activation.  The
+// handle retains the native execution owner, so a cache hit can activate the
+// already-validated request list under a fresh containing region without
+// re-running the expensive matrix layout queries.
+struct GpuPreparedClaimHandle {
+    std::shared_ptr<Storage> storage;
+    std::shared_ptr<const std::vector<PreparedClaim>> claims;
 };
 
 struct GpuMatrixDispatchPermit {
@@ -433,7 +452,7 @@ extern "C" int gpu_prepared_pinned_claim(
     if (!reservation || reservation->storage->context != ctx)
         return fail("pinned allocation requires its next prepared dispatch claim");
     auto &storage = *reservation->storage;
-    const auto &claim = reservation->claims[reservation->next];
+    const auto &claim = (*reservation->claims)[reservation->next];
     auto &slot = *storage.slots[reservation->slots[reservation->next]];
     if (slot.identity.kind != GPU_PREPARED_PINNED_HOST || claim.request.bytes != bytes ||
         claim.request.alignment != alignment || !slot.workspace) {
@@ -509,7 +528,7 @@ int GpuCudaResource::acquire(const GpuContext *ctx, int selected_device, GpuPrep
             return refuse("CUDA resource requires a matching prepared dispatch permit");
         auto &storage = *reservation->storage;
         auto &slot = storage.slots[reservation->slots[reservation->next]];
-        const auto &claim = reservation->claims[reservation->next];
+        const auto &claim = (*reservation->claims)[reservation->next];
         if (claim.request.kind != kind || !is_resource(slot->identity.kind))
             return refuse("CUDA resource differs from its prepared type");
         auto pending = std::make_unique<GpuPreparedResourceLease>(
@@ -640,7 +659,7 @@ int GpuDeviceWorkspace::acquire(
         auto &storage = *reservation.storage;
         const size_t index = reservation.slots[reservation.next];
         auto &slot = *storage.slots[index];
-        const auto &claim = reservation.claims[reservation.next];
+        const auto &claim = (*reservation.claims)[reservation.next];
         if (slot.identity.kind != kind || !slot.workspace ||
             bytes != claim.request.bytes || alignment != claim.request.alignment)
             return refuse(fail("device workspace differs from its prepared type, capacity, or alignment"));
@@ -1261,60 +1280,80 @@ extern "C" int gpu_prepared_storages_finish_setup(
     } catch (const std::exception &error) { return fail(error.what()); }
 }
 
-extern "C" int gpu_matrix_reserve(
+extern "C" int gpu_matrix_validate_claims(
     GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
-    const GpuPreparedRegion *region, GpuMatrixReservation **out)
+    GpuPreparedClaimHandle **out)
+{
+    if (!out) return fail("null prepared claim handle output");
+    *out = nullptr;
+    if (!storage || !storage->value || (count && !requests))
+        return fail("invalid prepared claim handle");
+    if (storage->value->context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared claim validation has unretired work");
+    try {
+        auto handle = std::make_unique<GpuPreparedClaimHandle>();
+        handle->storage = storage->value;
+        auto claims = std::make_shared<std::vector<PreparedClaim>>();
+        bool fits = false;
+        const int status = prepare_claims(*storage->value, requests, count, *claims, fits);
+        if (status != 0) return status;
+        if (!fits) return fail("prepared request does not fit its backing layout");
+        handle->claims = std::move(claims);
+        *out = handle.release();
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" int gpu_matrix_activate_claims(
+    const GpuPreparedClaimHandle *claims, const GpuPreparedRegion *region,
+    GpuMatrixReservation **out)
 {
     if (!out) return fail("null matrix reservation output");
     *out = nullptr;
-    if (!storage || !storage->value || (count && !requests))
-        return fail("invalid matrix reservation");
-    auto &backing = *storage->value;
-    if (region && (!region->value || region->value->storage != storage->value))
+    if (!claims || !claims->storage)
+        return fail("invalid prepared claim handle");
+    auto &backing = *claims->storage;
+    if (region && (!region->value || region->value->storage != claims->storage))
         return fail("prepared region belongs to a different storage");
     const uint64_t region_id = region ? region->value->identity : 0;
     if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
-        return fail("matrix reservation has unretired work");
+        return fail("prepared claim activation has unretired work");
     try {
-        auto reservation = std::make_unique<GpuMatrixReservation>(storage->value);
-        bool fits = false;
-        const int status = prepare_claims(backing, requests, count, reservation->claims, fits);
-        if (status != 0) return status;
-        if (!fits) return fail("prepared request does not fit its backing layout");
-        reservation->slots.reserve(count);
-        reservation->bounds.reserve(count);
-        for (const auto &claim : reservation->claims) {
+        auto reservation = std::make_unique<GpuMatrixReservation>(claims->storage);
+        reservation->region = region ? region->value : nullptr;
+        reservation->claims = claims->claims;
+        reservation->slots.reserve(claims->claims->size());
+        reservation->bounds.reserve(claims->claims->size());
+        for (const auto &claim : *claims->claims) {
             reservation->slots.push_back(claim.request.slot_index);
             reservation->bounds.push_back(claim.request);
         }
-        for (; reservation->claimed < count; ++reservation->claimed) {
+        for (; reservation->claimed < reservation->claims->size(); ++reservation->claimed) {
             unsigned int expected = available;
             const size_t slot = reservation->slots[reservation->claimed];
             uint64_t owner = 0;
             if (!backing.slots[slot]->reservation_owner.compare_exchange_strong(
                     owner, reservation->identity, std::memory_order_acq_rel))
-                return fail("prepared slot belongs to another invocation");
-            // Check after acquiring operation ownership: region acquisition
-            // checks that same owner after its CAS, closing both race orders.
+                return conflict("prepared slot belongs to another invocation");
             if (backing.slots[slot]->region_owner.load(std::memory_order_acquire) != region_id) {
                 backing.slots[slot]->reservation_owner.store(0, std::memory_order_release);
-                return fail("prepared slot belongs to another region");
+                return conflict("prepared slot belongs to another region");
             }
             if (!backing.slots[slot]->state.compare_exchange_strong(
                     expected, reserved, std::memory_order_acq_rel)) {
                 backing.slots[slot]->reservation_owner.store(0, std::memory_order_release);
-                return fail("prepared matrix slot is still owned by another reservation or output");
+                return conflict("prepared matrix slot is still owned by another reservation or output");
             }
             reserved_counter(backing, *backing.slots[slot]).fetch_add(
-                reservation_units(*backing.slots[slot]),
-                std::memory_order_acq_rel);
+                reservation_units(*backing.slots[slot]), std::memory_order_acq_rel);
         }
         if (!backing.context->execution->graph_admission_scoped.load(std::memory_order_acquire)) {
             backing.context->execution->admission_required.store(true, std::memory_order_release);
-            for (const auto &claim : reservation->claims) {
-                if (claim.request.kind == GPU_PREPARED_PINNED_HOST) {
+            for (const auto &claim : *reservation->claims) {
+                if (claim.request.kind == GPU_PREPARED_PINNED_HOST)
                     backing.context->execution->pinned_admission_required.store(true, std::memory_order_release);
-                }
                 if (claim.request.kind == GPU_PREPARED_TRANSFER_WORKSPACE)
                     backing.context->execution->transfer_admission_required.store(true, std::memory_order_release);
                 if (is_resource(claim.request.kind))
@@ -1326,6 +1365,23 @@ extern "C" int gpu_matrix_reserve(
     } catch (const std::exception &error) {
         return fail(error.what());
     }
+}
+
+extern "C" void gpu_matrix_claim_handle_destroy(GpuPreparedClaimHandle *claims)
+{
+    delete claims;
+}
+
+extern "C" int gpu_matrix_reserve(
+    GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
+    const GpuPreparedRegion *region, GpuMatrixReservation **out)
+{
+    GpuPreparedClaimHandle *claims = nullptr;
+    const int status = gpu_matrix_validate_claims(storage, requests, count, &claims);
+    if (status != 0) return status;
+    const int activated = gpu_matrix_activate_claims(claims, region, out);
+    gpu_matrix_claim_handle_destroy(claims);
+    return activated;
 }
 
 extern "C" int gpu_prepared_region_create(
@@ -1615,7 +1671,7 @@ extern "C" int gpu_matrix_reservation_rearm(
             // admitted envelope below and may grow again within that bound.
             bool narrower = false;
             for (size_t index = 0; index < count; ++index) {
-                const auto &previous = reservation->claims[index].request;
+                const auto &previous = (*reservation->claims)[index].request;
                 const auto &request = requests[index];
                 if (request.rows > previous.rows || request.columns > previous.columns ||
                     request.bytes > previous.bytes || request.alignment > previous.alignment)
@@ -1627,7 +1683,7 @@ extern "C" int gpu_matrix_reservation_rearm(
             // The initial envelope is already reserved. Specializing it for a
             // narrower first range changes no slot ownership or capacity charge.
             // Bounds remain the original invocation envelope, not this request.
-            reservation->claims.swap(claims);
+            reservation->claims = std::make_shared<std::vector<PreparedClaim>>(std::move(claims));
             return 0;
         }
         size_t acquired = 0;
@@ -1648,7 +1704,7 @@ extern "C" int gpu_matrix_reservation_rearm(
             }
             return fail("previous wave still owns a prepared slot or it is being inspected");
         }
-        reservation->claims.swap(claims);
+        reservation->claims = std::make_shared<std::vector<PreparedClaim>>(std::move(claims));
         reservation->next = 0;
         return 0;
     } catch (const std::exception &error) { return fail(error.what()); }
@@ -1709,8 +1765,9 @@ extern "C" int gpu_matrix_reservation_partition(
             auto child = std::make_unique<GpuMatrixReservation>(reservation->storage);
             child->slots.assign(reservation->slots.begin() + offset,
                                 reservation->slots.begin() + offset + counts[index]);
-            child->claims.assign(reservation->claims.begin() + offset,
-                                 reservation->claims.begin() + offset + counts[index]);
+            child->claims = std::make_shared<std::vector<PreparedClaim>>(
+                reservation->claims->begin() + offset,
+                reservation->claims->begin() + offset + counts[index]);
             child->bounds.assign(reservation->bounds.begin() + offset,
                                  reservation->bounds.begin() + offset + counts[index]);
             offset += counts[index];
@@ -1881,7 +1938,7 @@ extern "C" int gpu_prepared_matrix_claim(
     auto &storage = *reservation.storage;
     const size_t slot_index = reservation.slots[reservation.next];
     auto &slot = *storage.slots[slot_index];
-    const auto &claim = reservation.claims[reservation.next];
+    const auto &claim = (*reservation.claims)[reservation.next];
     GpuMatrix *matrix = slot.matrix;
     if (slot.identity.kind != GPU_PREPARED_MATRIX || !matrix ||
         claim.request.rows != rows || claim.request.columns != cols ||

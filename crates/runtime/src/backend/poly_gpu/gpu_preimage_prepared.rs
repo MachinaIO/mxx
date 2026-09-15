@@ -197,7 +197,7 @@ impl GpuDcrtBackend {
             plans.push(invocation.plan);
             invocations.push((
                 invocation.operation,
-                invocation.intervals,
+                invocation.template.intervals.clone(),
                 payload,
                 invocation.prepared,
             ));
@@ -369,6 +369,7 @@ impl GpuDcrtBackend {
                                         prepared,
                                         &payload.public,
                                         range.left_source.expect("admitted Preimage public matrix"),
+                                        range.left_prepared,
                                     )
                                     .value,
                             }

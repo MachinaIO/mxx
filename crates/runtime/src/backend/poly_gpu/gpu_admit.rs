@@ -5,7 +5,8 @@ use super::{
     gpu_compiled::{AdmittedMatrixBinding, InvocationOperands, LoweredMatrixInvocation},
     gpu_prepare::{
         MatrixDescriptor, MatrixInputPreparation, MatrixInputRequest, MatrixSlotContext,
-        MatrixSlotKey, PreparedMatrixSource, select_matrix_input, select_prepared_matrix,
+        MatrixSlotKey, PreparedMatrixInputs, PreparedMatrixSource, select_matrix_input,
+        select_prepared_matrix,
     },
     *,
 };
@@ -18,6 +19,8 @@ use mxx_primitives::matrix::gpu_dcrt_poly::{
     GpuPreparedRequest, GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedSlotSnapshot,
     GpuPreparedStorage, GpuPreparedWorkspaceLayout, GpuTracedClaim,
 };
+
+pub type GpuSetupClaim = (usize, usize, ConcreteMatrixType, Vec<GpuTracedClaim>);
 
 /// Complete metadata consumed by shared destination/input/scratch selection.
 pub struct MatrixPlacementInvocation {
@@ -101,6 +104,7 @@ pub struct GpuMatrixLayoutPlan {
     classes: Vec<GpuAllocationClass>,
     pub inputs: Vec<MatrixInputRequest>,
     invocations: Vec<MatrixInvocationGeometry>,
+    operations: Vec<PreparedOperation>,
 }
 
 struct MatrixInvocationGeometry {
@@ -168,10 +172,7 @@ impl GpuMatrixLayoutPlan {
         column_cap: usize,
         inventories: &[I],
     ) -> Result<
-        (
-            Vec<super::gpu_compiled::GpuAdmittedInvocationSummary>,
-            Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>,
-        ),
+        (Vec<super::gpu_compiled::GpuAdmittedInvocationSummary>, Vec<GpuSetupClaim>),
         GpuAdmissionError,
     > {
         let fits = self.fits(admissions, column_cap, inventories)?;
@@ -204,17 +205,17 @@ impl GpuMatrixLayoutPlan {
     fn setup_claims(
         &self,
         fits: &[crate::gpu_memory::GpuColumnFit],
-    ) -> Result<Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>, GpuAdmissionError> {
+    ) -> Result<Vec<GpuSetupClaim>, GpuAdmissionError> {
         use std::collections::{BTreeMap, BTreeSet};
-        let mut selected = Vec::<(GpuDCRTPolyParams, GpuPreparedRequest)>::new();
-        let mut extras = Vec::<(GpuDCRTPolyParams, GpuTracedClaim)>::new();
+        let mut selected = Vec::<(usize, GpuDCRTPolyParams, GpuPreparedRequest)>::new();
+        let mut extras = Vec::<(usize, GpuDCRTPolyParams, GpuTracedClaim)>::new();
         let mut seen = BTreeSet::<(usize, usize, (u64, u64, usize))>::new();
         let mut add =
             |device: usize, parameters: GpuDCRTPolyParams, request: GpuPreparedRequest| {
                 let context = parameters.context_identity();
                 let key = (device, context, request.slot_key());
                 if seen.insert(key) {
-                    selected.push((parameters, request));
+                    selected.push((device, parameters, request));
                 }
             };
         for input in &self.inputs {
@@ -226,11 +227,45 @@ impl GpuMatrixLayoutPlan {
                 for allocations in [&region.outputs, &region.scratch] {
                     for requests in allocations.prepared.iter().map(|entry| &entry.1) {
                         for &request in requests {
+                            let mut contexts = HashSet::new();
+                            contexts.extend(
+                                requirements
+                                    .outputs
+                                    .iter()
+                                    .filter(|output| {
+                                        output.interval.device == region.device &&
+                                            output.request.slot_key() == request.slot_key()
+                                    })
+                                    .map(|output| output.sources.parameters.context_identity()),
+                            );
+                            contexts.extend(
+                                requirements
+                                    .resources
+                                    .scratch
+                                    .iter()
+                                    .filter(|scratch| {
+                                        scratch.device == region.device &&
+                                            (
+                                                scratch.slot.storage_id(),
+                                                scratch.slot.slot_id(),
+                                                scratch.slot.slot_index(),
+                                            ) == request.slot_key()
+                                    })
+                                    .map(|scratch| scratch.parameters.context_identity()),
+                            );
+                            let context = if contexts.len() == 1 {
+                                contexts.into_iter().next().expect("one parameter context")
+                            } else {
+                                return Err(GpuAdmissionError::InvalidPlan(
+                                    "selected setup request has no unique parameter context".into(),
+                                ));
+                            };
                             let parameters = requirements
                                 .outputs
                                 .iter()
                                 .find(|output| {
                                     output.interval.device == region.device &&
+                                        output.sources.parameters.context_identity() == context &&
                                         output.request.slot_key() == request.slot_key()
                                 })
                                 .map(|output| output.sources.parameters.clone())
@@ -241,6 +276,7 @@ impl GpuMatrixLayoutPlan {
                                         .iter()
                                         .find(|scratch| {
                                             scratch.device == region.device &&
+                                                scratch.parameters.context_identity() == context &&
                                                 (
                                                     scratch.slot.storage_id(),
                                                     scratch.slot.slot_id(),
@@ -259,7 +295,7 @@ impl GpuMatrixLayoutPlan {
                     }
                 }
                 if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } =
-                    &self.invocations[index].operation
+                    &self.operations[index]
                 {
                     let width =
                         if region.device == 0 { fit.widths().gpu0 } else { fit.widths().nonzero }
@@ -312,12 +348,15 @@ impl GpuMatrixLayoutPlan {
                         ty.rows,
                         bound,
                     )?;
-                    extras.extend(claims.into_iter().map(|claim| (parameters.clone(), claim)));
+                    extras.extend(
+                        claims.into_iter().map(|claim| (region.device, parameters.clone(), claim)),
+                    );
                 }
             }
         }
-        let mut groups = BTreeMap::<ConcreteMatrixType, Vec<GpuTracedClaim>>::new();
-        for (params, request) in selected {
+        let mut groups = BTreeMap::<(usize, usize, ConcreteMatrixType), Vec<GpuTracedClaim>>::new();
+        for (device, params, request) in selected {
+            let context = params.context_identity();
             let claim = if request.kind() == GpuPreparedSlotKind::Matrix {
                 GpuTracedClaim::matrix(
                     request.rows(),
@@ -346,9 +385,10 @@ impl GpuMatrixLayoutPlan {
                     1
                 },
             };
-            groups.entry(ty).or_default().push(claim);
+            groups.entry((device, context, ty)).or_default().push(claim);
         }
-        for (params, claim) in extras {
+        for (device, params, claim) in extras {
+            let context = params.context_identity();
             let ty = ConcreteMatrixType {
                 modulus: params.modulus().as_ref().clone().into(),
                 ring_dimension: params.ring_dimension() as usize,
@@ -359,9 +399,12 @@ impl GpuMatrixLayoutPlan {
                     1
                 },
             };
-            groups.entry(ty).or_default().push(claim);
+            groups.entry((device, context, ty)).or_default().push(claim);
         }
-        Ok(groups.into_iter().collect())
+        Ok(groups
+            .into_iter()
+            .map(|((device, context, ty), claims)| (device, context, ty, claims))
+            .collect())
     }
 
     /// Exact selected output owners for binding the model's subsequent values.
@@ -1386,7 +1429,13 @@ impl GpuDcrtBackend {
                 })
             })
             .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        Ok(GpuMatrixLayoutPlan { layouts, classes, inputs: preparation, invocations })
+        Ok(GpuMatrixLayoutPlan {
+            layouts,
+            classes,
+            inputs: preparation,
+            invocations,
+            operations: lowered.iter().map(|invocation| invocation.operation.clone()).collect(),
+        })
     }
 
     /// Begin one explicit benchmark class with no live invocation/output leases.
@@ -1408,6 +1457,11 @@ impl GpuDcrtBackend {
         self.prepared_ledger = None;
         self.prepared_required = false;
         self.graph_prepared = false;
+        self.clear_prepared_caches();
+        #[cfg(test)]
+        {
+            self.graph_warmup_complete = false;
+        }
         self.admitted_plan_log.clear();
         Ok(guard)
     }
@@ -1415,12 +1469,26 @@ impl GpuDcrtBackend {
     /// Allocate the class's typed capacity before closing its native setup epoch.
     pub fn prepare_measurement_storage(
         &mut self,
-        claims: &[(ConcreteMatrixType, Vec<GpuTracedClaim>)],
+        claims: &[GpuSetupClaim],
     ) -> Result<(), PolyBackendError> {
+        let parameter_contexts = self.parameter_placements();
         let mut storage = Vec::new();
-        for (device, (_, backend)) in self.devices.iter().enumerate() {
-            for (ty, claims) in claims {
-                let parameters = backend.parameters(ty)?;
+        for device in 0..self.devices.len() {
+            let mut has_storage = false;
+            for (_, context, ty, claims) in claims.iter().filter(|(owner, ..)| *owner == device) {
+                let parameters = parameter_contexts[device]
+                    .iter()
+                    .find(|parameters| {
+                        parameters.context_identity() == *context &&
+                            parameters.ring_dimension() as usize == ty.ring_dimension &&
+                            num_bigint::BigInt::from(parameters.modulus().as_ref().clone()) ==
+                                ty.modulus
+                    })
+                    .ok_or_else(|| {
+                        PolyBackendError::GpuSubmission(format!(
+                            "setup claim references missing device {device} context {context}"
+                        ))
+                    })?;
                 let mut matrices = claims
                     .iter()
                     .copied()
@@ -1430,6 +1498,7 @@ impl GpuDcrtBackend {
                 if matrices.is_empty() && layouts.is_empty() {
                     continue;
                 }
+                has_storage = true;
                 if matrices.is_empty() {
                     matrices.push(GpuTracedClaim::matrix(1, 1, parameters.crt_depth() - 1, true));
                 }
@@ -1441,6 +1510,23 @@ impl GpuDcrtBackend {
                             Vec::new(),
                             Some(&matrices),
                             Some(&layouts),
+                        )
+                        .map_err(PolyBackendError::GpuSubmission)?,
+                    ),
+                ));
+            }
+            if !has_storage {
+                let parameters =
+                    parameter_contexts[device].first().expect("each GPU placement has parameters");
+                let placeholder = [GpuTracedClaim::matrix(1, 1, parameters.crt_depth() - 1, true)];
+                storage.push((
+                    device,
+                    Arc::new(
+                        GpuPreparedStorage::new(
+                            Some(parameters),
+                            Vec::new(),
+                            Some(&placeholder),
+                            None,
                         )
                         .map_err(PolyBackendError::GpuSubmission)?,
                     ),
@@ -1532,10 +1618,95 @@ impl GpuDcrtBackend {
                     } else {
                         compact.iter().flatten().next().map(|matrix| matrix.id)
                     },
+                    batch_identity: super::gpu_compiled::matrix_batch_identity(
+                        Some(node),
+                        self.active_operation.unwrap_or([0; 32]),
+                    ),
                 })
             })
             .collect::<Result<Vec<_>, PolyBackendError>>()?;
         self.admit_matrix_invocations(lowered, column_cap, expected)
+    }
+
+    /// Prepare one sibling batch through the same measurement boundary on the
+    /// cache-hit and fresh-admission paths. The requests are always rebuilt
+    /// from current operands; only the surrounding observer setup is shared.
+    fn prepare_matrix_inputs_for_admission(
+        &mut self,
+        ledger: &mut GpuMemoryLedger,
+        inventory: &[(usize, Arc<GpuPreparedStorage>)],
+        preparation: Vec<MatrixInputPreparation>,
+    ) -> Result<Arc<PreparedMatrixInputs>, PolyBackendError> {
+        if self.admitted_measurement_sink.is_none() || preparation.is_empty() {
+            return self.prepare_matrix_inputs(ledger, preparation);
+        }
+        let mut sink = self.admitted_measurement_sink.take().expect("measurement sink");
+        let result = (|| {
+            let device_indices = self
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(index, (device, _))| (*device, index))
+                .collect::<HashMap<_, _>>();
+            let active_devices = preparation
+                .par_iter()
+                .flat_map_iter(|input| {
+                    let sources = match input.layout.source {
+                        PreparedMatrixSource::Shard(index) |
+                        PreparedMatrixSource::Fragment { index, .. } => {
+                            &input.matrix.shards[index..index + 1]
+                        }
+                        PreparedMatrixSource::Replica { .. } => input.matrix.shards.as_slice(),
+                    };
+                    std::iter::once(input.device)
+                        .chain(sources.iter().map(|source| device_indices[&source.device_id]))
+                })
+                .collect::<HashSet<_>>();
+            let parameters = self
+                .device_parameters()
+                .into_iter()
+                .enumerate()
+                .filter(|(device, _)| active_devices.contains(device))
+                .collect();
+            let stores = inventory.iter().fold(
+                BTreeMap::<usize, Vec<Arc<GpuPreparedStorage>>>::new(),
+                |mut stores, (device, storage)| {
+                    stores.entry(*device).or_default().push(storage.clone());
+                    stores
+                },
+            );
+            let mut measurement = crate::gpu_measurement::GpuColumnMeasurement::new(
+                parameters, stores, &mut sink, None, true,
+            );
+            let timer = measurement
+                .begin(None)
+                .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+            let prepared = self.prepare_matrix_inputs(ledger, preparation)?;
+            measurement
+                .finish(
+                    timer,
+                    crate::gpu_measurement::GpuMeasuredStage::InputPreparation(
+                        self.active_operation,
+                    ),
+                )
+                .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+            Ok(prepared)
+        })();
+        self.admitted_measurement_sink = Some(sink);
+        result
+    }
+
+    fn finalize_admitted_matrix_batch(&mut self) {
+        if let Some(operation_identity) = self.unlogged_operation.take() {
+            for summary in self.admitted_invocation_summaries() {
+                if !self.admitted_plan_log.contains(&(operation_identity, summary.clone())) {
+                    self.admitted_plan_log.push((operation_identity, summary.clone()));
+                }
+            }
+        }
+        self.prepared_required = true;
+        self.pending_pilot = None;
+        self.pending_profile = None;
     }
 
     pub(super) fn admit_matrix_invocations(
@@ -1545,6 +1716,16 @@ impl GpuDcrtBackend {
         expected: Option<&[super::gpu_compiled::GpuAdmittedInvocationSummary]>,
     ) -> Result<(), PolyBackendError> {
         if lowered.is_empty() {
+            return Ok(());
+        }
+        let cache_contract = super::gpu_compiled::matrix_batch_contract(
+            &lowered, column_cap,
+            // Region identity is execution-scoped. The cached contract keeps
+            // only shape/operation/input metadata; native activation checks
+            // the current root region's permission at node time.
+            0,
+        );
+        if expected.is_none() && self.try_admit_cached_matrix_batch(&lowered, &cache_contract)? {
             return Ok(());
         }
         // Keep the ledger owned by the dispatcher across all early returns.
@@ -1596,6 +1777,11 @@ impl GpuDcrtBackend {
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(PolyBackendError::GpuSubmission)?;
+            #[cfg(test)]
+            {
+                self.prepared_matrix_snapshot_batches += 1;
+                self.prepared_matrix_layout_plans += 1;
+            }
             let mut matrix_inventory = Vec::with_capacity(snapshots.len());
             let mut deferred = HashSet::new();
             for (snapshot, pending) in snapshots {
@@ -1644,24 +1830,33 @@ impl GpuDcrtBackend {
                 }
             }
             let mut admitted = Vec::with_capacity(lowered.len());
+            let mut selected_fits = Vec::with_capacity(lowered.len());
             for (index, invocation) in lowered.into_iter().enumerate() {
                 let requirements = &layouts[index].1;
                 let intervals =
                     requirements.outputs.iter().map(|output| output.interval).collect::<Vec<_>>();
-                let plan = ledger
-                    .reserve_columns(
-                        invocation.operation.output_columns(invocation.operands.left.as_ref()),
+                let columns =
+                    invocation.operation.output_columns(invocation.operands.left.as_ref());
+                let policy =
+                    expected.map_or(GpuColumnWidthPolicy::Native(classes[index]), |expected| {
+                        GpuColumnWidthPolicy::NativeExact {
+                            class: classes[index],
+                            widths: &expected[index].plan.widths,
+                        }
+                    });
+                let fit = ledger
+                    .fit_columns(
+                        columns,
                         GpuOutputOwnership::Inherited(&intervals),
-                        expected.map_or(GpuColumnWidthPolicy::Native(classes[index]), |expected| {
-                            GpuColumnWidthPolicy::NativeExact {
-                                class: classes[index],
-                                widths: &expected[index].plan.widths,
-                            }
-                        }),
+                        policy,
                         &requirements.resources,
                     )
                     .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
-                let sources =
+                let plan = ledger
+                    .commit_columns(fit.clone())
+                    .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+                selected_fits.push(fit);
+                let sources: Vec<AdmittedMatrixBinding> =
                     requirements.outputs.iter().map(|output| output.sources.clone()).collect();
                 admitted.push((invocation, plan, sources));
             }
@@ -1691,88 +1886,240 @@ impl GpuDcrtBackend {
                     }
                 })
                 .collect::<Vec<_>>();
+            let mut owner_ordinals = HashMap::new();
+            for (invocation, _, _) in &admitted {
+                if let Some(left) = &invocation.operands.left {
+                    let ordinal = owner_ordinals.len();
+                    owner_ordinals.entry(left.id).or_insert(ordinal);
+                }
+                for right in &invocation.operands.right {
+                    let ordinal = owner_ordinals.len();
+                    owner_ordinals.entry(right.id).or_insert(ordinal);
+                }
+                if let Some(compact) = &invocation.operands.compact {
+                    let ordinal = owner_ordinals.len();
+                    owner_ordinals.entry(compact.id).or_insert(ordinal);
+                }
+            }
+            let mut seen_input_slots = HashSet::new();
+            let cached_inputs = preparation
+                .iter()
+                .filter(|input| seen_input_slots.insert(input.request.slot_key()))
+                .map(|input| {
+                    Ok(super::gpu_compiled::PreparedMatrixInput {
+                        owner: *owner_ordinals.get(&input.matrix.id).ok_or_else(|| {
+                            PolyBackendError::GpuSubmission(
+                                "selected input owner is absent from the invocation batch".into(),
+                            )
+                        })?,
+                        request: MatrixInputRequest {
+                            owner: input.matrix.id,
+                            layout: input.layout,
+                            parameters: input.parameters.clone(),
+                            device: input.device,
+                            request: input.request,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, PolyBackendError>>()?;
+            let mut inputs_by_storage = BTreeMap::<u64, Vec<_>>::new();
+            for input in cached_inputs {
+                inputs_by_storage
+                    .entry(input.request.request.slot_key().0)
+                    .or_default()
+                    .push(input);
+            }
             // Commit every sibling's output and reusable scratch before the
             // first normalization or replica copy. Input preparation reserves
             // its entire selected input list before submitting either phase.
             // Thus a later sibling's capacity failure drops all parked plans
             // without first performing GPU work for earlier siblings.
-            let prepared = if self.admitted_measurement_sink.is_some() && !preparation.is_empty() {
-                let mut sink = self.admitted_measurement_sink.take().unwrap();
-                let measured = (|| {
-                    let device_indices = self
-                        .devices
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (device, _))| (*device, index))
-                        .collect::<HashMap<_, _>>();
-                    let active_devices = preparation
-                        .par_iter()
-                        .flat_map_iter(|input| {
-                            let sources = match input.layout.source {
-                                PreparedMatrixSource::Shard(index) |
-                                PreparedMatrixSource::Fragment { index, .. } => {
-                                    &input.matrix.shards[index..index + 1]
-                                }
-                                PreparedMatrixSource::Replica { .. } => {
-                                    input.matrix.shards.as_slice()
-                                }
-                            };
-                            std::iter::once(input.device).chain(
-                                sources.iter().map(|source| device_indices[&source.device_id]),
-                            )
-                        })
-                        .collect::<HashSet<_>>();
-                    let parameters = self
-                        .device_parameters()
-                        .into_iter()
-                        .enumerate()
-                        .filter(|(device, _)| active_devices.contains(device))
-                        .collect();
-                    let stores = inventory.iter().fold(
-                        std::collections::BTreeMap::<usize, Vec<Arc<GpuPreparedStorage>>>::new(),
-                        |mut stores, (device, storage)| {
-                            stores.entry(*device).or_default().push(storage.clone());
-                            stores
-                        },
-                    );
-                    let mut measurement = crate::gpu_measurement::GpuColumnMeasurement::new(
-                        parameters, stores, &mut sink, None, true,
-                    );
-                    let timer = measurement
-                        .begin(None)
-                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
-                    let prepared = self.prepare_matrix_inputs(&mut ledger, preparation)?;
-                    measurement
-                        .finish(
-                            timer,
-                            crate::gpu_measurement::GpuMeasuredStage::InputPreparation(
-                                self.active_operation,
-                            ),
-                        )
-                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
-                    Ok::<_, PolyBackendError>(prepared)
-                })();
-                self.admitted_measurement_sink = Some(sink);
-                measured?
-            } else {
-                self.prepare_matrix_inputs(&mut ledger, preparation)?
-            };
+            let prepared =
+                self.prepare_matrix_inputs_for_admission(&mut ledger, &inventory, preparation)?;
+            let batch_identity =
+                admitted.first().map_or([0; 32], |(invocation, _, _)| invocation.batch_identity);
             self.prepared_invocations = self.compile_matrix_invocations(admitted, prepared)?;
-            // Retain distinct diagnostic plans in first-admission order. The
-            // measurement observer owns execution counts; repeated loop members
-            // must not append identical plan snapshots indefinitely.
-            if let Some(operation_identity) = self.unlogged_operation.take() {
-                for summary in self.admitted_invocation_summaries() {
-                    let entry = (operation_identity, summary);
-                    if !self.admitted_plan_log.contains(&entry) {
-                        self.admitted_plan_log.push(entry);
+            let cached_invocations = self
+                .prepared_invocations
+                .iter()
+                .zip(&selected_fits)
+                .map(|(invocation, fit)| {
+                    Ok(super::gpu_compiled::PreparedMatrixInvocation {
+                        operation: invocation.operation.clone(),
+                        fit: fit.clone(),
+                        template: invocation.template.clone(),
+                        prepared_inputs: invocation.prepared_inputs.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, PolyBackendError>>()?;
+            self.cache_prepared_matrix_batch(
+                batch_identity,
+                super::gpu_compiled::PreparedMatrixBatch {
+                    contract: cache_contract,
+                    inputs: inputs_by_storage.into_iter().collect(),
+                    invocations: cached_invocations,
+                },
+            );
+            self.finalize_admitted_matrix_batch();
+            Ok(())
+        })();
+        self.prepared_ledger = Some(ledger);
+        result
+    }
+
+    /// Rebind a complete cached sibling batch before taking any storage
+    /// snapshots. A stale preferred fit returns `false`; the caller then runs
+    /// the ordinary selector once, preserving the old outputs until that
+    /// fallback has committed a complete replacement batch.
+    fn try_admit_cached_matrix_batch(
+        &mut self,
+        lowered: &[LoweredMatrixInvocation],
+        contract: &super::gpu_compiled::MatrixBatchContract,
+    ) -> Result<bool, PolyBackendError> {
+        let batch_identity =
+            lowered.first().map_or([0; 32], |invocation| invocation.batch_identity);
+        let Some(batch) = self.prepared_matrix_batches.get(&batch_identity).cloned() else {
+            #[cfg(test)]
+            {
+                self.prepared_matrix_cache_key_misses += 1;
+            }
+            return Ok(false);
+        };
+        if !self.prepared_invocations.is_empty() {
+            return Ok(false);
+        }
+        if batch.contract != *contract ||
+            batch.invocations.len() != lowered.len() ||
+            batch
+                .invocations
+                .iter()
+                .zip(lowered)
+                .any(|(template, invocation)| template.operation != invocation.operation)
+        {
+            #[cfg(test)]
+            {
+                self.prepared_matrix_cache_contract_misses += 1;
+            }
+            return Ok(false);
+        }
+        let mut ledger = self.prepared_ledger.take().expect("prepared preflight has a ledger");
+        let measurement_inventory = ledger.prepared_inventory().collect::<Vec<_>>();
+        let result = (|| {
+            let mut plans = Vec::with_capacity(batch.invocations.len());
+            for template in &batch.invocations {
+                let fit = template.fit.clone();
+                let plan = match ledger.activate_cached_columns(fit) {
+                    Ok(plan) => plan,
+                    Err(GpuAdmissionError::StaleFit { .. }) => {
+                        #[cfg(test)]
+                        {
+                            self.prepared_matrix_cache_fallbacks += 1;
+                            self.prepared_matrix_cache_stale_fits += 1;
+                        }
+                        return Ok(false);
                     }
+                    Err(GpuAdmissionError::AcquisitionConflict(_)) => {
+                        #[cfg(test)]
+                        {
+                            self.prepared_matrix_cache_fallbacks += 1;
+                            self.prepared_matrix_cache_stale_fits += 1;
+                        }
+                        return Ok(false);
+                    }
+                    Err(GpuAdmissionError::UnknownPreparedStorage) => {
+                        #[cfg(test)]
+                        {
+                            self.prepared_matrix_cache_fallbacks += 1;
+                            self.prepared_matrix_cache_storage_fallbacks += 1;
+                        }
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(PolyBackendError::GpuSubmission(error.to_string())),
+                };
+                plans.push(plan);
+            }
+            let mut owners = HashMap::new();
+            for invocation in lowered {
+                if let Some(left) = &invocation.operands.left {
+                    let ordinal = owners.len();
+                    owners.entry(left.id).or_insert(ordinal);
+                }
+                for right in &invocation.operands.right {
+                    let ordinal = owners.len();
+                    owners.entry(right.id).or_insert(ordinal);
+                }
+                if let Some(compact) = &invocation.operands.compact {
+                    let ordinal = owners.len();
+                    owners.entry(compact.id).or_insert(ordinal);
                 }
             }
-            self.prepared_required = true;
-            self.pending_pilot = None;
-            self.pending_profile = None;
-            Ok(())
+            let inventory =
+                ledger.prepared_inventory().map(|(_, storage)| storage.clone()).collect::<Vec<_>>();
+            let mut preparation = Vec::new();
+            for (identity, inputs) in &batch.inputs {
+                let storage = inventory
+                    .iter()
+                    .find(|storage| storage.identity() == *identity)
+                    .cloned()
+                    .ok_or_else(|| {
+                        PolyBackendError::GpuSubmission(
+                            "cached input request references missing storage".into(),
+                        )
+                    })?;
+                for input in inputs {
+                    let matrix = lowered
+                        .iter()
+                        .flat_map(|invocation| {
+                            invocation
+                                .operands
+                                .left
+                                .iter()
+                                .chain(&invocation.operands.right)
+                                .find(|matrix| owners.get(&matrix.id) == Some(&input.owner))
+                        })
+                        .next()
+                        .cloned()
+                        .ok_or_else(|| {
+                            PolyBackendError::GpuSubmission(
+                                "cached input owner is absent from the invocation batch".into(),
+                            )
+                        })?;
+                    let mut request = input.request.clone();
+                    request.owner = matrix.id;
+                    preparation.push(MatrixInputPreparation {
+                        matrix,
+                        layout: request.layout,
+                        parameters: request.parameters.clone(),
+                        device: request.device,
+                        storage: storage.clone(),
+                        request: request.request,
+                    });
+                }
+            }
+            let prepared = match self.prepare_matrix_inputs_for_admission(
+                &mut ledger,
+                &measurement_inventory,
+                preparation,
+            ) {
+                Ok(prepared) => prepared,
+                Err(PolyBackendError::GpuAdmission(GpuAdmissionError::AcquisitionConflict(_))) => {
+                    #[cfg(test)]
+                    {
+                        self.prepared_matrix_cache_fallbacks += 1;
+                        self.prepared_matrix_cache_storage_fallbacks += 1;
+                    }
+                    return Ok(false);
+                }
+                Err(error) => return Err(error),
+            };
+            self.prepared_invocations =
+                self.bind_cached_matrix_invocations(lowered, plans, &batch.invocations, prepared)?;
+            #[cfg(test)]
+            {
+                self.prepared_matrix_cache_hits += 1;
+            }
+            self.finalize_admitted_matrix_batch();
+            Ok(true)
         })();
         self.prepared_ledger = Some(ledger);
         result
@@ -1785,9 +2132,13 @@ mod tests {
         super::gpu_prepare::{MatrixInputLayout, PreparedMatrixSource},
         GpuMatrixLayoutPlan, MatrixInputRequest, PreimageClaimPlan, preimage_replay_claims,
     };
+    use mxx_ir_core::types::ConcreteMatrixType;
     use mxx_primitives::{
         matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, GpuPreparedSlotSnapshot, GpuTracedClaim},
-        poly::dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+        poly::{
+            PolyParams,
+            dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+        },
     };
 
     #[test]
@@ -1833,13 +2184,116 @@ mod tests {
             classes: Vec::new(),
             inputs: requests,
             invocations: Vec::new(),
+            operations: Vec::new(),
         };
         let setup = plan.setup_claims(&[]).unwrap();
-        assert_eq!(setup.len(), 1);
-        assert_eq!(setup[0].1.len(), 2);
-        assert!(setup[0].1.iter().all(|claim| {
-            claim.kind() == GpuPreparedSlotKind::Matrix && claim.rows() == 1 && claim.columns() == 1
+        assert_eq!(setup.len(), 2);
+        assert_ne!(setup[0].1, setup[1].1);
+        assert!(setup.iter().all(|entry| {
+            entry.3.len() == 1 &&
+                entry.3[0].kind() == GpuPreparedSlotKind::Matrix &&
+                entry.3[0].rows() == 1 &&
+                entry.3[0].columns() == 1
         }));
+    }
+
+    #[test]
+    fn test_setup_keeps_same_slot_key_on_distinct_devices() {
+        let parameters = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let requests = (0usize..2)
+            .map(|device| {
+                let slots = GpuPreparedSlotSnapshot::plan(
+                    &parameters,
+                    &[GpuTracedClaim::matrix(1, 1, 0, false)],
+                )
+                .unwrap();
+                MatrixInputRequest {
+                    owner: u64::try_from(device).expect("test device index fits matrix owner"),
+                    layout: MatrixInputLayout {
+                        source: PreparedMatrixSource::Replica {
+                            device,
+                            context: parameters.context_identity(),
+                            evaluation: false,
+                        },
+                        shape: (1, 1),
+                        level: 0,
+                        evaluation: false,
+                    },
+                    parameters: parameters.clone(),
+                    device,
+                    request: slots[0].identity().matrix_request(1, 1, false),
+                }
+            })
+            .collect();
+        let plan = GpuMatrixLayoutPlan {
+            layouts: Vec::new(),
+            classes: Vec::new(),
+            inputs: requests,
+            invocations: Vec::new(),
+            operations: Vec::new(),
+        };
+        let setup = plan.setup_claims(&[]).unwrap();
+        assert_eq!(setup.len(), 2);
+        assert_eq!(setup.iter().map(|(device, _, _, _)| *device).collect::<Vec<_>>(), vec![0, 1]);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_measurement_storage_seals_unused_configured_devices_locally() {
+        let devices = detected_gpu_device_ids();
+        if devices.len() < 4 {
+            return;
+        }
+        let devices = devices[..4].to_vec();
+        let parameters = devices
+            .iter()
+            .map(|device| {
+                GpuDCRTPolyParams::new_with_gpu(
+                    4,
+                    vec![131_041, 131_009],
+                    1,
+                    vec![*device],
+                    Some(1),
+                    None,
+                    None,
+                )
+            })
+            .collect::<Vec<_>>();
+        let matrix_type = ConcreteMatrixType {
+            modulus: parameters[0].modulus().as_ref().clone().into(),
+            ring_dimension: parameters[0].ring_dimension() as usize,
+            rows: 1,
+            columns: 1,
+        };
+        let context = parameters[0].context_identity();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on(parameters, devices);
+        backend
+            .prepare_measurement_storage(&[(
+                0,
+                context,
+                matrix_type,
+                vec![GpuTracedClaim::matrix(1, 1, 0, true), GpuTracedClaim::matrix(1, 1, 0, true)],
+            )])
+            .unwrap();
+        let inventory =
+            backend.prepared_ledger.as_ref().unwrap().prepared_inventory().collect::<Vec<_>>();
+        assert_eq!(
+            inventory.iter().map(|(device, _)| *device).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(inventory[0].1.slot_count(), 2);
+        for device in 1..4 {
+            let storage = inventory
+                .iter()
+                .find(|(owner, _)| *owner == device)
+                .map(|(_, storage)| storage)
+                .unwrap();
+            assert_eq!(
+                storage.slot_count(),
+                1,
+                "unused device {device} must get only its placeholder"
+            );
+        }
     }
 
     fn preimage_claim_plan_for_replay_test() -> PreimageClaimPlan {

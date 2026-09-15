@@ -14,7 +14,7 @@ pub(super) struct BatchRequest {
     pub plans: Option<Vec<mxx_runtime::backend::poly_gpu::GpuAdmittedInvocationSummary>>,
     pub native: Option<(
         mxx_runtime::gpu_invocation::GpuNodeOperation,
-        Vec<(ConcreteMatrixType, Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>)>,
+        Vec<mxx_runtime::backend::poly_gpu::GpuSetupClaim>,
     )>,
 }
 
@@ -213,8 +213,9 @@ impl GpuNodeMeasurementBackend {
             .map_err(|error| {
                 let setup_claim_counts = claims
                     .iter()
-                    .enumerate()
-                    .map(|(index, (ty, setup))| format!("type_{index}={ty:?}:{}", setup.len()))
+                    .map(|(device, context, ty, setup)| {
+                        format!("device_{device}:context_{context}:{ty:?}:{}", setup.len())
+                    })
                     .collect::<Vec<_>>();
                 let nonzero_plan_summaries = plans
                     .iter()
@@ -223,12 +224,14 @@ impl GpuNodeMeasurementBackend {
                     .map(|(index, plan)| format!("{index}:{}x{}", plan.rows, plan.columns))
                     .collect::<Vec<_>>();
                 GpuMeasurementError(format!(
-                    "prepare_measurement_storage failed scope={:?} id={:?} kind={:?} setup_empty={} setup_claim_counts={setup_claim_counts:?} plan_count={} nonzero_plans={nonzero_plan_summaries:?}: {error}",
+                    "prepare_measurement_storage failed scope={:?} id={:?} kind={:?} setup_empty={} setup_claim_counts={setup_claim_counts:?} plan_count={} nonzero_plans={nonzero_plan_summaries:?} concrete_arguments={:?} concrete_outputs={:?}: {error}",
                     request.scope,
                     request.id,
                     request.kind,
                     claims.is_empty(),
                     plans.len(),
+                    request.concrete_argument_types,
+                    request.concrete_output_types,
                 ))
             })?;
         let matrices = prepared

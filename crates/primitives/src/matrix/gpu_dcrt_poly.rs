@@ -70,10 +70,10 @@ pub use gpu_view::{
 mod gpu_admission;
 pub use gpu_admission::{
     GpuCompactTransferKind, GpuGraphAdmissionGuard, GpuMatrixDispatch, GpuMatrixReservation,
-    GpuPreparedDemand, GpuPreparedOccupancy, GpuPreparedOccupancyMode, GpuPreparedRegion,
-    GpuPreparedRequest, GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedSlotSnapshot,
-    GpuPreparedStorage, GpuPreparedWorkspaceLayout, GpuTracedClaim, GpuTracedStepGuard,
-    capacity_class, matrix_capacity_class, trace_native_claims,
+    GpuPreparedClaimHandle, GpuPreparedDemand, GpuPreparedOccupancy, GpuPreparedOccupancyMode,
+    GpuPreparedRegion, GpuPreparedRequest, GpuPreparedReservationError, GpuPreparedSlotIdentity,
+    GpuPreparedSlotKind, GpuPreparedSlotSnapshot, GpuPreparedStorage, GpuPreparedWorkspaceLayout,
+    GpuTracedClaim, GpuTracedStepGuard, capacity_class, matrix_capacity_class, trace_native_claims,
 };
 
 #[path = "gpu_staging.rs"]

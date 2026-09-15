@@ -6,6 +6,7 @@
 #include <cstring>
 #include <exception>
 #include <limits>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -158,19 +159,24 @@ int gpu_matrix_prepare_kernels(GpuKernelPartition *partition)
         reinterpret_cast<const void *>(compact_preimage_check_batch_kernel),
         reinterpret_cast<const void *>(compact_preimage_commit_batch_kernel),
     };
-    for (const void *kernel : kernels) {
+    for (size_t index = 0; index < std::size(kernels); ++index) {
         cudaFuncAttributes attributes{};
-        const cudaError_t error = cudaFuncGetAttributes(&attributes, kernel);
-        if (error != cudaSuccess) return set_error(error);
+        const cudaError_t error = cudaFuncGetAttributes(&attributes, kernels[index]);
+        if (error != cudaSuccess)
+            return set_error(("kernel provisioning failed at inventory index " +
+                std::to_string(index) + ": " + cudaGetErrorString(error)).c_str());
     }
     cudaError_t error = cudaGetDriverEntryPointByVersion(
         "cuLaunchKernel", &partition->launch_entry, 12000, cudaEnableLegacyStream);
-    if (error != cudaSuccess) return set_error(error);
+    if (error != cudaSuccess)
+        return set_error(("cuLaunchKernel lookup failed: " +
+            std::string(cudaGetErrorString(error))).c_str());
     if (!partition->launch_entry) return set_error("cuLaunchKernel entry point unavailable");
     error = cudaGetFuncBySymbol(&partition->tensor_row_sum[0],
         reinterpret_cast<const void *>(tensor_sum_rows_all_limbs_kernel<false>));
     if (error == cudaSuccess)
         error = cudaGetFuncBySymbol(&partition->tensor_row_sum[1],
             reinterpret_cast<const void *>(tensor_sum_rows_all_limbs_kernel<true>));
-    return error == cudaSuccess ? 0 : set_error(error);
+    return error == cudaSuccess ? 0 : set_error(("tensor row-sum symbol lookup failed: " +
+        std::string(cudaGetErrorString(error))).c_str());
 }

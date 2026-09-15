@@ -317,10 +317,7 @@ struct GpuSelectedNode {
     inputs: Vec<Vec<Option<mxx_runtime::backend::poly_gpu::GpuMatrixDescriptor>>>,
     node: NodeId,
     plans: Vec<mxx_runtime::backend::poly_gpu::GpuAdmittedInvocationSummary>,
-    setup: Vec<(
-        mxx_ir_core::types::ConcreteMatrixType,
-        Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
-    )>,
+    setup: Vec<mxx_runtime::backend::poly_gpu::GpuSetupClaim>,
     outputs: BTreeMap<usize, (GpuSlotSets, mxx_runtime::backend::poly_gpu::GpuInventoryValue)>,
 }
 
@@ -1048,15 +1045,30 @@ impl GpuGraphInventory {
         let (plans, mut setup) = selected
             .fit_with_setup(&admissions, self.column_cap(), &inventories)
             .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        let mut active_devices = setup.iter().map(|entry| entry.0).collect::<BTreeSet<_>>();
+        for index in 0..plans.len() {
+            active_devices.extend(
+                selected.outputs(index).into_iter().map(|(interval, _, _)| interval.device),
+            );
+        }
         for (ty, demand) in self.frames.last().unwrap().resources.contexts.values() {
             let shared = demand.shared_workspace_claims();
             if shared.is_empty() {
                 continue;
             }
-            if let Some(entry) = setup.iter_mut().find(|entry| entry.0 == *ty) {
-                entry.1.extend(shared);
-            } else {
-                setup.push((ty.clone(), shared));
+            let parameters = backend
+                .resource_parameters(ty)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
+            for device in &active_devices {
+                let context = parameters[*device].context_identity();
+                if let Some(entry) = setup
+                    .iter_mut()
+                    .find(|entry| entry.0 == *device && entry.1 == context && entry.2 == *ty)
+                {
+                    entry.3.extend(shared.clone());
+                } else {
+                    setup.push((*device, context, ty.clone(), shared.clone()));
+                }
             }
         }
         let outputs = instances
@@ -1108,12 +1120,7 @@ impl GpuGraphInventory {
     pub(crate) fn selected_node_setup(
         &self,
         node: NodeId,
-    ) -> Option<
-        &[(
-            mxx_ir_core::types::ConcreteMatrixType,
-            Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
-        )],
-    > {
+    ) -> Option<&[mxx_runtime::backend::poly_gpu::GpuSetupClaim]> {
         let selected = self.frames.last()?.selected_node.as_ref()?;
         (selected.node == node).then_some(selected.setup.as_slice())
     }
@@ -2214,7 +2221,7 @@ mod tests {
                     .fit_with_setup(&admissions, cap, std::slice::from_ref(&capacity))
                     .unwrap();
                 assert!(!setup.is_empty(), "selected native resources must produce setup claims");
-                setup_counts.push(setup.iter().map(|entry| entry.1.len()).sum::<usize>());
+                setup_counts.push(setup.iter().map(|entry| entry.3.len()).sum::<usize>());
                 assert_eq!(
                     invocations[0].plan.schedule.local_job_counts(),
                     &[columns.div_ceil(cap)]

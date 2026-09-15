@@ -44,7 +44,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     ops::Deref,
     sync::{
@@ -52,6 +52,9 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
+
+const GRAPH_ADMISSION_CACHE_CAPACITY: usize = 16;
+const PREPARED_MATRIX_BATCH_CACHE_CAPACITY: usize = 256;
 
 #[path = "gpu_admit.rs"]
 mod gpu_admit;
@@ -68,14 +71,15 @@ mod gpu_preimage_batch;
 #[path = "gpu_prepare.rs"]
 mod gpu_prepare;
 pub use gpu_admit::{
-    GpuMatrixColumnContext, GpuMatrixColumnRequirements, GpuMatrixLayoutPlan,
+    GpuMatrixColumnContext, GpuMatrixColumnRequirements, GpuMatrixLayoutPlan, GpuSetupClaim,
     MatrixPlacementInvocation as GpuMatrixPlacementInvocation,
 };
 pub use gpu_compiled::GpuAdmittedInvocationSummary;
 use gpu_compiled::{
     CompiledMatrixInvocation, ExecutionPayload, PreimageClaimPlan, PreimagePlanKey,
-    PreparedOperation, TrapdoorPlanKey,
+    PreparedMatrixBatch, PreparedOperation, TrapdoorPlanKey,
 };
+use gpu_inventory::PreparedGraphAdmission;
 pub use gpu_inventory::{GpuContextDemand, GpuInventoryValue, GpuScopeProgress, GpuScopeResources};
 pub use gpu_prepare::{
     MatrixDescriptor as GpuMatrixDescriptor,
@@ -776,6 +780,33 @@ pub struct GpuDcrtBackend {
     graph_wave: usize,
     prepared_invocations: VecDeque<CompiledMatrixInvocation>,
     admitted_scope_operations: Vec<Weak<gpu_compiled::AdmittedScopeOperations>>,
+    /// One immutable prepared root template per stable operation/batch identity.
+    /// Actual input owners are rebound into a fresh active record for every
+    /// execution; the map is cleared at each setup boundary.
+    graph_admission_cache: BTreeMap<[u8; 32], PreparedGraphAdmission>,
+    prepared_matrix_batches: BTreeMap<[u8; 32], PreparedMatrixBatch>,
+    #[cfg(test)]
+    pub(crate) graph_admission_cache_hits: usize,
+    #[cfg(test)]
+    pub(crate) graph_admission_cache_misses: usize,
+    #[cfg(test)]
+    pub(crate) graph_warmup_complete: bool,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_hits: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_fallbacks: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_contract_misses: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_key_misses: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_storage_fallbacks: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_cache_stale_fits: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_snapshot_batches: usize,
+    #[cfg(test)]
+    pub(crate) prepared_matrix_layout_plans: usize,
     prepared_ledger: Option<crate::gpu_memory::GpuMemoryLedger>,
     /// Traced claim plans for preimage and trapdoor sampling classes, derived
     /// before the inventory sealed.
@@ -811,6 +842,29 @@ struct RuntimePilot {
 }
 
 impl GpuDcrtBackend {
+    fn clear_prepared_caches(&mut self) {
+        self.graph_admission_cache.clear();
+        self.prepared_matrix_batches.clear();
+    }
+
+    fn cache_graph_admission(&mut self, key: [u8; 32], value: PreparedGraphAdmission) {
+        if !self.graph_admission_cache.contains_key(&key) &&
+            self.graph_admission_cache.len() >= GRAPH_ADMISSION_CACHE_CAPACITY
+        {
+            self.clear_prepared_caches();
+        }
+        self.graph_admission_cache.insert(key, value);
+    }
+
+    fn cache_prepared_matrix_batch(&mut self, key: [u8; 32], value: PreparedMatrixBatch) {
+        if !self.prepared_matrix_batches.contains_key(&key) &&
+            self.prepared_matrix_batches.len() >= PREPARED_MATRIX_BATCH_CACHE_CAPACITY
+        {
+            self.clear_prepared_caches();
+        }
+        self.prepared_matrix_batches.insert(key, value);
+    }
+
     pub fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
         let vram_percent = fleet_context_vram_percent(
@@ -862,6 +916,30 @@ impl GpuDcrtBackend {
             graph_wave: 0,
             prepared_invocations: VecDeque::new(),
             admitted_scope_operations: Vec::new(),
+            graph_admission_cache: BTreeMap::new(),
+            prepared_matrix_batches: BTreeMap::new(),
+            #[cfg(test)]
+            graph_admission_cache_hits: 0,
+            #[cfg(test)]
+            graph_admission_cache_misses: 0,
+            #[cfg(test)]
+            graph_warmup_complete: false,
+            #[cfg(test)]
+            prepared_matrix_cache_hits: 0,
+            #[cfg(test)]
+            prepared_matrix_cache_fallbacks: 0,
+            #[cfg(test)]
+            prepared_matrix_cache_contract_misses: 0,
+            #[cfg(test)]
+            prepared_matrix_cache_key_misses: 0,
+            #[cfg(test)]
+            prepared_matrix_cache_storage_fallbacks: 0,
+            #[cfg(test)]
+            prepared_matrix_cache_stale_fits: 0,
+            #[cfg(test)]
+            prepared_matrix_snapshot_batches: 0,
+            #[cfg(test)]
+            prepared_matrix_layout_plans: 0,
             prepared_ledger: None,
             preimage_plans: HashMap::new(),
             trapdoor_plans: HashMap::new(),
@@ -879,6 +957,7 @@ impl GpuDcrtBackend {
         self.calibration_registry = registry;
         self.operation_profiles.clear();
         self.pending_profile = None;
+        self.clear_prepared_caches();
     }
 
     pub fn calibration_registry(&self) -> &FrozenGpuCalibrationRegistry {
@@ -983,6 +1062,7 @@ impl GpuDcrtBackend {
         }
         self.operation_widths.insert(operation, widths);
         self.manual_widths.insert(operation);
+        self.clear_prepared_caches();
     }
 
     /// Distinct admitted invocation plans, keyed by the selected operation
@@ -1352,6 +1432,7 @@ impl GpuDcrtBackend {
         self.operation_profiles.insert(operation, (*profile).clone());
         self.select_operation(operation, false)
             .map_err(|_| GpuCalibrationError::MemoryQueryFailed)?;
+        self.clear_prepared_caches();
         Ok(true)
     }
 
@@ -1894,6 +1975,112 @@ mod tests {
         assert!(backend.calibration_registry.is_empty());
         backend.select_operation(operation, true).unwrap();
         assert!(backend.pending_pilot.is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_manual_width_change_drops_cached_prepared_batches() {
+        use super::gpu_compiled::{MatrixBatchContract, MatrixBatchPolicy, PreparedMatrixBatch};
+        use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
+
+        let device = detected_gpu_device_ids()[0];
+        let gpu = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let mut backend = crate::backend::poly::gpu::gpu_backend_on([gpu], [device]);
+        backend.prepared_matrix_batches.insert(
+            [7; 32],
+            PreparedMatrixBatch {
+                contract: MatrixBatchContract {
+                    column_cap: 1,
+                    region_identity: 0,
+                    policy: MatrixBatchPolicy::Native,
+                    invocations: Vec::new(),
+                },
+                inputs: Vec::new(),
+                invocations: Vec::new(),
+            },
+        );
+        backend.set_column_widths_for_operation(
+            [1; 32],
+            GpuColumnWidths { gpu0: Some(1), nonzero: None },
+        );
+        assert!(backend.prepared_matrix_batches.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_cache_caps_clear_both_maps_and_preserve_replacements() {
+        use super::{
+            gpu_compiled::{MatrixBatchContract, MatrixBatchPolicy, PreparedMatrixBatch},
+            gpu_inventory::PreparedGraphAdmission,
+            *,
+        };
+        use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
+
+        let device = detected_gpu_device_ids()[0];
+        let parameters = GpuDCRTPolyParams::new(4, vec![131_041, 131_009], 1, None);
+        let mut backend = crate::backend::poly::gpu::gpu_backend_on([parameters], [device]);
+        let key = |value: usize| {
+            let mut key = [0; 32];
+            key[..std::mem::size_of::<usize>()].copy_from_slice(&value.to_le_bytes());
+            key
+        };
+        let graph = || PreparedGraphAdmission {
+            capture_trace: false,
+            wave_bound: 1,
+            wave: 1,
+            inputs: Vec::new(),
+            input_contract: [0; 32],
+            column_cap: 1,
+            region_identity: 0,
+            demand: Arc::new(BTreeMap::new()),
+            preferred: BTreeMap::new(),
+            operations: Arc::new(gpu_compiled::PreparedScopeOperations {
+                scope: mxx_ir_core::FrozenGraphScopeId::Root,
+                instances: Vec::new(),
+                value_layouts: Vec::new(),
+            }),
+        };
+        let batch = || PreparedMatrixBatch {
+            contract: MatrixBatchContract {
+                column_cap: 1,
+                region_identity: 0,
+                policy: MatrixBatchPolicy::Native,
+                invocations: Vec::new(),
+            },
+            inputs: Vec::new(),
+            invocations: Vec::new(),
+        };
+
+        for value in 0..GRAPH_ADMISSION_CACHE_CAPACITY {
+            backend.cache_graph_admission(key(value), graph());
+        }
+        backend.cache_prepared_matrix_batch(key(0), batch());
+        backend.cache_graph_admission(key(GRAPH_ADMISSION_CACHE_CAPACITY), graph());
+        assert_eq!(backend.graph_admission_cache.len(), 1);
+        assert!(backend.prepared_matrix_batches.is_empty());
+
+        backend.cache_graph_admission(key(0), graph());
+        for value in 0..PREPARED_MATRIX_BATCH_CACHE_CAPACITY {
+            backend.cache_prepared_matrix_batch(key(value), batch());
+        }
+        backend.cache_prepared_matrix_batch(key(PREPARED_MATRIX_BATCH_CACHE_CAPACITY), batch());
+        assert!(backend.graph_admission_cache.is_empty());
+        assert_eq!(backend.prepared_matrix_batches.len(), 1);
+
+        for value in 0..GRAPH_ADMISSION_CACHE_CAPACITY {
+            backend.cache_graph_admission(key(value), graph());
+        }
+        backend.cache_graph_admission(key(0), graph());
+        assert_eq!(backend.graph_admission_cache.len(), GRAPH_ADMISSION_CACHE_CAPACITY);
+        assert!(backend.graph_admission_cache.contains_key(&key(1)));
+
+        backend.clear_prepared_caches();
+        for value in 0..PREPARED_MATRIX_BATCH_CACHE_CAPACITY {
+            backend.cache_prepared_matrix_batch(key(value), batch());
+        }
+        backend.cache_prepared_matrix_batch(key(0), batch());
+        assert_eq!(backend.prepared_matrix_batches.len(), PREPARED_MATRIX_BATCH_CACHE_CAPACITY);
+        assert!(backend.prepared_matrix_batches.contains_key(&key(1)));
     }
 
     #[test]
@@ -4350,14 +4537,16 @@ impl Backend for GpuDcrtBackend {
 
     fn prepare_graph_admission(
         &mut self,
+        spec_hash: [u8; 32],
         validated: &mxx_ir_core::ValidatedGraph,
         capture_trace: bool,
         inputs: &std::collections::BTreeMap<String, crate::backend::RuntimeValue<Self>>,
         wave_bound: usize,
         warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error> {
-        GpuDcrtBackend::prepare_graph_admission(
+        GpuDcrtBackend::prepare_graph_admission_with_hash(
             self,
+            spec_hash,
             validated,
             capture_trace,
             inputs,

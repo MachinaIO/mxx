@@ -23,8 +23,30 @@ struct RegionOpaque {
     _private: [u8; 0],
 }
 
+#[derive(Debug)]
+pub enum GpuPreparedReservationError {
+    AcquisitionConflict(String),
+    Native(String),
+}
+
+fn reservation_error(status: i32) -> GpuPreparedReservationError {
+    let message = last_error_string();
+    if status == GPU_ADMISSION_ACQUISITION_CONFLICT {
+        GpuPreparedReservationError::AcquisitionConflict(message)
+    } else {
+        GpuPreparedReservationError::Native(message)
+    }
+}
+
+const GPU_ADMISSION_ACQUISITION_CONFLICT: i32 = -2;
+
 #[repr(C)]
 struct ReservationOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct ClaimHandleOpaque {
     _private: [u8; 0],
 }
 
@@ -356,6 +378,18 @@ unsafe extern "C" {
         region: *const RegionOpaque,
         out: *mut *mut ReservationOpaque,
     ) -> i32;
+    fn gpu_matrix_validate_claims(
+        storage: *mut PreparedStorageOpaque,
+        requests: *const GpuPreparedRequest,
+        count: usize,
+        out: *mut *mut ClaimHandleOpaque,
+    ) -> i32;
+    fn gpu_matrix_activate_claims(
+        claims: *const ClaimHandleOpaque,
+        region: *const RegionOpaque,
+        out: *mut *mut ReservationOpaque,
+    ) -> i32;
+    fn gpu_matrix_claim_handle_destroy(claims: *mut ClaimHandleOpaque);
     fn gpu_prepared_region_create(
         storage: *mut PreparedStorageOpaque,
         parent: *const RegionOpaque,
@@ -1412,7 +1446,150 @@ impl GpuPreparedStorage {
     /// The first successful reservation permanently requires ordinary-allocation
     /// permits on this owner. Cancellation does not downgrade that checked mode.
     pub fn reserve(&self, requests: &[GpuPreparedRequest]) -> Result<GpuMatrixReservation, String> {
-        reserve_prepared(self, requests, self.region.as_deref())
+        let claims = self.validate_claims(requests)?;
+        self.activate_claims(&claims)
+    }
+
+    pub fn reserve_with_outcome(
+        &self,
+        requests: &[GpuPreparedRequest],
+    ) -> Result<GpuMatrixReservation, GpuPreparedReservationError> {
+        let claims = self.validate_claims(requests).map_err(GpuPreparedReservationError::Native)?;
+        self.activate_claims_with_outcome(&claims)
+    }
+
+    /// Validate exact request layouts once and retain a reusable native handle.
+    /// The handle contains only immutable layout claims; an activation supplies
+    /// the current region authority separately.
+    pub fn validate_claims(
+        &self,
+        requests: &[GpuPreparedRequest],
+    ) -> Result<GpuPreparedClaimHandle, String> {
+        GpuPreparedClaimHandle::new(self, requests)
+    }
+
+    /// Activate a layout-validated claim handle using this view's current
+    /// region authority. The handle itself is consumed, while its validation
+    /// result may be cloned and retained by an immutable cache template.
+    pub fn activate_claims(
+        &self,
+        claims: &GpuPreparedClaimHandle,
+    ) -> Result<GpuMatrixReservation, String> {
+        claims.activate(self.region.as_deref())
+    }
+
+    pub fn activate_claims_with_outcome(
+        &self,
+        claims: &GpuPreparedClaimHandle,
+    ) -> Result<GpuMatrixReservation, GpuPreparedReservationError> {
+        claims.activate_with_outcome(self.region.as_deref())
+    }
+}
+
+/// Opaque native validation result. It owns no active slot reservation until
+/// [`Self::activate`] succeeds; dropping it is therefore side-effect free.
+#[must_use]
+pub struct GpuPreparedClaimHandle {
+    raw: Option<NonNull<ClaimHandleOpaque>>,
+    requests: Arc<Vec<GpuPreparedRequest>>,
+    slots: Arc<Vec<GpuPreparedSlotIdentity>>,
+}
+
+// The native handle retains the shared prepared storage and only contains
+// immutable claim metadata until its consuming activation. It can move to the
+// worker that owns the corresponding reservation.
+unsafe impl Send for GpuPreparedClaimHandle {}
+unsafe impl Sync for GpuPreparedClaimHandle {}
+
+impl GpuPreparedClaimHandle {
+    fn new(storage: &GpuPreparedStorage, requests: &[GpuPreparedRequest]) -> Result<Self, String> {
+        let slots = requests
+            .iter()
+            .map(|request| {
+                storage
+                    .slot_identity(request.slot_index)
+                    .ok_or_else(|| "prepared matrix slot index out of bounds".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_validate_claims(
+                storage.raw.as_ptr(),
+                requests.as_ptr(),
+                requests.len(),
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(Self {
+            raw: Some(NonNull::new(raw).expect("successful claim validation has a handle")),
+            requests: Arc::new(requests.to_vec()),
+            slots: Arc::new(slots),
+        })
+    }
+
+    /// Activate this validated request list atomically. A conflict rolls back
+    /// every partial slot claim and leaves the caller with an ordinary error.
+    pub fn activate(
+        &self,
+        region: Option<&GpuPreparedRegion>,
+    ) -> Result<GpuMatrixReservation, String> {
+        let raw_claims = self.raw.expect("live claim handle");
+        let mut raw_reservation = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_activate_claims(
+                raw_claims.as_ptr(),
+                region.map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+                &mut raw_reservation,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(GpuMatrixReservation {
+            raw: Some(
+                NonNull::new(raw_reservation).expect("successful activation has reservation"),
+            ),
+            slots: self.slots.clone(),
+            requests: self.requests.clone(),
+            not_sync: PhantomData,
+        })
+    }
+
+    pub fn activate_with_outcome(
+        &self,
+        region: Option<&GpuPreparedRegion>,
+    ) -> Result<GpuMatrixReservation, GpuPreparedReservationError> {
+        let raw_claims = self.raw.expect("live claim handle");
+        let mut raw_reservation = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_activate_claims(
+                raw_claims.as_ptr(),
+                region.map_or(std::ptr::null(), |region| region.raw.as_ptr()),
+                &mut raw_reservation,
+            )
+        };
+        if status != 0 {
+            return Err(reservation_error(status));
+        }
+        Ok(GpuMatrixReservation {
+            raw: Some(
+                NonNull::new(raw_reservation).expect("successful activation has reservation"),
+            ),
+            slots: self.slots.clone(),
+            requests: self.requests.clone(),
+            not_sync: PhantomData,
+        })
+    }
+}
+
+impl Drop for GpuPreparedClaimHandle {
+    fn drop(&mut self) {
+        if let Some(raw) = self.raw.take() {
+            unsafe { gpu_matrix_claim_handle_destroy(raw.as_ptr()) };
+        }
     }
 }
 
@@ -1520,8 +1697,8 @@ fn reserve_prepared(
     }
     Ok(GpuMatrixReservation {
         raw: Some(NonNull::new(raw).expect("successful reservation has an owner")),
-        slots: identities,
-        requests,
+        slots: Arc::new(identities),
+        requests: Arc::new(requests),
         not_sync: PhantomData,
     })
 }
@@ -1533,8 +1710,8 @@ fn reserve_prepared(
 #[must_use]
 pub struct GpuMatrixReservation {
     raw: Option<NonNull<ReservationOpaque>>,
-    slots: Vec<GpuPreparedSlotIdentity>,
-    requests: Vec<GpuPreparedRequest>,
+    slots: Arc<Vec<GpuPreparedSlotIdentity>>,
+    requests: Arc<Vec<GpuPreparedRequest>>,
     not_sync: PhantomData<Cell<()>>,
 }
 
@@ -1614,7 +1791,7 @@ impl GpuMatrixReservation {
         if status != 0 {
             return Err(last_error_string());
         }
-        self.requests = updated;
+        self.requests = Arc::new(updated);
         Ok(())
     }
 
@@ -1660,8 +1837,8 @@ impl GpuMatrixReservation {
         for (raw, (slots, requests)) in raw.into_iter().zip(identities) {
             children.push(Self {
                 raw: Some(NonNull::new(raw).expect("successful partition has child owners")),
-                slots,
-                requests,
+                slots: Arc::new(slots),
+                requests: Arc::new(requests),
                 not_sync: PhantomData,
             });
         }
@@ -1711,8 +1888,8 @@ impl GpuMatrixReservation {
         }
         for reservation in &mut reservations {
             reservation.raw = None;
-            slots.push(std::mem::take(&mut reservation.slots));
-            requests.push(std::mem::take(&mut reservation.requests));
+            slots.push(std::mem::take(&mut reservation.slots).to_vec());
+            requests.push(std::mem::take(&mut reservation.requests).to_vec());
         }
         Ok(GpuMatrixDispatch {
             raw: if extend {
@@ -1771,8 +1948,8 @@ impl GpuMatrixDispatch {
         {
             reservations.push(GpuMatrixReservation {
                 raw: Some(NonNull::new(pointer).expect("completed dispatch returns its owners")),
-                slots,
-                requests,
+                slots: Arc::new(slots),
+                requests: Arc::new(requests),
                 not_sync: PhantomData,
             });
         }
@@ -2049,6 +2226,27 @@ mod tests {
         assert_eq!(output.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, 1, columns));
         drop(output);
         assert!(storage.fits(&requests).unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prevalidated_claim_handle_activates_inside_region() {
+        let (_, params) = parameters();
+        let storage = Arc::new(
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 2)], None, None)
+                .unwrap(),
+        );
+        let request = storage.slot_identity(0).unwrap().matrix_request(1, 2, true);
+        let region = Arc::new(storage.reserve_region(&[0], None).unwrap().unwrap());
+        let regional_storage = region.storage();
+        let claims = Arc::new(regional_storage.validate_claims(&[request]).unwrap());
+        drop(regional_storage.activate_claims(claims.as_ref()).unwrap());
+        drop(regional_storage);
+        drop(region);
+        let next_region = Arc::new(storage.reserve_region(&[0], None).unwrap().unwrap());
+        drop(next_region.storage().activate_claims(claims.as_ref()).unwrap());
+        drop(next_region);
+        assert!(storage.snapshot().unwrap().iter().all(GpuPreparedSlotSnapshot::is_available));
     }
 
     #[test]

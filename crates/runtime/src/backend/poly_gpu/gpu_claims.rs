@@ -194,7 +194,7 @@ impl PreparedClaimBroker {
             self.assignment(claims, &HashSet::new(), &HashSet::new())?
         };
         let assignment = assignment.ok_or_else(|| {
-                let missing = self.match_claims(claims, &HashSet::new(), &HashSet::new())
+            let missing = self.match_claims(claims, &HashSet::new(), &HashSet::new())
                     .map(|selected| claims.iter().zip(selected).filter_map(|(claim, request)| request.is_none().then_some(*claim)).collect::<Vec<_>>());
                 format!("prepared inventory cannot fit simultaneous admitted claims; missing: {missing:?}; requested: {claims:?}")
             })?;

@@ -1283,12 +1283,14 @@ where
 {
     let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
         .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+    let spec_hash_bytes = spec_hash.0;
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
     let graph_admission = if config.prepared_gpu_admission {
         backend
             .prepare_graph_admission(
+                spec_hash_bytes,
                 validated,
                 capture_trace,
                 &inputs,

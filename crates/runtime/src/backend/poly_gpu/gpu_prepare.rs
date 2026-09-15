@@ -371,6 +371,7 @@ impl From<&GpuFleetSmallMatrix> for MatrixDescriptor {
 }
 
 /// One selected copy/normalization, before native values or storage are bound.
+#[derive(Clone)]
 pub struct MatrixInputRequest {
     pub owner: u64,
     pub layout: MatrixInputLayout,
@@ -524,9 +525,8 @@ impl GpuDcrtBackend {
                 requests: std::slice::from_ref(&input.request),
             })
             .collect::<Vec<_>>();
-        let reservation = ledger
-            .reserve(&[], &requirements)
-            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let reservation =
+            ledger.reserve(&[], &requirements).map_err(PolyBackendError::GpuAdmission)?;
         debug_assert!(reservation.allocations.is_empty());
         let mut groups = (0..self.devices.len()).map(|_| Vec::new()).collect::<Vec<_>>();
         for (index, (device, mut reservation)) in reservation.prepared.into_iter().enumerate() {
@@ -667,7 +667,9 @@ impl GpuDcrtBackend {
                 .map(|((state, _), claims)| (state, claims))
                 .collect();
             match result {
-                Ok(outputs) => Arc::make_mut(&mut prepared).extend(outputs.into_iter().flatten()),
+                Ok(outputs) => {
+                    Arc::make_mut(&mut prepared).extend(outputs.into_iter().flatten());
+                }
                 Err(error) => {
                     self.devices = workers.into_iter().map(|(state, _)| state).collect();
                     return Err(error);

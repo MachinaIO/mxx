@@ -531,10 +531,16 @@ impl GpuDcrtBackend {
         let mut invocations = Vec::with_capacity(inputs.len());
         for invocation in self.prepared_invocations.drain(..inputs.len()) {
             let CompiledMatrixInvocation {
-                operation, left, right, intervals, prepared, plan, ..
+                operation, left, right, template, prepared, plan, ..
             } = invocation;
             plans.push(plan);
-            invocations.push((operation, left.unwrap(), right, intervals, prepared));
+            invocations.push((
+                operation,
+                left.unwrap(),
+                right,
+                template.intervals.clone(),
+                prepared,
+            ));
         }
         if let Some(sink) = self.admitted_measurement_sink.as_mut() {
             // Preserve aliases across all siblings without including allocation
@@ -728,8 +734,12 @@ impl GpuDcrtBackend {
                         .map(|&(instance, job)| {
                             let (operation, input, _, intervals, prepared) = &run[instance];
                             let range = &intervals[job.source_interval];
-                            let source =
-                                operation.source(prepared, input, range.left_source.unwrap());
+                            let source = operation.source(
+                                prepared,
+                                input,
+                                range.left_source.unwrap(),
+                                range.left_prepared,
+                            );
                             let view = source
                                 .value
                                 .column_view(
@@ -802,6 +812,7 @@ impl GpuDcrtBackend {
                                                     prepared,
                                                     &right[index],
                                                     range.right_source[index],
+                                                    range.right_prepared[index],
                                                 );
                                                 let columns = if fixed {
                                                     0..right[index].columns
@@ -852,6 +863,7 @@ impl GpuDcrtBackend {
                                             prepared,
                                             &right[0],
                                             range.right_source[0],
+                                            range.right_prepared[0],
                                         );
                                         let columns = operation
                                             .other_columns(0, &right[0], job.start, job.end);

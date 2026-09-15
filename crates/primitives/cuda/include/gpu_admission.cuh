@@ -7,10 +7,15 @@ struct GpuPreparedMatrixLease;
 struct GpuPreparedStorage;
 struct GpuPreparedRegion;
 struct GpuMatrixReservation;
+struct GpuPreparedClaimHandle;
 struct GpuMatrixDispatchPermit;
 struct GpuPreparedWorkspaceLease;
 struct GpuPreparedPinnedLease;
 struct GpuPreparedResourceLease;
+
+// Negative native status returned when a valid prepared claim lost its slot
+// to a concurrent pre-submission reservation.
+constexpr int GPU_ADMISSION_ACQUISITION_CONFLICT = -2;
 
 enum GpuPreparedSlotKind {
     GPU_PREPARED_MATRIX = 0,
@@ -175,6 +180,16 @@ int gpu_prepared_storages_finish_setup(GpuPreparedStorage *const *storages, size
 int gpu_matrix_reserve(
     GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
     const GpuPreparedRegion *region, GpuMatrixReservation **out);
+// Validate an exact request list once against a storage layout and containing
+// region. Activation later claims the same slots without repeating layout
+// queries; the handle owns the native storage/region references.
+int gpu_matrix_validate_claims(
+    GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
+    GpuPreparedClaimHandle **out);
+int gpu_matrix_activate_claims(
+    const GpuPreparedClaimHandle *claims, const GpuPreparedRegion *region,
+    GpuMatrixReservation **out);
+void gpu_matrix_claim_handle_destroy(GpuPreparedClaimHandle *claims);
 // Claim whole native slots for a containing region. Nested regions transfer
 // exclusion from their parent without releasing slots to external admissions.
 // Success with a null output means capacity changed/is busy; all acquired slots

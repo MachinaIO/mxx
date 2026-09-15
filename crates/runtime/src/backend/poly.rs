@@ -257,6 +257,9 @@ pub enum PolyBackendError {
     GpuCalibration(String),
     #[error("GPU fleet submission failed: {0}")]
     GpuSubmission(String),
+    #[cfg(feature = "gpu")]
+    #[error("GPU admission failed: {0}")]
+    GpuAdmission(#[from] crate::gpu_memory::GpuAdmissionError),
     #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
     UnsupportedPlacement,
     #[error(

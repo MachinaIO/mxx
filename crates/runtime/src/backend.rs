@@ -224,6 +224,7 @@ pub trait Backend {
     /// forbidden; backing that scales with the configured bound is not.
     fn prepare_graph_admission(
         &mut self,
+        _spec_hash: [u8; 32],
         _validated: &mxx_ir_core::ValidatedGraph,
         _capture_trace: bool,
         _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,

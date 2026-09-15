@@ -1243,7 +1243,6 @@ pub(crate) mod private_mul_tests {
             crt_bits: 32,
             terminal_depth: 1,
             max_crt_depth: 2,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::one(),
             operations_per_drop: 1,
         })
@@ -1287,7 +1286,6 @@ pub(crate) mod private_mul_tests {
             crt_bits: 32,
             terminal_depth: 1,
             max_crt_depth: 2,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::one(),
             operations_per_drop: 1,
         })
@@ -1345,7 +1343,6 @@ pub(crate) mod private_mul_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 10,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -1846,7 +1843,6 @@ pub(super) mod prf_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -1960,7 +1956,6 @@ pub(super) mod prf_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -2129,7 +2124,6 @@ mod linear_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         };
@@ -2341,7 +2335,6 @@ pub(crate) mod encoding_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -2621,7 +2614,6 @@ pub(crate) mod encoding_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         };
@@ -3001,7 +2993,6 @@ mod common_prf_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 24,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: (native_width - 1).into(),
             operations_per_drop: 1,
         })
@@ -3396,7 +3387,6 @@ pub(crate) mod family_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -3580,7 +3570,6 @@ pub(crate) mod family_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
             operations_per_drop: 1,
         })
@@ -3962,7 +3951,6 @@ mod program_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 4u8.into(),
             operations_per_drop: 1,
         })
@@ -4274,7 +4262,6 @@ pub(crate) mod terminal_tests {
             crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: value_bound.clone(),
             operations_per_drop: 1,
         })
@@ -4493,7 +4480,6 @@ pub(crate) mod terminal_tests {
             crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: weight.magnitude().clone(),
             operations_per_drop: 1,
         })

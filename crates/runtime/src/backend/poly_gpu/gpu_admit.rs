@@ -150,7 +150,7 @@ impl GpuMatrixLayoutPlan {
     ) -> Result<
         (
             Vec<super::gpu_compiled::GpuAdmittedInvocationSummary>,
-            Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>,
+            Vec<(usize, ConcreteMatrixType, Vec<GpuTracedClaim>)>,
         ),
         GpuAdmissionError,
     > {
@@ -184,17 +184,17 @@ impl GpuMatrixLayoutPlan {
     fn setup_claims(
         &self,
         fits: &[crate::gpu_memory::GpuColumnFit],
-    ) -> Result<Vec<(ConcreteMatrixType, Vec<GpuTracedClaim>)>, GpuAdmissionError> {
+    ) -> Result<Vec<(usize, ConcreteMatrixType, Vec<GpuTracedClaim>)>, GpuAdmissionError> {
         use std::collections::{BTreeMap, BTreeSet};
-        let mut selected = Vec::<(GpuDCRTPolyParams, GpuPreparedRequest)>::new();
-        let mut extra = Vec::<(GpuDCRTPolyParams, GpuTracedClaim)>::new();
+        let mut selected = Vec::<(usize, GpuDCRTPolyParams, GpuPreparedRequest)>::new();
+        let mut extra = Vec::<(usize, GpuDCRTPolyParams, GpuTracedClaim)>::new();
         let mut seen = BTreeSet::<(usize, usize, (u64, u64, usize))>::new();
         let mut add =
             |device: usize, parameters: GpuDCRTPolyParams, request: GpuPreparedRequest| {
                 let context = parameters.context_identity();
                 let key = (device, context, request.slot_key());
                 if seen.insert(key) {
-                    selected.push((parameters, request));
+                    selected.push((device, parameters, request));
                 }
             };
         for input in &self.inputs {
@@ -269,26 +269,29 @@ impl GpuMatrixLayoutPlan {
                             )
                         })?;
                     extra.extend(
-                        plan.destination.iter().copied().map(|claim| (parameters.clone(), claim)),
+                        plan.destination
+                            .iter()
+                            .copied()
+                            .map(|claim| (region.device, parameters.clone(), claim)),
                     );
                     extra.extend(
                         plan.tile_claims(&parameters, *public_rows, width)
                             .map_err(GpuAdmissionError::InvalidPlan)?
                             .into_iter()
-                            .map(|claim| (parameters.clone(), claim)),
+                            .map(|claim| (region.device, parameters.clone(), claim)),
                     );
                     extra.extend(
                         plan.attempt_claims(&parameters, *public_rows, width, ty.rows, bound)
                             .map_err(GpuAdmissionError::InvalidPlan)?
                             .into_iter()
                             .flatten()
-                            .map(|claim| (parameters.clone(), claim)),
+                            .map(|claim| (region.device, parameters.clone(), claim)),
                     );
                 }
             }
         }
-        let mut groups = BTreeMap::<ConcreteMatrixType, Vec<GpuTracedClaim>>::new();
-        for (params, request) in selected {
+        let mut groups = BTreeMap::<(usize, ConcreteMatrixType), Vec<GpuTracedClaim>>::new();
+        for (device, params, request) in selected {
             let claim = if request.kind() == GpuPreparedSlotKind::Matrix {
                 GpuTracedClaim::matrix(
                     request.rows(),
@@ -317,9 +320,9 @@ impl GpuMatrixLayoutPlan {
                     1
                 },
             };
-            groups.entry(ty).or_default().push(claim);
+            groups.entry((device, ty)).or_default().push(claim);
         }
-        for (params, claim) in extra {
+        for (device, params, claim) in extra {
             let ty = ConcreteMatrixType {
                 modulus: params.modulus().as_ref().clone().into(),
                 ring_dimension: params.ring_dimension() as usize,
@@ -330,9 +333,9 @@ impl GpuMatrixLayoutPlan {
                     1
                 },
             };
-            groups.entry(ty).or_default().push(claim);
+            groups.entry((device, ty)).or_default().push(claim);
         }
-        Ok(groups.into_iter().collect())
+        Ok(groups.into_iter().map(|((device, ty), claims)| (device, ty, claims)).collect())
     }
 
     /// Exact selected output owners for binding the model's subsequent values.
@@ -1392,11 +1395,13 @@ impl GpuDcrtBackend {
     /// Allocate the class's typed capacity before closing its native setup epoch.
     pub fn prepare_measurement_storage(
         &mut self,
-        claims: &[(ConcreteMatrixType, Vec<GpuTracedClaim>)],
+        claims: &[(usize, ConcreteMatrixType, Vec<GpuTracedClaim>)],
     ) -> Result<(), PolyBackendError> {
+        let configured_parameters = self.device_parameters();
         let mut storage = Vec::new();
         for (device, (_, backend)) in self.devices.iter().enumerate() {
-            for (ty, claims) in claims {
+            let mut has_storage = false;
+            for (_, ty, claims) in claims.iter().filter(|(owner, ..)| *owner == device) {
                 let parameters = backend.parameters(ty)?;
                 let mut matrices = claims
                     .iter()
@@ -1407,6 +1412,7 @@ impl GpuDcrtBackend {
                 if matrices.is_empty() && layouts.is_empty() {
                     continue;
                 }
+                has_storage = true;
                 if matrices.is_empty() {
                     matrices.push(GpuTracedClaim::matrix(1, 1, parameters.crt_depth() - 1, true));
                 }
@@ -1418,6 +1424,28 @@ impl GpuDcrtBackend {
                             Vec::new(),
                             Some(&matrices),
                             Some(&layouts),
+                        )
+                        .map_err(PolyBackendError::GpuSubmission)?,
+                    ),
+                ));
+            }
+            if !has_storage {
+                // `prepare_memory` seals a complete fleet and therefore needs
+                // one native storage owner for every configured device, even
+                // when placement selected no workload claim on that device.
+                // Keep this placeholder separate from active setup claims: it
+                // establishes the device's execution owner without cloning a
+                // resource that belongs to another GPU.
+                let parameters = &configured_parameters[device];
+                let placeholder = [GpuTracedClaim::matrix(1, 1, parameters.crt_depth() - 1, true)];
+                storage.push((
+                    device,
+                    Arc::new(
+                        GpuPreparedStorage::new(
+                            Some(parameters),
+                            Vec::new(),
+                            Some(&placeholder),
+                            None,
                         )
                         .map_err(PolyBackendError::GpuSubmission)?,
                     ),
@@ -1814,8 +1842,8 @@ mod tests {
         };
         let setup = plan.setup_claims(&[]).unwrap();
         assert_eq!(setup.len(), 1);
-        assert_eq!(setup[0].1.len(), 2);
-        assert!(setup[0].1.iter().all(|claim| {
+        assert_eq!(setup[0].2.len(), 2);
+        assert!(setup[0].2.iter().all(|claim| {
             claim.kind() == GpuPreparedSlotKind::Matrix && claim.rows() == 1 && claim.columns() == 1
         }));
     }

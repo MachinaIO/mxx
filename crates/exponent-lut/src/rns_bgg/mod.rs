@@ -372,7 +372,6 @@ pub struct RnsBggPlanRequest {
     pub crt_bits: usize,
     pub terminal_depth: usize,
     pub max_crt_depth: usize,
-    pub memory_budget_bytes: u64,
     pub terminal_value_bound: BigUint,
     /// Number of logical MulPrivate/LUT operations between physical drops.
     pub operations_per_drop: usize,
@@ -685,7 +684,6 @@ mod parameter_tests {
             crt_bits: 16,
             terminal_depth: 1,
             max_crt_depth: 16,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::one(),
             operations_per_drop: 1,
         }
@@ -797,14 +795,11 @@ mod parameter_tests {
     }
 
     #[test]
-    fn test_rns_bgg_planner_rejects_insufficient_public_budgets() {
+    fn test_rns_bgg_planner_rejects_insufficient_public_constraints() {
         let base = request();
         let mut changed = base.clone();
         changed.max_crt_depth = changed.terminal_depth;
         assert!(matches!(RnsBggParameters::plan(&changed), Err(RnsBggError::Budget("CRT depth"))));
-        let mut changed = base.clone();
-        changed.memory_budget_bytes = 0;
-        assert!(matches!(RnsBggParameters::plan(&changed), Err(RnsBggError::Budget("memory"))));
         let mut changed = base.clone();
         changed.terminal_value_bound = BigUint::from(1u8) << 128;
         assert!(matches!(

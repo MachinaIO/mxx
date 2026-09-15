@@ -14,7 +14,11 @@ pub(super) struct BatchRequest {
     pub plans: Option<Vec<mxx_runtime::backend::poly_gpu::GpuAdmittedInvocationSummary>>,
     pub native: Option<(
         mxx_runtime::gpu_invocation::GpuNodeOperation,
-        Vec<(ConcreteMatrixType, Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>)>,
+        Vec<(
+            usize,
+            ConcreteMatrixType,
+            Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
+        )>,
     )>,
 }
 
@@ -213,8 +217,9 @@ impl GpuNodeMeasurementBackend {
             .map_err(|error| {
                 let setup_claim_counts = claims
                     .iter()
-                    .enumerate()
-                    .map(|(index, (ty, setup))| format!("type_{index}={ty:?}:{}", setup.len()))
+                    .map(|(device, ty, setup)| {
+                        format!("device_{device}:{ty:?}:{}", setup.len())
+                    })
                     .collect::<Vec<_>>();
                 let nonzero_plan_summaries = plans
                     .iter()
@@ -314,12 +319,14 @@ impl GpuNodeMeasurementBackend {
             backend.set_admitted_measurement_sink(None);
             result.map_err(|error| {
                 GpuMeasurementError(format!(
-                    "native measurement admit/run failed scope={:?} id={:?} kind={:?} siblings={} plan_count={}: {error}",
+                    "native measurement admit/run failed scope={:?} id={:?} kind={:?} siblings={} plans={:?} concrete_arguments={:?} concrete_outputs={:?}: {error}",
                     request.scope,
                     request.id,
                     request.kind,
                     prepared.len(),
-                    batch.plans.as_ref().map_or(0, Vec::len),
+                    batch.plans,
+                    request.concrete_argument_types,
+                    request.concrete_output_types,
                 ))
             })?;
             let (mut observed, wave_latency, schedules) =

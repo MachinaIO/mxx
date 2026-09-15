@@ -299,11 +299,11 @@ pub fn trace_program(
 
 impl RnsBggParameters {
     /// Search public prime candidates using the full Program audit. The
-    /// request's terminal depth is the lower bound; its CRT/memory budgets
-    /// remain hard limits on the declared allocation profile. Width/slot
-    /// counts must cover the workload's storage contract; this is not yet a
-    /// liveness-based peak-memory scheduler. The returned manifest describes allocation,
-    /// while the returned trace is the actual Program acceptance evidence.
+    /// request's terminal depth and maximum CRT depth bound the modulus search.
+    /// Width/slot counts describe the workload's storage contract. Estimated
+    /// peak storage remains a Pareto objective and manifest result, but never
+    /// rejects an otherwise valid cryptographic parameter set. The returned
+    /// trace is the actual Program acceptance evidence.
     /// This conservative search does not certify globally minimal parameters.
     pub fn search_program(
         request: &super::RnsBggPlanRequest,
@@ -797,7 +797,6 @@ mod tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 6,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
             operations_per_drop: 1,
         };
@@ -999,7 +998,6 @@ mod tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::one(),
             operations_per_drop: 1,
         })
@@ -1034,7 +1032,6 @@ mod tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 4,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -1297,7 +1294,6 @@ mod tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         };
@@ -1576,10 +1572,6 @@ impl RnsBggParameters {
                                     continue;
                                 }
                             }
-                            if peak > BigUint::from(request.memory_budget_bytes) {
-                                failure = RnsBggError::Budget("memory");
-                                continue;
-                            }
                             let states = following.entry((high, low)).or_default();
                             if states.iter().any(|(_, bound, memory)| {
                                 bound.error <= output.error && *memory <= peak
@@ -1685,9 +1677,6 @@ impl RnsBggParameters {
             }
             bounds.push(bound);
             bytes = bytes.max(self.lut_stage_bytes(i, request.widths[i], request.slots[i])?);
-        }
-        if bytes > BigUint::from(request.memory_budget_bytes) {
-            return Err(RnsBggError::Budget("memory"));
         }
         let terminal = self.level(stages)?;
         let range = (&request.terminal_value_bound + &bounds[stages].error) * 2u8;
@@ -1937,7 +1926,6 @@ mod refresh_plan_tests {
             crt_bits: 30,
             terminal_depth: 3,
             max_crt_depth: 24,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 32u8.into(),
             operations_per_drop: 1,
         })

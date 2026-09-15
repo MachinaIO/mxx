@@ -1114,49 +1114,39 @@ impl RnsBggScheme {
             let end = (start + batch).min(material.branches.len());
             let members = &material.branches[start..end];
             let lifted = &lifted_ciphertexts[start..end];
-            let operation = mxx_dsl::Subgraph::define(
-                format!("rns-bgg-branch-{:02x?}-{:02x?}-{start}", material.id, input.id),
-                raw_public.schema(),
-                |accumulated: RnsBggMatrix| {
-                    let inputs = Family::pack(
-                        members
-                            .iter()
-                            .zip(lifted)
-                            .map(|((mask, _), lifted)| (mask.public.clone(), lifted.clone()))
-                            .collect(),
-                    )?;
-                    let prepared = mxx_dsl::parallel(members.len(), |index| {
-                        let sigma = IntExpr::Select {
-                            selector: Box::new(index.expression()?),
-                            branches: members
-                                .iter()
-                                .map(|(mask, _)| IntExpr::constant(mask.sigma))
-                                .collect(),
-                        };
-                        let (mask, lifted) = inputs.at(index);
-                        let intermediate = (input.matrix.clone().ring_automorphism(sigma) *
-                            lifted.clone())
-                        .block_mod_switch(next.clone());
-                        let intermediate = self
-                            .prepare_digits(level, intermediate)
-                            .map_err(|_| DslError::Schema)?;
-                        let public = mask.clone() * intermediate.clone();
-                        Ok(((mask, lifted, intermediate), public))
-                    })?;
-                    let sum =
-                        crate::utils::balanced_sum_family(prepared.field(|(_, public)| public)?)
-                            .map_err(|_| DslError::Schema)?;
-                    Ok((prepared.field(|(cache, _)| cache)?, accumulated + sum))
-                },
+            let inputs = Family::pack(
+                members
+                    .iter()
+                    .zip(lifted)
+                    .map(|((mask, _), lifted)| (mask.public.clone(), lifted.clone()))
+                    .collect(),
             )?;
-            let (cache, accumulated) = operation.call(raw_public)?;
-            raw_public = accumulated;
+            let prepared = mxx_dsl::parallel(members.len(), |index| {
+                let sigma = IntExpr::Select {
+                    selector: Box::new(index.expression()?),
+                    branches: members
+                        .iter()
+                        .map(|(mask, _)| IntExpr::constant(mask.sigma))
+                        .collect(),
+                };
+                let (mask, lifted) = inputs.at(index);
+                let intermediate = (input.matrix.clone().ring_automorphism(sigma) * lifted)
+                    .block_mod_switch(next.clone());
+                let intermediate =
+                    self.prepare_digits(level, intermediate).map_err(|_| DslError::Schema)?;
+                let public = mask.clone() * intermediate.clone();
+                Ok(((mask, intermediate), public))
+            })?;
+            let sum = crate::utils::balanced_sum_family(prepared.field(|(_, public)| public)?)
+                .map_err(|_| DslError::Schema)?;
+            raw_public = raw_public + sum;
+            let cache = prepared.field(|(cache, _)| cache)?;
             for (index, (mask, _)) in members.iter().enumerate() {
-                let (mask_public, lifted_ciphertext, lifted_intermediate) = cache.at(index);
+                let (mask_public, lifted_intermediate) = cache.at(index);
                 branches.push(PreparedBranch {
                     sigma: mask.sigma,
                     mask_public,
-                    lifted_ciphertext,
+                    lifted_ciphertext: lifted[index].clone(),
                     lifted_intermediate,
                 });
             }
@@ -2576,7 +2566,6 @@ pub(crate) mod terminal_artifact_tests {
             crt_bits: 30,
             terminal_depth: 2,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: value_bound.clone(),
             operations_per_drop: 1,
         })
@@ -2848,7 +2837,6 @@ pub(crate) mod program_artifacts_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 16u8.into(),
             operations_per_drop: 1,
         })
@@ -3254,7 +3242,7 @@ pub(crate) mod program_artifacts_tests {
         let mut backend = make_backend(&parameters);
         let directory = tempfile::tempdir().unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let produced = execute(
+        let mut produced = execute(
             &producer,
             &mut backend,
             BTreeMap::from([(
@@ -3391,12 +3379,19 @@ pub(crate) mod program_artifacts_tests {
             switches, 10,
             "scalar/family LUT and indexed/shared direct product, two online polynomials each"
         );
-        let consumed =
+        let mut consumed =
             execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        for (name, value) in consumed.outputs {
-            let RuntimeValue::Matrix(actual) = value else { panic!("polynomial") };
-            let RuntimeValue::Matrix(expected) = &produced.outputs[&name] else {
+        let names = consumed.outputs.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let RuntimeValue::Matrix(actual) =
+                consumed.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
+            else {
+                panic!("polynomial")
+            };
+            let RuntimeValue::Matrix(expected) =
+                produced.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
+            else {
                 panic!("polynomial")
             };
             check_matrix(actual.as_ref(), expected.as_ref(), &name);
@@ -3493,7 +3488,6 @@ mod linear_artifact_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 8,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 1u8.into(),
             operations_per_drop: 1,
         })
@@ -3605,7 +3599,7 @@ mod linear_artifact_tests {
         let directory = tempfile::tempdir().unwrap();
         let mut store = FileArtifactStore::new(directory.path()).unwrap();
         let mut backend = cpu_backend(parameters.levels().iter().cloned());
-        let produced = execute(
+        let mut produced = execute(
             &graph,
             &mut backend,
             BTreeMap::from([(
@@ -3725,12 +3719,19 @@ mod linear_artifact_tests {
                 &BTreeMap::from([(production.clone(), store.load_manifest(&production).unwrap())]),
             )
             .unwrap();
-        let consumed =
+        let mut consumed =
             execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        for (name, value) in consumed.outputs {
-            let RuntimeValue::Matrix(actual) = value else { panic!("polynomial") };
-            let RuntimeValue::Matrix(expected) = &produced.outputs[&name] else {
+        let names = consumed.outputs.keys().cloned().collect::<Vec<_>>();
+        for name in names {
+            let RuntimeValue::Matrix(actual) =
+                consumed.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
+            else {
+                panic!("polynomial")
+            };
+            let RuntimeValue::Matrix(expected) =
+                produced.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
+            else {
                 panic!("polynomial")
             };
             assert_eq!(actual.as_ref(), expected.as_ref(), "{name}");
@@ -4147,7 +4148,6 @@ pub(crate) mod readout_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: BigUint::from(3u8) *
                 weight.iter().flatten().map(|x| x.magnitude()).max().unwrap().clone(),
             operations_per_drop: 1,
@@ -4535,7 +4535,6 @@ pub(crate) mod terminal_family_tests {
             crt_bits: 30,
             terminal_depth: 2,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 18u8.into(),
             operations_per_drop: 1,
         })
@@ -4769,7 +4768,6 @@ pub(crate) mod terminal_family_tests {
             crt_bits: 30,
             terminal_depth: 1,
             max_crt_depth: 12,
-            memory_budget_bytes: u64::MAX,
             terminal_value_bound: 3u8.into(),
             operations_per_drop: 1,
         })

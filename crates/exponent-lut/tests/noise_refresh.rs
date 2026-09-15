@@ -7664,7 +7664,6 @@ mod rns_bgg {
                 crt_bits: 30,
                 terminal_depth,
                 max_crt_depth: 32,
-                memory_budget_bytes: 1 << 30,
                 terminal_value_bound: 32u8.into(),
                 operations_per_drop: 1,
             });

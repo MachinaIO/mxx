@@ -1028,7 +1028,6 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             crt_bits: 32,
             terminal_depth: 2,
             max_crt_depth: 32,
-            memory_budget_bytes: 1 << 30,
             terminal_value_bound: 4u8.into(),
             operations_per_drop: 1,
         })

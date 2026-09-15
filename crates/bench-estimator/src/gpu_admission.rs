@@ -318,6 +318,7 @@ struct GpuSelectedNode {
     node: NodeId,
     plans: Vec<mxx_runtime::backend::poly_gpu::GpuAdmittedInvocationSummary>,
     setup: Vec<(
+        usize,
         mxx_ir_core::types::ConcreteMatrixType,
         Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
     )>,
@@ -1053,10 +1054,14 @@ impl GpuGraphInventory {
             if shared.is_empty() {
                 continue;
             }
-            if let Some(entry) = setup.iter_mut().find(|entry| entry.0 == *ty) {
-                entry.1.extend(shared);
-            } else {
-                setup.push((ty.clone(), shared));
+            for device in 0..backend.device_parameters().len() {
+                if let Some(entry) =
+                    setup.iter_mut().find(|entry| entry.0 == device && entry.1 == *ty)
+                {
+                    entry.2.extend(shared.clone());
+                } else {
+                    setup.push((device, ty.clone(), shared.clone()));
+                }
             }
         }
         let outputs = instances
@@ -1110,6 +1115,7 @@ impl GpuGraphInventory {
         node: NodeId,
     ) -> Option<
         &[(
+            usize,
             mxx_ir_core::types::ConcreteMatrixType,
             Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
         )],
@@ -2214,7 +2220,7 @@ mod tests {
                     .fit_with_setup(&admissions, cap, std::slice::from_ref(&capacity))
                     .unwrap();
                 assert!(!setup.is_empty(), "selected native resources must produce setup claims");
-                setup_counts.push(setup.iter().map(|entry| entry.1.len()).sum::<usize>());
+                setup_counts.push(setup.iter().map(|entry| entry.2.len()).sum::<usize>());
                 assert_eq!(
                     invocations[0].plan.schedule.local_job_counts(),
                     &[columns.div_ceil(cap)]

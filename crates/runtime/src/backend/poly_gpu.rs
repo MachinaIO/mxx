@@ -98,7 +98,7 @@ pub use fleet::{
     GpuMatrixColumnRequirements, GpuMatrixDescriptor, GpuMatrixFragmentDescriptor,
     GpuMatrixInputFragment, GpuMatrixInputLayout, GpuMatrixInputRequest, GpuMatrixInputSource,
     GpuMatrixLayoutPlan, GpuMatrixPlacementInvocation, GpuMatrixSlotContext,
-    GpuMatrixSlotInventory, GpuScopeProgress, GpuScopeResources,
+    GpuMatrixSlotInventory, GpuScopeProgress, GpuScopeResources, GpuSetupClaim,
 };
 
 #[cfg(test)]

@@ -9,15 +9,12 @@ impl GpuDcrtBackend {
     pub(in super::super) fn execute_matrix_batch(
         &mut self,
         inputs: &[Vec<&GpuFleetMatrix>],
-        expected: Vec<PreparedMatrixOperation>,
+        expected: Vec<PreparedOperation>,
     ) -> Result<Vec<GpuFleetMatrix>, PolyBackendError> {
         if !self.prepared_required {
             if !matches!(
                 expected.first(),
-                Some(
-                    PreparedMatrixOperation::Multiply { .. } |
-                        PreparedMatrixOperation::Accumulate { .. }
-                )
+                Some(PreparedOperation::Multiply { .. } | PreparedOperation::Accumulate { .. })
             ) {
                 self.restart_runtime_pilot_after_matrix_inputs(
                     &inputs.iter().flat_map(|inputs| inputs.iter().copied()).collect::<Vec<_>>(),
@@ -26,7 +23,7 @@ impl GpuDcrtBackend {
             // Explicit calibration still uses its ordinary primitive runner.
             // The selected widths subsequently bound every sibling's real work.
             if let Some(input) = inputs.first() {
-                if let PreparedMatrixOperation::Accumulate { products, bias, rows } = &expected[0] {
+                if let PreparedOperation::Accumulate { products, bias, rows } = &expected[0] {
                     if self.runtime_pilot_is_pending() {
                         let request = MatrixMulAccumulateRequest {
                             products: products
@@ -46,7 +43,7 @@ impl GpuDcrtBackend {
                         let runner = self.accumulate_column_runner(&request, *rows, columns)?;
                         self.calibrate_column_operation(columns, runner)?;
                     }
-                } else if let PreparedMatrixOperation::Multiply { scales_left } = expected[0] {
+                } else if let PreparedOperation::Multiply { scales_left } = expected[0] {
                     if self.runtime_pilot_is_pending() {
                         let (scalable, fixed) =
                             if scales_left { (input[0], input[1]) } else { (input[1], input[0]) };
@@ -55,9 +52,9 @@ impl GpuDcrtBackend {
                     }
                 } else if matches!(
                     expected[0],
-                    PreparedMatrixOperation::Add | PreparedMatrixOperation::Subtract
+                    PreparedOperation::Add | PreparedOperation::Subtract
                 ) {
-                    let subtract = expected[0] == PreparedMatrixOperation::Subtract;
+                    let subtract = expected[0] == PreparedOperation::Subtract;
                     let runner = Self::binary_column_runner(
                         input[0],
                         input[1],
@@ -72,11 +69,11 @@ impl GpuDcrtBackend {
                     self.calibrate_column_operation(input[0].columns, Arc::new(runner))?;
                 } else {
                     let operation = match &expected[0] {
-                        PreparedMatrixOperation::Negate => GpuUnaryColumnOperation::Negate,
-                        PreparedMatrixOperation::Scale(scalar) => {
+                        PreparedOperation::Negate => GpuUnaryColumnOperation::Negate,
+                        PreparedOperation::Scale(scalar) => {
                             GpuUnaryColumnOperation::Scale(scalar.clone())
                         }
-                        PreparedMatrixOperation::Automorphism(index) => {
+                        PreparedOperation::Automorphism(index) => {
                             GpuUnaryColumnOperation::Automorphism(*index)
                         }
                         _ => unreachable!("allocating unary batch"),
@@ -92,13 +89,10 @@ impl GpuDcrtBackend {
                     .map(|(input, operation)| {
                         let mut values =
                             input.iter().map(|value| (*value).clone()).collect::<Vec<_>>();
-                        if matches!(
-                            operation,
-                            PreparedMatrixOperation::Multiply { scales_left: false }
-                        ) {
+                        if matches!(operation, PreparedOperation::Multiply { scales_left: false }) {
                             values.swap(0, 1);
                         }
-                        if let PreparedMatrixOperation::Accumulate { products, .. } = operation {
+                        if let PreparedOperation::Accumulate { products, .. } = operation {
                             for (index, (_, scales_left)) in products.iter().enumerate() {
                                 if !scales_left {
                                     values.swap(2 * index, 2 * index + 1);
@@ -120,10 +114,8 @@ impl GpuDcrtBackend {
                         let mut replicas = HashMap::new();
                         for (input, operation) in inputs.iter().zip(operations.iter()) {
                             let count = match operation {
-                                PreparedMatrixOperation::Multiply { .. } => 1,
-                                PreparedMatrixOperation::Accumulate { products, .. } => {
-                                    products.len()
-                                }
+                                PreparedOperation::Multiply { .. } => 1,
+                                PreparedOperation::Accumulate { products, .. } => products.len(),
                                 _ => 0,
                             };
                             for index in (0..count).map(|index| 2 * index + 1) {
@@ -151,10 +143,7 @@ impl GpuDcrtBackend {
             );
             if matches!(
                 operations.first(),
-                Some(
-                    PreparedMatrixOperation::Multiply { .. } |
-                        PreparedMatrixOperation::Accumulate { .. }
-                )
+                Some(PreparedOperation::Multiply { .. } | PreparedOperation::Accumulate { .. })
             ) {
                 self.restart_runtime_pilot_after_fixed_inputs()
                     .map_err(PolyBackendError::GpuCalibration)?;
@@ -168,8 +157,8 @@ impl GpuDcrtBackend {
                         .iter()
                         .enumerate()
                         .filter(|(index, _)| match operation {
-                            PreparedMatrixOperation::Multiply { .. } => *index == 0,
-                            PreparedMatrixOperation::Accumulate { .. } => *index % 2 == 0,
+                            PreparedOperation::Multiply { .. } => *index == 0,
+                            PreparedOperation::Accumulate { .. } => *index % 2 == 0,
                             _ => true,
                         })
                         .map(|(_, value)| value)
@@ -243,7 +232,7 @@ impl GpuDcrtBackend {
                                         job.end - job.start,
                                         operations[instance].kind_name(),
                                         sources[instance].get(1).map(GpuFleetMatrix::size),
-                                        if let PreparedMatrixOperation::Accumulate {
+                                        if let PreparedOperation::Accumulate {
                                             products,
                                             rows,
                                             ..
@@ -255,7 +244,7 @@ impl GpuDcrtBackend {
                                         },
                                         matches!(
                                             operations[instance],
-                                            PreparedMatrixOperation::Multiply { scales_left: true }
+                                            PreparedOperation::Multiply { scales_left: true }
                                         ),
                                     ))
                                     .or_insert_with(Vec::new)
@@ -314,8 +303,8 @@ impl GpuDcrtBackend {
                                 let evaluation = class.2 ||
                                     matches!(
                                         operations[jobs[0].0],
-                                        PreparedMatrixOperation::Multiply { .. } |
-                                            PreparedMatrixOperation::Accumulate { .. }
+                                        PreparedOperation::Multiply { .. } |
+                                            PreparedOperation::Accumulate { .. }
                                     );
                                 let pieces = jobs
                                     .iter()
@@ -336,8 +325,7 @@ impl GpuDcrtBackend {
                                 let mut right = Vec::new();
                                 if matches!(
                                     operations[jobs[0].0],
-                                    PreparedMatrixOperation::Add |
-                                        PreparedMatrixOperation::Subtract
+                                    PreparedOperation::Add | PreparedOperation::Subtract
                                 ) {
                                     for (instance, job) in jobs {
                                         right.push(prepare(
@@ -349,8 +337,7 @@ impl GpuDcrtBackend {
                                     }
                                 }
                                 let mut extra = Vec::new();
-                                if let PreparedMatrixOperation::Accumulate { .. } =
-                                    &operations[jobs[0].0]
+                                if let PreparedOperation::Accumulate { .. } = &operations[jobs[0].0]
                                 {
                                     for (instance, job) in jobs {
                                         extra.push(
@@ -366,13 +353,13 @@ impl GpuDcrtBackend {
                                     }
                                 }
                                 let values = match &operations[jobs[0].0] {
-                                    PreparedMatrixOperation::Accumulate { .. } => {
+                                    PreparedOperation::Accumulate { .. } => {
                                         let sums = jobs
                                             .iter()
                                             .zip(&views)
                                             .zip(&extra)
                                             .map(|(((instance, _), first), extra)| {
-                                                let PreparedMatrixOperation::Accumulate {
+                                                let PreparedOperation::Accumulate {
                                                     products,
                                                     bias,
                                                     ..
@@ -414,7 +401,7 @@ impl GpuDcrtBackend {
                                             .map_err(PolyBackendError::GpuSubmission)?;
                                         GpuDCRTPolyMatrixColumnView::multiply_accumulate_batch(sums)
                                     }
-                                    PreparedMatrixOperation::Multiply { scales_left } => {
+                                    PreparedOperation::Multiply { scales_left } => {
                                         let pairs = views
                                             .into_iter()
                                             .zip(jobs)
@@ -432,8 +419,7 @@ impl GpuDcrtBackend {
                                             .map_err(PolyBackendError::GpuSubmission)?;
                                         GpuDCRTPolyMatrixColumnView::multiply_batch(pairs)
                                     }
-                                    PreparedMatrixOperation::Add |
-                                    PreparedMatrixOperation::Subtract => {
+                                    PreparedOperation::Add | PreparedOperation::Subtract => {
                                         let pairs = views
                                             .into_iter()
                                             .zip(&right)
@@ -448,20 +434,19 @@ impl GpuDcrtBackend {
                                             .map_err(PolyBackendError::GpuSubmission)?;
                                         GpuDCRTPolyMatrixColumnView::binary_batch(
                                             pairs,
-                                            operations[jobs[0].0] ==
-                                                PreparedMatrixOperation::Subtract,
+                                            operations[jobs[0].0] == PreparedOperation::Subtract,
                                         )
                                     }
-                                    PreparedMatrixOperation::Negate => {
+                                    PreparedOperation::Negate => {
                                         GpuDCRTPolyMatrixColumnView::negate_batch(
                                             views.into_iter().map(|view| (view, None)),
                                         )
                                     }
-                                    PreparedMatrixOperation::Scale(_) => {
+                                    PreparedOperation::Scale(_) => {
                                         GpuDCRTPolyMatrixColumnView::scale_integer_batch(
                                             views.into_iter().zip(jobs).map(
                                                 |(view, (instance, _))| {
-                                                    let PreparedMatrixOperation::Scale(scalar) =
+                                                    let PreparedOperation::Scale(scalar) =
                                                         &operations[*instance]
                                                     else {
                                                         unreachable!()
@@ -471,13 +456,12 @@ impl GpuDcrtBackend {
                                             ),
                                         )
                                     }
-                                    PreparedMatrixOperation::Automorphism(_) => {
+                                    PreparedOperation::Automorphism(_) => {
                                         GpuDCRTPolyMatrixColumnView::ring_automorphism_batch(
                                             views.into_iter().zip(jobs).map(
                                                 |(view, (instance, _))| {
-                                                    let PreparedMatrixOperation::Automorphism(
-                                                        index,
-                                                    ) = &operations[*instance]
+                                                    let PreparedOperation::Automorphism(index) =
+                                                        &operations[*instance]
                                                     else {
                                                         unreachable!()
                                                     };
@@ -515,14 +499,14 @@ impl GpuDcrtBackend {
                 .zip(operations.par_iter())
                 .map(|((mut shards, input), operation)| {
                     shards.par_sort_unstable_by_key(|shard| shard.global_column_start);
-                    let rows = if matches!(operation, PreparedMatrixOperation::Multiply { .. }) &&
+                    let rows = if matches!(operation, PreparedOperation::Multiply { .. }) &&
                         input[1].size() != (1, 1)
                     {
                         input[1].rows
                     } else {
                         input[0].rows
                     };
-                    let rows = if let PreparedMatrixOperation::Accumulate { rows, .. } = operation {
+                    let rows = if let PreparedOperation::Accumulate { rows, .. } = operation {
                         *rows
                     } else {
                         rows
@@ -547,10 +531,16 @@ impl GpuDcrtBackend {
         let mut invocations = Vec::with_capacity(inputs.len());
         for invocation in self.prepared_invocations.drain(..inputs.len()) {
             let CompiledMatrixInvocation {
-                operation, left, right, intervals, prepared, plan, ..
+                operation, left, right, template, prepared, plan, ..
             } = invocation;
             plans.push(plan);
-            invocations.push((operation, left.unwrap(), right, intervals, prepared));
+            invocations.push((
+                operation,
+                left.unwrap(),
+                right,
+                template.intervals.clone(),
+                prepared,
+            ));
         }
         if let Some(sink) = self.admitted_measurement_sink.as_mut() {
             // Preserve aliases across all siblings without including allocation
@@ -705,8 +695,7 @@ impl GpuDcrtBackend {
                     groups
                         .entry((
                             operation.kind_name(),
-                            if let PreparedMatrixOperation::Accumulate { products, .. } = operation
-                            {
+                            if let PreparedOperation::Accumulate { products, .. } = operation {
                                 products.len()
                             } else {
                                 1
@@ -745,8 +734,12 @@ impl GpuDcrtBackend {
                         .map(|&(instance, job)| {
                             let (operation, input, _, intervals, prepared) = &run[instance];
                             let range = &intervals[job.source_interval];
-                            let source =
-                                operation.source(prepared, input, range.left_source.unwrap());
+                            let source = operation.source(
+                                prepared,
+                                input,
+                                range.left_source.unwrap(),
+                                range.left_prepared,
+                            );
                             let view = source
                                 .value
                                 .column_view(
@@ -772,14 +765,13 @@ impl GpuDcrtBackend {
                         .collect::<Result<Vec<_>, GpuAdmissionError>>()?;
                     let results = brokers[first][first_job.source_interval]
                         .hold(&claims, false, || {
-                            if *expected == PreparedMatrixOperation::Negate {
+                            if *expected == PreparedOperation::Negate {
                                 GpuDCRTPolyMatrixColumnView::negate_batch(destinations)
-                            } else if matches!(expected, PreparedMatrixOperation::Scale(_)) {
+                            } else if matches!(expected, PreparedOperation::Scale(_)) {
                                 GpuDCRTPolyMatrixColumnView::scale_integer_batch(
                                     jobs.iter().zip(destinations).map(
                                         |(&(instance, _), (input, output))| {
-                                            let PreparedMatrixOperation::Scale(scalar) =
-                                                &run[instance].0
+                                            let PreparedOperation::Scale(scalar) = &run[instance].0
                                             else {
                                                 unreachable!("scale batch")
                                             };
@@ -787,11 +779,11 @@ impl GpuDcrtBackend {
                                         },
                                     ),
                                 )
-                            } else if matches!(expected, PreparedMatrixOperation::Automorphism(_)) {
+                            } else if matches!(expected, PreparedOperation::Automorphism(_)) {
                                 GpuDCRTPolyMatrixColumnView::ring_automorphism_batch(
                                     jobs.iter().zip(destinations).map(
                                         |(&(instance, _), (input, output))| {
-                                            let PreparedMatrixOperation::Automorphism(index) =
+                                            let PreparedOperation::Automorphism(index) =
                                                 &run[instance].0
                                             else {
                                                 unreachable!("automorphism batch")
@@ -800,18 +792,15 @@ impl GpuDcrtBackend {
                                         },
                                     ),
                                 )
-                            } else if matches!(expected, PreparedMatrixOperation::Accumulate { .. })
-                            {
+                            } else if matches!(expected, PreparedOperation::Accumulate { .. }) {
                                 let sums = jobs
                                     .iter()
                                     .zip(destinations)
                                     .map(|(&(instance, job), (primary, destination))| {
                                         let (operation, _, right, intervals, prepared) =
                                             &run[instance];
-                                        let PreparedMatrixOperation::Accumulate {
-                                            products,
-                                            bias,
-                                            ..
+                                        let PreparedOperation::Accumulate {
+                                            products, bias, ..
                                         } = operation
                                         else {
                                             unreachable!("accumulate batch")
@@ -823,6 +812,7 @@ impl GpuDcrtBackend {
                                                     prepared,
                                                     &right[index],
                                                     range.right_source[index],
+                                                    range.right_prepared[index],
                                                 );
                                                 let columns = if fixed {
                                                     0..right[index].columns
@@ -873,6 +863,7 @@ impl GpuDcrtBackend {
                                             prepared,
                                             &right[0],
                                             range.right_source[0],
+                                            range.right_prepared[0],
                                         );
                                         let columns = operation
                                             .other_columns(0, &right[0], job.start, job.end);
@@ -883,9 +874,7 @@ impl GpuDcrtBackend {
                                         Ok(
                                             if matches!(
                                                 operation,
-                                                PreparedMatrixOperation::Multiply {
-                                                    scales_left: false
-                                                }
+                                                PreparedOperation::Multiply { scales_left: false }
                                             ) {
                                                 (right, left, output)
                                             } else {
@@ -894,12 +883,12 @@ impl GpuDcrtBackend {
                                         )
                                     })
                                     .collect::<Result<Vec<_>, String>>()?;
-                                if matches!(expected, PreparedMatrixOperation::Multiply { .. }) {
+                                if matches!(expected, PreparedOperation::Multiply { .. }) {
                                     GpuDCRTPolyMatrixColumnView::multiply_batch(pairs)
                                 } else {
                                     GpuDCRTPolyMatrixColumnView::binary_batch(
                                         pairs,
-                                        *expected == PreparedMatrixOperation::Subtract,
+                                        *expected == PreparedOperation::Subtract,
                                     )
                                 }
                             }

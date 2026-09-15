@@ -3686,14 +3686,30 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
         step: crate::dataflow::DataflowStep,
     ) -> Result<(), Self::Error> {
         let Some(key) = self.active_dataflow else { return Ok(()) };
-        self.admission_graphs.get_mut(&key).unwrap().inventory.as_mut().unwrap().step(
+        let result = self.admission_graphs.get_mut(&key).unwrap().inventory.as_mut().unwrap().step(
             self.prepared_backend.as_mut().expect("explicitly prepared fleet"),
             graph,
             scope,
             instances,
             ancestors,
             step,
-        )?;
+        );
+        if let Err(error) = result {
+            let node_context = match step {
+                crate::dataflow::DataflowStep::BeforeNode(node) |
+                crate::dataflow::DataflowStep::AfterNode { node, .. } => graph
+                    .source
+                    .scope(scope)
+                    .and_then(|scope_graph| scope_graph.node(node))
+                    .map(|handle| format!("node={node:?} kind={:?}", handle.kind()))
+                    .unwrap_or_else(|| format!("node={node:?} kind=<unavailable>")),
+                _ => "node=<scope-boundary> kind=<not-applicable>".to_owned(),
+            };
+            return Err(GpuMeasurementError(format!(
+                "GPU dataflow admission failed scope={scope:?} step={step:?} siblings={} {node_context}: {error}",
+                instances.len(),
+            )));
+        }
         if *scope == mxx_ir_core::FrozenGraphScopeId::Root &&
             step == crate::dataflow::DataflowStep::Leave
         {
@@ -5135,6 +5151,11 @@ mod tests {
             .filter(|batch| matches!(batch.request.kind, NodeKind::PreimageSample { .. }))
             .collect::<Vec<_>>();
         assert!(!samples.is_empty());
+        let collected = samples
+            .iter()
+            .find(|batch| batch.plans.as_ref().is_some_and(|plans| plans.len() == 2))
+            .expect("a collected preimage batch must retain two sibling plans");
+        assert_eq!(collected.plans.as_ref().unwrap().len(), 2);
         for sample in samples {
             let plans = sample.plans.as_ref().expect("Preimage must use cached native plans");
             assert_eq!(plans.len(), sample.owners.len());

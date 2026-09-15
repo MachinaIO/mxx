@@ -1283,12 +1283,14 @@ where
 {
     let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
         .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+    let spec_hash_bytes = spec_hash.0;
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
     let graph_admission = if config.prepared_gpu_admission {
         backend
             .prepare_graph_admission(
+                spec_hash_bytes,
                 validated,
                 capture_trace,
                 &inputs,
@@ -3234,6 +3236,13 @@ where
             }
             NodeKind::PolynomialValues { evaluation } => {
                 let input = self.matrix(values, node.args[0])?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    None,
+                    GpuInvocation::PolynomialValues { value: &input, evaluation: *evaluation },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .polynomial_values(&input, *evaluation)
@@ -4006,6 +4015,13 @@ where
             NodeKind::ExtractCoefficient { position, .. } => {
                 let input = self.matrix(values, node.args[0])?;
                 let position = self.eval_usize(node.id, position, env)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    None,
+                    GpuInvocation::ExtractCoefficient { value: &input, position },
+                )
+                .map_err(Self::backend_error)?;
                 let output = self
                     .backend
                     .extract_coefficient(&input, position)
@@ -4050,6 +4066,17 @@ where
                     .evaluate(env)
                     .map_err(|error| self.expression_error(node.id, error))?;
                 let length = self.eval_usize(node.id, length, env)?;
+                #[cfg(feature = "gpu")]
+                preflight(
+                    self.backend,
+                    None,
+                    GpuInvocation::ThresholdDecode {
+                        value: &input,
+                        plaintext_modulus: &plaintext,
+                        length,
+                    },
+                )
+                .map_err(Self::backend_error)?;
                 let decoded = self
                     .backend
                     .threshold_decode(&input, &plaintext, length)

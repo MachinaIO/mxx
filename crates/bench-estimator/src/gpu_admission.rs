@@ -175,10 +175,11 @@ impl GpuContextInventory {
         &mut self,
         demand: &mxx_runtime::backend::poly_gpu::GpuContextDemand,
         assignment: &[mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedRequest],
+        full_level: usize,
         progress: impl Fn(usize) -> mxx_runtime::backend::poly_gpu::GpuScopeProgress,
     ) {
         let retained = demand
-            .retained_claim_indices(None, progress)
+            .retained_claim_indices(None, full_level, progress)
             .into_iter()
             .map(|index| assignment[index].slot_key())
             .collect::<std::collections::BTreeSet<_>>();
@@ -316,10 +317,7 @@ struct GpuSelectedNode {
     inputs: Vec<Vec<Option<mxx_runtime::backend::poly_gpu::GpuMatrixDescriptor>>>,
     node: NodeId,
     plans: Vec<mxx_runtime::backend::poly_gpu::GpuAdmittedInvocationSummary>,
-    setup: Vec<(
-        mxx_ir_core::types::ConcreteMatrixType,
-        Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
-    )>,
+    setup: Vec<mxx_runtime::backend::poly_gpu::GpuSetupClaim>,
     outputs: BTreeMap<usize, (GpuSlotSets, mxx_runtime::backend::poly_gpu::GpuInventoryValue)>,
 }
 
@@ -490,7 +488,11 @@ impl GpuGraphInventory {
                         for (begin, issued) in &frame.issued {
                             if let Some(assignments) = issued.get(key) {
                                 let retained = demand
-                                    .retained_claim_indices(Some(*begin), |i| frame.progress[i]);
+                                    .retained_claim_indices(
+                                        Some(*begin),
+                                        self.inventory.contexts[key][0].parameters.crt_depth() - 1,
+                                        |i| frame.progress[i],
+                                    );
                                 keys.extend(assignments[index].iter().filter_map(
                                     |(claim, assigned)| {
                                         retained.contains(claim).then_some(assigned.slot_key())
@@ -560,8 +562,11 @@ impl GpuGraphInventory {
                 .context_demands
                 .iter()
                 .map(|(key, (_, demand))| {
-                    let indices =
-                        demand.retained_claim_indices(None, |_| GpuScopeProgress::Before(0));
+                    let indices = demand.retained_claim_indices(
+                        None,
+                        self.inventory.contexts[key][0].parameters.crt_depth() - 1,
+                        |_| GpuScopeProgress::Before(0),
+                    );
                     let slots = wave.assignments[key]
                         .iter()
                         .map(|assignment| {
@@ -606,8 +611,11 @@ impl GpuGraphInventory {
                         .context_demands
                         .iter()
                         .map(|(key, (_, demand))| {
-                            let indices = demand
-                                .retained_claim_indices(None, |_| GpuScopeProgress::Before(0));
+                            let indices = demand.retained_claim_indices(
+                                None,
+                                self.inventory.contexts[key][0].parameters.crt_depth() - 1,
+                                |_| GpuScopeProgress::Before(0),
+                            );
                             let assigned = wave.assignments[key]
                                 .iter()
                                 .map(|assignment| {
@@ -674,7 +682,17 @@ impl GpuGraphInventory {
                             .enumerate()
                             .map(|(node, handle)| {
                                 (0..handle.output_types().len())
-                                    .map(|port| liveness.output_end(node, port))
+                                    .map(|port| {
+                                        let wire = WireRef {
+                                            node: NodeId(node as u64),
+                                            port: mxx_ir_core::types::Port(port as u32),
+                                        };
+                                        if matches!(handle.kind(), NodeKind::Input { .. }) {
+                                            liveness.until(wire).unwrap_or(node)
+                                        } else {
+                                            liveness.output_end(node, port)
+                                        }
+                                    })
                                     .collect()
                             })
                             .collect())
@@ -712,7 +730,11 @@ impl GpuGraphInventory {
                     assignments.keys().any(|key| {
                         !frame.resources.contexts[key]
                             .1
-                            .retained_claim_indices(Some(*begin), |i| frame.progress[i])
+                            .retained_claim_indices(
+                                Some(*begin),
+                                self.inventory.contexts[key][0].parameters.crt_depth() - 1,
+                                |i| frame.progress[i],
+                            )
                             .is_empty()
                     })
                 });
@@ -861,6 +883,7 @@ impl GpuGraphInventory {
                         instance.index,
                         *wire,
                         &[],
+                        self.inventory.contexts[&key][0].parameters.crt_depth() - 1,
                         GpuScopeProgress::Issued(node.0 as usize),
                     );
                     let contexts = available.contexts.get_mut(&key).unwrap();
@@ -1019,9 +1042,35 @@ impl GpuGraphInventory {
                 observed_physical_bytes: 0,
             })
             .collect::<Vec<_>>();
-        let plans = selected
-            .fit(&admissions, self.column_cap(), &inventories)
+        let (plans, mut setup) = selected
+            .fit_with_setup(&admissions, self.column_cap(), &inventories)
             .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        let mut active_devices = setup.iter().map(|entry| entry.0).collect::<BTreeSet<_>>();
+        for index in 0..plans.len() {
+            active_devices.extend(
+                selected.outputs(index).into_iter().map(|(interval, _, _)| interval.device),
+            );
+        }
+        for (ty, demand) in self.frames.last().unwrap().resources.contexts.values() {
+            let shared = demand.shared_workspace_claims();
+            if shared.is_empty() {
+                continue;
+            }
+            let parameters = backend
+                .resource_parameters(ty)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
+            for device in &active_devices {
+                let context = parameters[*device].context_identity();
+                if let Some(entry) = setup
+                    .iter_mut()
+                    .find(|entry| entry.0 == *device && entry.1 == context && entry.2 == *ty)
+                {
+                    entry.3.extend(shared.clone());
+                } else {
+                    setup.push((*device, context, ty.clone(), shared.clone()));
+                }
+            }
+        }
         let outputs = instances
             .iter()
             .enumerate()
@@ -1049,32 +1098,6 @@ impl GpuGraphInventory {
                 (instance.index, (BTreeMap::from([(output_keys[index].clone(), slots)]), layout))
             })
             .collect();
-        let setup = self
-            .frames
-            .last()
-            .unwrap()
-            .resources
-            .contexts
-            .iter()
-            .map(|(key, (ty, demand))| {
-                let claims = demand.claims(&available.contexts[key][0].parameters);
-                let selected = demand.retained_claim_indices(Some(node.0 as usize), |_| {
-                    GpuScopeProgress::Issued(node.0 as usize)
-                });
-                (
-                    ty.clone(),
-                    selected
-                        .into_iter()
-                        .filter(|index| {
-                            !imported.get(key).is_some_and(|devices| {
-                                devices[0].iter().any(|(imported, _)| imported == index)
-                            })
-                        })
-                        .map(|index| claims[index])
-                        .collect(),
-                )
-            })
-            .collect();
         Ok(Some(GpuSelectedNode { node, plans, outputs, setup, inputs, imported, materialized }))
     }
 
@@ -1097,12 +1120,7 @@ impl GpuGraphInventory {
     pub(crate) fn selected_node_setup(
         &self,
         node: NodeId,
-    ) -> Option<
-        &[(
-            mxx_ir_core::types::ConcreteMatrixType,
-            Vec<mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim>,
-        )],
-    > {
+    ) -> Option<&[mxx_runtime::backend::poly_gpu::GpuSetupClaim]> {
         let selected = self.frames.last()?.selected_node.as_ref()?;
         (selected.node == node).then_some(selected.setup.as_slice())
     }
@@ -1112,7 +1130,11 @@ impl GpuGraphInventory {
         let inventory = self.available();
         let frame = self.frames.last_mut().unwrap();
         let issued = frame.resources.contexts.par_iter().map(|(key, (_, demand))| {
-            let indices = demand.retained_claim_indices(Some(node.0 as usize), |_| GpuScopeProgress::Issued(node.0 as usize))
+            let indices = demand.retained_claim_indices(
+                    Some(node.0 as usize),
+                    inventory.contexts[key][0].parameters.crt_depth() - 1,
+                    |_| GpuScopeProgress::Issued(node.0 as usize),
+                )
                 .into_iter().filter(|index| !frame.initial.get(key).is_some_and(|contexts|
                     contexts.first().is_some_and(|claims| claims.iter().any(|(i, _)| i == index))))
                 .collect::<Vec<_>>();
@@ -1196,14 +1218,18 @@ impl GpuGraphInventory {
                             instance.index,
                             *wire,
                             members,
+                            self.inventory.contexts[key][0].parameters.crt_depth() - 1,
                             frame.progress[instance.index],
                         );
                         let mut contexts =
                             vec![BTreeSet::new(); self.inventory.contexts[key].len()];
                         for (begin, issued) in &frame.issued {
                             let Some(assignments) = issued.get(key) else { continue };
-                            let live =
-                                demand.retained_claim_indices(Some(*begin), |i| frame.progress[i]);
+                            let live = demand.retained_claim_indices(
+                                Some(*begin),
+                                self.inventory.contexts[key][0].parameters.crt_depth() - 1,
+                                |i| frame.progress[i],
+                            );
                             for (context, assignments) in contexts.iter_mut().zip(assignments) {
                                 context.extend(assignments.iter().filter_map(
                                     |(index, request)| {
@@ -1356,6 +1382,7 @@ impl GpuHypotheticalWave {
         instance: usize,
         wire: WireRef,
         members: &[usize],
+        full_level: usize,
         progress: mxx_runtime::backend::poly_gpu::GpuScopeProgress,
     ) -> std::collections::BTreeMap<
         (String, usize),
@@ -1364,7 +1391,8 @@ impl GpuHypotheticalWave {
         self.context_demands
             .par_iter()
             .map(|(key, (_, demand))| {
-                let indices = demand.value_claim_indices(instance, wire, members, progress);
+                let indices =
+                    demand.value_claim_indices(instance, wire, members, full_level, progress);
                 let contexts = self.assignments[key]
                     .par_iter()
                     .map(|assignment| indices.iter().map(|&index| assignment[index]).collect())
@@ -1655,10 +1683,100 @@ mod tests {
     use crate::dataflow::{ScopeAdmissionState, ValueStorage};
     use mxx_dsl::{DslContext, Family, Ring, parallel};
     use mxx_ir_core::{
+        artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        },
+        encoding,
         node::NodeKind,
-        types::{ConcreteWireType, Port},
+        types::{ConcreteMatrixType, ConcreteWireType, Port},
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_lazy_artifact_inputs_retire_after_single_scale_when_products_are_retained() {
+        let ring = Ring::new(257, 16);
+        let matrix =
+            ConcreteMatrixType { modulus: 257.into(), ring_dimension: 16, rows: 1, columns: 20 };
+        let production = ProductionId { spec_hash: SpecHash([41; 32]), execution_nonce: [42; 32] };
+        let manifest = Manifest {
+            ir_version: encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([
+                (
+                    "a".to_owned(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix.clone()),
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Public,
+                        content_hash: None,
+                        layout: None,
+                    },
+                ),
+                (
+                    "b".to_owned(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix.clone()),
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Public,
+                        content_hash: None,
+                        layout: None,
+                    },
+                ),
+            ]),
+        };
+        let a =
+            ring.artifact_input(production.clone(), "a", (1, 20), ArtifactConfidentiality::Public);
+        let b =
+            ring.artifact_input(production.clone(), "b", (1, 20), ArtifactConfidentiality::Public);
+        let graph = DslContext::new("lazy-artifact-input-retirement")
+            .output("a_product", 2 * a)
+            .unwrap()
+            .output("b_product", 3 * b)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let root = FrozenGraphScopeId::Root;
+        let optimizer = inventory_plan(&graph, false);
+        let liveness = owner_liveness(&graph, &root, &graph.bindings, &optimizer, false).unwrap();
+        let checked = graph.root_scope();
+        let source_scope = graph.source.scope(&root).unwrap();
+        let input_wires = checked
+            .execution_order
+            .iter()
+            .enumerate()
+            .filter_map(|(position, handle)| {
+                matches!(handle.kind(), NodeKind::Input { artifact: Some(_), .. })
+                    .then_some((position, WireRef { node: NodeId(position as u64), port: Port(0) }))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(input_wires.len(), 2);
+        for wire in input_wires.into_iter().map(|entry| entry.1) {
+            let scale_position = checked
+                .execution_order
+                .iter()
+                .enumerate()
+                .find(|entry| {
+                    let handle = entry.1;
+                    matches!(handle.kind(), NodeKind::MatrixBinary(_)) &&
+                        source_scope
+                            .arguments(handle)
+                            .is_some_and(|arguments| arguments.contains(&wire))
+                })
+                .map(|entry| entry.0)
+                .expect("each artifact input has one scalar scale consumer");
+            assert_eq!(liveness.until(wire), Some(scale_position));
+            assert!(
+                liveness.output_end(wire.node.0 as usize, 0) > scale_position,
+                "the old child-input borrowing extension must not define root input retirement"
+            );
+        }
+    }
 
     #[test]
     fn test_gpu_retained_scopes_drop_dead_packed_members_and_preserve_aliases() {
@@ -1922,6 +2040,7 @@ mod tests {
         // allocation/dispatch is sealed while lowering and typed planning run.
         let guard = GpuGraphAdmissionGuard::new(vec![params.clone()]).unwrap();
         let mut matrix_counts = Vec::new();
+        let mut setup_counts = Vec::new();
         for id in [0, 1] {
             let inputs = BTreeMap::from([
                 (wires[0], first.clone()),
@@ -2098,8 +2217,11 @@ mod tests {
                     [GpuContextInventory { parameters: params.clone(), slots: slots.clone() }];
                 let capacity = super::GpuColumnContextInventory { contexts: &capacity };
                 let cap = columns.div_ceil(2);
-                let invocations =
-                    selected.fit(&admissions, cap, std::slice::from_ref(&capacity)).unwrap();
+                let (invocations, setup) = selected
+                    .fit_with_setup(&admissions, cap, std::slice::from_ref(&capacity))
+                    .unwrap();
+                assert!(!setup.is_empty(), "selected native resources must produce setup claims");
+                setup_counts.push(setup.iter().map(|entry| entry.3.len()).sum::<usize>());
                 assert_eq!(
                     invocations[0].plan.schedule.local_job_counts(),
                     &[columns.div_ceil(cap)]
@@ -2137,7 +2259,7 @@ mod tests {
                 let position = graph.root_scope().execution_order.len();
                 assert!(
                     !context
-                        .retained_claim_indices(None, |_| {
+                        .retained_claim_indices(None, params.crt_depth() - 1, |_| {
                             mxx_runtime::backend::poly_gpu::GpuScopeProgress::Before(position)
                         })
                         .is_empty(),
@@ -2145,9 +2267,12 @@ mod tests {
                 );
                 let mut retained_inventory =
                     GpuContextInventory { parameters: params.clone(), slots: slots.clone() };
-                retained_inventory.exclude_retained(context, &assigned, |_| {
-                    mxx_runtime::backend::poly_gpu::GpuScopeProgress::Before(position)
-                });
+                retained_inventory.exclude_retained(
+                    context,
+                    &assigned,
+                    params.crt_depth() - 1,
+                    |_| mxx_runtime::backend::poly_gpu::GpuScopeProgress::Before(position),
+                );
                 assert!(
                     !super::GpuColumnContextInventory {
                         contexts: std::slice::from_ref(&retained_inventory),
@@ -2174,6 +2299,11 @@ mod tests {
             matrix_counts[1],
             matrix_counts[0] + 1,
             "equal-shaped independent inputs need one more normalization owner than a shared input"
+        );
+        assert_eq!(
+            setup_counts[1],
+            setup_counts[0] + 1,
+            "equal-shaped independent inputs need distinct setup claims"
         );
         // Negation preserves the artifact's payload format. Without reading
         // that payload, its returned format is unresolved and must stay unbound.
@@ -2351,22 +2481,49 @@ mod tests {
             .unwrap();
         for (_, context) in resources.contexts.values() {
             let progress = mxx_runtime::backend::poly_gpu::GpuScopeProgress::Before(usize::MAX);
-            let first = context.value_claim_indices(0, inner_family, &[0], progress);
-            let second = context.value_claim_indices(0, inner_family, &[1], progress);
+            let first = context.value_claim_indices(
+                0,
+                inner_family,
+                &[0],
+                params.crt_depth() - 1,
+                progress,
+            );
+            let second = context.value_claim_indices(
+                0,
+                inner_family,
+                &[1],
+                params.crt_depth() - 1,
+                progress,
+            );
             assert_eq!(first.len(), 1);
             assert_eq!(second.len(), 1);
             assert!(first.is_disjoint(&second));
             assert_eq!(
-                context.value_claim_indices(0, outer_scope.outputs()[0], &[], progress),
+                context.value_claim_indices(
+                    0,
+                    outer_scope.outputs()[0],
+                    &[],
+                    params.crt_depth() - 1,
+                    progress
+                ),
                 first
             );
-            assert_eq!(context.value_claim_indices(0, packed, &[0], progress), first);
             assert_eq!(
-                context.value_claim_indices(0, packed, &[1], progress),
+                context.value_claim_indices(0, packed, &[0], params.crt_depth() - 1, progress),
+                first
+            );
+            assert_eq!(
+                context.value_claim_indices(0, packed, &[1], params.crt_depth() - 1, progress),
                 first,
                 "both occurrences of a repeated pack member preserve its owner"
             );
-            let sibling = context.value_claim_indices(1, outer_scope.outputs()[0], &[], progress);
+            let sibling = context.value_claim_indices(
+                1,
+                outer_scope.outputs()[0],
+                &[],
+                params.crt_depth() - 1,
+                progress,
+            );
             assert_eq!(sibling.len(), 1);
             assert!(first.is_disjoint(&sibling));
         }
@@ -2471,6 +2628,7 @@ mod tests {
                 instance,
                 result_wire,
                 &[],
+                params.crt_depth() - 1,
                 mxx_runtime::backend::poly_gpu::GpuScopeProgress::Before(usize::MAX),
             )
         });
@@ -2492,18 +2650,20 @@ mod tests {
             use mxx_runtime::backend::poly_gpu::GpuScopeProgress::{Before, Issued};
             let position = result_wire.node.0 as usize;
             assert!(
-                !context.retained_claim_indices(None, |_| Before(0)).is_empty(),
+                !context
+                    .retained_claim_indices(None, params.crt_depth() - 1, |_| Before(0))
+                    .is_empty(),
                 "cold broadcasts are already placed before the first body node"
             );
-            let before = context.retained_claim_indices(None, |index| {
+            let before = context.retained_claim_indices(None, params.crt_depth() - 1, |index| {
                 assert!(index < 2);
                 Before(position)
             });
-            let mixed = context.retained_claim_indices(None, |index| {
+            let mixed = context.retained_claim_indices(None, params.crt_depth() - 1, |index| {
                 assert!(index < 2);
                 if index == 0 { Issued(position) } else { Before(position) }
             });
-            let issued = context.retained_claim_indices(None, |index| {
+            let issued = context.retained_claim_indices(None, params.crt_depth() - 1, |index| {
                 assert!(index < 2);
                 Issued(position)
             });

@@ -170,6 +170,12 @@ immutable fragment metadata with its native owner. Admission shares that metadat
 and later source selection consumes it without rescanning native shards. A value
 produced after admission uses its own published layout through the same source
 planner. Equal shapes never substitute for IDs.
+GPU operation lowering has one prepared representation, `PreparedOperation`, shared
+by IR admission, direct invocation preflight, and the compiled executor. Host-valued
+polynomial observations and threshold decoding are boundary requests over the same
+typed polynomial-readback operation; they do not create a parallel readback plan or
+matrix invocation queue. Native readback claims retain their exact level and
+coefficient/evaluation format through inventory demand and execution.
 Direct fleet calls use this same admission path rather than accepting externally
 assembled operation plans.
 Direct primitive preflight includes deferred upload spans and completion events

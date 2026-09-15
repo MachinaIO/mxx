@@ -1763,6 +1763,7 @@ extern "C" int gpu_matrix_reservation_partition(
         size_t offset = 0;
         for (size_t index = 0; index < child_count; ++index) {
             auto child = std::make_unique<GpuMatrixReservation>(reservation->storage);
+            child->region = reservation->region;
             child->slots.assign(reservation->slots.begin() + offset,
                                 reservation->slots.begin() + offset + counts[index]);
             child->claims = std::make_shared<std::vector<PreparedClaim>>(

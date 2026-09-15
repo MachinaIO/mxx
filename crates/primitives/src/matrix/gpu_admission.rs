@@ -2230,6 +2230,37 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
+    fn test_gpu_partitioned_reservations_retain_region_until_last_child_drops() {
+        let (_, params) = parameters();
+        let storage = Arc::new(
+            GpuPreparedStorage::new(
+                None,
+                vec![
+                    GpuDCRTPolyMatrix::zero(&params, 1, 1),
+                    GpuDCRTPolyMatrix::zero(&params, 1, 1),
+                    GpuDCRTPolyMatrix::zero(&params, 1, 1),
+                ],
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let region = Arc::new(storage.reserve_region(&[0, 1, 2], None).unwrap().unwrap());
+        let regional_storage = region.storage();
+        let parent = reserve(&regional_storage, &[0, 1]).unwrap();
+        drop(regional_storage);
+        drop(region);
+
+        let mut children = parent.partition(&[1, 1]).unwrap();
+        assert!(storage.reserve_region(&[2], None).unwrap().is_none());
+        drop(children.pop().unwrap());
+        assert!(storage.reserve_region(&[2], None).unwrap().is_none());
+        drop(children.pop().unwrap());
+        assert!(storage.reserve_region(&[2], None).unwrap().is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_prevalidated_claim_handle_activates_inside_region() {
         let (_, params) = parameters();
         let storage = Arc::new(

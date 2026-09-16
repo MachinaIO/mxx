@@ -8,19 +8,99 @@ use super::{
         MatrixSlotKey, PreparedMatrixInputs, PreparedMatrixSource, select_matrix_input,
         select_prepared_matrix,
     },
+    gpu_prepared_lowering::{PreparedBindingId, PreparedStorageBinding},
     *,
 };
 use crate::gpu_memory::{
     GpuAdmissionError, GpuColumnAllocations, GpuColumnMemoryRequirements, GpuColumnWidthPolicy,
-    GpuMemoryLedger, GpuOutputOwnership,
+    GpuMemoryLedger, GpuMemoryRegion, GpuOutputOwnership, GpuPreparedAllocationRequirement,
 };
 use mxx_ir_core::types::ConcreteMatrixType;
 use mxx_primitives::matrix::gpu_dcrt_poly::{
     GpuPreparedRequest, GpuPreparedSlotIdentity, GpuPreparedSlotKind, GpuPreparedSlotSnapshot,
     GpuPreparedStorage, GpuPreparedWorkspaceLayout, GpuTracedClaim,
 };
+use std::collections::BTreeSet;
 
 pub type GpuSetupClaim = (usize, usize, ConcreteMatrixType, Vec<GpuTracedClaim>);
+
+fn reserve_preimage_intermediate_region(
+    ledger: &mut GpuMemoryLedger,
+    inventory: &[(usize, Arc<GpuPreparedStorage>)],
+    parameters: &GpuDCRTPolyParams,
+    claims: &[GpuTracedClaim],
+) -> Result<
+    (Arc<GpuMemoryRegion>, BTreeMap<PreparedBindingId, PreparedStorageBinding>),
+    PolyBackendError,
+> {
+    let mut used = BTreeSet::new();
+    let mut bindings = BTreeMap::new();
+    let mut selected =
+        BTreeMap::<u64, (usize, Arc<GpuPreparedStorage>, Vec<GpuPreparedRequest>)>::new();
+    for (claim_index, claim) in claims.iter().enumerate() {
+        let selected_slot = inventory.iter().find_map(|(device, storage)| {
+            if storage.device() != parameters.device_ids()[0] ||
+                storage.context_identity() != parameters.context_identity()
+            {
+                return None;
+            }
+            let snapshots = storage.snapshot().ok()?;
+            snapshots.iter().find_map(|snapshot| {
+                if !snapshot.is_available() {
+                    return None;
+                }
+                let request = snapshot.request(parameters, claim).ok()??;
+                used.insert(request.slot_key()).then_some((*device, Arc::clone(storage), request))
+            })
+        });
+        let (device, storage, request) = selected_slot.ok_or_else(|| {
+            PolyBackendError::GpuSubmission(
+                "accepted prepared storage cannot fit preimage intermediate demand".into(),
+            )
+        })?;
+        selected
+            .entry(storage.identity())
+            .or_insert_with(|| (device, Arc::clone(&storage), Vec::new()))
+            .2
+            .push(request);
+        let slot = storage
+            .slot_identity(request.slot_key().2)
+            .ok_or_else(|| PolyBackendError::GpuSubmission("preimage slot disappeared".into()))?;
+        bindings.insert(
+            PreparedBindingId {
+                owner: claim_index as u64,
+                device: storage.device(),
+                instance: claim_index / 6,
+                storage: Some(PreparedStorageBinding {
+                    storage_id: slot.storage_id(),
+                    slot_id: slot.slot_id(),
+                    slot_index: slot.slot_index(),
+                    context: storage.context_identity(),
+                    basis: request.level().unwrap_or_default(),
+                }),
+            },
+            PreparedStorageBinding {
+                storage_id: slot.storage_id(),
+                slot_id: slot.slot_id(),
+                slot_index: slot.slot_index(),
+                context: storage.context_identity(),
+                basis: request.level().unwrap_or_default(),
+            },
+        );
+    }
+    let requirements = selected
+        .values()
+        .map(|(device, storage, requests)| GpuPreparedAllocationRequirement {
+            device: *device,
+            storage,
+            requests,
+        })
+        .collect::<Vec<_>>();
+    let region = ledger
+        .reserve_detached_region(&requirements, usize::MAX)
+        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+    Ok((region, bindings))
+}
 
 /// Complete metadata consumed by shared destination/input/scratch selection.
 pub struct MatrixPlacementInvocation {
@@ -294,7 +374,7 @@ impl GpuMatrixLayoutPlan {
                         }
                     }
                 }
-                if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } =
+                if let PreparedOperation::Preimage { ty, bound, public_rows, command, .. } =
                     &self.operations[index]
                 {
                     let width =
@@ -308,13 +388,7 @@ impl GpuMatrixLayoutPlan {
                         .outputs
                         .iter()
                         .filter(|output| output.interval.device == region.device)
-                        .find(|output| {
-                            region.outputs.prepared.iter().any(|(_, requests)| {
-                                requests
-                                    .iter()
-                                    .any(|request| output.request.slot_key() == request.slot_key())
-                            })
-                        })
+                        .next()
                         .map(|output| output.sources.parameters.clone())
                         .or_else(|| {
                             requirements
@@ -341,7 +415,7 @@ impl GpuMatrixLayoutPlan {
                             )
                         })?;
                     let claims = preimage_replay_claims(
-                        plan,
+                        &command.plan,
                         &parameters,
                         *public_rows,
                         width,
@@ -811,6 +885,7 @@ impl GpuDcrtBackend {
         prepared: Vec<(usize, Arc<GpuPreparedStorage>)>,
         external_pool_exclusive: bool,
     ) -> Result<(), PolyBackendError> {
+        crate::backend::poly_gpu::record_provisioning_begin();
         use mxx_primitives::poly::dcrt::gpu::{
             GpuAllocationEpochBoundary, GpuAllocationEpochObservation,
         };
@@ -888,7 +963,8 @@ impl GpuDcrtBackend {
         self.prepared_required = true;
         self.pending_pilot = None;
         self.pending_profile = None;
-        self.operation_profiles.clear();
+        self.pending_calibration = None;
+        self.measurement_cache.clear();
         Ok(())
     }
 
@@ -901,6 +977,7 @@ impl GpuDcrtBackend {
         matrix_inventory: &super::gpu_prepare::MatrixSlotInventory,
         deferred: &HashSet<u64>,
     ) -> Result<GpuMatrixLayoutPlan, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(4);
         let mut chosen = HashSet::new();
         let mut preparation = Vec::new();
         let mut planned = HashSet::new();
@@ -1336,7 +1413,7 @@ impl GpuDcrtBackend {
                 .map(|output| output.interval.end - output.interval.start)
                 .max()
                 .unwrap();
-            if let PreparedOperation::Preimage { ty, bound, public_rows, plan, .. } = operation {
+            if let PreparedOperation::Preimage { ty, bound, public_rows, command, .. } = operation {
                 // Step claims use the same accepted inventory as fixed and
                 // retained output owners. Bound the native allocation class
                 // before width selection, including the arbitrary-width tail.
@@ -1364,13 +1441,17 @@ impl GpuDcrtBackend {
                     let mut high = maximum;
                     while low < high {
                         let width = low + (high - low).div_ceil(2);
-                        let mut claims = plan.destination.clone();
+                        let mut claims = command.plan.destination.clone();
                         claims.extend(
-                            plan.tile_claims(params, *public_rows, width)
+                            command
+                                .plan
+                                .tile_claims(params, *public_rows, width)
                                 .map_err(PolyBackendError::GpuCalibration)?,
                         );
                         claims.extend(
-                            plan.attempt_claims(params, *public_rows, width, ty.rows, bound)
+                            command
+                                .plan
+                                .attempt_claims(params, *public_rows, width, ty.rows, bound)
                                 .map_err(PolyBackendError::GpuCalibration)?
                                 .into_iter()
                                 .flatten(),
@@ -1546,6 +1627,7 @@ impl GpuDcrtBackend {
         column_cap: usize,
         expected: Option<&[super::gpu_compiled::GpuAdmittedInvocationSummary]>,
     ) -> Result<(), PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(3);
         let lowered = matrices
             .iter()
             .zip(compact)
@@ -1715,6 +1797,7 @@ impl GpuDcrtBackend {
         column_cap: usize,
         expected: Option<&[super::gpu_compiled::GpuAdmittedInvocationSummary]>,
     ) -> Result<(), PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(3);
         if lowered.is_empty() {
             return Ok(());
         }
@@ -1831,6 +1914,7 @@ impl GpuDcrtBackend {
             }
             let mut admitted = Vec::with_capacity(lowered.len());
             let mut selected_fits = Vec::with_capacity(lowered.len());
+            let mut preimage_outputs = (0..lowered.len()).map(|_| Vec::new()).collect::<Vec<_>>();
             for (index, invocation) in lowered.into_iter().enumerate() {
                 let requirements = &layouts[index].1;
                 let intervals =
@@ -1852,13 +1936,128 @@ impl GpuDcrtBackend {
                         &requirements.resources,
                     )
                     .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
-                let plan = ledger
+                let mut plan = ledger
                     .commit_columns(fit.clone())
                     .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+                let fit =
+                    if let PreparedOperation::Preimage { ty, bound, .. } = &invocation.operation {
+                        let owners = plan
+                            .prepare_preimage_outputs(|device| {
+                                requirements
+                                    .outputs
+                                    .iter()
+                                    .filter(|output| output.interval.device == device)
+                                    .map(|output| {
+                                        let owner = GpuSmallMatrix::new_zero(
+                                            &output.sources.parameters,
+                                            ty.rows,
+                                            output.interval.end - output.interval.start,
+                                            bound.clone(),
+                                        )
+                                        .map_err(|error| {
+                                            GpuAdmissionError::NativeReservation(error.to_string())
+                                        })?;
+                                        owner.prepare_preimage_hard_cutoff();
+                                        Ok(Arc::new(owner))
+                                    })
+                                    .collect::<Result<Vec<_>, GpuAdmissionError>>()
+                            })
+                            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+                        for (device, owners) in owners {
+                            let ranges = requirements
+                                .outputs
+                                .iter()
+                                .filter(|output| output.interval.device == device);
+                            for (output, owner) in ranges.zip(owners) {
+                                preimage_outputs[index].push(
+                                    super::gpu_compiled::PreparedPreimageOutput::new(
+                                        device,
+                                        output.interval.start,
+                                        output.interval.end,
+                                        owner,
+                                    ),
+                                );
+                            }
+                        }
+                        fit.without_prepared_outputs()
+                    } else {
+                        fit
+                    };
                 selected_fits.push(fit);
                 let sources: Vec<AdmittedMatrixBinding> =
                     requirements.outputs.iter().map(|output| output.sources.clone()).collect();
                 admitted.push((invocation, plan, sources));
+            }
+            // Bind every width/context-specific preimage command tape before
+            // publication. Production execution only looks up these tapes;
+            // it cannot derive claims or phase owners after admission.
+            let preimage_concurrency = admitted.len().max(1);
+            for (index, (invocation, _, _)) in admitted.iter_mut().enumerate() {
+                let PreparedOperation::Preimage { ty, bound, public_rows, command, .. } =
+                    &mut invocation.operation
+                else {
+                    continue;
+                };
+                command.tapes.clear();
+                let requirements = &layouts[index].1;
+                for region in selected_fits[index].regions() {
+                    let region_device = region.device;
+                    let width = if region.device == 0 {
+                        selected_fits[index].widths().gpu0
+                    } else {
+                        selected_fits[index].widths().nonzero
+                    }
+                    .ok_or_else(|| {
+                        PolyBackendError::GpuSubmission(
+                            "preimage command tape has no accepted device width".into(),
+                        )
+                    })?;
+                    let parameters = requirements
+                        .outputs
+                        .iter()
+                        .filter(|output| output.interval.device == region.device)
+                        .next()
+                        .map(|output| output.sources.parameters.clone())
+                        .ok_or_else(|| {
+                            PolyBackendError::GpuSubmission(
+                                "preimage command tape has no parameter context".into(),
+                            )
+                        })?;
+                    let attempt_claims = command
+                        .plan
+                        .attempt_claims(&parameters, *public_rows, width, ty.rows, bound)
+                        .map_err(PolyBackendError::GpuSubmission)?;
+                    let intermediate_claims = (0..preimage_concurrency)
+                        .flat_map(|_| [0usize, 2, 5, 7, 8, 11])
+                        .flat_map(|phase| attempt_claims[phase].iter().copied())
+                        .filter(|claim| claim.kind() == GpuPreparedSlotKind::Matrix)
+                        .collect::<Vec<_>>();
+                    let (region, bindings) = reserve_preimage_intermediate_region(
+                        &mut ledger,
+                        inventory.as_ref(),
+                        &parameters,
+                        &intermediate_claims,
+                    )?;
+                    command
+                        .add_tape(
+                            &parameters,
+                            width,
+                            region,
+                            bindings,
+                            preimage_concurrency,
+                            preimage_outputs[index]
+                                .iter()
+                                .filter(|output| output.device == region_device)
+                                .cloned()
+                                .collect(),
+                        )
+                        .map_err(PolyBackendError::GpuSubmission)?;
+                }
+                if command.tapes.is_empty() {
+                    return Err(PolyBackendError::GpuSubmission(
+                        "preimage command tape has no admitted device region".into(),
+                    ));
+                }
             }
             let input_owners = admitted
                 .iter()
@@ -2016,7 +2215,9 @@ impl GpuDcrtBackend {
                             self.prepared_matrix_cache_fallbacks += 1;
                             self.prepared_matrix_cache_stale_fits += 1;
                         }
-                        return Ok(false);
+                        return Err(PolyBackendError::GpuSubmission(
+                            "cached matrix admission fit is stale".into(),
+                        ));
                     }
                     Err(GpuAdmissionError::AcquisitionConflict(_)) => {
                         #[cfg(test)]
@@ -2024,7 +2225,9 @@ impl GpuDcrtBackend {
                             self.prepared_matrix_cache_fallbacks += 1;
                             self.prepared_matrix_cache_stale_fits += 1;
                         }
-                        return Ok(false);
+                        return Err(PolyBackendError::GpuSubmission(
+                            "cached matrix admission has an acquisition conflict".into(),
+                        ));
                     }
                     Err(GpuAdmissionError::UnknownPreparedStorage) => {
                         #[cfg(test)]
@@ -2032,7 +2235,9 @@ impl GpuDcrtBackend {
                             self.prepared_matrix_cache_fallbacks += 1;
                             self.prepared_matrix_cache_storage_fallbacks += 1;
                         }
-                        return Ok(false);
+                        return Err(PolyBackendError::GpuSubmission(
+                            "cached matrix admission references unknown storage".into(),
+                        ));
                     }
                     Err(error) => return Err(PolyBackendError::GpuSubmission(error.to_string())),
                 };
@@ -2108,7 +2313,9 @@ impl GpuDcrtBackend {
                         self.prepared_matrix_cache_fallbacks += 1;
                         self.prepared_matrix_cache_storage_fallbacks += 1;
                     }
-                    return Ok(false);
+                    return Err(PolyBackendError::GpuSubmission(
+                        "cached matrix input admission has an acquisition conflict".into(),
+                    ));
                 }
                 Err(error) => return Err(error),
             };
@@ -2325,7 +2532,7 @@ mod tests {
             destination: vec![GpuTracedClaim::matrix(1, 1, 0, false)],
             tile: vec![GpuTracedClaim::matrix(1, 1, 0, false)],
             attempt: std::array::from_fn(|_| vec![GpuTracedClaim::matrix(1, 1, 0, false)]),
-            attempts: 16,
+            replay: super::gpu_compiled::PreimageReplayPlan::new(16).unwrap(),
             bytes_per_poly: 0,
         }
     }
@@ -2357,5 +2564,22 @@ mod tests {
         extras.extend(first.iter().copied());
         extras.extend(second.iter().copied());
         assert_eq!(extras.len(), first.len() * 2);
+    }
+
+    #[test]
+    fn preimage_replay_schedule_is_independent_of_seed_and_target() {
+        let schedule = super::gpu_compiled::PreimageReplayPlan::new(7).unwrap();
+        // Seeds and targets are deliberately not represented by the prepared
+        // schedule.  Changing either operand therefore reuses the same fixed
+        // bounded native phase plan.
+        let first_seed = [0x11; 32];
+        let second_seed = [0x22; 32];
+        let first_target = vec![1u8, 2, 3];
+        let second_target = vec![9u8, 8, 7];
+        assert_ne!(first_seed, second_seed);
+        assert_ne!(first_target, second_target);
+        assert_eq!(schedule, schedule.clone());
+        assert!(schedule.validate_attempt(6).is_ok());
+        assert!(schedule.validate_attempt(7).is_err());
     }
 }

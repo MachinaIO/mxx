@@ -1222,6 +1222,397 @@ extern "C" int gpu_matrix_store_const_coeff_batch(
     return serde_build_event_set_from_streams(mat->ctx, streams, out_events);
 }
 
+struct GpuPreparedConstCoeffReadbackLimb
+{
+    size_t ordinal;
+    dim3 limb_id;
+    int device;
+    cudaStream_t stream;
+    const uint8_t *source;
+    size_t source_pitch;
+    uint8_t source_width;
+    cudaEvent_t completion;
+    std::unique_ptr<GpuCudaResource> completion_resource;
+};
+
+struct GpuPreparedConstCoeffReadback
+{
+    const GpuMatrix *matrix;
+    uint64_t *words;
+    size_t polynomial_count;
+    size_t words_per_poly;
+    size_t coefficient_index;
+    size_t coefficient_count;
+    std::vector<GpuPreparedConstCoeffReadbackLimb> limbs;
+};
+
+extern "C" int gpu_matrix_prepare_const_coeff_readback(
+    const GpuMatrix *mat,
+    uint64_t *words_out,
+    size_t words_per_poly,
+    size_t coefficient_index,
+    size_t coefficient_count,
+    GpuPreparedConstCoeffReadback **out_plan)
+{
+    if (!out_plan)
+        return set_error("null prepared coefficient readback output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution || mat->format != GPU_POLY_FORMAT_COEFF)
+        return set_error("invalid prepared coefficient readback matrix");
+    if (mat->level < 0 || mat->ctx->N <= 0 || coefficient_count == 0 ||
+        coefficient_index >= static_cast<size_t>(mat->ctx->N) ||
+        coefficient_count > static_cast<size_t>(mat->ctx->N) - coefficient_index)
+        return set_error("invalid prepared coefficient readback dimensions");
+
+    size_t polynomial_count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &polynomial_count))
+        return set_error("prepared coefficient readback matrix size overflow");
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    if (polynomial_count == 0 || !words_out ||
+        words_per_poly < limb_count * coefficient_count)
+        return set_error("invalid prepared coefficient readback output");
+    size_t total_words = 0;
+    if (!serde_checked_mul_size(polynomial_count, words_per_poly, &total_words))
+        return set_error("prepared coefficient readback output size overflow");
+    if (mat->ctx->limb_gpu_ids.size() < limb_count)
+        return set_error("prepared coefficient readback limb metadata is incomplete");
+
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+    auto *prepared = new GpuPreparedConstCoeffReadback{
+        mat, words_out, polynomial_count, words_per_poly,
+        coefficient_index, coefficient_count, {}};
+    try
+    {
+        prepared->limbs.reserve(limb_count);
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+            const uint8_t *source_base = matrix_limb_ptr_by_id(mat, 0, limb_id);
+            if (!source_base)
+                throw std::runtime_error("null prepared coefficient readback source");
+
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+                throw std::runtime_error("invalid prepared coefficient readback limb device");
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0 || !stream)
+                throw std::runtime_error("invalid prepared coefficient readback stream");
+
+            size_t source_pitch = 0;
+            uint8_t source_width = 0;
+            if (!matrix_limb_metadata_by_id(mat, limb_id, &source_pitch, &source_width) ||
+                source_width == 0 ||
+                source_pitch < static_cast<size_t>(mat->ctx->N) * source_width)
+                throw std::runtime_error("invalid prepared coefficient readback layout");
+            const uint8_t *source = source_base + coefficient_index * source_width;
+
+            auto completion = std::make_unique<GpuCudaResource>();
+            const int resource_status =
+                completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (resource_status != 0)
+                throw std::runtime_error("failed to acquire prepared readback completion event");
+            prepared->limbs.push_back(GpuPreparedConstCoeffReadbackLimb{
+                limb,
+                limb_id,
+                device,
+                stream,
+                source,
+                source_pitch,
+                source_width,
+                completion->event,
+                std::move(completion),
+            });
+        }
+    }
+    catch (const std::exception &error)
+    {
+        delete prepared;
+        return set_error(error.what());
+    }
+    *out_plan = prepared;
+    return 0;
+}
+
+extern "C" int gpu_matrix_submit_const_coeff_readback(
+    const GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx || !plan->words ||
+        plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback plan");
+    size_t total_words = 0;
+    if (!serde_checked_mul_size(plan->polynomial_count, plan->words_per_poly, &total_words))
+        return set_error("prepared coefficient readback output size overflow");
+    std::fill_n(plan->words, total_words, static_cast<uint64_t>(0));
+
+    for (const auto &limb : plan->limbs)
+    {
+        cudaError_t error = cudaSetDevice(limb.device);
+        if (error != cudaSuccess)
+            return set_error(error);
+        int status = matrix_wait_limb_stream(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, true, true);
+        if (status != 0)
+            return status;
+        auto *destination = reinterpret_cast<uint8_t *>(plan->words) +
+            limb.ordinal * plan->coefficient_count * sizeof(uint64_t);
+        error = cudaMemcpy2DAsync(
+            destination,
+            plan->words_per_poly * sizeof(uint64_t),
+            limb.source,
+            limb.source_pitch,
+            static_cast<size_t>(limb.source_width) * plan->coefficient_count,
+            plan->polynomial_count,
+            cudaMemcpyDeviceToHost,
+            limb.stream);
+        if (error != cudaSuccess)
+            return set_error(error);
+        error = cudaEventRecord(limb.completion, limb.stream);
+        if (error != cudaSuccess)
+            return set_error(error);
+        status = matrix_track_limb_consumer_readonly(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, limb.completion, true);
+        if (status != 0)
+            return status;
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_wait_const_coeff_readback(
+    const GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan || plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback wait");
+    for (const auto &limb : plan->limbs)
+    {
+        const cudaError_t error = cudaEventSynchronize(limb.completion);
+        if (error != cudaSuccess)
+            return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" void gpu_matrix_destroy_const_coeff_readback(
+    GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan) return;
+    delete plan;
+}
+
+struct GpuPreparedRnsUploadLimb
+{
+    size_t ordinal;
+    dim3 limb_id;
+    int device;
+    cudaStream_t stream;
+    GpuMatrix::SharedLimbBuffer::DeviceDescriptor *destination;
+    size_t staging_bytes;
+    size_t blocks;
+    std::unique_ptr<GpuDeviceWorkspace> workspace;
+    std::unique_ptr<GpuCudaResource> completion_resource;
+};
+
+struct GpuPreparedRnsUpload
+{
+    GpuMatrix *matrix;
+    const uint8_t *host_bytes;
+    size_t bytes_per_poly;
+    size_t polynomial_count;
+    size_t limb_count;
+    GpuPolyFormat format;
+    bool transform_to_eval;
+    GpuMatrixTransformPlan *transform;
+    std::vector<GpuPreparedRnsUploadLimb> limbs;
+};
+
+extern "C" int gpu_matrix_prepare_rns_upload(
+    GpuMatrix *mat,
+    const uint8_t *bytes,
+    size_t bytes_per_poly,
+    int format,
+    bool transform_to_eval,
+    GpuPreparedRnsUpload **out_plan)
+{
+    if (!out_plan)
+        return set_error("null prepared RNS upload output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution || !bytes || mat->level < 0 ||
+        mat->ctx->N <= 0)
+        return set_error("invalid prepared RNS upload arguments");
+    GpuPolyFormat target_format;
+    if (!parse_format(format, target_format))
+        return set_error("invalid prepared RNS upload format");
+    if (transform_to_eval && target_format != GPU_POLY_FORMAT_COEFF)
+        return set_error("prepared RNS upload transform requires coefficient input");
+    if (transform_to_eval && mat->format != GPU_POLY_FORMAT_EVAL)
+        return set_error("prepared RNS upload transform requires evaluation destination");
+    if (!transform_to_eval && mat->format != target_format)
+        return set_error("prepared RNS upload destination format mismatch");
+
+    size_t polynomial_count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &polynomial_count) || polynomial_count == 0)
+        return set_error("invalid prepared RNS upload matrix size");
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    size_t expected_words = 0;
+    size_t expected_bytes = 0;
+    if (!serde_checked_mul_size(limb_count, static_cast<size_t>(mat->ctx->N), &expected_words) ||
+        !serde_checked_mul_size(expected_words, sizeof(uint64_t), &expected_bytes) ||
+        bytes_per_poly < expected_bytes)
+        return set_error("prepared RNS upload byte span is too small");
+    if (mat->ctx->limb_gpu_ids.size() < limb_count)
+        return set_error("prepared RNS upload limb metadata is incomplete");
+
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+    auto *prepared = new GpuPreparedRnsUpload{
+        mat, bytes, bytes_per_poly, polynomial_count, limb_count, target_format,
+        transform_to_eval, nullptr, {}};
+    try
+    {
+        prepared->limbs.reserve(limb_count);
+        const size_t host_limb_bytes = static_cast<size_t>(mat->ctx->N) * sizeof(uint64_t);
+        const size_t total_coefficients = polynomial_count * static_cast<size_t>(mat->ctx->N);
+        const size_t blocks = (total_coefficients + 255) / 256;
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+            if (limb_id.x >= mat->shared_limb_buffers.size())
+                throw std::runtime_error("invalid prepared RNS upload partition");
+            auto &buffer = mat->shared_limb_buffers[limb_id.x];
+            if (!buffer.device_descriptors || limb_id.y >= buffer.limb_count)
+                throw std::runtime_error("missing prepared RNS upload descriptors");
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+                throw std::runtime_error("invalid prepared RNS upload device");
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0 || !stream)
+                throw std::runtime_error("invalid prepared RNS upload stream");
+
+            auto workspace = std::make_unique<GpuDeviceWorkspace>();
+            const size_t staging_bytes = total_coefficients * sizeof(uint64_t);
+            status = workspace->acquire(
+                mat->ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE,
+                staging_bytes, alignof(uint64_t), stream);
+            if (status != 0)
+                throw std::runtime_error("failed to acquire prepared RNS upload workspace");
+            auto completion = std::make_unique<GpuCudaResource>();
+            status = completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status != 0)
+                throw std::runtime_error("failed to acquire prepared RNS upload completion event");
+            prepared->limbs.push_back(GpuPreparedRnsUploadLimb{
+                limb,
+                limb_id,
+                device,
+                stream,
+                buffer.device_descriptors + limb_id.y,
+                staging_bytes,
+                blocks,
+                std::move(workspace),
+                std::move(completion),
+            });
+            if (host_limb_bytes > bytes_per_poly)
+                throw std::runtime_error("prepared RNS upload host stride is invalid");
+        }
+        if (transform_to_eval)
+        {
+            const GpuMatrixRange range{0, mat->rows, 0, mat->cols};
+            const int status = gpu_matrix_prepare_ntt_plan(
+                mat, &range, true, &prepared->transform);
+            if (status != 0)
+                throw std::runtime_error("failed to prepare RNS upload NTT transform");
+        }
+    }
+    catch (const std::exception &error)
+    {
+        if (prepared->transform)
+            gpu_matrix_destroy_ntt_plan(prepared->transform);
+        delete prepared;
+        return set_error(error.what());
+    }
+    *out_plan = prepared;
+    return 0;
+}
+
+extern "C" int gpu_matrix_submit_rns_upload(const GpuPreparedRnsUpload *plan)
+{
+    if (!plan || !plan->matrix || !plan->host_bytes || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload plan");
+    const size_t host_limb_bytes = static_cast<size_t>(plan->matrix->ctx->N) * sizeof(uint64_t);
+    for (const auto &limb : plan->limbs)
+    {
+        cudaError_t error = cudaSetDevice(limb.device);
+        if (error != cudaSuccess)
+            return set_error(error);
+        int status = matrix_wait_limb_stream(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, true, false);
+        if (status != 0)
+            return status;
+        auto *staging = reinterpret_cast<uint64_t *>(limb.workspace->data);
+        const auto *source = plan->host_bytes + limb.ordinal * host_limb_bytes;
+        error = cudaMemcpy2DAsync(
+            staging,
+            limb.staging_bytes / plan->polynomial_count,
+            source,
+            plan->bytes_per_poly,
+            host_limb_bytes,
+            plan->polynomial_count,
+            cudaMemcpyHostToDevice,
+            limb.stream);
+        if (error != cudaSuccess)
+            return set_error(error);
+        serde_pack_u64_limbs_to_packed_kernel<<<
+            static_cast<unsigned int>(limb.blocks), 256, 0, limb.stream>>>(
+            staging, limb.destination, 1, plan->polynomial_count,
+            static_cast<size_t>(plan->matrix->ctx->N));
+        error = cudaGetLastError();
+        if (error != cudaSuccess)
+            return set_error(error);
+        status = matrix_record_limb_write(plan->matrix, limb.limb_id, limb.stream, true);
+        if (status != 0)
+            return status;
+    }
+    if (plan->transform_to_eval)
+    {
+        const int status = gpu_matrix_submit_ntt_plan(plan->transform, plan->matrix);
+        if (status != 0)
+            return status;
+    }
+    else
+    {
+        plan->matrix->format = plan->format;
+    }
+    for (const auto &limb : plan->limbs)
+    {
+        const cudaError_t error = cudaEventRecord(limb.completion_resource->event, limb.stream);
+        if (error != cudaSuccess)
+            return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_wait_rns_upload(const GpuPreparedRnsUpload *plan)
+{
+    if (!plan || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload wait");
+    for (const auto &limb : plan->limbs)
+    {
+        const cudaError_t error = cudaEventSynchronize(limb.completion_resource->event);
+        if (error != cudaSuccess)
+            return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" void gpu_matrix_destroy_rns_upload(GpuPreparedRnsUpload *plan)
+{
+    if (!plan) return;
+    if (plan->transform)
+        gpu_matrix_destroy_ntt_plan(plan->transform);
+    delete plan;
+}
+
 extern "C" int gpu_poly_store_compact_bytes(
     GpuMatrix *poly,
     uint8_t *payload_out,

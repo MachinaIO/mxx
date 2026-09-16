@@ -40,6 +40,13 @@ extern "C"
     int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped_moduli);
     int gpu_matrix_decompose_base_small(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out);
 
+    typedef struct GpuPreparedGadgetDecompose GpuPreparedGadgetDecompose;
+    int gpu_matrix_prepare_gadget_decompose(
+        const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out,
+        int small, size_t dropped_moduli, GpuPreparedGadgetDecompose **plan);
+    int gpu_matrix_submit_gadget_decompose(const GpuPreparedGadgetDecompose *plan);
+    void gpu_matrix_destroy_gadget_decompose(GpuPreparedGadgetDecompose *plan);
+
 #ifdef __cplusplus
 }
 #endif

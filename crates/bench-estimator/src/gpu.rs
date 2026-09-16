@@ -38,10 +38,10 @@ use mxx_runtime::{
     },
     gpu_calibration::{
         GpuAllocationClass, GpuCalibrationKey, GpuCalibrationMetric, GpuCalibrationObservation,
-        GpuCalibrationProfile, GpuCalibrationRegistry, GpuColumnWidths, GpuDeviceCalibration,
-        GpuDeviceMemory, gpu_calibration_environment, gpu_calibration_operation_identity,
-        gpu_capped_waterfill_columns, gpu_matrix_multiply_scales_left,
-        gpu_operation_is_column_separable_for_types,
+        GpuCalibrationProfile, GpuCalibrationRegistry, GpuCalibrationResourceSignature,
+        GpuColumnWidths, GpuDeviceCalibration, GpuDeviceMemory, gpu_calibration_environment,
+        gpu_calibration_operation_identity, gpu_capped_waterfill_columns,
+        gpu_matrix_multiply_scales_left, gpu_operation_is_column_separable_for_types,
     },
     gpu_enqueue::GpuEnqueuePool,
     gpu_schedule::{GpuColumnInterval, GpuColumnJob, GpuColumnSchedule},
@@ -182,10 +182,14 @@ impl PreparedMeasurement {
     }
 
     fn finish(&self) {
-        self.arguments.iter().flatten().for_each(|value| value.wait_until_ready());
-        self.small_arguments.iter().flatten().for_each(|value| value.wait_until_ready());
+        self.arguments.iter().flatten().for_each(|value| {
+            let _ = value.wait_until_ready();
+        });
+        self.small_arguments.iter().flatten().for_each(|value| {
+            let _ = value.wait_until_ready();
+        });
         if let Some((public, trapdoor, ..)) = &self.preimage_trapdoor {
-            public.wait_until_ready();
+            let _ = public.wait_until_ready();
             trapdoor.wait_until_ready();
         }
     }
@@ -1199,6 +1203,7 @@ impl GpuNodeMeasurementBackend {
         let calibration_key = GpuCalibrationKey::new(
             operation.as_slice(),
             gpu_calibration_environment(&representative_device, self.workers.len(), vram_percent),
+            GpuCalibrationResourceSignature::default(),
             GpuAllocationClass {
                 identity: operation,
                 bound_identity: None,
@@ -4672,7 +4677,7 @@ mod tests {
                 for shard in first.shards() {
                     assert_eq!(shard.value.level(), level);
                     assert_eq!(shard.value.is_ntt(), evaluation);
-                    let restored = -(-&shard.value);
+                    let restored = -(-shard.value.as_ref());
                     assert_eq!(restored.to_rns_snapshot(), shard.value.to_rns_snapshot());
                 }
             }

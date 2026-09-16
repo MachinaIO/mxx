@@ -216,6 +216,7 @@ namespace
                 blocks_x,
                 static_cast<uint32_t>(chunk),
                 static_cast<uint32_t>(limb_count)};
+            gpu_test_record_kernel_launch();
             ntt_twist_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 layout,
                 twiddles,
@@ -264,6 +265,7 @@ namespace
                 blocks_x,
                 static_cast<uint32_t>(chunk),
                 static_cast<uint32_t>(limb_count)};
+            gpu_test_record_kernel_launch();
             ntt_scale_all_limbs_kernel<<<grid, kTransformThreads, 0, stream>>>(
                 layout,
                 moduli,
@@ -315,6 +317,7 @@ namespace
                 blocks_x,
                 static_cast<uint32_t>(chunk),
                 static_cast<uint32_t>(limb_count)};
+            gpu_test_record_kernel_launch();
             ntt_stage_all_limbs_kernel<ForwardDif><<<grid, kTransformThreads, 0, stream>>>(
                 layout,
                 twiddles,
@@ -445,7 +448,8 @@ namespace
         {
             const size_t chunk = std::min(kMaxGridY, poly_count - offset);
             const dim3 grid(n / tile_size, static_cast<uint32_t>(chunk), static_cast<uint32_t>(limb_count));
-            ntt_fused_local_stages_kernel<Forward><<<
+                gpu_test_record_kernel_launch();
+                ntt_fused_local_stages_kernel<Forward><<<
                 grid, kTransformThreads, tile_size * sizeof(uint64_t), stream>>>(
                 layout,
                 Forward ? constants.twiddle_forward : constants.twiddle_inverse,
@@ -545,6 +549,7 @@ namespace
             {
 #define MXX_LAUNCH_NTT_TOP(width) \
             case width: \
+                gpu_test_record_kernel_launch(); \
                 ntt_fused_top_stages_kernel<Forward, width><<<grid, kTransformThreads, 0, stream>>>( \
                     layout, twiddles, shoup, constants.moduli, constants.n_inv, constants.n_inv_shoup, offset); \
                 break
@@ -563,6 +568,7 @@ namespace
     template <bool Forward>
     int run_matrix_transform_u64(GpuMatrix *mat, const GpuMatrixRange *range = nullptr)
     {
+        gpu_test_record_native_validation();
         if (!mat || !mat->ctx)
         {
             return set_error("invalid matrix in run_matrix_transform_u64");
@@ -796,6 +802,324 @@ namespace
         if (!range) mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
         return 0;
     }
+}
+
+enum class PreparedNttLaunchKind : uint8_t
+{
+    FusedTop,
+    Twist,
+    Stage,
+    Scale,
+    FusedLocal,
+};
+
+struct PreparedNttLaunch
+{
+    PreparedNttLaunchKind kind;
+    MatrixNttDescriptorView layout;
+    const GpuRingDeviceConstants *constants;
+    cudaStream_t stream;
+    dim3 grid;
+    dim3 block;
+    uint32_t n;
+    uint32_t len;
+    uint32_t width;
+    size_t limb_count;
+    size_t poly_offset;
+    size_t shared_bytes;
+    bool forward;
+};
+
+struct GpuMatrixTransformPlan
+{
+    GpuMatrix *matrix;
+    std::vector<PreparedNttLaunch> launches;
+};
+
+template <bool Forward>
+int submit_prepared_ntt_top_impl(const PreparedNttLaunch &launch)
+{
+    const auto &constants = *launch.constants;
+    const uint64_t *twiddles = Forward ? constants.twiddle_forward : constants.twiddle_inverse;
+    const uint64_t *shoup = Forward ? constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse;
+    switch (launch.width)
+    {
+#define MXX_SUBMIT_NTT_TOP(width) \
+    case width: \
+        ntt_fused_top_stages_kernel<Forward, width><<<launch.grid, launch.block, launch.shared_bytes, launch.stream>>>( \
+            launch.layout, twiddles, shoup, constants.moduli, constants.n_inv, \
+            constants.n_inv_shoup, launch.poly_offset); \
+        break
+        MXX_SUBMIT_NTT_TOP(2);
+        MXX_SUBMIT_NTT_TOP(4);
+        MXX_SUBMIT_NTT_TOP(8);
+        MXX_SUBMIT_NTT_TOP(16);
+#undef MXX_SUBMIT_NTT_TOP
+    default:
+        return set_error("invalid prepared NTT fused-top width");
+    }
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+template <bool Forward>
+int submit_prepared_ntt_twist_impl(const PreparedNttLaunch &launch)
+{
+    const auto &constants = *launch.constants;
+    ntt_twist_all_limbs_kernel<<<launch.grid, launch.block, launch.shared_bytes, launch.stream>>>(
+        launch.layout,
+        Forward ? constants.twiddle_forward : constants.twiddle_inverse,
+        Forward ? constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse,
+        constants.moduli,
+        launch.limb_count,
+        launch.n,
+        launch.poly_offset);
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+template <bool Forward>
+int submit_prepared_ntt_stage_impl(const PreparedNttLaunch &launch)
+{
+    const auto &constants = *launch.constants;
+    ntt_stage_all_limbs_kernel<Forward><<<launch.grid, launch.block, launch.shared_bytes, launch.stream>>>(
+        launch.layout,
+        Forward ? constants.twiddle_forward : constants.twiddle_inverse,
+        Forward ? constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse,
+        constants.moduli,
+        launch.limb_count,
+        launch.n,
+        launch.len,
+        launch.poly_offset);
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+template <bool Forward>
+int submit_prepared_ntt_local_impl(const PreparedNttLaunch &launch)
+{
+    const auto &constants = *launch.constants;
+    ntt_fused_local_stages_kernel<Forward><<<launch.grid, launch.block, launch.shared_bytes, launch.stream>>>(
+        launch.layout,
+        Forward ? constants.twiddle_forward : constants.twiddle_inverse,
+        Forward ? constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse,
+        constants.moduli, constants.n_inv, constants.n_inv_shoup,
+        launch.n,
+        std::min(launch.n, kFusedNttCoefficients),
+        launch.poly_offset);
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+int submit_prepared_ntt_scale(const PreparedNttLaunch &launch)
+{
+    const auto &constants = *launch.constants;
+    ntt_scale_all_limbs_kernel<<<launch.grid, launch.block, launch.shared_bytes, launch.stream>>>(
+        launch.layout, constants.moduli, constants.n_inv, constants.n_inv_shoup,
+        launch.limb_count, launch.n, launch.poly_offset);
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+int submit_prepared_ntt_launch(const PreparedNttLaunch &launch)
+{
+    switch (launch.kind)
+    {
+    case PreparedNttLaunchKind::FusedTop:
+        return launch.forward ? submit_prepared_ntt_top_impl<true>(launch) : submit_prepared_ntt_top_impl<false>(launch);
+    case PreparedNttLaunchKind::Twist:
+        return launch.forward ? submit_prepared_ntt_twist_impl<true>(launch) : submit_prepared_ntt_twist_impl<false>(launch);
+    case PreparedNttLaunchKind::Stage:
+        return launch.forward ? submit_prepared_ntt_stage_impl<true>(launch) : submit_prepared_ntt_stage_impl<false>(launch);
+    case PreparedNttLaunchKind::Scale:
+        return submit_prepared_ntt_scale(launch);
+    case PreparedNttLaunchKind::FusedLocal:
+        return launch.forward ? submit_prepared_ntt_local_impl<true>(launch) : submit_prepared_ntt_local_impl<false>(launch);
+    }
+    return set_error("invalid prepared NTT launch kind");
+}
+
+extern "C" int gpu_matrix_prepare_ntt_plan(
+    const GpuMatrix *mat, const GpuMatrixRange *range,
+    bool forward, GpuMatrixTransformPlan **plan)
+{
+    if (!mat || !mat->ctx || !plan || mat->level < 0 || mat->ctx->N < 2 ||
+        !is_power_of_two_u32(static_cast<uint32_t>(mat->ctx->N)))
+        return set_error("invalid prepared NTT matrix");
+    const GpuMatrixRange selected = range ? *range :
+        GpuMatrixRange{0, mat->rows, 0, mat->cols};
+    if (selected.row_start > selected.row_end || selected.row_end > mat->rows ||
+        selected.column_start > selected.column_end || selected.column_end > mat->cols ||
+        selected.row_end - selected.row_start == 0 ||
+        selected.column_end - selected.column_start == 0)
+        return set_error("invalid prepared NTT range");
+    const uint32_t n = static_cast<uint32_t>(mat->ctx->N);
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    if (limb_count > GPU_RUNTIME_MAX_LIMBS || mat->ctx->limb_gpu_ids.size() < limb_count ||
+        mat->ctx->limb_prime_ids.size() < limb_count)
+        return set_error("invalid prepared NTT limb metadata");
+    MatrixNttDescriptorView layout{};
+    layout.offset = selected.row_start * mat->cols + selected.column_start;
+    layout.columns = selected.column_end - selected.column_start;
+    layout.pitch = mat->cols;
+    int dispatch_device = -1;
+    size_t dispatch_slot = std::numeric_limits<size_t>::max();
+    cudaStream_t dispatch_stream = nullptr;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+        if (limb_id.x >= mat->shared_limb_buffers.size())
+            return set_error("invalid prepared NTT limb partition");
+        int limb_device = -1;
+        int status = matrix_limb_device(mat, limb_id, &limb_device);
+        if (status != 0) return status;
+        if (limb == 0)
+        {
+            dispatch_device = limb_device;
+            dispatch_slot = static_cast<size_t>(limb_id.x);
+            status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
+            if (status != 0 || !dispatch_stream) return status ? status : set_error("null prepared NTT stream");
+        }
+        else if (limb_device != dispatch_device)
+            return set_error("prepared NTT requires one device");
+        const int primeid = mat->ctx->limb_prime_ids[limb];
+        if (primeid < 0 || static_cast<size_t>(primeid) >= mat->ctx->moduli.size() ||
+            limb_id.x >= mat->ctx->gpu_ids.size())
+            return set_error("invalid prepared NTT prime metadata");
+        size_t stride_bytes = 0;
+        uint8_t coeff_bytes = 0;
+        if (!matrix_limb_metadata_by_id(mat, limb_id, &stride_bytes, &coeff_bytes) ||
+            coeff_bytes == 0 || stride_bytes < static_cast<size_t>(n) * coeff_bytes)
+            return set_error("invalid prepared NTT limb layout");
+        if (!matrix_limb_ptr_by_id(mat, 0, limb_id))
+            return set_error("null prepared NTT limb pointer");
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        if (!buffer.device_descriptors || limb_id.y >= buffer.limb_count)
+            return set_error("missing prepared NTT descriptors");
+        if (limb == 0) layout.descriptors = buffer.device_descriptors;
+        else if (layout.descriptors != buffer.device_descriptors)
+            return set_error("prepared NTT descriptors span partitions");
+        layout.indices[limb] = limb_id.y;
+    }
+    if (dispatch_slot >= mat->ctx->ring_device_constants.size())
+        return set_error("missing prepared NTT constants");
+    const auto &constants = mat->ctx->ring_device_constants[dispatch_slot];
+    if (constants.device != dispatch_device || constants.limb_count < limb_count ||
+        constants.ring_dimension != n || !constants.twiddle_forward ||
+        !constants.twiddle_inverse || !constants.twiddle_shoup_forward ||
+        !constants.twiddle_shoup_inverse || !constants.moduli || !constants.n_inv ||
+        !constants.n_inv_shoup)
+        return set_error("invalid prepared NTT constants");
+    const size_t poly_rows = selected.row_end - selected.row_start;
+    const size_t poly_columns = selected.column_end - selected.column_start;
+    if (poly_rows != 0 && poly_columns > std::numeric_limits<size_t>::max() / poly_rows)
+        return set_error("prepared NTT polynomial count overflow");
+    const size_t poly_count = poly_rows * poly_columns;
+    const dim3 block{kTransformThreads, 1, 1};
+    try
+    {
+        std::vector<PreparedNttLaunch> launches;
+    auto append_chunked = [&](PreparedNttLaunchKind kind, dim3 grid, uint32_t len,
+                              uint32_t width, size_t shared_bytes, bool launch_forward) {
+        for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
+        {
+            const size_t chunk = std::min(kMaxGridY, poly_count - offset);
+            grid.y = static_cast<uint32_t>(chunk);
+            launches.push_back(PreparedNttLaunch{
+                kind,
+                layout,
+                &constants,
+                dispatch_stream,
+                grid,
+                block,
+                n,
+                len,
+                width,
+                limb_count,
+                offset,
+                shared_bytes,
+                launch_forward,
+            });
+        }
+    };
+    if (!forward)
+    {
+        const uint32_t tile_size = std::min(n, kFusedNttCoefficients);
+        append_chunked(PreparedNttLaunchKind::FusedLocal,
+            dim3{n / tile_size, 0, static_cast<uint32_t>(limb_count)}, 0, 0,
+            tile_size * sizeof(uint64_t), false);
+        if (n > kFusedNttCoefficients && n <= 16 * kFusedNttCoefficients)
+            append_chunked(PreparedNttLaunchKind::FusedTop,
+                dim3{n / kTransformThreads, 0, static_cast<uint32_t>(limb_count)}, 0,
+                n / kFusedNttCoefficients, 0, false);
+        else if (n > kFusedNttCoefficients)
+        {
+            for (uint32_t len = kFusedNttCoefficients * 2; len <= n; len <<= 1)
+                append_chunked(PreparedNttLaunchKind::Stage,
+                    dim3{((n >> 1) + kTransformThreads - 1) / kTransformThreads, 0,
+                         static_cast<uint32_t>(limb_count)}, len, 0, 0, false);
+            append_chunked(PreparedNttLaunchKind::Scale,
+                dim3{(n + kTransformThreads - 1) / kTransformThreads, 0,
+                     static_cast<uint32_t>(limb_count)}, 0, 0, 0, false);
+            append_chunked(PreparedNttLaunchKind::Twist,
+                dim3{(n + kTransformThreads - 1) / kTransformThreads, 0,
+                     static_cast<uint32_t>(limb_count)}, 0, 0, 0, false);
+        }
+    }
+    else
+    {
+        if (n > kFusedNttCoefficients && n <= 16 * kFusedNttCoefficients)
+            append_chunked(PreparedNttLaunchKind::FusedTop,
+                dim3{n / kTransformThreads, 0, static_cast<uint32_t>(limb_count)}, 0,
+                n / kFusedNttCoefficients, 0, true);
+        else if (n > kFusedNttCoefficients)
+        {
+            append_chunked(PreparedNttLaunchKind::Twist,
+                dim3{(n + kTransformThreads - 1) / kTransformThreads, 0,
+                     static_cast<uint32_t>(limb_count)}, 0, 0, 0, true);
+            for (uint32_t len = n; len > kFusedNttCoefficients; len >>= 1)
+                append_chunked(PreparedNttLaunchKind::Stage,
+                    dim3{((n >> 1) + kTransformThreads - 1) / kTransformThreads, 0,
+                         static_cast<uint32_t>(limb_count)}, len, 0, 0, true);
+        }
+        const uint32_t tile_size = std::min(n, kFusedNttCoefficients);
+        append_chunked(PreparedNttLaunchKind::FusedLocal,
+            dim3{n / tile_size, 0, static_cast<uint32_t>(limb_count)}, 0, 0,
+            tile_size * sizeof(uint64_t), true);
+    }
+        auto prepared = std::make_unique<GpuMatrixTransformPlan>();
+        prepared->matrix = const_cast<GpuMatrix *>(mat);
+        prepared->launches = std::move(launches);
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_ntt_plan(
+    const GpuMatrixTransformPlan *plan, GpuMatrix *mat)
+{
+    if (!plan || !mat || plan->matrix != mat)
+        return set_error("prepared NTT matrix binding mismatch");
+    if (plan->launches.empty())
+        return set_error("prepared NTT has no launch records");
+    const auto &first = plan->launches.front();
+    int status = matrix_wait_all_limb_streams(mat, first.constants->device, first.stream);
+    if (status != 0) return status;
+    for (const auto &launch : plan->launches)
+    {
+        status = submit_prepared_ntt_launch(launch);
+        if (status != 0) return status;
+    }
+    if (status == 0) status = matrix_record_all_limb_writes(mat, first.stream);
+    if (status == 0)
+        mat->format = first.forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+    return status;
+}
+
+extern "C" void gpu_matrix_destroy_ntt_plan(GpuMatrixTransformPlan *plan)
+{
+    delete plan;
 }
 
 int gpu_matrix_ntt_all(GpuMatrix *mat)

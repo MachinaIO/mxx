@@ -352,6 +352,477 @@ namespace
 
 }
 
+struct RnsLaunchMetadata
+{
+    size_t source_count;
+    size_t target_count;
+    size_t digit_size;
+    size_t group_count;
+    size_t retained[kCrtMaxLimbs];
+    uint64_t source_moduli[kCrtMaxLimbs];
+    uint64_t target_moduli[kCrtMaxLimbs];
+    uint64_t scales[kCrtMaxLimbs];
+    uint64_t inverses[kCrtMaxLimbs];
+    uint64_t plaintext_modulus;
+};
+struct RnsCompactMetadata
+{
+    RnsLaunchMetadata plan;
+    uint64_t weights[kCrtMaxLimbs];
+};
+
+struct RnsConversionMetadata
+{
+    RnsLaunchMetadata plan;
+    uint64_t weights[kCrtMaxLimbs * kCrtMaxLimbs];
+};
+
+struct GpuPreparedModulusConversion
+{
+    ModulusConversionPlan metadata;
+    const GpuContext *source_context;
+    const GpuContext *target_context;
+    size_t rows;
+    size_t columns;
+    int conversion;
+    int source_level;
+    int target_level;
+    int source_format;
+    int target_format;
+    int device;
+    cudaStream_t stream;
+    RnsCompactMetadata rns_metadata;
+    RnsConversionMetadata *device_rns_metadata;
+    bool rns_mod_down;
+    size_t coefficient_count;
+    int grid_blocks;
+
+    ~GpuPreparedModulusConversion()
+    {
+        if (!device_rns_metadata) return;
+        cudaSetDevice(device);
+        if (stream) cudaFreeAsync(device_rns_metadata, stream);
+        else cudaFree(device_rns_metadata);
+    }
+};
+
+struct GpuPreparedCrtRecompose
+{
+    const GpuContext *source_context = nullptr;
+    GpuMatrix *output = nullptr;
+    size_t level_count = 0;
+    size_t columns = 0;
+    size_t ring_dimension = 0;
+    size_t target_count = 0;
+    size_t coefficient_count = 0;
+    int device = -1;
+    int grid_blocks = 0;
+    cudaStream_t stream = nullptr;
+    std::vector<CrtLevelMetadata> levels;
+    CrtOutputMetadata output_metadata{};
+    GpuDeviceWorkspace metadata_workspace;
+
+    ~GpuPreparedCrtRecompose()
+    {
+        (void)metadata_workspace.release(stream);
+    }
+};
+
+namespace
+{
+int prepare_crt_recompose_metadata(
+    const GpuMatrix *const *levels, size_t level_count,
+    const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
+    size_t reconstruction_stride, GpuMatrix *out, GpuPreparedCrtRecompose &prepared)
+{
+    if (!levels || !level_count || !plaintext_moduli || !reconstruction_residues || !out ||
+        !out->ctx || !out->ctx->execution || out->format != GPU_POLY_FORMAT_COEFF ||
+        out->shared_limb_buffers.size() != 1 || out->rows != 1 || level_count > kCrtMaxLimbs)
+        return set_error("invalid prepared CRT recomposition layout");
+    const auto &target = out->shared_limb_buffers[0];
+    prepared.target_count = static_cast<size_t>(out->level) + 1;
+    if (out->level < 0 || prepared.target_count > kCrtMaxLimbs ||
+        reconstruction_stride != prepared.target_count || !target.device_descriptors ||
+        target.limb_count < prepared.target_count)
+        return set_error("invalid prepared CRT recomposition output basis");
+    prepared.source_context = out->ctx;
+    prepared.output = out;
+    prepared.level_count = level_count;
+    prepared.columns = out->cols;
+    prepared.ring_dimension = static_cast<size_t>(out->ctx->N);
+    prepared.coefficient_count = prepared.columns * prepared.ring_dimension;
+    prepared.output_metadata.descriptors = target.device_descriptors;
+    prepared.output_metadata.limb_count = prepared.target_count;
+    std::copy_n(out->ctx->moduli.begin(), prepared.target_count, prepared.output_metadata.moduli);
+    prepared.levels.resize(level_count);
+    for (size_t level = 0; level < level_count; ++level)
+    {
+        const auto *source = levels[level];
+        if (!source || !source->ctx || source->ctx->execution != out->ctx->execution ||
+            source == out || source->ctx->N != out->ctx->N || source->rows != 1 ||
+            source->cols != out->cols || source->level < 0 || source->level >= kCrtMaxLimbs ||
+            source->format != GPU_POLY_FORMAT_COEFF || source->shared_limb_buffers.size() != 1 ||
+            !plaintext_moduli[level])
+            return set_error("invalid prepared CRT recomposition input");
+        const auto &buffer = source->shared_limb_buffers[0];
+        const size_t source_count = static_cast<size_t>(source->level) + 1;
+        if (source_count > source->ctx->moduli.size() || source_count > buffer.limb_count ||
+            buffer.device != target.device || !buffer.device_descriptors ||
+            source->ctx->ring_device_constants.empty() ||
+            source->ctx->ring_device_constants[0].device != target.device ||
+            !source->ctx->ring_device_constants[0].garner_inverses)
+            return set_error("prepared CRT recomposition requires colocated sources");
+        auto &entry = prepared.levels[level];
+        entry.descriptors = buffer.device_descriptors;
+        entry.input_offset = 0;
+        entry.limb_count = source_count;
+        entry.plaintext_modulus = plaintext_moduli[level];
+        std::copy_n(source->ctx->moduli.begin(), source_count, entry.moduli);
+        std::copy_n(reconstruction_residues + level * reconstruction_stride,
+            prepared.target_count, entry.reconstruction);
+        const std::vector<uint64_t> active(source->ctx->moduli.begin(),
+            source->ctx->moduli.begin() + source_count);
+        std::vector<uint64_t> words;
+        if (!serde_compute_modulus_words_le(active, &words) || words.empty() ||
+            words.size() > kCrtMaxWords)
+            return set_error("unsupported prepared CRT source modulus size");
+        entry.word_count = static_cast<int>(words.size());
+        std::copy(words.begin(), words.end(), entry.modulus_words);
+        entry.garner = source->ctx->ring_device_constants[0].garner_inverses;
+        entry.garner_stride = source->ctx->moduli.size();
+    }
+    if (matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream) != 0 ||
+        !prepared.stream)
+        return set_error("missing prepared CRT recomposition stream");
+    const size_t blocks = prepared.coefficient_count / 128 +
+        (prepared.coefficient_count % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("prepared CRT recomposition exceeds CUDA grid capacity");
+    prepared.device = target.device;
+    prepared.grid_blocks = static_cast<int>(blocks);
+    if (level_count > 2)
+    {
+        size_t levels_bytes = 0;
+        if (level_count > SIZE_MAX / sizeof(CrtLevelMetadata))
+            return set_error("prepared CRT metadata size overflow");
+        levels_bytes = level_count * sizeof(CrtLevelMetadata);
+        size_t metadata_bytes = levels_bytes + sizeof(CrtOutputMetadata);
+        if (prepared.metadata_workspace.acquire(out->ctx, prepared.device,
+                GPU_PREPARED_BATCH_WORKSPACE, metadata_bytes,
+                alignof(CrtLevelMetadata), prepared.stream) != 0)
+            return 1;
+        cudaError_t error = cudaSetDevice(prepared.device);
+        if (error == cudaSuccess)
+            error = cudaMemcpyAsync(prepared.metadata_workspace.data, prepared.levels.data(),
+                levels_bytes, cudaMemcpyHostToDevice, prepared.stream);
+        if (error == cudaSuccess)
+            error = cudaMemcpyAsync(prepared.metadata_workspace.data + levels_bytes,
+                &prepared.output_metadata, sizeof(CrtOutputMetadata),
+                cudaMemcpyHostToDevice, prepared.stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
+    return 0;
+}
+}
+
+extern "C" int gpu_matrix_prepare_crt_recompose(
+    const GpuMatrix *const *levels, size_t level_count,
+    const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
+    size_t reconstruction_stride, GpuMatrix *out,
+    GpuPreparedCrtRecompose **plan)
+{
+    if (!plan) return set_error("null prepared CRT recomposition output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedCrtRecompose>();
+        const int status = prepare_crt_recompose_metadata(levels, level_count,
+            plaintext_moduli, reconstruction_residues, reconstruction_stride, out, *prepared);
+        if (status != 0) return status;
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_crt_recompose(
+    const GpuPreparedCrtRecompose *prepared,
+    const GpuMatrix *const *levels, size_t level_count)
+{
+    if (!prepared || !levels || level_count != prepared->level_count || !prepared->output)
+        return set_error("invalid prepared CRT recomposition submission");
+    for (size_t level = 0; level < level_count; ++level)
+    {
+        const auto *source = levels[level];
+        if (!source || !source->ctx || source->ctx->execution != prepared->source_context->execution ||
+            source->rows != 1 || source->cols != prepared->columns ||
+            source->format != GPU_POLY_FORMAT_COEFF || source->shared_limb_buffers.size() != 1 ||
+            static_cast<size_t>(source->level) + 1 != prepared->levels[level].limb_count)
+            return set_error("prepared CRT recomposition input contract mismatch");
+    }
+    const cudaError_t selected = cudaSetDevice(prepared->device);
+    if (selected != cudaSuccess) return set_error(selected);
+    for (size_t level = 0; level < level_count; ++level)
+    {
+        if (matrix_wait_all_limb_streams(levels[level], prepared->device, prepared->stream, false, true) != 0)
+            return 1;
+    }
+    if (matrix_wait_all_limb_streams(prepared->output, prepared->device, prepared->stream) != 0)
+        return 1;
+    if (level_count > 2)
+    {
+        const size_t levels_bytes = level_count * sizeof(CrtLevelMetadata);
+        auto *device_levels = reinterpret_cast<const CrtLevelMetadata *>(prepared->metadata_workspace.data);
+        auto *device_output = reinterpret_cast<const CrtOutputMetadata *>(prepared->metadata_workspace.data + levels_bytes);
+        crt_recompose_kernel<<<prepared->grid_blocks, 128, 0, prepared->stream>>>(
+            device_levels, device_output, level_count, prepared->coefficient_count,
+            prepared->ring_dimension, 0);
+    }
+    else
+    {
+        CrtLaunchMetadata launch{};
+        for (size_t level = 0; level < level_count; ++level)
+            launch.levels[level] = prepared->levels[level];
+        launch.output = prepared->output_metadata;
+        crt_recompose_range_kernel<<<prepared->grid_blocks, 128, 0, prepared->stream>>>(
+            launch, level_count, prepared->coefficient_count, prepared->ring_dimension, 0);
+    }
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+    {
+        gpu_matrix_retire_submitted_work(prepared->output);
+        return set_error(error);
+    }
+    int status = matrix_record_all_limb_writes(prepared->output, prepared->stream, true);
+    if (status == 0)
+    {
+        const dim3 first = prepared->output->ctx->limb_gpu_ids[0];
+        const auto &states = prepared->output->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        for (size_t level = 0; level < level_count && status == 0; ++level)
+            status = matrix_track_all_limb_consumers(levels[level], prepared->device,
+                prepared->stream, completion, true, true);
+    }
+    if (status != 0) gpu_matrix_retire_submitted_work(prepared->output);
+    return status;
+}
+
+extern "C" void gpu_matrix_destroy_prepared_crt_recompose(GpuPreparedCrtRecompose *plan)
+{
+    delete plan;
+}
+
+namespace
+{
+    static int prepare_rns_modulus_conversion_plan(
+        const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
+        uint64_t plaintext_modulus, const uint64_t *inverses, size_t inverse_count,
+        const uint64_t *scales, GpuPreparedModulusConversion &prepared);
+    static int submit_rns_modulus_conversion(
+        const GpuPreparedModulusConversion *prepared, GpuMatrix *out,
+        const GpuMatrix *source, const GpuMatrixBatchView *view,
+        bool apply_output_transform);
+}
+
+static int prepare_modulus_conversion_plan(
+    const GpuMatrix *source, const GpuMatrix *out, int conversion,
+    const uint64_t *division_inverses, size_t inverse_count,
+    uint64_t plaintext_modulus, const uint64_t *input_scales,
+    GpuPreparedModulusConversion &prepared)
+{
+    if (!source || !out || !source->ctx || !out->ctx || out == source ||
+        !source->ctx->execution || out->ctx->execution != source->ctx->execution ||
+        out->ctx->N != source->ctx->N || out->ctx->N <= 0 || conversion < 0 || conversion > 4 ||
+        source->level < 0 || out->level < 0 || source->shared_limb_buffers.size() != 1 ||
+        out->shared_limb_buffers.size() != 1 ||
+        (conversion == 0 && out->format != source->format) ||
+        (conversion != 0 && source->format != GPU_POLY_FORMAT_COEFF) ||
+        (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL))
+        return set_error("invalid prepared coefficient modulus conversion layout");
+    if (conversion == 4)
+        return prepare_rns_modulus_conversion_plan(
+            source, out, static_cast<size_t>(source->level) + 1, plaintext_modulus,
+            division_inverses, inverse_count, input_scales, prepared);
+    const size_t source_count = static_cast<size_t>(source->level) + 1;
+    const size_t target_count = static_cast<size_t>(out->level) + 1;
+    if (source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
+        (conversion != 2 && target_count > source_count) ||
+        source_count > source->ctx->moduli.size() || target_count > out->ctx->moduli.size() ||
+        !division_inverses || inverse_count != target_count ||
+        (conversion == 3 && (plaintext_modulus == 0 || !input_scales || target_count >= source_count)))
+        return set_error("invalid prepared coefficient modulus conversion basis");
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count < source_count || output.limb_count < target_count ||
+        source->rows != out->rows || source->cols != out->cols)
+        return set_error("prepared coefficient conversion requires matching colocated owners");
+    if (source->ctx->ring_device_constants.empty() ||
+        source->ctx->ring_device_constants[0].device != output.device ||
+        !source->ctx->ring_device_constants[0].garner_inverses)
+        return set_error("missing setup CRT inverse table");
+    ModulusConversionPlan metadata{};
+    metadata.source_count = source_count;
+    metadata.target_count = target_count;
+    metadata.garner = source->ctx->ring_device_constants[0].garner_inverses;
+    metadata.garner_stride = source->ctx->moduli.size();
+    bool retained[kCrtMaxLimbs]{};
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        metadata.source_moduli[limb] = source->ctx->moduli[limb];
+        metadata.input_scales[limb] = conversion == 3 ? input_scales[limb] : 1;
+        if (metadata.source_moduli[limb] <= 1 || !(metadata.source_moduli[limb] & 1))
+            return set_error("prepared conversion requires odd CRT moduli");
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const uint64_t modulus = out->ctx->moduli[limb];
+        size_t selected = 0;
+        while (selected < source_count && metadata.source_moduli[selected] != modulus) ++selected;
+        if (conversion != 2 && (selected == source_count || retained[selected]))
+            return set_error("destination CRT basis is not an exact subset");
+        if (selected < source_count) retained[selected] = true;
+        metadata.retained[limb] = selected;
+        metadata.target_moduli[limb] = modulus;
+        metadata.division_inverses[limb] = division_inverses[limb];
+    }
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        if (conversion == 2 && !retained[limb])
+            return set_error("centered extension requires a containing CRT basis");
+        if (conversion == 3 && (static_cast<unsigned __int128>(plaintext_modulus) *
+            metadata.input_scales[limb]) % metadata.source_moduli[limb] != 1)
+            return set_error("invalid BGV plaintext inverse");
+        if (conversion == 2 || !retained[limb]) metadata.discarded[metadata.discarded_count++] = limb;
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const uint64_t modulus = metadata.target_moduli[limb];
+        uint64_t divisor = 1;
+        for (size_t discarded = 0; discarded < metadata.discarded_count; ++discarded)
+            divisor = static_cast<uint64_t>((static_cast<unsigned __int128>(divisor) *
+                metadata.source_moduli[metadata.discarded[discarded]]) % modulus);
+        metadata.divisor_residues[limb] = divisor;
+        if ((conversion == 1 || conversion == 3) &&
+            (static_cast<unsigned __int128>(divisor) * division_inverses[limb]) % modulus != 1)
+            return set_error("invalid exact modulus division inverse");
+    }
+    prepared.metadata = metadata;
+    prepared.source_context = source->ctx;
+    prepared.target_context = out->ctx;
+    prepared.rows = source->rows;
+    prepared.columns = source->cols;
+    prepared.conversion = conversion;
+    prepared.source_level = source->level;
+    prepared.target_level = out->level;
+    prepared.source_format = source->format;
+    prepared.target_format = out->format;
+    prepared.device = input.device;
+    int stream_status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream);
+    if (stream_status != 0 || !prepared.stream)
+        return stream_status ? stream_status : set_error("null prepared CRT stream");
+    return 0;
+}
+
+extern "C" int gpu_matrix_prepare_modulus_conversion(
+    const GpuMatrix *source, const GpuMatrix *out, int conversion,
+    const uint64_t *division_inverses, size_t inverse_count,
+    uint64_t plaintext_modulus, const uint64_t *input_scales,
+    GpuPreparedModulusConversion **plan)
+{
+    if (!plan) return set_error("null prepared conversion output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedModulusConversion>();
+        const int status = prepare_modulus_conversion_plan(
+            source, out, conversion, division_inverses, inverse_count,
+            plaintext_modulus, input_scales, *prepared);
+        if (status != 0) return status;
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_rns_conversion(
+    const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
+    uint64_t plaintext_modulus, const uint64_t *scales, const uint64_t *inverses,
+    size_t inverse_count, GpuPreparedModulusConversion **plan)
+{
+    if (!plan) return set_error("null prepared RNS conversion output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedModulusConversion>();
+        const int status = prepare_rns_modulus_conversion_plan(
+            source, out, digit_size, plaintext_modulus, inverses, inverse_count, scales, *prepared);
+        if (status != 0) return status;
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_modulus_conversion(
+    const GpuPreparedModulusConversion *prepared, GpuMatrix *out,
+    const GpuMatrix *source, const GpuMatrixBatchView *view,
+    bool apply_output_transform)
+{
+    if (prepared->conversion == 4)
+        return submit_rns_modulus_conversion(prepared, out, source, view, apply_output_transform);
+    const auto &input_range = view->left;
+    const auto &output_range = view->output;
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    cudaStream_t stream = prepared->stream;
+    if (!stream) return set_error("prepared CRT stream is unavailable");
+    int status = 0;
+    cudaError_t error = cudaSetDevice(prepared->device);
+    if (error != cudaSuccess) return set_error(error);
+    for (size_t limb = 0; limb < prepared->metadata.source_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[limb], prepared->device,
+            stream, false, true);
+        if (status != 0) return status;
+    }
+    status = matrix_wait_all_limb_streams(out, prepared->device, stream);
+    if (status != 0) return status;
+    const size_t coefficient_count = prepared->rows * prepared->columns *
+        static_cast<size_t>(out->ctx->N);
+    const size_t blocks = coefficient_count / 128 + (coefficient_count % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("prepared modulus conversion exceeds CUDA grid capacity");
+    convert_modulus_range_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+        input.device_descriptors, output.device_descriptors, prepared->metadata,
+        coefficient_count, static_cast<size_t>(out->ctx->N), prepared->conversion,
+        prepared->columns, input_range.row_start * source->cols + input_range.column_start,
+        source->cols, output_range.row_start * out->cols + output_range.column_start, out->cols);
+    error = cudaGetLastError();
+    status = error == cudaSuccess ? matrix_record_all_limb_writes(out, stream, true) : set_error(error);
+    if (status == 0)
+    {
+        const dim3 first = out->ctx->limb_gpu_ids[0];
+        const auto &states = out->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        status = matrix_track_all_limb_consumers(source, prepared->device, stream, completion, true, true);
+    }
+    if (status == 0 && apply_output_transform && prepared->conversion != 0 && out->format == GPU_POLY_FORMAT_EVAL)
+        status = run_matrix_transform_u64<true>(out, &output_range);
+    if (status != 0)
+    {
+        const int retired = gpu_matrix_retire_submitted_work(out);
+        if (retired != 0) return retired;
+    }
+    return status;
+}
+
+extern "C" void gpu_matrix_destroy_prepared_modulus_conversion(
+    GpuPreparedModulusConversion *plan)
+{
+    delete plan;
+}
+
 extern "C" int gpu_matrix_convert_modulus(
     GpuMatrix *out,
     const GpuMatrix *source,
@@ -536,6 +1007,148 @@ extern "C" int gpu_matrix_convert_modulus(
         if (retired != 0) return retired;
     }
     return status;
+}
+
+struct GpuPreparedCenteredRebaseState
+{
+    GpuMatrix *out;
+    const GpuMatrix *source;
+    GpuMatrixRange input_range;
+    GpuMatrixRange output_range;
+    CrtOutputMetadata metadata;
+    size_t coefficient_count;
+    size_t columns;
+    size_t n;
+    size_t target_count;
+    size_t blocks;
+    int device;
+    cudaStream_t stream;
+};
+
+static int prepare_centered_rebase_plan(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    GpuPreparedCenteredRebaseState &prepared)
+{
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid execution owner in prepared centered rebase");
+    if (!source || out == source || !source->ctx ||
+        out->ctx->execution != source->ctx->execution || out->ctx->N != source->ctx->N ||
+        source->level != 0 || source->ctx->moduli.size() != 1 || out->level < 0 ||
+        source->format != GPU_POLY_FORMAT_COEFF ||
+        (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL))
+        return set_error("prepared centered rebase requires single-limb coefficients and matching execution");
+    prepared.input_range = view ? view->left : GpuMatrixRange{0, source->rows, 0, source->cols};
+    prepared.output_range = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+    const auto valid = [](const GpuMatrixRange &r, const GpuMatrix *m) {
+        return r.row_start <= r.row_end && r.row_end <= m->rows &&
+            r.column_start <= r.column_end && r.column_end <= m->cols;
+    };
+    if (!valid(prepared.input_range, source) || !valid(prepared.output_range, out) ||
+        prepared.input_range.row_end - prepared.input_range.row_start !=
+            prepared.output_range.row_end - prepared.output_range.row_start ||
+        prepared.input_range.column_end - prepared.input_range.column_start !=
+            prepared.output_range.column_end - prepared.output_range.column_start)
+        return set_error("invalid prepared centered rebase rectangle");
+    const size_t rows = prepared.input_range.row_end - prepared.input_range.row_start;
+    prepared.columns = prepared.input_range.column_end - prepared.input_range.column_start;
+    prepared.target_count = static_cast<size_t>(out->level) + 1;
+    if (out->ctx->N <= 0 || prepared.target_count > kCrtMaxLimbs ||
+        prepared.target_count > out->ctx->moduli.size() || !rows || !prepared.columns)
+        return set_error("invalid prepared centered rebase destination basis");
+    prepared.n = static_cast<size_t>(out->ctx->N);
+    if (source->rows > SIZE_MAX / source->cols || out->rows > SIZE_MAX / out->cols ||
+        source->rows * source->cols > SIZE_MAX / prepared.n ||
+        out->rows * out->cols > SIZE_MAX / prepared.n)
+        return set_error("prepared centered rebase shape overflow");
+    prepared.coefficient_count = rows * prepared.columns * prepared.n;
+    if (prepared.coefficient_count > SIZE_MAX / prepared.target_count)
+        return set_error("prepared centered rebase coefficient count overflow");
+    const size_t count = prepared.coefficient_count * prepared.target_count;
+    prepared.blocks = count / 128 + (count % 128 != 0);
+    if (prepared.blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("prepared centered rebase exceeds CUDA grid capacity");
+    if (source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
+        return set_error("prepared centered rebase requires colocated partitions");
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count != 1 || output.limb_count < prepared.target_count)
+        return set_error("prepared centered rebase requires colocated device descriptors");
+    prepared.device = output.device;
+    prepared.out = out;
+    prepared.source = source;
+    prepared.metadata = {};
+    prepared.metadata.descriptors = output.device_descriptors;
+    prepared.metadata.limb_count = prepared.target_count;
+    std::copy_n(out->ctx->moduli.begin(), prepared.target_count, prepared.metadata.moduli);
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream);
+    if (status != 0) return status;
+    return 0;
+}
+
+static int submit_centered_rebase_plan(const GpuPreparedCenteredRebaseState &prepared)
+{
+    cudaError_t error = cudaSetDevice(prepared.device);
+    if (error != cudaSuccess) return set_error(error);
+    int status = matrix_wait_all_limb_streams(prepared.source, prepared.device, prepared.stream, false, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(prepared.out, prepared.device, prepared.stream);
+    if (status != 0) return status;
+    const auto &input = prepared.source->shared_limb_buffers[0];
+    centered_rebase_kernel<<<static_cast<int>(prepared.blocks), 128, 0, prepared.stream>>>(
+        input.device_descriptors, prepared.metadata, prepared.source->ctx->moduli[0],
+        prepared.coefficient_count, prepared.n, prepared.columns,
+        prepared.input_range.row_start * prepared.source->cols + prepared.input_range.column_start,
+        prepared.source->cols, prepared.output_range.row_start * prepared.out->cols +
+            prepared.output_range.column_start, prepared.out->cols);
+    error = cudaGetLastError();
+    status = error == cudaSuccess ? matrix_record_all_limb_writes(prepared.out, prepared.stream, true) : set_error(error);
+    if (status == 0)
+    {
+        const dim3 first = prepared.out->ctx->limb_gpu_ids[0];
+        const auto &states = prepared.out->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        status = matrix_track_all_limb_consumers(
+            prepared.source, prepared.device, prepared.stream, completion, true, true);
+    }
+    if (status == 0 && prepared.out->format == GPU_POLY_FORMAT_EVAL)
+        status = run_matrix_transform_u64<true>(prepared.out, &prepared.output_range);
+    if (status != 0)
+    {
+        const int retired = gpu_matrix_retire_submitted_work(prepared.out);
+        if (retired != 0) return retired;
+    }
+    return status;
+}
+
+extern "C" int gpu_matrix_prepare_centered_rebase(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    GpuPreparedCenteredRebase **plan)
+{
+    if (!plan) return set_error("null prepared centered rebase output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedCenteredRebaseState>();
+        const int status = prepare_centered_rebase_plan(out, source, view, *prepared);
+        if (status != 0) return status;
+        *plan = reinterpret_cast<GpuPreparedCenteredRebase *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_centered_rebase(const GpuPreparedCenteredRebase *plan)
+{
+    const auto *prepared = reinterpret_cast<const GpuPreparedCenteredRebaseState *>(plan);
+    if (!prepared || !prepared->out || !prepared->source || !prepared->stream)
+        return set_error("invalid prepared centered rebase plan");
+    return submit_centered_rebase_plan(*prepared);
+}
+
+extern "C" void gpu_matrix_destroy_centered_rebase(GpuPreparedCenteredRebase *plan)
+{
+    delete reinterpret_cast<GpuPreparedCenteredRebaseState *>(plan);
 }
 
 extern "C" int gpu_matrix_centered_rebase(
@@ -780,27 +1393,119 @@ namespace
 {
     // By-value launch parameters avoid pinned allocation and host metadata
     // transfers. CUDA copies these arguments before the launch returns.
-    struct RnsLaunchMetadata
-    {
-        size_t source_count;
-        size_t target_count;
-        size_t digit_size;
-        size_t group_count;
-        size_t retained[kCrtMaxLimbs];
-        uint64_t source_moduli[kCrtMaxLimbs];
-        uint64_t target_moduli[kCrtMaxLimbs];
-        uint64_t scales[kCrtMaxLimbs];
-        uint64_t inverses[kCrtMaxLimbs];
-        uint64_t plaintext_modulus;
-    };
     static_assert(sizeof(RnsLaunchMetadata) + sizeof(void *) < 4096,
         "RNS setup arguments must fit the baseline CUDA kernel argument limit");
 
-    struct RnsConversionMetadata
+    static int prepare_rns_modulus_conversion_plan(
+        const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
+        uint64_t plaintext_modulus, const uint64_t *inverses, size_t inverse_count,
+        const uint64_t *scales, GpuPreparedModulusConversion &prepared)
     {
-        RnsLaunchMetadata plan;
-        uint64_t weights[kCrtMaxLimbs * kCrtMaxLimbs];
-    };
+        const size_t source_count = static_cast<size_t>(source->level) + 1;
+        const size_t target_count = static_cast<size_t>(out->level) + 1;
+        const bool mod_down = plaintext_modulus != 0;
+        if ((mod_down && plaintext_modulus < 2) || (!mod_down && digit_size == 0) ||
+            !inverses || !scales || source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
+            source->format != GPU_POLY_FORMAT_COEFF ||
+            (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL) ||
+            source_count != source->ctx->moduli.size() || target_count != out->ctx->moduli.size() ||
+            inverse_count != target_count || source->cols != out->cols ||
+            (mod_down && target_count >= source_count) || (!mod_down && target_count < source_count) ||
+            source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1 ||
+            target_count == 0)
+            return set_error("invalid prepared RNS basis or shape");
+        const size_t group_count = mod_down ? 1 : source_count / digit_size + (source_count % digit_size != 0);
+        if (source->rows > SIZE_MAX / group_count || out->rows != source->rows * group_count)
+            return set_error("invalid prepared RNS group shape");
+        const auto &input = source->shared_limb_buffers[0];
+        const auto &output = out->shared_limb_buffers[0];
+        if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+            input.limb_count < source_count || output.limb_count < target_count)
+            return set_error("prepared RNS requires colocated descriptors");
+        prepared.rns_metadata = {};
+        auto &metadata = prepared.rns_metadata;
+        metadata.plan.source_count = source_count;
+        metadata.plan.target_count = target_count;
+        metadata.plan.digit_size = mod_down ? source_count : digit_size;
+        metadata.plan.group_count = group_count;
+        metadata.plan.plaintext_modulus = plaintext_modulus;
+        for (size_t limb = 0; limb < source_count; ++limb)
+        {
+            metadata.plan.source_moduli[limb] = source->ctx->moduli[limb];
+            metadata.plan.scales[limb] = scales[limb];
+        }
+        for (size_t limb = 0; limb < target_count; ++limb)
+        {
+            const uint64_t modulus = out->ctx->moduli[limb];
+            size_t retained = 0;
+            while (retained < source_count && source->ctx->moduli[retained] != modulus) ++retained;
+            if (mod_down && retained == source_count)
+                return set_error("prepared RNS ModDown target must be a source subset");
+            metadata.plan.retained[limb] = retained;
+            metadata.plan.target_moduli[limb] = modulus;
+            metadata.plan.inverses[limb] = inverses[limb];
+        }
+        RnsConversionMetadata expanded{};
+        expanded.plan = metadata.plan;
+        for (size_t input_limb = 0; input_limb < source_count; ++input_limb)
+        {
+            for (size_t target_limb = 0; target_limb < target_count; ++target_limb)
+            {
+                uint64_t weight = mod_down && metadata.plan.scales[input_limb] == 0 ? 0 : 1;
+                const uint64_t modulus = metadata.plan.target_moduli[target_limb];
+                const size_t begin = mod_down ? 0 : (input_limb / digit_size) * digit_size;
+                const size_t end = mod_down ? source_count : std::min(source_count, begin + digit_size);
+                for (size_t limb = begin; limb < end; ++limb)
+                {
+                    if (limb != input_limb && (!mod_down || metadata.plan.scales[limb] != 0))
+                        weight = static_cast<uint64_t>((static_cast<unsigned __int128>(weight) *
+                            (metadata.plan.source_moduli[limb] % modulus)) % modulus);
+                }
+                expanded.weights[input_limb * kCrtMaxLimbs + target_limb] = weight;
+                if (source_count * target_count <= kCrtMaxLimbs)
+                    metadata.weights[input_limb * target_count + target_limb] = weight;
+            }
+        }
+        if (source->rows > SIZE_MAX / source->cols ||
+            source->rows * source->cols > SIZE_MAX / static_cast<size_t>(out->ctx->N))
+            return set_error("prepared RNS shape overflow");
+        prepared.coefficient_count = source->rows * source->cols * static_cast<size_t>(out->ctx->N);
+        prepared.rns_mod_down = mod_down;
+        const size_t total = prepared.coefficient_count * target_count * group_count;
+        const size_t blocks = total / 128 + (total % 128 != 0);
+        if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+            return set_error("prepared RNS exceeds CUDA grid capacity");
+        prepared.grid_blocks = static_cast<int>(blocks);
+        prepared.source_context = source->ctx;
+        prepared.target_context = out->ctx;
+        prepared.rows = source->rows;
+        prepared.columns = source->cols;
+        prepared.conversion = 4;
+        prepared.source_level = source->level;
+        prepared.target_level = out->level;
+        prepared.source_format = source->format;
+        prepared.target_format = out->format;
+        prepared.device = input.device;
+        int stream_status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream);
+        if (stream_status != 0 || !prepared.stream)
+            return stream_status ? stream_status : set_error("null prepared RNS stream");
+        prepared.device_rns_metadata = nullptr;
+        if (source_count * target_count > kCrtMaxLimbs)
+        {
+            cudaError_t error = cudaSetDevice(prepared.device);
+            if (error != cudaSuccess) return set_error(error);
+            error = cudaMalloc(reinterpret_cast<void **>(&prepared.device_rns_metadata), sizeof(expanded));
+            if (error != cudaSuccess) return set_error(error);
+            error = cudaMemcpy(prepared.device_rns_metadata, &expanded, sizeof(expanded), cudaMemcpyHostToDevice);
+            if (error != cudaSuccess)
+            {
+                cudaFree(prepared.device_rns_metadata);
+                prepared.device_rns_metadata = nullptr;
+                return set_error(error);
+            }
+        }
+        return 0;
+    }
 
     __global__ void rns_setup_kernel(RnsConversionMetadata *metadata, RnsLaunchMetadata plan)
     {
@@ -872,11 +1577,6 @@ namespace
         matrix_store_limb_u64(output.base, output_poly, coefficient,
             output.stride, output.width, sum);
     }
-    struct RnsCompactMetadata
-    {
-        RnsLaunchMetadata plan;
-        uint64_t weights[64];
-    };
     static_assert(sizeof(RnsCompactMetadata) + 2 * sizeof(void *) + 7 * sizeof(size_t) + sizeof(bool) <= 4096,
                   "compact RNS launch exceeds portable CUDA parameter budget");
 
@@ -888,6 +1588,65 @@ namespace
     {
         rns_convert_coefficient(source, target, metadata.plan, metadata.weights,
                                 metadata.plan.target_count, count, dimension, down, columns, input_offset, input_pitch, output_offset, output_pitch);
+    }
+
+    __global__ void rns_conversion_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *target,
+        const RnsConversionMetadata *metadata, size_t count, size_t dimension, bool down,
+        size_t columns, size_t input_offset, size_t input_pitch, size_t output_offset, size_t output_pitch);
+
+    static int submit_rns_modulus_conversion(
+        const GpuPreparedModulusConversion *prepared, GpuMatrix *out,
+        const GpuMatrix *source, const GpuMatrixBatchView *view,
+        bool apply_output_transform)
+    {
+        cudaStream_t stream = prepared->stream;
+        if (!stream) return set_error("prepared RNS stream is unavailable");
+        int status = 0;
+        cudaError_t error = cudaSetDevice(prepared->device);
+        if (error != cudaSuccess) return set_error(error);
+        status = matrix_wait_all_limb_streams(source, prepared->device, stream, false, true);
+        if (status != 0) return status;
+        status = matrix_wait_all_limb_streams(out, prepared->device, stream);
+        if (status != 0) return status;
+        const auto &input = source->shared_limb_buffers[0];
+        const auto &output = out->shared_limb_buffers[0];
+        const auto &metadata = prepared->rns_metadata;
+        gpu_test_record_kernel_launch();
+        if (prepared->device_rns_metadata)
+        {
+            rns_conversion_kernel<<<prepared->grid_blocks, 128, 0, stream>>>(
+                input.device_descriptors, output.device_descriptors, prepared->device_rns_metadata,
+                prepared->coefficient_count, static_cast<size_t>(out->ctx->N), prepared->rns_mod_down,
+                prepared->columns, view->left.row_start * source->cols + view->left.column_start, source->cols,
+                view->output.row_start * out->cols + view->output.column_start, out->cols);
+        }
+        else
+        {
+            rns_compact_conversion_kernel<<<prepared->grid_blocks, 128, 0, stream>>>(
+                input.device_descriptors, output.device_descriptors, metadata,
+                prepared->coefficient_count, static_cast<size_t>(out->ctx->N), prepared->rns_mod_down, prepared->columns,
+                view->left.row_start * source->cols + view->left.column_start, source->cols,
+                view->output.row_start * out->cols + view->output.column_start, out->cols);
+        }
+        error = cudaGetLastError();
+        status = error == cudaSuccess ? matrix_record_all_limb_writes(out, stream) : set_error(error);
+        if (status == 0)
+        {
+            const dim3 first = out->ctx->limb_gpu_ids[0];
+            const auto &states = out->exec_limb_states[first.x];
+            const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+            status = matrix_track_all_limb_consumers(source, prepared->device, stream, completion, true, true);
+        }
+        if (status == 0 && apply_output_transform && out->format == GPU_POLY_FORMAT_EVAL)
+            status = run_matrix_transform_u64<true>(out, &view->output);
+        if (status != 0)
+        {
+            const int retired = gpu_matrix_retire_submitted_work(out);
+            if (retired != 0) return retired;
+        }
+        return status;
     }
 
     __global__ void rns_conversion_kernel(
@@ -907,6 +1666,7 @@ extern "C" int gpu_matrix_rns_conversion(
     uint64_t plaintext_modulus, const uint64_t *scales,
     const uint64_t *inverses, const uint64_t *weights, const GpuMatrixBatchView *view)
 {
+    gpu_test_record_native_validation();
     if (!out || !out->ctx || !out->ctx->execution)
         return set_error("invalid execution owner in gpu_matrix_rns_conversion");
     GpuAllocationActivity activity(out->ctx->execution.get(), -1);

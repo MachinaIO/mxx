@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <cuda_runtime.h>
+#include "gpu_test.cuh"
 
 #ifdef __cplusplus
 #include <atomic>

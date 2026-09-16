@@ -92,6 +92,11 @@ use mxx_primitives::{
 };
 
 mod fleet;
+mod gpu_prepared;
+pub mod gpu_prepared_control;
+pub(crate) mod gpu_prepared_host;
+pub(crate) mod gpu_prepared_lowering;
+pub(crate) use fleet::prepared_runtime_value;
 pub use fleet::{
     GpuAdmittedInvocationSummary, GpuColumnShard, GpuContextDemand, GpuDcrtBackend, GpuFleetMatrix,
     GpuFleetSmallMatrix, GpuFleetTrapdoor, GpuInventoryValue, GpuMatrixColumnContext,
@@ -99,6 +104,16 @@ pub use fleet::{
     GpuMatrixInputFragment, GpuMatrixInputLayout, GpuMatrixInputRequest, GpuMatrixInputSource,
     GpuMatrixLayoutPlan, GpuMatrixPlacementInvocation, GpuMatrixSlotContext,
     GpuMatrixSlotInventory, GpuScopeProgress, GpuScopeResources, GpuSetupClaim,
+};
+pub use gpu_prepared::{
+    PreparedGpuBusy, PreparedGpuExecution, PreparedGpuFleetExecution, PreparedGpuFleetOutput,
+    PreparedGpuOutput, PreparedGpuRunError, PreparedGpuWorkCounters, begin_prepared_gpu_work_gate,
+    end_prepared_gpu_work_gate, prepared_gpu_work_counters, reset_prepared_gpu_work_counters,
+};
+pub(crate) use gpu_prepared::{
+    PreparedRuntimeValue, from_lowered_program, record_prepared_forbidden,
+    record_prepared_generic_fallback, record_provisioning_append, record_provisioning_begin,
+    record_provisioning_permit,
 };
 
 #[cfg(test)]
@@ -545,7 +560,7 @@ mod tests {
                 };
                 drop(consumed);
                 drop(store);
-                output.wait_until_ready();
+                output.wait_until_ready().unwrap();
                 assert_eq!(backend.matrix_to_bytes(&output).unwrap(), expected);
             }
         }

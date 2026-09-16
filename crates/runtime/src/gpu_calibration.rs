@@ -24,6 +24,40 @@ use std::{
     sync::{Arc, RwLock},
 };
 
+/// Resource properties that affect a GPU calibration pilot beyond the
+/// normalized IR operation identity.  These are setup metadata only; they are
+/// collected from already-resident representative owners and never require a
+/// probe launch.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+pub struct GpuCalibrationResourceSignature {
+    pub levels: Arc<[usize]>,
+    pub formats: Arc<[bool]>,
+    pub contexts: Arc<[usize]>,
+    pub basis: [u8; 32],
+}
+
+impl Default for GpuCalibrationResourceSignature {
+    fn default() -> Self {
+        Self {
+            levels: Arc::from([]),
+            formats: Arc::from([]),
+            contexts: Arc::from([]),
+            basis: [0; 32],
+        }
+    }
+}
+
+impl GpuCalibrationResourceSignature {
+    pub fn new(
+        levels: impl Into<Arc<[usize]>>,
+        formats: impl Into<Arc<[bool]>>,
+        contexts: impl Into<Arc<[usize]>>,
+        basis: [u8; 32],
+    ) -> Self {
+        Self { levels: levels.into(), formats: formats.into(), contexts: contexts.into(), basis }
+    }
+}
+
 struct OperationIdentityCacheEntry {
     kind: NodeKind,
     arguments: Vec<ConcreteWireType>,
@@ -547,13 +581,15 @@ pub enum GpuCandidateCapacity {
     PreparedAvailableBytes(u64),
 }
 
-/// Exact semantic, environment, metric and allocation-class identity. Operation
-/// remains the canonical dispatch identity; class metadata prevents its normalized shape
-/// from reusing a pilot across native allocation or range boundaries.
+/// Exact semantic, environment, resource, metric and allocation-class identity.
+/// Operation remains the canonical dispatch identity; resource metadata prevents
+/// a normalized shape from reusing a pilot across level, format, context or CRT
+/// basis boundaries, while the environment separates device architectures.
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub struct GpuCalibrationKey {
     operation: Arc<[u8]>,
     environment: Arc<[u8]>,
+    resource: GpuCalibrationResourceSignature,
     class: GpuAllocationClass,
     metric: GpuCalibrationMetric,
 }
@@ -562,10 +598,17 @@ impl GpuCalibrationKey {
     pub fn new(
         operation: impl Into<Arc<[u8]>>,
         environment: impl Into<Arc<[u8]>>,
+        resource: GpuCalibrationResourceSignature,
         class: GpuAllocationClass,
         metric: GpuCalibrationMetric,
     ) -> Self {
-        Self { operation: operation.into(), environment: environment.into(), class, metric }
+        Self {
+            operation: operation.into(),
+            environment: environment.into(),
+            resource,
+            class,
+            metric,
+        }
     }
 
     pub fn operation(&self) -> &[u8] {
@@ -591,6 +634,7 @@ impl fmt::Debug for GpuCalibrationKey {
             .debug_struct("GpuCalibrationKey")
             .field("operation_bytes", &self.operation.len())
             .field("environment_bytes", &self.environment.len())
+            .field("resource", &self.resource)
             .field("class", &self.class)
             .field("metric", &self.metric)
             .finish()
@@ -1771,6 +1815,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(full, representative);
+
+        let key = |operation| {
+            GpuCalibrationKey::new(
+                operation,
+                &b"arch-a"[..],
+                GpuCalibrationResourceSignature::default(),
+                test_class(),
+                GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+            )
+        };
+        let registry = GpuCalibrationRegistry::new();
+        let profile = GpuCalibrationProfile { gpu0: Some(calibration(1, 256)), nonzero: None };
+        registry.insert(key(full), profile.clone()).unwrap();
+        assert_eq!(registry.get(&key(representative)).as_deref(), Some(&profile));
     }
 
     #[test]
@@ -1980,12 +2038,14 @@ mod tests {
         let first = GpuCalibrationKey::new(
             operation(7),
             &b"same-environment"[..],
+            GpuCalibrationResourceSignature::default(),
             test_class(),
             GpuCalibrationMetric::DefaultPoolIncrementalBytes,
         );
         let second = GpuCalibrationKey::new(
             operation(8),
             &b"same-environment"[..],
+            GpuCalibrationResourceSignature::default(),
             test_class(),
             GpuCalibrationMetric::DefaultPoolIncrementalBytes,
         );
@@ -3281,7 +3341,15 @@ mod tests {
             GpuCalibrationMetric::PreparedOccupiedSpanBytes { storage_configuration: [31; 32] };
         let other_configuration =
             GpuCalibrationMetric::PreparedOccupiedSpanBytes { storage_configuration: [32; 32] };
-        let key = |metric| GpuCalibrationKey::new(&b"op"[..], &b"environment"[..], class, metric);
+        let key = |metric| {
+            GpuCalibrationKey::new(
+                &b"op"[..],
+                &b"environment"[..],
+                GpuCalibrationResourceSignature::default(),
+                class,
+                metric,
+            )
+        };
         let profile = |metric| GpuCalibrationProfile {
             gpu0: Some(GpuDeviceCalibration::from_pilot(class, 2, 10, Some(20), metric).unwrap()),
             nonzero: None,
@@ -3403,12 +3471,14 @@ mod tests {
         let same_operation_a = GpuCalibrationKey::new(
             &b"multiply"[..],
             &b"cuda-a"[..],
+            GpuCalibrationResourceSignature::default(),
             test_class(),
             GpuCalibrationMetric::DefaultPoolIncrementalBytes,
         );
         let same_operation_b = GpuCalibrationKey::new(
             &b"multiply"[..],
             &b"cuda-b"[..],
+            GpuCalibrationResourceSignature::default(),
             test_class(),
             GpuCalibrationMetric::DefaultPoolIncrementalBytes,
         );
@@ -3425,6 +3495,7 @@ mod tests {
                 .get(&GpuCalibrationKey::new(
                     &b"multiply"[..],
                     &b"cuda-a"[..],
+                    GpuCalibrationResourceSignature::default(),
                     unknown,
                     GpuCalibrationMetric::DefaultPoolIncrementalBytes
                 ))
@@ -3435,6 +3506,7 @@ mod tests {
                 .get(&GpuCalibrationKey::new(
                     &b"multiply"[..],
                     &b"cuda-a"[..],
+                    GpuCalibrationResourceSignature::default(),
                     GpuAllocationClass { maximum_columns: 4, ..test_class() },
                     GpuCalibrationMetric::DefaultPoolIncrementalBytes
                 ))
@@ -3445,6 +3517,7 @@ mod tests {
                 .get(&GpuCalibrationKey::new(
                     &b"multiply"[..],
                     &b"cuda-a"[..],
+                    GpuCalibrationResourceSignature::default(),
                     GpuAllocationClass { identity: [19; 32], ..test_class() },
                     GpuCalibrationMetric::DefaultPoolIncrementalBytes
                 ))
@@ -3455,6 +3528,7 @@ mod tests {
                 GpuCalibrationKey::new(
                     &b"multiply"[..],
                     &b"cuda-a"[..],
+                    GpuCalibrationResourceSignature::default(),
                     unknown,
                     GpuCalibrationMetric::DefaultPoolIncrementalBytes
                 ),
@@ -3481,12 +3555,35 @@ mod tests {
             Err(GpuCalibrationError::RegistryFrozen)
         );
     }
+
+    #[test]
+    fn calibration_key_separates_level_format_and_crt_basis() {
+        let class = test_class();
+        let resource = |level, format, basis| {
+            GpuCalibrationResourceSignature::new(vec![level], vec![format], vec![17], [basis; 32])
+        };
+        let base = |resource| {
+            GpuCalibrationKey::new(
+                &b"multiply"[..],
+                &b"cuda-a"[..],
+                resource,
+                class,
+                GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+            )
+        };
+        let level = base(resource(3, false, 1));
+        assert_ne!(level, base(resource(4, false, 1)));
+        assert_ne!(level, base(resource(3, true, 1)));
+        assert_ne!(level, base(resource(3, false, 2)));
+        assert_eq!(level, base(resource(3, false, 1)));
+    }
     #[test]
     fn registry_merges_independently_observed_roles() {
         let registry = GpuCalibrationRegistry::new();
         let key = GpuCalibrationKey::new(
             &b"operation"[..],
             &b"environment"[..],
+            GpuCalibrationResourceSignature::default(),
             test_class(),
             GpuCalibrationMetric::DefaultPoolIncrementalBytes,
         );

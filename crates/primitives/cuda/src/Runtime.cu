@@ -1094,6 +1094,7 @@ namespace
         auto alloc_and_copy = [&](uint64_t **dst, const std::vector<uint64_t> &src)
         {
             const size_t bytes = src.size() * sizeof(uint64_t);
+            gpu_test_record_cuda_allocation();
             err = cudaMalloc(reinterpret_cast<void **>(dst), bytes);
             if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
             err = cudaMemcpy(*dst, src.data(), bytes, cudaMemcpyHostToDevice);
@@ -1149,6 +1150,7 @@ namespace
         const size_t twiddle_bytes = twiddle_count * sizeof(uint64_t);
         auto alloc_and_copy = [&](uint64_t **dst, const uint64_t *src)
         {
+            gpu_test_record_cuda_allocation();
             cudaError_t local_err = cudaMalloc(reinterpret_cast<void **>(dst), twiddle_bytes);
             if (local_err != cudaSuccess)
             {
@@ -2660,7 +2662,8 @@ extern "C"
             }
             if (!ctx || !ctx->execution || ctx->gpu_ids.empty() || alignment == 0 ||
                 alignment > 256 || (alignment & (alignment - 1)) != 0 ||
-                ctx->execution->unretired_work.load(std::memory_order_acquire))
+                (ctx->execution->unretired_work.load(std::memory_order_acquire) &&
+                 !gpu_prepared_provisioning_active(ctx)))
             {
                 set_error("invalid pinned allocation context or alignment");
                 return nullptr;
@@ -2686,6 +2689,7 @@ extern "C"
                 return nullptr;
             }
             void *ptr = nullptr;
+            gpu_test_record_cuda_allocation();
             err = cudaHostAlloc(&ptr, bytes, cudaHostAllocPortable);
             if (err != cudaSuccess)
             {

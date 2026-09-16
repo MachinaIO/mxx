@@ -46,7 +46,15 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixScalar.cu");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixScalar.cuh");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/gpu_schedule.cu");
+        println!("cargo::rerun-if-changed=cuda/include/gpu_schedule.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/gpu_preimage.cuh");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/gpu_preimage.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/gpu_compact_decompose.cu");
+        println!("cargo::rerun-if-changed=cuda/include/gpu_compact_decompose.cuh");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
@@ -88,6 +96,9 @@ fn main() {
             .flag("-Xcompiler")
             .flag("-fPIC")
             .flag(format!("-arch=sm_{cuda_arch}"));
+        if env::var("CARGO_FEATURE_GPU_INSTRUMENTATION").is_ok() {
+            build.define("MXX_GPU_INSTRUMENTATION", None);
+        }
         if !debug_build {
             build.flag("-lineinfo");
         }

@@ -42,6 +42,8 @@ extern "C"
         GpuMatrix **out,
         bool initialize_descriptors = true);
     void gpu_matrix_destroy(GpuMatrix *mat);
+    int gpu_matrix_prepared_shape(GpuMatrix *owner, size_t rows, size_t cols,
+        int level, int format, GpuMatrix **out);
     int gpu_matrix_zero(GpuMatrix *mat);
     int gpu_matrix_wait(const GpuMatrix *mat);
     int gpu_matrix_is_ready(const GpuMatrix *mat, int *out_ready);

@@ -6,6 +6,7 @@ use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_fhe::{BgvCiphertext, FheScheme};
 use mxx_ir_core::node::IndexRange;
 use mxx_primitives::poly::PolyParams;
+use mxx_runtime::RuntimeValue;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 use rand::Rng;
@@ -311,17 +312,25 @@ fn test_gpu_bgv_round_trip() {
         if label == "relinearize" {
             inputs.insert("rk".into(), keys["rk"].clone());
         }
-        let expected_bytes = gpu_utils::matrix_bytes(&stage_values[stages[index + 1].0], &backend);
-        let (warmup, _) = run(&graph, &mut backend, inputs.clone());
-        assert!(
-            gpu_utils::matrix_bytes(&warmup["ct"], &backend) == expected_bytes,
-            "warmup replay {label}"
+        let (graph_output, _) = run(&graph, &mut backend, inputs.clone());
+        let RuntimeValue::Matrix(graph_matrix) = &graph_output["ct"] else {
+            panic!("ordinary graph output must remain GPU-resident")
+        };
+        let RuntimeValue::Matrix(input_matrix) = &inputs["ct"] else {
+            panic!("prepared input must remain GPU-resident")
+        };
+        assert_eq!(
+            graph_matrix.shards().len(),
+            input_matrix.shards().len(),
+            "ordinary and prepared executions must use the same fleet shard count"
         );
+        let expected_bytes = gpu_utils::matrix_bytes(&graph_output["ct"], &backend);
         let samples = (0..utils::repetitions())
             .map(|sample| {
                 let (output, seconds) = run(&graph, &mut backend, inputs.clone());
+                let output = output["ct"].clone();
                 assert!(
-                    gpu_utils::matrix_bytes(&output["ct"], &backend) == expected_bytes,
+                    gpu_utils::matrix_bytes(&output, &backend) == expected_bytes,
                     "replay {label} sample {sample}"
                 );
                 seconds

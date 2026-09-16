@@ -476,6 +476,7 @@ mod tests {
             production_id: None,
             artifact_handles: BTreeMap::new(),
             staged_family_leases: Vec::new(),
+            prepared_outputs: None,
         };
         let mut store = MemoryArtifactStore::default();
         result.materialize_output("staged", &mut backend, &mut store).unwrap();

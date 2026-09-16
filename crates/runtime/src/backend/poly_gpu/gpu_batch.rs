@@ -1071,7 +1071,7 @@ mod tests {
             .enumerate()
             .map(|(index, input)| {
                 if index == 2 {
-                    let mut value = input.shards[0].value.clone();
+                    let mut value = (*input.shards[0].value).clone();
                     value.intt_all_in_place();
                     Arc::new(GpuFleetMatrix::from_matrix(value))
                 } else {

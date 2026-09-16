@@ -26,8 +26,6 @@ extern "C"
         size_t pinned_bytes;
     } GpuMatrixBatchWorkspaceBytes;
 
-    // Rectangular ranges refer to the original allocation owner. Empty ranges
-    // are handled by Rust without native submission. No events/payload are copied.
     typedef struct GpuMatrixRange
     {
         size_t row_start;
@@ -36,15 +34,50 @@ extern "C"
         size_t column_end;
     } GpuMatrixRange;
 
-    // Null selects complete owners. Otherwise left/output shapes agree across
-    // the batch; right is used only for binary add/sub. Output rectangles may
-    // share an owner only when disjoint, and output/input owners never alias.
     typedef struct GpuMatrixBatchView
     {
         GpuMatrixRange left;
         GpuMatrixRange right;
         GpuMatrixRange output;
     } GpuMatrixBatchView;
+
+    struct GpuPreparedArithmetic;
+    struct GpuPreparedInputCopy;
+    struct GpuPreparedTranspose;
+
+    typedef enum GpuPreparedArithmeticKind
+    {
+        GPU_PREPARED_ARITHMETIC_COPY = 0,
+        GPU_PREPARED_ARITHMETIC_ADD = 1,
+        GPU_PREPARED_ARITHMETIC_TENSOR = 2,
+        GPU_PREPARED_ARITHMETIC_TENSOR_SUM_ROWS = 3,
+        GPU_PREPARED_ARITHMETIC_MULTIPLY = 4,
+        GPU_PREPARED_ARITHMETIC_SUBTRACT = 5,
+        GPU_PREPARED_ARITHMETIC_NEGATE = 6,
+        GPU_PREPARED_ARITHMETIC_SCALE = 7,
+        GPU_PREPARED_ARITHMETIC_AUTOMORPHISM = 8,
+    } GpuPreparedArithmeticKind;
+
+    int gpu_matrix_prepare_arithmetic(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+        const size_t *rows, const size_t *offsets, size_t group_count,
+        size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+        const uint64_t *scalar_residues, size_t scalar_count,
+        size_t automorphism_index,
+        GpuPreparedArithmetic **plan);
+    int gpu_matrix_submit_arithmetic(const GpuPreparedArithmetic *plan);
+    void gpu_matrix_destroy_arithmetic_plan(GpuPreparedArithmetic *plan);
+    int gpu_matrix_prepare_input_copy(
+        GpuMatrix *out, const GpuMatrix *source_template,
+        const GpuMatrixBatchView *view, GpuPreparedInputCopy **plan);
+    int gpu_matrix_submit_input_copy(
+        const GpuPreparedInputCopy *plan, const GpuMatrix *source);
+    void gpu_matrix_destroy_input_copy(GpuPreparedInputCopy *plan);
+    int gpu_matrix_prepare_transpose(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        GpuPreparedTranspose **plan);
+    int gpu_matrix_submit_transpose(const GpuPreparedTranspose *plan);
+    void gpu_matrix_destroy_transpose(GpuPreparedTranspose *plan);
 
     // Out-of-place batches use the first output's exclusive auxiliary storage.
     // matrix_views is 0 or 1; add/sub, negate, scalar multiplication, and

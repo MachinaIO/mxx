@@ -2,16 +2,61 @@
 
 use mxx_primitives::{
     matrix::gpu_dcrt_poly::{
-        GpuPreparedRequest, GpuPreparedSlotKind, GpuPreparedSlotSnapshot, GpuPreparedStorage,
-        GpuTracedClaim,
+        GpuMatrixReservation, GpuPreparedRequest, GpuPreparedSlotKind, GpuPreparedSlotSnapshot,
+        GpuPreparedStorage, GpuTracedClaim,
     },
     poly::dcrt::gpu::GpuDCRTPolyParams,
 };
 use rayon::prelude::*;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
+
+/// Warmup-owned exact claim lease. The native reservation is acquired once
+/// during preparation and rearmed after each submitted phase; production
+/// replay therefore never performs claim matching or reservation creation.
+pub(super) struct PreparedClaimLease {
+    reservations: Mutex<Option<Vec<GpuMatrixReservation>>>,
+}
+
+impl PreparedClaimLease {
+    pub(super) fn new(reservations: Vec<GpuMatrixReservation>) -> Self {
+        Self { reservations: Mutex::new(Some(reservations)) }
+    }
+
+    pub(super) fn run<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let reservations = self
+            .reservations
+            .lock()
+            .map_err(|_| "prepared claim lease poisoned".to_owned())?
+            .take()
+            .ok_or_else(|| "prepared claim lease is unavailable".to_owned())?;
+        let mut reservations = reservations.into_iter();
+        let Some(first) = reservations.next() else {
+            return operation();
+        };
+        let dispatch = first.enter_or_extend(reservations.collect())?;
+        let result = operation();
+        match result {
+            Ok(value) => {
+                let reservations = dispatch.finish()?;
+                self.reservations
+                    .lock()
+                    .map_err(|_| "prepared claim lease poisoned".to_owned())?
+                    .replace(reservations);
+                Ok(value)
+            }
+            Err(error) => {
+                drop(dispatch);
+                Err(error)
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct PreparedClaimBroker {
@@ -58,6 +103,33 @@ impl PreparedClaimBroker {
         run: impl FnOnce() -> Result<T, String>,
     ) -> Result<T, String> {
         self.hold_inner(claims, true, true, run)
+    }
+
+    pub(super) fn reserve_traced(
+        &self,
+        claims: &[GpuTracedClaim],
+    ) -> Result<Arc<PreparedClaimLease>, String> {
+        let assignment = self
+            .assignment(claims, &HashSet::new(), &HashSet::new())?
+            .ok_or_else(|| "prepared inventory cannot fit warmup claim lease".to_owned())?;
+        let mut groups = Vec::<(&Arc<GpuPreparedStorage>, Vec<GpuPreparedRequest>)>::new();
+        for (storage, request) in assignment {
+            if let Some((previous, requests)) = groups.last_mut() {
+                if previous.identity() == storage.identity() {
+                    requests.push(request);
+                    continue;
+                }
+            }
+            groups.push((storage, vec![request]));
+        }
+        let mut reservations = groups
+            .into_iter()
+            .map(|(storage, requests)| storage.reserve(&requests))
+            .collect::<Result<Vec<_>, _>>()?;
+        for reservation in &mut reservations {
+            reservation.require_all_resources()?;
+        }
+        Ok(Arc::new(PreparedClaimLease::new(reservations)))
     }
 
     fn match_claims(
@@ -120,6 +192,7 @@ impl PreparedClaimBroker {
         excluded: &HashSet<u64>,
         reclaiming: &HashSet<u64>,
     ) -> Result<Option<Vec<(&Arc<GpuPreparedStorage>, GpuPreparedRequest)>>, String> {
+        crate::backend::poly_gpu::record_prepared_forbidden(2);
         let storage_by_id = self
             .storages
             .iter()

@@ -186,6 +186,7 @@ impl MatrixInputLayout {
         parameters: &GpuDCRTPolyParams,
         slots: &[(mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedSlotSnapshot, bool)],
     ) -> Result<Option<Vec<(Self, GpuPreparedRequest)>>, String> {
+        crate::backend::poly_gpu::record_prepared_forbidden(2);
         use mxx_primitives::matrix::gpu_dcrt_poly::{GpuPreparedSlotSnapshot, GpuTracedClaim};
         let mut layouts = layouts.into_iter().peekable();
         if layouts.peek().is_none() {
@@ -227,7 +228,7 @@ pub(super) type SymbolicMatrixLayouts =
     std::collections::BTreeMap<mxx_ir_core::types::WireRef, Arc<[MatrixInputFragment]>>;
 
 pub(super) type PreparedMatrixInputs =
-    HashMap<(u64, PreparedMatrixSource), Arc<GpuColumnShard<GpuDCRTPolyMatrix>>>;
+    HashMap<(u64, PreparedMatrixSource), Arc<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>>;
 
 pub(super) struct MatrixInputPreparation {
     pub matrix: GpuFleetMatrix,
@@ -654,7 +655,7 @@ impl GpuDcrtBackend {
                             Arc::new(GpuColumnShard {
                                 device_id: input.parameters.device_ids()[0],
                                 global_column_start: start,
-                                value: output,
+                                value: Arc::new(output),
                             }),
                         ));
                     }

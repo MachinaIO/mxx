@@ -8,6 +8,8 @@ extern "C"
 {
 #endif
 
+    typedef struct GpuPreparedConstCoeffReadback GpuPreparedConstCoeffReadback;
+
     int gpu_matrix_load_rns_batch(
         GpuMatrix *mat,
         const uint8_t *bytes,
@@ -28,6 +30,36 @@ extern "C"
         uint64_t *words_out,
         size_t words_per_poly,
         GpuEventSet **out_events);
+
+    // Fixed coefficient-domain readback. Preparation captures the matrix
+    // geometry, every limb's source descriptor/stream and one completion event
+    // per source stream. Submission only replays the already validated 2-D
+    // copies into the caller-owned pinned buffer.
+    int gpu_matrix_prepare_const_coeff_readback(
+        const GpuMatrix *mat,
+        uint64_t *words_out,
+        size_t words_per_poly,
+        size_t coefficient_index,
+        size_t coefficient_count,
+        GpuPreparedConstCoeffReadback **out_plan);
+    int gpu_matrix_submit_const_coeff_readback(
+        const GpuPreparedConstCoeffReadback *plan);
+    int gpu_matrix_wait_const_coeff_readback(
+        const GpuPreparedConstCoeffReadback *plan);
+    void gpu_matrix_destroy_const_coeff_readback(
+        GpuPreparedConstCoeffReadback *plan);
+
+    typedef struct GpuPreparedRnsUpload GpuPreparedRnsUpload;
+    int gpu_matrix_prepare_rns_upload(
+        GpuMatrix *mat,
+        const uint8_t *bytes,
+        size_t bytes_per_poly,
+        int format,
+        bool transform_to_eval,
+        GpuPreparedRnsUpload **out_plan);
+    int gpu_matrix_submit_rns_upload(const GpuPreparedRnsUpload *plan);
+    int gpu_matrix_wait_rns_upload(const GpuPreparedRnsUpload *plan);
+    void gpu_matrix_destroy_rns_upload(GpuPreparedRnsUpload *plan);
 
 
     int gpu_matrix_store_compact_bytes(

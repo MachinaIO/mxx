@@ -97,7 +97,7 @@ impl GpuDcrtBackend {
                                 attempt, seed: request.randomness_seed,
                             });
                         }
-                        let flags = sampler.preimage_attempt_batch(&params, pending, &mut ())
+                        let flags = sampler.preimage_attempt_batch(&params, pending.into_boxed_slice(), &mut ())
                             .map_err(PolyBackendError::GpuSubmission)?;
                         for (index, flag) in indices.into_iter().zip(flags) { accepted[index] = flag; }
                         if accepted.iter().all(|flag| *flag) { break; }
@@ -163,7 +163,10 @@ mod tests {
         let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, 5.0);
         let (trapdoor, public) = sampler.trapdoor(&params, 1);
         let public = Arc::new(GpuFleetMatrix::from_matrix(public));
-        let trapdoor = Arc::new(GpuFleetTrapdoor { values: Arc::new(vec![trapdoor]) });
+        let trapdoor = Arc::new(GpuFleetTrapdoor {
+            values: Arc::new(vec![Arc::new(trapdoor)]),
+            prepared_lease: None,
+        });
         let ty = ConcreteMatrixType {
             modulus: BigInt::from(params.modulus().as_ref().clone()),
             ring_dimension: n as usize,

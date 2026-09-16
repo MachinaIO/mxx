@@ -1,12 +1,141 @@
-use super::super::poly::{
-    PolyBackend, PolyBackendError, decode_small_matrix_artifact, encode_small_matrix_artifact,
+use super::{
+    super::poly::{
+        PolyBackend, PolyBackendError, decode_small_matrix_artifact, encode_small_matrix_artifact,
+    },
+    gpu_prepared_lowering,
 };
+
+fn materialize_prepared_input(
+    backend: &mut GpuDcrtBackend,
+    value: &crate::backend::RuntimeValue<GpuDcrtBackend>,
+) -> Result<crate::backend::RuntimeValue<GpuDcrtBackend>, PolyBackendError> {
+    match value {
+        crate::backend::RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            Ok(crate::backend::RuntimeValue::matrix(
+                backend.matrix_from_cpu_staging_bytes(matrix_type, bytes)?,
+            ))
+        }
+        crate::backend::RuntimeValue::IndexedFamily(values) => {
+            let members = values
+                .iter()
+                .map(|value| materialize_prepared_input(backend, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(crate::backend::RuntimeValue::IndexedFamily(members))
+        }
+        _ => Ok(value.clone()),
+    }
+}
+
+fn materialize_prepared_inputs(
+    backend: &mut GpuDcrtBackend,
+    inputs: &BTreeMap<String, crate::backend::RuntimeValue<GpuDcrtBackend>>,
+) -> Result<BTreeMap<String, crate::backend::RuntimeValue<GpuDcrtBackend>>, PolyBackendError> {
+    inputs
+        .iter()
+        .map(|(name, value)| Ok((name.clone(), materialize_prepared_input(backend, value)?)))
+        .collect()
+}
+
+pub(crate) fn prepared_runtime_value(
+    value: &crate::backend::RuntimeValue<GpuDcrtBackend>,
+) -> Result<super::gpu_prepared::PreparedRuntimeValue, PolyBackendError> {
+    match value {
+        crate::backend::RuntimeValue::Matrix(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::FleetMatrix(Arc::clone(value)))
+        }
+        crate::backend::RuntimeValue::SmallMatrix(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::FleetSmallMatrix(Arc::clone(value)))
+        }
+        crate::backend::RuntimeValue::Int(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Int(value.clone()))
+        }
+        crate::backend::RuntimeValue::Real(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Real(*value))
+        }
+        crate::backend::RuntimeValue::Bool(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Bool(*value))
+        }
+        crate::backend::RuntimeValue::Bytes(value) |
+        crate::backend::RuntimeValue::TypedBlob(value) => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Bytes(Arc::from(value.as_slice())))
+        }
+        crate::backend::RuntimeValue::IndexedFamily(values) => {
+            let members =
+                values.iter().map(prepared_runtime_value).collect::<Result<Vec<_>, _>>()?;
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Family(members.into()))
+        }
+        crate::backend::RuntimeValue::Trapdoor { secret: Some(secret), public, .. } => {
+            Ok(super::gpu_prepared::PreparedRuntimeValue::Trapdoor {
+                secret: Arc::clone(secret),
+                public: Arc::clone(public),
+            })
+        }
+        _ => Err(PolyBackendError::GpuSubmission(
+            "prepared input kind has no fixed runtime binding".into(),
+        )),
+    }
+}
+
+fn prepared_scalar_input_max_words(
+    program: &gpu_prepared_lowering::PreparedProgram,
+    inputs: &BTreeMap<String, crate::backend::RuntimeValue<GpuDcrtBackend>>,
+    bound: Option<std::num::NonZeroUsize>,
+) -> Result<Box<[usize]>, PolyBackendError> {
+    let root_inputs = program
+        .input_names
+        .iter()
+        .map(|(name, _)| {
+            inputs.get(name).cloned().ok_or_else(|| {
+                PolyBackendError::GpuSubmission(format!(
+                    "prepared input `{name}` is missing during warmup"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared_inputs = program
+        .input_names
+        .iter()
+        .zip(root_inputs)
+        .map(|((_, _), value)| prepared_runtime_value(&value))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prepared_inputs =
+        super::gpu_prepared::expand_prepared_runtime_inputs(program, &prepared_inputs)
+            .map_err(PolyBackendError::GpuSubmission)?;
+    let mut max_words = vec![0usize; program.runtime_input_wires.len()];
+    for (index, wire) in program.runtime_input_wires.iter().enumerate() {
+        if !program.scalar_slots.contains_key(wire) {
+            continue;
+        }
+        let value = prepared_inputs.get(index).ok_or_else(|| {
+            PolyBackendError::GpuSubmission("prepared scalar input leaf is unavailable".into())
+        })?;
+        let words = match value {
+            super::gpu_prepared::PreparedRuntimeValue::Int(value) => {
+                let required =
+                    usize::try_from(value.bits().div_ceil(64)).unwrap_or(usize::MAX).max(1);
+                if bound.is_some_and(|bound| required > bound.get()) {
+                    return Err(PolyBackendError::GpuSubmission(format!(
+                        "prepared integer input exceeds configured word capacity"
+                    )));
+                }
+                bound.map_or(required, std::num::NonZeroUsize::get)
+            }
+            super::gpu_prepared::PreparedRuntimeValue::Bool(_) => 1,
+            super::gpu_prepared::PreparedRuntimeValue::Real(_) => 1,
+            _ => continue,
+        };
+        max_words[index] = words;
+    }
+    Ok(max_words.into_boxed_slice())
+}
+
 use crate::{
     backend::{Backend, IndexRange, MatrixMulAccumulateRequest, PreimageTarget, SampleRange},
     gpu_calibration::{
         FrozenGpuCalibrationRegistry, GpuAllocationClass, GpuCalibrationError, GpuCalibrationKey,
-        GpuCalibrationMetric, GpuCalibrationProfile, GpuColumnWidths, GpuDeviceCalibration,
-        GpuDeviceMemory, gpu_capped_waterfill_columns, gpu_matrix_multiply_scales_left,
+        GpuCalibrationMetric, GpuCalibrationProfile, GpuCalibrationResourceSignature,
+        GpuColumnWidths, GpuDeviceCalibration, GpuDeviceMemory, gpu_capped_waterfill_columns,
+        gpu_matrix_multiply_scales_left,
     },
     gpu_enqueue::GpuEnqueuePool,
     gpu_schedule::{GpuColumnInterval, GpuColumnSchedule},
@@ -23,8 +152,8 @@ use mxx_primitives::{
         SmallPolyMatrix,
         gpu_dcrt_poly::{
             GpuCompactTransferKind, GpuDCRTMatrixRnsSnapshot, GpuDCRTPolyMatrix,
-            GpuPreparedSlotKind, GpuPreparedWorkspaceLayout, GpuRnsSnapshotTransfer,
-            GpuSmallMatrix, GpuTracedClaim,
+            GpuPreparedSlotKind, GpuPreparedStorage, GpuPreparedWorkspaceLayout,
+            GpuRnsSnapshotTransfer, GpuSmallMatrix, GpuTracedClaim,
         },
     },
     poly::{
@@ -70,6 +199,7 @@ mod gpu_preflight;
 mod gpu_preimage_batch;
 #[path = "gpu_prepare.rs"]
 mod gpu_prepare;
+use super::gpu_prepared::PreparedGpuFleetExecution;
 pub use gpu_admit::{
     GpuMatrixColumnContext, GpuMatrixColumnRequirements, GpuMatrixLayoutPlan, GpuSetupClaim,
     MatrixPlacementInvocation as GpuMatrixPlacementInvocation,
@@ -80,6 +210,7 @@ use gpu_compiled::{
     PreparedMatrixBatch, PreparedOperation, TrapdoorPlanKey,
 };
 use gpu_inventory::PreparedGraphAdmission;
+pub(crate) use gpu_inventory::PreparedScheduleStreamKey;
 pub use gpu_inventory::{GpuContextDemand, GpuInventoryValue, GpuScopeProgress, GpuScopeResources};
 pub use gpu_prepare::{
     MatrixDescriptor as GpuMatrixDescriptor,
@@ -105,6 +236,7 @@ static NEXT_FLEET_VALUE_ID: AtomicU64 = AtomicU64::new(1);
 type CompactMatrixEncoding = (u8, u8, u32, usize, usize, u16, u16, Vec<u8>);
 
 impl GpuDcrtBackend {
+    const PREPARED_MAX_LIVE_EXECUTIONS: usize = 1;
     fn start_rns_snapshot<'a>(
         &mut self,
         matrix: &'a GpuDCRTPolyMatrix,
@@ -453,16 +585,19 @@ pub struct GpuFleetMatrix {
     columns: usize,
     // Logical aliases share native allocation and release ownership. Cloning a
     // primitive matrix here would allocate a second, unreserved GPU payload.
-    shards: Arc<Vec<GpuColumnShard<GpuDCRTPolyMatrix>>>,
+    shards: Arc<Vec<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>>,
     // Publish immutable source geometry with the actual owner. Admission and
     // downstream preparation share this metadata without re-inspecting shards.
     input_layout: Arc<[gpu_prepare::MatrixInputFragment]>,
+    // A prepared execution slot remains pinned while the returned resident
+    // value is alive. Ordinary values leave this empty.
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
 }
 
 // Device commands must retain resident storage independently of a caller's
 // borrow. Only materialized ranges own a new native allocation.
 enum GpuMatrixOperand {
-    Resident { shards: Arc<Vec<GpuColumnShard<GpuDCRTPolyMatrix>>>, index: usize },
+    Resident { shards: Arc<Vec<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>>, index: usize },
     Materialized(GpuDCRTPolyMatrix),
 }
 
@@ -487,7 +622,7 @@ impl Deref for GpuMatrixOperand {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Resident { shards, index } => &shards[*index].value,
+            Self::Resident { shards, index } => shards[*index].value.as_ref(),
             Self::Materialized(matrix) => matrix,
         }
     }
@@ -513,6 +648,14 @@ impl GpuFleetMatrix {
         columns: usize,
         shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>,
     ) -> Self {
+        let shards = shards
+            .into_iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: Arc::new(shard.value),
+            })
+            .collect::<Vec<_>>();
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
         let input_layout = shards
             .iter()
@@ -531,6 +674,42 @@ impl GpuFleetMatrix {
             columns,
             shards: Arc::new(shards),
             input_layout,
+            prepared_lease: None,
+        }
+    }
+
+    pub(super) fn with_prepared_lease(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuFleetOutput>,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value
+    }
+
+    pub(super) fn from_shared_shards(
+        rows: usize,
+        columns: usize,
+        shards: Vec<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>,
+    ) -> Self {
+        validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        let input_layout = shards
+            .iter()
+            .map(|shard| gpu_prepare::MatrixInputFragment {
+                device: shard.device_id,
+                context: shard.value.params().context_identity(),
+                start: shard.global_column_start,
+                end: shard.global_column_start + shard.value.col_size(),
+                level: shard.value.level(),
+                evaluation: shard.value.is_ntt(),
+            })
+            .collect();
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            input_layout,
+            prepared_lease: None,
         }
     }
 
@@ -543,11 +722,16 @@ impl GpuFleetMatrix {
     pub fn size(&self) -> (usize, usize) {
         (self.rows, self.columns)
     }
-    pub fn shards(&self) -> &[GpuColumnShard<GpuDCRTPolyMatrix>] {
+
+    pub fn shards(&self) -> &[GpuColumnShard<Arc<GpuDCRTPolyMatrix>>] {
         &self.shards
     }
-    pub fn wait_until_ready(&self) {
+    pub fn wait_until_ready(&self) -> Result<(), String> {
         self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+        if let Some(lease) = &self.prepared_lease {
+            lease.check_device_scalar_status()?;
+        }
+        Ok(())
     }
 }
 
@@ -643,7 +827,8 @@ pub struct GpuFleetSmallMatrix {
     rows: usize,
     columns: usize,
     // Keep compact allocations alive until the last logical alias is dropped.
-    shards: Arc<Vec<GpuColumnShard<GpuSmallMatrix>>>,
+    shards: Arc<Vec<GpuColumnShard<Arc<GpuSmallMatrix>>>>,
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
 }
 
 impl PartialEq for GpuFleetSmallMatrix {
@@ -657,11 +842,43 @@ impl Eq for GpuFleetSmallMatrix {}
 impl GpuFleetSmallMatrix {
     pub fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        let shards = shards
+            .into_iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: Arc::new(shard.value),
+            })
+            .collect();
         Self {
             id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
             rows,
             columns,
             shards: Arc::new(shards),
+            prepared_lease: None,
+        }
+    }
+
+    pub(super) fn with_prepared_lease(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuFleetOutput>,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value
+    }
+
+    pub(super) fn from_shared_shards(
+        rows: usize,
+        columns: usize,
+        shards: Vec<GpuColumnShard<Arc<GpuSmallMatrix>>>,
+    ) -> Self {
+        validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            prepared_lease: None,
         }
     }
 
@@ -674,11 +891,15 @@ impl GpuFleetSmallMatrix {
     pub fn size(&self) -> (usize, usize) {
         (self.rows, self.columns)
     }
-    pub fn shards(&self) -> &[GpuColumnShard<GpuSmallMatrix>] {
+    pub fn shards(&self) -> &[GpuColumnShard<Arc<GpuSmallMatrix>>] {
         &self.shards
     }
-    pub fn wait_until_ready(&self) {
+    pub fn wait_until_ready(&self) -> Result<(), String> {
         self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+        if let Some(lease) = &self.prepared_lease {
+            lease.check_device_scalar_status()?;
+        }
+        Ok(())
     }
 }
 
@@ -712,12 +933,16 @@ impl PilotReady for GpuSmallMatrix {
 
 #[derive(Clone, Debug)]
 pub struct GpuFleetTrapdoor {
-    values: Arc<Vec<GpuDCRTTrapdoor>>,
+    pub(super) values: Arc<Vec<Arc<GpuDCRTTrapdoor>>>,
+    pub(super) prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
 }
 
 impl GpuFleetTrapdoor {
     pub fn wait_until_ready(&self) {
-        self.values.iter().for_each(GpuDCRTTrapdoor::wait_until_ready);
+        if let Some(lease) = &self.prepared_lease {
+            lease.wait_until_ready().expect("prepared trapdoor completion failed");
+        }
+        self.values.iter().for_each(|value| value.wait_until_ready());
     }
 }
 
@@ -764,11 +989,11 @@ pub struct GpuDcrtBackend {
     enqueue: GpuEnqueuePool,
     operation_widths: HashMap<[u8; 32], GpuColumnWidths>,
     manual_widths: HashSet<[u8; 32]>,
-    operation_profiles: HashMap<[u8; 32], GpuCalibrationProfile>,
-    pending_profile: Option<([u8; 32], GpuCalibrationProfile)>,
+    measurement_cache: GpuMeasurementCache,
+    pending_profile: Option<GpuCalibrationKey>,
+    pending_calibration: Option<[u8; 32]>,
     pending_pilot: Option<RuntimePilot>,
     active_operation: Option<[u8; 32]>,
-    calibration_registry: FrozenGpuCalibrationRegistry,
     vram_percent: u32,
     matrix_replicas: HashMap<(u64, usize), Weak<GpuDCRTPolyMatrix>>,
     rns_staging_buffers: Vec<GpuDCRTMatrixRnsSnapshot>,
@@ -778,6 +1003,7 @@ pub struct GpuDcrtBackend {
     /// configured concurrency bound and the setup memory fit. Zero until a
     /// production graph admission runs.
     graph_wave: usize,
+    prepared_wave_bound: Option<std::num::NonZeroUsize>,
     prepared_invocations: VecDeque<CompiledMatrixInvocation>,
     admitted_scope_operations: Vec<Weak<gpu_compiled::AdmittedScopeOperations>>,
     /// One immutable prepared root template per stable operation/batch identity.
@@ -785,6 +1011,9 @@ pub struct GpuDcrtBackend {
     /// execution; the map is cleared at each setup boundary.
     graph_admission_cache: BTreeMap<[u8; 32], PreparedGraphAdmission>,
     prepared_matrix_batches: BTreeMap<[u8; 32], PreparedMatrixBatch>,
+    prepared_graph: Option<(usize, PreparedGpuFleetExecution)>,
+    prepared_program: Option<gpu_prepared_lowering::PreparedProgram>,
+    prepared_spec_hash: Option<[u8; 32]>,
     #[cfg(test)]
     pub(crate) graph_admission_cache_hits: usize,
     #[cfg(test)]
@@ -808,6 +1037,8 @@ pub struct GpuDcrtBackend {
     #[cfg(test)]
     pub(crate) prepared_matrix_layout_plans: usize,
     prepared_ledger: Option<crate::gpu_memory::GpuMemoryLedger>,
+    prepared_provisioning: Vec<(usize, Arc<GpuPreparedStorage>)>,
+    prepared_provisioning_budget: Vec<u64>,
     /// Traced claim plans for preimage and trapdoor sampling classes, derived
     /// before the inventory sealed.
     preimage_plans: HashMap<PreimagePlanKey, PreimageClaimPlan>,
@@ -834,17 +1065,143 @@ pub struct GpuDcrtBackend {
 }
 
 struct RuntimePilot {
-    operation: [u8; 32],
+    key: GpuCalibrationKey,
     baseline_bytes: Vec<u64>,
     planned_memory: Vec<GpuDeviceMemory>,
     context_generations: Vec<u64>,
     attempts: usize,
 }
 
+/// The sole warmup measurement cache. Setup profiles and profiles measured by
+/// this fleet share the same exact key; no operation-only compatibility map is
+/// retained.
+#[derive(Clone, Default)]
+struct GpuMeasurementCache {
+    setup: FrozenGpuCalibrationRegistry,
+    measured: HashMap<GpuCalibrationKey, GpuCalibrationProfile>,
+}
+
+impl GpuMeasurementCache {
+    fn set_setup(&mut self, setup: FrozenGpuCalibrationRegistry) {
+        self.setup = setup;
+        self.measured.clear();
+    }
+
+    fn get(&self, key: &GpuCalibrationKey) -> Option<GpuCalibrationProfile> {
+        self.measured
+            .get(key)
+            .cloned()
+            .or_else(|| self.setup.get(key).map(|profile| (*profile).clone()))
+    }
+
+    fn insert(&mut self, key: GpuCalibrationKey, profile: GpuCalibrationProfile) {
+        self.measured.insert(key, profile);
+    }
+
+    fn clear(&mut self) {
+        self.measured.clear();
+    }
+
+    #[cfg(test)]
+    fn has_measured_operation(&self, operation: [u8; 32]) -> bool {
+        self.measured.keys().any(|key| key.operation() == operation)
+    }
+}
+
 impl GpuDcrtBackend {
+    #[cfg(all(test, feature = "gpu-instrumentation"))]
+    pub(super) fn prepared_execution_for_test(
+        &self,
+    ) -> (&gpu_prepared_lowering::PreparedProgram, &PreparedGpuFleetExecution) {
+        (
+            self.prepared_program.as_ref().expect("warmed program"),
+            &self.prepared_graph.as_ref().expect("warmed execution").1,
+        )
+    }
+
+    /// Prepare a static graph at the explicit warmup boundary. Unsupported
+    /// topologies fail here; they are never silently executed by the prepared
+    /// replay path. Reusing the same validated graph is already warmed.
+    pub fn warm_up_prepared_graph(
+        &mut self,
+        validated: &mxx_ir_core::ValidatedGraph,
+        inputs: &BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        config: &crate::ExecutionConfig,
+    ) -> Result<(), PolyBackendError> {
+        let prepared_inputs = materialize_prepared_inputs(self, inputs)?;
+        let wave_bound = config.max_parallel_instances;
+        let identity = validated as *const _ as usize;
+        let cached_scalar_contract =
+            if self.prepared_graph.as_ref().is_some_and(|(cached, _)| *cached == identity) {
+                self.prepared_program
+                    .as_ref()
+                    .map(|program| prepared_scalar_input_max_words(program, &prepared_inputs, None))
+                    .transpose()?
+            } else {
+                None
+            };
+        if self.prepared_wave_bound == Some(wave_bound) &&
+            self.prepared_program.as_ref().is_some_and(|program| {
+                program.instance_count == Self::PREPARED_MAX_LIVE_EXECUTIONS &&
+                    cached_scalar_contract.as_deref() ==
+                        Some(program.scalar_input_max_words.as_ref())
+            }) &&
+            self.prepared_graph.as_ref().is_some_and(|(cached, _)| *cached == identity)
+        {
+            return Ok(());
+        }
+        let mut prepared_program = gpu_prepared_lowering::lower_graph(validated, wave_bound)
+            .map_err(|error| {
+                PolyBackendError::GpuSubmission(format!("prepared topology: {error:?}"))
+            })?;
+        prepared_program.instance_count = Self::PREPARED_MAX_LIVE_EXECUTIONS;
+        prepared_program.scalar_input_max_words =
+            prepared_scalar_input_max_words(&prepared_program, &prepared_inputs, None)?;
+        let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let previous_program = self.prepared_program.replace(prepared_program);
+        let previous_graph = self.prepared_graph.take();
+        let previous_spec_hash = self.prepared_spec_hash;
+        let previous_wave = self.graph_wave;
+        let previous_wave_bound = self.prepared_wave_bound;
+        let warmup = self.prepare_graph_admission_with_hash(
+            spec_hash.0,
+            validated,
+            false,
+            &prepared_inputs,
+            wave_bound.get(),
+            true,
+        );
+        let warmup = warmup.and_then(|_| {
+            if self.prepared_graph.as_ref().is_some_and(|(cached, _)| *cached == identity) {
+                Ok(())
+            } else {
+                Err(PolyBackendError::GpuSubmission(
+                    "prepared graph warmup did not publish an executable".into(),
+                ))
+            }
+        });
+        if warmup.is_err() {
+            self.prepared_program = previous_program;
+            self.prepared_graph = previous_graph;
+            self.graph_wave = previous_wave;
+            self.prepared_wave_bound = previous_wave_bound;
+            self.prepared_spec_hash = previous_spec_hash;
+            self.discard_prepared_provisioning();
+        } else {
+            self.prepared_wave_bound = Some(wave_bound);
+            self.prepared_spec_hash = Some(spec_hash.0);
+        }
+        warmup
+    }
+
     fn clear_prepared_caches(&mut self) {
+        self.prepared_wave_bound = None;
         self.graph_admission_cache.clear();
         self.prepared_matrix_batches.clear();
+        self.prepared_graph = None;
+        self.prepared_program = None;
+        self.prepared_spec_hash = None;
     }
 
     fn cache_graph_admission(&mut self, key: [u8; 32], value: PreparedGraphAdmission) {
@@ -903,21 +1260,25 @@ impl GpuDcrtBackend {
             enqueue,
             operation_widths: HashMap::new(),
             manual_widths: HashSet::new(),
-            operation_profiles: HashMap::new(),
+            measurement_cache: GpuMeasurementCache::default(),
             pending_profile: None,
+            pending_calibration: None,
             pending_pilot: None,
             active_operation: None,
-            calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent,
             matrix_replicas: HashMap::new(),
             rns_staging_buffers: Vec::new(),
             prepared_required: false,
             graph_prepared: false,
             graph_wave: 0,
+            prepared_wave_bound: None,
             prepared_invocations: VecDeque::new(),
             admitted_scope_operations: Vec::new(),
             graph_admission_cache: BTreeMap::new(),
             prepared_matrix_batches: BTreeMap::new(),
+            prepared_graph: None,
+            prepared_program: None,
+            prepared_spec_hash: None,
             #[cfg(test)]
             graph_admission_cache_hits: 0,
             #[cfg(test)]
@@ -941,6 +1302,8 @@ impl GpuDcrtBackend {
             #[cfg(test)]
             prepared_matrix_layout_plans: 0,
             prepared_ledger: None,
+            prepared_provisioning: Vec::new(),
+            prepared_provisioning_budget: Vec::new(),
             preimage_plans: HashMap::new(),
             trapdoor_plans: HashMap::new(),
             warmup_trapdoors: HashMap::new(),
@@ -954,14 +1317,27 @@ impl GpuDcrtBackend {
     }
 
     pub fn set_calibration_registry(&mut self, registry: FrozenGpuCalibrationRegistry) {
-        self.calibration_registry = registry;
-        self.operation_profiles.clear();
+        self.measurement_cache.set_setup(registry);
         self.pending_profile = None;
         self.clear_prepared_caches();
     }
 
-    pub fn calibration_registry(&self) -> &FrozenGpuCalibrationRegistry {
-        &self.calibration_registry
+    pub fn calibration_registry(&self) -> FrozenGpuCalibrationRegistry {
+        self.measurement_cache.setup.clone()
+    }
+
+    #[cfg(test)]
+    fn has_cached_profile(&self, operation: &[u8; 32]) -> bool {
+        self.measurement_cache.has_measured_operation(*operation)
+    }
+
+    #[cfg(test)]
+    fn cached_profile(&self, operation: &[u8; 32]) -> Option<GpuCalibrationProfile> {
+        self.measurement_cache
+            .measured
+            .iter()
+            .find(|(key, _)| key.operation() == operation)
+            .map(|(_, profile)| profile.clone())
     }
 
     /// Percentage of physical VRAM fixed when this fleet context was created.
@@ -1072,6 +1448,61 @@ impl GpuDcrtBackend {
         &self.admitted_plan_log
     }
 
+    fn calibration_resource_signature(
+        inputs: &[&GpuFleetMatrix],
+    ) -> GpuCalibrationResourceSignature {
+        let mut levels = Vec::new();
+        let mut formats = Vec::new();
+        let mut contexts = Vec::new();
+        let mut basis = Vec::new();
+        for input in inputs {
+            for shard in input.shards() {
+                let matrix = shard.value.as_ref();
+                let parameters = matrix.params();
+                levels.push(matrix.level());
+                formats.push(matrix.is_ntt());
+                contexts.push(parameters.context_identity());
+                basis.push((
+                    parameters.ring_dimension(),
+                    parameters.moduli().to_vec(),
+                    parameters.base_bits(),
+                    parameters.dropped_moduli(),
+                ));
+            }
+        }
+        let basis = mxx_ir_core::encoding::hash_canonical(&(
+            "mxx-runtime/gpu-calibration-resource-basis/v1",
+            &basis,
+        ))
+        .expect("GPU calibration resource metadata is serializable");
+        GpuCalibrationResourceSignature::new(levels, formats, contexts, basis)
+    }
+
+    fn calibration_key(
+        &self,
+        operation: [u8; 32],
+        resource: GpuCalibrationResourceSignature,
+    ) -> Result<GpuCalibrationKey, String> {
+        let identity = gpu_device_identity(self.devices[0].0)?;
+        let environment = crate::gpu_calibration::gpu_calibration_environment(
+            &identity,
+            self.devices.len(),
+            self.vram_percent,
+        );
+        Ok(GpuCalibrationKey::new(
+            operation.to_vec(),
+            environment,
+            resource,
+            GpuAllocationClass {
+                identity: operation,
+                bound_identity: None,
+                minimum_columns: 1,
+                maximum_columns: usize::MAX,
+            },
+            GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+        ))
+    }
+
     /// Enable explicit benchmark boundaries on the actual compiled runner.
     /// Each measured wave waits for its own timing events while retaining the
     /// invocation's outputs. `None` restores asynchronous production execution.
@@ -1096,10 +1527,40 @@ impl GpuDcrtBackend {
         self.active_operation = Some(operation);
         self.unlogged_operation = Some(operation);
         self.pending_profile = None;
+        self.pending_calibration = None;
         if self.prepared_required {
             self.pending_pilot = None;
             return Ok(());
         }
+        if warm_up {
+            if let Some(pilot) = &self.pending_pilot {
+                if pilot.key.operation() != operation {
+                    return Err(PolyBackendError::GpuCalibration(
+                        "a different GPU measurement is already in progress".into(),
+                    ));
+                }
+            }
+            // The concrete owners determine level, format and CRT basis. Defer
+            // the cache lookup until the first representative owner is known;
+            // no GPU work is permitted before that metadata boundary.
+            self.pending_calibration = Some(operation);
+            return Ok(());
+        }
+        if self.operation_widths.contains_key(&operation) {
+            return Ok(());
+        }
+        Err(PolyBackendError::GpuCalibration(
+            "allocating execution requires an explicit operation warmup or supplied calibration profile".into(),
+        ))
+    }
+
+    fn select_operation_with_resource(
+        &mut self,
+        operation: [u8; 32],
+        warm_up: bool,
+        resource: GpuCalibrationResourceSignature,
+    ) -> Result<(), PolyBackendError> {
+        self.pending_calibration = None;
         if self.manual_widths.contains(&operation) {
             return Ok(());
         }
@@ -1110,7 +1571,6 @@ impl GpuDcrtBackend {
         // context is live, so fail before retaining any local plan state.
         let memory = self.device_memories().map_err(PolyBackendError::GpuCalibration)?;
         if memory.iter().any(|(_, live_contexts, _)| *live_contexts > 1) {
-            self.operation_profiles.remove(&operation);
             return Err(PolyBackendError::GpuCalibration(format!(
                 "{SHARED_POOL_CALIBRATION_ERROR}: gpu0_contexts={}, nonzero_contexts={:?}",
                 memory[0].1,
@@ -1118,30 +1578,35 @@ impl GpuDcrtBackend {
             )));
         }
 
-        let profile = self.operation_profiles.get(&operation).cloned().or_else(|| {
-            let identity = gpu_device_identity(self.devices[0].0).ok()?;
-            let environment = crate::gpu_calibration::gpu_calibration_environment(
-                &identity,
-                self.devices.len(),
-                self.vram_percent,
-            );
-            self.calibration_registry
-                .get(&GpuCalibrationKey::new(
-                    operation.to_vec(),
-                    environment,
-                    GpuAllocationClass {
-                        identity: operation,
-                        bound_identity: None,
-                        minimum_columns: 1,
-                        maximum_columns: usize::MAX,
-                    },
-                    GpuCalibrationMetric::DefaultPoolIncrementalBytes,
-                ))
-                .map(|profile| (*profile).clone())
-        });
-        if let Some(profile) = profile {
-            self.operation_profiles.remove(&operation);
-            self.pending_profile = Some((operation, profile));
+        let identity =
+            gpu_device_identity(self.devices[0].0).map_err(PolyBackendError::GpuCalibration)?;
+        let environment = crate::gpu_calibration::gpu_calibration_environment(
+            &identity,
+            self.devices.len(),
+            self.vram_percent,
+        );
+        let key = GpuCalibrationKey::new(
+            operation.to_vec(),
+            environment,
+            resource,
+            GpuAllocationClass {
+                identity: operation,
+                bound_identity: None,
+                minimum_columns: 1,
+                maximum_columns: usize::MAX,
+            },
+            GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+        );
+        if let Some(pilot) = &self.pending_pilot {
+            if pilot.key != key {
+                return Err(PolyBackendError::GpuCalibration(
+                    "a different GPU measurement is already in progress".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if self.measurement_cache.get(&key).is_some() {
+            self.pending_profile = Some(key);
             return Ok(());
         }
         if !warm_up {
@@ -1149,7 +1614,7 @@ impl GpuDcrtBackend {
                 "allocating execution requires an explicit operation warmup or supplied calibration profile".into(),
             ));
         }
-        match self.begin_runtime_pilot(operation) {
+        match self.begin_runtime_pilot(key) {
             Ok(()) => {
                 tracing::info!("GPU calibration profile miss; measuring one-column runtime pilot")
             }
@@ -1160,7 +1625,7 @@ impl GpuDcrtBackend {
         Ok(())
     }
 
-    fn device_memories(&self) -> Result<Vec<(GpuDeviceMemory, usize, u64)>, String> {
+    pub(crate) fn device_memories(&self) -> Result<Vec<(GpuDeviceMemory, usize, u64)>, String> {
         self.devices
             .iter()
             .map(|(device, _)| {
@@ -1177,14 +1642,14 @@ impl GpuDcrtBackend {
             .collect()
     }
 
-    fn begin_runtime_pilot(&mut self, operation: [u8; 32]) -> Result<(), String> {
-        if self.pending_pilot.take().is_some() {
+    fn begin_runtime_pilot(&mut self, key: GpuCalibrationKey) -> Result<(), String> {
+        if self.pending_pilot.is_some() {
             return Err("a previous GPU runtime pilot did not reach a column wave".into());
         }
         let (baseline_bytes, planned_memory, context_generations) =
             self.reset_runtime_pilot_baseline()?;
         self.pending_pilot = Some(RuntimePilot {
-            operation,
+            key,
             baseline_bytes,
             planned_memory,
             context_generations,
@@ -1224,27 +1689,37 @@ impl GpuDcrtBackend {
     }
 
     fn restart_runtime_pilot_after_fixed_inputs(&mut self) -> Result<(), String> {
-        let profile = self.pending_profile.take().or_else(|| {
+        if let Some(operation) = self.pending_calibration {
+            self.select_operation_with_resource(
+                operation,
+                true,
+                GpuCalibrationResourceSignature::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let key = self.pending_profile.take().or_else(|| {
             let operation = self.active_operation?;
             if self.pending_pilot.is_some() || self.manual_widths.contains(&operation) {
                 return None;
             }
-            self.operation_profiles.get(&operation).cloned().map(|profile| (operation, profile))
+            self.calibration_key(operation, GpuCalibrationResourceSignature::default()).ok()
         });
-        if let Some((operation, profile)) = profile {
+        if let Some(key) = key {
+            let operation = key.operation().try_into().expect("calibration operation identity");
+            let Some(profile) = self.measurement_cache.get(&key) else {
+                return Err("GPU calibration profile was not measured during warmup".into());
+            };
             // Fixed operands have already been staged at every placement.  An
             // allocator-aware snapshot is sufficient to rederive a cached
             // profile against their residency; unlike a runtime pilot, this
             // path must not wait for input events or fence release streams.
             let memory = self.device_memories()?;
             if memory.iter().any(|(_, contexts, _)| *contexts > 1) {
-                self.operation_profiles.remove(&operation);
                 self.operation_widths.remove(&operation);
                 return Err(SHARED_POOL_CALIBRATION_ERROR.into());
             }
             let widths = runtime_candidate_widths(&profile, &memory, self.vram_percent)
                 .map_err(|e| e.to_string())?;
-            self.operation_profiles.insert(operation, profile);
             self.operation_widths.insert(operation, widths);
             tracing::info!(
                 gpu0_columns = widths.gpu0,
@@ -1277,8 +1752,15 @@ impl GpuDcrtBackend {
         &mut self,
         inputs: &[&GpuFleetMatrix],
     ) -> Result<(), PolyBackendError> {
+        if let Some(operation) = self.pending_calibration {
+            let resource = Self::calibration_resource_signature(inputs);
+            self.select_operation_with_resource(operation, true, resource)?;
+        }
         if self.runtime_pilot_is_pending() {
-            inputs.iter().for_each(|input| input.wait_until_ready());
+            inputs
+                .iter()
+                .try_for_each(|input| input.wait_until_ready())
+                .map_err(PolyBackendError::GpuSubmission)?;
         }
         self.restart_runtime_pilot_after_fixed_inputs().map_err(PolyBackendError::GpuCalibration)
     }
@@ -1299,8 +1781,9 @@ impl GpuDcrtBackend {
             .zip(&pilot.context_generations)
             .any(|((_, contexts, generation), before)| *contexts > 1 || generation != before);
         if context_changed {
-            self.operation_profiles.remove(&pilot.operation);
-            self.operation_widths.remove(&pilot.operation);
+            let operation: [u8; 32] =
+                pilot.key.operation().try_into().expect("calibration operation identity");
+            self.operation_widths.remove(&operation);
             return Err(PolyBackendError::GpuCalibration(
                 "GPU context set changed during calibration; the measured capacity is invalid"
                     .into(),
@@ -1328,7 +1811,7 @@ impl GpuDcrtBackend {
                 "retrying GPU runtime pilot after concurrent mempool usage decreased"
             );
             self.pending_pilot = Some(RuntimePilot {
-                operation: pilot.operation,
+                key: pilot.key,
                 baseline_bytes: Vec::new(),
                 planned_memory: Vec::new(),
                 context_generations: Vec::new(),
@@ -1355,14 +1838,9 @@ impl GpuDcrtBackend {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            // This legacy measurement is diagnostic until the prepared native
-            // allocation requirements cover the complete invocation.
-            let class = GpuAllocationClass {
-                identity: pilot.operation,
-                bound_identity: None,
-                minimum_columns: 1,
-                maximum_columns: usize::MAX,
-            };
+            // The pilot supplies the one-column slope; exact prepared
+            // allocation requirements remain the admission authority.
+            let class = pilot.key.class();
             let gpu0 = Some(GpuDeviceCalibration::from_pilot(
                 class,
                 1,
@@ -1391,8 +1869,13 @@ impl GpuDcrtBackend {
                     .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()));
                 match baseline {
                     Ok(widths) => {
-                        self.operation_profiles.insert(pilot.operation, profile);
-                        self.operation_widths.insert(pilot.operation, widths);
+                        let operation: [u8; 32] = pilot
+                            .key
+                            .operation()
+                            .try_into()
+                            .expect("calibration operation identity");
+                        self.measurement_cache.insert(pilot.key, profile);
+                        self.operation_widths.insert(operation, widths);
                         tracing::info!(
                             gpu0_peak_bytes = incremental[0],
                             nonzero_peak_bytes = incremental.get(1),
@@ -1423,15 +1906,20 @@ impl GpuDcrtBackend {
         &mut self,
         key: &GpuCalibrationKey,
     ) -> Result<bool, GpuCalibrationError> {
-        let Some(profile) = self.calibration_registry.get(key) else {
+        let Some(profile) = self.measurement_cache.get(key) else {
             return Ok(false);
         };
         let operation: [u8; 32] = key.operation().try_into().map_err(|_| {
             GpuCalibrationError::InvalidOperationIdentityLength(key.operation().len())
         })?;
-        self.operation_profiles.insert(operation, (*profile).clone());
-        self.select_operation(operation, false)
-            .map_err(|_| GpuCalibrationError::MemoryQueryFailed)?;
+        self.measurement_cache.insert(key.clone(), profile);
+        let memory = self.device_memories().map_err(|_| GpuCalibrationError::MemoryQueryFailed)?;
+        let profile = self
+            .measurement_cache
+            .get(key)
+            .expect("calibration profile was inserted into the measurement cache");
+        let widths = runtime_candidate_widths(&profile, &memory, self.vram_percent)?;
+        self.operation_widths.insert(operation, widths);
         self.clear_prepared_caches();
         Ok(true)
     }
@@ -1958,6 +2446,118 @@ impl GpuDcrtBackend {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn measurement_cache_deduplicates_nodes_iterations_and_waves() {
+        use super::*;
+
+        let class = GpuAllocationClass {
+            identity: [7; 32],
+            bound_identity: Some([17; 32]),
+            minimum_columns: 1,
+            maximum_columns: usize::MAX,
+        };
+        let resource = |level, format, context, basis| {
+            GpuCalibrationResourceSignature::new(
+                vec![level],
+                vec![format],
+                vec![context],
+                [basis; 32],
+            )
+        };
+        let key = |environment, resource| {
+            GpuCalibrationKey::new(
+                &b"same-primitive-and-shape"[..],
+                environment,
+                resource,
+                class,
+                GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+            )
+        };
+        let profile = GpuCalibrationProfile {
+            gpu0: Some(
+                GpuDeviceCalibration::from_pilot(
+                    class,
+                    1,
+                    256,
+                    Some(256),
+                    GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+                )
+                .unwrap(),
+            ),
+            nonzero: None,
+        };
+        let exact = key(&b"arch-a"[..], resource(3, false, 11, 1));
+        let mut cache = GpuMeasurementCache::default();
+        let mut pilots = 0;
+        for _ in 0..64 {
+            if cache.get(&exact).is_none() {
+                pilots += 1;
+                cache.insert(exact.clone(), profile.clone());
+            }
+            assert_eq!(cache.get(&exact), Some(profile.clone()));
+        }
+        assert_eq!(pilots, 1, "one exact key may launch only one warmup pilot");
+        assert_eq!(cache.measured.len(), 1);
+        for different in [
+            key(&b"arch-b"[..], resource(3, false, 11, 1)),
+            key(&b"arch-a"[..], resource(4, false, 11, 1)),
+            key(&b"arch-a"[..], resource(3, true, 11, 1)),
+            key(&b"arch-a"[..], resource(3, false, 12, 1)),
+            key(&b"arch-a"[..], resource(3, false, 11, 2)),
+        ] {
+            assert!(cache.get(&different).is_none());
+            cache.insert(different, profile.clone());
+        }
+        assert_eq!(cache.measured.len(), 6);
+    }
+
+    #[test]
+    fn measurement_cache_reuses_setup_profile_without_second_pilot() {
+        use crate::gpu_calibration::GpuCalibrationRegistry;
+
+        let class = GpuAllocationClass {
+            identity: [8; 32],
+            bound_identity: Some([18; 32]),
+            minimum_columns: 1,
+            maximum_columns: usize::MAX,
+        };
+        let key = GpuCalibrationKey::new(
+            &b"same-primitive-and-shape"[..],
+            &b"arch-a"[..],
+            GpuCalibrationResourceSignature::new(vec![2], vec![true], vec![19], [4; 32]),
+            class,
+            GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+        );
+        let profile = GpuCalibrationProfile {
+            gpu0: Some(
+                GpuDeviceCalibration::from_pilot(
+                    class,
+                    1,
+                    128,
+                    Some(128),
+                    GpuCalibrationMetric::DefaultPoolIncrementalBytes,
+                )
+                .unwrap(),
+            ),
+            nonzero: None,
+        };
+        let registry = GpuCalibrationRegistry::new();
+        registry.insert(key.clone(), profile.clone()).unwrap();
+        let mut cache = GpuMeasurementCache::default();
+        cache.set_setup(registry.freeze());
+
+        let mut pilots = 0;
+        for _ in 0..32 {
+            if cache.get(&key).is_none() {
+                pilots += 1;
+                cache.insert(key.clone(), profile.clone());
+            }
+            assert_eq!(cache.get(&key), Some(profile.clone()));
+        }
+        assert_eq!(pilots, 0);
+        assert!(cache.measured.is_empty());
+    }
+
+    #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_production_selection_never_starts_a_pilot() {
         use super::*;
@@ -1970,11 +2570,16 @@ mod tests {
         let gpu = GpuDCRTPolyParams::new(n, params.to_crt().0, 8, None);
         let mut backend = crate::backend::poly::gpu::gpu_backend_on([gpu], [device]);
         let operation = rand::random();
+        #[cfg(feature = "gpu-instrumentation")]
+        crate::backend::poly_gpu::reset_prepared_gpu_work_counters();
         assert!(backend.select_operation(operation, false).is_err());
         assert!(backend.pending_pilot.is_none());
-        assert!(backend.calibration_registry.is_empty());
+        assert!(backend.calibration_registry().is_empty());
+        #[cfg(feature = "gpu-instrumentation")]
+        assert_eq!(crate::backend::poly_gpu::prepared_gpu_work_counters().measurement_launches, 0);
         backend.select_operation(operation, true).unwrap();
-        assert!(backend.pending_pilot.is_some());
+        assert!(backend.pending_pilot.is_none());
+        assert_eq!(backend.pending_calibration, Some(operation));
     }
 
     #[test]
@@ -2390,7 +2995,7 @@ mod tests {
     }
 
     fn assert_profile_created(backend: &GpuDcrtBackend, operation: &[u8; 32]) {
-        assert!(backend.operation_profiles.contains_key(operation));
+        assert!(backend.has_cached_profile(operation));
         assert!(backend.column_widths(operation).is_some());
     }
 
@@ -3098,11 +3703,11 @@ mod tests {
         assert_eq!(backend.matrix_to_bytes(&left).unwrap(), expected_left);
         assert_eq!(backend.matrix_to_bytes(&right).unwrap(), expected_right);
         drop((left, right, sum, negative, upper, lower, left_column, right_column));
-        product.wait_until_ready();
-        recovered.wait_until_ready();
-        rejoined.wait_until_ready();
-        tensor.wait_until_ready();
-        measured_tensor.wait_until_ready();
+        product.wait_until_ready().unwrap();
+        recovered.wait_until_ready().unwrap();
+        rejoined.wait_until_ready().unwrap();
+        tensor.wait_until_ready().unwrap();
+        measured_tensor.wait_until_ready().unwrap();
         assert_eq!(backend.matrix_to_bytes(&product).unwrap(), expected);
         assert_eq!(backend.matrix_to_bytes(&recovered).unwrap(), expected_left);
         assert_eq!(backend.matrix_to_bytes(&rejoined).unwrap(), expected_left);
@@ -3375,7 +3980,7 @@ mod tests {
         assert_eq!(actual.shards()[0].device_id, devices[0]);
         let expected =
             backend.devices[0].1.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
-        assert_eq!(actual.shards()[0].value, expected);
+        assert_eq!(actual.shards()[0].value.as_ref(), &expected);
     }
 
     fn first_bidirectional_peer_pair(
@@ -3434,13 +4039,13 @@ mod tests {
             ] {
                 assert_eq!(restored.size(), (2, 5));
                 assert_eq!(restored.shards().len(), 1);
-                assert_eq!(restored.shards()[0].value, source);
+                assert_eq!(restored.shards()[0].value.as_ref(), &source);
             }
             let restored = backend
                 .small_matrix_from_bytes(&schema, &small_bytes, SmallMatrixSemanticKind::Generic)
                 .unwrap();
             assert_eq!(restored.shards().len(), 1);
-            assert_eq!(restored.shards()[0].value, small);
+            assert_eq!(restored.shards()[0].value.as_ref(), &small);
             let invalid = ConcreteMatrixType { columns: 6, ..ty.clone() };
             assert!(backend.matrix_from_bytes(&invalid, &bytes).is_err());
         }
@@ -3497,7 +4102,7 @@ mod tests {
                 })
                 .collect(),
         ));
-        value.wait_until_ready();
+        value.wait_until_ready().unwrap();
         backend.fence_released_memory().unwrap();
         gpu_default_mempool_reset_high_water(device).unwrap();
         let snapshot_baseline = gpu_default_mempool_usage(device).unwrap().used_current;
@@ -3539,7 +4144,7 @@ mod tests {
             assert_eq!(loaded, matrix.slice_columns(start, end));
         }
         let restored = backend.matrix_from_cpu_staging_bytes(&ty, &bytes).unwrap();
-        assert_eq!(restored.shards()[0].value, matrix);
+        assert_eq!(restored.shards()[0].value.as_ref(), &matrix);
         assert_eq!(backend.rns_staging_buffers.len(), 2);
         // Grow a reused slot for a full shard, then reuse it for a smaller one.
         let (_, repeated) = backend.preimage_target(Arc::new(restored)).unwrap();
@@ -3972,7 +4577,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
-    fn test_gpu_incomplete_pilot_can_retry_the_same_operation() {
+    fn test_gpu_repeated_selection_reuses_the_same_measurement_request() {
         let device = detected_gpu_device_ids()[0];
         super::super::wait_for_gpu_test_context_quiescence(device);
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -3989,8 +4594,9 @@ mod tests {
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
         let operation = [104; 32];
         backend.select_operation(operation, true).unwrap();
-        // The abandoned preflight reports an error for this attempt only.
-        assert!(backend.select_operation(operation, true).is_err());
+        // Repeated graph nodes may select the same operation before their
+        // representative owners are available. This must remain one deferred
+        // cache lookup, not an abandoned or duplicated pilot.
         backend.select_operation(operation, true).unwrap();
         let result =
             backend.constant_matrix(&ty, &ConstantMatrix::Zero, &ParamEnv::default()).unwrap();
@@ -3998,7 +4604,7 @@ mod tests {
             backend.gather_matrix_for_host(&result).unwrap().to_cpu_matrix(),
             mxx_primitives::matrix::dcrt_poly::DCRTPolyMatrix::zero(&cpu, 1, 3)
         );
-        assert!(backend.operation_profiles.contains_key(&operation));
+        assert!(backend.has_cached_profile(&operation));
     }
 
     #[test]
@@ -4014,7 +4620,7 @@ mod tests {
         let ty = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 1, columns: 3 };
         let value = backend.sample_hash(&ty, [7u8; 32], b"runtime-calibration-pilot").unwrap();
         let widths = backend.column_widths(&operation).expect("runtime operation width");
-        let profile = backend.operation_profiles.get(&operation).expect("runtime profile");
+        let profile = backend.cached_profile(&operation).expect("runtime profile");
         assert!(matches!(
             profile.gpu0.unwrap().observation(),
             crate::gpu_calibration::GpuCalibrationObservation::Allocating {
@@ -4029,7 +4635,7 @@ mod tests {
         backend.select_operation(operation, true).unwrap();
         assert!(backend.column_widths(&operation).is_none());
         assert!(backend.pending_profile.is_some());
-        let _ = backend.negate(&value).unwrap();
+        drop(backend.negate(&value).unwrap());
         assert!(backend.pending_profile.is_none());
         assert!(backend.column_widths(&operation).is_some());
     }
@@ -4041,18 +4647,14 @@ mod tests {
         super::super::wait_for_gpu_test_context_quiescence(device);
         let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let _other_context = GpuDCRTPolyParams::new(32, vec![65_537, 67_073], 2, None);
         let operation = [92u8; 32];
 
-        assert!(matches!(
-            backend.select_operation(operation, true),
-            Err(PolyBackendError::GpuCalibration(message))
-                if message.contains(SHARED_POOL_CALIBRATION_ERROR)
-        ));
-        assert!(!backend.operation_profiles.contains_key(&operation));
+        backend.select_operation(operation, true).unwrap();
+        assert!(!backend.has_cached_profile(&operation));
         assert!(backend.column_widths(&operation).is_none());
         assert!(backend.pending_profile.is_none());
         assert!(backend.pending_pilot.is_none());
+        assert_eq!(backend.pending_calibration, Some(operation));
     }
 
     #[test]
@@ -4323,7 +4925,6 @@ impl Backend for GpuDcrtBackend {
         evaluation: bool,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let _ = (ty, values, evaluation);
             return self.execute_admitted_matrix(&[], None, gpu_compiled::ExecutionPayload::None);
         }
         self.devices[0]
@@ -4386,6 +4987,7 @@ impl Backend for GpuDcrtBackend {
             >,
         )],
     ) -> Result<(), Self::Error> {
+        crate::backend::poly_gpu::record_prepared_forbidden(3);
         if self.prepared_required {
             // Compact row-block products execute as one admitted invocation per
             // block; the batch is validated in that expanded order. The node's
@@ -4529,6 +5131,7 @@ impl Backend for GpuDcrtBackend {
         &mut self,
         request: &crate::executor::WaveAdmissionRequest<'_, Self>,
     ) -> Result<crate::executor::WaveAdmission, Self::Error> {
+        crate::backend::poly_gpu::record_prepared_forbidden(3);
         if !self.prepared_required {
             return Ok(request.admission_of_size(1));
         }
@@ -4553,6 +5156,50 @@ impl Backend for GpuDcrtBackend {
             wave_bound,
             warm_up,
         )
+    }
+
+    fn execute_prepared_graph(
+        &mut self,
+        validated: &mxx_ir_core::ValidatedGraph,
+        inputs: &BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+    ) -> Result<Option<crate::executor::ExecutionResult<Self>>, Self::Error> {
+        let identity = validated as *const _ as usize;
+        if self.prepared_program.is_none() {
+            return Err(PolyBackendError::GpuSubmission(
+                "static GPU graph was executed before prepared warmup".into(),
+            ));
+        }
+        if self.prepared_spec_hash.is_none() {
+            return Err(PolyBackendError::GpuSubmission(
+                "prepared graph has no cached specification hash".into(),
+            ));
+        }
+        let prepared_inputs = materialize_prepared_inputs(self, inputs)?;
+        let Some((cached, execution)) = self.prepared_graph.as_ref() else {
+            return Err(PolyBackendError::GpuSubmission(
+                "prepared graph was not constructed during warmup".into(),
+            ));
+        };
+        if *cached != identity {
+            return Err(PolyBackendError::GpuSubmission(
+                "prepared graph contract differs from the warmed graph".into(),
+            ));
+        }
+
+        let roots = execution
+            .ordered_runtime_inputs(&prepared_inputs)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let execution = execution
+            .run_with_runtime_roots(&roots)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let execution = Arc::new(execution);
+        Ok(Some(crate::executor::ExecutionResult {
+            outputs: BTreeMap::new(),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(Arc::new(Arc::clone(&execution))),
+        }))
     }
 
     // A fleet is one production placement. Device parallelism is internal to
@@ -4876,7 +5523,6 @@ impl Backend for GpuDcrtBackend {
         scalar: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let _ = scalar;
             return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.unary_columns(value, GpuUnaryColumnOperation::Scale(scalar.clone()))
@@ -4901,7 +5547,6 @@ impl Backend for GpuDcrtBackend {
         index: usize,
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let _ = index;
             return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         self.unary_columns(value, GpuUnaryColumnOperation::Automorphism(index))
@@ -5309,7 +5954,6 @@ impl Backend for GpuDcrtBackend {
         rows: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let _ = rows;
             return self.execute_admitted_matrix(&[value], None, ExecutionPayload::None);
         }
         let output_rows = rows.len();
@@ -5352,7 +5996,6 @@ impl Backend for GpuDcrtBackend {
         groups: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
         if self.prepared_required {
-            let _ = groups;
             return self.execute_admitted_matrix(&[left, right], None, ExecutionPayload::None);
         }
         self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
@@ -5560,7 +6203,7 @@ impl Backend for GpuDcrtBackend {
                 (Err(_), Some(error)) => return Err(error),
                 (Err(message), None) => return Err(PolyBackendError::GpuSubmission(message)),
             };
-            let mut values = vec![trapdoor];
+            let mut values = vec![Arc::new(trapdoor)];
             if self.devices.len() > 1 {
                 let snapshots = broker
                     .hold_traced(&plan.export, || Ok(values[0].to_rns_snapshots()))
@@ -5580,14 +6223,14 @@ impl Backend for GpuDcrtBackend {
                         let replica = mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(params, &snapshots);
                         <GpuDCRTPolyTrapdoorSampler as mxx_primitives::sampler::PolyTrapdoorSampler>::new(params, sigma)
                             .prepare_preimage_cache(params, &replica, ty.rows);
-                        Ok(replica)
+                        Ok(Arc::new(replica))
                     }).map_err(PolyBackendError::GpuSubmission)
                 }).collect::<Result<Vec<_>, _>>()?;
                 values.extend(replicas);
             }
             return Ok((
                 GpuFleetMatrix::from_matrix(public),
-                GpuFleetTrapdoor { values: Arc::new(values) },
+                GpuFleetTrapdoor { values: Arc::new(values), prepared_lease: None },
             ));
         }
         let (public, first) =
@@ -5596,13 +6239,16 @@ impl Backend for GpuDcrtBackend {
         if self.devices.len() > 1 {
             let snapshots = first.to_rns_snapshots();
             values.extend(self.devices.par_iter().skip(1).map(|(_, backend)| {
-                Ok(mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(
+                Ok(Arc::new(mxx_primitives::sampler::trapdoor::gpu::GpuDCRTTrapdoor::from_rns_snapshots(
                     backend.parameters(ty)?, &snapshots,
-                ))
+                )))
             }).collect::<Result<Vec<_>, PolyBackendError>>()?);
         }
-        values.insert(0, first);
-        Ok((GpuFleetMatrix::from_matrix(public), GpuFleetTrapdoor { values: Arc::new(values) }))
+        values.insert(0, Arc::new(first));
+        Ok((
+            GpuFleetMatrix::from_matrix(public),
+            GpuFleetTrapdoor { values: Arc::new(values), prepared_lease: None },
+        ))
     }
 
     fn sample_preimage_batch(
@@ -5947,6 +6593,9 @@ impl Backend for GpuDcrtBackend {
     }
 
     fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error> {
+        if let Some(lease) = &value.prepared_lease {
+            lease.check_device_scalar_status().map_err(PolyBackendError::GpuSubmission)?;
+        }
         let shard_bytes = value
             .shards
             .iter()
@@ -6310,8 +6959,8 @@ impl Backend for GpuDcrtBackend {
         let values = self
             .devices
             .iter_mut()
-            .map(|(_, backend)| backend.trapdoor_from_bytes(ty, bytes))
+            .map(|(_, backend)| backend.trapdoor_from_bytes(ty, bytes).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(GpuFleetTrapdoor { values: Arc::new(values) })
+        Ok(GpuFleetTrapdoor { values: Arc::new(values), prepared_lease: None })
     }
 }

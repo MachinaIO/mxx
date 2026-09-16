@@ -52,6 +52,9 @@ pub fn compile(graph: BuiltGraph, backend: &mut GpuDcrtBackend) -> ValidatedGrap
 /// No device-wide synchronization, decryption, or correctness diagnostics are timed.
 pub fn run(graph: &ValidatedGraph, backend: &mut GpuDcrtBackend, inputs: Inputs) -> (Inputs, f64) {
     let mut store = MemoryArtifactStore::default();
+    backend
+        .warm_up_prepared_graph(graph, &inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("GPU prepared graph warmup");
     // Complete releases from the preceding oracle or input preparation before
     // measuring this call. Default execute keeps releases asynchronous; output
     // event completion below still includes all work producing the result.
@@ -60,11 +63,11 @@ pub fn run(graph: &ValidatedGraph, backend: &mut GpuDcrtBackend, inputs: Inputs)
     let start = Instant::now();
     let mut result =
         execute(graph, backend, inputs, &mut store, SamplingMode::Fresh).expect("GPU execution");
-    for name in result.outputs.keys().cloned().collect::<Vec<_>>() {
+    for name in result.output_names().map(str::to_owned).collect::<Vec<_>>() {
         if let RuntimeValue::Matrix(matrix) =
             result.materialize_output(&name, backend, &mut store).expect("materialize GPU output")
         {
-            matrix.wait_until_ready();
+            matrix.wait_until_ready().expect("GPU matrix output must become ready");
         }
     }
     let seconds = start.elapsed().as_secs_f64();

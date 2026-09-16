@@ -41,6 +41,8 @@ impl GpuDcrtBackend {
         }
         while self.runtime_pilot_is_pending() {
             let wave = self.next_column_wave(0, columns);
+            #[cfg(feature = "gpu-instrumentation")]
+            mxx_primitives::poly::dcrt::gpu::gpu_test_record_measurement_launch();
             let launched = execute(self, &wave)?;
             let completed = self.finish_runtime_pilot(&launched)?;
             drop(launched);
@@ -522,7 +524,7 @@ impl GpuDcrtBackend {
             .map(|(_, backend)| Self::matrix_operand_on_device(backend, fixed, 0, fixed.columns))
             .collect::<Result<Vec<_>, _>>()?;
         if self.runtime_pilot_is_pending() {
-            scalable.wait_until_ready();
+            scalable.wait_until_ready().map_err(PolyBackendError::GpuSubmission)?;
             replicas.iter().for_each(|replica| replica.wait_until_ready());
         }
         self.restart_runtime_pilot_after_fixed_inputs()
@@ -635,7 +637,7 @@ impl GpuDcrtBackend {
             fixed_replicas.push(self.full_matrix_replicas(fixed)?);
         }
         if self.runtime_pilot_is_pending() {
-            request.products.iter().for_each(|(_, left, right)| {
+            request.products.iter().try_for_each(|(_, left, right)| {
                 let scalable = if gpu_matrix_multiply_scales_left(
                     left.rows,
                     left.columns,
@@ -646,10 +648,10 @@ impl GpuDcrtBackend {
                 } else {
                     right
                 };
-                scalable.wait_until_ready();
-            });
+                scalable.wait_until_ready().map_err(PolyBackendError::GpuSubmission)
+            })?;
             if let Some(bias) = &request.bias {
-                bias.wait_until_ready();
+                bias.wait_until_ready().map_err(PolyBackendError::GpuSubmission)?;
             }
             fixed_replicas.iter().flatten().for_each(|replica| replica.wait_until_ready());
         }
@@ -715,7 +717,7 @@ impl GpuDcrtBackend {
             None
         };
         if self.runtime_pilot_is_pending() {
-            rhs.wait_until_ready();
+            rhs.wait_until_ready().map_err(PolyBackendError::GpuSubmission)?;
             lhs_replicas.iter().for_each(|replica| replica.wait_until_ready());
         }
         self.restart_runtime_pilot_after_fixed_inputs()
@@ -904,7 +906,7 @@ impl GpuDcrtBackend {
         );
         let pilots = if self.runtime_pilot_is_pending() && rhs.columns > 0 {
             let pilots = Arc::new(self.compact_pilot_columns(rhs)?);
-            rhs.wait_until_ready();
+            rhs.wait_until_ready().map_err(PolyBackendError::GpuSubmission)?;
             replicas.iter().flatten().for_each(|value| value.wait_until_ready());
             Some(pilots)
         } else {
@@ -1455,7 +1457,7 @@ mod tests {
                 backend.select_operation(operation, true).unwrap();
                 backend.preflight_gpu_operations(&[(0, None, invocation)]).unwrap();
                 assert!(backend.pending_pilot.is_none(), "preflight must finish before production");
-                assert!(backend.operation_profiles.contains_key(&operation));
+                assert!(backend.has_cached_profile(&operation));
                 let actual = execute(backend).unwrap();
                 assert_eq!(backend.gather_matrix_for_host(&actual).unwrap(), expected);
             };
@@ -1543,7 +1545,7 @@ mod tests {
         assert!(backend.pending_pilot.is_none());
         let digits = backend.gadget_decompose(&left, false, None).unwrap();
         let expected_digits = raw.gadget_decompose(false, None).unwrap();
-        assert_eq!(digits.shards[0].value, expected_digits);
+        assert_eq!(digits.shards[0].value.as_ref(), &expected_digits);
         let lhs_type = ConcreteMatrixType { columns: digits.rows, ..ty };
         let lhs = backend.devices[0]
             .1
@@ -1611,9 +1613,9 @@ mod tests {
             )])
             .unwrap();
         assert!(backend.pending_pilot.is_none());
-        let profile = backend.operation_profiles[&operation].clone();
+        let profile = backend.cached_profile(&operation).expect("runtime profile");
         let output = backend.sample_hash(&ty, key, tag).unwrap();
-        assert_eq!(backend.operation_profiles[&operation], profile);
+        assert_eq!(backend.cached_profile(&operation), Some(profile));
         let expected = backend.devices[0].1.sample_hash(&ty, key, tag).unwrap();
         assert_eq!(backend.gather_matrix_for_host(&output).unwrap(), expected);
         for request in [
@@ -1624,7 +1626,7 @@ mod tests {
             backend.select_operation(operation, true).unwrap();
             backend.preflight_gpu_operations(&[(0, None, request)]).unwrap();
             assert!(backend.pending_pilot.is_none());
-            assert!(backend.operation_profiles.contains_key(&operation));
+            assert!(backend.has_cached_profile(&operation));
         }
         let actual = backend.ring_automorphism(&output, 3).unwrap();
         assert_eq!(
@@ -1672,7 +1674,8 @@ mod tests {
         let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, 4.578);
         let (trapdoor, public) = sampler.trapdoor(&params, 1);
         let public = GpuFleetMatrix::from_matrix(public);
-        let trapdoor = GpuFleetTrapdoor { values: Arc::new(vec![trapdoor]) };
+        let trapdoor =
+            GpuFleetTrapdoor { values: Arc::new(vec![Arc::new(trapdoor)]), prepared_lease: None };
         let target_type = ConcreteMatrixType {
             modulus: params.modulus().as_ref().clone().into(),
             ring_dimension: n as usize,
@@ -1711,7 +1714,7 @@ mod tests {
             )])
             .unwrap();
         assert!(backend.pending_pilot.is_none());
-        assert!(backend.operation_profiles.contains_key(&operation));
+        assert!(backend.has_cached_profile(&operation));
         let seed = rand::random();
         let actual = backend
             .sample_preimage(
@@ -1737,7 +1740,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(actual.shards.len(), 1);
-        assert_eq!(actual.shards[0].value, reference);
+        assert_eq!(actual.shards[0].value.as_ref(), &reference);
         assert_eq!(
             public.shards[0].value.multiply_small_rhs(&actual.shards[0].value).unwrap(),
             expected

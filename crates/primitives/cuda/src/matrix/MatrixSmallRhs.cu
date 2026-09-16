@@ -50,6 +50,11 @@ struct GpuSmallMatrix
     bool owns_hard_cutoff_decision_event = true;
     cudaEvent_t write_done = nullptr;
     bool write_done_valid = false;
+    GpuCudaResource readback_completion;
+    uint8_t *readback_host = nullptr;
+    const uint8_t *readback_source = nullptr;
+    size_t readback_row_bytes = 0;
+    size_t readback_source_pitch = 0;
 };
 
 namespace
@@ -862,7 +867,9 @@ void small_release_hard_cutoff_plan(GpuSmallMatrix *mat, cudaStream_t stream)
     mat->hard_cutoff_host_accepted = nullptr;
 }
 
-int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
+int small_hard_cutoff_metadata(GpuSmallMatrix *mat,
+    std::vector<int> &subset_indices, std::vector<uint64_t> &modulus_words,
+    std::vector<uint64_t> &half_modulus_words, std::vector<uint64_t> &padded_bound)
 {
     if (!mat || !mat->ctx || !mat->stream || mat->device < 0 || mat->bound_words.empty())
         return set_error("invalid compact hard-cutoff plan owner");
@@ -873,7 +880,6 @@ int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
 
     std::vector<uint64_t> doubled_bound;
     compact_double_words(mat->bound_words.data(), mat->bound_words.size(), &doubled_bound);
-    std::vector<int> subset_indices;
     std::vector<uint64_t> subset_moduli;
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
@@ -885,7 +891,6 @@ int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
             break;
         }
     }
-    std::vector<uint64_t> modulus_words;
     if (subset_indices.empty())
     {
         for (size_t limb = 0; limb < limb_count; ++limb)
@@ -915,12 +920,21 @@ int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
          (8 * (mat->magnitude_bytes % 8))) != 0)
         return set_error("compact hard cutoff exceeds magnitude width");
 
-    std::vector<uint64_t> half_modulus_words = modulus_words;
+    half_modulus_words = modulus_words;
     serde_shift_words_right_one_le(&half_modulus_words);
     modulus_words.resize(words_per_coeff, 0);
     half_modulus_words.resize(words_per_coeff, 0);
-    std::vector<uint64_t> padded_bound(words_per_coeff, 0);
+    padded_bound.resize(words_per_coeff, 0);
     std::copy(mat->bound_words.begin(), mat->bound_words.end(), padded_bound.begin());
+    return 0;
+}
+
+int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
+{
+    std::vector<int> subset_indices;
+    std::vector<uint64_t> modulus_words, half_modulus_words, padded_bound;
+    if (small_hard_cutoff_metadata(mat, subset_indices, modulus_words,
+            half_modulus_words, padded_bound) != 0) return 1;
 
     std::vector<void *> pinned_uploads;
     pinned_uploads.reserve(5);
@@ -982,9 +996,9 @@ int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
             err = cudaEventCreateWithFlags(&mat->hard_cutoff_decision_ready, cudaEventDisableTiming);
     }
     if (err != cudaSuccess) return set_error(err);
-    mat->hard_cutoff_limb_count = limb_count;
+    mat->hard_cutoff_limb_count = mat->ctx->moduli.size();
     mat->hard_cutoff_subset_count = static_cast<int>(subset_indices.size());
-    mat->hard_cutoff_words_per_coeff = static_cast<int>(words_per_coeff);
+    mat->hard_cutoff_words_per_coeff = static_cast<int>(modulus_words.size());
     return 0;
 }
 
@@ -1303,6 +1317,42 @@ extern "C" int gpu_small_matrix_load_coefficients(
         return record_status;
     }
     return defer_status;
+}
+
+extern "C" int gpu_small_matrix_prepare_readback(GpuSmallMatrix *mat, uint8_t *payload, size_t bytes)
+{
+    if (!mat || !payload || bytes != mat->payload_bytes || mat->readback_host)
+        return set_error("invalid prepared compact readback binding");
+    const int status = mat->readback_completion.acquire(mat->ctx, mat->device, GPU_PREPARED_COMPLETION_EVENT);
+    if (status != 0) return status;
+    const size_t coefficient_bytes = 1 + mat->magnitude_bytes;
+    mat->readback_host = payload;
+    mat->readback_source = mat->payload + mat->column_offset * mat->n * coefficient_bytes;
+    mat->readback_row_bytes = mat->cols * mat->n * coefficient_bytes;
+    mat->readback_source_pitch = mat->storage_cols * mat->n * coefficient_bytes;
+    return 0;
+}
+
+extern "C" int gpu_small_matrix_read_prepared(const GpuSmallMatrix *mat)
+{
+    cudaError_t error = cudaSetDevice(mat->device);
+    if (error == cudaSuccess && mat->write_done_valid)
+        error = cudaStreamWaitEvent(mat->stream, mat->write_done, 0);
+    if (error == cudaSuccess)
+        error = cudaMemcpy2DAsync(mat->readback_host, mat->readback_row_bytes,
+            mat->readback_source, mat->readback_source_pitch, mat->readback_row_bytes,
+            mat->rows, cudaMemcpyDeviceToHost, mat->stream);
+    if (error == cudaSuccess)
+        error = cudaEventRecord(mat->readback_completion.event, mat->stream);
+    if (error == cudaSuccess)
+        error = cudaEventSynchronize(mat->readback_completion.event);
+    if (error != cudaSuccess) {
+        // A failed copy/record/wait may leave the device using the fixed host
+        // destination. Retain the execution and backing instead of freeing it.
+        mat->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+        mat->ctx->execution->unretired_work.store(true, std::memory_order_release);
+    }
+    return error == cudaSuccess ? 0 : set_error(error);
 }
 
 extern "C" int gpu_small_matrix_store_coefficients(
@@ -1638,6 +1688,342 @@ extern "C" int gpu_matrix_query_small_rhs_workspace_bytes(
         !small_mul_size(words, limbs - narrow, wide_bytes) || !small_mul_size(*wide_bytes, sizeof(uint64_t), wide_bytes))
         return set_error("compact RHS workspace overflow");
     return 0;
+}
+
+struct PreparedSmallRhsGroup
+{
+    size_t limb_offset = 0;
+    size_t limb_count = 0;
+    size_t typed_limb_offset = 0;
+    bool narrow = false;
+    bool lazy_reduce = false;
+    dim3 grid{};
+};
+
+struct PreparedSmallRhsExpansion
+{
+    const void *kernel;
+    dim3 grid;
+    const uint8_t *payload;
+    void *workspace;
+    const uint64_t *twiddles, *shoup, *moduli;
+    size_t limb_offset, limb_count, poly_count, columns, storage_columns;
+    size_t n, magnitude_bytes, column_offset;
+    uint32_t n_u32, len;
+    std::array<void *, 13> arguments{};
+};
+
+struct GpuPreparedSmallRhs
+{
+    GpuContext *ctx = nullptr;
+    const GpuSmallMatrix *rhs = nullptr;
+    GpuMatrix *output = nullptr;
+    int device = -1;
+    size_t dispatch_slot = 0;
+    cudaStream_t stream = nullptr;
+    size_t rows = 0;
+    size_t inner = 0;
+    size_t columns = 0;
+    size_t n = 0;
+    size_t limbs = 0;
+    size_t workspace_words_per_limb = 0;
+    uint32_t n_u32 = 0;
+    std::vector<uint64_t> active_moduli;
+    std::vector<PreparedSmallRhsGroup> groups;
+    CompactRowBlocks blocks{};
+    GpuDeviceWorkspace workspace_u32;
+    GpuDeviceWorkspace workspace_u64;
+    std::vector<std::unique_ptr<PreparedSmallRhsExpansion>> expansion;
+
+    ~GpuPreparedSmallRhs()
+    {
+        (void)workspace_u32.release(stream);
+        (void)workspace_u64.release(stream);
+    }
+};
+
+namespace
+{
+int prepare_small_rhs_ntt(GpuPreparedSmallRhs &prepared)
+{
+    const auto &constants = prepared.ctx->ring_device_constants[prepared.dispatch_slot];
+    const size_t poly_count = prepared.inner * prepared.columns;
+    for (const PreparedSmallRhsGroup &group : prepared.groups) {
+        size_t butterflies = 0;
+        if (!small_mul_size(group.limb_count, poly_count, &butterflies) ||
+            !small_mul_size(butterflies, prepared.n / 2, &butterflies) ||
+            poly_count > UINT32_MAX)
+            return set_error(cudaErrorInvalidConfiguration);
+        const size_t first_blocks = (butterflies + kSmallThreads - 1) / kSmallThreads;
+        const size_t suffix_blocks = poly_count * (prepared.n / kCompactNttSuffixSize);
+        if (first_blocks > UINT32_MAX || suffix_blocks > UINT32_MAX)
+            return set_error(cudaErrorInvalidConfiguration);
+        const auto append = [&](int phase, uint32_t len, dim3 grid) {
+            auto launch = std::make_unique<PreparedSmallRhsExpansion>();
+            launch->grid = grid;
+            launch->payload = prepared.rhs->payload;
+            launch->workspace = group.narrow
+                ? static_cast<void *>(reinterpret_cast<uint32_t *>(prepared.workspace_u32.data) +
+                    group.typed_limb_offset * prepared.workspace_words_per_limb)
+                : static_cast<void *>(reinterpret_cast<uint64_t *>(prepared.workspace_u64.data) +
+                    group.typed_limb_offset * prepared.workspace_words_per_limb);
+            launch->twiddles = constants.twiddle_forward;
+            launch->shoup = constants.twiddle_shoup_forward;
+            launch->moduli = constants.moduli;
+            launch->limb_offset = group.limb_offset;
+            launch->limb_count = group.limb_count;
+            launch->poly_count = poly_count;
+            launch->columns = prepared.columns;
+            launch->storage_columns = prepared.rhs->storage_cols;
+            launch->n = prepared.n;
+            launch->n_u32 = prepared.n_u32;
+            launch->magnitude_bytes = prepared.rhs->magnitude_bytes;
+            launch->column_offset = prepared.rhs->column_offset;
+            launch->len = len;
+            if (phase == 0 || phase == 1) {
+                launch->kernel = phase == 0
+                    ? (group.narrow ? reinterpret_cast<const void *>(compact_rhs_dif_all_shared_kernel<uint32_t>)
+                                    : reinterpret_cast<const void *>(compact_rhs_dif_all_shared_kernel<uint64_t>))
+                    : (group.narrow ? reinterpret_cast<const void *>(compact_rhs_dif_first_kernel<uint32_t>)
+                                    : reinterpret_cast<const void *>(compact_rhs_dif_first_kernel<uint64_t>));
+                launch->arguments = {&launch->payload, &launch->workspace, &launch->twiddles,
+                    &launch->shoup, &launch->moduli, &launch->limb_offset, &launch->limb_count,
+                    &launch->poly_count, &launch->columns, &launch->storage_columns,
+                    &launch->n_u32, &launch->magnitude_bytes, &launch->column_offset};
+            } else if (phase == 2) {
+                launch->kernel = group.narrow
+                    ? reinterpret_cast<const void *>(compact_ntt_dif_stage_kernel<uint32_t>)
+                    : reinterpret_cast<const void *>(compact_ntt_dif_stage_kernel<uint64_t>);
+                launch->arguments = {&launch->workspace, &launch->twiddles, &launch->shoup,
+                    &launch->moduli, &launch->limb_offset, &launch->limb_count,
+                    &launch->poly_count, &launch->n, &launch->len};
+            } else {
+                launch->kernel = group.narrow
+                    ? reinterpret_cast<const void *>(compact_rhs_dif_suffix_kernel<uint32_t>)
+                    : reinterpret_cast<const void *>(compact_rhs_dif_suffix_kernel<uint64_t>);
+                launch->arguments = {&launch->workspace, &launch->twiddles, &launch->shoup,
+                    &launch->moduli, &launch->limb_offset, &launch->limb_count,
+                    &launch->poly_count, &launch->n_u32};
+            }
+            prepared.expansion.push_back(std::move(launch));
+        };
+        if (prepared.n_u32 <= kCompactNttSuffixSize) {
+            append(0, 0, dim3(static_cast<uint32_t>(poly_count), static_cast<uint32_t>(group.limb_count)));
+        } else {
+            const dim3 grid(static_cast<uint32_t>(first_blocks));
+            append(1, 0, grid);
+            for (uint32_t len = prepared.n_u32 >> 1; len > kCompactNttSuffixSize; len >>= 1)
+                append(2, len, grid);
+            append(3, 0, dim3(static_cast<uint32_t>(suffix_blocks), static_cast<uint32_t>(group.limb_count)));
+        }
+    }
+    return 0;
+}
+}
+
+extern "C" int gpu_matrix_prepare_small_rhs(
+    const GpuMatrix *input_template,
+    GpuMatrix *output,
+    const GpuSmallMatrix *rhs_small,
+    size_t residency_budget_bytes,
+    GpuPreparedSmallRhs **out_plan)
+{
+    if (!out_plan) return set_error("null prepared compact RHS output");
+    *out_plan = nullptr;
+    if (!input_template || !output || !rhs_small || !input_template->ctx ||
+        input_template->ctx != output->ctx || output->ctx != rhs_small->ctx ||
+        input_template->format != GPU_POLY_FORMAT_EVAL || output->format != GPU_POLY_FORMAT_EVAL ||
+        input_template->level < 0 || output->level != input_template->level ||
+        input_template->cols != rhs_small->rows || output->rows != input_template->rows ||
+        output->cols != rhs_small->cols || static_cast<size_t>(input_template->ctx->N) != rhs_small->n)
+        return set_error("invalid prepared compact RHS arguments");
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedSmallRhs>();
+        prepared->ctx = output->ctx;
+        prepared->rhs = rhs_small;
+        prepared->output = output;
+        prepared->rows = output->rows;
+        prepared->inner = input_template->cols;
+        prepared->columns = output->cols;
+        prepared->n = rhs_small->n;
+        prepared->limbs = static_cast<size_t>(input_template->level + 1);
+        prepared->n_u32 = static_cast<uint32_t>(prepared->n);
+        if (prepared->limbs == 0 || prepared->limbs > kMaxSmallLimbCount ||
+            prepared->ctx->limb_gpu_ids.size() < prepared->limbs ||
+            !is_power_of_two_u32(prepared->n_u32))
+            return set_error("invalid prepared compact RHS level");
+        if (small_set_device(rhs_small) != 0) return 1;
+
+        for (size_t limb = 0; limb < prepared->limbs; ++limb)
+        {
+            const dim3 id = prepared->ctx->limb_gpu_ids[limb];
+            int lhs_device = -1;
+            int output_device = -1;
+            size_t lhs_stride = 0, output_stride = 0;
+            uint8_t lhs_width = 0, output_width = 0;
+            if (matrix_limb_device(input_template, id, &lhs_device) != 0 ||
+                matrix_limb_device(output, id, &output_device) != 0 ||
+                lhs_device != rhs_small->device || output_device != rhs_small->device ||
+                id.y >= input_template->shared_limb_buffers[id.x].limb_count ||
+                id.y >= output->shared_limb_buffers[id.x].limb_count ||
+                !input_template->shared_limb_buffers[id.x].device_descriptors ||
+                !output->shared_limb_buffers[id.x].device_descriptors ||
+                !matrix_limb_metadata_by_id(input_template, id, &lhs_stride, &lhs_width) ||
+                !matrix_limb_metadata_by_id(output, id, &output_stride, &output_width))
+                return set_error("prepared compact RHS requires one placement");
+            if (limb == 0)
+            {
+                prepared->device = output_device;
+                prepared->dispatch_slot = static_cast<size_t>(id.x);
+                if (matrix_limb_stream(output, id, &prepared->stream) != 0) return 1;
+            }
+            else if (output_device != prepared->device)
+                return set_error("prepared compact RHS requires one device");
+            prepared->blocks.outputs[0] = output->shared_limb_buffers[prepared->dispatch_slot].device_descriptors;
+        }
+        if (!prepared->stream || prepared->dispatch_slot >= prepared->ctx->ring_device_constants.size())
+            return set_error("missing prepared compact RHS stream");
+        const auto &constants = prepared->ctx->ring_device_constants[prepared->dispatch_slot];
+        if (constants.device != prepared->device || constants.ring_dimension != prepared->n ||
+            constants.limb_count < prepared->limbs || !constants.twiddle_forward ||
+            !constants.twiddle_shoup_forward || !constants.moduli)
+            return set_error("missing prepared compact RHS constants");
+
+        size_t u32_limb_count = 0, u64_limb_count = 0;
+        for (size_t limb = 0; limb < prepared->limbs; ++limb)
+        {
+            if (limb >= prepared->ctx->limb_prime_ids.size())
+                return set_error("missing prepared compact RHS prime metadata");
+            const int prime_id = prepared->ctx->limb_prime_ids[limb];
+            if (prime_id < 0 || static_cast<size_t>(prime_id) >= prepared->ctx->moduli.size())
+                return set_error("invalid prepared compact RHS prime metadata");
+            const uint64_t modulus = prepared->ctx->moduli[static_cast<size_t>(prime_id)];
+            prepared->active_moduli.push_back(modulus);
+            const bool narrow = modulus <= UINT32_MAX;
+            size_t &typed_count = narrow ? u32_limb_count : u64_limb_count;
+            if (prepared->groups.empty() || prepared->groups.back().narrow != narrow)
+                prepared->groups.push_back(PreparedSmallRhsGroup{limb, 1, typed_count, narrow});
+            else
+                ++prepared->groups.back().limb_count;
+            ++typed_count;
+        }
+        if (!small_mul_size(prepared->inner, prepared->columns, &prepared->workspace_words_per_limb) ||
+            !small_mul_size(prepared->workspace_words_per_limb, prepared->n, &prepared->workspace_words_per_limb))
+            return set_error("prepared compact RHS workspace size overflow");
+        size_t workspace_u32_bytes = 0, workspace_u64_bytes = 0, workspace_bytes = 0;
+        if (gpu_matrix_query_small_rhs_workspace_bytes(prepared->ctx, input_template->level,
+                prepared->inner, prepared->columns, &workspace_u32_bytes, &workspace_u64_bytes) != 0 ||
+            !small_add_size(workspace_u32_bytes, workspace_u64_bytes, &workspace_bytes) ||
+            workspace_bytes > residency_budget_bytes)
+            return 2;
+        prepared->blocks.ends[0] = prepared->rows;
+        prepared->blocks.input_offsets[0] = 0;
+        prepared->blocks.input_pitches[0] = input_template->cols;
+        prepared->blocks.output_offsets[0] = 0;
+        prepared->blocks.output_pitches[0] = output->cols;
+        if (prepared->workspace_u32.acquire(prepared->ctx, prepared->device,
+                GPU_PREPARED_COMPACT_WORKSPACE, workspace_u32_bytes,
+                alignof(uint32_t), prepared->stream) != 0 ||
+            prepared->workspace_u64.acquire(prepared->ctx, prepared->device,
+                GPU_PREPARED_COMPACT_WORKSPACE, workspace_u64_bytes,
+                alignof(uint64_t), prepared->stream) != 0)
+            return 1;
+        if (prepare_small_rhs_ntt(*prepared) != 0)
+            return 1;
+        for (PreparedSmallRhsGroup &group : prepared->groups)
+        {
+            group.lazy_reduce = compact_lazy_dot_is_safe(
+                prepared->active_moduli, group.limb_offset, group.limb_count, prepared->inner);
+            size_t output_words = 0;
+            if (!small_mul_size(group.limb_count, prepared->rows, &output_words) ||
+                !small_mul_size(output_words, prepared->columns, &output_words) ||
+                !small_mul_size(output_words, prepared->n, &output_words))
+                return set_error(cudaErrorInvalidConfiguration);
+            const size_t grid_blocks = (output_words + kSmallThreads - 1) / kSmallThreads;
+            if (grid_blocks > std::numeric_limits<uint32_t>::max())
+                return set_error(cudaErrorInvalidConfiguration);
+            group.grid = dim3(static_cast<uint32_t>(grid_blocks));
+        }
+        *out_plan = reinterpret_cast<GpuPreparedSmallRhs *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_small_rhs(
+    const GpuPreparedSmallRhs *opaque,
+    const GpuMatrix *input)
+{
+    const auto *prepared = opaque;
+    if (!prepared || !input || input->ctx != prepared->ctx || input->format != GPU_POLY_FORMAT_EVAL ||
+        input->level != prepared->output->level || input->rows != prepared->rows ||
+        input->cols != prepared->inner || input == prepared->output)
+        return set_error("prepared compact RHS input contract mismatch");
+    const cudaError_t selected = cudaSetDevice(prepared->device);
+    if (selected != cudaSuccess) return set_error(selected);
+    if (matrix_wait_all_limb_streams(input, prepared->device, prepared->stream, true, true) != 0 ||
+        matrix_wait_all_limb_streams(prepared->output, prepared->device, prepared->stream, true) != 0)
+        return 1;
+    if (small_wait(prepared->rhs, prepared->stream) != 0) return 1;
+    for (const auto &launch : prepared->expansion) {
+        gpu_test_record_kernel_launch();
+        const cudaError_t error = cudaLaunchKernel(launch->kernel, launch->grid,
+            dim3(kSmallThreads), launch->arguments.data(), 0, prepared->stream);
+        if (error != cudaSuccess) {
+            gpu_matrix_retire_submitted_work(prepared->output);
+            return set_error(error);
+        }
+    }
+    CompactRowBlocks blocks = prepared->blocks;
+    blocks.inputs[0] = input->shared_limb_buffers[prepared->dispatch_slot].device_descriptors;
+    const auto &constants = prepared->ctx->ring_device_constants[prepared->dispatch_slot];
+    for (const PreparedSmallRhsGroup &group : prepared->groups)
+    {
+        if (group.narrow)
+        {
+            const auto *workspace = reinterpret_cast<const uint32_t *>(prepared->workspace_u32.data) +
+                group.typed_limb_offset * prepared->workspace_words_per_limb;
+            compact_accumulate_kernel<<<group.grid, kSmallThreads, 0, prepared->stream>>>(
+                blocks, constants.moduli, group.limb_offset, workspace, group.limb_count,
+                prepared->rows, prepared->inner, prepared->columns, prepared->n, group.lazy_reduce);
+        }
+        else
+        {
+            const auto *workspace = reinterpret_cast<const uint64_t *>(prepared->workspace_u64.data) +
+                group.typed_limb_offset * prepared->workspace_words_per_limb;
+            compact_accumulate_kernel<<<group.grid, kSmallThreads, 0, prepared->stream>>>(
+                blocks, constants.moduli, group.limb_offset, workspace, group.limb_count,
+                prepared->rows, prepared->inner, prepared->columns, prepared->n, group.lazy_reduce);
+        }
+        const cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess)
+        {
+            gpu_matrix_retire_submitted_work(prepared->output);
+            return set_error(error);
+        }
+    }
+    if (matrix_record_all_limb_writes(prepared->output, prepared->stream, true) != 0)
+    {
+        gpu_matrix_retire_submitted_work(prepared->output);
+        return 1;
+    }
+    const dim3 first = prepared->ctx->limb_gpu_ids[0];
+    const auto &states = prepared->output->exec_limb_states[first.x];
+    const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+    if (small_track_consumer(prepared->rhs, prepared->stream, completion) != 0) {
+        gpu_matrix_retire_submitted_work(prepared->output);
+        return 1;
+    }
+    const int tracked = matrix_track_all_limb_consumers(input, prepared->device, prepared->stream,
+        completion, true, true);
+    if (tracked != 0) gpu_matrix_retire_submitted_work(prepared->output);
+    return tracked;
+}
+
+extern "C" void gpu_matrix_destroy_prepared_small_rhs(GpuPreparedSmallRhs *opaque)
+{
+    delete opaque;
 }
 
 extern "C" int gpu_matrix_mul_small_rhs(
@@ -2060,6 +2446,313 @@ extern "C" int gpu_matrix_mul_small_rhs(
 
 // Inputs are homogeneous coefficient matrices in one context. Destinations
 // have independent cutoff plans/decision words, but may use different bounds.
+// The command keeps job metadata and acceptance on the device across all
+// bounded attempts. Publication never overwrites an earlier accepted sample.
+struct GpuPreparedPreimageCutoff {
+    GpuContext *ctx = nullptr;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    size_t rows = 0, columns = 0, coefficients = 0, n = 0, limbs = 0;
+    size_t maximum_bytes = 0;
+    std::vector<GpuSmallMatrix *> destinations;
+    std::vector<const GpuMatrix *> sources;
+    std::vector<CompactPreimageJob> jobs;
+    std::vector<std::unique_ptr<GpuDeviceWorkspace>> staging;
+    GpuDeviceWorkspace descriptors, success;
+    GpuCudaResource completion;
+    int32_t *host_status = nullptr;
+    bool started = false;
+    bool finished = false;
+
+    ~GpuPreparedPreimageCutoff() {
+        for (auto &owner : staging) (void)owner->release(stream);
+        (void)descriptors.release(stream);
+        (void)success.release(stream);
+    }
+};
+
+namespace {
+void prepared_preimage_cutoff_layout(size_t coefficients, size_t magnitude_bytes,
+    size_t count, GpuPreparedWorkspaceLayout *layouts)
+{
+    layouts[0] = {coefficients * (1 + magnitude_bytes), alignof(uint8_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[1] = {count * sizeof(CompactPreimageJob), alignof(CompactPreimageJob), GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[2] = {2 * count * sizeof(int32_t), alignof(int32_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[3] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
+}
+
+__global__ void prepared_preimage_status_kernel(int32_t *success, size_t count,
+                                               bool begin, bool continuation)
+{
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    if (begin) {
+        success[count + index] = continuation
+            ? (success[count + index] || !success[index]) : 0;
+        success[index] = 0;
+    } else if (success[count + index]) {
+        success[index] = 0;
+    }
+}
+
+__global__ void prepared_preimage_initialize_kernel(
+    const CompactPreimageJob *jobs, const int32_t *success, size_t count)
+{
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count) *jobs[index].accepted = success[index] ? 0 : 1;
+}
+
+__global__ void prepared_preimage_check_kernel(
+    const CompactPreimageJob *jobs, const int32_t *success, size_t coefficients, size_t n)
+{
+    if (success[blockIdx.y]) return;
+    const auto job = jobs[blockIdx.y];
+    compact_check_pack_preimage_kernel_body(
+        job.source, job.moduli, job.inverses, job.inverse_stride,
+        job.indices, job.subsets, job.limbs, coefficients, n, job.words,
+        job.modulus, job.half, job.bound, job.magnitude, job.accepted, job.staging);
+}
+
+__global__ void prepared_preimage_commit_kernel(
+    const CompactPreimageJob *jobs, const int32_t *success,
+    size_t n, size_t rows, size_t columns)
+{
+    const auto job = jobs[blockIdx.y];
+    if (success[blockIdx.y] || !*job.accepted) return;
+    compact_commit_preimage_tile_kernel_body(
+        job.payload, job.staging, n, rows, columns,
+        job.dst_cols, job.dst_row, job.dst_col, 1 + job.magnitude);
+}
+
+__global__ void prepared_preimage_accept_kernel(
+    const CompactPreimageJob *jobs, int32_t *success, size_t count)
+{
+    const size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < count && *jobs[index].accepted) success[index] = 1;
+}
+}
+
+extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
+    GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
+    const size_t *dst_rows, const size_t *dst_columns, size_t count,
+    int32_t *host_status, GpuPreparedPreimageCutoff **out)
+{
+    if (!destinations || !sources || !dst_rows || !dst_columns ||
+        !count || count > 65535 || !host_status || !out || !destinations[0] || !sources[0])
+        return set_error("invalid prepared preimage cutoff arguments");
+    *out = nullptr;
+    try {
+        auto plan = std::make_unique<GpuPreparedPreimageCutoff>();
+        auto *first = destinations[0];
+        if (small_set_device(first) != 0) return 1;
+        plan->ctx = first->ctx;
+        plan->device = first->device;
+        plan->stream = first->stream;
+        plan->rows = sources[0]->rows;
+        plan->columns = sources[0]->cols;
+        plan->n = first->n;
+        plan->limbs = sources[0]->level + 1;
+        plan->host_status = host_status;
+        if (!plan->rows || !plan->columns ||
+            !small_mul_size(plan->rows, plan->columns, &plan->coefficients) ||
+            !small_mul_size(plan->coefficients, plan->n, &plan->coefficients))
+            return set_error("invalid prepared preimage candidate geometry");
+        plan->jobs.resize(count);
+        plan->destinations.assign(destinations, destinations + count);
+        plan->sources.assign(sources, sources + count);
+        plan->staging.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            auto *dst = destinations[index];
+            const auto *src = sources[index];
+            if (!dst || !src || dst->ctx != plan->ctx || src->ctx != plan->ctx ||
+                dst->device != plan->device || src->rows != plan->rows ||
+                src->cols != plan->columns || src->level < 0 ||
+                static_cast<size_t>(src->level + 1) != plan->limbs ||
+                src->format != GPU_POLY_FORMAT_COEFF || dst_rows[index] > dst->rows ||
+                plan->rows > dst->rows - dst_rows[index] || dst_columns[index] > dst->cols ||
+                plan->columns > dst->cols - dst_columns[index])
+                return set_error("prepared preimage cutoff job contract mismatch");
+            // Acceptance storage belongs to a destination; sharing one within
+            // this batch would race even when its tile ranges are disjoint.
+            for (size_t previous = 0; previous < index; ++previous)
+                if (destinations[previous] == dst)
+                    return set_error("prepared preimage cutoff destinations must be distinct");
+            if (gpu_small_matrix_prepare_preimage_hard_cutoff(dst) != 0) return 1;
+            const size_t partition = src->ctx->limb_gpu_ids[0].x;
+            for (size_t limb = 0; limb < plan->limbs; ++limb)
+                if (src->ctx->limb_gpu_ids[limb].x != partition)
+                    return set_error("prepared preimage cutoff requires all limbs on one device");
+            const auto &constants = src->ctx->ring_device_constants[partition];
+            size_t bytes = 0;
+            if (!small_mul_size(plan->coefficients, 1 + dst->magnitude_bytes, &bytes))
+                return set_error("prepared preimage staging size overflow");
+            auto staging = std::make_unique<GpuDeviceWorkspace>();
+            if (staging->acquire(plan->ctx, plan->device, GPU_PREPARED_COMPACT_WORKSPACE,
+                    bytes, alignof(uint8_t), plan->stream) != 0) return 1;
+            plan->jobs[index] = {
+                src->shared_limb_buffers[partition].device_descriptors,
+                constants.moduli, dst->hard_cutoff_garner_inverses,
+                dst->hard_cutoff_modulus_words, dst->hard_cutoff_half_modulus_words,
+                dst->hard_cutoff_bound_words, dst->hard_cutoff_subset_indices,
+                static_cast<int>(src->ctx->moduli.size()), dst->hard_cutoff_subset_count,
+                static_cast<int>(plan->limbs), dst->hard_cutoff_words_per_coeff,
+                dst->hard_cutoff_device_accepted, staging->data, dst->payload,
+                dst->magnitude_bytes, dst->cols, dst_rows[index], dst_columns[index]
+            };
+            plan->maximum_bytes = std::max(plan->maximum_bytes, bytes);
+            plan->staging.push_back(std::move(staging));
+        }
+        GpuPreparedWorkspaceLayout layouts[4]{};
+        prepared_preimage_cutoff_layout(plan->coefficients, destinations[0]->magnitude_bytes, count, layouts);
+        if (plan->descriptors.acquire(plan->ctx, plan->device, layouts[1].kind,
+                layouts[1].bytes, layouts[1].alignment, plan->stream) != 0 ||
+            plan->success.acquire(plan->ctx, plan->device, GPU_PREPARED_COMPACT_WORKSPACE,
+                layouts[2].bytes, layouts[2].alignment, plan->stream) != 0 ||
+            plan->completion.acquire(plan->ctx, plan->device, GPU_PREPARED_COMPLETION_EVENT) != 0)
+            return 1;
+        auto error = cudaMemcpyAsync(plan->descriptors.data, plan->jobs.data(),
+            count * sizeof(CompactPreimageJob), cudaMemcpyHostToDevice, plan->stream);
+        // Immutable host metadata stays owned by the plan. Submission uses the
+        // same stream, so initialization needs no host completion wait.
+        if (error != cudaSuccess) return set_error(error);
+        *out = plan.release();
+        return 0;
+    } catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_preimage_cutoff_layout(GpuSmallMatrix *output,
+    GpuPreparedWorkspaceLayout *layouts, size_t *count)
+{
+    if (!output || !layouts || !count) return set_error("invalid preimage cutoff layout");
+    size_t index = 0;
+    layouts[index++] = {sizeof(int32_t), alignof(int32_t), GPU_PREPARED_PINNED_HOST};
+    if (!output->hard_cutoff_subset_count) {
+        std::vector<int> subset;
+        std::vector<uint64_t> modulus, half, bound;
+        if (small_hard_cutoff_metadata(output, subset, modulus, half, bound) != 0) return 1;
+        const size_t bytes[] = {output->ctx->garner_inverse_table.size() * sizeof(uint64_t),
+            subset.size() * sizeof(int), modulus.size() * sizeof(uint64_t),
+            half.size() * sizeof(uint64_t), bound.size() * sizeof(uint64_t)};
+        for (size_t i = 0; i < 5; ++i) {
+            const size_t alignment = i == 1 ? alignof(int) : alignof(uint64_t);
+            layouts[index++] = {bytes[i], alignment, GPU_PREPARED_PINNED_HOST};
+            layouts[index++] = {bytes[i], alignment, GPU_PREPARED_COMPACT_WORKSPACE};
+        }
+        layouts[index++] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
+        layouts[index++] = {sizeof(int), alignof(int), GPU_PREPARED_COMPACT_WORKSPACE};
+        layouts[index++] = {sizeof(int), alignof(int), GPU_PREPARED_PINNED_HOST};
+    }
+    size_t coefficients = 0;
+    if (!small_mul_size(output->rows, output->cols, &coefficients) ||
+        !small_mul_size(coefficients, output->n, &coefficients) ||
+        coefficients > SIZE_MAX / (1 + output->magnitude_bytes))
+        return set_error("preimage cutoff layout overflow");
+    prepared_preimage_cutoff_layout(coefficients, output->magnitude_bytes, 1, layouts + index);
+    *count = index + 4;
+    return 0;
+}
+
+extern "C" int gpu_small_matrix_begin_preimage_cutoff(GpuPreparedPreimageCutoff *plan)
+{
+    if (!plan) return set_error("prepared preimage cutoff is null");
+    auto error = cudaSetDevice(plan->device);
+    if (error == cudaSuccess) {
+        prepared_preimage_status_kernel<<<(plan->sources.size() + 255) / 256, 256, 0, plan->stream>>>(
+            reinterpret_cast<int32_t *>(plan->success.data), plan->sources.size(), true,
+            plan->started && !plan->finished);
+        gpu_test_record_kernel_launch();
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) error = cudaEventRecord(plan->completion.event, plan->stream);
+    if (error != cudaSuccess) return set_error(error);
+    plan->started = true;
+    plan->finished = false;
+    return 0;
+}
+
+extern "C" int gpu_small_matrix_submit_preimage_cutoff(GpuPreparedPreimageCutoff *plan)
+{
+    if (!plan || !plan->started || plan->finished)
+        return set_error("prepared preimage cutoff has no active invocation");
+    if (small_set_device(plan->destinations[0]) != 0) return 1;
+    for (size_t index = 0; index < plan->sources.size(); ++index) {
+        if (small_wait(plan->destinations[index], plan->stream) != 0) return 1;
+        if (matrix_wait_all_limb_streams(plan->sources[index], plan->device,
+                plan->stream, true, true) != 0) return 1;
+    }
+    const auto *jobs = reinterpret_cast<const CompactPreimageJob *>(plan->descriptors.data);
+    auto *success = reinterpret_cast<int32_t *>(plan->success.data);
+    const auto count = plan->sources.size();
+    const auto blocks = (count + kSmallThreads - 1) / kSmallThreads;
+    gpu_test_record_kernel_launch();
+    prepared_preimage_initialize_kernel<<<blocks, kSmallThreads, 0, plan->stream>>>(jobs, success, count);
+    auto error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    gpu_test_record_kernel_launch();
+    prepared_preimage_check_kernel<<<dim3((plan->coefficients + kSmallThreads - 1) / kSmallThreads, count),
+        kSmallThreads, 0, plan->stream>>>(jobs, success, plan->coefficients, plan->n);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    gpu_test_record_kernel_launch();
+    prepared_preimage_commit_kernel<<<dim3((plan->maximum_bytes + kSmallThreads - 1) / kSmallThreads, count),
+        kSmallThreads, 0, plan->stream>>>(jobs, success, plan->n, plan->rows, plan->columns);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    gpu_test_record_kernel_launch();
+    prepared_preimage_accept_kernel<<<blocks, kSmallThreads, 0, plan->stream>>>(jobs, success, count);
+    error = cudaGetLastError();
+    if (error == cudaSuccess) error = cudaEventRecord(plan->completion.event, plan->stream);
+    if (error != cudaSuccess) return set_error(error);
+    for (size_t index = 0; index < count; ++index) {
+        const auto *source = plan->sources[index];
+        for (size_t limb = 0; limb < plan->limbs; ++limb)
+            if (matrix_track_limb_consumer_readonly(source, source->ctx->limb_gpu_ids[limb],
+                    plan->device, plan->stream, plan->completion.event, true) != 0) return 1;
+        if (small_record(plan->destinations[index], plan->stream) != 0) return 1;
+    }
+    return 0;
+}
+
+extern "C" int gpu_small_matrix_finish_preimage_cutoff(GpuPreparedPreimageCutoff *plan)
+{
+    if (!plan || !plan->started || plan->finished)
+        return set_error("prepared preimage cutoff has no active invocation");
+    auto error = cudaSetDevice(plan->device);
+    if (error == cudaSuccess) {
+        prepared_preimage_status_kernel<<<(plan->sources.size() + 255) / 256, 256, 0, plan->stream>>>(
+            reinterpret_cast<int32_t *>(plan->success.data), plan->sources.size(), false, false);
+        gpu_test_record_kernel_launch();
+        error = cudaGetLastError();
+    }
+    if (error == cudaSuccess) error = cudaMemcpyAsync(plan->host_status, plan->success.data,
+        plan->sources.size() * sizeof(int32_t), cudaMemcpyDeviceToHost, plan->stream);
+    if (error == cudaSuccess) error = cudaEventRecord(plan->completion.event, plan->stream);
+    if (error != cudaSuccess) return set_error(error);
+    plan->finished = true;
+    return 0;
+}
+
+extern "C" int gpu_small_matrix_wait_preimage_cutoff(const GpuPreparedPreimageCutoff *plan)
+{
+    if (!plan || !plan->finished) return set_error("prepared preimage cutoff is not finished");
+    const auto error = cudaEventSynchronize(plan->completion.event);
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+extern "C" int gpu_preimage_cutoff_is_ready(const GpuPreparedPreimageCutoff *plan, bool *ready)
+{
+    if (!plan || !ready || !plan->finished) return set_error("preimage cutoff readback not submitted");
+    auto error = cudaSetDevice(plan->device);
+    if (error == cudaSuccess) error = cudaEventQuery(plan->completion.event);
+    *ready = error == cudaSuccess;
+    return error == cudaSuccess || error == cudaErrorNotReady ? 0 : set_error(error);
+}
+
+extern "C" void gpu_small_matrix_destroy_preimage_cutoff(GpuPreparedPreimageCutoff *plan)
+{
+    delete plan;
+}
+
 // The caller owns every destination exclusively and supplies valid tile ranges.
 extern "C" int gpu_small_matrix_pack_preimage_batch(
     GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,

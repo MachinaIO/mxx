@@ -2,12 +2,23 @@
 #include "matrix/MatrixUtils.cuh"
 
 #include <condition_variable>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <utility>
 #include <vector>
 
 namespace {
+#ifdef MXX_GPU_INSTRUMENTATION
+std::atomic<bool> work_gate{false};
+std::atomic<size_t> event_creations{0};
+std::atomic<size_t> stream_creations{0};
+std::atomic<size_t> native_validations{0};
+std::atomic<size_t> cuda_allocations{0};
+std::atomic<size_t> kernel_launches{0};
+std::atomic<size_t> measurement_launches{0};
+#endif
+
 struct StreamGate {
     std::mutex mutex;
     std::condition_variable changed;
@@ -25,6 +36,86 @@ void CUDART_CB wait_for_release(void *pointer)
     // Notify under the lock so destruction cannot race a final callback access.
     gate.changed.notify_all();
 }
+
+extern "C" void gpu_test_set_work_gate(bool enabled)
+{
+#ifdef MXX_GPU_INSTRUMENTATION
+    work_gate.store(enabled, std::memory_order_release);
+#else
+    (void)enabled;
+#endif
+}
+
+extern "C" void gpu_test_reset_work_counters()
+{
+#ifdef MXX_GPU_INSTRUMENTATION
+    event_creations.store(0, std::memory_order_relaxed);
+    stream_creations.store(0, std::memory_order_relaxed);
+    native_validations.store(0, std::memory_order_relaxed);
+    cuda_allocations.store(0, std::memory_order_relaxed);
+    kernel_launches.store(0, std::memory_order_relaxed);
+    measurement_launches.store(0, std::memory_order_relaxed);
+#endif
+}
+
+extern "C" void gpu_test_read_work_counters(
+    size_t *events, size_t *streams, size_t *validations,
+    size_t *allocations, size_t *kernels, size_t *measurements)
+{
+#ifdef MXX_GPU_INSTRUMENTATION
+    if (events) *events = event_creations.load(std::memory_order_relaxed);
+    if (streams) *streams = stream_creations.load(std::memory_order_relaxed);
+    if (validations) *validations = native_validations.load(std::memory_order_relaxed);
+    if (allocations) *allocations = cuda_allocations.load(std::memory_order_relaxed);
+    if (kernels) *kernels = kernel_launches.load(std::memory_order_relaxed);
+    if (measurements) *measurements = measurement_launches.load(std::memory_order_relaxed);
+#else
+    if (events) *events = 0;
+    if (streams) *streams = 0;
+    if (validations) *validations = 0;
+    if (allocations) *allocations = 0;
+    if (kernels) *kernels = 0;
+    if (measurements) *measurements = 0;
+#endif
+}
+
+#ifdef MXX_GPU_INSTRUMENTATION
+extern "C" void gpu_test_record_event_creation()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        event_creations.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gpu_test_record_stream_creation()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        stream_creations.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gpu_test_record_native_validation()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        native_validations.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gpu_test_record_cuda_allocation()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        cuda_allocations.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gpu_test_record_kernel_launch()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        kernel_launches.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void gpu_test_record_measurement_launch()
+{
+    if (work_gate.load(std::memory_order_acquire))
+        measurement_launches.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 }
 
 extern "C" void gpu_test_release_stream_gate(void *pointer)

@@ -7,6 +7,7 @@
 #include <exception>
 #include <limits>
 #include <string>
+#include <stdexcept>
 #include <type_traits>
 #include <vector>
 
@@ -23,7 +24,11 @@
 #include "MatrixSerde.cu"
 #include "MatrixSerdeBatch.cu"
 #include "MatrixCrt.cu"
+#include "MatrixScalar.cu"
 #include "MatrixSmallRhs.cu" // compact bounded RHS implementation and staged kernels
+#include "gpu_preimage.cu"
+#include "gpu_compact_decompose.cu"
+#include "gpu_schedule.cu"
 
 // Every native kernel specialization reachable from this translation unit is
 // loaded before setup residency is accepted. Keep this explicit inventory in
@@ -142,6 +147,10 @@ int gpu_matrix_prepare_kernels(GpuKernelPartition *partition)
         reinterpret_cast<const void *>(rns_compact_conversion_kernel),
         reinterpret_cast<const void *>(rns_conversion_kernel),
         // MatrixSmallRhs.cu
+        reinterpret_cast<const void *>(prepared_threshold_kernel),
+        reinterpret_cast<const void *>(prepared_scalar_pack_kernel),
+        reinterpret_cast<const void *>(prepared_scalar_op_kernel),
+        reinterpret_cast<const void *>(prepared_scalar_matrix_select_kernel),
         reinterpret_cast<const void *>(compact_decompose_kernel),
         reinterpret_cast<const void *>(compact_rhs_dif_first_kernel<uint32_t>),
         reinterpret_cast<const void *>(compact_rhs_dif_first_kernel<uint64_t>),
@@ -158,6 +167,11 @@ int gpu_matrix_prepare_kernels(GpuKernelPartition *partition)
         reinterpret_cast<const void *>(compact_preimage_initialize_batch_kernel),
         reinterpret_cast<const void *>(compact_preimage_check_batch_kernel),
         reinterpret_cast<const void *>(compact_preimage_commit_batch_kernel),
+        reinterpret_cast<const void *>(prepared_preimage_initialize_kernel),
+        reinterpret_cast<const void *>(prepared_preimage_status_kernel),
+        reinterpret_cast<const void *>(prepared_preimage_check_kernel),
+        reinterpret_cast<const void *>(prepared_preimage_commit_kernel),
+        reinterpret_cast<const void *>(prepared_preimage_accept_kernel),
     };
     for (size_t index = 0; index < std::size(kernels); ++index) {
         cudaFuncAttributes attributes{};

@@ -55,6 +55,11 @@ struct DispatchOpaque {
     _private: [u8; 0],
 }
 
+#[repr(C)]
+struct ProvisioningPermitOpaque {
+    _private: [u8; 0],
+}
+
 /// Owns the automatic runtime graph boundary. Native output leases remain
 /// alive independently; dropping this guard only ends the allocation policy.
 pub struct GpuGraphAdmissionGuard {
@@ -103,6 +108,15 @@ unsafe extern "C" {
     ) -> i32;
     fn gpu_graph_admission_begin(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque) -> i32;
     fn gpu_graph_admission_end(context: *mut crate::poly::dcrt::gpu::GpuContextOpaque);
+    fn gpu_prepared_provision_begin(
+        context: *mut crate::poly::dcrt::gpu::GpuContextOpaque,
+        claims: *const GpuTracedClaim,
+        count: usize,
+        out: *mut *mut ProvisioningPermitOpaque,
+    ) -> i32;
+    fn gpu_prepared_provision_enter(permit: *mut ProvisioningPermitOpaque) -> i32;
+    fn gpu_prepared_provision_finish(permit: *mut ProvisioningPermitOpaque) -> i32;
+    fn gpu_prepared_provision_cancel(permit: *mut ProvisioningPermitOpaque);
 }
 
 /// One native claim recorded by [`trace_native_claims`], in claim order.
@@ -116,6 +130,83 @@ pub struct GpuTracedClaim {
     format: i32,
     bytes: usize,
     alignment: usize,
+}
+
+/// Setup-only authority for constructing new prepared backing after an
+/// execution owner's allocation domains have been sealed. The native permit
+/// consumes this exact ordered list and is thread-bound while active.
+pub struct GpuPreparedProvisioningPermit {
+    raw: NonNull<ProvisioningPermitOpaque>,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+/// Active scope for one provisioning transaction. Dropping an unfinished scope
+/// cancels the native authority; it never clears the execution owner's seal.
+pub struct GpuPreparedProvisioningGuard {
+    raw: NonNull<ProvisioningPermitOpaque>,
+    active: bool,
+    _thread_bound: PhantomData<Rc<()>>,
+}
+
+impl GpuPreparedProvisioningPermit {
+    pub fn begin(
+        parameters: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        claims: &[GpuTracedClaim],
+    ) -> Result<Self, String> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_prepared_provision_begin(
+                parameters.ctx_raw(),
+                claims.as_ptr(),
+                claims.len(),
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(Self {
+            raw: NonNull::new(raw).ok_or("successful provisioning permit has no owner")?,
+            _thread_bound: PhantomData,
+        })
+    }
+
+    pub fn enter(self) -> Result<GpuPreparedProvisioningGuard, String> {
+        let raw = self.raw;
+        let status = unsafe { gpu_prepared_provision_enter(raw.as_ptr()) };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        std::mem::forget(self);
+        Ok(GpuPreparedProvisioningGuard { raw, active: true, _thread_bound: PhantomData })
+    }
+}
+
+impl Drop for GpuPreparedProvisioningPermit {
+    fn drop(&mut self) {
+        unsafe { gpu_prepared_provision_cancel(self.raw.as_ptr()) };
+    }
+}
+
+impl GpuPreparedProvisioningGuard {
+    pub fn finish(mut self) -> Result<(), String> {
+        let status = unsafe { gpu_prepared_provision_finish(self.raw.as_ptr()) };
+        if status != 0 {
+            unsafe { gpu_prepared_provision_cancel(self.raw.as_ptr()) };
+            self.active = false;
+            return Err(last_error_string());
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for GpuPreparedProvisioningGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { gpu_prepared_provision_cancel(self.raw.as_ptr()) };
+        }
+    }
 }
 
 impl GpuTracedClaim {
@@ -2067,6 +2158,148 @@ mod tests {
         let cpu = DCRTPolyParams::new(n, 2, 54, 4, None, None);
         let gpu = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, None);
         (cpu, gpu)
+    }
+
+    fn sealed_baseline() -> (GpuDCRTPolyParams, GpuPreparedStorage) {
+        let (_, params) = parameters();
+        let baseline =
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None, None)
+                .unwrap();
+        GpuPreparedStorage::finish_setup(&[&baseline]).unwrap();
+        (params, baseline)
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_provisioning_permit_authorizes_exact_owner() {
+        let (_, params) = parameters();
+        let baseline =
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None, None)
+                .unwrap();
+        // Keep an unrelated source and a queued reader alive across the setup
+        // transaction. Provisioning must allocate distinct backing and leave
+        // this existing output readable.
+        let source = GpuDCRTPolyMatrix::identity_columns(&params, 2, 0, 1);
+        let source_raw = source.raw;
+        let reader = source.transpose();
+        let (expected, readback_claims) = trace_native_claims(|| reader.to_cpu_matrix()).unwrap();
+        GpuPreparedStorage::finish_setup(&[&baseline]).unwrap();
+        let level = params.crt_depth() - 1;
+        let claim = GpuTracedClaim::matrix(1, 1, level, true);
+        let mut provisioning_claims = Vec::with_capacity(1 + readback_claims.len());
+        provisioning_claims.push(claim);
+        provisioning_claims.extend(readback_claims);
+        let mut ordinary = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create(
+                params.ctx_raw(),
+                level as i32,
+                1,
+                1,
+                GPU_POLY_FORMAT_EVAL,
+                &mut ordinary,
+                true,
+            )
+        };
+        assert_ne!(status, 0);
+        assert!(ordinary.is_null());
+
+        let permit = GpuPreparedProvisioningPermit::begin(&params, &provisioning_claims).unwrap();
+        let guard = permit.enter().unwrap();
+        let provisioned = GpuDCRTPolyMatrix::new_empty_with_state(&params, 1, 1, level, true, None);
+        assert_ne!(provisioned.raw, source_raw);
+        let actual = reader.to_cpu_matrix();
+        assert_eq!(actual, expected);
+        guard.finish().unwrap();
+        drop(provisioned);
+        drop((reader, source, baseline));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_provisioning_permit_rejects_mismatch_and_exhaustion() {
+        let (params, baseline) = sealed_baseline();
+        let level = params.crt_depth() - 1;
+        let claim = GpuTracedClaim::matrix(1, 1, level, true);
+
+        let permit = GpuPreparedProvisioningPermit::begin(&params, &[claim]).unwrap();
+        let guard = permit.enter().unwrap();
+        let mut mismatched = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create(
+                params.ctx_raw(),
+                level as i32,
+                1,
+                2,
+                GPU_POLY_FORMAT_EVAL,
+                &mut mismatched,
+                true,
+            )
+        };
+        assert_ne!(status, 0);
+        assert!(mismatched.is_null());
+        drop(guard);
+
+        let permit = GpuPreparedProvisioningPermit::begin(&params, &[claim]).unwrap();
+        let guard = permit.enter().unwrap();
+        let first = GpuDCRTPolyMatrix::new_empty_with_state(&params, 1, 1, level, true, None);
+        drop(first);
+        let mut exhausted = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create(
+                params.ctx_raw(),
+                level as i32,
+                1,
+                1,
+                GPU_POLY_FORMAT_EVAL,
+                &mut exhausted,
+                true,
+            )
+        };
+        assert_ne!(status, 0);
+        assert!(exhausted.is_null());
+        guard.finish().unwrap();
+        drop(baseline);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_provisioning_permit_cannot_nest_ordinary_dispatch() {
+        let (params, baseline) = sealed_baseline();
+        let level = params.crt_depth() - 1;
+        let claim = GpuTracedClaim::matrix(1, 1, level, true);
+        let request = baseline.slot_identity(0).unwrap().matrix_request(1, 1, true);
+        let permit = GpuPreparedProvisioningPermit::begin(&params, &[claim]).unwrap();
+        let guard = permit.enter().unwrap();
+        let reservation = baseline.reserve(&[request]).unwrap();
+        assert!(reservation.enter(Vec::new()).is_err());
+        drop(guard);
+        drop(baseline);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_provisioning_permit_authorizes_exact_storage_workspace() {
+        let (_, params) = parameters();
+        let anchor =
+            GpuPreparedStorage::new(None, vec![GpuDCRTPolyMatrix::zero(&params, 1, 1)], None, None)
+                .unwrap();
+        let spare = GpuDCRTPolyMatrix::zero(&params, 1, 1);
+        GpuPreparedStorage::finish_setup(&[&anchor]).unwrap();
+        let layout = GpuPreparedWorkspaceLayout {
+            bytes: 64,
+            alignment: 8,
+            kind: GpuPreparedSlotKind::BatchWorkspace,
+        };
+        let claim = GpuTracedClaim::workspace(layout);
+        let permit = GpuPreparedProvisioningPermit::begin(&params, &[claim]).unwrap();
+        let guard = permit.enter().unwrap();
+        let provisioned =
+            GpuPreparedStorage::new(None, vec![spare], None, Some(std::slice::from_ref(&layout)))
+                .unwrap();
+        guard.finish().unwrap();
+        drop(provisioned);
+        drop(anchor);
     }
 
     #[test]
@@ -5357,6 +5590,72 @@ mod tests {
             assert_eq!(reader.to_cpu_matrix(), expected.transpose());
             assert_eq!(replacement.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, rows, 2));
         }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_shape_headers_share_lifetime_and_reader_events() {
+        use crate::matrix::gpu_dcrt_poly::GpuPreparedInputCopy;
+        use std::sync::Arc;
+
+        let (cpu, params) = parameters();
+        let source = Arc::new(GpuDCRTPolyMatrix::identity(&params, 2, None));
+        let zero = Arc::new(GpuDCRTPolyMatrix::zero(&params, 2, 2));
+        let storage = GpuPreparedStorage::new(
+            None,
+            vec![GpuDCRTPolyMatrix::zero(&params, 4, 4), GpuDCRTPolyMatrix::zero(&params, 2, 2)],
+            None,
+            None,
+        )
+        .unwrap();
+        let dispatch = reserve(&storage, &[0, 1]).unwrap().enter(Vec::new()).unwrap();
+        let backing = Arc::new(GpuDCRTPolyMatrix::new_empty_with_state(
+            &params,
+            4,
+            4,
+            params.crt_depth() - 1,
+            true,
+            None,
+        ));
+        let address = backing.raw;
+        let weak = Arc::downgrade(&backing);
+        let view =
+            GpuDCRTPolyMatrix::prepared_shape(Arc::clone(&backing), 2, 2, backing.level(), true)
+                .unwrap();
+        let discarded =
+            GpuDCRTPolyMatrix::prepared_shape(Arc::clone(&backing), 1, 4, backing.level(), true)
+                .unwrap();
+        drop(discarded);
+        assert!(reserve(&storage, &[0]).is_err(), "header drop must not release its live backing");
+        assert!(
+            GpuDCRTPolyMatrix::prepared_shape(Arc::clone(&backing), 5, 4, backing.level(), true)
+                .is_err()
+        );
+        let copy =
+            GpuPreparedInputCopy::bind(Arc::clone(&view), Arc::clone(&source), None).unwrap();
+        let overwrite =
+            GpuPreparedInputCopy::bind(Arc::clone(&view), Arc::clone(&zero), None).unwrap();
+        drop(backing);
+        assert!(weak.upgrade().is_some(), "a live header retains accepted backing");
+        copy.submit_borrowed(&source).unwrap();
+        let reader = view.transpose();
+        // No host wait: the alias write must join the reader recorded through
+        // the other header, rather than consulting a copied event-state cache.
+        overwrite.submit_borrowed(&zero).unwrap();
+        drop(copy);
+        drop(overwrite);
+        drop(view);
+        assert!(weak.upgrade().is_none());
+        drop(dispatch.finish().unwrap());
+        let dispatch = reserve(&storage, &[0]).unwrap().enter(Vec::new()).unwrap();
+        let replacement = GpuDCRTPolyMatrix::zero(&params, 4, 4);
+        assert_eq!(
+            replacement.raw, address,
+            "the accepted slot must be reusable without ABA ownership"
+        );
+        drop(dispatch.finish().unwrap());
+        assert_eq!(reader.to_cpu_matrix(), DCRTPolyMatrix::identity(&cpu, 2, None).transpose());
+        assert_eq!(replacement.to_cpu_matrix(), DCRTPolyMatrix::zero(&cpu, 4, 4));
     }
 
     #[test]

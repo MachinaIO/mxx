@@ -1,5 +1,47 @@
 #include "gpu_admission.cuh"
 
+GpuMatrix::GpuMatrix(GpuContext *context, size_t row_count, size_t column_count,
+                     int active_level, GpuPolyFormat active_format)
+    : ctx(context), rows(row_count), cols(column_count), level(active_level),
+      format(active_format), exec_limb_states(owned_exec_limb_states),
+      host_observed_writer_ready(owned_host_observed_writer_ready)
+{}
+
+GpuMatrix::GpuMatrix(GpuMatrix &owner, size_t row_count, size_t column_count,
+                     int active_level, GpuPolyFormat active_format)
+    : ctx(owner.ctx), rows(row_count), cols(column_count), level(active_level),
+      format(active_format), shared_limb_buffers(owner.shared_limb_buffers),
+      shared_aux_buffers(owner.shared_aux_buffers), exec_limb_states(owner.exec_limb_states),
+      descriptors_initialized(owner.descriptors_initialized),
+      host_observed_writer_ready(owner.host_observed_writer_ready),
+      prepared_view_owner(owner.prepared_view_owner ? owner.prepared_view_owner : &owner)
+{
+    const size_t count = rows * cols;
+    for (auto &buffer : shared_limb_buffers)
+        buffer.bytes_total = count * buffer.bytes_per_poly;
+    for (auto &buffer : shared_aux_buffers)
+        buffer.slots_total = count * buffer.slots_per_poly;
+}
+
+extern "C" int gpu_matrix_prepared_shape(GpuMatrix *owner, size_t rows, size_t cols,
+                                          int level, int format, GpuMatrix **out)
+{
+    if (!owner || !owner->ctx || !out || rows == 0 || cols == 0 || level < 0 ||
+        (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL))
+        return set_error("invalid prepared matrix header");
+    GpuMatrix *backing = owner->prepared_view_owner ? owner->prepared_view_owner : owner;
+    if (level > backing->level || backing->shared_limb_buffers.size() != 1 ||
+        rows > backing->rows * backing->cols / cols)
+        return set_error("prepared matrix header exceeds its accepted backing");
+    // The context, device descriptors, basis and polynomial stride are inherited,
+    // never reconstructed from a different parameter owner. A warmup allocation
+    // and an admitted allocation have the same backing lifetime: Rust retains
+    // its owner until every header is dropped. Admission is enforced by the
+    // allocator, rather than by whether a read-only header has a slot lease.
+    *out = new GpuMatrix(*backing, rows, cols, level, static_cast<GpuPolyFormat>(format));
+    return 0;
+}
+
 namespace
 {
     struct DeviceDescriptorInit
@@ -489,7 +531,8 @@ extern "C" int gpu_matrix_create(
         return set_error("invalid gpu_matrix_create arguments");
     }
     *out = nullptr;
-    if (ctx->execution->unretired_work.load(std::memory_order_acquire))
+    if (ctx->execution->unretired_work.load(std::memory_order_acquire) &&
+        !gpu_prepared_provisioning_active(ctx))
         return set_error("GPU execution has unretired work; allocation rejected");
     MatrixAllocationPlan plan{};
     const int plan_status =
@@ -505,7 +548,7 @@ extern "C" int gpu_matrix_create(
         ctx, level, rows, cols, format, out, &prepared);
     if (prepared_status != 0 || prepared) return prepared_status;
 
-    auto *mat = new GpuMatrix{ctx, rows, cols, level, plan.format, {}, {}, {}};
+    auto *mat = new GpuMatrix(ctx, rows, cols, level, plan.format);
     mat->descriptors_initialized = initialize_descriptors || plan.count == 0;
     const size_t partition_count = plan.partitions.size();
     mat->shared_limb_buffers.resize(partition_count);
@@ -604,6 +647,7 @@ extern "C" int gpu_matrix_create(
         }
 
         uint8_t *base = nullptr;
+        gpu_test_record_cuda_allocation();
         err = cudaMallocAsync(
             reinterpret_cast<void **>(&base),
             partition.allocation_bytes,
@@ -781,6 +825,11 @@ extern "C" void gpu_matrix_destroy(GpuMatrix *mat)
 {
     if (!mat)
     {
+        return;
+    }
+    if (mat->prepared_view_owner)
+    {
+        delete mat;
         return;
     }
     if (mat->ctx->execution->unretired_work.load(std::memory_order_acquire)) return;

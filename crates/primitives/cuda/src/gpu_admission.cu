@@ -395,8 +395,17 @@ struct GpuMatrixDispatchPermit {
     }
 };
 
+struct GpuPreparedProvisioningPermit {
+    GpuContext *context = nullptr;
+    std::shared_ptr<GpuExecutionOwner> execution;
+    std::vector<GpuClaimTraceEntry> claims;
+    size_t next = 0;
+    bool entered = false;
+};
+
 namespace {
 thread_local GpuMatrixDispatchPermit *active_permit = nullptr;
+thread_local GpuPreparedProvisioningPermit *active_provisioning = nullptr;
 
 // Ordered record of the claims an operation would make. Recording happens only
 // on open domains (no permit, admission not required), on the calling thread.
@@ -436,6 +445,114 @@ void trace_claim(GpuPreparedSlotKind kind, size_t rows, size_t cols, int level, 
             static_cast<int>(kind), rows, cols, level, format, bytes, alignment});
     } catch (...) {}
 }
+
+int validate_provisioning_claim(const GpuClaimTraceEntry &claim)
+{
+    const auto kind = static_cast<GpuPreparedSlotKind>(claim.kind);
+    if (kind == GPU_PREPARED_MATRIX) {
+        if (claim.rows == 0 || claim.columns == 0 || claim.bytes != 0 || claim.alignment != 0 ||
+            claim.level < 0 ||
+            (claim.format != GPU_POLY_FORMAT_COEFF && claim.format != GPU_POLY_FORMAT_EVAL))
+            return fail("invalid provisioning matrix request");
+        return 0;
+    }
+    if (is_resource(kind)) {
+        if (claim.rows != 0 || claim.columns != 0 || claim.level != -1 || claim.format != -1 ||
+            claim.bytes != 0 || claim.alignment != 1)
+            return fail("invalid provisioning CUDA resource request");
+        return 0;
+    }
+    if (kind != GPU_PREPARED_BATCH_WORKSPACE &&
+        kind != GPU_PREPARED_TRANSFORM_WORKSPACE &&
+        kind != GPU_PREPARED_PINNED_HOST && kind != GPU_PREPARED_COMPACT_PAYLOAD &&
+        kind != GPU_PREPARED_COMPACT_WORKSPACE && kind != GPU_PREPARED_SAMPLER_WORKSPACE &&
+        kind != GPU_PREPARED_TRANSFER_WORKSPACE)
+        return fail("invalid provisioning workspace kind");
+    if (claim.rows != 0 || claim.columns != 0 || claim.level != -1 || claim.format != -1 ||
+        claim.bytes == 0 || claim.alignment == 0 || claim.alignment > 256 ||
+        (claim.alignment & (claim.alignment - 1)) != 0)
+        return fail("invalid provisioning workspace request");
+    return 0;
+}
+
+int provisioning_consume(
+    GpuContext *context, GpuPreparedSlotKind kind, size_t rows, size_t columns,
+    int level, int format, size_t bytes, size_t alignment)
+{
+    if (!active_provisioning) return fail("no active provisioning permit");
+    auto &permit = *active_provisioning;
+    if (permit.context != context || permit.execution != context->execution)
+        return fail("provisioning request belongs to another context");
+    if (permit.next >= permit.claims.size())
+        return fail("provisioning request list is exhausted");
+    const auto &claim = permit.claims[permit.next];
+    if (claim.kind != static_cast<int>(kind) || claim.rows != rows || claim.columns != columns ||
+        claim.level != level || claim.format != format || claim.bytes != bytes ||
+        claim.alignment != alignment)
+        return fail("provisioning construction differs from its exact request");
+    ++permit.next;
+    return 0;
+}
+}
+
+extern "C" int gpu_prepared_provision_begin(
+    GpuContext *context, const GpuClaimTraceEntry *claims, size_t count,
+    GpuPreparedProvisioningPermit **out)
+{
+    if (!out) return fail("null provisioning permit output");
+    *out = nullptr;
+    if (!context || !context->execution || !claims || count == 0 || active_permit ||
+        active_provisioning)
+        return fail("invalid or nested provisioning permit");
+    auto execution = context->execution;
+    if (!gpu_context_admission_is_required(context))
+        return fail("provisioning requires a sealed execution owner");
+    try {
+        auto permit = std::make_unique<GpuPreparedProvisioningPermit>();
+        permit->context = context;
+        permit->execution = std::move(execution);
+        permit->claims.assign(claims, claims + count);
+        for (const auto &claim : permit->claims) {
+            const int status = validate_provisioning_claim(claim);
+            if (status != 0) return status;
+        }
+        *out = permit.release();
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_prepared_provision_enter(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit || permit->entered || active_permit || active_provisioning)
+        return fail("invalid or nested provisioning activation");
+    if (!permit->context || permit->context->execution != permit->execution)
+        return fail("provisioning execution owner is no longer valid");
+    permit->entered = true;
+    active_provisioning = permit;
+    return 0;
+}
+
+extern "C" int gpu_prepared_provision_finish(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit || permit != active_provisioning || !permit->entered)
+        return fail("provisioning permit must finish on its submitting thread");
+    if (permit->next != permit->claims.size())
+        return fail("provisioning permit finished before consuming every request");
+    active_provisioning = nullptr;
+    delete permit;
+    return 0;
+}
+
+extern "C" void gpu_prepared_provision_cancel(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit) return;
+    if (active_provisioning == permit) active_provisioning = nullptr;
+    delete permit;
+}
+
+extern "C" int gpu_prepared_provisioning_active(const GpuContext *context)
+{
+    return active_provisioning && active_provisioning->context == context ? 1 : 0;
 }
 
 extern "C" int gpu_prepared_pinned_claim(
@@ -443,6 +560,15 @@ extern "C" int gpu_prepared_pinned_claim(
 {
     if (!ctx || !ctx->execution || !out || !handled) return fail("invalid prepared pinned claim");
     *out = nullptr;
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != ctx->execution)
+            return fail("pinned provisioning belongs to another context");
+        const int status = provisioning_consume(
+            ctx, GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
+        if (status != 0) return status;
+        *handled = 0;
+        return 0;
+    }
     *handled = ((active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire)) || ctx->execution->pinned_admission_required.load(std::memory_order_acquire)) ? 1 : 0;
     if (!*handled) {
         trace_claim(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
@@ -520,9 +646,20 @@ int GpuCudaResource::acquire(const GpuContext *ctx, int selected_device, GpuPrep
         return fail(message);
     };
     GpuAllocationActivity activity(execution.get(), device);
-    if (execution->unretired_work.load(std::memory_order_acquire))
+    if (execution->unretired_work.load(std::memory_order_acquire) &&
+        !(active_provisioning && active_provisioning->execution == execution))
         return refuse("CUDA resource request has unretired work");
-    if ((active_permit && execution->graph_admission_scoped.load(std::memory_order_acquire)) || execution->resource_admission_required.load(std::memory_order_acquire)) {
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != execution)
+            return refuse("CUDA resource provisioning belongs to another context");
+        const int status = provisioning_consume(
+            const_cast<GpuContext *>(ctx), kind, 0, 0, -1, -1, 0, 1);
+        if (status != 0) {
+            execution.reset();
+            device = -1;
+            return status;
+        }
+    } else if ((active_permit && execution->graph_admission_scoped.load(std::memory_order_acquire)) || execution->resource_admission_required.load(std::memory_order_acquire)) {
         auto *reservation = active_permit ? active_permit->next_reservation() : nullptr;
         if (!reservation || reservation->storage->context != ctx || reservation->storage->device != device)
             return refuse("CUDA resource requires a matching prepared dispatch permit");
@@ -542,7 +679,7 @@ int GpuCudaResource::acquire(const GpuContext *ctx, int selected_device, GpuPrep
         note_consumed(kind, 0, 0, -1, -1, 0, 1);
         return 0;
     }
-    trace_claim(kind, 0, 0, -1, -1, 0, 1);
+    if (!active_provisioning) trace_claim(kind, 0, 0, -1, -1, 0, 1);
     cudaError_t error = cudaSetDevice(device);
     if (error == cudaSuccess) {
         if (kind == GPU_PREPARED_COMPLETION_EVENT)
@@ -634,7 +771,8 @@ int GpuDeviceWorkspace::acquire(
          kind != GPU_PREPARED_SAMPLER_WORKSPACE && kind != GPU_PREPARED_TRANSFER_WORKSPACE))
         return fail("invalid device workspace request");
     if (bytes == 0) return 0;
-    if (ctx->execution->unretired_work.load(std::memory_order_acquire))
+    if (ctx->execution->unretired_work.load(std::memory_order_acquire) &&
+        !(active_provisioning && active_provisioning->execution == ctx->execution))
         return fail("device workspace request has unretired work");
     execution = ctx->execution;
     device = selected_device;
@@ -651,7 +789,13 @@ int GpuDeviceWorkspace::acquire(
     const bool requires_permit = kind == GPU_PREPARED_TRANSFER_WORKSPACE
         ? ((active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire)) || ctx->execution->transfer_admission_required.load(std::memory_order_acquire))
         : (active_permit || gpu_context_admission_is_required(ctx));
-    if (requires_permit) {
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != ctx->execution)
+            return refuse(fail("device workspace provisioning belongs to another context"));
+        const int status = provisioning_consume(
+            ctx, kind, 0, 0, -1, -1, bytes, alignment);
+        if (status != 0) return refuse(status);
+    } else if (requires_permit) {
         auto *next = active_permit ? active_permit->next_reservation() : nullptr;
         if (!next || next->storage->context != ctx || next->storage->device != device)
             return refuse(fail("device workspace requires a matching prepared dispatch permit"));
@@ -686,10 +830,12 @@ int GpuDeviceWorkspace::acquire(
         note_consumed(kind, 0, 0, -1, -1, bytes, alignment);
         return 0;
     }
-    trace_claim(kind, 0, 0, -1, -1, bytes, alignment);
+    if (!active_provisioning) trace_claim(kind, 0, 0, -1, -1, bytes, alignment);
     cudaError_t error = cudaSetDevice(device);
-    if (error == cudaSuccess)
+    if (error == cudaSuccess) {
+        gpu_test_record_cuda_allocation();
         error = cudaMallocAsync(reinterpret_cast<void **>(&data), bytes, stream);
+    }
     if (error != cudaSuccess) {
         data = nullptr;
         return refuse(fail(error));
@@ -857,9 +1003,13 @@ extern "C" int gpu_prepared_storage_create(
     GpuContext *context = matrices[0]->ctx;
     auto execution = context->execution;
     GpuAllocationActivity activity(execution.get(), context->gpu_ids[0]);
-    if (gpu_context_admission_is_required(context))
+    if (active_provisioning) {
+        if (active_provisioning->context != context ||
+            active_provisioning->execution != execution)
+            return fail("prepared storage provisioning belongs to another context");
+    } else if (gpu_context_admission_is_required(context))
         return fail("prepared matrix resources must be created before checked dispatch");
-    if (context->execution->unretired_work.load(std::memory_order_acquire))
+    if (!active_provisioning && context->execution->unretired_work.load(std::memory_order_acquire))
         return fail("cannot prepare matrix storage with unretired work");
     std::shared_ptr<Storage> storage;
     int previous = -1;
@@ -962,6 +1112,11 @@ extern "C" int gpu_prepared_storage_create(
             storage->slots.push_back(std::move(slot));
             auto &prepared = *storage->slots.back();
             if (is_resource(layout.kind)) {
+                if (active_provisioning) {
+                    const int status = provisioning_consume(
+                        context, layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment);
+                    if (status != 0) return status;
+                }
                 if (storage->resources->capacity == SIZE_MAX)
                     return fail("prepared resource capacity overflow");
                 ++storage->resources->capacity;
@@ -977,6 +1132,12 @@ extern "C" int gpu_prepared_storage_create(
                 prepared.workspace = gpu_pinned_alloc(context, layout.bytes, layout.alignment);
                 if (!prepared.workspace) return fail("failed to prepare pinned host storage");
             } else {
+                if (active_provisioning) {
+                    const int status = provisioning_consume(
+                        context, layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment);
+                    if (status != 0) return status;
+                }
+                gpu_test_record_cuda_allocation();
                 error = cudaMallocAsync(&prepared.workspace, layout.bytes, release);
                 if (error == cudaSuccess)
                     error = cudaEventCreateWithFlags(&prepared.reusable, cudaEventDisableTiming);
@@ -1222,10 +1383,15 @@ extern "C" void gpu_graph_admission_end(GpuContext *ctx)
     // native reservation into permission for an unclaimed allocation.
     if (!owner.prepared_active_reservations.load(std::memory_order_acquire) &&
         !owner.unretired_work.load(std::memory_order_acquire)) {
-        owner.admission_required.store(false, std::memory_order_release);
-        owner.pinned_admission_required.store(false, std::memory_order_release);
-        owner.transfer_admission_required.store(false, std::memory_order_release);
-        owner.resource_admission_required.store(false, std::memory_order_release);
+        // A completed managed inventory is a long-lived sealed owner. An
+        // ordinary graph scope may temporarily open it, but ending that scope
+        // must restore the seal so later provisioning targets this same owner
+        // rather than requiring a replacement ledger or dropping live outputs.
+        const bool sealed = owner.allocation_tracking_complete.load(std::memory_order_acquire);
+        owner.admission_required.store(sealed, std::memory_order_release);
+        owner.pinned_admission_required.store(sealed, std::memory_order_release);
+        owner.transfer_admission_required.store(sealed, std::memory_order_release);
+        owner.resource_admission_required.store(sealed, std::memory_order_release);
     }
     owner.graph_admission_active.store(false, std::memory_order_release);
 }
@@ -1798,7 +1964,7 @@ extern "C" int gpu_matrix_dispatch_enter(
 {
     if (!out) return fail("null matrix dispatch permit output");
     *out = nullptr;
-    if (!reservations || count == 0 || active_permit)
+    if (!reservations || count == 0 || active_permit || active_provisioning)
         return fail("invalid or nested matrix dispatch activation");
     try {
         std::unordered_set<GpuMatrixReservation *> unique;
@@ -1913,6 +2079,14 @@ extern "C" int gpu_prepared_matrix_claim(
 {
     if (!ctx || !out || !handled) return fail("invalid prepared matrix allocation");
     *handled = 0;
+    if (active_provisioning) {
+        const int status = provisioning_consume(
+            ctx, GPU_PREPARED_MATRIX, rows, cols, level, format, 0, 0);
+        if (status != 0) return status;
+        // The provisioning permit authorizes the ordinary constructor below;
+        // it never supplies a persistent slot or weakens the admission seal.
+        return 0;
+    }
     if (!active_permit && !gpu_context_admission_is_required(ctx)) {
         if (rows != 0 && cols != 0) trace_claim(GPU_PREPARED_MATRIX, rows, cols, level, format, 0, 0);
         return 0;

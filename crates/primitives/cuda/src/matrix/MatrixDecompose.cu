@@ -1,6 +1,6 @@
 MatrixTransformWorkspace::MatrixTransformWorkspace()
     : base(nullptr), pinned(nullptr), owner(nullptr), device(-1), stream(nullptr),
-      bytes(0), separate(false), completed(false)
+      bytes(0), separate(false), completed(false), persistent(false)
 {
 }
 
@@ -49,6 +49,22 @@ int MatrixTransformWorkspace::acquire(
     return 0;
 }
 
+int MatrixTransformWorkspace::acquire_persistent(
+    GpuMatrix *output, int selected_device, cudaStream_t selected_stream,
+    const GpuMatrixTransformWorkspaceBytes &requirements)
+{
+    const int status = acquire(output, selected_device, selected_stream, requirements);
+    if (status == 0) persistent = true;
+    return status;
+}
+
+int MatrixTransformWorkspace::begin_replay()
+{
+    if (!persistent || !owner || completed)
+        return set_error("invalid persistent matrix transform replay");
+    return matrix_wait_all_limb_streams(owner, device, stream, true);
+}
+
 int MatrixTransformWorkspace::upload()
 {
     if (!owner || !pinned || !base || bytes == 0)
@@ -80,6 +96,10 @@ int MatrixTransformWorkspace::release()
 int MatrixTransformWorkspace::complete()
 {
     if (!owner || completed) return set_error("invalid matrix transform completion");
+    if (persistent)
+    {
+        return matrix_record_all_limb_writes(owner, stream);
+    }
     const int status = release();
     if (status != 0) return status;
     // Final ownership dominates the metadata free and all auxiliary consumers.
@@ -1318,6 +1338,285 @@ static int gpu_matrix_decompose_base_impl(
 
     cleanup();
     return 0;
+}
+
+// A decomposition replay owns every value that the ordinary entry point used
+// to rediscover on each call.  In particular, the source scratch matrix and
+// its inverse transform are provisioned once for evaluation-domain inputs;
+// submit only copies the fixed source, waits on its existing writer events,
+// and replays the fixed kernel geometry into the fixed output owner.
+struct GpuPreparedGadgetDecompose
+{
+    const GpuMatrix *source;
+    GpuMatrix *output;
+    GpuMatrix *coefficient_source;
+    GpuMatrixTransformPlan *inverse;
+    GpuMatrixTransformPlan *forward;
+    MatrixTransformWorkspace correction_workspace;
+    uint32_t base_bits;
+    size_t dropped_moduli;
+    size_t rows;
+    size_t cols;
+    size_t count;
+    size_t crt_depth;
+    size_t source_limb_count;
+    size_t digits_per_tower;
+    size_t out_log_base_q;
+    size_t output_rows;
+    int dispatch_device;
+    cudaStream_t dispatch_stream;
+    bool small;
+    bool output_evaluation;
+    std::vector<dim3> limb_ids;
+    std::vector<uint8_t *> output_bases;
+    std::vector<size_t> output_strides;
+    std::vector<uint8_t> output_widths;
+};
+
+static void destroy_prepared_gadget_decompose(GpuPreparedGadgetDecompose *plan)
+{
+    if (!plan) return;
+    if (plan->inverse) gpu_matrix_destroy_ntt_plan(plan->inverse);
+    if (plan->forward) gpu_matrix_destroy_ntt_plan(plan->forward);
+    if (plan->coefficient_source) gpu_matrix_destroy(plan->coefficient_source);
+    delete plan;
+}
+
+extern "C" int gpu_matrix_prepare_gadget_decompose(
+    const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out,
+    int small, size_t dropped_moduli, GpuPreparedGadgetDecompose **plan)
+{
+    if (!plan) return set_error("null prepared gadget decomposition output");
+    *plan = nullptr;
+    if (!src || !out || !src->ctx || src->ctx != out->ctx || src->level != out->level ||
+        (small != 0 && small != 1))
+        return set_error("invalid prepared gadget decomposition owners");
+    GpuPolyFormat output_format;
+    if (!parse_format(out->format, output_format))
+        return set_error("invalid prepared gadget decomposition output format");
+    const int level = src->level;
+    if (level < 0 || base_bits == 0 || base_bits > (small ? 64U : 62U) ||
+        (small && dropped_moduli != 0) || dropped_moduli > static_cast<size_t>(level))
+        return set_error("invalid prepared gadget decomposition parameters");
+    GpuMatrixDecomposeWorkspaceBytes requirements{};
+    int status = gpu_matrix_query_decompose_workspace_bytes(
+        src->ctx, level, src->rows, src->cols, src->format,
+        base_bits, small, dropped_moduli, &requirements);
+    if (status != 0) return status;
+    if (out->rows != requirements.output_rows || out->cols != src->cols)
+        return set_error("prepared gadget decomposition output shape mismatch");
+
+    auto prepared = std::make_unique<GpuPreparedGadgetDecompose>();
+    prepared->source = src;
+    prepared->output = out;
+    prepared->coefficient_source = nullptr;
+    prepared->inverse = nullptr;
+    prepared->forward = nullptr;
+    prepared->base_bits = base_bits;
+    prepared->dropped_moduli = dropped_moduli;
+    prepared->rows = src->rows;
+    prepared->cols = src->cols;
+    prepared->count = src->rows * src->cols;
+    prepared->crt_depth = static_cast<size_t>(level) + 1;
+    prepared->small = small != 0;
+    prepared->output_evaluation = output_format == GPU_POLY_FORMAT_EVAL;
+    prepared->output_rows = requirements.output_rows;
+
+    const size_t limbs = prepared->crt_depth;
+    uint32_t crt_bits = 0;
+    for (const auto modulus : src->ctx->moduli)
+        crt_bits = std::max(crt_bits, bit_width_u64(modulus));
+    prepared->digits_per_tower = (crt_bits + base_bits - 1) / base_bits;
+    prepared->source_limb_count = prepared->small ? limbs : limbs - dropped_moduli;
+    prepared->out_log_base_q = prepared->small ? prepared->digits_per_tower :
+        prepared->digits_per_tower * prepared->source_limb_count;
+    if (prepared->digits_per_tower == 0 || prepared->source_limb_count == 0)
+        return set_error("invalid prepared gadget decomposition geometry");
+
+    if (src->format == GPU_POLY_FORMAT_EVAL || dropped_moduli > 0) {
+        status = gpu_matrix_create(src->ctx, level, src->rows, src->cols,
+            GPU_POLY_FORMAT_COEFF, &prepared->coefficient_source);
+        if (status != 0) return status;
+        if (src->format == GPU_POLY_FORMAT_EVAL) {
+            status = gpu_matrix_prepare_ntt_plan(
+                prepared->coefficient_source, nullptr, false, &prepared->inverse);
+            if (status != 0) {
+                destroy_prepared_gadget_decompose(prepared.release());
+                return status;
+            }
+        }
+    }
+
+    const auto &limb_map = src->ctx->limb_gpu_ids;
+    if (limb_map.size() < limbs || out->shared_limb_buffers.size() != 1 ||
+        !out->shared_limb_buffers[0].device_descriptors ||
+        out->shared_limb_buffers[0].limb_count < limbs || src->shared_limb_buffers.size() != 1 ||
+        !src->shared_limb_buffers[0].device_descriptors ||
+        src->shared_limb_buffers[0].limb_count < prepared->source_limb_count) {
+        destroy_prepared_gadget_decompose(prepared.release());
+        return set_error("missing prepared gadget decomposition descriptors");
+    }
+    prepared->limb_ids.resize(limbs);
+    prepared->output_bases.resize(limbs);
+    prepared->output_strides.resize(limbs);
+    prepared->output_widths.resize(limbs);
+    for (size_t limb = 0; limb < limbs; ++limb) {
+        const dim3 id = limb_map[limb];
+        if (id.x != 0 || id.y != limb) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return set_error("prepared gadget decomposition requires ordered descriptors");
+        }
+        prepared->limb_ids[limb] = id;
+        int device = -1;
+        status = matrix_limb_device(out, id, &device);
+        if (status != 0) { destroy_prepared_gadget_decompose(prepared.release()); return status; }
+        cudaStream_t stream = nullptr;
+        status = matrix_limb_stream(out, id, &stream);
+        if (status != 0 || !stream) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return status ? status : set_error("null prepared gadget decomposition stream");
+        }
+        if (limb == 0) {
+            prepared->dispatch_device = device;
+            prepared->dispatch_stream = stream;
+        } else if (device != prepared->dispatch_device) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return set_error("prepared gadget decomposition requires one device");
+        }
+        prepared->output_bases[limb] = matrix_limb_ptr_by_id(out, 0, id);
+        if (!prepared->output_bases[limb] || !matrix_limb_metadata_by_id(
+                out, id, &prepared->output_strides[limb], &prepared->output_widths[limb])) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return set_error("invalid prepared gadget decomposition output metadata");
+        }
+    }
+    if (prepared->output_evaluation) {
+        status = gpu_matrix_prepare_ntt_plan(out, nullptr, true, &prepared->forward);
+        if (status != 0) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return status;
+        }
+    }
+    if (dropped_moduli > 0) {
+        GpuMatrixTransformWorkspaceBytes correction{};
+        status = gpu_matrix_query_gadget_correction_workspace_bytes(
+            src->ctx, level, src->rows, src->cols, dropped_moduli, &correction);
+        if (status != 0) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return status;
+        }
+        status = prepared->correction_workspace.acquire_persistent(
+            prepared->coefficient_source, prepared->dispatch_device,
+            prepared->dispatch_stream, correction);
+        if (status != 0) {
+            destroy_prepared_gadget_decompose(prepared.release());
+            return status;
+        }
+    }
+    *plan = prepared.release();
+    return 0;
+}
+
+extern "C" int gpu_matrix_submit_gadget_decompose(const GpuPreparedGadgetDecompose *opaque)
+{
+    if (!opaque || !opaque->source || !opaque->output || !opaque->dispatch_stream)
+        return set_error("invalid prepared gadget decomposition plan");
+    auto *plan = const_cast<GpuPreparedGadgetDecompose *>(opaque);
+    int status = 0;
+    cudaError_t err = cudaSetDevice(plan->dispatch_device);
+    if (err != cudaSuccess) return set_error(err);
+    GpuMatrix *inputs = const_cast<GpuMatrix *>(plan->source);
+    if (plan->coefficient_source) {
+        status = gpu_matrix_copy(plan->coefficient_source, plan->source);
+        if (status != 0) return status;
+        inputs = plan->coefficient_source;
+        if (plan->inverse) {
+            status = gpu_matrix_submit_ntt_plan(plan->inverse, inputs);
+            if (status != 0) return status;
+        }
+        if (plan->dropped_moduli > 0) {
+            status = plan->correction_workspace.begin_replay();
+            if (status != 0) return status;
+            auto *weights = reinterpret_cast<uint64_t *>(plan->correction_workspace.base);
+            const size_t retained = plan->crt_depth - plan->dropped_moduli;
+            const size_t entries = plan->dropped_moduli * (retained + 1);
+            const auto &constants = plan->coefficient_source->ctx->ring_device_constants[0];
+            gadget_low_constants_kernel<<<
+                (entries + 255) / 256, 256, 0, plan->dispatch_stream>>>(
+                constants.moduli, weights, retained, plan->dropped_moduli);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) return set_error(err);
+            const size_t coefficient_count = static_cast<size_t>(plan->source->ctx->N) *
+                plan->rows * plan->cols;
+            const size_t blocks = coefficient_count / 256 + (coefficient_count % 256 != 0);
+            const dim3 grid(static_cast<unsigned int>(blocks), static_cast<unsigned int>(retained));
+            gadget_correct_residues_kernel<<<grid, 256, 0, plan->dispatch_stream>>>(
+                plan->coefficient_source->shared_limb_buffers[0].device_descriptors,
+                constants.moduli, weights, retained, plan->dropped_moduli,
+                plan->source->ctx->N, plan->rows * plan->cols);
+            err = cudaGetLastError();
+            if (err != cudaSuccess) return set_error(err);
+            status = plan->correction_workspace.complete();
+            if (status != 0) return status;
+        }
+    }
+    const size_t out_count = plan->output->rows * plan->output->cols;
+    for (size_t limb = 0; limb < plan->crt_depth; ++limb) {
+        if (out_count != 0) {
+            err = cudaMemset2DAsync(plan->output_bases[limb], plan->output_strides[limb], 0,
+                static_cast<size_t>(plan->source->ctx->N) * plan->output_widths[limb],
+                out_count, plan->dispatch_stream);
+            if (err != cudaSuccess) return set_error(err);
+        }
+    }
+    if (plan->small) {
+        status = matrix_wait_all_limb_streams(inputs, plan->dispatch_device,
+            plan->dispatch_stream, false, true);
+        if (status != 0) return status;
+    }
+    const size_t launch_count = plan->small ? 1 : plan->source_limb_count;
+    for (size_t src_limb = 0; src_limb < launch_count; ++src_limb) {
+        const dim3 id = plan->limb_ids[src_limb];
+        if (!plan->small) {
+            status = matrix_wait_limb_stream(inputs, id, plan->dispatch_device,
+                plan->dispatch_stream);
+            if (status != 0) return status;
+        }
+        size_t stride = 0;
+        uint8_t width = 0;
+        const uint8_t *src_base = matrix_limb_ptr_by_id(inputs, 0, id);
+        if (!src_base || !matrix_limb_metadata_by_id(inputs, id, &stride, &width))
+            return set_error("invalid prepared gadget decomposition input metadata");
+        status = launch_decompose_all_slots_kernel(
+            src_base, inputs->shared_limb_buffers[0].device_descriptors,
+            plan->output->shared_limb_buffers[0].device_descriptors,
+            plan->output->ctx->ring_device_constants[0].moduli,
+            stride, width, plan->crt_depth, plan->count, static_cast<size_t>(plan->source->ctx->N),
+            plan->cols, plan->output->cols, plan->out_log_base_q,
+            plan->source->ctx->moduli[src_limb], plan->base_bits, plan->digits_per_tower,
+            !plan->small, plan->small ? 0 : src_limb * plan->digits_per_tower,
+            plan->dispatch_stream);
+        if (status != 0) return status;
+        status = plan->small
+            ? matrix_track_all_limb_consumers(inputs, plan->dispatch_device,
+                plan->dispatch_stream, nullptr, false, true)
+            : matrix_track_limb_consumer(inputs, id, plan->dispatch_device,
+                plan->dispatch_stream);
+        if (status != 0) return status;
+    }
+    status = matrix_record_all_limb_writes(plan->output, plan->dispatch_stream);
+    if (status != 0) return status;
+    plan->output->format = GPU_POLY_FORMAT_COEFF;
+    if (plan->forward) {
+        status = gpu_matrix_submit_ntt_plan(plan->forward, plan->output);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+extern "C" void gpu_matrix_destroy_gadget_decompose(GpuPreparedGadgetDecompose *plan)
+{
+    destroy_prepared_gadget_decompose(plan);
 }
 
 extern "C" int gpu_matrix_decompose_base(const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out, size_t dropped_moduli)

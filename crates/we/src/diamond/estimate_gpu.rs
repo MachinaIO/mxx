@@ -59,12 +59,16 @@ enum ReadyOutput {
 impl ReadyOutput {
     fn wait_until_ready(self) {
         match self {
-            Self::Matrix(matrix) => matrix.wait_until_ready(),
+            Self::Matrix(matrix) => {
+                let _ = matrix.wait_until_ready();
+            }
             Self::Trapdoor { public, secret } => {
-                public.wait_until_ready();
+                let _ = public.wait_until_ready();
                 secret.wait_until_ready();
             }
-            Self::SmallMatrix(matrix) => matrix.wait_until_ready(),
+            Self::SmallMatrix(matrix) => {
+                let _ = matrix.wait_until_ready();
+            }
             Self::Host => {}
         }
     }
@@ -122,7 +126,7 @@ impl DiamondGpuMeasurementBackend {
                     &SampleRange { minimum: BigInt::from(0), maximum: &ty.modulus - BigInt::one() },
                 )
                 .map_err(Self::backend_error)?;
-            value.wait_until_ready();
+            let _ = value.wait_until_ready();
             self.matrix_cache.insert(key.clone(), Arc::new(value));
         }
         Ok(Arc::clone(self.matrix_cache.get(&key).expect("inserted measurement matrix")))
@@ -145,7 +149,7 @@ impl DiamondGpuMeasurementBackend {
                 .backend
                 .sample_trapdoor(matrix, sigma, gadget_base, *digit_count)
                 .map_err(Self::backend_error)?;
-            public.wait_until_ready();
+            let _ = public.wait_until_ready();
             secret.wait_until_ready();
             self.trapdoor_cache.insert(key.clone(), (Arc::new(public), Arc::new(secret)));
         }
@@ -321,14 +325,14 @@ impl DiamondGpuMeasurementBackend {
         for ty in node.argument_types {
             match ty {
                 ConcreteWireType::Matrix(matrix) => {
-                    self.matrix(matrix)?.wait_until_ready();
+                    let _ = self.matrix(matrix)?.wait_until_ready();
                 }
                 ConcreteWireType::Preimage { .. } | ConcreteWireType::SmallMatrix { .. } => {
                     self.small_matrix(ty)?;
                 }
                 ConcreteWireType::Trapdoor { .. } => {
                     let (public, secret) = self.trapdoor(ty, bindings)?;
-                    public.wait_until_ready();
+                    let _ = public.wait_until_ready();
                     secret.wait_until_ready();
                 }
                 _ => {}

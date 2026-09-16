@@ -643,6 +643,245 @@ namespace
         matrix_store_limb_u64(dst_base, dst_poly_idx, coeff_idx, dst_stride, dst_bytes, value);
     }
 
+    __global__ void prepared_add_rect_all_limbs_kernel(
+        const BlockElementwiseMetadata metadata, size_t limb_count,
+        size_t rows, size_t columns, size_t n,
+        size_t lhs_cols, size_t rhs_cols, size_t out_cols,
+        size_t lhs_row, size_t lhs_column, size_t rhs_row, size_t rhs_column,
+        size_t out_row, size_t out_column)
+    {
+        const size_t limb = static_cast<size_t>(blockIdx.z);
+        if (limb >= limb_count) return;
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = rows * columns * n;
+        if (index >= total) return;
+        const size_t poly = index / n;
+        const size_t coefficient = index % n;
+        const size_t row = poly / columns;
+        const size_t column = poly % columns;
+        const size_t lhs_poly = (lhs_row + row) * lhs_cols + lhs_column + column;
+        const size_t rhs_poly = (rhs_row + row) * rhs_cols + rhs_column + column;
+        const size_t out_poly = (out_row + row) * out_cols + out_column + column;
+        const uint64_t lhs = matrix_load_limb_u64(
+            metadata.lhs_bases[limb], lhs_poly, coefficient,
+            metadata.lhs_stride_bytes[limb], metadata.lhs_coeff_bytes[limb]);
+        const uint64_t rhs = matrix_load_limb_u64(
+            metadata.rhs_bases[limb], rhs_poly, coefficient,
+            metadata.rhs_stride_bytes[limb], metadata.rhs_coeff_bytes[limb]);
+        matrix_store_limb_u64(
+            metadata.out_bases[limb], out_poly, coefficient,
+            metadata.out_stride_bytes[limb], metadata.out_coeff_bytes[limb],
+            add_mod_u64(lhs, rhs, metadata.moduli[limb]));
+    }
+
+    __device__ __forceinline__ uint64_t prepared_sub_mod_u64(uint64_t lhs, uint64_t rhs, uint64_t modulus)
+    {
+        return lhs >= rhs ? lhs - rhs : modulus - (rhs - lhs);
+    }
+
+    __global__ void prepared_sub_rect_all_limbs_kernel(
+        const BlockElementwiseMetadata metadata, size_t limb_count,
+        size_t rows, size_t columns, size_t n,
+        size_t lhs_cols, size_t rhs_cols, size_t out_cols,
+        size_t lhs_row, size_t lhs_column, size_t rhs_row, size_t rhs_column,
+        size_t out_row, size_t out_column)
+    {
+        const size_t limb = static_cast<size_t>(blockIdx.z);
+        if (limb >= limb_count) return;
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = rows * columns * n;
+        if (index >= total) return;
+        const size_t poly = index / n;
+        const size_t coefficient = index % n;
+        const size_t row = poly / columns;
+        const size_t column = poly % columns;
+        const size_t lhs_poly = (lhs_row + row) * lhs_cols + lhs_column + column;
+        const size_t rhs_poly = (rhs_row + row) * rhs_cols + rhs_column + column;
+        const size_t out_poly = (out_row + row) * out_cols + out_column + column;
+        const uint64_t lhs = matrix_load_limb_u64(
+            metadata.lhs_bases[limb], lhs_poly, coefficient,
+            metadata.lhs_stride_bytes[limb], metadata.lhs_coeff_bytes[limb]);
+        const uint64_t rhs = matrix_load_limb_u64(
+            metadata.rhs_bases[limb], rhs_poly, coefficient,
+            metadata.rhs_stride_bytes[limb], metadata.rhs_coeff_bytes[limb]);
+        matrix_store_limb_u64(
+            metadata.out_bases[limb], out_poly, coefficient,
+            metadata.out_stride_bytes[limb], metadata.out_coeff_bytes[limb],
+            prepared_sub_mod_u64(lhs, rhs, metadata.moduli[limb]));
+    }
+
+    __global__ void prepared_unary_rect_all_limbs_kernel(
+        const BlockElementwiseMetadata metadata, const uint64_t *scalars,
+        size_t limb_count, size_t rows, size_t columns, size_t n,
+        size_t lhs_cols, size_t out_cols, size_t lhs_row, size_t lhs_column,
+        size_t out_row, size_t out_column, int operation)
+    {
+        const size_t limb = static_cast<size_t>(blockIdx.z);
+        if (limb >= limb_count) return;
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = rows * columns * n;
+        if (index >= total) return;
+        const size_t poly = index / n;
+        const size_t coefficient = index % n;
+        const size_t row = poly / columns;
+        const size_t column = poly % columns;
+        const size_t lhs_poly = (lhs_row + row) * lhs_cols + lhs_column + column;
+        const size_t out_poly = (out_row + row) * out_cols + out_column + column;
+        const uint64_t value = matrix_load_limb_u64(
+            metadata.lhs_bases[limb], lhs_poly, coefficient,
+            metadata.lhs_stride_bytes[limb], metadata.lhs_coeff_bytes[limb]);
+        const uint64_t output = operation == 0
+            ? (value == 0 ? 0 : metadata.moduli[limb] - value)
+            : mul_mod_u64(value, scalars[limb], metadata.moduli[limb]);
+        matrix_store_limb_u64(
+            metadata.out_bases[limb], out_poly, coefficient,
+            metadata.out_stride_bytes[limb], metadata.out_coeff_bytes[limb], output);
+    }
+
+    __global__ void prepared_automorphism_rect_all_limbs_kernel(
+        const BlockElementwiseMetadata metadata, size_t limb_count,
+        size_t rows, size_t columns, size_t n, size_t lhs_cols, size_t out_cols,
+        size_t lhs_row, size_t lhs_column, size_t out_row, size_t out_column,
+        size_t index, bool evaluation, unsigned log_n)
+    {
+        const size_t limb = static_cast<size_t>(blockIdx.z);
+        if (limb >= limb_count) return;
+        const size_t linear = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        const size_t total = rows * columns * n;
+        if (linear >= total) return;
+        const size_t poly = linear / n;
+        const size_t position = linear % n;
+        const size_t row = poly / columns;
+        const size_t column = poly % columns;
+        const size_t lhs_poly = (lhs_row + row) * lhs_cols + lhs_column + column;
+        const size_t out_poly = (out_row + row) * out_cols + out_column + column;
+        size_t source = position;
+        size_t target = position;
+        uint64_t value;
+        if (evaluation)
+        {
+            const size_t k = log_n == 0 ? 0 : __brev(static_cast<unsigned>(position)) >> (32 - log_n);
+            const size_t exponent = ((2 * k + 1) * index) % (2 * n);
+            const unsigned natural = static_cast<unsigned>((exponent - 1) / 2);
+            source = log_n == 0 ? 0 : __brev(natural) >> (32 - log_n);
+            value = matrix_load_limb_u64(metadata.lhs_bases[limb], lhs_poly, source,
+                metadata.lhs_stride_bytes[limb], metadata.lhs_coeff_bytes[limb]);
+            target = position;
+        }
+        else
+        {
+            const size_t exponent = (position * index) % (2 * n);
+            target = exponent < n ? exponent : exponent - n;
+            value = matrix_load_limb_u64(metadata.lhs_bases[limb], lhs_poly, source,
+                metadata.lhs_stride_bytes[limb], metadata.lhs_coeff_bytes[limb]);
+            if (exponent >= n && value != 0) value = metadata.moduli[limb] - value;
+        }
+        matrix_store_limb_u64(metadata.out_bases[limb], out_poly, target,
+            metadata.out_stride_bytes[limb], metadata.out_coeff_bytes[limb], value);
+    }
+
+    __global__ void prepared_small_dot_rect_kernel(
+        DescriptorProductMetadata metadata, size_t rows, size_t inner, size_t columns,
+        size_t n, size_t lhs_cols, size_t rhs_cols, size_t out_cols,
+        size_t lhs_row, size_t lhs_column, size_t rhs_row, size_t rhs_column,
+        size_t out_row, size_t out_column)
+    {
+        const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coefficient >= n) return;
+        const size_t limb = blockIdx.z;
+        const auto lhs = metadata.lhs[metadata.indices[limb]];
+        const auto rhs = metadata.rhs[metadata.indices[limb]];
+        const auto out = metadata.out[metadata.indices[limb]];
+        const uint64_t modulus = metadata.moduli[limb];
+        const size_t column = blockIdx.y;
+        if (column >= columns) return;
+        for (size_t row = 0; row < rows; ++row)
+        {
+            unsigned __int128 sum = 0;
+            for (size_t k = 0; k < inner; ++k)
+            {
+                const uint64_t a = matrix_load_limb_u64(
+                    lhs.base, (lhs_row + row) * lhs_cols + lhs_column + k,
+                    coefficient, lhs.stride, lhs.width);
+                const uint64_t b = matrix_load_limb_u64(
+                    rhs.base, (rhs_row + k) * rhs_cols + rhs_column + column,
+                    coefficient, rhs.stride, rhs.width);
+                const unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+                if (~static_cast<unsigned __int128>(0) - sum < product)
+                {
+                    sum %= modulus;
+                }
+                sum += product;
+            }
+            matrix_store_limb_u64(
+                out.base, (out_row + row) * out_cols + out_column + column,
+                coefficient, out.stride, out.width, static_cast<uint64_t>(sum % modulus));
+        }
+    }
+
+    __global__ void prepared_block_matmul_rect_kernel(
+        const uint8_t *lhs_base, const uint8_t *rhs_base, uint8_t *out_base,
+        size_t rows, size_t inner, size_t columns, size_t n,
+        size_t lhs_pitch, size_t rhs_pitch, size_t out_pitch,
+        size_t lhs_row, size_t lhs_column, size_t rhs_row, size_t rhs_column,
+        size_t out_row, size_t out_column,
+        size_t lhs_stride, size_t rhs_stride, size_t out_stride,
+        uint8_t lhs_width, uint8_t rhs_width, uint8_t out_width, uint64_t modulus)
+    {
+        __shared__ uint64_t lhs_tile[kMatmulTileM][kMatmulTileK];
+        __shared__ uint64_t rhs_tile[kMatmulTileK][kMatmulTileN];
+        const size_t row_base = static_cast<size_t>(blockIdx.y) * kMatmulTileM;
+        const size_t col_base = static_cast<size_t>(blockIdx.x) * kMatmulTileN;
+        const size_t row = row_base + threadIdx.y;
+        const size_t column = col_base + threadIdx.x;
+        const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
+        const int threads = blockDim.x * blockDim.y;
+        for (size_t coefficient = static_cast<size_t>(blockIdx.z);
+             coefficient < n; coefficient += static_cast<size_t>(gridDim.z))
+        {
+            uint64_t sum = 0;
+            for (size_t k0 = 0; k0 < inner; k0 += kMatmulTileK)
+            {
+                for (int i = tid; i < kMatmulTileM * kMatmulTileK; i += threads)
+                {
+                    const int tile_row = i / kMatmulTileK;
+                    const int tile_k = i - tile_row * kMatmulTileK;
+                    const size_t source_row = row_base + static_cast<size_t>(tile_row);
+                    const size_t source_column = k0 + static_cast<size_t>(tile_k);
+                    uint64_t value = 0;
+                    if (source_row < rows && source_column < inner)
+                        value = matrix_load_limb_u64(
+                            lhs_base, (lhs_row + source_row) * lhs_pitch + lhs_column + source_column,
+                            coefficient, lhs_stride, lhs_width);
+                    lhs_tile[tile_row][tile_k] = value;
+                }
+                for (int i = tid; i < kMatmulTileK * kMatmulTileN; i += threads)
+                {
+                    const int tile_k = i / kMatmulTileN;
+                    const int tile_column = i - tile_k * kMatmulTileN;
+                    const size_t source_row = k0 + static_cast<size_t>(tile_k);
+                    const size_t source_column = col_base + static_cast<size_t>(tile_column);
+                    uint64_t value = 0;
+                    if (source_row < inner && source_column < columns)
+                        value = matrix_load_limb_u64(
+                            rhs_base, (rhs_row + source_row) * rhs_pitch + rhs_column + source_column,
+                            coefficient, rhs_stride, rhs_width);
+                    rhs_tile[tile_k][tile_column] = value;
+                }
+                __syncthreads();
+                if (row < rows && column < columns)
+                    for (int k = 0; k < kMatmulTileK; ++k)
+                        sum = add_mod_u64(sum, mul_mod_u64(
+                            lhs_tile[threadIdx.y][k], rhs_tile[k][threadIdx.x], modulus), modulus);
+                __syncthreads();
+            }
+            if (row < rows && column < columns)
+                matrix_store_limb_u64(
+                    out_base, (out_row + row) * out_pitch + out_column + column,
+                    coefficient, out_stride, out_width, sum);
+        }
+    }
+
     __global__ void block_add_rect_all_limbs_kernel(
         const BlockAddMetadata metadata,
         size_t limb_count,
@@ -2204,7 +2443,792 @@ namespace
         return 0;
     }
 
+    enum class PreparedArithmeticKind
+    {
+        Copy = 0,
+        Add = 1,
+        Tensor = 2,
+        TensorSumRows = 3,
+        Multiply = 4,
+        Subtract = 5,
+        Negate = 6,
+        Scale = 7,
+        Automorphism = 8,
+    };
+
+    struct PreparedMatmulLaunch
+    {
+        const uint8_t *lhs_base;
+        const uint8_t *rhs_base;
+        uint8_t *out_base;
+        size_t lhs_stride;
+        size_t rhs_stride;
+        size_t out_stride;
+        uint8_t lhs_width;
+        uint8_t rhs_width;
+        uint8_t out_width;
+        uint64_t modulus;
+        uint64_t reciprocal;
+        size_t rows;
+        size_t inner;
+        size_t columns;
+        size_t n;
+        size_t lhs_pitch;
+        size_t rhs_pitch;
+        size_t out_pitch;
+        size_t lhs_row;
+        size_t lhs_column;
+        size_t rhs_row;
+        size_t rhs_column;
+        size_t out_row;
+        size_t out_column;
+        bool thin;
+        bool lazy_reduction;
+        dim3 grid;
+        dim3 block;
+    };
+
+    struct GpuPreparedArithmeticState
+    {
+        PreparedArithmeticKind kind;
+        GpuMatrix *out;
+        const GpuMatrix *lhs;
+        const GpuMatrix *rhs;
+        GpuMatrixRange left_range;
+        GpuMatrixRange right_range;
+        GpuMatrixRange output_range;
+        size_t column_start;
+        size_t left_columns;
+        size_t right_rows;
+        size_t right_columns;
+        size_t output_count;
+        size_t n;
+        size_t limb_count;
+        int device;
+        cudaStream_t stream;
+        dim3 grid;
+        BlockCopyMetadata copy;
+        BlockElementwiseMetadata elementwise;
+        DescriptorProductMetadata product;
+        TensorGeometry geometry;
+        TensorRowSumMetadata row_sum;
+        bool row_sum_separate_polynomials;
+        PreparedMatmulLaunch matmul[kArithMetadataLimbs];
+        size_t matmul_count;
+        uint64_t scalars[kArithMetadataLimbs];
+        size_t automorphism_index;
+        bool evaluation;
+        unsigned log_n;
+    };
+
+    struct GpuPreparedInputCopyState
+    {
+        GpuMatrix *out;
+        GpuMatrixRange input_range;
+        GpuMatrixRange output_range;
+        BlockCopyMetadata source_layout;
+        size_t source_rows;
+        size_t source_columns;
+        size_t level;
+        size_t n;
+        int format;
+        int device;
+        cudaStream_t stream;
+        dim3 grid;
+    };
+
+    int prepared_matrix_metadata(
+        const GpuMatrix *matrix, const dim3 &id, const uint8_t **base,
+        size_t *stride, uint8_t *width, int *device);
+
+    int prepare_copy_layout(
+        GpuMatrix *out, const GpuMatrix *source,
+        const GpuMatrixBatchView *view, GpuPreparedInputCopyState &prepared)
+    {
+        if (!out || !source || !out->ctx || source->ctx != out->ctx ||
+            source->level < 0 || out->level != source->level)
+            return set_error("prepared input copy owners are incompatible");
+        prepared.input_range = view ? view->left : GpuMatrixRange{0, source->rows, 0, source->cols};
+        prepared.output_range = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+        const auto valid = [](const GpuMatrix *matrix, const GpuMatrixRange &range) {
+            return range.row_start <= range.row_end && range.row_end <= matrix->rows &&
+                range.column_start <= range.column_end && range.column_end <= matrix->cols;
+        };
+        if (!valid(source, prepared.input_range) || !valid(out, prepared.output_range) ||
+            prepared.input_range.row_end - prepared.input_range.row_start !=
+                prepared.output_range.row_end - prepared.output_range.row_start ||
+            prepared.input_range.column_end - prepared.input_range.column_start !=
+                prepared.output_range.column_end - prepared.output_range.column_start)
+            return set_error("prepared input copy ranges are incompatible");
+        prepared.out = out;
+        prepared.source_rows = source->rows;
+        prepared.source_columns = source->cols;
+        prepared.level = static_cast<size_t>(source->level);
+        prepared.n = static_cast<size_t>(source->ctx->N);
+        prepared.format = source->format;
+        prepared.device = -1;
+        int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream);
+        if (status != 0) return status;
+        status = matrix_limb_device(out, out->ctx->limb_gpu_ids[0], &prepared.device);
+        if (status != 0) return status;
+        prepared.source_layout = {};
+        for (size_t limb = 0; limb <= prepared.level; ++limb)
+        {
+            const dim3 id = out->ctx->limb_gpu_ids[limb];
+            int source_device = -1, output_device = -1;
+            const uint8_t *source_base = nullptr, *output_base = nullptr;
+            size_t source_stride = 0, output_stride = 0;
+            uint8_t source_width = 0, output_width = 0;
+            status = prepared_matrix_metadata(source, id, &source_base, &source_stride, &source_width, &source_device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(out, id, &output_base, &output_stride, &output_width, &output_device);
+            if (status != 0) return status;
+            if (source_device != prepared.device || output_device != prepared.device)
+                return set_error("prepared input copy owners use different devices");
+            prepared.source_layout.src_bases[limb] = source_base;
+            prepared.source_layout.src_stride_bytes[limb] = source_stride;
+            prepared.source_layout.src_coeff_bytes[limb] = source_width;
+            prepared.source_layout.dst_bases[limb] = const_cast<uint8_t *>(output_base);
+            prepared.source_layout.dst_stride_bytes[limb] = output_stride;
+            prepared.source_layout.dst_coeff_bytes[limb] = output_width;
+        }
+        const size_t rows = prepared.output_range.row_end - prepared.output_range.row_start;
+        const size_t columns = prepared.output_range.column_end - prepared.output_range.column_start;
+        prepared.grid = dim3(static_cast<unsigned int>((rows * columns * prepared.n + 255) / 256), 1,
+                             static_cast<unsigned int>(prepared.level + 1));
+        return 0;
+    }
+
+    int prepared_matrix_partition(
+        const GpuMatrix *matrix, const dim3 &id, int *device,
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor **descriptors)
+    {
+        if (id.x >= matrix->shared_limb_buffers.size())
+            return set_error("prepared arithmetic partition is unavailable");
+        const auto &buffer = matrix->shared_limb_buffers[id.x];
+        if (!buffer.device_descriptors || id.y >= buffer.limb_count)
+            return set_error("prepared arithmetic descriptors are unavailable");
+        if (*device < 0) *device = buffer.device;
+        if (*device != buffer.device)
+            return set_error("prepared arithmetic requires one device");
+        if (*descriptors && *descriptors != buffer.device_descriptors)
+            return set_error("prepared arithmetic descriptors span partitions");
+        *descriptors = buffer.device_descriptors;
+        return 0;
+    }
+
+    int prepared_matrix_metadata(
+        const GpuMatrix *matrix, const dim3 &id, const uint8_t **base,
+        size_t *stride, uint8_t *width, int *device)
+    {
+        *base = matrix_limb_ptr_by_id(matrix, 0, id);
+        if (!*base || !matrix_limb_metadata_by_id(matrix, id, stride, width))
+            return set_error("prepared arithmetic matrix metadata is unavailable");
+        return matrix_limb_device(matrix, id, device);
+    }
+
+    int prepare_product_metadata(
+        GpuPreparedArithmeticState &prepared, const GpuMatrix *lhs,
+        const GpuMatrix *rhs, GpuMatrix *out)
+    {
+        prepared.product = {};
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+            int device = -1;
+            GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs_descriptors = nullptr;
+            GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs_descriptors = nullptr;
+            GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out_descriptors = nullptr;
+            int status = prepared_matrix_partition(lhs, id, &device, &lhs_descriptors);
+            if (status != 0) return status;
+            status = prepared_matrix_partition(rhs, id, &device, &rhs_descriptors);
+            if (status != 0) return status;
+            status = prepared_matrix_partition(out, id, &device, &out_descriptors);
+            if (status != 0) return status;
+            if (limb == 0)
+            {
+                prepared.device = device;
+                prepared.product.lhs = lhs_descriptors;
+                prepared.product.rhs = rhs_descriptors;
+                prepared.product.out = out_descriptors;
+            }
+            else if (prepared.product.lhs != lhs_descriptors ||
+                     prepared.product.rhs != rhs_descriptors ||
+                     prepared.product.out != out_descriptors)
+                return set_error("prepared arithmetic descriptors changed by limb");
+            prepared.product.indices[limb] = id.y;
+            prepared.product.moduli[limb] = lhs->ctx->moduli[limb];
+        }
+        return 0;
+    }
+
+    int prepare_block_metadata(
+        GpuPreparedArithmeticState &prepared, const GpuMatrix *lhs,
+        const GpuMatrix *rhs, GpuMatrix *out)
+    {
+        prepared.elementwise = {};
+        prepared.copy = {};
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+            const uint8_t *lhs_base = nullptr;
+            const uint8_t *rhs_base = nullptr;
+            const uint8_t *src_base = nullptr;
+            const uint8_t *dst_base = nullptr;
+            uint8_t *out_base = nullptr;
+            size_t lhs_stride = 0, rhs_stride = 0, out_stride = 0;
+            size_t src_stride = 0, dst_stride = 0;
+            uint8_t lhs_width = 0, rhs_width = 0, out_width = 0;
+            uint8_t src_width = 0, dst_width = 0;
+            int lhs_device = -1, rhs_device = -1, out_device = -1;
+            int status = prepared_matrix_metadata(lhs, id, &lhs_base, &lhs_stride, &lhs_width, &lhs_device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(rhs, id, &rhs_base, &rhs_stride, &rhs_width, &rhs_device);
+            if (status != 0) return status;
+            const uint8_t *out_const = nullptr;
+            status = prepared_matrix_metadata(out, id, &out_const, &out_stride, &out_width, &out_device);
+            if (status != 0) return status;
+            out_base = const_cast<uint8_t *>(out_const);
+            if (lhs_device != rhs_device || lhs_device != out_device)
+                return set_error("prepared arithmetic owners use different devices");
+            if (limb == 0) prepared.device = out_device;
+            if (prepared.device != out_device) return set_error("prepared arithmetic uses multiple devices");
+            prepared.elementwise.lhs_bases[limb] = lhs_base;
+            prepared.elementwise.rhs_bases[limb] = rhs_base;
+            prepared.elementwise.out_bases[limb] = out_base;
+            prepared.elementwise.lhs_stride_bytes[limb] = lhs_stride;
+            prepared.elementwise.rhs_stride_bytes[limb] = rhs_stride;
+            prepared.elementwise.out_stride_bytes[limb] = out_stride;
+            prepared.elementwise.lhs_coeff_bytes[limb] = lhs_width;
+            prepared.elementwise.rhs_coeff_bytes[limb] = rhs_width;
+            prepared.elementwise.out_coeff_bytes[limb] = out_width;
+            prepared.elementwise.moduli[limb] = lhs->ctx->moduli[limb];
+            status = prepared_matrix_metadata(lhs, id, &src_base, &src_stride, &src_width, &lhs_device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(out, id, &dst_base, &dst_stride, &dst_width, &out_device);
+            if (status != 0) return status;
+            prepared.copy.src_bases[limb] = src_base;
+            prepared.copy.dst_bases[limb] = const_cast<uint8_t *>(dst_base);
+            prepared.copy.src_stride_bytes[limb] = src_stride;
+            prepared.copy.dst_stride_bytes[limb] = dst_stride;
+            prepared.copy.src_coeff_bytes[limb] = src_width;
+            prepared.copy.dst_coeff_bytes[limb] = dst_width;
+        }
+        return 0;
+    }
+
+    int prepare_unary_metadata(
+        GpuPreparedArithmeticState &prepared, const GpuMatrix *lhs, GpuMatrix *out)
+    {
+        prepared.elementwise = {};
+        prepared.copy = {};
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+            const uint8_t *lhs_base = nullptr;
+            const uint8_t *out_base = nullptr;
+            size_t lhs_stride = 0, out_stride = 0;
+            uint8_t lhs_width = 0, out_width = 0;
+            int lhs_device = -1, out_device = -1;
+            int status = prepared_matrix_metadata(
+                lhs, id, &lhs_base, &lhs_stride, &lhs_width, &lhs_device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(
+                out, id, &out_base, &out_stride, &out_width, &out_device);
+            if (status != 0) return status;
+            if (lhs_device != out_device)
+                return set_error("prepared unary owners use different devices");
+            if (limb == 0) prepared.device = out_device;
+            if (prepared.device != out_device)
+                return set_error("prepared unary uses multiple devices");
+            prepared.elementwise.lhs_bases[limb] = lhs_base;
+            prepared.elementwise.out_bases[limb] = const_cast<uint8_t *>(out_base);
+            prepared.elementwise.lhs_stride_bytes[limb] = lhs_stride;
+            prepared.elementwise.out_stride_bytes[limb] = out_stride;
+            prepared.elementwise.lhs_coeff_bytes[limb] = lhs_width;
+            prepared.elementwise.out_coeff_bytes[limb] = out_width;
+            prepared.elementwise.moduli[limb] = lhs->ctx->moduli[limb];
+        }
+        return 0;
+    }
+
+    int prepare_arithmetic_plan(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+        int kind, const size_t *rows, const size_t *offsets,
+        size_t group_count, size_t term_count, const GpuMatrixBatchView *view,
+        size_t column_start, const uint64_t *scalar_residues, size_t scalar_count,
+        size_t automorphism_index, GpuPreparedArithmeticState &prepared)
+    {
+        if (!out || !lhs || !lhs->ctx || !out->ctx || out->ctx != lhs->ctx ||
+            out->level != lhs->level || lhs->level < 0 || kind < 0 || kind > 8)
+            return set_error("invalid prepared arithmetic owners");
+        const bool unary = kind == static_cast<int>(PreparedArithmeticKind::Negate) ||
+            kind == static_cast<int>(PreparedArithmeticKind::Scale) ||
+            kind == static_cast<int>(PreparedArithmeticKind::Automorphism);
+        if (!unary && kind != static_cast<int>(PreparedArithmeticKind::Copy) && !rhs)
+            return set_error("prepared arithmetic requires a right owner");
+        if (rhs && (rhs->ctx != lhs->ctx || rhs->level != lhs->level))
+            return set_error("prepared arithmetic context mismatch");
+        prepared = {};
+        prepared.kind = static_cast<PreparedArithmeticKind>(kind);
+        prepared.out = out;
+        prepared.lhs = lhs;
+        prepared.rhs = rhs;
+        prepared.limb_count = static_cast<size_t>(lhs->level) + 1;
+        prepared.n = static_cast<size_t>(lhs->ctx->N);
+        if (!prepared.n || prepared.limb_count > kArithMetadataLimbs)
+            return set_error("prepared arithmetic basis is unavailable");
+        prepared.left_range = view ? view->left : GpuMatrixRange{0, lhs->rows, 0, lhs->cols};
+        prepared.right_range = view && rhs ? view->right : GpuMatrixRange{0, rhs ? rhs->rows : lhs->rows, 0, rhs ? rhs->cols : lhs->cols};
+        prepared.output_range = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+        prepared.column_start = column_start;
+        const auto valid = [](const GpuMatrix *matrix, const GpuMatrixRange &range) {
+            return range.row_start <= range.row_end && range.row_end <= matrix->rows &&
+                range.column_start <= range.column_end && range.column_end <= matrix->cols;
+        };
+        if (!valid(lhs, prepared.left_range) || !valid(out, prepared.output_range) ||
+            (rhs && !valid(rhs, prepared.right_range)))
+            return set_error("prepared arithmetic range is invalid");
+        prepared.left_columns = prepared.left_range.column_end - prepared.left_range.column_start;
+        prepared.right_rows = prepared.right_range.row_end - prepared.right_range.row_start;
+        prepared.right_columns = prepared.right_range.column_end - prepared.right_range.column_start;
+        const size_t output_rows = prepared.output_range.row_end - prepared.output_range.row_start;
+        const size_t output_columns = prepared.output_range.column_end - prepared.output_range.column_start;
+        prepared.output_count = output_rows * output_columns;
+        int status = matrix_limb_stream(out, lhs->ctx->limb_gpu_ids[0], &prepared.stream);
+        if (status != 0) return status;
+        prepared.device = -1;
+        status = matrix_limb_device(out, lhs->ctx->limb_gpu_ids[0], &prepared.device);
+        if (status != 0) return status;
+        if (kind == static_cast<int>(PreparedArithmeticKind::Copy))
+        {
+            if (lhs->format != out->format || output_rows != prepared.left_range.row_end - prepared.left_range.row_start ||
+                output_columns != prepared.left_columns)
+                return set_error("prepared copy shape or format mismatch");
+            status = prepare_block_metadata(prepared, lhs, lhs, out);
+            if (status != 0) return status;
+            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
+                                 static_cast<unsigned int>(prepared.limb_count));
+            return 0;
+        }
+        if (kind == static_cast<int>(PreparedArithmeticKind::Add))
+        {
+            if (prepared.left_range.row_end - prepared.left_range.row_start !=
+                    prepared.right_range.row_end - prepared.right_range.row_start ||
+                prepared.left_columns != prepared.right_columns ||
+                output_rows != prepared.left_range.row_end - prepared.left_range.row_start ||
+                output_columns != prepared.left_columns ||
+                lhs->format != rhs->format || lhs->format != out->format)
+                return set_error("prepared add shape or format mismatch");
+            status = prepare_block_metadata(prepared, lhs, rhs, out);
+            if (status != 0) return status;
+            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
+                                 static_cast<unsigned int>(prepared.limb_count));
+            return 0;
+        }
+        if (kind == static_cast<int>(PreparedArithmeticKind::Subtract))
+        {
+            if (prepared.left_range.row_end - prepared.left_range.row_start !=
+                    prepared.right_range.row_end - prepared.right_range.row_start ||
+                prepared.left_columns != prepared.right_columns ||
+                output_rows != prepared.left_range.row_end - prepared.left_range.row_start ||
+                output_columns != prepared.left_columns ||
+                lhs->format != rhs->format || lhs->format != out->format)
+                return set_error("prepared subtract shape or format mismatch");
+            status = prepare_block_metadata(prepared, lhs, rhs, out);
+            if (status != 0) return status;
+            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
+                                 static_cast<unsigned int>(prepared.limb_count));
+            return 0;
+        }
+        if (unary)
+        {
+            if (output_rows != prepared.left_range.row_end - prepared.left_range.row_start ||
+                output_columns != prepared.left_columns || lhs->format != out->format)
+                return set_error("prepared unary shape or format mismatch");
+            if (kind == static_cast<int>(PreparedArithmeticKind::Scale))
+            {
+                if (!scalar_residues || scalar_count != prepared.limb_count)
+                    return set_error("prepared scale requires one residue per limb");
+                std::copy_n(scalar_residues, scalar_count, prepared.scalars);
+            }
+            if (kind == static_cast<int>(PreparedArithmeticKind::Automorphism))
+            {
+                if (automorphism_index == 0 || automorphism_index >= 2 * prepared.n ||
+                    (automorphism_index & 1) == 0 || (prepared.n & (prepared.n - 1)) != 0)
+                    return set_error("prepared automorphism index is invalid");
+                prepared.automorphism_index = automorphism_index;
+                prepared.evaluation = lhs->format == GPU_POLY_FORMAT_EVAL;
+                prepared.log_n = static_cast<unsigned>(__builtin_ctzll(prepared.n));
+            }
+            status = prepare_unary_metadata(prepared, lhs, out);
+            if (status != 0) return status;
+            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
+                                 static_cast<unsigned int>(prepared.limb_count));
+            return 0;
+        }
+        if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL ||
+            out->format != GPU_POLY_FORMAT_EVAL)
+            return set_error("prepared product requires Eval format");
+        status = prepare_product_metadata(prepared, lhs, rhs, out);
+        if (status != 0) return status;
+        prepared.geometry = TensorGeometry{
+            prepared.left_range.row_start * lhs->cols + prepared.left_range.column_start, lhs->cols,
+            prepared.right_range.row_start * rhs->cols + prepared.right_range.column_start, rhs->cols,
+            prepared.output_range.row_start * out->cols + prepared.output_range.column_start, out->cols,
+            column_start, output_columns};
+        if (kind == static_cast<int>(PreparedArithmeticKind::Tensor) ||
+            kind == static_cast<int>(PreparedArithmeticKind::TensorSumRows))
+        {
+            const bool grouped = kind == static_cast<int>(PreparedArithmeticKind::TensorSumRows);
+            if (prepared.right_rows == 0 || prepared.left_columns == 0 || prepared.right_columns == 0 ||
+                (grouped && (!rows || !offsets || group_count == 0 || group_count > 16 || term_count == 0 || term_count > 32)))
+                return set_error("prepared tensor shape or grouping is invalid");
+            const size_t product_rows = (prepared.left_range.row_end - prepared.left_range.row_start) * prepared.right_rows;
+            if ((!grouped && output_rows != product_rows) || output_columns > prepared.left_columns * prepared.right_columns ||
+                column_start > prepared.left_columns * prepared.right_columns - output_columns)
+                return set_error("prepared tensor output shape is invalid");
+            if (grouped)
+            {
+                if (output_rows != group_count || offsets[0] != 0 || offsets[group_count] != term_count)
+                    return set_error("prepared tensor row groups are invalid");
+                prepared.row_sum = {};
+                prepared.row_sum.product = prepared.product;
+                prepared.row_sum.geometry = prepared.geometry;
+                std::copy_n(rows, term_count, prepared.row_sum.rows);
+                std::copy_n(offsets, group_count + 1, prepared.row_sum.offsets);
+                std::copy_n(lhs->ctx->barrett_reciprocals.data(), prepared.limb_count, prepared.row_sum.reciprocals);
+                for (size_t term = 0; term < term_count; ++term)
+                    if (rows[term] >= product_rows) return set_error("prepared tensor row index is invalid");
+                prepared.row_sum_separate_polynomials = prepared.n >= 256;
+                const size_t poly_count = output_rows * output_columns;
+                prepared.grid = prepared.row_sum_separate_polynomials
+                    ? dim3(static_cast<unsigned int>((prepared.n + 255) / 256), static_cast<unsigned int>(std::min(poly_count, size_t{65535})), static_cast<unsigned int>(prepared.limb_count))
+                    : dim3(static_cast<unsigned int>((poly_count * prepared.n + 255) / 256), 1, static_cast<unsigned int>(prepared.limb_count));
+            }
+            else
+            {
+                const size_t count = output_rows * output_columns * prepared.n;
+                prepared.grid = dim3(static_cast<unsigned int>((count + 255) / 256), 1, static_cast<unsigned int>(prepared.limb_count));
+            }
+            return 0;
+        }
+        if (kind != static_cast<int>(PreparedArithmeticKind::Multiply))
+            return set_error("unknown prepared arithmetic kind");
+        const size_t rows_count = prepared.left_range.row_end - prepared.left_range.row_start;
+        const size_t inner = prepared.left_columns;
+        const size_t cols_count = prepared.right_columns;
+        if (prepared.right_rows != inner || output_rows != rows_count || output_columns != cols_count || !inner)
+            return set_error("prepared multiply shape is invalid");
+        if (rows_count <= 4 && cols_count <= 4 && inner <= 16)
+        {
+            prepared.grid = dim3(static_cast<unsigned int>((prepared.n + 255) / 256), static_cast<unsigned int>(cols_count), static_cast<unsigned int>(prepared.limb_count));
+            return 0;
+        }
+        prepared.matmul_count = prepared.limb_count;
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            auto &launch = prepared.matmul[limb];
+            const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+            int device = prepared.device;
+            const uint8_t *lhs_base = nullptr, *rhs_base = nullptr, *out_base_const = nullptr;
+            status = prepared_matrix_metadata(lhs, id, &lhs_base, &launch.lhs_stride, &launch.lhs_width, &device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(rhs, id, &rhs_base, &launch.rhs_stride, &launch.rhs_width, &device);
+            if (status != 0) return status;
+            status = prepared_matrix_metadata(out, id, &out_base_const, &launch.out_stride, &launch.out_width, &device);
+            if (status != 0) return status;
+            launch.lhs_base = lhs_base;
+            launch.rhs_base = rhs_base;
+            launch.out_base = const_cast<uint8_t *>(out_base_const);
+            launch.rows = rows_count;
+            launch.inner = inner;
+            launch.columns = cols_count;
+            launch.n = prepared.n;
+            launch.lhs_pitch = lhs->cols;
+            launch.rhs_pitch = rhs->cols;
+            launch.out_pitch = out->cols;
+            launch.lhs_row = prepared.left_range.row_start;
+            launch.lhs_column = prepared.left_range.column_start;
+            launch.rhs_row = prepared.right_range.row_start;
+            launch.rhs_column = prepared.right_range.column_start;
+            launch.out_row = prepared.output_range.row_start;
+            launch.out_column = prepared.output_range.column_start;
+            launch.thin = view == nullptr && rows_count == 1 &&
+                matrix_barrett_u32_reciprocal(lhs->ctx->moduli[limb], &launch.reciprocal);
+            launch.lazy_reduction = launch.thin && matrix_lazy_dot_u64(inner, lhs->ctx->moduli[limb]);
+            launch.modulus = lhs->ctx->moduli[limb];
+            if (launch.thin)
+            {
+                launch.block = dim3(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock, 1);
+                launch.grid = dim3(static_cast<unsigned int>((cols_count + kThinMatmulColumnsPerBlock - 1) / kThinMatmulColumnsPerBlock), 1,
+                    static_cast<unsigned int>(std::min((prepared.n + kThinMatmulWarpSize - 1) / kThinMatmulWarpSize, kMatmulMaxGridZ)));
+            }
+            else
+            {
+                launch.block = dim3(kMatmulTileN, kMatmulTileM, 1);
+                launch.grid = dim3(static_cast<unsigned int>((cols_count + kMatmulTileN - 1) / kMatmulTileN), static_cast<unsigned int>((rows_count + kMatmulTileM - 1) / kMatmulTileM),
+                    static_cast<unsigned int>(std::min(prepared.n, kMatmulMaxGridZ)));
+            }
+        }
+        return 0;
+    }
+
+    int prepared_arithmetic_wait(const GpuPreparedArithmeticState &prepared)
+    {
+        int status = matrix_wait_all_limb_streams(prepared.lhs, prepared.device, prepared.stream, true, true);
+        if (status != 0) return status;
+        if (prepared.rhs && prepared.rhs != prepared.lhs)
+        {
+            status = matrix_wait_all_limb_streams(prepared.rhs, prepared.device, prepared.stream, true, true);
+            if (status != 0) return status;
+        }
+        return matrix_wait_all_limb_streams(prepared.out, prepared.device, prepared.stream, true);
+    }
+
+    int prepared_arithmetic_finish(const GpuPreparedArithmeticState &prepared)
+    {
+        int status = matrix_record_all_limb_writes(prepared.out, prepared.stream, true);
+        if (status != 0) return status;
+        const dim3 first = prepared.out->ctx->limb_gpu_ids[0];
+        const auto &states = prepared.out->exec_limb_states[first.x];
+        const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+        status = matrix_track_all_limb_consumers(prepared.lhs, prepared.device, prepared.stream, completion, true, true);
+        if (status != 0) return status;
+        if (prepared.rhs && prepared.rhs != prepared.lhs)
+            status = matrix_track_all_limb_consumers(prepared.rhs, prepared.device, prepared.stream, completion, true, true);
+        return status;
+    }
+
 } // namespace
+
+extern "C" int gpu_matrix_prepare_arithmetic(
+    GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+    const size_t *rows, const size_t *offsets, size_t group_count,
+    size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+    const uint64_t *scalar_residues, size_t scalar_count, size_t automorphism_index,
+    GpuPreparedArithmetic **plan)
+{
+    if (!plan) return set_error("null prepared arithmetic output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedArithmeticState>();
+        const int status = prepare_arithmetic_plan(
+            out, lhs, rhs, kind, rows, offsets, group_count, term_count,
+            view, column_start, scalar_residues, scalar_count, automorphism_index, *prepared);
+        if (status != 0) return status;
+        *plan = reinterpret_cast<GpuPreparedArithmetic *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_arithmetic(const GpuPreparedArithmetic *opaque)
+{
+    const auto *prepared = reinterpret_cast<const GpuPreparedArithmeticState *>(opaque);
+    if (!prepared || !prepared->out || !prepared->lhs || !prepared->stream)
+        return set_error("invalid prepared arithmetic plan");
+    int status = cudaSetDevice(prepared->device);
+    if (status != cudaSuccess) return set_error(static_cast<cudaError_t>(status));
+    status = prepared_arithmetic_wait(*prepared);
+    if (status != 0) return status;
+    switch (prepared->kind)
+    {
+        case PreparedArithmeticKind::Copy:
+            block_copy_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->copy, prepared->limb_count,
+                prepared->output_range.row_end - prepared->output_range.row_start,
+                prepared->output_range.column_end - prepared->output_range.column_start,
+                prepared->n, prepared->lhs->cols, prepared->out->cols,
+                prepared->left_range.row_start, prepared->left_range.column_start,
+                prepared->output_range.row_start, prepared->output_range.column_start);
+            break;
+        case PreparedArithmeticKind::Add:
+            prepared_add_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->elementwise, prepared->limb_count,
+                prepared->output_range.row_end - prepared->output_range.row_start,
+                prepared->output_range.column_end - prepared->output_range.column_start,
+                prepared->n, prepared->lhs->cols, prepared->rhs->cols, prepared->out->cols,
+                prepared->left_range.row_start, prepared->left_range.column_start,
+                prepared->right_range.row_start, prepared->right_range.column_start,
+                prepared->output_range.row_start, prepared->output_range.column_start);
+            break;
+        case PreparedArithmeticKind::Subtract:
+            prepared_sub_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->elementwise, prepared->limb_count,
+                prepared->output_range.row_end - prepared->output_range.row_start,
+                prepared->output_range.column_end - prepared->output_range.column_start,
+                prepared->n, prepared->lhs->cols, prepared->rhs->cols, prepared->out->cols,
+                prepared->left_range.row_start, prepared->left_range.column_start,
+                prepared->right_range.row_start, prepared->right_range.column_start,
+                prepared->output_range.row_start, prepared->output_range.column_start);
+            break;
+        case PreparedArithmeticKind::Negate:
+        case PreparedArithmeticKind::Scale:
+            prepared_unary_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->elementwise, prepared->scalars, prepared->limb_count,
+                prepared->output_range.row_end - prepared->output_range.row_start,
+                prepared->output_range.column_end - prepared->output_range.column_start,
+                prepared->n, prepared->lhs->cols, prepared->out->cols,
+                prepared->left_range.row_start, prepared->left_range.column_start,
+                prepared->output_range.row_start, prepared->output_range.column_start,
+                prepared->kind == PreparedArithmeticKind::Negate ? 0 : 1);
+            break;
+        case PreparedArithmeticKind::Automorphism:
+            prepared_automorphism_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->elementwise, prepared->limb_count,
+                prepared->output_range.row_end - prepared->output_range.row_start,
+                prepared->output_range.column_end - prepared->output_range.column_start,
+                prepared->n, prepared->lhs->cols, prepared->out->cols,
+                prepared->left_range.row_start, prepared->left_range.column_start,
+                prepared->output_range.row_start, prepared->output_range.column_start,
+                prepared->automorphism_index, prepared->evaluation, prepared->log_n);
+            break;
+        case PreparedArithmeticKind::Tensor:
+            tensor_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                prepared->product, prepared->left_columns, prepared->right_rows,
+                prepared->right_columns, prepared->output_count * prepared->n,
+                prepared->n, prepared->geometry);
+            break;
+        case PreparedArithmeticKind::TensorSumRows:
+            if (prepared->row_sum_separate_polynomials)
+                tensor_sum_rows_all_limbs_kernel<true><<<prepared->grid, 256, 0, prepared->stream>>>(
+                    prepared->row_sum, prepared->left_columns, prepared->right_rows,
+                    prepared->right_columns, prepared->output_count, prepared->n);
+            else
+                tensor_sum_rows_all_limbs_kernel<false><<<prepared->grid, 256, 0, prepared->stream>>>(
+                    prepared->row_sum, prepared->left_columns, prepared->right_rows,
+                    prepared->right_columns, prepared->output_count, prepared->n);
+            break;
+        case PreparedArithmeticKind::Multiply:
+            if (prepared->matmul_count == 0)
+                prepared_small_dot_rect_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+                    prepared->product,
+                    prepared->output_range.row_end - prepared->output_range.row_start,
+                    prepared->left_columns, prepared->right_columns, prepared->n,
+                    prepared->lhs->cols, prepared->rhs->cols, prepared->out->cols,
+                    prepared->left_range.row_start, prepared->left_range.column_start,
+                    prepared->right_range.row_start, prepared->right_range.column_start,
+                    prepared->output_range.row_start, prepared->output_range.column_start);
+            else
+            {
+                for (size_t limb = 0; limb < prepared->matmul_count; ++limb)
+                {
+                    const auto &launch = prepared->matmul[limb];
+                    if (launch.thin)
+                        block_thin_row_matmul_kernel<<<launch.grid, launch.block, 0, prepared->stream>>>(
+                            launch.lhs_base, launch.rhs_base, launch.out_base,
+                            launch.inner, launch.columns, launch.n, launch.lhs_stride,
+                            launch.rhs_stride, launch.out_stride, launch.lhs_width,
+                            launch.rhs_width, launch.out_width, launch.modulus,
+                            launch.reciprocal, launch.lazy_reduction);
+                    else
+                        prepared_block_matmul_rect_kernel<<<launch.grid, launch.block, 0, prepared->stream>>>(
+                            launch.lhs_base, launch.rhs_base, launch.out_base,
+                            launch.rows, launch.inner, launch.columns, launch.n,
+                            launch.lhs_pitch, launch.rhs_pitch, launch.out_pitch,
+                            launch.lhs_row, launch.lhs_column,
+                            launch.rhs_row, launch.rhs_column,
+                            launch.out_row, launch.out_column,
+                            launch.lhs_stride, launch.rhs_stride, launch.out_stride,
+                            launch.lhs_width, launch.rhs_width,
+                            launch.out_width, launch.modulus);
+                }
+            }
+            break;
+    }
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess)
+    {
+        gpu_matrix_retire_submitted_work(prepared->out);
+        return set_error(error);
+    }
+    status = prepared_arithmetic_finish(*prepared);
+    if (status != 0)
+    {
+        gpu_matrix_retire_submitted_work(prepared->out);
+        return status;
+    }
+    prepared->out->format = prepared->lhs->format;
+    return 0;
+}
+
+extern "C" void gpu_matrix_destroy_arithmetic_plan(GpuPreparedArithmetic *opaque)
+{
+    delete reinterpret_cast<GpuPreparedArithmeticState *>(opaque);
+}
+
+extern "C" int gpu_matrix_prepare_input_copy(
+    GpuMatrix *out, const GpuMatrix *source_template,
+    const GpuMatrixBatchView *view, GpuPreparedInputCopy **plan)
+{
+    if (!plan) return set_error("null prepared input copy output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedInputCopyState>();
+        const int status = prepare_copy_layout(out, source_template, view, *prepared);
+        if (status != 0) return status;
+        *plan = reinterpret_cast<GpuPreparedInputCopy *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_input_copy(
+    const GpuPreparedInputCopy *opaque, const GpuMatrix *source)
+{
+    const auto *prepared = reinterpret_cast<const GpuPreparedInputCopyState *>(opaque);
+    if (!prepared || !prepared->out || !source)
+        return set_error("invalid prepared input copy");
+    if (source->ctx != prepared->out->ctx || source->level != static_cast<int>(prepared->level) ||
+        source->rows != prepared->source_rows || source->cols != prepared->source_columns ||
+        source->format != prepared->format)
+        return set_error("prepared input copy source contract mismatch");
+    BlockCopyMetadata metadata = prepared->source_layout;
+    for (size_t limb = 0; limb <= prepared->level; ++limb)
+    {
+        const dim3 id = source->ctx->limb_gpu_ids[limb];
+        int device = -1;
+        const uint8_t *base = nullptr;
+        size_t stride = 0;
+        uint8_t width = 0;
+        int status = prepared_matrix_metadata(source, id, &base, &stride, &width, &device);
+        if (status != 0) return status;
+        if (device != prepared->device ||
+            stride != prepared->source_layout.src_stride_bytes[limb] ||
+            width != prepared->source_layout.src_coeff_bytes[limb])
+            return set_error("prepared input copy source byte extent mismatch");
+        metadata.src_bases[limb] = base;
+    }
+    int status = cudaSetDevice(prepared->device);
+    if (status != cudaSuccess) return set_error(static_cast<cudaError_t>(status));
+    status = matrix_wait_all_limb_streams(source, prepared->device, prepared->stream, true, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(prepared->out, prepared->device, prepared->stream, true);
+    if (status != 0) return status;
+    const size_t rows = prepared->output_range.row_end - prepared->output_range.row_start;
+    const size_t columns = prepared->output_range.column_end - prepared->output_range.column_start;
+    block_copy_rect_all_limbs_kernel<<<prepared->grid, 256, 0, prepared->stream>>>(
+        metadata, prepared->level + 1, rows, columns, prepared->n,
+        source->cols, prepared->out->cols,
+        prepared->input_range.row_start, prepared->input_range.column_start,
+        prepared->output_range.row_start, prepared->output_range.column_start);
+    cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    status = matrix_record_all_limb_writes(prepared->out, prepared->stream, true);
+    if (status != 0) return status;
+    const dim3 first = prepared->out->ctx->limb_gpu_ids[0];
+    const auto &states = prepared->out->exec_limb_states[first.x];
+    const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+    return matrix_track_all_limb_consumers(source, prepared->device, prepared->stream, completion, true, true);
+}
+
+extern "C" void gpu_matrix_destroy_input_copy(GpuPreparedInputCopy *opaque)
+{
+    delete reinterpret_cast<GpuPreparedInputCopyState *>(opaque);
+}
 
 int launch_sample_p1_integer_kernel(
     const uint8_t *a_base,
@@ -2458,6 +3482,153 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
 
     out->format = lhs->format;
     return 0;
+}
+
+struct GpuPreparedTransposeState
+{
+    GpuMatrix *out;
+    const GpuMatrix *source;
+    GpuMatrixBatchView view;
+    TransposeMetadata metadata;
+    size_t rows;
+    size_t count;
+    size_t limb_count;
+    int device;
+    cudaStream_t stream;
+    bool has_view;
+};
+
+static int prepare_transpose_plan(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    GpuPreparedTransposeState &prepared)
+{
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid execution owner in prepared transpose");
+    if (!source || out == source || !source->ctx || out->ctx != source->ctx ||
+        source->level < 0 || out->level != source->level || out->format != source->format ||
+        (!view && (out->rows != source->cols || out->cols != source->rows)))
+        return set_error("invalid prepared transpose arguments");
+    prepared.has_view = view != nullptr;
+    prepared.view = view ? *view : GpuMatrixBatchView{
+        GpuMatrixRange{0, source->rows, 0, source->cols},
+        GpuMatrixRange{0, source->rows, 0, source->cols},
+        GpuMatrixRange{0, out->rows, 0, out->cols}};
+    const GpuMatrixRange &input = prepared.view.left;
+    const GpuMatrixRange &output = prepared.view.output;
+    const auto valid = [](const GpuMatrixRange &r, const GpuMatrix *m) {
+        return r.row_start <= r.row_end && r.row_end <= m->rows &&
+            r.column_start <= r.column_end && r.column_end <= m->cols;
+    };
+    if (!valid(input, source) || !valid(output, out) ||
+        input.row_end - input.row_start != output.column_end - output.column_start ||
+        input.column_end - input.column_start != output.row_end - output.row_start)
+        return set_error("invalid prepared transpose view");
+    prepared.rows = input.row_end - input.row_start;
+    const size_t columns = input.column_end - input.column_start;
+    if (prepared.rows == 0 || columns == 0 || source->ctx->N <= 0)
+        return set_error("empty prepared transpose is not replayable");
+    const size_t n = static_cast<size_t>(source->ctx->N);
+    prepared.limb_count = static_cast<size_t>(source->level) + 1;
+    if (prepared.limb_count > kArithMetadataLimbs ||
+        source->ctx->limb_gpu_ids.size() < prepared.limb_count ||
+        source->rows > std::numeric_limits<size_t>::max() / source->cols ||
+        source->rows * source->cols > std::numeric_limits<size_t>::max() / n)
+        return set_error("prepared transpose shape overflow or invalid basis");
+    prepared.metadata = {};
+    prepared.metadata.source_offset = input.row_start * source->cols + input.column_start;
+    prepared.metadata.source_stride = source->cols;
+    prepared.metadata.output_offset = output.row_start * out->cols + output.column_start;
+    prepared.metadata.output_stride = out->cols;
+    prepared.device = -1;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &prepared.stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+    {
+        const dim3 id = source->ctx->limb_gpu_ids[limb];
+        if (id.x >= source->shared_limb_buffers.size() || id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid prepared transpose partition");
+        const auto &input_buffer = source->shared_limb_buffers[id.x];
+        const auto &output_buffer = out->shared_limb_buffers[id.x];
+        if (!input_buffer.device_descriptors || !output_buffer.device_descriptors ||
+            id.y >= input_buffer.limb_count || id.y >= output_buffer.limb_count ||
+            input_buffer.device != output_buffer.device)
+            return set_error("invalid prepared transpose descriptors");
+        if (limb == 0)
+        {
+            prepared.device = output_buffer.device;
+            prepared.metadata.source = input_buffer.device_descriptors;
+            prepared.metadata.out = output_buffer.device_descriptors;
+        }
+        else if (prepared.device != output_buffer.device ||
+                 prepared.metadata.source != input_buffer.device_descriptors ||
+                 prepared.metadata.out != output_buffer.device_descriptors)
+            return set_error("prepared transpose descriptors span partitions");
+        prepared.metadata.indices[limb] = id.y;
+    }
+    prepared.count = prepared.rows * columns * n;
+    if (prepared.count > std::numeric_limits<size_t>::max() / 256)
+        return set_error("prepared transpose grid overflow");
+    prepared.out = out;
+    prepared.source = source;
+    return 0;
+}
+
+static int submit_transpose_plan(const GpuPreparedTransposeState &prepared)
+{
+    cudaError_t error = cudaSetDevice(prepared.device);
+    if (error != cudaSuccess) return set_error(error);
+    int status = matrix_wait_all_limb_streams(prepared.source, prepared.device, prepared.stream, false, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(prepared.out, prepared.device, prepared.stream);
+    if (status != 0) return status;
+    const dim3 grid(static_cast<unsigned int>(std::min(prepared.count / 256 + (prepared.count % 256 != 0), size_t{65535})),
+                    1, static_cast<unsigned int>(prepared.limb_count));
+    transpose_all_limbs_kernel<<<grid, 256, 0, prepared.stream>>>(
+        prepared.metadata, prepared.rows, prepared.count, static_cast<size_t>(prepared.source->ctx->N));
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    if (prepared.has_view)
+    {
+        status = matrix_record_all_limb_writes(prepared.out, prepared.stream, true);
+        if (status != 0) return status;
+        const dim3 first = prepared.out->ctx->limb_gpu_ids[0];
+        const cudaEvent_t completion = prepared.out->exec_limb_states[first.x][first.y].write_done;
+        return matrix_track_all_limb_consumers(
+            prepared.source, prepared.device, prepared.stream, completion, true, true);
+    }
+    status = matrix_track_all_limb_consumers(prepared.source, prepared.device, prepared.stream);
+    if (status != 0) return status;
+    return matrix_record_all_limb_writes(prepared.out, prepared.stream);
+}
+
+extern "C" int gpu_matrix_prepare_transpose(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    GpuPreparedTranspose **plan)
+{
+    if (!plan) return set_error("null prepared transpose output");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedTransposeState>();
+        const int status = prepare_transpose_plan(out, source, view, *prepared);
+        if (status != 0) return status;
+        *plan = reinterpret_cast<GpuPreparedTranspose *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_submit_transpose(const GpuPreparedTranspose *plan)
+{
+    const auto *prepared = reinterpret_cast<const GpuPreparedTransposeState *>(plan);
+    if (!prepared || !prepared->out || !prepared->source || !prepared->stream)
+        return set_error("invalid prepared transpose plan");
+    return submit_transpose_plan(*prepared);
+}
+
+extern "C" void gpu_matrix_destroy_transpose(GpuPreparedTranspose *plan)
+{
+    delete reinterpret_cast<GpuPreparedTransposeState *>(plan);
 }
 
 extern "C" int gpu_matrix_transpose(

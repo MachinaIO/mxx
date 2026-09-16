@@ -237,6 +237,21 @@ pub trait Backend {
         Ok(None)
     }
 
+    /// Replays a fully prepared static graph without entering the ordinary
+    /// executor. Implementations return `None` when no executable was accepted
+    /// at the explicit warmup boundary; they must return an error for a graph
+    /// that was declared prepared but whose contract no longer matches.
+    fn execute_prepared_graph(
+        &mut self,
+        _validated: &mxx_ir_core::ValidatedGraph,
+        _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
+    ) -> Result<Option<crate::executor::ExecutionResult<Self>>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
     /// Admit the bounded wave of sibling bodies to execute next for `request`.
     /// Called once per wave, before that wave's lazy inputs are materialized.
     ///

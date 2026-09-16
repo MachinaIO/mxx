@@ -34,6 +34,10 @@ typedef enum GpuMatrixSampleDist
 #ifdef __cplusplus
 struct GpuMatrix
 {
+    GpuMatrix(GpuContext *context, size_t row_count, size_t column_count,
+              int active_level, GpuPolyFormat active_format);
+    GpuMatrix(GpuMatrix &owner, size_t row_count, size_t column_count,
+              int active_level, GpuPolyFormat active_format);
     GpuContext *ctx;
     size_t rows;
     size_t cols;
@@ -82,11 +86,16 @@ struct GpuMatrix
     };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
-    std::vector<std::vector<LimbExecState>> exec_limb_states;
+    std::vector<std::vector<LimbExecState>> owned_exec_limb_states;
+    std::vector<std::vector<LimbExecState>> &exec_limb_states;
     // A deferred allocation stays private until its filling kernel is submitted.
     bool descriptors_initialized = true;
     // Actual writes invalidate this; reader lifetime joins remain independent.
-    mutable std::atomic<bool> host_observed_writer_ready{false};
+    std::atomic<bool> owned_host_observed_writer_ready{false};
+    std::atomic<bool> &host_observed_writer_ready;
+    // Non-owning native link. The Rust header retains a strong backing Arc.
+    // Views never recycle the payload or destroy its events.
+    GpuMatrix *prepared_view_owner = nullptr;
 };
 #endif
 

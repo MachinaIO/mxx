@@ -17,6 +17,7 @@ required-features = ["gpu"]
 [features]
 default = []
 gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+gpu-instrumentation = ["gpu", "mxx-primitives/gpu-instrumentation", "mxx-runtime/gpu-instrumentation"]
 
 [dependencies]
 mxx-dsl.workspace = true

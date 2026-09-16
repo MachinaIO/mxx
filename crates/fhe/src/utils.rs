@@ -173,7 +173,7 @@ pub(crate) fn execute_graph(
         .expect("FHE graph execution");
     // Structural families may be lazy staged outputs. Materialize them before
     // dropping the memory store so assertions observe actual runtime values.
-    for name in result.outputs.keys().cloned().collect::<Vec<_>>() {
+    for name in result.output_names().map(str::to_owned).collect::<Vec<_>>() {
         result.materialize_output(&name, &mut backend, &mut store).expect("load FHE output");
     }
     result.cleanup_staged(&mut store).expect("clean streamed outputs");

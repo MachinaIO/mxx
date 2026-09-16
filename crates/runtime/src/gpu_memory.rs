@@ -365,6 +365,39 @@ pub struct GpuColumnFit {
 }
 
 impl GpuColumnFit {
+    pub(crate) fn without_prepared_outputs(mut self) -> Self {
+        // `validated` follows the fixed/output/scratch group order used by
+        // commit_columns. Once output reservations have been transferred to
+        // their warmup owners, retain only the claims for groups that remain
+        // in the production plan. Dropping every claim would make cached
+        // activation revalidate scratch against the wrong group cardinality.
+        let mut validated = std::mem::take(&mut self.validated).into_iter();
+        let mut retained = Vec::new();
+        for region in &self.devices {
+            for (is_output, allocations) in
+                [(false, &region.fixed), (true, &region.outputs), (false, &region.scratch)]
+            {
+                for (identity, requests) in &allocations.prepared {
+                    if requests.is_empty() {
+                        continue;
+                    }
+                    let claim =
+                        validated.next().expect("validated claim per prepared allocation group");
+                    debug_assert_eq!(*identity, claim.0);
+                    if !is_output {
+                        retained.push(claim);
+                    }
+                }
+            }
+        }
+        debug_assert!(validated.next().is_none());
+        self.validated = retained;
+        for region in &mut self.devices {
+            region.outputs = GpuColumnAllocations::default();
+        }
+        self
+    }
+
     /// Select complete output placement and scratch width using the same CPU
     /// algorithm for actual and hypothetical inventories. Admissions and slot
     /// availability must describe the same scenario; neither is mutated here.
@@ -955,6 +988,36 @@ impl GpuAdmittedPlanSummary {
 }
 
 impl GpuColumnMemoryPlan {
+    /// Consume retained prepared-output reservations during admission so a
+    /// prepared operation can keep its native output owners for replay. The
+    /// callback runs while the exact output dispatch is active; production
+    /// plans therefore carry no output reservation and never construct an
+    /// output owner on the submission path.
+    pub(crate) fn prepare_preimage_outputs<O>(
+        &mut self,
+        initialize: impl Fn(usize) -> Result<O, GpuAdmissionError>,
+    ) -> Result<Vec<(usize, O)>, GpuAdmissionError> {
+        let mut owners = Vec::new();
+        for leases in &mut self.devices {
+            if !leases.outputs.is_empty() {
+                return Err(GpuAdmissionError::InvalidPlan(
+                    "preimage output owner cannot retain managed output leases".into(),
+                ));
+            }
+            if leases.prepared_outputs.is_empty() {
+                continue;
+            }
+            let mut reservations = std::mem::take(&mut leases.prepared_outputs);
+            let first = reservations.remove(0);
+            let dispatch =
+                first.enter(reservations).map_err(GpuAdmissionError::NativeReservation)?;
+            let owner = initialize(leases.device)?;
+            dispatch.finish().map_err(GpuAdmissionError::NativeReservation)?;
+            owners.push((leases.device, owner));
+        }
+        Ok(owners)
+    }
+
     pub fn schedule(&self) -> &GpuColumnSchedule {
         &self.schedule
     }
@@ -1432,6 +1495,29 @@ impl GpuDeviceAdmission {
 pub struct GpuMemoryRegion {
     inventory: BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>,
     column_cap: usize,
+    nested: Vec<(usize, Arc<GpuPreparedStorage>)>,
+}
+
+impl GpuMemoryRegion {
+    /// Retain another already ledger-authorized detached region in this unpublished
+    /// execution instance. Its native slot reservations travel with these views.
+    pub(crate) fn retain_detached_region(&mut self, child: &Self) {
+        self.nested.extend(child.prepared_inventory());
+    }
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self { inventory: BTreeMap::new(), column_cap: 0, nested: Vec::new() }
+    }
+
+    pub(crate) fn prepared_inventory(
+        &self,
+    ) -> impl Iterator<Item = (usize, Arc<GpuPreparedStorage>)> {
+        let mut inventory = self.inventory.clone();
+        for (device, storage) in &self.nested {
+            inventory.insert(storage.identity(), (*device, Arc::clone(storage)));
+        }
+        inventory.into_values().collect::<Vec<_>>().into_iter()
+    }
 }
 
 pub struct GpuMemoryLedger {
@@ -1519,6 +1605,81 @@ pub enum GpuAdmissionError {
 }
 
 impl GpuMemoryLedger {
+    /// Charge the complete backing demand before any native prepared storage
+    /// is constructed.  The charge is part of the provisioning transaction;
+    /// callers must either append the resulting stores or roll it back.
+    pub(crate) fn begin_prepared_provisioning(
+        &mut self,
+        additional: &[u64],
+    ) -> Result<(), GpuAdmissionError> {
+        if additional.len() != self.devices.len() {
+            return Err(GpuAdmissionError::InvalidDevice(additional.len()));
+        }
+        self.poll_releases()?;
+        for (index, (device, requested_bytes)) in self.devices.iter().zip(additional).enumerate() {
+            if *requested_bytes > device.available_bytes() {
+                return Err(GpuAdmissionError::Capacity {
+                    device: index,
+                    requested_bytes: *requested_bytes,
+                    charged_bytes: device.charged_bytes(),
+                    budget_bytes: device.budget_bytes,
+                });
+            }
+        }
+        crate::backend::poly_gpu::record_provisioning_begin();
+        for (device, requested_bytes) in self.devices.iter_mut().zip(additional) {
+            device.allocation_bytes = device
+                .allocation_bytes
+                .checked_add(*requested_bytes)
+                .ok_or(GpuAdmissionError::Overflow)?;
+        }
+        Ok(())
+    }
+
+    /// Undo a not-yet-published provisioning charge.  This is intentionally
+    /// only used by the owning warmup transaction after native construction
+    /// or detached-region acquisition fails.
+    pub(crate) fn rollback_prepared_provisioning(&mut self, additional: &[u64]) {
+        debug_assert_eq!(additional.len(), self.devices.len());
+        for (device, requested_bytes) in self.devices.iter_mut().zip(additional) {
+            debug_assert!(device.allocation_bytes >= *requested_bytes);
+            device.allocation_bytes -= *requested_bytes;
+        }
+    }
+
+    /// Append newly provisioned prepared storage to this execution owner.
+    /// The ledger is never replaced after setup; all identities and the full
+    /// fleet budget are validated before any store becomes visible.
+    pub(crate) fn append_prepared_storages(
+        &mut self,
+        prepared: Vec<(usize, Arc<GpuPreparedStorage>)>,
+    ) -> Result<(), GpuAdmissionError> {
+        if prepared.is_empty() {
+            return Ok(());
+        }
+        self.poll_releases()?;
+        let mut identities = BTreeSet::new();
+        for (device, storage) in &prepared {
+            let expected = self
+                .execution_identities
+                .as_ref()
+                .and_then(|identities| identities.get(*device))
+                .ok_or(GpuAdmissionError::InvalidDevice(*device))?;
+            if *expected != (storage.device(), storage.execution_owner_id()) ||
+                !identities.insert(storage.identity()) ||
+                self.prepared_storages.contains_key(&storage.identity())
+            {
+                return Err(GpuAdmissionError::ExecutionMismatch);
+            }
+        }
+        for (device, storage) in prepared {
+            crate::backend::poly_gpu::record_provisioning_permit();
+            self.prepared_storages.insert(storage.identity(), (device, storage));
+            crate::backend::poly_gpu::record_provisioning_append();
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepared_inventory(
         &self,
     ) -> impl Iterator<Item = (usize, Arc<GpuPreparedStorage>)> {
@@ -1561,10 +1722,49 @@ impl GpuMemoryLedger {
         requirements: &[GpuPreparedAllocationRequirement<'_>],
         column_cap: usize,
     ) -> Result<Arc<GpuMemoryRegion>, GpuAdmissionError> {
-        let inventory = self
+        self.reserve_region_inner(requirements, column_cap, true, &[])
+    }
+
+    /// Reserve exact prepared slots without publishing the resulting permission
+    /// into ordinary admission. The caller must retain the returned region for
+    /// as long as its owners are live; ordinary admissions continue to see the
+    /// setup inventory while this detached region exists.
+    pub(crate) fn reserve_detached_region(
+        &mut self,
+        requirements: &[GpuPreparedAllocationRequirement<'_>],
+        column_cap: usize,
+    ) -> Result<Arc<GpuMemoryRegion>, GpuAdmissionError> {
+        self.reserve_region_inner(requirements, column_cap, false, &[])
+    }
+
+    pub(crate) fn reserve_provisioning_region(
+        &mut self,
+        additions: &[(usize, Arc<GpuPreparedStorage>)],
+        requirements: &[GpuPreparedAllocationRequirement<'_>],
+        column_cap: usize,
+    ) -> Result<Arc<GpuMemoryRegion>, GpuAdmissionError> {
+        self.reserve_region_inner(requirements, column_cap, false, additions)
+    }
+
+    fn reserve_region_inner(
+        &mut self,
+        requirements: &[GpuPreparedAllocationRequirement<'_>],
+        column_cap: usize,
+        publish: bool,
+        additions: &[(usize, Arc<GpuPreparedStorage>)],
+    ) -> Result<Arc<GpuMemoryRegion>, GpuAdmissionError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(5);
+        let mut inventory = self
             .prepared_inventory()
             .map(|(device, storage)| (storage.identity(), (device, storage)))
             .collect::<BTreeMap<_, _>>();
+        for (device, storage) in additions {
+            if inventory.contains_key(&storage.identity()) {
+                return Err(GpuAdmissionError::DuplicatePreparedStorage);
+            }
+            inventory.insert(storage.identity(), (*device, Arc::clone(storage)));
+            self.validate_prepared_storage(*device, storage, &inventory)?;
+        }
         let mut selected = BTreeMap::<u64, (usize, Vec<usize>)>::new();
         for requirement in requirements {
             self.validate_prepared_storage(requirement.device, requirement.storage, &inventory)?;
@@ -1590,9 +1790,12 @@ impl GpuMemoryLedger {
         let regions = Arc::new(GpuMemoryRegion {
             inventory: regions,
             column_cap: column_cap.min(self.column_cap()),
+            nested: Vec::new(),
         });
-        self.region_inventories.retain(|entry| entry.strong_count() != 0);
-        self.region_inventories.push(Arc::downgrade(&regions));
+        if publish {
+            self.region_inventories.retain(|entry| entry.strong_count() != 0);
+            self.region_inventories.push(Arc::downgrade(&regions));
+        }
         Ok(regions)
     }
 
@@ -1631,6 +1834,7 @@ impl GpuMemoryLedger {
         policy: GpuColumnWidthPolicy<'_>,
         requirements: &impl GpuColumnMemoryRequirements,
     ) -> Result<GpuColumnFit, GpuAdmissionError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(4);
         let owner = self.region_inventories.iter().rev().find_map(Weak::upgrade);
         let inventory =
             owner.as_ref().map(|owner| &owner.inventory).unwrap_or(&self.prepared_storages);
@@ -1661,6 +1865,7 @@ impl GpuMemoryLedger {
         &mut self,
         fit: GpuColumnFit,
     ) -> Result<GpuColumnMemoryPlan, GpuAdmissionError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(5);
         self.poll_releases()?;
         let GpuColumnFit { schedule, widths, devices: regions, validated } = fit;
         // The innermost wave owns these slots. Resolving a backing ID through
@@ -1790,6 +1995,7 @@ impl GpuMemoryLedger {
         groups: &[(usize, &GpuColumnAllocations)],
         validated: Option<Vec<GpuValidatedClaim>>,
     ) -> Result<Vec<GpuResourceLeases>, GpuAdmissionError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(6);
         let physical = groups
             .iter()
             .flat_map(|(device, requests)| {
@@ -1956,6 +2162,7 @@ impl GpuMemoryLedger {
         let mut ledger =
             Self::from_accounting_snapshot(&memory, &physical, percent, Some(&identities))?;
         for (device, storage) in prepared {
+            crate::backend::poly_gpu::record_provisioning_permit();
             let identity =
                 identities.get(device).ok_or(GpuAdmissionError::InvalidDevice(device))?;
             if *identity != (storage.device(), storage.execution_owner_id()) {
@@ -1964,6 +2171,7 @@ impl GpuMemoryLedger {
             if ledger.prepared_storages.insert(storage.identity(), (device, storage)).is_some() {
                 return Err(GpuAdmissionError::DuplicatePreparedStorage);
             }
+            crate::backend::poly_gpu::record_provisioning_append();
         }
         // Registering the inventory cannot promote stale setup observations.
         drop(Self::validate_epochs(&epochs, GpuAllocationEpochBoundary::InitialSetup)?);
@@ -2103,6 +2311,7 @@ impl GpuMemoryLedger {
         requirements: &[GpuAllocationRequirement],
         prepared: &[GpuPreparedAllocationRequirement<'_>],
     ) -> Result<GpuMemoryReservation, GpuAdmissionError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(5);
         self.reserve_inner(requirements, prepared, None)
     }
 
@@ -4143,6 +4352,78 @@ mod tests {
         drop(parent);
         assert_eq!(ledger.prepared_inventory().count(), storages.len());
         assert!(storage.fits(&requests).unwrap());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_detached_region_reconfiguration_waits_for_final_owner_drop() {
+        let (_, _, storages, mut ledger) = prepared_ledger_fixture(1, 100);
+        let (device, storage) = &storages[0];
+        let slot = storage.slot_identity(0).unwrap();
+        let requests = [slot.matrix_request(slot.rows(), slot.columns(), true)];
+        let requirements =
+            [GpuPreparedAllocationRequirement { device: *device, storage, requests: &requests }];
+        let competing = storage.reserve(&requests).unwrap();
+        assert!(matches!(
+            ledger.reserve_detached_region(&requirements, usize::MAX),
+            Err(GpuAdmissionError::StaleFit { device: failed }) if failed == *device
+        ));
+        drop(competing);
+        let detached = ledger.reserve_detached_region(&requirements, usize::MAX).unwrap();
+
+        assert_eq!(ledger.prepared_inventory().count(), storages.len());
+        let scoped = detached.prepared_inventory().next().unwrap().1;
+        assert!(scoped.fits(&requests).unwrap());
+        assert!(!storage.fits(&requests).unwrap());
+        assert!(storage.reserve(&requests).is_err());
+
+        drop(scoped);
+        drop(detached);
+        assert_eq!(ledger.prepared_inventory().count(), storages.len());
+        let reusable = storage.reserve(&requests).unwrap();
+        drop(reusable);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_detached_region_rolls_back_all_devices_after_late_conflict() {
+        let (_, _, storages, mut ledger) = prepared_ledger_fixture(2, 100);
+        assert!(storages.len() >= 2);
+        let first = &storages[0];
+        let second = &storages[1];
+        let first_slot = first.1.slot_identity(0).unwrap();
+        let second_slot = second.1.slot_identity(0).unwrap();
+        let first_requests =
+            [first_slot.matrix_request(first_slot.rows(), first_slot.columns(), true)];
+        let second_requests =
+            [second_slot.matrix_request(second_slot.rows(), second_slot.columns(), true)];
+        let requirements = [
+            GpuPreparedAllocationRequirement {
+                device: first.0,
+                storage: &first.1,
+                requests: &first_requests,
+            },
+            GpuPreparedAllocationRequirement {
+                device: second.0,
+                storage: &second.1,
+                requests: &second_requests,
+            },
+        ];
+        let competing = second.1.reserve(&second_requests).unwrap();
+        assert!(matches!(
+            ledger.reserve_detached_region(&requirements, usize::MAX),
+            Err(GpuAdmissionError::StaleFit { device }) if device == second.0
+        ));
+        assert!(first.1.fits(&first_requests).unwrap(), "first device claim leaked after rollback");
+        drop(competing);
+
+        let region = ledger.reserve_detached_region(&requirements, usize::MAX).unwrap();
+        assert!(!first.1.fits(&first_requests).unwrap());
+        assert!(!second.1.fits(&second_requests).unwrap());
+        drop(region);
+        assert!(first.1.fits(&first_requests).unwrap());
+        assert!(second.1.fits(&second_requests).unwrap());
+        assert_eq!(ledger.prepared_inventory().count(), storages.len());
     }
 
     // Existing pure lifecycle fixtures model no retained pool pages. The

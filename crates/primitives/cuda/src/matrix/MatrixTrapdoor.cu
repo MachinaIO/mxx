@@ -1389,6 +1389,7 @@ struct P1BatchJob {
     uint64_t modulus;
     double c_scale;
     GpuRngSeed seed;
+    const int32_t *completed = nullptr;
 };
 struct P1BatchDescriptors {
     P1BatchJob jobs[kP1BatchMatrices];
@@ -1402,6 +1403,7 @@ __global__ void matrix_sample_p1_batch_kernel(
     P1BatchDescriptors batch, size_t d, size_t columns, size_t n)
 {
     const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
     const auto source = job.input[batch.indices[0]];
     if constexpr (Large) {
         matrix_sample_p1_integer_cached_kernel_large_body(
@@ -1418,6 +1420,7 @@ __global__ void matrix_scatter_p1_batch_kernel(
     P1BatchDescriptors batch, size_t polynomials, size_t n)
 {
     const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
     const auto output = job.output[batch.indices[blockIdx.z]];
     matrix_scatter_p1_integer_to_limb_kernel_body(
         job.samples, output.base, output.stride, output.width,
@@ -1678,6 +1681,7 @@ constexpr size_t kGadgetBatchMatrices = 64;
 struct GadgetBatchJob {
     const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *input, *output;
     GpuRngSeed seed;
+    const int32_t *completed = nullptr;
 };
 struct GadgetBatchDescriptors { GadgetBatchJob jobs[kGadgetBatchMatrices]; };
 static_assert(sizeof(GadgetBatchDescriptors) + 128 < 4096, "bounded gadget sampler arguments");
@@ -1688,6 +1692,7 @@ __global__ void matrix_sample_gadget_batch_kernel(
     uint32_t base_bits, uint32_t digits, double c)
 {
     const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
     const uint32_t tower = blockIdx.z;
     const auto input = job.input[tower];
     matrix_gauss_samp_gq_arb_base_sample_kernel_body(

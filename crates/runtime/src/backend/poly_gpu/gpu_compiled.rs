@@ -7,6 +7,7 @@
 mod gpu_batch;
 #[path = "gpu_preimage_prepared.rs"]
 mod gpu_preimage_prepared;
+pub(crate) use gpu_preimage_prepared::{PreparedPreimageCommand, PreparedPreimageOutput};
 
 pub(super) use super::gpu_claims::PreparedClaimBroker;
 
@@ -39,9 +40,14 @@ use mxx_primitives::{
     poly::dcrt::gpu::GpuRngSeed,
     sampler::{
         PolyTrapdoorSampler,
-        trapdoor::gpu::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor},
+        trapdoor::gpu::{
+            GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor, GpuPreimageAttempt,
+            GpuPreimageBatchResources,
+        },
     },
 };
+use num_bigint::{BigUint, Sign};
+use num_traits::{One, Zero};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum PreparedOperation {
@@ -127,7 +133,8 @@ pub(super) enum PreparedOperation {
         gadget_base: BigInt,
         digit_count: usize,
         public_rows: usize,
-        plan: PreimageClaimPlan,
+        /// Standalone owner-bearing command payload built during admission.
+        command: PreparedPreimageCommand,
     },
     Decompose {
         small: bool,
@@ -239,7 +246,7 @@ pub(super) enum ExecutionPayload {
 }
 
 pub(super) struct PreimagePayload {
-    pub trapdoors: Arc<Vec<GpuDCRTTrapdoor>>,
+    pub trapdoors: Arc<Vec<Arc<GpuDCRTTrapdoor>>>,
     pub public: GpuFleetMatrix,
     pub target: PolyMatrixColumnData<GpuFleetMatrix>,
     pub target_global_column_start: usize,
@@ -258,17 +265,69 @@ impl std::fmt::Debug for PreimagePayload {
 /// Exact native claims of one preimage invocation class, recorded before the
 /// inventory sealed by tracing one column; native layout queries specialize widths.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct PreimageClaimPlan {
+pub(crate) struct PreimageClaimPlan {
     /// Claims of the destination's hard-cutoff plan (after its payload owner).
     pub destination: Vec<GpuTracedClaim>,
     /// One-column claim order for materializing a staged target tile.
     pub tile: Vec<GpuTracedClaim>,
     /// One-column claim order for a candidate attempt with a prepared covariance cache.
     pub attempt: [Vec<GpuTracedClaim>; 16],
-    pub attempts: usize,
+    /// Immutable replay descriptor.  The retry bound and phase count are
+    /// fixed while the graph is prepared; submit only supplies the runtime
+    /// seed, target and owner-bearing operands.
+    pub replay: PreimageReplayPlan,
     /// Native RNS staging width of one full-level polynomial, so pilots stage
     /// a zero target through the same loader as production.
     pub bytes_per_poly: usize,
+}
+
+/// Fixed native schedule metadata for a prepared preimage invocation.
+///
+/// This intentionally contains no input payload.  Seeds and targets are
+/// execution operands, whereas the bounded retry schedule and its sixteen
+/// phase boundaries belong to the prepared graph.  Keeping this descriptor
+/// beside the traced claims also makes it impossible for a submit to silently
+/// choose a different retry schedule.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreimageReplayPlan {
+    pub attempts: usize,
+}
+
+impl PreimageReplayPlan {
+    pub(super) fn new(attempts: usize) -> Result<Self, String> {
+        if attempts == 0 {
+            return Err("preimage replay requires at least one bounded attempt".into());
+        }
+        Ok(Self { attempts })
+    }
+
+    pub(super) fn validate_attempt(&self, attempt: usize) -> Result<(), String> {
+        if attempt < self.attempts {
+            Ok(())
+        } else {
+            Err(format!(
+                "preimage replay attempt {attempt} exceeds prepared bound {}",
+                self.attempts
+            ))
+        }
+    }
+
+    /// Submit exactly one already-prepared native phase wave.  The only
+    /// per-submit values are the job owners, target tiles and seeds; the
+    /// bounded retry schedule is owned by this immutable descriptor.
+    pub(super) fn submit_attempt_into<'a>(
+        &self,
+        sampler: &GpuDCRTPolyTrapdoorSampler,
+        parameters: &GpuDCRTPolyParams,
+        jobs: &[GpuPreimageAttempt<'a>],
+        resources: &mut impl GpuPreimageBatchResources,
+        accepted: &mut [bool],
+    ) -> Result<(), String> {
+        if let Some(attempt) = jobs.first().map(|job| job.attempt) {
+            self.validate_attempt(attempt)?;
+        }
+        sampler.preimage_attempt_batch_into(parameters, jobs, resources, accepted)
+    }
 }
 
 impl PreimageClaimPlan {
@@ -465,6 +524,52 @@ pub(super) fn materialize_preimage_tile(
     Ok(tile)
 }
 
+/// Copy a current preimage target into a warmup-owned tile. The destination is
+/// consumed and returned so its allocation identity remains fixed while its
+/// write event orders the next native attempt.
+pub(super) fn copy_preimage_tile(
+    params: &GpuDCRTPolyParams,
+    target: &PolyMatrixColumnData<GpuFleetMatrix>,
+    rows: usize,
+    start: usize,
+    end: usize,
+    destination: GpuDCRTPolyMatrix,
+) -> Result<GpuDCRTPolyMatrix, String> {
+    match target.subrange(start, end) {
+        PolyMatrixColumnData::CpuStaging { bytes, start, end, .. } => {
+            let staged =
+                <GpuDCRTPolyMatrix as mxx_primitives::matrix::PolyMatrix>::from_cpu_staging_columns(
+                    params, &bytes, start, end,
+                );
+            if staged.size() != (rows, end - start) {
+                return Err("preimage target tile shape differs from the public matrix".into());
+            }
+            staged.column_view(0..end - start)?.copy(Some((destination, 0..rows, 0..end - start)))
+        }
+        PolyMatrixColumnData::Resident { value, start, end } => {
+            let shard = value
+                .shards()
+                .iter()
+                .find(|shard| {
+                    shard.value.params() == params &&
+                        shard.global_column_start <= start &&
+                        end - shard.global_column_start <= shard.value.col_size()
+                })
+                .ok_or("preimage target is not resident on the destination context")?;
+            shard
+                .value
+                .column_view(start - shard.global_column_start..end - shard.global_column_start)?
+                .copy(Some((destination, 0..rows, 0..end - start)))
+        }
+    }
+    .map(|mut tile| {
+        if !tile.is_ntt() {
+            tile.ntt_all_in_place();
+        }
+        tile
+    })
+}
+
 impl ExecutionPayload {
     fn seed(&self) -> Option<GpuRngSeed> {
         match self {
@@ -544,12 +649,20 @@ impl PreparedOperation {
         })?;
         Ok(Self::Preimage {
             ty: ty.clone(),
-            bound,
+            bound: bound.clone(),
             sigma_bits: sigma.to_bits(),
             gadget_base: gadget_base.clone(),
             digit_count,
             public_rows,
-            plan: plan.clone(),
+            command: PreparedPreimageCommand::new(
+                ty.clone(),
+                bound.clone(),
+                sigma,
+                gadget_base.clone(),
+                digit_count,
+                public_rows,
+                plan.clone(),
+            ),
         })
     }
 
@@ -887,7 +1000,35 @@ impl PreparedOperation {
                     })
                 }
             }
-            _ => None,
+            NodeKind::Input { .. } |
+            NodeKind::ConstantInt(_) |
+            NodeKind::EvaluateInt(_) |
+            NodeKind::ConstantReal(_) |
+            NodeKind::ConstantBool(_) |
+            NodeKind::GadgetTrapdoor { .. } |
+            NodeKind::TrapdoorPublic |
+            NodeKind::IntBinary(_) |
+            NodeKind::IntCompare(_) |
+            NodeKind::BitExtract { .. } |
+            NodeKind::IntToReal |
+            NodeKind::BoolToInt |
+            NodeKind::RealBinary(_) |
+            NodeKind::RealSqrt |
+            NodeKind::TrapdoorSample { .. } |
+            NodeKind::PreimageSample { .. } |
+            NodeKind::ExtractCoefficient { .. } |
+            NodeKind::LiftIntegerToConstantPolynomial { .. } |
+            NodeKind::ThresholdDecode { .. } |
+            NodeKind::PackPolynomialCoefficients { .. } |
+            NodeKind::PolynomialFromValues { .. } |
+            NodeKind::PolynomialValues { .. } |
+            NodeKind::SubgraphCall(_) |
+            NodeKind::ParallelLoop(_) |
+            NodeKind::SequentialLoop(_) |
+            NodeKind::FamilyPack { .. } |
+            NodeKind::FamilyGetStatic { .. } |
+            NodeKind::FamilyGetDynamic |
+            NodeKind::Select { .. } => None,
         })
     }
 
@@ -1943,11 +2084,11 @@ impl PreparedOperation {
 
     pub(super) fn source<'a>(
         &self,
-        inputs: &'a [Arc<GpuColumnShard<GpuDCRTPolyMatrix>>],
+        inputs: &'a [Arc<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>],
         matrix: &'a GpuFleetMatrix,
         index: PreparedMatrixSource,
         prepared_index: Option<usize>,
-    ) -> &'a GpuColumnShard<GpuDCRTPolyMatrix> {
+    ) -> &'a GpuColumnShard<Arc<GpuDCRTPolyMatrix>> {
         match index {
             PreparedMatrixSource::Shard(index) => &matrix.shards[index],
             PreparedMatrixSource::Replica { .. } | PreparedMatrixSource::Fragment { .. } => {
@@ -1960,14 +2101,13 @@ impl PreparedOperation {
     /// caller owns the complete destination until all of its ranges are filled.
     pub(super) fn run(
         &self,
-        left: Option<&GpuColumnShard<GpuDCRTPolyMatrix>>,
-        right: &[&GpuColumnShard<GpuDCRTPolyMatrix>],
-        compact: Option<&GpuColumnShard<GpuSmallMatrix>>,
+        left: Option<&GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>,
+        right: &[&GpuColumnShard<Arc<GpuDCRTPolyMatrix>>],
+        compact: Option<&GpuColumnShard<Arc<GpuSmallMatrix>>>,
         start: usize,
         end: usize,
         destination: (PreparedMatrixValue, std::ops::Range<usize>, std::ops::Range<usize>),
         payload: &ExecutionPayload,
-        broker: &PreparedClaimBroker,
     ) -> Result<PreparedMatrixValue, String> {
         let seed = payload.seed();
         if matches!(self, Self::Preimage { .. }) {
@@ -1980,19 +2120,26 @@ impl PreparedOperation {
             let ExecutionPayload::Preimage(payload) = payload else {
                 return Err("preimage invocation has no operands".into());
             };
-            return self
-                .run_preimage_batch(
-                    vec![gpu_preimage_prepared::PreparedPreimageJob {
-                        output,
-                        destination_column: columns.start,
-                        start,
-                        end,
-                        payload,
-                        public: &left.expect("admitted Preimage public matrix").value,
-                    }],
-                    broker,
-                )
-                .map(|mut outputs| PreparedMatrixValue::Compact(outputs.remove(0)));
+            let Self::Preimage { command, .. } = self else { unreachable!("preimage operation") };
+            let tape = command
+                .tape_for(output.params().context_identity(), end - start)
+                .ok_or("preimage has no warmup-owned command tape for this context and width")?;
+            let mut outputs = command.submit_batch(
+                tape,
+                vec![gpu_preimage_prepared::PreparedPreimageJob {
+                    trapdoor: &payload.trapdoors[0],
+                    output: Arc::new(output),
+                    destination_column: columns.start,
+                    start,
+                    end,
+                    payload,
+                    public: &left.expect("admitted Preimage public matrix").value,
+                }]
+                .into_boxed_slice(),
+            )?;
+            let output = Arc::try_unwrap(outputs.remove(0))
+                .map_err(|_| "preimage output remained aliased".to_owned())?;
+            return Ok(PreparedMatrixValue::Compact(output));
         }
         if let Self::ImportCompact { ty, bound } = self {
             let (PreparedMatrixValue::Compact(mut output), rows, columns) = destination else {
@@ -2441,7 +2588,7 @@ pub(super) struct CompiledMatrixInvocation {
     pub(super) caller_compact: Option<u64>,
     pub(super) plan: GpuColumnMemoryPlan,
     pub(super) template: Arc<CompiledMatrixInvocationTemplate>,
-    pub(super) prepared: Arc<[Arc<GpuColumnShard<GpuDCRTPolyMatrix>>]>,
+    pub(super) prepared: Arc<[Arc<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>]>,
     pub(super) prepared_inputs: Arc<[PreparedInputSelector]>,
 }
 
@@ -2779,11 +2926,15 @@ impl CompiledMatrixInvocation {
                     "validated IR node does not determine a prepared matrix operation".into(),
                 )
             })?,
-            Some(node) => Self::lower_ir(node, backend)?.ok_or_else(|| {
-                PolyBackendError::GpuSubmission(
-                    "validated IR node does not determine a prepared matrix operation".into(),
-                )
-            })?,
+            Some(node) => match Self::lower_ir(node, backend)? {
+                Some(operation) => operation,
+                None => {
+                    crate::backend::poly_gpu::record_prepared_generic_fallback();
+                    return Err(PolyBackendError::GpuSubmission(
+                        "validated IR node does not determine a prepared matrix operation".into(),
+                    ));
+                }
+            },
             None => Self::from_invocation(request, &operands, backend)?,
         };
         let mut input_layouts: MatrixInputLayouts = operands
@@ -3653,6 +3804,33 @@ impl CompiledMatrixInvocation {
         }
     }
 
+    fn packed_polynomial_coefficients(
+        ty: &ConcreteMatrixType,
+        bits: &[bool],
+        coefficient_bits: usize,
+    ) -> Result<Vec<BigInt>, PolyBackendError> {
+        if !ty.is_scalar() ||
+            coefficient_bits == 0 ||
+            bits.len() != ty.ring_dimension.saturating_mul(coefficient_bits)
+        {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let modulus = ty.modulus.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+        bits.chunks_exact(coefficient_bits)
+            .map(|coefficient_bits| {
+                let mut coefficient = BigUint::zero();
+                for (position, bit) in coefficient_bits.iter().copied().enumerate() {
+                    if bit {
+                        coefficient |= BigUint::one() << position;
+                    }
+                }
+                (coefficient < modulus)
+                    .then_some(BigInt::from_biguint(Sign::Plus, coefficient))
+                    .ok_or(PolyBackendError::InvalidInteger)
+            })
+            .collect()
+    }
+
     /// The invocation's own operation, for a caller that identifies no IR node: a
     /// fusion result, a sampler algorithm step, an artifact or transcript import,
     /// or a direct primitive call. Operations whose kind the validated IR
@@ -3938,6 +4116,18 @@ impl CompiledMatrixInvocation {
                 evaluation: *evaluation,
             });
         }
+        if let GpuInvocation::PackPolynomialCoefficients { ty, bits, coefficient_bits } = request {
+            backend.devices[0].1.parameters(ty)?;
+            return Ok(PreparedOperation::Polynomial {
+                ty: (**ty).clone(),
+                coefficients: CompiledMatrixInvocation::packed_polynomial_coefficients(
+                    ty,
+                    bits,
+                    *coefficient_bits,
+                )?,
+                evaluation: false,
+            });
+        }
         if let GpuInvocation::Constant { ty, value, env } = request {
             return PreparedOperation::constant(
                 ty,
@@ -4089,7 +4279,7 @@ impl CompiledMatrixInvocation {
     pub(super) fn compact_shard<'a>(
         compact: Option<&'a GpuFleetSmallMatrix>,
         source: Option<PreparedMatrixSource>,
-    ) -> Option<&'a GpuColumnShard<GpuSmallMatrix>> {
+    ) -> Option<&'a GpuColumnShard<Arc<GpuSmallMatrix>>> {
         match (compact, source) {
             (Some(compact), Some(PreparedMatrixSource::Shard(index))) => compact.shards.get(index),
             _ => None,
@@ -4642,9 +4832,6 @@ impl GpuDcrtBackend {
         let scratch_intervals = intervals.clone();
         let scratch_operation = operation.clone();
         let scratch_rows = operation.scratch_rows()?;
-        let brokers = Arc::new(
-            intervals.iter().map(|range| self.claim_broker(&range.parameters)).collect::<Vec<_>>(),
-        );
         let mut measurement = self.admitted_measurement_sink.as_mut().map(|sink| {
             // Normalize logical owner aliases within the invocation, so fresh
             // allocations with the same layout do not create a new scenario.
@@ -4856,7 +5043,6 @@ impl GpuDcrtBackend {
                             job.start - range.interval.start..job.end - range.interval.start,
                         ),
                         &payload,
-                        &brokers[job.source_interval],
                     )
                     .map_err(GpuAdmissionError::NativeReservation)?;
                 outputs[range.destination] = Some(GpuColumnShard { value, ..output });
@@ -4886,6 +5072,28 @@ mod tests {
         poly::dcrt::params::DCRTPolyParams,
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
+
+    #[test]
+    fn packed_polynomial_coefficients_are_resolved_once_and_checked() {
+        let ty = ConcreteMatrixType {
+            modulus: BigInt::from(257u16),
+            ring_dimension: 3,
+            rows: 1,
+            columns: 1,
+        };
+        let bits = [true, false, true, false, true, true];
+        assert_eq!(
+            CompiledMatrixInvocation::packed_polynomial_coefficients(&ty, &bits, 2).unwrap(),
+            vec![BigInt::from(1u8), BigInt::from(1u8), BigInt::from(3u8)]
+        );
+        assert!(
+            CompiledMatrixInvocation::packed_polynomial_coefficients(&ty, &bits[..5], 2).is_err()
+        );
+        let narrow = ConcreteMatrixType { modulus: BigInt::from(3u8), ..ty };
+        assert!(
+            CompiledMatrixInvocation::packed_polynomial_coefficients(&narrow, &bits, 2).is_err()
+        );
+    }
 
     #[test]
     #[serial_test::serial(gpu_context)]
@@ -5622,7 +5830,7 @@ mod tests {
                 GpuInvocation::MultiplySmallRhsRowBlocks { blocks: &block_refs, right: &rhs },
             ),
         ];
-        let read = |shard: &GpuColumnShard<GpuDCRTPolyMatrix>| {
+        let read = |shard: &GpuColumnShard<Arc<GpuDCRTPolyMatrix>>| {
             assert!(shard.value.is_ntt());
             let events = shard.value.rns_store_completion_events().unwrap();
             let transfer = params
@@ -6394,7 +6602,7 @@ mod tests {
             .collect::<Vec<_>>();
         for _ in 0..2 {
             backend.preflight_gpu_operations(&requests).unwrap();
-            assert!(backend.calibration_registry.is_empty(), "production must not calibrate");
+            assert!(backend.calibration_registry().is_empty(), "production must not calibrate");
             assert!(
                 backend
                     .crt_recompose(&level_sets[1], &plaintext[0], &coefficients[0], &ty)
@@ -6628,7 +6836,7 @@ mod tests {
             .collect::<Vec<_>>();
         for _ in 0..2 {
             backend.preflight_gpu_operations(&requests).unwrap();
-            assert!(backend.calibration_registry.is_empty(), "production must not calibrate");
+            assert!(backend.calibration_registry().is_empty(), "production must not calibrate");
             let outputs = conversions
                 .iter()
                 .zip(&types)
@@ -6875,7 +7083,7 @@ mod tests {
             .collect::<Vec<_>>();
         for _ in 0..2 {
             backend.preflight_gpu_operations(&requests).unwrap();
-            assert!(backend.calibration_registry.is_empty(), "production must not calibrate");
+            assert!(backend.calibration_registry().is_empty(), "production must not calibrate");
             let outputs = conversions
                 .iter()
                 .map(|conversion| {
@@ -7117,7 +7325,7 @@ mod tests {
         for _ in 0..2 {
             backend.preflight_gpu_operations(&requests).unwrap();
             assert_eq!(
-                backend.calibration_registry.len(),
+                backend.calibration_registry().len(),
                 0,
                 "source bases must not trigger production calibration"
             );

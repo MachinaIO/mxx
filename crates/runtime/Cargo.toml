@@ -8,6 +8,7 @@ description = "Execution backends, transcripts, and in-memory artifacts for mxx 
 [features]
 default = []
 gpu = ["mxx-primitives/gpu"]
+gpu-instrumentation = ["gpu", "mxx-primitives/gpu-instrumentation"]
 
 [dependencies]
 bincode.workspace = true

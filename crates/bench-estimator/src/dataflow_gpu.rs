@@ -23,10 +23,14 @@ fn error(e: impl fmt::Display) -> GpuMeasurementError {
 
 fn finish(value: &RuntimeValue<GpuDcrtBackend>) {
     match value {
-        RuntimeValue::Matrix(matrix) => matrix.wait_until_ready(),
-        RuntimeValue::SmallMatrix(matrix) => matrix.wait_until_ready(),
+        RuntimeValue::Matrix(matrix) => {
+            let _ = matrix.wait_until_ready();
+        }
+        RuntimeValue::SmallMatrix(matrix) => {
+            let _ = matrix.wait_until_ready();
+        }
         RuntimeValue::Trapdoor { public, secret, .. } => {
-            public.wait_until_ready();
+            let _ = public.wait_until_ready();
             if let Some(secret) = secret {
                 secret.wait_until_ready();
             }
@@ -331,7 +335,7 @@ impl TransferMeasurements {
                         let restored = backend
                             .matrix_from_cpu_staging_bytes(matrix, raw.as_ref().unwrap())
                             .map_err(error)?;
-                        restored.wait_until_ready();
+                        let _ = restored.wait_until_ready();
                         restored_matrix = Some(restored);
                     }
                     TransferKind::Export => {

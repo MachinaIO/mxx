@@ -12,6 +12,7 @@ struct GpuMatrixDispatchPermit;
 struct GpuPreparedWorkspaceLease;
 struct GpuPreparedPinnedLease;
 struct GpuPreparedResourceLease;
+struct GpuPreparedProvisioningPermit;
 
 // Negative native status returned when a valid prepared claim lost its slot
 // to a concurrent pre-submission reservation.
@@ -127,6 +128,18 @@ struct GpuPreparedOccupancy {
 };
 
 extern "C" {
+
+// Setup-only authority for constructing new prepared backing after the
+// execution owner has been sealed. The request list is consumed in order by
+// the matching matrix/workspace construction sites; it never disables the
+// ordinary admission seal and cannot coexist with a dispatch permit.
+int gpu_prepared_provision_begin(
+    GpuContext *context, const GpuClaimTraceEntry *claims, size_t count,
+    GpuPreparedProvisioningPermit **out);
+int gpu_prepared_provision_enter(GpuPreparedProvisioningPermit *permit);
+int gpu_prepared_provision_finish(GpuPreparedProvisioningPermit *permit);
+void gpu_prepared_provision_cancel(GpuPreparedProvisioningPermit *permit);
+int gpu_prepared_provisioning_active(const GpuContext *context);
 
 // Explicit setup only. The caller transfers ownership of the backing matrices
 // through owner/release_owner on success. Optional typed workspaces, missing

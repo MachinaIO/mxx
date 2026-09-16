@@ -8,6 +8,10 @@ extern "C"
 #endif
 
 typedef struct GpuSmallMatrix GpuSmallMatrix;
+typedef struct GpuPreparedSmallRhs GpuPreparedSmallRhs;
+typedef struct GpuPreparedPreimageCutoff GpuPreparedPreimageCutoff;
+int gpu_preimage_cutoff_layout(GpuSmallMatrix *output, GpuPreparedWorkspaceLayout *layouts, size_t *count);
+int gpu_preimage_cutoff_is_ready(const GpuPreparedPreimageCutoff *plan, bool *ready);
 
 typedef struct GpuSmallMatrixAllocationReport
 {
@@ -35,6 +39,8 @@ int gpu_small_matrix_create(
     GpuSmallMatrix **out);
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
 int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
+int gpu_small_matrix_prepare_readback(GpuSmallMatrix *mat, uint8_t *payload, size_t bytes);
+int gpu_small_matrix_read_prepared(const GpuSmallMatrix *mat);
 int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src);
 int gpu_small_matrix_copy_columns(
     GpuSmallMatrix *out,
@@ -75,6 +81,16 @@ int gpu_small_matrix_pack_preimage_batch(
     GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
     const size_t *dst_rows, const size_t *dst_columns, size_t count, int32_t *accepted);
 
+int gpu_small_matrix_prepare_preimage_cutoff(
+    GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
+    const size_t *dst_rows, const size_t *dst_columns, size_t count,
+    int32_t *host_status, GpuPreparedPreimageCutoff **out);
+int gpu_small_matrix_begin_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
+int gpu_small_matrix_submit_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
+int gpu_small_matrix_finish_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
+int gpu_small_matrix_wait_preimage_cutoff(const GpuPreparedPreimageCutoff *plan);
+void gpu_small_matrix_destroy_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
+
 int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     GpuSmallMatrix *dst,
     const GpuMatrix *src,
@@ -95,6 +111,19 @@ int gpu_matrix_mul_small_rhs(
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
     GpuSmallMatrixAllocationReport *allocation_report, const GpuMatrixBatchView *views);
+// Prepare one fixed compact-RHS multiplication.  The compact RHS NTT and its
+// typed workspace are built once; submit only rebinds a same-shape evaluation
+// input and replays the fixed accumulation launch.
+int gpu_matrix_prepare_small_rhs(
+    const GpuMatrix *input_template,
+    GpuMatrix *output,
+    const GpuSmallMatrix *rhs_small,
+    size_t residency_budget_bytes,
+    GpuPreparedSmallRhs **out_plan);
+int gpu_matrix_submit_small_rhs(
+    const GpuPreparedSmallRhs *plan,
+    const GpuMatrix *input);
+void gpu_matrix_destroy_prepared_small_rhs(GpuPreparedSmallRhs *plan);
 #ifdef __cplusplus
 }
 #endif

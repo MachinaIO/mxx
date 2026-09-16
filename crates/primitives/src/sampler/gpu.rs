@@ -356,6 +356,16 @@ mod tests {
     }
 
     #[test]
+    fn test_hash_seed_changes_with_key_and_tag() {
+        let key = [7u8; 32];
+        let same = hash_seed_for_matrix::<Keccak256>(key, b"fixed-prefix");
+        let changed_key = hash_seed_for_matrix::<Keccak256>([8u8; 32], b"fixed-prefix");
+        let changed_tag = hash_seed_for_matrix::<Keccak256>(key, b"changed-prefix");
+        assert_ne!(same, changed_key);
+        assert_ne!(same, changed_tag);
+    }
+
+    #[test]
     #[sequential]
     fn test_gpu_uniform_sampler_size() {
         gpu_device_sync();

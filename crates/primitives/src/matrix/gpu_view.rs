@@ -815,41 +815,8 @@ impl GpuDCRTPolyMatrixColumnView<'_> {
         if rows == 0 || columns == 0 {
             return Ok(output);
         }
-        let source_primes = &self.params().moduli()[..=self.owner.level];
-        let target_primes = parameters.moduli();
-        let (mode, plaintext_modulus) = match conversion {
-            GpuMatrixModulusConversion::Reduce => (0, 0),
-            GpuMatrixModulusConversion::Round => (1, 0),
-            GpuMatrixModulusConversion::CenteredExtend => (2, 0),
-            GpuMatrixModulusConversion::BlockSwitch { plaintext_modulus } => (3, plaintext_modulus),
-        };
-        let division_inverses = target_primes
-            .par_iter()
-            .map(|prime| {
-                if mode == 0 || mode == 2 {
-                    return Ok(1);
-                }
-                let product = source_primes
-                    .iter()
-                    .filter(|p| !target_primes.contains(p))
-                    .fold(1u64, |product, p| {
-                        ((product as u128 * (*p % prime) as u128) % *prime as u128) as u64
-                    });
-                crate::utils::mod_inverse(product, *prime)
-                    .ok_or("discarded CRT product is not invertible")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let input_scales = source_primes
-            .par_iter()
-            .map(|prime| {
-                if mode != 3 {
-                    Ok(1)
-                } else {
-                    crate::utils::mod_inverse(plaintext_modulus % prime, *prime)
-                        .ok_or("plaintext modulus is not invertible")
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let (mode, plaintext_modulus, division_inverses, input_scales) =
+            super::gpu_prepared::conversion_arguments(self.owner, parameters, conversion)?;
         let coefficients = (!is_reduce && self.owner.is_ntt)
             .then(|| self.copy(None).map(|input| input.into_coeff_domain()))
             .transpose()?;
@@ -3277,6 +3244,62 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_conversion_rejects_shape_and_level_rebinding() {
+        use super::super::gpu_prepared::GpuPreparedModulusConversion;
+        use std::sync::Arc;
+
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let narrow = DCRTPolyParams::new(n, 2, 17, 4, None, None).to_crt().0;
+        let wide = DCRTPolyParams::new(n, 1, 54, 4, None, None).to_crt().0[0];
+        let full_primes = vec![narrow[0], wide, narrow[1]];
+        let small_cpu = DCRTPolyParams::new(n, 2, 17, 4, Some(vec![narrow[1], narrow[0]]), None);
+        let full = GpuDCRTPolyParams::new(n, full_primes, 4, None);
+        let small = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            small_cpu.to_crt().0,
+            4,
+            full.gpu_ids().to_vec(),
+            Some(1),
+            Some(&full),
+            None,
+        );
+        let source = GpuDCRTPolyMatrix::new_zero_with_state(&full, 2, 3, 2, true);
+        let target = GpuDCRTPolyMatrix::new_zero_with_state(&small, 2, 3, 1, true);
+        let plan = Arc::new(
+            GpuPreparedModulusConversion::new(&source, &target, GpuMatrixModulusConversion::Reduce)
+                .unwrap(),
+        );
+        assert!(
+            GpuPreparedModulusConversion::bind(
+                Arc::clone(&plan),
+                Arc::new(source.clone()),
+                &target,
+            )
+            .is_ok()
+        );
+
+        let larger_source = Arc::new(GpuDCRTPolyMatrix::new_zero_with_state(&full, 3, 3, 2, true));
+        let larger_target = Arc::new(GpuDCRTPolyMatrix::new_zero_with_state(&small, 3, 3, 1, true));
+        assert!(
+            GpuPreparedModulusConversion::bind(
+                Arc::clone(&plan),
+                larger_source,
+                larger_target.as_ref()
+            )
+            .is_err()
+        );
+
+        let lower_source = Arc::new(GpuDCRTPolyMatrix::new_zero_with_state(&full, 2, 3, 1, true));
+        let lower_target = Arc::new(GpuDCRTPolyMatrix::new_zero_with_state(&small, 2, 3, 0, true));
+        assert!(
+            GpuPreparedModulusConversion::bind(plan, lower_source, lower_target.as_ref()).is_err()
+        );
     }
 
     #[test]

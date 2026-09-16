@@ -58,13 +58,6 @@ pub struct ExecutionConfig {
     /// When set, also drain pending releases before returning. With `None`,
     /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
-    /// By default, derive the complete prepared GPU inventory from the graph and accept it
-    /// before the first node executes. Graphs containing kinds without a
-    /// compiled admitted runner fail before any partial execution. The caller
-    /// asserts exclusive device observation during setup. Resource-discovery
-    /// trials must already have run in explicit backend warmup; production
-    /// reports missing plans rather than executing synthetic GPU work.
-    pub prepared_gpu_admission: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -73,7 +66,6 @@ impl Default for ExecutionConfig {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
-            prepared_gpu_admission: true,
         }
     }
 }
@@ -444,6 +436,15 @@ pub struct ExecutionResult<B: Backend> {
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
     pub staged_family_leases: Vec<StagedFamilyLease>,
+    pub(crate) prepared_outputs: Option<std::sync::Arc<dyn PreparedOutputLease<B>>>,
+}
+
+/// A prepared backend owns one invocation lease and resolves all exports from
+/// its immutable warmup descriptor tree.  The executor deliberately does not
+/// retain one closure/map entry per output.
+pub(crate) trait PreparedOutputLease<B: Backend>: Send {
+    fn output_names(&self) -> &[String];
+    fn materialize(&self, name: &str, backend: &mut B) -> Result<RuntimeValue<B>, ExecutionError>;
 }
 
 /// A dispatch-only optimization: the original graph, validation and producer
@@ -991,6 +992,18 @@ pub struct StagedFamilyLease {
 }
 
 impl<B: Backend> ExecutionResult<B> {
+    /// Returns every exported name, including outputs whose payload is still
+    /// owned by a prepared backend lease.  Deferred outputs intentionally do
+    /// not fabricate a `RuntimeValue` merely to make enumeration complete.
+    pub fn output_names(&self) -> impl Iterator<Item = &str> {
+        self.outputs.keys().map(String::as_str).chain(
+            self.prepared_outputs
+                .as_deref()
+                .into_iter()
+                .flat_map(|lease| lease.output_names().iter().map(String::as_str)),
+        )
+    }
+
     /// Materializes a named output that the executor returned as a lazy or streamed artifact.
     ///
     /// Parallel-loop families may be streamed through the artifact store so their live backend
@@ -1003,6 +1016,14 @@ impl<B: Backend> ExecutionResult<B> {
         backend: &mut B,
         store: &mut S,
     ) -> Result<&RuntimeValue<B>, ExecutionError> {
+        if !self.outputs.contains_key(name) {
+            let value = self
+                .prepared_outputs
+                .as_ref()
+                .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?
+                .materialize(name, backend)?;
+            self.outputs.insert(name.to_owned(), value);
+        }
         let value = self
             .outputs
             .get_mut(name)
@@ -1068,6 +1089,10 @@ struct ExecutableNode<'a> {
 pub enum ExecutionError {
     #[error("backend operation failed: {0}")]
     Backend(String),
+    #[error(
+        "prepared preimage sampling exhausted at columns {column_start}..{column_end} after {attempts} attempts"
+    )]
+    SamplingExhausted { column_start: usize, column_end: usize, attempts: usize },
     #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
     PreimageProgressMismatch { expected: usize, actual: usize },
     #[error("artifact operation failed: {0}")]
@@ -1281,26 +1306,31 @@ where
     B: Backend,
     S: SessionStore,
 {
+    if let Some(mut result) = backend
+        .execute_prepared_graph(validated, &inputs)
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?
+    {
+        if result.production_id.is_none() {
+            result.production_id = session;
+        }
+        return Ok((result, BTreeMap::new()));
+    }
     let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
         .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
     let spec_hash_bytes = spec_hash.0;
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
-    let graph_admission = if config.prepared_gpu_admission {
-        backend
-            .prepare_graph_admission(
-                spec_hash_bytes,
-                validated,
-                capture_trace,
-                &inputs,
-                config.max_parallel_instances.get(),
-                false,
-            )
-            .map_err(|error| ExecutionError::Backend(error.to_string()))?
-    } else {
-        None
-    };
+    let graph_admission = backend
+        .prepare_graph_admission(
+            spec_hash_bytes,
+            validated,
+            capture_trace,
+            &inputs,
+            config.max_parallel_instances.get(),
+            false,
+        )
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
     let mut executor = Executor {
         validated,
         backend,
@@ -1440,6 +1470,7 @@ where
         production_id,
         artifact_handles,
         staged_family_leases,
+        prepared_outputs: None,
     };
     drop(graph_admission);
     Ok((result, executor.trace.take().unwrap_or_default()))
@@ -6770,7 +6801,147 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    struct TestPreparedLease {
+        names: Box<[String]>,
+        fail: Mutex<bool>,
+    }
+
+    impl PreparedOutputLease<PlacementProbeBackend> for TestPreparedLease {
+        fn output_names(&self) -> &[String] {
+            &self.names
+        }
+
+        fn materialize(
+            &self,
+            _name: &str,
+            _backend: &mut PlacementProbeBackend,
+        ) -> Result<RuntimeValue<PlacementProbeBackend>, ExecutionError> {
+            let mut fail = self.fail.lock().unwrap();
+            if std::mem::take(&mut *fail) {
+                Err(ExecutionError::Backend("transient resolver failure".into()))
+            } else {
+                Ok(RuntimeValue::Bool(true))
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_output_resolver_survives_materialization_failure() {
+        let mut backend = PlacementProbeBackend::default();
+        let mut result = ExecutionResult {
+            outputs: BTreeMap::new(),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(Arc::new(TestPreparedLease {
+                names: vec!["value".to_owned()].into_boxed_slice(),
+                fail: Mutex::new(true),
+            })),
+        };
+        let mut store = MemoryArtifactStore::default();
+        assert!(result.materialize_output("value", &mut backend, &mut store).is_err());
+        assert!(!result.outputs.contains_key("value"));
+        let value = result.materialize_output("value", &mut backend, &mut store).unwrap();
+        assert!(matches!(value, RuntimeValue::Bool(true)));
+    }
+
+    #[test]
+    fn output_names_include_deferred_without_fabricating_values() {
+        let result = ExecutionResult::<PlacementProbeBackend> {
+            outputs: BTreeMap::from([("resident".to_owned(), RuntimeValue::Bool(true))]),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(Arc::new(TestPreparedLease {
+                names: vec!["deferred".to_owned()].into_boxed_slice(),
+                fail: Mutex::new(false),
+            })),
+        };
+        assert_eq!(result.output_names().collect::<Vec<_>>(), ["resident", "deferred"]);
+        assert!(!result.outputs.contains_key("deferred"));
+    }
+
+    #[test]
+    fn prepared_hook_bypasses_executor_after_explicit_warmup() {
+        let context = DslContext::new("prepared-hook-bypass");
+        let flag = Ring::new(97, 8usize).bool_input("flag");
+        let graph = context
+            .output("out", flag)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = PlacementProbeBackend::default();
+        Backend::prepare_graph_admission(
+            &mut backend,
+            [0; 32],
+            &graph,
+            false,
+            &BTreeMap::new(),
+            1,
+            true,
+        )
+        .unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let result = execute(
+            &graph,
+            &mut backend,
+            BTreeMap::from([(String::from("flag"), RuntimeValue::Bool(true))]),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert!(matches!(result.outputs["out"], RuntimeValue::Bool(true)));
+        assert_eq!(backend.prepared_dispatches, 1);
+    }
+
+    #[test]
+    fn prepared_hook_reuses_existing_session_production_id() {
+        let context = DslContext::new("prepared-hook-session-id");
+        let flag = Ring::new(97, 8usize).bool_input("flag");
+        let graph = context
+            .output("out", flag)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = PlacementProbeBackend::default();
+        Backend::prepare_graph_admission(
+            &mut backend,
+            [0; 32],
+            &graph,
+            false,
+            &BTreeMap::new(),
+            1,
+            true,
+        )
+        .unwrap();
+        let production = mxx_ir_core::artifact::ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
+            execution_nonce: [9; 32],
+        };
+        let mut store = MemoryArtifactStore::default();
+        let (result, _) = execute_internal(
+            &graph,
+            &mut backend,
+            BTreeMap::from([(String::from("flag"), RuntimeValue::Bool(true))]),
+            &mut store,
+            SamplingMode::Fresh,
+            false,
+            Some(production.clone()),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(result.production_id, Some(production));
+        assert_eq!(backend.prepared_dispatches, 1);
+    }
 
     #[test]
     fn wave_admission_staging_is_per_output_port() {
@@ -7999,6 +8170,8 @@ mod tests {
         fail_broadcast_preparation: bool,
         fail_move_at: Option<usize>,
         fail_at: Option<(SmallMatrixSemanticKind, usize)>,
+        prepared_graph: Option<usize>,
+        prepared_dispatches: usize,
     }
 
     macro_rules! unused_probe_operation {
@@ -8013,6 +8186,49 @@ mod tests {
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        fn prepare_graph_admission(
+            &mut self,
+            _spec_hash: [u8; 32],
+            validated: &mxx_ir_core::ValidatedGraph,
+            _capture_trace: bool,
+            _inputs: &BTreeMap<String, RuntimeValue<Self>>,
+            _wave_bound: usize,
+            warm_up: bool,
+        ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error> {
+            if warm_up {
+                self.prepared_graph = Some(validated as *const _ as usize);
+            }
+            Ok(None)
+        }
+
+        fn execute_prepared_graph(
+            &mut self,
+            validated: &mxx_ir_core::ValidatedGraph,
+            inputs: &BTreeMap<String, RuntimeValue<Self>>,
+        ) -> Result<Option<ExecutionResult<Self>>, Self::Error> {
+            if self.prepared_graph != Some(validated as *const _ as usize) {
+                return Ok(None);
+            }
+            self.prepared_dispatches += 1;
+            let value = inputs
+                .values()
+                .next()
+                .cloned()
+                .ok_or(PlacementProbeError::ForcedFailure { placement: self.active })?;
+            Ok(Some(ExecutionResult {
+                outputs: validated
+                    .source
+                    .outputs()
+                    .keys()
+                    .map(|name| (name.clone(), value.clone()))
+                    .collect(),
+                production_id: None,
+                artifact_handles: BTreeMap::new(),
+                staged_family_leases: Vec::new(),
+                prepared_outputs: None,
+            }))
+        }
 
         fn admit_wave(
             &mut self,

@@ -11,7 +11,7 @@
 use super::{
     gpu_compiled::{
         AdmittedScopeOperations, InventoryOperation, PreimageClaimPlan, PreimagePlanKey,
-        PreparedOperation, TrapdoorPlanKey,
+        PreimageReplayPlan, PreparedOperation, TrapdoorPlanKey,
     },
     *,
 };
@@ -27,14 +27,17 @@ use mxx_primitives::{
         PolyMatrix, PolyMatrixColumnData,
         gpu_dcrt_poly::{
             GpuCompactTransferKind, GpuCpuStagingLayout, GpuDCRTPolyMatrix, GpuGraphAdmissionGuard,
-            GpuPreparedRequest, GpuPreparedSlotKind, GpuPreparedSlotSnapshot, GpuPreparedStorage,
-            GpuPreparedWorkspaceLayout, GpuTracedClaim, trace_native_claims,
+            GpuPreparedProvisioningPermit, GpuPreparedRequest, GpuPreparedSlotKind,
+            GpuPreparedSlotSnapshot, GpuPreparedStorage, GpuPreparedWorkspaceLayout,
+            GpuTracedClaim, trace_native_claims,
         },
     },
     sampler::{PolyTrapdoorSampler, trapdoor::gpu::GpuDCRTPolyTrapdoorSampler},
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const PREPARED_STORAGE_INSTANCES: usize = 2;
 
 #[derive(Clone)]
 pub(super) struct RootInputDescriptor {
@@ -58,6 +61,31 @@ pub(super) struct PreparedGraphAdmission {
 }
 
 pub(super) type PreparedGraphAssignment = BTreeMap<u64, Vec<GpuPreparedRequest>>;
+
+/// Stable identity of one prepared command stream.  The physical device is
+/// explicit because fleet order is not a CUDA device identity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(crate) struct PreparedScheduleStreamKey {
+    pub instance: usize,
+    pub command: usize,
+    pub stream: usize,
+    pub device: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PreparedScheduleResourceBinding {
+    pub key: PreparedScheduleStreamKey,
+    pub storage: super::gpu_prepared_lowering::PreparedStorageBinding,
+    pub request: GpuPreparedRequest,
+}
+
+/// The detached region and exact event-slot bindings remain owned together
+/// until every schedule using them has been dropped.  The native schedule
+/// owns the actual `GpuCudaResource`; this table only records its authorized
+/// physical slot, so replay never searches inventory or creates an event.
+pub(crate) struct PreparedScheduleBindings {
+    pub entries: Box<[PreparedScheduleResourceBinding]>,
+}
 
 /// Possible source boundaries and a descending list of containing owner widths.
 /// Capacities are not execution intervals. For alternative family layouts, rank
@@ -539,6 +567,13 @@ fn source_levels(layout: Option<&GpuInventoryValue>, full_level: usize) -> Vec<u
 }
 
 impl GpuContextDemand {
+    pub(super) fn add_required_matrix_claims(
+        &mut self,
+        claims: impl IntoIterator<Item = GpuTracedClaim>,
+    ) {
+        self.matrix_required_claims.extend(claims.into_iter().map(|claim| (usize::MAX, claim)));
+    }
+
     fn same_timeline(&self, other: &Self) -> bool {
         self.instance_count == other.instance_count &&
             self.matrix_claims == other.matrix_claims &&
@@ -1834,6 +1869,296 @@ pub(super) fn input_contract(input_columns: &BTreeMap<WireRef, GpuInventoryValue
 }
 
 impl GpuDcrtBackend {
+    fn prepared_output_codec_claims(
+        &self,
+        program: &super::gpu_prepared_lowering::PreparedProgram,
+    ) -> Result<Vec<(GpuDCRTPolyParams, Vec<GpuTracedClaim>)>, PolyBackendError> {
+        let mut claims = Vec::new();
+        for wire in &program.outputs {
+            let Some(matrix) = program.wire_types[wire].matrix_type() else {
+                continue;
+            };
+            let location = program.values.get(wire).ok_or_else(|| {
+                PolyBackendError::GpuSubmission("prepared output has no location".into())
+            })?;
+            let backend = self
+                .devices
+                .iter()
+                .find(|(device, _)| *device == location.device)
+                .map(|(_, backend)| backend)
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let params = backend.parameters(matrix)?.clone();
+            let transfer = params
+                .compact_transfer_workspace(
+                    location.level,
+                    matrix.rows,
+                    matrix.columns,
+                    GpuCompactTransferKind::Store,
+                )
+                .map_err(PolyBackendError::GpuSubmission)?;
+            claims.push((
+                params,
+                vec![
+                    GpuTracedClaim::matrix(
+                        matrix.rows,
+                        matrix.columns,
+                        location.level,
+                        matches!(
+                            location.format,
+                            super::gpu_prepared_lowering::PreparedFormat::Evaluation
+                        ),
+                    ),
+                    GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
+                        kind: GpuPreparedSlotKind::SubmissionStream,
+                        bytes: 0,
+                        alignment: 1,
+                    }),
+                    GpuTracedClaim::workspace(transfer),
+                ],
+            ));
+        }
+        Ok(claims)
+    }
+
+    pub(crate) fn prepared_device_index(&self, physical_device: i32) -> Option<usize> {
+        prepared_device_index_from_identities(
+            self.prepared_ledger.as_ref()?.execution_identities()?,
+            physical_device,
+        )
+    }
+
+    pub(crate) fn accepted_prepared_storage_inventory(
+        &self,
+    ) -> Option<BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>> {
+        self.prepared_ledger.as_ref().map(|ledger| {
+            ledger
+                .prepared_inventory()
+                .map(|(device, storage)| (storage.identity(), (device, storage)))
+                .collect()
+        })
+    }
+
+    pub(crate) fn prepared_storage_inventory(
+        &self,
+    ) -> Option<BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>> {
+        let mut inventory = self.accepted_prepared_storage_inventory()?;
+        for (device, storage) in &self.prepared_provisioning {
+            if inventory.insert(storage.identity(), (*device, Arc::clone(storage))).is_some() {
+                return None;
+            }
+        }
+        Some(inventory)
+    }
+
+    /// Provision completion events from an already detached prepared region.
+    /// Matrix, compact-payload, and event claims are acquired by the caller's
+    /// single warmup transaction before this method is entered.
+    pub(crate) fn provision_prepared_schedules_in_region(
+        &mut self,
+        schedules: &mut [Option<mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedSchedule>],
+        streams: &[Box<[PreparedScheduleStreamKey]>],
+        region: &mut Arc<crate::gpu_memory::GpuMemoryRegion>,
+    ) -> Result<PreparedScheduleBindings, PolyBackendError> {
+        use mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedSlotKind;
+
+        if schedules.len() != streams.len() {
+            return Err(PolyBackendError::GpuSubmission(
+                "prepared schedule stream table length mismatch".into(),
+            ));
+        }
+        let mut stream_count = 0usize;
+        let mut parameters = Vec::with_capacity(schedules.len());
+        let mut claims = BTreeMap::<usize, (GpuDCRTPolyParams, Vec<GpuTracedClaim>)>::new();
+        for (schedule, schedule_streams) in schedules.iter().zip(streams) {
+            let schedule = schedule.as_ref().ok_or_else(|| {
+                PolyBackendError::GpuSubmission("missing prepared schedule".into())
+            })?;
+            let expected = schedule.stream_count();
+            if expected != schedule_streams.len() {
+                return Err(PolyBackendError::GpuSubmission(format!(
+                    "prepared schedule stream table has {} entries, native plan reports {expected}",
+                    schedule_streams.len()
+                )));
+            }
+            stream_count =
+                stream_count.checked_add(expected).ok_or(PolyBackendError::InvalidInteger)?;
+            let owners = schedule.stream_parameters().map_err(PolyBackendError::GpuSubmission)?;
+            for (key, owner) in schedule_streams.iter().zip(&owners) {
+                if !owner.device_ids().contains(&key.device) {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                claims
+                    .entry(owner.context_identity())
+                    .or_insert_with(|| (owner.clone(), Vec::new()))
+                    .1
+                    .push(GpuTracedClaim::workspace(event()));
+            }
+            parameters.push(owners);
+        }
+        self.prepare_storage_claims(claims.into_values().collect(), true)?;
+        let inventory = self
+            .prepared_storage_inventory()
+            .ok_or_else(|| {
+                PolyBackendError::GpuSubmission("prepared event inventory is missing".into())
+            })?
+            .into_values()
+            .collect::<Vec<_>>();
+        let mut used = BTreeSet::new();
+        let mut selected = Vec::with_capacity(stream_count);
+        for (schedule_streams, owners) in streams.iter().zip(&parameters) {
+            for (&key, owner) in schedule_streams.iter().zip(owners) {
+                let candidate = inventory
+                    .iter()
+                    .filter(|(_, storage)| {
+                        storage.device() == key.device &&
+                            storage.context_identity() == owner.context_identity()
+                    })
+                    .flat_map(|(device, storage)| {
+                        (0..storage.slot_count()).map(move |slot| (*device, storage, slot))
+                    })
+                    .filter_map(|(device, storage, slot)| {
+                        let identity = storage.slot_identity(slot)?;
+                        (identity.kind() == GpuPreparedSlotKind::CompletionEvent &&
+                            storage.snapshot().ok()?.get(slot)?.is_available())
+                        .then(|| {
+                            let request = identity.workspace_request(0, 1);
+                            (device, Arc::clone(storage), request)
+                        })
+                    })
+                    .find(|(_, _, request)| used.insert(request.slot_key()));
+                let (device, storage, request) = candidate.ok_or_else(|| {
+                    PolyBackendError::GpuSubmission(
+                        "prepared inventory cannot fit schedule completion events".into(),
+                    )
+                })?;
+                selected.push((key, device, storage, request));
+            }
+        }
+
+        let mut event_requirements =
+            BTreeMap::<u64, (usize, Arc<GpuPreparedStorage>, Vec<GpuPreparedRequest>)>::new();
+        for (_, device, storage, request) in &selected {
+            event_requirements
+                .entry(storage.identity())
+                .or_insert_with(|| (*device, Arc::clone(storage), Vec::new()))
+                .2
+                .push(*request);
+        }
+        let requests = event_requirements
+            .iter()
+            .map(|(identity, (_, _, requests))| (*identity, requests.clone()))
+            .collect();
+        let (event_region, _) = self.reserve_standalone_prepared_region(&requests)?;
+        Arc::get_mut(region)
+            .ok_or_else(|| {
+                PolyBackendError::GpuSubmission(
+                    "prepared region was published before schedule provisioning".into(),
+                )
+            })?
+            .retain_detached_region(&event_region);
+
+        let region_inventory = region
+            .prepared_inventory()
+            .map(|(_, storage)| (storage.identity(), storage))
+            .collect::<BTreeMap<_, _>>();
+
+        let provision = (|| {
+            let mut entries = Vec::with_capacity(selected.len());
+            let mut selected_offset = 0;
+            for (schedule, schedule_streams) in schedules.iter_mut().zip(streams) {
+                let schedule =
+                    schedule.as_mut().ok_or_else(|| "missing prepared schedule".to_owned())?;
+                let count = schedule_streams.len();
+                let schedule_selected = &selected[selected_offset..selected_offset + count];
+                selected_offset += count;
+                let mut grouped =
+                    BTreeMap::<u64, (Arc<GpuPreparedStorage>, Vec<GpuPreparedRequest>)>::new();
+                for (_, _, storage, request) in schedule_selected {
+                    let authorized = region_inventory
+                        .get(&storage.identity())
+                        .ok_or_else(|| "detached schedule storage disappeared".to_owned())?;
+                    grouped
+                        .entry(authorized.identity())
+                        .or_insert_with(|| (Arc::clone(authorized), Vec::new()))
+                        .1
+                        .push(*request);
+                }
+                let mut reservations = grouped
+                    .values()
+                    .map(|(storage, requests)| storage.reserve(requests))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let first = reservations
+                    .drain(..1)
+                    .next()
+                    .ok_or_else(|| "prepared schedule has no event reservation".to_owned())?;
+                let dispatch = first.enter(reservations)?;
+                schedule.provision()?;
+                drop(dispatch.finish()?);
+                for (key, _, storage, request) in schedule_selected {
+                    let identity = storage
+                        .slot_identity(request.slot_key().2)
+                        .ok_or_else(|| "prepared schedule event slot disappeared".to_owned())?;
+                    entries.push(PreparedScheduleResourceBinding {
+                        key: *key,
+                        storage: super::gpu_prepared_lowering::PreparedStorageBinding {
+                            storage_id: identity.storage_id(),
+                            slot_id: identity.slot_id(),
+                            slot_index: identity.slot_index(),
+                            context: storage.context_identity(),
+                            basis: request.level().unwrap_or_default(),
+                        },
+                        request: *request,
+                    });
+                }
+            }
+            entries.sort_by_key(|entry| entry.key);
+            Ok::<_, String>(entries.into_boxed_slice())
+        })();
+        match provision {
+            Ok(entries) => Ok(PreparedScheduleBindings { entries }),
+            Err(error) => Err(PolyBackendError::GpuSubmission(error)),
+        }
+    }
+
+    fn commit_prepared_provisioning(&mut self) -> Result<(), PolyBackendError> {
+        let additions = std::mem::take(&mut self.prepared_provisioning);
+        let result = self
+            .prepared_ledger
+            .as_mut()
+            .expect("prepared provisioning requires an accepted ledger")
+            .append_prepared_storages(additions)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()));
+        if result.is_ok() {
+            self.prepared_provisioning_budget.clear();
+        } else {
+            self.rollback_prepared_provisioning();
+        }
+        result
+    }
+
+    pub(super) fn discard_prepared_provisioning(&mut self) {
+        self.prepared_provisioning.clear();
+        self.rollback_prepared_provisioning();
+    }
+
+    fn rollback_prepared_provisioning(&mut self) {
+        if !self.prepared_provisioning_budget.is_empty() {
+            if let Some(ledger) = self.prepared_ledger.as_mut() {
+                ledger.rollback_prepared_provisioning(&self.prepared_provisioning_budget);
+            }
+            self.prepared_provisioning_budget.clear();
+        }
+    }
+
+    pub(crate) fn poll_prepared_releases(&mut self) -> Result<(), PolyBackendError> {
+        if let Some(ledger) = &mut self.prepared_ledger {
+            ledger
+                .poll_releases()
+                .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     /// Trace the exact claims of sampling one trapdoor class and preparing its
     /// preimage covariance cache, on the still-open domains of device 0.
     fn trace_trapdoor_sampling(
@@ -2097,7 +2422,8 @@ impl GpuDcrtBackend {
                     global_column_start: 0,
                     attempt: 0,
                     seed,
-                }],
+                }]
+                .into_boxed_slice(),
                 &mut attempt,
             )
             .map_err(PolyBackendError::GpuSubmission)?;
@@ -2105,8 +2431,11 @@ impl GpuDcrtBackend {
             destination: destination_claims[1..].to_vec(),
             tile,
             attempt: attempt.0,
-            attempts: mxx_primitives::env::gpu_preimage_max_tile_attempts()
-                .map_err(PolyBackendError::GpuSubmission)?,
+            replay: PreimageReplayPlan::new(
+                mxx_primitives::env::gpu_preimage_max_tile_attempts()
+                    .map_err(PolyBackendError::GpuSubmission)?,
+            )
+            .map_err(PolyBackendError::GpuSubmission)?,
             bytes_per_poly,
         };
         self.preimage_plans.insert(key, plan.clone());
@@ -2131,6 +2460,8 @@ impl GpuDcrtBackend {
         wave_bound: usize,
         warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(0);
+        crate::backend::poly_gpu::record_prepared_forbidden(1);
         let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
             .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
         self.prepare_graph_admission_with_hash(
@@ -2152,12 +2483,11 @@ impl GpuDcrtBackend {
         wave_bound: usize,
         warm_up: bool,
     ) -> Result<Option<Box<dyn std::any::Any>>, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(0);
         let root_cacheable = root_graph_is_cacheable(validated, inputs);
         if self.prepared_ledger.is_some() && !self.graph_prepared {
             return Ok(None);
         }
-        let guard = GpuGraphAdmissionGuard::new(self.device_parameters())
-            .map_err(PolyBackendError::GpuSubmission)?;
         if root_cacheable && !warm_up && self.graph_prepared {
             let hit = self.graph_admission_cache.get(&spec_hash).and_then(|template| {
                 let ledger = self.prepared_ledger.as_ref();
@@ -2182,37 +2512,19 @@ impl GpuDcrtBackend {
                 Some((template.wave, template.operations.clone(), input_columns))
             });
             if let Some((wave, prepared, input_columns)) = hit {
-                let (template_column_cap, template_demand, template_preferred) = {
+                let (template_column_cap, template_preferred) = {
                     let template =
                         self.graph_admission_cache.get(&spec_hash).expect("cache hit template");
-                    (template.column_cap, template.demand.clone(), template.preferred.clone())
+                    (template.column_cap, template.preferred.clone())
                 };
-                let region = match self
+                let region = self
                     .reserve_graph_region(&template_preferred, template_column_cap)
-                {
-                    Ok(region) => region,
-                    Err(PolyBackendError::GpuSubmission(_)) => {
-                        if template_demand.is_empty() {
-                            return Err(PolyBackendError::GpuSubmission(
-                                "cached graph assignment cannot be reserved".into(),
-                            ));
-                        } else {
-                            self.prepare_graph_storage((*template_demand).clone())?;
-                            let requests = self.preferred_graph_assignment(&template_demand)?.ok_or_else(|| {
-                                PolyBackendError::GpuSubmission(
-                                    "prepared graph demand cannot be assigned after provisioning".into(),
-                                )
-                            })?;
-                            let region =
-                                self.reserve_graph_region(&requests, template_column_cap)?;
-                            if let Some(template) = self.graph_admission_cache.get_mut(&spec_hash) {
-                                template.preferred = requests;
-                            }
-                            region
-                        }
-                    }
-                    Err(error) => return Err(error),
-                };
+                    .map_err(|error| match error {
+                        PolyBackendError::GpuSubmission(_) => PolyBackendError::GpuSubmission(
+                            "cached graph assignment cannot be reserved".into(),
+                        ),
+                        error => error,
+                    })?;
                 self.graph_wave = wave;
                 let active = Arc::new(AdmittedScopeOperations {
                     prepared,
@@ -2227,8 +2539,15 @@ impl GpuDcrtBackend {
                 {
                     self.graph_admission_cache_hits += 1;
                 }
+                let guard = GpuGraphAdmissionGuard::new(self.device_parameters())
+                    .map_err(PolyBackendError::GpuSubmission)?;
                 return Ok(Some(Box::new((guard, active, region))));
             }
+        }
+        if !warm_up && self.prepared_ledger.is_none() {
+            return Err(PolyBackendError::GpuSubmission(
+                "explicit graph warmup required: prepared inventory is unavailable for graph resource demand".into(),
+            ));
         }
         if !warm_up && {
             #[cfg(test)]
@@ -2255,7 +2574,106 @@ impl GpuDcrtBackend {
             &FrozenGraphScopeId::Root,
             &validated.bindings,
         )?;
-        if warm_up {
+        let prepared_inputs = super::materialize_prepared_inputs(self, inputs)?;
+        let prepared_runtime_inputs = validated
+            .root_scope()
+            .execution_order
+            .iter()
+            .filter_map(|node| {
+                let NodeKind::Input { name, .. } = node.kind() else {
+                    return None;
+                };
+                Some(
+                    crate::backend::poly_gpu::prepared_runtime_value(prepared_inputs.get(name)?)
+                        .map_err(|error| error.to_string()),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PolyBackendError::GpuSubmission)?;
+        let prepared_matrix_inputs = prepared_runtime_inputs
+            .iter()
+            .filter_map(|value| match value {
+                crate::backend::poly_gpu::PreparedRuntimeValue::FleetMatrix(value) => {
+                    Some(Arc::clone(value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // A prepared program exists only after warmup lowering and command
+        // factory construction succeeded. Its presence is the support
+        // guarantee; production does not rescan the topology.
+        let prepared_kind = self.prepared_program.is_some();
+
+        // Prepared warmup is itself the exact factory transaction. The
+        // generic inventory demand path below exists for legacy admission
+        // callers; running it here would repeat graph-sized class discovery
+        // and can conflict with the sealed workspace permit owned by the
+        // command factory. The factory derives and reserves its own fixed
+        // descriptors before publishing the executable.
+        if warm_up && prepared_kind {
+            let mut program = super::gpu_prepared_lowering::lower_graph(
+                validated,
+                std::num::NonZeroUsize::new(wave_bound.max(1)).expect("nonzero warmup wave"),
+            )
+            .map_err(|error| {
+                PolyBackendError::GpuSubmission(format!("prepared topology: {error:?}"))
+            })?;
+            program.instance_count =
+                self.prepared_program.as_ref().expect("prepared warmup program").instance_count;
+            program.scalar_input_max_words = self
+                .prepared_program
+                .as_ref()
+                .expect("prepared warmup program")
+                .scalar_input_max_words
+                .clone();
+            let execution = match crate::backend::poly_gpu::from_lowered_program(
+                self,
+                &prepared_runtime_inputs,
+                &mut program,
+            ) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    self.discard_prepared_provisioning();
+                    return Err(PolyBackendError::GpuSubmission(error));
+                }
+            };
+            if let Err(error) = self.commit_prepared_provisioning() {
+                self.discard_prepared_provisioning();
+                return Err(error);
+            }
+            // Host exports are an explicit boundary, but their stream and
+            // transfer workspace are still fixed warmup descriptors. Reserve
+            // one exact codec envelope for each exported matrix output so
+            // production readback never grows the prepared inventory.
+            let codec_claims = self.prepared_output_codec_claims(&program)?;
+            if !codec_claims.is_empty() {
+                self.prepare_storage_claims(codec_claims, true)?;
+                if let Err(error) = self.commit_prepared_provisioning() {
+                    self.discard_prepared_provisioning();
+                    return Err(error);
+                }
+            }
+            let execution = execution
+                .with_program(Arc::new(program.clone()))
+                .map_err(PolyBackendError::GpuSubmission)?;
+            self.prepared_program = Some(program);
+            self.graph_prepared = true;
+            self.prepared_graph = Some((validated as *const _ as usize, execution));
+            self.warmup_trapdoors.clear();
+            self.fence_released_memory()?;
+            #[cfg(test)]
+            {
+                self.graph_warmup_complete = true;
+            }
+            return Ok(None);
+        }
+
+        let warmup_guard = warm_up
+            .then(|| GpuGraphAdmissionGuard::new(self.device_parameters()))
+            .transpose()
+            .map_err(PolyBackendError::GpuSubmission)?;
+        if warm_up && !prepared_kind {
+            let _warmup_guard = warmup_guard;
             // Warmup owns class discovery only. The scratch column envelope is
             // a production storage decision, not a class property, so discover
             // at one column; graph-sized backing stays out of warmup entirely.
@@ -2305,12 +2723,128 @@ impl GpuDcrtBackend {
             &available,
             &operations,
         )?;
-        let demand = resources.contexts;
-        let prepared_demand = Arc::new(demand.clone());
+        // The demand trace may use ordinary prepared dispatches, but native
+        // provisioning must start only after that temporary graph scope has
+        // restored the long-lived seal.
+        drop(warmup_guard);
+        let mut demand = resources.contexts;
+        if root_cacheable && (!warm_up || prepared_kind) {
+            for params in self.parameter_placements()[0].iter() {
+                let ty = ConcreteMatrixType {
+                    modulus: params.modulus().as_ref().clone().into(),
+                    ring_dimension: params.ring_dimension() as usize,
+                    rows: 1,
+                    columns: 1,
+                };
+                demand
+                    .entry((ty.modulus.to_string(), ty.ring_dimension))
+                    .or_insert_with(|| (ty, GpuContextDemand::default()));
+            }
+        }
+        let required_claim_counts = demand
+            .values()
+            .map(|(_, context)| context.matrix_required_claims.len())
+            .collect::<Vec<_>>();
+        // Reserve the complete fixed-command envelope before the first
+        // production graph can leave live output leases. Later prepared
+        // graphs reuse these accepted slots and never replace the ledger.
+        if root_cacheable && (!warm_up || prepared_kind) {
+            for (ty, context) in demand.values_mut() {
+                let params = self.devices[0].1.parameters(ty)?;
+                let mut levels = BTreeSet::from([params.crt_depth() - 1]);
+                for matrix in &prepared_matrix_inputs {
+                    for shard in matrix.shards() {
+                        if shard.value.params().context_identity() == params.context_identity() {
+                            levels.insert(shard.value.level());
+                            levels.insert(shard.value.level().saturating_sub(1));
+                        }
+                    }
+                }
+                for level in levels {
+                    let groups = level + 1;
+                    for _ in 0..PREPARED_STORAGE_INSTANCES {
+                        context.add_required_matrix_claims([
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(4, ty.columns, level, true),
+                            GpuTracedClaim::matrix(3, ty.columns, level, true),
+                            GpuTracedClaim::matrix(1, ty.columns, level, false),
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(groups, ty.columns, level, true),
+                            GpuTracedClaim::matrix(2, ty.columns, level, true),
+                            GpuTracedClaim::matrix(2, ty.columns, level, false),
+                            GpuTracedClaim::matrix(2, ty.columns, level, false),
+                            GpuTracedClaim::matrix(2, ty.columns, level, false),
+                        ]);
+                    }
+                }
+            }
+        }
         let value_layouts = resources.value_layouts.into_iter().next().unwrap();
         self.graph_wave = wave;
-        self.prepare_graph_storage(demand)?;
+        self.prepare_graph_storage(demand.clone(), prepared_kind)?;
+        for ((_, context), required_count) in demand.values_mut().zip(required_claim_counts) {
+            context.matrix_required_claims.truncate(required_count);
+        }
+        let prepared_demand = Arc::new(demand.clone());
         self.graph_prepared = true;
+        if prepared_kind {
+            let mut program = super::gpu_prepared_lowering::lower_graph(
+                validated,
+                std::num::NonZeroUsize::new(wave.max(1)).expect("nonzero admitted wave"),
+            )
+            .map_err(|error| {
+                PolyBackendError::GpuSubmission(format!("prepared topology: {error:?}"))
+            })?;
+            program.instance_count =
+                self.prepared_program.as_ref().expect("prepared warmup program").instance_count;
+            program.scalar_input_max_words = self
+                .prepared_program
+                .as_ref()
+                .expect("prepared warmup program")
+                .scalar_input_max_words
+                .clone();
+            let execution = match crate::backend::poly_gpu::from_lowered_program(
+                self,
+                &prepared_runtime_inputs,
+                &mut program,
+            ) {
+                Ok(execution) => execution,
+                Err(error) => {
+                    self.discard_prepared_provisioning();
+                    return Err(PolyBackendError::GpuSubmission(error));
+                }
+            };
+            self.prepared_program = Some(program.clone());
+            if self.prepared_program.is_none() {
+                self.discard_prepared_provisioning();
+                return Err(PolyBackendError::GpuSubmission(
+                    "prepared topology was not lowered".into(),
+                ));
+            }
+            if let Err(error) = self.commit_prepared_provisioning() {
+                self.discard_prepared_provisioning();
+                return Err(error);
+            }
+            // Keep the lowered program in backend state as the O(1) execution
+            // contract.  The executable owns an independent Arc clone; taking
+            // the only copy here made every subsequent execute call observe a
+            // missing prepared program and silently re-enter the generic path.
+            let execution = execution
+                .with_program(Arc::new(program.clone()))
+                .map_err(PolyBackendError::GpuSubmission)?;
+            self.prepared_program = Some(program);
+            self.prepared_graph = Some((validated as *const _ as usize, execution));
+            self.warmup_trapdoors.clear();
+            self.fence_released_memory()?;
+            #[cfg(test)]
+            {
+                self.graph_warmup_complete = true;
+            }
+            return Ok(None);
+        }
         let prepared = Arc::new(super::gpu_compiled::PreparedScopeOperations {
             scope: FrozenGraphScopeId::Root,
             instances: vec![operations],
@@ -2321,6 +2855,8 @@ impl GpuDcrtBackend {
                     .collect(),
             ],
         });
+        let guard = GpuGraphAdmissionGuard::new(self.device_parameters())
+            .map_err(PolyBackendError::GpuSubmission)?;
         let active = Arc::new(AdmittedScopeOperations {
             prepared: prepared.clone(),
             input_layouts: input_columns
@@ -2416,13 +2952,14 @@ impl GpuDcrtBackend {
         let inventory = self
             .prepared_ledger
             .as_ref()
-            .map(|ledger| {
-                ledger
-                    .prepared_inventory()
-                    .map(|(device, storage)| (device, storage.clone()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            .ok_or_else(|| {
+                PolyBackendError::GpuSubmission(
+                    "prepared inventory is unavailable for graph resource demand".into(),
+                )
+            })?
+            .prepared_inventory()
+            .map(|(device, storage)| (device, storage.clone()))
+            .collect::<Vec<_>>();
         // Production backing of a parallel loop covers one complete configured
         // wave: `wave_bound` bodies may run at once, so one body's peak slots
         // must exist `wave_bound` times. The bound is the configured concurrency
@@ -2547,6 +3084,7 @@ impl GpuDcrtBackend {
         &self,
         demand: &BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
     ) -> Result<Option<PreparedGraphAssignment>, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(2);
         if demand.is_empty() {
             return Ok(Some(PreparedGraphAssignment::default()));
         }
@@ -2601,6 +3139,7 @@ impl GpuDcrtBackend {
         requests: &BTreeMap<u64, Vec<GpuPreparedRequest>>,
         column_cap: usize,
     ) -> Result<Option<Arc<crate::gpu_memory::GpuMemoryRegion>>, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(5);
         if requests.is_empty() {
             return Ok(None);
         }
@@ -2637,90 +3176,246 @@ impl GpuDcrtBackend {
             .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))
     }
 
-    fn finish_prepared_setup(&self) -> Result<(), PolyBackendError> {
-        let Some(ledger) = &self.prepared_ledger else {
-            return Ok(());
-        };
-        for device in 0..self.devices.len() {
-            let stores = ledger
-                .prepared_inventory()
-                .filter(|(owner, _)| *owner == device)
-                .map(|(_, storage)| storage.clone())
-                .collect::<Vec<_>>();
-            let store_refs = stores.iter().map(Arc::as_ref).collect::<Vec<_>>();
-            GpuPreparedStorage::finish_setup(&store_refs)
-                .map_err(PolyBackendError::GpuSubmission)?;
+    pub(crate) fn reserve_standalone_prepared_region(
+        &mut self,
+        requests: &BTreeMap<u64, Vec<GpuPreparedRequest>>,
+    ) -> Result<
+        (Arc<crate::gpu_memory::GpuMemoryRegion>, BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>),
+        PolyBackendError,
+    > {
+        let inventory = self.prepared_storage_inventory().ok_or_else(|| {
+            PolyBackendError::GpuSubmission("duplicate prepared provisioning storage".into())
+        })?;
+        let requests = requests.clone();
+        let provisioning = self.prepared_provisioning.clone();
+        let ledger = self.prepared_ledger.as_mut().ok_or_else(|| {
+            PolyBackendError::GpuSubmission(
+                "standalone prepared execution requires accepted graph storage".into(),
+            )
+        })?;
+        let requirements = requests
+            .iter()
+            .map(|(identity, requests)| {
+                let (device, storage) = inventory.get(identity).ok_or_else(|| {
+                    PolyBackendError::GpuSubmission(
+                        "standalone prepared request references unknown accepted storage".into(),
+                    )
+                })?;
+                Ok(crate::gpu_memory::GpuPreparedAllocationRequirement {
+                    device: *device,
+                    storage,
+                    requests,
+                })
+            })
+            .collect::<Result<Vec<_>, PolyBackendError>>()?;
+        let region = if provisioning.is_empty() {
+            ledger.reserve_detached_region(&requirements, usize::MAX)
+        } else {
+            ledger.reserve_provisioning_region(&provisioning, &requirements, usize::MAX)
         }
-        Ok(())
+        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let selected = region
+            .prepared_inventory()
+            .filter_map(|(device, storage)| {
+                requests
+                    .contains_key(&storage.identity())
+                    .then_some((storage.identity(), (device, storage)))
+            })
+            .collect();
+        Ok((region, selected))
     }
 
     fn prepare_graph_storage(
         &mut self,
         demand: BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
+        defer_append: bool,
     ) -> Result<(), PolyBackendError> {
-        // Build one storage per context per device before any domain closes.
+        let mut claims = Vec::new();
+        for (_, backend) in &self.devices {
+            for (ty, context) in demand.values() {
+                let params = backend.parameters(ty)?;
+                claims.push((params.clone(), context.claims(params)));
+            }
+        }
+        self.prepare_storage_claims(claims, defer_append)
+    }
+
+    pub(crate) fn prepare_storage_claims(
+        &mut self,
+        demands: Vec<(GpuDCRTPolyParams, Vec<GpuTracedClaim>)>,
+        defer_append: bool,
+    ) -> Result<(), PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(7);
         let mut prepared = self
-            .prepared_ledger
-            .as_ref()
-            .map(|ledger| {
-                ledger
-                    .prepared_inventory()
-                    .map(|(device, storage)| (device, storage.clone()))
-                    .collect::<Vec<_>>()
-            })
+            .prepared_storage_inventory()
+            .map(|inventory| inventory.into_values().collect::<Vec<_>>())
             .unwrap_or_default();
         let original_count = prepared.len();
         let mut used = HashSet::new();
-        for (device, (_, backend)) in self.devices.iter().enumerate() {
-            for (ty, context) in demand.values() {
-                let params = backend.parameters(ty)?;
-                let (missing_matrices, missing_layouts) =
-                    context.missing(params, &prepared, device, &mut used)?;
-                if missing_matrices.is_empty() && missing_layouts.is_empty() {
-                    continue;
+        struct PendingStorage {
+            device: usize,
+            params: GpuDCRTPolyParams,
+            matrices: Vec<GpuTracedClaim>,
+            layouts: Vec<GpuPreparedWorkspaceLayout>,
+        }
+        let mut pending = Vec::new();
+        for (params, claims) in demands {
+            let device = self
+                .devices
+                .iter()
+                .position(|(physical, _)| params.device_ids().contains(physical))
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let broker = super::gpu_compiled::PreparedClaimBroker::new(
+                &params,
+                prepared
+                    .iter()
+                    .filter(|(owner, _)| *owner == device)
+                    .map(|(_, storage)| Arc::clone(storage))
+                    .collect(),
+            );
+            let missing =
+                broker.missing(&claims, &mut used).map_err(PolyBackendError::GpuSubmission)?;
+            let mut matrices = Vec::new();
+            let mut layouts = Vec::new();
+            for claim in missing {
+                if claim.kind() == GpuPreparedSlotKind::Matrix {
+                    matrices.push(claim);
+                } else {
+                    layouts.push(claim.layout().ok_or(PolyBackendError::InvalidInteger)?);
                 }
+            }
+            if matrices.is_empty() && layouts.is_empty() {
+                continue;
+            }
+            if matrices.is_empty() {
+                matrices.push(GpuTracedClaim::matrix(1, 1, params.crt_depth() - 1, true));
+            }
+            pending.push(PendingStorage { device, params, matrices, layouts });
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        // Reserve the complete fleet charge before the first native backing is
+        // constructed.  The native permits below then consume precisely this
+        // already-accounted request; append only publishes the private stores.
+        let mut additional = vec![0u64; self.devices.len()];
+        if original_count != 0 {
+            for request in &pending {
+                let claims = request
+                    .matrices
+                    .iter()
+                    .copied()
+                    .chain(request.layouts.iter().copied().map(GpuTracedClaim::workspace))
+                    .collect::<Vec<_>>();
+                let slots = GpuPreparedSlotSnapshot::plan(&request.params, &claims)
+                    .map_err(PolyBackendError::GpuCalibration)?;
+                let bytes = slots.into_iter().try_fold(0u64, |total, slot| {
+                    let identity = slot.identity();
+                    if matches!(
+                        identity.kind(),
+                        GpuPreparedSlotKind::PinnedHost |
+                            GpuPreparedSlotKind::CompletionEvent |
+                            GpuPreparedSlotKind::SubmissionStream
+                    ) {
+                        return Ok(total);
+                    }
+                    total
+                        .checked_add(
+                            u64::try_from(identity.requested_backing_bytes())
+                                .map_err(|_| PolyBackendError::InvalidInteger)?,
+                        )
+                        .ok_or(PolyBackendError::InvalidInteger)
+                })?;
+                additional[request.device] = additional[request.device]
+                    .checked_add(bytes)
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+            }
+            let mut total_budget = self.prepared_provisioning_budget.clone();
+            total_budget.resize(self.devices.len(), 0);
+            for (total, extra) in total_budget.iter_mut().zip(&additional) {
+                *total = total.checked_add(*extra).ok_or(PolyBackendError::InvalidInteger)?;
+            }
+            self.prepared_ledger
+                .as_mut()
+                .expect("existing prepared inventory has a ledger")
+                .begin_prepared_provisioning(&additional)
+                .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+            self.prepared_provisioning_budget = total_budget;
+        }
+
+        let mut appended = Vec::with_capacity(pending.len());
+        let construction = (|| {
+            for request in pending {
                 // Production backing is allocated, not zeroed: these slots are
                 // full-overwrite destinations claimed by dispatch, so a
                 // placeholder zero kernel would be disposable work. The shapes
                 // are appended uninitialized inside the primitives storage
-                // constructor and never exist as a readable matrix here. A
-                // layouts-only context still needs one matrix slot, and that
-                // fallback is allocated the same way.
+                // constructor and never exist as a readable matrix here.
+                let provisioning_claims = request
+                    .matrices
+                    .iter()
+                    .copied()
+                    .chain(request.layouts.iter().copied().map(GpuTracedClaim::workspace))
+                    .collect::<Vec<_>>();
+                let provisioning = if original_count != 0 {
+                    Some(
+                        GpuPreparedProvisioningPermit::begin(&request.params, &provisioning_claims)
+                            .map_err(PolyBackendError::GpuSubmission)?
+                            .enter()
+                            .map_err(PolyBackendError::GpuSubmission)?,
+                    )
+                } else {
+                    None
+                };
                 let storage = GpuPreparedStorage::new(
-                    Some(params),
+                    Some(&request.params),
                     Vec::new(),
-                    Some(&missing_matrices),
-                    Some(&missing_layouts),
+                    Some(&request.matrices),
+                    Some(&request.layouts),
                 )
                 .map_err(PolyBackendError::GpuSubmission)?;
-                prepared.push((device, Arc::new(storage)));
+                if let Some(provisioning) = provisioning {
+                    provisioning.finish().map_err(PolyBackendError::GpuSubmission)?;
+                }
+                let storage = Arc::new(storage);
+                prepared.push((request.device, Arc::clone(&storage)));
+                appended.push((request.device, storage));
             }
+            Ok::<(), PolyBackendError>(())
+        })();
+        if let Err(error) = construction {
+            self.rollback_prepared_provisioning();
+            return Err(error);
         }
-        if prepared.is_empty() {
-            return Ok(());
-        }
-        if original_count != 0 && prepared.len() == original_count {
-            // Re-enter the graph seal without adding backing or imposing a new
-            // initial-budget check on already accepted capacity. Output leases
-            // and their asynchronous reader/release edges remain untouched.
-            self.finish_prepared_setup()?;
-            return Ok(());
-        }
-        let previous = self.prepared_ledger.take();
-        self.prepared_required = false;
-        match self.prepare_memory(prepared, true) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                self.prepared_required = previous.is_some();
-                self.prepared_ledger = previous;
-                Err(error)
+
+        if original_count != 0 {
+            if defer_append {
+                self.prepared_provisioning.extend(appended);
+                Ok(())
+            } else {
+                let result = self
+                    .prepared_ledger
+                    .as_mut()
+                    .expect("existing prepared inventory has a ledger")
+                    .append_prepared_storages(appended)
+                    .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()));
+                if result.is_ok() {
+                    self.prepared_provisioning_budget.clear();
+                } else {
+                    self.rollback_prepared_provisioning();
+                }
+                result
             }
+        } else {
+            self.prepare_memory(prepared, true)
         }
     }
     pub(super) fn admit_loop_wave(
         &mut self,
         request: &crate::executor::WaveAdmissionRequest<'_, Self>,
     ) -> Result<crate::executor::WaveAdmission, PolyBackendError> {
+        crate::backend::poly_gpu::record_prepared_forbidden(3);
         use crate::{backend::RuntimeValue, gpu_memory::GpuPreparedAllocationRequirement};
         let limit = request.caller_cap().min(request.remaining()).min(u16::MAX as usize);
         let bindings = (request.next_index()..request.next_index() + limit)
@@ -4111,6 +4806,7 @@ impl GpuDcrtBackend {
                 // lowering used for execution, not a second supported-kind list.
                 _ if prepared.is_some() => {}
                 NodeKind::PolynomialFromValues { .. } |
+                NodeKind::PackPolynomialCoefficients { .. } |
                 NodeKind::PolynomialValues { .. } |
                 NodeKind::ExtractCoefficient { .. } |
                 NodeKind::ThresholdDecode { .. } |
@@ -4462,22 +5158,6 @@ impl GpuDcrtBackend {
                         }
                     }
                 }
-                kind if let Some(evaluation) =
-                    super::gpu_compiled::polynomial_readback_evaluation(kind) =>
-                {
-                    let Some(ConcreteWireType::Matrix(ty)) = argument_types.first() else {
-                        return Err(unsupported(kind));
-                    };
-                    let levels = source_levels(
-                        column_layouts.get(&arguments[0]),
-                        self.devices[0].1.parameters(ty)?.crt_depth() - 1,
-                    );
-                    for level in levels {
-                        let claims =
-                            self.trace_polynomial_values(ty, level, evaluation, warm_up)?;
-                        add_claim_alternatives(&mut demand, ty, &claims);
-                    }
-                }
                 NodeKind::TrapdoorSample { .. } => {
                     // Port 0 is the public matrix, port 1 the trapdoor.
                     let Some(ConcreteWireType::Trapdoor {
@@ -4597,7 +5277,32 @@ impl GpuDcrtBackend {
                         add_matrix(&mut demand, ty, 1, ty.columns.min(scratch_columns));
                     }
                 }
-                _ => {}
+                kind => {
+                    // Fixed Threshold has its own accepted coefficient staging,
+                    // scalar payload and readback claims. It never executes the
+                    // ordinary polynomial-values serializer, including warmup.
+                    if self.prepared_program.is_some() &&
+                        matches!(kind, NodeKind::ThresholdDecode { .. })
+                    {
+                        continue;
+                    }
+                    if let Some(evaluation) =
+                        super::gpu_compiled::polynomial_readback_evaluation(kind)
+                    {
+                        let Some(ConcreteWireType::Matrix(ty)) = argument_types.first() else {
+                            return Err(unsupported(kind));
+                        };
+                        let levels = source_levels(
+                            column_layouts.get(&arguments[0]),
+                            self.devices[0].1.parameters(ty)?.crt_depth() - 1,
+                        );
+                        for level in levels {
+                            let claims =
+                                self.trace_polynomial_values(ty, level, evaluation, warm_up)?;
+                            add_claim_alternatives(&mut demand, ty, &claims);
+                        }
+                    }
+                }
             }
         }
         owners.borrow_mut().clear();
@@ -4753,8 +5458,25 @@ impl GpuDcrtBackend {
     }
 }
 
+fn prepared_device_index_from_identities(
+    identities: &[(i32, u64)],
+    physical_device: i32,
+) -> Option<usize> {
+    identities.iter().position(|(device, _)| *device == physical_device)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prepared_device_index_uses_physical_identity_not_position() {
+        use super::prepared_device_index_from_identities;
+
+        let identities = [(7, 101), (3, 202), (11, 303)];
+        assert_eq!(prepared_device_index_from_identities(&identities, 3), Some(1));
+        assert_eq!(prepared_device_index_from_identities(&identities, 11), Some(2));
+        assert_eq!(prepared_device_index_from_identities(&identities, 5), None);
+    }
+
     #[test]
     fn test_input_contract_canonicalizes_owner_ids_but_preserves_alias_topology() {
         use super::{GpuInventoryValue, gpu_prepare::MatrixInputFragment, input_contract};
@@ -4905,7 +5627,7 @@ mod tests {
                 inputs,
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
-                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+                ExecutionConfig::default(),
             )
             .unwrap();
             assert!(matches!(
@@ -7542,7 +8264,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+            ExecutionConfig::default(),
         )
         .unwrap();
         let RuntimeValue::Matrix(output) =
@@ -8101,7 +8823,6 @@ mod tests {
                 SamplingMode::Fresh,
                 ExecutionConfig {
                     max_parallel_instances: std::num::NonZeroUsize::new(wave).expect("nonzero"),
-                    prepared_gpu_admission: true,
                     ..ExecutionConfig::default()
                 },
             )
@@ -8335,7 +9056,7 @@ mod tests {
                 BTreeMap::from([("key".into(), RuntimeValue::Bytes(key.to_vec()))]),
                 &mut store,
                 SamplingMode::Fresh,
-                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+                ExecutionConfig::default(),
             )
             .unwrap();
             let RuntimeValue::SmallMatrix(output) =
@@ -8403,7 +9124,7 @@ mod tests {
             )
             .unwrap()
             .0;
-        backend.prepare_graph_storage(demand).unwrap();
+        backend.prepare_graph_storage(demand, false).unwrap();
         let mut store = MemoryArtifactStore::default();
         let mut result = execute_with_config(
             &graph,
@@ -8411,7 +9132,7 @@ mod tests {
             BTreeMap::from([("a".into(), RuntimeValue::matrix(matrix.into()))]),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+            ExecutionConfig::default(),
         )
         .unwrap();
         let product = backend
@@ -8486,7 +9207,7 @@ mod tests {
             )
             .unwrap()
             .0;
-        backend.prepare_graph_storage(demand).unwrap();
+        backend.prepare_graph_storage(demand, false).unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
         backend.set_admitted_measurement_sink(Some(Box::new(move |event| {
             sender.send(event).unwrap();
@@ -8498,7 +9219,7 @@ mod tests {
             BTreeMap::from([("a".into(), RuntimeValue::matrix(matrix.into()))]),
             &mut store,
             SamplingMode::Fresh,
-            ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+            ExecutionConfig::default(),
         )
         .unwrap();
         backend.set_admitted_measurement_sink(None);
@@ -8653,7 +9374,7 @@ mod tests {
                 BTreeMap::from([("a".into(), RuntimeValue::matrix(matrix.into()))]),
                 &mut store,
                 SamplingMode::Fresh,
-                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+                ExecutionConfig::default(),
             )
             .unwrap();
             for name in ["source", "selected"] {
@@ -8720,7 +9441,7 @@ mod tests {
                 BTreeMap::from([("a".into(), RuntimeValue::matrix(matrix.into()))]),
                 &mut store,
                 SamplingMode::Fresh,
-                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+                ExecutionConfig::default(),
             )
             .unwrap();
             let RuntimeValue::Matrix(output) =
@@ -8813,18 +9534,7 @@ mod tests {
             ),
             (
                 "b".to_string(),
-                RuntimeValue::HostMatrix {
-                    matrix_type: mxx_ir_core::types::ConcreteMatrixType {
-                        modulus: num_bigint::BigInt::from(params.modulus().as_ref().clone()),
-                        ring_dimension: n as usize,
-                        rows: 2,
-                        columns: 3,
-                    },
-                    bytes: std::sync::Arc::new(
-                        GpuDCRTPolyMatrix::from_cpu_matrix(&params, &right)
-                            .into_cpu_staging_bytes(),
-                    ),
-                },
+                RuntimeValue::matrix(GpuDCRTPolyMatrix::from_cpu_matrix(&params, &right).into()),
             ),
             (
                 "c".to_string(),
@@ -8838,11 +9548,14 @@ mod tests {
             .expect("polynomial readback requires explicit resource warmup");
         assert!(error.to_string().contains("explicit graph warmup required"), "{error}");
         assert!(backend.polynomial_value_plans.is_empty());
-        drop(backend.prepare_graph_admission(&graph, false, &inputs, 1, true).unwrap());
-        assert!(!backend.polynomial_value_plans.is_empty());
-        assert_warmup_provisioned_no_graph_storage(&backend);
+        backend.warm_up_prepared_graph(&graph, &inputs, &ExecutionConfig::default()).unwrap();
+        assert!(
+            backend.polynomial_value_plans.is_empty(),
+            "prepared warmup uses the exact host factory instead of legacy readback tracing"
+        );
+        assert!(backend.prepared_ledger.is_some());
         let mut store = MemoryArtifactStore::default();
-        let config = ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() };
+        let config = ExecutionConfig::default();
         let mut result = execute_with_config(
             &graph,
             &mut backend,
@@ -9035,7 +9748,7 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
         let mut fresh = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
-        let config = ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() };
+        let config = ExecutionConfig::default();
         assert!(
             execute_with_config(
                 &trapdoor_graph,
@@ -9101,7 +9814,7 @@ mod tests {
                 inputs,
                 &mut store,
                 SamplingMode::Fresh,
-                ExecutionConfig { prepared_gpu_admission: true, ..ExecutionConfig::default() },
+                ExecutionConfig::default(),
             )
             .unwrap();
             let RuntimeValue::Matrix(output) =
@@ -9341,7 +10054,6 @@ mod tests {
                         SamplingMode::Fresh,
                         ExecutionConfig {
                             max_parallel_instances: NonZeroUsize::new(cap).unwrap(),
-                            prepared_gpu_admission: true,
                             ..ExecutionConfig::default()
                         },
                     )
@@ -9455,6 +10167,9 @@ mod tests {
             .map(|value| value.parse::<u32>().unwrap())
             .unwrap_or(32);
         let mut devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        if devices.is_empty() {
+            return;
+        }
         if fleet {
             assert!(devices.len() > 1, "remote multi-GPU test");
         } else {
@@ -9592,11 +10307,10 @@ mod tests {
                 )
                 .unwrap()
                 .0;
-            backend.prepare_graph_storage(demand).unwrap();
+            backend.prepare_graph_storage(demand, false).unwrap();
         }
         let mut store = MemoryArtifactStore::default();
         let config = ExecutionConfig {
-            prepared_gpu_admission: true,
             max_parallel_instances: std::num::NonZeroUsize::new(instances).unwrap(),
             ..ExecutionConfig::default()
         };

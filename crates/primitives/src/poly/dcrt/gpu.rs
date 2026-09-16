@@ -38,8 +38,125 @@ pub(crate) struct GpuMatrixOpaque {
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
+pub(crate) struct GpuPreparedModulusConversionOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedCenteredRebaseOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedCrtRecomposeOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedArithmeticOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedTransposeOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedInputCopyOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedSamplingOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedGadgetDecomposeOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedConstCoeffReadbackOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedRnsUploadOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub(crate) struct GpuPreparedThresholdOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedScalarPackOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedScalarBufferOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedScalarOpOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedScalarMatrixSelectOpaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub(crate) struct GpuPreparedScalarRef {
+    pub owner: *const GpuPreparedScalarBufferOpaque,
+    pub index: usize,
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuMatrixTransformPlanOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
 pub(crate) struct GpuSmallMatrixOpaque {
     _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedSmallRhsOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub(crate) struct GpuPreparedPreimageCutoffOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub(crate) struct GpuPreparedPreimagePhasesOpaque {
+    _private: [u8; 0],
+}
+
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub(crate) struct GpuPreparedScheduleOpaque {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct GpuPreparedPlanRef {
+    pub kind: u32,
+    pub plan: *const std::ffi::c_void,
 }
 
 #[repr(C)]
@@ -167,6 +284,41 @@ pub(crate) struct GpuMatrixBatchView {
 }
 
 unsafe extern "C" {
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_set_work_gate"]
+    fn gpu_test_set_work_gate_native(enabled: bool);
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_reset_work_counters"]
+    fn gpu_test_reset_work_counters_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_read_work_counters"]
+    fn gpu_test_read_work_counters_native(
+        events: *mut usize,
+        streams: *mut usize,
+        native_validations: *mut usize,
+        allocations: *mut usize,
+        kernel_launches: *mut usize,
+        measurement_launches: *mut usize,
+    );
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_measurement_launch"]
+    fn gpu_test_record_measurement_launch_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_event_creation"]
+    fn gpu_test_record_event_creation_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_stream_creation"]
+    fn gpu_test_record_stream_creation_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_native_validation"]
+    fn gpu_test_record_native_validation_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_cuda_allocation"]
+    fn gpu_test_record_cuda_allocation_native();
+    #[cfg(feature = "gpu-instrumentation")]
+    #[link_name = "gpu_test_record_kernel_launch"]
+    fn gpu_test_record_kernel_launch_native();
+
     #[cfg(test)]
     #[link_name = "cudaGetDevice"]
     fn cuda_get_device(device: *mut c_int) -> c_int;
@@ -277,6 +429,14 @@ unsafe extern "C" {
         out_mat: *mut *mut GpuMatrixOpaque,
         initialize_descriptors: bool,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepared_shape(
+        owner: *mut GpuMatrixOpaque,
+        rows: usize,
+        columns: usize,
+        level: c_int,
+        format: c_int,
+        output: *mut *mut GpuMatrixOpaque,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_query_allocation_bytes(
         ctx: *const GpuContextOpaque,
         level: c_int,
@@ -331,6 +491,111 @@ unsafe extern "C" {
         words_per_poly: usize,
         out_events: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_const_coeff_readback(
+        mat: *const GpuMatrixOpaque,
+        words_out: *mut u64,
+        words_per_poly: usize,
+        coefficient_index: usize,
+        coefficient_count: usize,
+        out_plan: *mut *mut GpuPreparedConstCoeffReadbackOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_const_coeff_readback(
+        plan: *const GpuPreparedConstCoeffReadbackOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_wait_const_coeff_readback(
+        plan: *const GpuPreparedConstCoeffReadbackOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_const_coeff_readback(
+        plan: *mut GpuPreparedConstCoeffReadbackOpaque,
+    );
+    pub(crate) fn gpu_matrix_prepare_rns_upload(
+        mat: *mut GpuMatrixOpaque,
+        bytes: *const u8,
+        bytes_per_poly: usize,
+        format: c_int,
+        transform_to_eval: bool,
+        out_plan: *mut *mut GpuPreparedRnsUploadOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_rns_upload(plan: *const GpuPreparedRnsUploadOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_wait_rns_upload(plan: *const GpuPreparedRnsUploadOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_rns_upload(plan: *mut GpuPreparedRnsUploadOpaque);
+    pub(crate) fn gpu_matrix_prepare_scalar_buffer(
+        anchor: *const GpuMatrixOpaque,
+        count: usize,
+        words: usize,
+        host: *mut u64,
+        out: *mut *mut GpuPreparedScalarBufferOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_upload_scalar_buffer(
+        buffer: *const GpuPreparedScalarBufferOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_wait_scalar_buffer(
+        buffer: *const GpuPreparedScalarBufferOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_read_scalar_buffer(
+        buffer: *const GpuPreparedScalarBufferOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_scalar_buffer(buffer: *mut GpuPreparedScalarBufferOpaque);
+    pub(crate) fn gpu_matrix_scalar_op_workspace_bytes(
+        left: usize,
+        right: usize,
+        output: usize,
+        candidate_count: usize,
+    ) -> usize;
+    pub(crate) fn gpu_matrix_prepare_scalar_op(
+        opcode: c_int,
+        left: GpuPreparedScalarRef,
+        right: GpuPreparedScalarRef,
+        output: GpuPreparedScalarRef,
+        bit: usize,
+        candidates: *const GpuPreparedScalarRef,
+        candidate_count: usize,
+        out: *mut *mut GpuPreparedScalarOpOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_scalar_op(plan: *const GpuPreparedScalarOpOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_scalar_op(plan: *mut GpuPreparedScalarOpOpaque);
+    pub(crate) fn gpu_matrix_scalar_matrix_select_workspace_bytes(count: usize) -> usize;
+    pub(crate) fn gpu_matrix_prepare_scalar_matrix_select(
+        output: *mut GpuMatrixOpaque,
+        selector: GpuPreparedScalarRef,
+        sources: *const *const GpuMatrixOpaque,
+        views: *const GpuMatrixBatchView,
+        count: usize,
+        out: *mut *mut GpuPreparedScalarMatrixSelectOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_scalar_matrix_select(
+        plan: *const GpuPreparedScalarMatrixSelectOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_scalar_matrix_select(
+        plan: *mut GpuPreparedScalarMatrixSelectOpaque,
+    );
+    pub(crate) fn gpu_matrix_threshold_workspace_bytes(
+        source: *const GpuMatrixOpaque,
+        count: usize,
+        plaintext_words: usize,
+        bytes: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_threshold(
+        source: *const GpuMatrixOpaque,
+        count: usize,
+        plaintext: *const u64,
+        plaintext_words: usize,
+        output_bool: bool,
+        output: *mut GpuPreparedScalarBufferOpaque,
+        out: *mut *mut GpuPreparedThresholdOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_threshold(plan: *const GpuPreparedThresholdOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_threshold(plan: *mut GpuPreparedThresholdOpaque);
+    pub(crate) fn gpu_matrix_scalar_pack_workspace_bytes(count: usize) -> usize;
+    pub(crate) fn gpu_matrix_prepare_scalar_pack(
+        output: *mut GpuMatrixOpaque,
+        values: *const GpuPreparedScalarRef,
+        count: usize,
+        coefficient_bits: usize,
+        out: *mut *mut GpuPreparedScalarPackOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_scalar_pack(plan: *const GpuPreparedScalarPackOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_scalar_pack(plan: *mut GpuPreparedScalarPackOpaque);
     pub(crate) fn gpu_matrix_store_compact_bytes(
         mat: *mut GpuMatrixOpaque,
         payload_out: *mut u8,
@@ -493,6 +758,16 @@ unsafe extern "C" {
         source: *const GpuMatrixOpaque,
         view: *const GpuMatrixBatchView,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_centered_rebase(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        view: *const GpuMatrixBatchView,
+        plan: *mut *mut GpuPreparedCenteredRebaseOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_centered_rebase(
+        plan: *const GpuPreparedCenteredRebaseOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_centered_rebase(plan: *mut GpuPreparedCenteredRebaseOpaque);
     pub(crate) fn gpu_matrix_convert_modulus(
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,
@@ -503,6 +778,84 @@ unsafe extern "C" {
         input_scales: *const u64,
         view: *const GpuMatrixBatchView,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_modulus_conversion(
+        source: *const GpuMatrixOpaque,
+        out: *const GpuMatrixOpaque,
+        conversion: c_int,
+        division_inverses: *const u64,
+        inverse_count: usize,
+        plaintext_modulus: u64,
+        input_scales: *const u64,
+        plan: *mut *mut GpuPreparedModulusConversionOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_rns_conversion(
+        source: *const GpuMatrixOpaque,
+        out: *const GpuMatrixOpaque,
+        digit_size: usize,
+        plaintext_modulus: u64,
+        scales: *const u64,
+        inverses: *const u64,
+        inverse_count: usize,
+        plan: *mut *mut GpuPreparedModulusConversionOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_modulus_conversion(
+        plan: *const GpuPreparedModulusConversionOpaque,
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        view: *const GpuMatrixBatchView,
+        apply_output_transform: bool,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_prepared_modulus_conversion(
+        plan: *mut GpuPreparedModulusConversionOpaque,
+    );
+    pub(crate) fn gpu_matrix_prepare_arithmetic(
+        out: *mut GpuMatrixOpaque,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        kind: c_int,
+        rows: *const usize,
+        offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
+        view: *const GpuMatrixBatchView,
+        column_start: usize,
+        scalar_residues: *const u64,
+        scalar_count: usize,
+        automorphism_index: usize,
+        plan: *mut *mut GpuPreparedArithmeticOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_arithmetic(plan: *const GpuPreparedArithmeticOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_arithmetic_plan(plan: *mut GpuPreparedArithmeticOpaque);
+    pub(crate) fn gpu_matrix_prepare_input_copy(
+        out: *mut GpuMatrixOpaque,
+        source_template: *const GpuMatrixOpaque,
+        view: *const GpuMatrixBatchView,
+        plan: *mut *mut GpuPreparedInputCopyOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_input_copy(
+        plan: *const GpuPreparedInputCopyOpaque,
+        source: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_input_copy(plan: *mut GpuPreparedInputCopyOpaque);
+    pub(crate) fn gpu_matrix_prepare_transpose(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        view: *const GpuMatrixBatchView,
+        plan: *mut *mut GpuPreparedTransposeOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_transpose(plan: *const GpuPreparedTransposeOpaque) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_transpose(plan: *mut GpuPreparedTransposeOpaque);
+    pub(crate) fn gpu_matrix_prepare_ntt_plan(
+        matrix: *const GpuMatrixOpaque,
+        range: *const GpuMatrixRange,
+        forward: bool,
+        plan: *mut *mut GpuMatrixTransformPlanOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_ntt_plan(
+        plan: *const GpuMatrixTransformPlanOpaque,
+        matrix: *mut GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_ntt_plan(plan: *mut GpuMatrixTransformPlanOpaque);
     pub(crate) fn gpu_matrix_crt_recompose(
         out: *mut GpuMatrixOpaque,
         levels: *const *const GpuMatrixOpaque,
@@ -513,6 +866,23 @@ unsafe extern "C" {
         input_views: *const GpuMatrixRange,
         output_view: *const GpuMatrixRange,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_crt_recompose(
+        levels: *const *const GpuMatrixOpaque,
+        level_count: usize,
+        plaintext_moduli: *const u64,
+        reconstruction_residues: *const u64,
+        reconstruction_stride: usize,
+        out: *mut GpuMatrixOpaque,
+        plan: *mut *mut GpuPreparedCrtRecomposeOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_crt_recompose(
+        plan: *const GpuPreparedCrtRecomposeOpaque,
+        levels: *const *const GpuMatrixOpaque,
+        level_count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_prepared_crt_recompose(
+        plan: *mut GpuPreparedCrtRecomposeOpaque,
+    );
     pub(crate) fn gpu_matrix_copy_block(
         out: *mut GpuMatrixOpaque,
         src: *const GpuMatrixOpaque,
@@ -555,6 +925,18 @@ unsafe extern "C" {
         base_bits: u32,
         out: *mut GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_gadget_decompose(
+        src: *const GpuMatrixOpaque,
+        base_bits: u32,
+        out: *mut GpuMatrixOpaque,
+        small: c_int,
+        dropped_moduli: usize,
+        plan: *mut *mut GpuPreparedGadgetDecomposeOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_gadget_decompose(
+        plan: *const GpuPreparedGadgetDecomposeOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_gadget_decompose(plan: *mut GpuPreparedGadgetDecomposeOpaque);
     pub(crate) fn gpu_matrix_sample_gadget_batch(
         outputs: *const *mut GpuMatrixOpaque,
         inputs: *const *const GpuMatrixOpaque,
@@ -652,6 +1034,22 @@ unsafe extern "C" {
         col_offset: usize,
         range: *const GpuMatrixRange,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_sampling(
+        out: *mut GpuMatrixOpaque,
+        dist_type: c_int,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        coefficient_modulus: u64,
+        full_ncol: usize,
+        col_offset: usize,
+        range: *const GpuMatrixRange,
+        plan: *mut *mut GpuPreparedSamplingOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_sampling(
+        plan: *const GpuPreparedSamplingOpaque,
+        seed: GpuRngSeed,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_sampling(plan: *mut GpuPreparedSamplingOpaque);
     pub(crate) fn gpu_matrix_ntt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_all(mat: *mut GpuMatrixOpaque) -> c_int;
     pub(crate) fn gpu_matrix_intt_batch(
@@ -707,6 +1105,12 @@ unsafe extern "C" {
         payload: *mut u8,
         payload_len: usize,
     ) -> c_int;
+    pub(crate) fn gpu_small_matrix_prepare_readback(
+        mat: *mut GpuSmallMatrixOpaque,
+        payload: *mut u8,
+        bytes: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_read_prepared(mat: *const GpuSmallMatrixOpaque) -> c_int;
     pub(crate) fn gpu_small_matrix_decompose_base(
         sources: *const *const GpuMatrixOpaque,
         block_count: usize,
@@ -750,6 +1154,125 @@ unsafe extern "C" {
         allocation_report: *mut GpuSmallMatrixAllocationReportRaw,
         views: *const GpuMatrixBatchView,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_prepare_small_rhs(
+        input_template: *const GpuMatrixOpaque,
+        output: *mut GpuMatrixOpaque,
+        rhs_small: *const GpuSmallMatrixOpaque,
+        residency_budget_bytes: usize,
+        plan: *mut *mut GpuPreparedSmallRhsOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_submit_small_rhs(
+        plan: *const GpuPreparedSmallRhsOpaque,
+        input: *const GpuMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_destroy_prepared_small_rhs(plan: *mut GpuPreparedSmallRhsOpaque);
+
+    pub(crate) fn gpu_small_matrix_prepare_preimage_cutoff(
+        destinations: *const *mut GpuSmallMatrixOpaque,
+        sources: *const *const GpuMatrixOpaque,
+        rows: *const usize,
+        columns: *const usize,
+        count: usize,
+        host_status: *mut i32,
+        plan: *mut *mut GpuPreparedPreimageCutoffOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_begin_preimage_cutoff(
+        plan: *mut GpuPreparedPreimageCutoffOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_submit_preimage_cutoff(
+        plan: *mut GpuPreparedPreimageCutoffOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_finish_preimage_cutoff(
+        plan: *mut GpuPreparedPreimageCutoffOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_wait_preimage_cutoff(
+        plan: *const GpuPreparedPreimageCutoffOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_destroy_preimage_cutoff(
+        plan: *mut GpuPreparedPreimageCutoffOpaque,
+    );
+    pub(crate) fn gpu_preimage_prepare_phases(
+        a: *const GpuMatrixOpaque,
+        b: *const GpuMatrixOpaque,
+        d: *const GpuMatrixOpaque,
+        product: *const GpuMatrixOpaque,
+        p1: *mut GpuMatrixOpaque,
+        residual: *const GpuMatrixOpaque,
+        gadget: *mut GpuMatrixOpaque,
+        base_bits: u32,
+        c: f64,
+        smoothing: f64,
+        sigma: f64,
+        plan: *mut *mut GpuPreparedPreimagePhasesOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_phase_layout(
+        ctx: *mut GpuContextOpaque,
+        rows: usize,
+        columns: usize,
+        layouts: *mut crate::matrix::gpu_dcrt_poly::GpuPreparedWorkspaceLayout,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_cutoff_layout(
+        output: *mut GpuSmallMatrixOpaque,
+        layouts: *mut crate::matrix::gpu_dcrt_poly::GpuPreparedWorkspaceLayout,
+        count: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_refresh_covariance(
+        plan: *mut GpuPreparedPreimagePhasesOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_submit_p1(
+        plan: *mut GpuPreparedPreimagePhasesOpaque,
+        seed: GpuRngSeed,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_submit_gadget(
+        plan: *mut GpuPreparedPreimagePhasesOpaque,
+        seed: GpuRngSeed,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_destroy_phases(plan: *mut GpuPreparedPreimagePhasesOpaque);
+    pub(crate) fn gpu_preimage_mask_phases(
+        plan: *mut GpuPreparedPreimagePhasesOpaque,
+        cutoff: *const GpuPreparedPreimageCutoffOpaque,
+        job: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_mask_sampling(
+        plan: *mut GpuPreparedSamplingOpaque,
+        cutoff: *const GpuPreparedPreimageCutoffOpaque,
+        job: usize,
+    ) -> c_int;
+
+    pub(crate) fn gpu_prepared_schedule_create(
+        plans: *const GpuPreparedPlanRef,
+        count: usize,
+        dependencies: *const *const GpuPreparedScheduleOpaque,
+        dependency_count: usize,
+        out: *mut *mut GpuPreparedScheduleOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_stream_count(
+        schedule: *const GpuPreparedScheduleOpaque,
+    ) -> usize;
+    pub(crate) fn gpu_prepared_schedule_stream_context(
+        schedule: *const GpuPreparedScheduleOpaque,
+        index: usize,
+    ) -> *const std::ffi::c_void;
+    pub(crate) fn gpu_prepared_schedule_bind_dependencies(
+        schedule: *mut GpuPreparedScheduleOpaque,
+        dependencies: *const *const GpuPreparedScheduleOpaque,
+        count: usize,
+    ) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_provision(
+        schedule: *mut GpuPreparedScheduleOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_begin(schedule: *const GpuPreparedScheduleOpaque) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_end(schedule: *const GpuPreparedScheduleOpaque) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_is_ready(
+        schedule: *const GpuPreparedScheduleOpaque,
+        ready: *mut bool,
+    ) -> c_int;
+    pub(crate) fn gpu_preimage_cutoff_is_ready(
+        plan: *const GpuPreparedPreimageCutoffOpaque,
+        ready: *mut bool,
+    ) -> c_int;
+    pub(crate) fn gpu_prepared_schedule_destroy(schedule: *mut GpuPreparedScheduleOpaque);
+
     fn gpu_device_synchronize() -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
     fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
@@ -758,6 +1281,67 @@ unsafe extern "C" {
 
     fn gpu_pinned_alloc(ctx: *mut GpuContextOpaque, bytes: usize, alignment: usize) -> *mut u8;
     fn gpu_pinned_free(ptr: *mut u8) -> c_int;
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_set_work_gate(enabled: bool) {
+    unsafe { gpu_test_set_work_gate_native(enabled) }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_reset_work_counters() {
+    unsafe { gpu_test_reset_work_counters_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_work_counters() -> (usize, usize, usize, usize, usize, usize) {
+    let mut events = 0;
+    let mut streams = 0;
+    let mut native_validations = 0;
+    let mut allocations = 0;
+    let mut kernel_launches = 0;
+    let mut measurement_launches = 0;
+    unsafe {
+        gpu_test_read_work_counters_native(
+            &mut events,
+            &mut streams,
+            &mut native_validations,
+            &mut allocations,
+            &mut kernel_launches,
+            &mut measurement_launches,
+        )
+    };
+    (events, streams, native_validations, allocations, kernel_launches, measurement_launches)
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_measurement_launch() {
+    unsafe { gpu_test_record_measurement_launch_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_event_creation() {
+    unsafe { gpu_test_record_event_creation_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_stream_creation() {
+    unsafe { gpu_test_record_stream_creation_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_native_validation() {
+    unsafe { gpu_test_record_native_validation_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_cuda_allocation() {
+    unsafe { gpu_test_record_cuda_allocation_native() }
+}
+
+#[cfg(feature = "gpu-instrumentation")]
+pub fn gpu_test_record_kernel_launch() {
+    unsafe { gpu_test_record_kernel_launch_native() }
 }
 
 pub const GPU_POLY_FORMAT_COEFF: c_int = 0;

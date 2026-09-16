@@ -62,9 +62,7 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
     let expected = lhs.clone() + &rhs;
     let mut backend = gpu_backend([gpu_parameters.clone()]);
     let mut store = MemoryArtifactStore::default();
-    let mut result = execute(
-        &graph,
-        &mut backend,
+    let inputs =
         BTreeMap::from([
             (
                 "input-0".to_owned(),
@@ -78,11 +76,12 @@ fn test_gpu_dsl_ir_runtime_executes_gadget_arithmetic() {
                     GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &rhs),
                 )),
             ),
-        ]),
-        &mut store,
-        SamplingMode::Fresh,
-    )
-    .expect("execute gadget graph on the GPU runtime backend");
+        ]);
+    backend
+        .warm_up_prepared_graph(&graph, &inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("warm up gadget graph on the GPU runtime backend");
+    let mut result = execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
+        .expect("execute gadget graph on the GPU runtime backend");
     let actual = result
         .materialize_output("output-0", &mut backend, &mut store)
         .expect("materialize GPU gadget output");
@@ -119,6 +118,9 @@ fn test_gpu_parallel_loop_executes_batched_matrix_arithmetic() {
         .expect("build GPU batch graph");
     let graph = built.validate(&ParamEnv::default()).expect("validate GPU batch graph");
     let mut backend = gpu_backend([gpu_parameters]);
+    backend
+        .warm_up_prepared_graph(&graph, &BTreeMap::new(), &mxx_runtime::ExecutionConfig::default())
+        .expect("warm up batched matrix arithmetic on the GPU runtime backend");
     let execution = execute(
         &graph,
         &mut backend,
@@ -209,6 +211,9 @@ fn test_gpu_packed_nested_rns_addition_matches_cpu_matrices() {
         .collect();
     let mut backend = gpu_backend([gpu_parameters]);
     let mut store = MemoryArtifactStore::default();
+    backend
+        .warm_up_prepared_graph(&graph, &runtime_inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("warm up packed nested-RNS graph on the GPU runtime backend");
     let mut execution =
         execute(&graph, &mut backend, runtime_inputs, &mut store, SamplingMode::Fresh)
             .expect("execute packed nested-RNS addition on the GPU runtime backend");
@@ -322,6 +327,9 @@ fn test_gpu_ring_gsw_arithmetic_executes_through_dsl_ir_runtime_and_decrypts() {
         })
         .collect::<BTreeMap<_, _>>();
     let mut backend = gpu_backend([gpu_parameters]);
+    backend
+        .warm_up_prepared_graph(&graph, &runtime_inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("warm up Ring-GSW graph on the GPU runtime backend");
     let execution = execute(
         &graph,
         &mut backend,

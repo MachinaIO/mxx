@@ -1518,37 +1518,20 @@ pub enum GpuCalibrationError {
     InvalidPeakBaseline { peak_bytes: u64, baseline_bytes: u64 },
     #[error("GPU calibration operation identity must contain 32 bytes, got {0}")]
     InvalidOperationIdentityLength(usize),
-    #[error("GPU calibration registry is frozen")]
-    RegistryFrozen,
 }
 
 #[derive(Default)]
 struct RegistryState {
     profiles: HashMap<GpuCalibrationKey, Arc<GpuCalibrationProfile>>,
-    frozen: bool,
 }
 
-/// Setup-time calibration cache shared by estimator and runtime.
+/// Setup-time calibration cache shared by the estimator and runtime warmup.
 ///
-/// Populate it during estimator or runtime preflight, then call [`Self::freeze`]
-/// and pass the returned lock-free snapshot to hot execution. Clones share the
-/// same setup registry and frozen state.
+/// The registry is never consulted by production execution. Warmup consumes
+/// profiles from this cache and publishes concrete operation widths instead.
 #[derive(Clone, Default)]
 pub struct GpuCalibrationRegistry {
     state: Arc<RwLock<RegistryState>>,
-}
-
-impl From<FrozenGpuCalibrationRegistry> for GpuCalibrationRegistry {
-    fn from(snapshot: FrozenGpuCalibrationRegistry) -> Self {
-        // A new setup registry owns only profiles. Existing frozen readers keep
-        // their snapshot; native slots, values and residency are never copied.
-        Self {
-            state: Arc::new(RwLock::new(RegistryState {
-                profiles: (*snapshot.profiles).clone(),
-                frozen: false,
-            })),
-        }
-    }
 }
 
 impl GpuCalibrationRegistry {
@@ -1571,9 +1554,6 @@ impl GpuCalibrationRegistry {
         mut profile: GpuCalibrationProfile,
     ) -> Result<Option<Arc<GpuCalibrationProfile>>, GpuCalibrationError> {
         let mut state = self.state.write().expect("GPU calibration registry lock poisoned");
-        if state.frozen {
-            return Err(GpuCalibrationError::RegistryFrozen);
-        }
         key.class.validate()?;
         if profile.gpu0.is_none() && profile.nonzero.is_none() {
             return Err(GpuCalibrationError::EmptyProfile);
@@ -1596,42 +1576,12 @@ impl GpuCalibrationRegistry {
         Ok(state.profiles.insert(key, Arc::new(profile)))
     }
 
-    pub fn freeze(&self) -> FrozenGpuCalibrationRegistry {
-        let mut state = self.state.write().expect("GPU calibration registry lock poisoned");
-        state.frozen = true;
-        FrozenGpuCalibrationRegistry { profiles: Arc::new(state.profiles.clone()) }
-    }
-
-    pub fn is_frozen(&self) -> bool {
-        self.state.read().expect("GPU calibration registry lock poisoned").frozen
-    }
-
     pub fn len(&self) -> usize {
         self.state.read().expect("GPU calibration registry lock poisoned").profiles.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-}
-
-/// Immutable, lock-free calibration lookup used by the execution hot path.
-#[derive(Clone, Default)]
-pub struct FrozenGpuCalibrationRegistry {
-    profiles: Arc<HashMap<GpuCalibrationKey, Arc<GpuCalibrationProfile>>>,
-}
-
-impl FrozenGpuCalibrationRegistry {
-    pub fn get(&self, key: &GpuCalibrationKey) -> Option<Arc<GpuCalibrationProfile>> {
-        self.profiles.get(key).cloned()
-    }
-
-    pub fn len(&self) -> usize {
-        self.profiles.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.profiles.is_empty()
     }
 }
 
@@ -3381,10 +3331,9 @@ mod tests {
             Err(GpuCalibrationError::CalibrationMetricMismatch),
         );
         assert_eq!(registry.len(), 2);
-        let frozen = registry.freeze();
-        assert_eq!(frozen.get(&key(pool_metric)).as_deref(), Some(&pool));
-        assert_eq!(frozen.get(&key(prepared_metric)).as_deref(), Some(&prepared));
-        assert!(frozen.get(&key(other_configuration)).is_none());
+        assert_eq!(registry.get(&key(pool_metric)).as_deref(), Some(&pool));
+        assert_eq!(registry.get(&key(prepared_metric)).as_deref(), Some(&prepared));
+        assert!(registry.get(&key(other_configuration)).is_none());
     }
 
     #[test]
@@ -3545,15 +3494,11 @@ mod tests {
         );
 
         let shared = registry.clone();
-        let frozen = registry.freeze();
-        assert!(shared.is_frozen());
         assert_eq!(shared.len(), 1);
-        assert_eq!(frozen.get(&same_operation_a).as_deref(), Some(&profile));
-        assert_eq!(frozen.len(), 1);
-        assert_eq!(
-            shared.insert(same_operation_b, profile),
-            Err(GpuCalibrationError::RegistryFrozen)
-        );
+        assert_eq!(shared.get(&same_operation_a).as_deref(), Some(&profile));
+        assert_eq!(shared.len(), 1);
+        shared.insert(same_operation_b, profile).unwrap();
+        assert_eq!(shared.len(), 2);
     }
 
     #[test]

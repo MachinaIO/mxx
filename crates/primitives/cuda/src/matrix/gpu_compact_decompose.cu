@@ -1,4 +1,5 @@
 #include "gpu_compact_decompose.cuh"
+#include "gpu_prepared_plan.cuh"
 
 struct GpuPreparedCompactDecompose {
     GpuMatrix *source;
@@ -16,9 +17,52 @@ struct GpuPreparedCompactDecompose {
     }
 };
 
-extern "C" int gpu_small_matrix_prepare_decompose(
+static int compact_ntt_substage(
+    const GpuPreparedPlanDescriptor *descriptor, GpuPreparedPlanDescriptor *substage)
+{
+    if (!descriptor || !substage) return set_error("missing compact inverse NTT substage");
+    size_t allocation_index = SIZE_MAX;
+    for (size_t index = 0; index < descriptor->allocation_count; ++index)
+        if (descriptor->allocations[index].kind == GPU_PREPARED_PLAN_HOST_ONLY &&
+            descriptor->allocations[index].key.role == GPU_PREPARED_STAGE_NTT)
+        {
+            allocation_index = index;
+            break;
+        }
+    if (allocation_index == SIZE_MAX || descriptor->streams[0].key.role != GPU_PREPARED_STAGE_NTT)
+    {
+        size_t stream_index = SIZE_MAX;
+        for (size_t index = 0; index < descriptor->stream_count; ++index)
+            if (descriptor->streams[index].key.role == GPU_PREPARED_STAGE_NTT)
+            { stream_index = index; break; }
+        if (stream_index == SIZE_MAX) return set_error("compact inverse NTT stream is absent");
+        *substage = GpuPreparedPlanDescriptor{};
+        substage->stream_count = 1;
+        substage->streams[0] = descriptor->streams[stream_index];
+    }
+    else
+    {
+        *substage = GpuPreparedPlanDescriptor{};
+        substage->stream_count = 1;
+        substage->streams[0] = descriptor->streams[0];
+    }
+    const auto &allocation = descriptor->allocations[allocation_index];
+    if (allocation.bytes == 0 || allocation.bytes % sizeof(GpuPreparedNttLaunchLayout) != 0)
+        return set_error("compact inverse NTT geometry is invalid");
+    substage->allocation_count = 1;
+    substage->allocations[0] = allocation;
+    substage->launch_count = allocation.bytes / sizeof(GpuPreparedNttLaunchLayout);
+    if (substage->launch_count > descriptor->launch_count)
+        return set_error("compact inverse NTT launch table is incomplete");
+    std::memcpy(substage->launches, descriptor->launches,
+        substage->launch_count * sizeof(GpuPreparedLaunchLayout));
+    return 0;
+}
+
+static int prepare_compact_decompose_impl(
     GpuMatrix *source, GpuSmallMatrix *output, uint32_t base_bits, bool small,
-    size_t dropped_moduli, GpuPreparedCompactDecompose **out)
+    size_t dropped_moduli, GpuPreparedCompactDecompose **out,
+    const GpuPreparedPlanDescriptor *saved = nullptr)
 try {
     if (!out || !source || !output || source->ctx != output->ctx ||
         !source->ctx || source->level < 0 || base_bits == 0 || base_bits >= 63 ||
@@ -67,14 +111,38 @@ try {
     if (!plan->blocks.inputs[0] || !plan->moduli)
         return set_error("prepared compact decomposition descriptors missing");
     if (source->format == GPU_POLY_FORMAT_EVAL) {
-        const int status = gpu_matrix_prepare_ntt_plan(source, nullptr, false, &plan->inverse);
+        int status = 0;
+        if (saved) {
+            GpuPreparedPlanDescriptor inverse_layout{};
+            status = compact_ntt_substage(saved, &inverse_layout);
+            if (status == 0)
+                status = gpu_matrix_prepare_ntt_plan_with_layout(
+                    source, nullptr, false, &inverse_layout, &plan->inverse);
+        } else {
+            status = gpu_matrix_prepare_ntt_plan(source, nullptr, false, &plan->inverse);
+        }
         if (status != 0) return status;
     }
     if (plan->dropped) {
         GpuMatrixTransformWorkspaceBytes bytes{};
-        int status = gpu_matrix_query_gadget_correction_workspace_bytes(source->ctx,
-            source->level, source->rows, source->cols, dropped_moduli, &bytes);
-        if (status != 0) return status;
+        int status = 0;
+        if (saved) {
+            bool found = false;
+            for (size_t index = 0; index < saved->allocation_count; ++index) {
+                const auto &entry = saved->allocations[index];
+                if (entry.kind == GPU_PREPARED_BATCH_WORKSPACE &&
+                    entry.key.role == GPU_PREPARED_STAGE_TRANSFORM) {
+                    if (found) return set_error("duplicate compact correction workspace");
+                    bytes = {entry.bytes, entry.bytes, 0, entry.alignment};
+                    found = true;
+                }
+            }
+            if (!found) return set_error("compact correction workspace is absent");
+        } else {
+            status = gpu_matrix_query_gadget_correction_workspace_bytes(source->ctx,
+                source->level, source->rows, source->cols, dropped_moduli, &bytes);
+            if (status != 0) return status;
+        }
         status = plan->correction.acquire_persistent(source, output->device, output->stream, bytes);
         if (status != 0) return status;
         const size_t count = plan->polynomial_count * output->n;
@@ -92,6 +160,39 @@ try {
     }
     *out = plan.release();
     return 0;
+}
+catch (const std::exception &error) { return set_error(error.what()); }
+
+extern "C" int gpu_small_matrix_prepare_decompose(
+    GpuMatrix *source, GpuSmallMatrix *output, uint32_t base_bits, bool small,
+    size_t dropped_moduli, GpuPreparedCompactDecompose **out)
+{
+    return prepare_compact_decompose_impl(source, output, base_bits, small,
+        dropped_moduli, out);
+}
+
+extern "C" int gpu_small_matrix_prepare_decompose_with_layout(
+    GpuMatrix *source, GpuSmallMatrix *output, uint32_t base_bits, bool small,
+    size_t dropped_moduli, const GpuPreparedPlanDescriptor *layout,
+    GpuPreparedCompactDecompose **out)
+try {
+    if (!layout || !out || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared compact decomposition layout is missing");
+    if (!source || !output || source->level < 0 || layout->allocation_count <
+            static_cast<size_t>(source->level + 1) || layout->stream_count == 0)
+        return set_error("prepared compact decomposition layout is incomplete");
+    if (source->format == GPU_POLY_FORMAT_EVAL) {
+        GpuPreparedPlanDescriptor inverse_layout{};
+        if (compact_ntt_substage(layout, &inverse_layout) != 0)
+            return set_error("prepared compact inverse NTT descriptor is incomplete");
+        GpuMatrixTransformPlan *validated = nullptr;
+        if (gpu_matrix_prepare_ntt_plan_with_layout(source, nullptr, false,
+                &inverse_layout, &validated) != 0)
+            return set_error("prepared compact inverse NTT descriptor differs");
+        gpu_matrix_destroy_ntt_plan(validated);
+    }
+    return prepare_compact_decompose_impl(source, output, base_bits, small,
+        dropped_moduli, out, layout);
 }
 catch (const std::exception &error) { return set_error(error.what()); }
 

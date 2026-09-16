@@ -37,13 +37,26 @@ extern "C" int gpu_prepared_schedule_is_ready(const GpuPreparedSchedule *schedul
     if (!schedule || !ready || !schedule->state->provisioned)
         return set_error("invalid prepared schedule readiness query");
     *ready = true;
+    int current = 0;
+    cudaError_t error = cudaGetDevice(&current);
+    if (error != cudaSuccess) return set_error(error);
     for (const auto &stream : schedule->state->streams) {
-        auto error = cudaSetDevice(stream.device);
+        error = cudaSetDevice(stream.device);
         if (error == cudaSuccess) error = cudaEventQuery(stream.completion->event);
-        if (error == cudaErrorNotReady) { *ready = false; continue; }
-        if (error != cudaSuccess) return set_error(error);
+        if (error == cudaErrorNotReady) {
+            // A stream that is still running is a readiness result, never an
+            // error: this query is the runtime's nonblocking polling path, and
+            // reporting the pending status as a failure would poison a healthy,
+            // simply unfinished schedule.
+            *ready = false;
+            error = cudaSuccess;
+            continue;
+        }
+        if (error != cudaSuccess) break;
     }
-    return 0;
+    const cudaError_t restored = cudaSetDevice(current);
+    if (error == cudaSuccess) error = restored;
+    return error == cudaSuccess ? 0 : set_error(error);
 }
 
 extern "C" int gpu_prepared_schedule_create(

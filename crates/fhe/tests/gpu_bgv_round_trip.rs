@@ -1,7 +1,7 @@
 pub mod gpu_utils;
 pub mod utils;
 
-use gpu_utils::{centered, compile, input, integers, run};
+use gpu_utils::{centered, compile, input, integers, run, setup};
 use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_fhe::{BgvCiphertext, FheScheme};
 use mxx_ir_core::node::IndexRange;
@@ -81,7 +81,9 @@ fn test_gpu_bgv_round_trip() {
             .unwrap(),
         &mut backend,
     );
-    let (keys, keygen_seconds) = run(&keygen, &mut backend, BTreeMap::new());
+    let keygen_inputs = BTreeMap::new();
+    setup(&keygen, &mut backend, &keygen_inputs);
+    let (keys, keygen_seconds) = run(&keygen, &mut backend, keygen_inputs);
     println!("FHE_PROGRESS scheme=bgv stage=keygen seconds={keygen_seconds}");
     let encryption = compile(encryption, &mut backend);
     let t = bgv.plaintext_modulus;
@@ -102,15 +104,13 @@ fn test_gpu_bgv_round_trip() {
         assert_eq!(y.len(), n);
         assert!(x.iter().chain(&y).all(|v| *v >= 0 && (*v as u64) < t));
     }
-    let (encrypted, encryption_seconds) = run(
-        &encryption,
-        &mut backend,
-        BTreeMap::from([
-            ("pk".into(), keys["pk"].clone()),
-            ("x".into(), input(&x)),
-            ("y".into(), input(&y)),
-        ]),
-    );
+    let encryption_inputs = BTreeMap::from([
+        ("pk".into(), keys["pk"].clone()),
+        ("x".into(), input(&x)),
+        ("y".into(), input(&y)),
+    ]);
+    setup(&encryption, &mut backend, &encryption_inputs);
+    let (encrypted, encryption_seconds) = run(&encryption, &mut backend, encryption_inputs);
     println!("FHE_PROGRESS scheme=bgv stage=encryption seconds={encryption_seconds}");
     let eval_inputs = BTreeMap::from([
         ("lhs".into(), encrypted["lhs"].clone()),
@@ -154,6 +154,7 @@ fn test_gpu_bgv_round_trip() {
         } else {
             eval_inputs.clone()
         };
+        setup(&graph, &mut backend, &needed);
         let (evaluated, _) = run(&graph, &mut backend, needed);
         stage_values.insert(*name, evaluated["ct"].clone());
         let p = common.parameters_at(*level).unwrap();
@@ -182,14 +183,12 @@ fn test_gpu_bgv_round_trip() {
                 .unwrap(),
             &mut backend,
         );
-        let (decoded, _) = run(
-            &decrypt,
-            &mut backend,
-            BTreeMap::from([
-                ("ct".into(), evaluated["ct"].clone()),
-                ("sk".into(), keys["sk"].clone()),
-            ]),
-        );
+        let decrypt_inputs = BTreeMap::from([
+            ("ct".into(), evaluated["ct"].clone()),
+            ("sk".into(), keys["sk"].clone()),
+        ]);
+        setup(&decrypt, &mut backend, &decrypt_inputs);
+        let (decoded, _) = run(&decrypt, &mut backend, decrypt_inputs);
         let expected = x
             .iter()
             .zip(&y)
@@ -243,11 +242,10 @@ fn test_gpu_bgv_round_trip() {
                 .unwrap(),
             &mut backend,
         );
-        let (output, _) = run(
-            &graph,
-            &mut backend,
-            BTreeMap::from([("ct".into(), stage_values["relinearized"].clone())]),
-        );
+        let reference_inputs =
+            BTreeMap::from([("ct".into(), stage_values["relinearized"].clone())]);
+        setup(&graph, &mut backend, &reference_inputs);
+        let (output, _) = run(&graph, &mut backend, reference_inputs);
         assert_eq!(
             gpu_utils::matrix_bytes(&output["actual"], &backend),
             gpu_utils::matrix_bytes(&output["reference"], &backend),
@@ -268,6 +266,7 @@ fn test_gpu_bgv_round_trip() {
             &mut backend,
         );
         let expected_bytes = gpu_utils::matrix_bytes(&stage_values[stages[index].0], &backend);
+        setup(&graph, &mut backend, &eval_inputs);
         let (warmup, _) = run(&graph, &mut backend, eval_inputs.clone());
         assert!(
             gpu_utils::matrix_bytes(&warmup["ct"], &backend) == expected_bytes,
@@ -312,6 +311,7 @@ fn test_gpu_bgv_round_trip() {
         if label == "relinearize" {
             inputs.insert("rk".into(), keys["rk"].clone());
         }
+        setup(&graph, &mut backend, &inputs);
         let (graph_output, _) = run(&graph, &mut backend, inputs.clone());
         let RuntimeValue::Matrix(graph_matrix) = &graph_output["ct"] else {
             panic!("ordinary graph output must remain GPU-resident")

@@ -5,7 +5,7 @@
 //! allocates storage, or builds a schedule.
 
 use super::gpu_prepared_lowering::{
-    FixedCopy, PreparedOperation, PreparedProgram, PreparedScalar, ScalarOpcode, ScalarValue,
+    FixedCopy, GpuPreparation, PreparedOperation, PreparedScalar, ScalarOpcode, ScalarValue,
     ValueLocation,
 };
 use mxx_ir_core::node::{IntBinaryOp, IntCompareOp, RealBinaryOp};
@@ -211,9 +211,6 @@ pub enum PreparedControlCommand {
         source: usize,
         output: usize,
     },
-    FixedCopies {
-        copies: Box<[FixedCopy]>,
-    },
     Selection {
         candidates: Box<[ValueLocation]>,
         selector: PreparedSelector,
@@ -234,6 +231,7 @@ pub enum PreparedExecutableCommand {
         variant_indices: Box<[usize]>,
     },
     Sequential {
+        call: mxx_ir_core::types::NodeId,
         count: usize,
         counts: Box<[usize]>,
         offsets: Box<[usize]>,
@@ -241,9 +239,11 @@ pub enum PreparedExecutableCommand {
         tail: Box<[PreparedExecutableCommand]>,
     },
     Subgraph {
+        call: Option<mxx_ir_core::types::NodeId>,
         body: Box<[PreparedExecutableCommand]>,
     },
     Parallel {
+        call: mxx_ir_core::types::NodeId,
         counts: Box<[usize]>,
         waves: Box<[Box<[PreparedExecutableCommand]>]>,
     },
@@ -257,7 +257,7 @@ pub enum PreparedSelector {
 }
 
 fn selector_source(
-    program: &PreparedProgram,
+    program: &GpuPreparation,
     wire: mxx_ir_core::types::WireRef,
     node_id: u32,
 ) -> Result<PreparedSelector, String> {
@@ -276,11 +276,47 @@ fn selector_source(
     Err(format!("selection node {node_id} selector is not a scalar binding"))
 }
 
+fn validate_fixed_location_pair(
+    source: &ValueLocation,
+    output: &ValueLocation,
+) -> Result<(), String> {
+    if source.device != output.device || source.shape() != output.shape() {
+        return Err("prepared fixed locations are incompatible".into());
+    }
+    Ok(())
+}
+
+fn validate_fixed_copies(copies: &[FixedCopy]) -> Result<(), String> {
+    if copies
+        .iter()
+        .any(|copy| validate_fixed_location_pair(&copy.source, &copy.destination).is_err())
+    {
+        return Err("prepared fixed view copy has incompatible locations".into());
+    }
+    Ok(())
+}
+
+fn validate_family_pack(
+    members: &[ValueLocation],
+    scalar_members: &[usize],
+    output: Option<&ValueLocation>,
+) -> Result<(), String> {
+    if members.is_empty() && scalar_members.is_empty() {
+        return Err("prepared family has no compatible fixed members".into());
+    }
+    if let Some(output) = output {
+        if members.is_empty() || output.device != members[0].device {
+            return Err("prepared family has no compatible fixed members".into());
+        }
+    }
+    Ok(())
+}
+
 /// Build all non-native fixed commands during warmup.  Native commands remain
 /// owned by the native factory; this function only emits control descriptors,
 /// so the common factory can concatenate both sets without a second IR pass.
 pub fn build_control_commands(
-    program: &PreparedProgram,
+    program: &GpuPreparation,
 ) -> Result<Box<[PreparedControlCommand]>, String> {
     let mut commands = Vec::new();
     for node in &program.topology.nodes {
@@ -378,7 +414,8 @@ pub fn build_control_commands(
                                 output: location.clone(),
                             }
                         }
-                        super::gpu_prepared_lowering::PreparedView::FixedCopies(_) => {
+                        super::gpu_prepared_lowering::PreparedView::FixedCopies(copies) => {
+                            validate_fixed_copies(copies)?;
                             return Err(format!(
                                 "view node {} requires an owner-bound copy command",
                                 node.id
@@ -400,6 +437,7 @@ pub fn build_control_commands(
                         .and_then(|wire| program.values.get(wire))
                         .cloned()
                         .ok_or_else(|| format!("alias node {} has no output", node.id))?;
+                    validate_fixed_location_pair(&source, &output)?;
                     PreparedControlCommand::Alias { source, output }
                 }
             }
@@ -440,6 +478,7 @@ pub fn build_control_commands(
                                 .into_boxed_slice()
                         })
                         .unwrap_or_default();
+                    validate_family_pack(members, &scalar_members, output.as_ref())?;
                     PreparedControlCommand::FamilyPack {
                         members: members.clone(),
                         scalar_members,
@@ -451,12 +490,11 @@ pub fn build_control_commands(
                     })?;
                     match selection {
                         super::gpu_prepared_lowering::PreparedSelection::Static { location } => {
-                            PreparedControlCommand::Alias {
-                                source: location.clone(),
-                                output: output.ok_or_else(|| {
-                                    format!("selection node {} has no matrix output", node.id)
-                                })?,
-                            }
+                            let output = output.ok_or_else(|| {
+                                format!("selection node {} has no matrix output", node.id)
+                            })?;
+                            validate_fixed_location_pair(location, &output)?;
+                            PreparedControlCommand::Alias { source: location.clone(), output }
                         }
                         super::gpu_prepared_lowering::PreparedSelection::Dynamic {
                             candidates,
@@ -635,29 +673,7 @@ pub fn execute_control_commands(
                     .ok_or_else(|| "prepared scalar alias output is missing".to_owned())?
                     .clone_from(&value);
             }
-            PreparedControlCommand::Alias { source, output } => {
-                if source.device != output.device || source.shape() != output.shape() {
-                    return Err("prepared alias has incompatible fixed locations".into());
-                }
-            }
-            PreparedControlCommand::FamilyPack { members, scalar_members, output } => {
-                if members.is_empty() && scalar_members.is_empty() {
-                    return Err("prepared family has no compatible fixed members".into());
-                }
-                if let Some(output) = output {
-                    if members.is_empty() || output.device != members[0].device {
-                        return Err("prepared family has no compatible fixed members".into());
-                    }
-                }
-            }
-            PreparedControlCommand::FixedCopies { copies } => {
-                if copies.iter().any(|copy| {
-                    copy.source.shape() != copy.destination.shape() ||
-                        copy.source.device != copy.destination.device
-                }) {
-                    return Err("prepared fixed view copy has incompatible locations".into());
-                }
-            }
+            PreparedControlCommand::Alias { .. } | PreparedControlCommand::FamilyPack { .. } => {}
             PreparedControlCommand::Input {
                 slot: Some(slot),
                 runtime_index: Some(runtime_index),
@@ -728,6 +744,22 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, &ScalarValue::Int(BigInt::from(12)));
+    }
+
+    #[test]
+    fn scalar_commands_preserve_a_1024_bit_product_exactly() {
+        let multiply = command(
+            ScalarOpcode::IntBinary(IntBinaryOp::Multiply),
+            &[ScalarValue::Runtime(0), ScalarValue::Runtime(1)],
+            2,
+        );
+        let value = (BigInt::from(1u8) << 1023usize) + BigInt::from(17u8);
+        let expected = &value * &value;
+        let mut scratch = vec![ScalarValue::Int(BigInt::from(0)); multiply.value_count()];
+        let result = multiply
+            .execute(&[ScalarValue::Int(value.clone()), ScalarValue::Int(value)], &[], &mut scratch)
+            .unwrap();
+        assert_eq!(result, &ScalarValue::Int(expected));
     }
 
     #[test]
@@ -901,6 +933,50 @@ mod tests {
             },
         };
         assert!(matches!(alias, PreparedControlCommand::Alias { .. }));
+    }
+
+    #[test]
+    fn warmup_rejects_incompatible_fixed_locations() {
+        let location = |device, columns| ValueLocation {
+            owner: 1,
+            rows: 0..1,
+            columns: 0..columns,
+            level: 0,
+            format: super::super::gpu_prepared_lowering::PreparedFormat::Evaluation,
+            device,
+        };
+        assert!(validate_fixed_location_pair(&location(0, 1), &location(1, 1)).is_err());
+        assert!(validate_fixed_location_pair(&location(0, 1), &location(0, 2)).is_err());
+        assert!(
+            validate_fixed_copies(&[FixedCopy {
+                source: location(0, 1),
+                destination: location(0, 2)
+            },])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn replay_does_not_revalidate_fixed_locations() {
+        let location = |device| ValueLocation {
+            owner: 1,
+            rows: 0..1,
+            columns: 0..1,
+            level: 0,
+            format: super::super::gpu_prepared_lowering::PreparedFormat::Evaluation,
+            device,
+        };
+        let commands = [
+            PreparedControlCommand::Alias { source: location(0), output: location(1) },
+            PreparedControlCommand::FamilyPack {
+                members: Box::new([]),
+                scalar_members: vec![0].into_boxed_slice(),
+                output: None,
+            },
+        ];
+        let mut slots = vec![ScalarValue::Bool(false)];
+        execute_control_commands(&commands, &[], &mut [], &mut [], &mut slots, &mut [], None)
+            .unwrap();
     }
 
     #[test]

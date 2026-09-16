@@ -8,7 +8,7 @@ use mxx_primitives::matrix::{
     PolyMatrix,
     gpu_dcrt_poly::{
         GpuDCRTPolyMatrix, GpuPreparedConstCoeffReadback, GpuPreparedRnsReconstruction,
-        GpuPreparedRnsUpload,
+        GpuPreparedRnsUpload, PreparedPlanLayout,
     },
 };
 use std::sync::{Arc, Mutex};
@@ -23,6 +23,7 @@ pub(crate) struct PreparedHostCommandSpec {
     pub bytes_per_poly: usize,
     pub format: i32,
     pub transform_to_eval: bool,
+    pub plan: PreparedPlanLayout,
 }
 
 pub(crate) enum PreparedHostCommand {
@@ -38,6 +39,7 @@ pub(crate) fn bind_readback(spec: &PreparedHostCommandSpec) -> Result<PreparedHo
         spec.words_per_poly,
         spec.coefficient_index,
         spec.coefficient_count,
+        spec.plan.clone(),
     )?;
     let values = Arc::new(Mutex::new(
         vec![0u64; source.size().0 * source.size().1 * spec.words_per_poly].into_boxed_slice(),
@@ -49,8 +51,12 @@ pub(crate) fn bind_reconstruction(
     spec: &PreparedHostCommandSpec,
 ) -> Result<PreparedHostCommand, String> {
     let source = Arc::clone(spec.source.as_ref().ok_or("reconstruction source owner is missing")?);
-    let command =
-        GpuPreparedRnsReconstruction::bind(source, spec.coefficient_index, spec.coefficient_count)?;
+    let command = GpuPreparedRnsReconstruction::bind(
+        source,
+        spec.coefficient_index,
+        spec.coefficient_count,
+        spec.plan.clone(),
+    )?;
     Ok(PreparedHostCommand::Reconstruction { command })
 }
 
@@ -61,6 +67,7 @@ pub(crate) fn bind_upload(spec: &PreparedHostCommandSpec) -> Result<PreparedHost
         spec.bytes_per_poly,
         spec.format,
         spec.transform_to_eval,
+        spec.plan.clone(),
     )?;
     Ok(PreparedHostCommand::Upload { command })
 }

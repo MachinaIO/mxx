@@ -29,10 +29,16 @@ const SPECTRAL_CONSTANT: f64 = 1.8;
 
 #[path = "gpu_prepared_preimage.rs"]
 mod gpu_prepared_preimage;
-pub use gpu_prepared_preimage::{GpuPreparedPreimageError, GpuPreparedPreimageSampler};
+pub use gpu_prepared_preimage::{
+    GpuPreparedPreimageBindEntry, GpuPreparedPreimageEntryKind, GpuPreparedPreimageError,
+    GpuPreparedPreimageLayout, GpuPreparedPreimageSampler, PREIMAGE_STAGE_KINDS, PreimageStage,
+};
 #[path = "gpu_prepared_trapdoor.rs"]
 mod gpu_prepared_trapdoor;
-pub use gpu_prepared_trapdoor::GpuPreparedTrapdoorSampler;
+pub use gpu_prepared_trapdoor::{
+    GpuPreparedTrapdoorBindEntry, GpuPreparedTrapdoorEntryKind, GpuPreparedTrapdoorLayout,
+    GpuPreparedTrapdoorSampler, TRAPDOOR_STAGE_KINDS, TrapdoorStage,
+};
 
 pub(super) type TrapdoorMatrix = GpuDCRTPolyMatrix;
 
@@ -230,11 +236,15 @@ impl GpuDCRTTrapdoor {
 
     /// Waits for every matrix required to consume this trapdoor.
     pub fn wait_until_ready(&self) {
-        self.r.wait_until_ready();
-        self.e.wait_until_ready();
-        self.a_mat_coeff.wait_until_ready();
-        self.b_mat_coeff.wait_until_ready();
-        self.d_mat_coeff.wait_until_ready();
+        self.wait_until_ready_result().unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Wait for every matrix required to consume this trapdoor and preserve
+    /// the first native failure for result-based fleet APIs.
+    pub fn wait_until_ready_result(&self) -> Result<(), String> {
+        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+            .into_iter()
+            .try_for_each(GpuDCRTPolyMatrix::wait_until_ready_result)
     }
 
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
@@ -256,7 +266,7 @@ impl GpuDCRTTrapdoor {
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
-        let mats = [&self.r, &self.e];
+        let mats = [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff];
         let mut parts = Vec::with_capacity(mats.len());
         let mut total_len = 0usize;
         for mat in mats {
@@ -291,17 +301,80 @@ impl GpuDCRTTrapdoor {
         };
         let r_bytes = next(bytes, &mut offset)?;
         let e_bytes = next(bytes, &mut offset)?;
+        let a_bytes = next(bytes, &mut offset)?;
+        let b_bytes = next(bytes, &mut offset)?;
+        let d_bytes = next(bytes, &mut offset)?;
         if offset != bytes.len() {
             return None;
         }
 
         let r = GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
         let e = GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
-        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
-        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
-        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
+        let a_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
+        let b_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
+        let d_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
         let p1_covariance_cache = Arc::new(Mutex::new(None));
         Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache })
+    }
+
+    /// Validate and upload the complete trapdoor payload into these existing
+    /// owners. Replay uses this fixed destination path; it never samples or
+    /// allocates a replacement trapdoor.
+    pub fn load_compact_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        let mut offset = 0usize;
+        let next = |offset: &mut usize| -> Result<&[u8], String> {
+            let end = offset.checked_add(8).ok_or("trapdoor payload length overflow")?;
+            if end > bytes.len() {
+                return Err("trapdoor payload is truncated".into());
+            }
+            let mut len_bytes = [0u8; 8];
+            len_bytes.copy_from_slice(&bytes[*offset..end]);
+            let len = usize::try_from(u64::from_le_bytes(len_bytes))
+                .map_err(|_| "trapdoor payload length overflow")?;
+            let start = end;
+            let end = start.checked_add(len).ok_or("trapdoor payload length overflow")?;
+            if end > bytes.len() {
+                return Err("trapdoor payload is truncated".into());
+            }
+            *offset = end;
+            Ok(&bytes[start..end])
+        };
+        let payloads = [
+            next(&mut offset)?,
+            next(&mut offset)?,
+            next(&mut offset)?,
+            next(&mut offset)?,
+            next(&mut offset)?,
+        ];
+        if offset != bytes.len() {
+            return Err("trapdoor payload has trailing bytes".into());
+        }
+        for (payload, owner) in payloads.into_iter().zip([
+            &self.r,
+            &self.e,
+            &self.a_mat_coeff,
+            &self.b_mat_coeff,
+            &self.d_mat_coeff,
+        ]) {
+            GpuDCRTPolyMatrix::validate_compact_bytes(
+                payload,
+                owner.row_size(),
+                owner.col_size(),
+                owner.level(),
+                owner.params().ring_dimension() as usize,
+                owner.is_ntt(),
+            )?;
+        }
+        for (payload, owner) in payloads.into_iter().zip([
+            &self.r,
+            &self.e,
+            &self.a_mat_coeff,
+            &self.b_mat_coeff,
+            &self.d_mat_coeff,
+        ]) {
+            owner.load_compact_bytes(payload)?;
+        }
+        Ok(())
     }
 }
 

@@ -2,6 +2,7 @@
 
 #include "matrix/Matrix.cuh"
 #include "gpu_admission.cuh"
+#include "gpu_prepared_plan.cuh"
 
 #ifdef __cplusplus
 extern "C"
@@ -41,25 +42,57 @@ extern "C"
         size_t words_per_poly,
         size_t coefficient_index,
         size_t coefficient_count,
+        const GpuPreparedPlanDescriptor *plan,
         GpuPreparedConstCoeffReadback **out_plan);
+    // Submission mutates only the per-submission terminal generations; the
+    // recorded event of the newest generation is what a readiness query and the
+    // pinned-free retirement both rely on.
     int gpu_matrix_submit_const_coeff_readback(
-        const GpuPreparedConstCoeffReadback *plan);
+        GpuPreparedConstCoeffReadback *plan);
+    int gpu_matrix_query_const_coeff_readback(
+        const GpuPreparedConstCoeffReadback *plan,
+        int *out_ready);
     int gpu_matrix_wait_const_coeff_readback(
         const GpuPreparedConstCoeffReadback *plan);
+    // Hands the pinned readback destination to the context-owned reclaimer
+    // behind fresh terminal events for every stream the plan submits on.
+    int gpu_matrix_defer_const_coeff_readback_pinned_free(
+        const GpuPreparedConstCoeffReadback *plan,
+        void *pointer);
     void gpu_matrix_destroy_const_coeff_readback(
         GpuPreparedConstCoeffReadback *plan);
 
     typedef struct GpuPreparedRnsUpload GpuPreparedRnsUpload;
+    typedef struct GpuPreparedCompactUpload GpuPreparedCompactUpload;
     int gpu_matrix_prepare_rns_upload(
         GpuMatrix *mat,
         const uint8_t *bytes,
         size_t bytes_per_poly,
         int format,
         bool transform_to_eval,
+        const GpuPreparedPlanDescriptor *plan,
         GpuPreparedRnsUpload **out_plan);
-    int gpu_matrix_submit_rns_upload(const GpuPreparedRnsUpload *plan);
+    int gpu_matrix_submit_rns_upload(GpuPreparedRnsUpload *plan);
+    int gpu_matrix_query_rns_upload(
+        const GpuPreparedRnsUpload *plan,
+        int *out_ready);
     int gpu_matrix_wait_rns_upload(const GpuPreparedRnsUpload *plan);
+    // Hands the pinned staging allocation to the context-owned reclaimer behind
+    // fresh terminal events for every stream the plan submits on.
+    int gpu_matrix_defer_rns_upload_pinned_free(
+        const GpuPreparedRnsUpload *plan,
+        void *pointer);
     void gpu_matrix_destroy_rns_upload(GpuPreparedRnsUpload *plan);
+    int gpu_matrix_prepare_compact_upload(
+        GpuMatrix *mat, const uint8_t *payload, size_t payload_capacity,
+        uint16_t max_coeff_bits, const GpuPreparedPlanDescriptor *plan,
+        GpuPreparedCompactUpload **out_plan);
+    int gpu_matrix_submit_compact_upload(
+        GpuPreparedCompactUpload *plan, uint16_t max_coeff_bits, size_t payload_len);
+    int gpu_matrix_query_compact_upload(
+        const GpuPreparedCompactUpload *plan, int *out_ready);
+    int gpu_matrix_wait_compact_upload(const GpuPreparedCompactUpload *plan);
+    void gpu_matrix_destroy_compact_upload(GpuPreparedCompactUpload *plan);
 
 
     int gpu_matrix_store_compact_bytes(

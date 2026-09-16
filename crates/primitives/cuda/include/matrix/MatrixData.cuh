@@ -2,6 +2,8 @@
 
 #include "matrix/Matrix.cuh"
 
+struct GpuPreparedOwnerLayout;
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -39,6 +41,15 @@ extern "C"
         size_t rows,
         size_t cols,
         int format,
+        GpuMatrix **out,
+        bool initialize_descriptors = true);
+    int gpu_matrix_create_prepared(
+        GpuContext *ctx,
+        int level,
+        size_t rows,
+        size_t cols,
+        int format,
+        const GpuPreparedOwnerLayout *owner_layout,
         GpuMatrix **out,
         bool initialize_descriptors = true);
     void gpu_matrix_destroy(GpuMatrix *mat);

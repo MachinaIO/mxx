@@ -1,22 +1,215 @@
 //! Warmup binding of scalar chains that consume device-produced values.
-use super::{super::gpu_prepared_lowering::PreparedProgram, *};
+use super::{super::gpu_prepared_lowering::GpuPreparation, *};
 use mxx_ir_core::{
     node::{IntBinaryOp, IntCompareOp, RealBinaryOp},
     types::ConcreteWireType,
 };
-use mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedScalarOpcode;
+use mxx_primitives::matrix::gpu_dcrt_poly::{
+    GpuPreparedScalarOpcode, GpuScalarCapacityAllocator, GpuScalarCapacityLease,
+};
+
+/// Adapter from the prepared runtime ledger to the primitive scalar growth
+/// hook.  The returned native-independent lease owns the ledger lifecycle and
+/// can therefore outlive this short mutable backend borrow.
+pub(crate) struct LedgerScalarCapacityAllocator<'a> {
+    ledger: &'a mut crate::gpu_memory::GpuMemoryLedger,
+}
+
+struct LedgerScalarCapacityLease {
+    lease: Option<crate::gpu_memory::GpuAllocationLease>,
+}
+
+impl GpuScalarCapacityLease for LedgerScalarCapacityLease {
+    fn commit(&mut self) -> Result<(), String> {
+        self.lease
+            .as_mut()
+            .ok_or("scalar capacity lease already retired")?
+            .commit_prepared_scalar()
+            .map_err(|error| error.to_string())
+    }
+
+    fn cancel(&mut self) -> Result<(), String> {
+        self.lease
+            .as_mut()
+            .ok_or("scalar capacity lease already retired")?
+            .cancel_prepared_scalar()
+            .map_err(|error| error.to_string())?;
+        self.lease = None;
+        Ok(())
+    }
+
+    fn retire(
+        &mut self,
+        completion: mxx_primitives::poly::dcrt::gpu::GpuReleaseCompletion,
+    ) -> Result<(), String> {
+        self.lease
+            .as_mut()
+            .ok_or("scalar capacity lease already retired")?
+            .retire_prepared_scalar(completion)
+            .map_err(|error| error.to_string())?;
+        self.lease = None;
+        Ok(())
+    }
+
+    fn quarantine(&mut self) -> Result<(), String> {
+        let lease = self.lease.as_mut().ok_or("scalar capacity lease already retired")?;
+        lease.quarantine_prepared_scalar().map_err(|error| error.to_string())?;
+        self.lease = None;
+        Ok(())
+    }
+}
+
+impl<'a> LedgerScalarCapacityAllocator<'a> {
+    pub(crate) fn new(ledger: &'a mut crate::gpu_memory::GpuMemoryLedger) -> Self {
+        Self { ledger }
+    }
+}
+
+impl GpuScalarCapacityAllocator for LedgerScalarCapacityAllocator<'_> {
+    fn reserve(
+        &mut self,
+        _params: &mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams,
+        device: i32,
+        device_bytes: u64,
+        pinned_bytes: u64,
+    ) -> Result<Box<dyn GpuScalarCapacityLease>, String> {
+        let device = self
+            .ledger
+            .execution_identities()
+            .and_then(|identities| identities.iter().position(|(physical, _)| *physical == device))
+            .ok_or("scalar capacity device is not an accepted execution owner")?;
+        let reservation = self
+            .ledger
+            .reserve(
+                &[crate::gpu_memory::GpuAllocationRequirement {
+                    device,
+                    bytes: device_bytes,
+                    pinned_bytes,
+                }],
+                &[],
+            )
+            .map_err(|error| error.to_string())?;
+        let id = *reservation
+            .allocations
+            .first()
+            .ok_or("scalar capacity reservation returned no allocation")?;
+        let mut leases = match self.ledger.submit(std::slice::from_ref(&id)) {
+            Ok(leases) => leases,
+            Err(error) => {
+                // `reserve` publishes the charge before leases are handed to
+                // the caller.  Explicitly cancel here so a dispatcher error
+                // cannot strand a generation's budget.
+                let _ = self.ledger.cancel(&reservation.allocations);
+                return Err(error.to_string());
+            }
+        };
+        let lease = match leases.pop() {
+            Some(lease) => lease,
+            None => {
+                let _ = self.ledger.cancel(&reservation.allocations);
+                return Err("scalar capacity reservation returned no lease".into());
+            }
+        };
+        Ok(Box::new(LedgerScalarCapacityLease { lease: Some(lease) }))
+    }
+}
+
+pub(super) fn required_runtime_scalar_capacity(
+    commands: &[super::PreparedCommand],
+    inputs: &[PreparedRuntimeValue],
+) -> Result<usize, String> {
+    let mut required = 1;
+    for value in inputs {
+        if let PreparedRuntimeValue::Int(value) = value {
+            required = required.max(required_scalar_words(value)?);
+        }
+    }
+    for command in commands {
+        if let super::PreparedOperation::ScalarOp { command, .. } = &command.operation {
+            required = required.max(
+                command
+                    .inputs()
+                    .chain(std::iter::once(command.output()))
+                    .map(|buffer| buffer.words())
+                    .max()
+                    .unwrap_or(1),
+            );
+        }
+    }
+    let scalar_ops = commands
+        .iter()
+        .filter(|command| matches!(command.operation, super::PreparedOperation::ScalarOp { .. }))
+        .count();
+    if required > 1 {
+        required = required
+            .checked_mul(scalar_ops.checked_add(1).ok_or("scalar capacity overflow")?)
+            .and_then(|words| words.checked_add(scalar_ops))
+            .ok_or("scalar capacity overflow")?;
+    }
+    Ok(required)
+}
+
+pub(super) fn ensure_runtime_scalar_capacity<'a, 'b>(
+    commands: &[super::PreparedCommand],
+    inputs: &[PreparedRuntimeValue],
+    mut allocator: Option<&'a mut (dyn GpuScalarCapacityAllocator + 'b)>,
+) -> Result<usize, String> {
+    let required = required_runtime_scalar_capacity(commands, inputs)?;
+    for command in commands {
+        match &command.operation {
+            super::PreparedOperation::ScalarUpload { command, .. } => {
+                if required > command.words() {
+                    command.ensure_capacity(
+                        required,
+                        allocator.as_deref_mut().ok_or("scalar capacity allocator unavailable")?,
+                    )?;
+                }
+            }
+            super::PreparedOperation::ScalarOp { command, .. } => {
+                for buffer in command.inputs() {
+                    if required > buffer.words() {
+                        buffer.ensure_capacity(
+                            required,
+                            allocator
+                                .as_deref_mut()
+                                .ok_or("scalar capacity allocator unavailable")?,
+                        )?;
+                    }
+                }
+                if required > command.output().words() {
+                    command.output().ensure_capacity(
+                        required,
+                        allocator.as_deref_mut().ok_or("scalar capacity allocator unavailable")?,
+                    )?;
+                }
+            }
+            super::PreparedOperation::Threshold { command, .. } => {
+                if required > command.output().words() {
+                    command.output().ensure_capacity(
+                        required,
+                        allocator.as_deref_mut().ok_or("scalar capacity allocator unavailable")?,
+                    )?;
+                }
+            }
+            super::PreparedOperation::ScalarMatrixSelect { .. } |
+            super::PreparedOperation::ScalarPack { .. } |
+            _ => {}
+        }
+    }
+    Ok(required)
+}
 
 pub(super) fn stage_runtime_scalar(
     buffer: &GpuPreparedScalarBuffer,
     value: &PreparedRuntimeValue,
 ) -> Result<(), String> {
+    if let PreparedRuntimeValue::Int(value) = value {
+        let _ = required_scalar_words(value)?;
+    }
     buffer.upload(|words, _| {
         words.fill(0);
         match value {
             PreparedRuntimeValue::Int(value) => {
-                if value.bits() as usize >= words.len() * 64 {
-                    return Err("prepared integer exceeds fixed signed capacity".into());
-                }
                 for (word, digit) in words.iter_mut().zip(value.magnitude().iter_u64_digits()) {
                     *word = digit;
                 }
@@ -37,42 +230,63 @@ pub(super) fn stage_runtime_scalar(
     })
 }
 
-pub(super) fn allocate_scalar_buffer(
-    backend: &mut GpuDcrtBackend,
-    region: &mut Arc<crate::gpu_memory::GpuMemoryRegion>,
+/// Number of little-endian words needed for a signed two's-complement value.
+/// The extra sign word is intentional: it keeps both positive values whose
+/// high bit is set and their negative counterparts representable without
+/// treating the warmup value as a semantic width limit.
+pub(super) fn required_scalar_words(value: &num_bigint::BigInt) -> Result<usize, String> {
+    value
+        .bits()
+        .try_into()
+        .map_err(|_| "scalar integer width exceeds host capacity".to_owned())
+        .and_then(|bits: usize| {
+            bits.div_ceil(64).checked_add(1).ok_or_else(|| "scalar capacity overflow".into())
+        })
+}
+
+pub(super) fn allocate_scalar_buffer_for_wire(
+    resources: &super::super::gpu_prepared_lowering::PreparedResolvedResources,
+    region: &Arc<crate::gpu_memory::GpuMemoryRegion>,
     anchor: &Arc<GpuDCRTPolyMatrix>,
+    wire: WireRef,
+    instance: usize,
     device: i32,
+) -> Result<Arc<GpuPreparedScalarBuffer>, String> {
+    let resolved = resources
+        .scalar_buffers
+        .iter()
+        .find(|buffer| {
+            buffer.plan.wire == wire &&
+                buffer.plan.instance == instance &&
+                buffer.plan.owner.device == device
+        })
+        .ok_or_else(|| format!("prepared scalar buffer {wire:?} has no resolved descriptor"))?;
+    let slots = resolved
+        .slots
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| format!("prepared scalar buffer {wire:?} has an unresolved slot"))?;
+    allocate_scalar_buffer_with_layout(
+        region,
+        anchor,
+        resolved.plan.count,
+        resolved.plan.words,
+        resolved.layout.clone(),
+        &slots,
+    )
+}
+
+pub(super) fn allocate_scalar_buffer_with_layout(
+    region: &Arc<crate::gpu_memory::GpuMemoryRegion>,
+    anchor: &Arc<GpuDCRTPolyMatrix>,
     count: usize,
     words: usize,
+    layout: mxx_primitives::matrix::gpu_dcrt_poly::PreparedPlanLayout,
+    slots: &[super::super::gpu_prepared_lowering::PreparedSlotRef],
 ) -> Result<Arc<GpuPreparedScalarBuffer>, String> {
-    let bytes = (words + 1)
-        .checked_mul(count)
-        .and_then(|words| words.checked_mul(8))
-        .ok_or("scalar capacity overflow")?;
-    let claims = [
-        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
-            kind: GpuPreparedSlotKind::PinnedHost,
-            bytes,
-            alignment: 8,
-        }),
-        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
-            kind: GpuPreparedSlotKind::BatchWorkspace,
-            bytes,
-            alignment: 8,
-        }),
-        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
-            kind: GpuPreparedSlotKind::CompletionEvent,
-            bytes: 0,
-            alignment: 1,
-        }),
-        GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
-            kind: GpuPreparedSlotKind::CompletionEvent,
-            bytes: 0,
-            alignment: 1,
-        }),
-    ];
-    bind_prepared_claims(backend, region, anchor.params(), device, &claims, || {
-        GpuPreparedScalarBuffer::bind(Arc::clone(anchor), count, words)
+    super::bind_prepared_slots(region, slots, || {
+        GpuPreparedScalarBuffer::bind_with_layout(Arc::clone(anchor), count, words, layout)
     })
 }
 
@@ -96,12 +310,16 @@ fn constant(
 /// Evaluate only magnitude bounds at warmup. The same two-bank replay walks
 /// these abstract values, so a loop's integer capacity reflects all iterations
 /// without cloning its command tape or guessing a runtime allocation margin.
-fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>, String> {
+fn scalar_capacities(
+    program: &GpuPreparation,
+    runtime_inputs: &[PreparedRuntimeValue],
+) -> Result<BTreeMap<usize, usize>, String> {
     use super::super::gpu_prepared_lowering::PreparedReplayStep;
     use num_bigint::BigUint;
 
     fn visit(
-        program: &PreparedProgram,
+        program: &GpuPreparation,
+        runtime_inputs: &[PreparedRuntimeValue],
         steps: &[PreparedReplayStep],
         parent: Option<usize>,
         bounds: &mut BTreeMap<usize, BigUint>,
@@ -142,10 +360,10 @@ fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>
                             .iter()
                             .position(|input| input == wire)
                             .unwrap();
-                        let words = program.scalar_input_max_words[input];
-                        (BigUint::from(1u8) <<
-                            words.checked_mul(64).ok_or("scalar capacity overflow")?) -
-                            BigUint::from(1u8)
+                        match runtime_inputs.get(input) {
+                            Some(PreparedRuntimeValue::Int(value)) => value.magnitude().clone(),
+                            _ => BigUint::from(0u8),
+                        }
                     } else {
                         match kind {
                             NodeKind::ThresholdDecode {
@@ -205,14 +423,21 @@ fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>
                         bounds.insert(slot, magnitude.clone());
                     }
                 }
-                PreparedReplayStep::Subgraph { body } => {
-                    visit(program, body, parent, bounds, capacities)?
+                PreparedReplayStep::Subgraph { body, .. } => {
+                    visit(program, runtime_inputs, body, parent, bounds, capacities)?
                 }
-                PreparedReplayStep::Parallel { counts, waves } => {
+                PreparedReplayStep::Parallel { counts, waves, .. } => {
                     let active =
                         parent.and_then(|index| counts.get(index)).copied().unwrap_or(usize::MAX);
                     for body in waves.iter().flat_map(|wave| wave.iter()).take(active) {
-                        visit(program, std::slice::from_ref(body), parent, bounds, capacities)?;
+                        visit(
+                            program,
+                            runtime_inputs,
+                            std::slice::from_ref(body),
+                            parent,
+                            bounds,
+                            capacities,
+                        )?;
                     }
                 }
                 PreparedReplayStep::Sequential { count, counts, offsets, banks, tail, .. } => {
@@ -225,6 +450,7 @@ fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>
                     for iteration in 0..count {
                         visit(
                             program,
+                            runtime_inputs,
                             &banks[iteration & 1],
                             Some(base + iteration),
                             bounds,
@@ -232,7 +458,14 @@ fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>
                         )?;
                     }
                     if count % 2 == 1 {
-                        visit(program, tail, Some(base + count - 1), bounds, capacities)?;
+                        visit(
+                            program,
+                            runtime_inputs,
+                            tail,
+                            Some(base + count - 1),
+                            bounds,
+                            capacities,
+                        )?;
                     }
                 }
             }
@@ -240,22 +473,27 @@ fn scalar_capacities(program: &PreparedProgram) -> Result<BTreeMap<usize, usize>
         Ok(())
     }
     let mut capacities = BTreeMap::new();
-    visit(program, &program.replay, None, &mut BTreeMap::new(), &mut capacities)?;
+    visit(program, runtime_inputs, &program.replay, None, &mut BTreeMap::new(), &mut capacities)?;
     Ok(capacities)
 }
 
 pub(super) fn prepare_scalar_commands(
-    backend: &mut GpuDcrtBackend,
     region: &mut Arc<crate::gpu_memory::GpuMemoryRegion>,
-    program: &PreparedProgram,
+    program: &GpuPreparation,
     runtime_inputs: &[PreparedRuntimeValue],
     anchor: &Arc<GpuDCRTPolyMatrix>,
     device: i32,
     values: &mut BTreeMap<WireRef, (Arc<GpuPreparedScalarBuffer>, usize)>,
     commands: &mut Vec<PreparedCommand>,
+    resources: &super::super::gpu_prepared_lowering::PreparedResolvedResources,
+    instance: usize,
 ) -> Result<(), String> {
-    let capacities = scalar_capacities(program)?;
-    let unused_capacity = capacities.values().copied().max().unwrap_or(1);
+    // Initial native descriptors use the structural scalar width. Runtime
+    // BigInt magnitude is admitted separately by `ensure_runtime_scalar_capacity`
+    // immediately before replay, so warmup must not turn its representative
+    // input into a permanent width contract.
+    let capacities = scalar_capacities(program, runtime_inputs)?;
+    let _ = capacities;
     let mut slots = values
         .iter()
         .filter_map(|(wire, value)| {
@@ -272,8 +510,8 @@ pub(super) fn prepare_scalar_commands(
             .position(|candidate| candidate == wire)
             .ok_or("prepared family scalar leaf has no runtime slot")?;
         let slot = program.scalar_slots[wire];
-        let words = program.scalar_input_max_words.get(input).copied().unwrap_or(1).max(1);
-        let output = allocate_scalar_buffer(backend, region, anchor, device, 1, words)?;
+        let output =
+            allocate_scalar_buffer_for_wire(resources, region, anchor, *wire, instance, device)?;
         let mut command = PreparedCommand::new(PreparedOperation::ScalarUpload {
             command: Arc::clone(&output),
             input,
@@ -309,8 +547,9 @@ pub(super) fn prepare_scalar_commands(
         let output = match slots.get(&slot) {
             Some((owner, _)) => Arc::clone(owner),
             None => {
-                let words = capacities.get(&slot).copied().unwrap_or(unused_capacity);
-                let owner = allocate_scalar_buffer(backend, region, anchor, device, 1, words)?;
+                let owner = allocate_scalar_buffer_for_wire(
+                    resources, region, anchor, wire, instance, device,
+                )?;
                 slots.insert(slot, (Arc::clone(&owner), 0));
                 owner
             }
@@ -349,7 +588,6 @@ pub(super) fn prepare_scalar_commands(
             .map(|kind| if copied { Ok(None) } else { constant(kind, &source.environment) })
             .collect::<Result<Vec<_>, _>>()?;
         let mut prepared = Vec::new();
-        let output_words = output.words();
         for (variant, kind) in variants.iter().enumerate() {
             let mut candidates = Vec::new();
             let (opcode, left, right, bit) = if let Some(selection) =
@@ -384,11 +622,9 @@ pub(super) fn prepare_scalar_commands(
                     _ => return Err("matrix selection is not a scalar command".into()),
                 }
             } else if let Some(value) = &constants[variant] {
-                let words = match value {
-                    PreparedRuntimeValue::Int(value) => value.bits().div_ceil(64) as usize + 1,
-                    _ => 1,
-                };
-                let input = allocate_scalar_buffer(backend, region, anchor, device, 1, words)?;
+                let input = allocate_scalar_buffer_for_wire(
+                    resources, region, anchor, wire, instance, device,
+                )?;
                 stage_runtime_scalar(&input, value)?;
                 input.wait()?;
                 (GpuPreparedScalarOpcode::Copy, (input, 0), None, 0)
@@ -450,28 +686,19 @@ pub(super) fn prepare_scalar_commands(
             prepared.push((opcode, left, right, bit, candidates));
         }
         for (variant, (opcode, left, right, bit, candidates)) in prepared.into_iter().enumerate() {
-            let bytes = GpuPreparedScalarOp::workspace_bytes(
-                left.0.words(),
-                right.as_ref().map_or(0, |value| value.0.words()),
-                output_words,
-                candidates.len(),
-            );
-            let claims = [GpuTracedClaim::workspace(GpuPreparedWorkspaceLayout {
-                kind: GpuPreparedSlotKind::BatchWorkspace,
-                bytes,
-                alignment: 8,
-            })];
-            let plan =
-                bind_prepared_claims(backend, region, anchor.params(), device, &claims, || {
-                    GpuPreparedScalarOp::bind(
-                        opcode,
-                        left,
-                        right,
-                        (Arc::clone(&output), 0),
-                        bit,
-                        &candidates,
-                    )
-                })?;
+            let layout = super::resolved_stage_layout(resources, node.id, instance, device)?;
+            let slots = super::resolved_stage_slots(resources, node.id, instance, device)?;
+            let plan = super::bind_prepared_slots(region, &slots, || {
+                GpuPreparedScalarOp::bind_with_layout(
+                    opcode,
+                    left,
+                    right,
+                    (Arc::clone(&output), 0),
+                    bit,
+                    &candidates,
+                    layout,
+                )
+            })?;
             let mut command = PreparedCommand::new(PreparedOperation::ScalarOp {
                 command: plan,
                 wire,
@@ -495,6 +722,27 @@ mod tests {
         executor::{ExecutionConfig, execute_with_config},
         transcript::SamplingMode,
     };
+    use num_bigint::BigInt;
+
+    #[test]
+    fn scalar_capacity_includes_signed_sign_word() {
+        assert_eq!(required_scalar_words(&BigInt::from(0)).unwrap(), 1);
+        assert_eq!(required_scalar_words(&BigInt::from(-1)).unwrap(), 2);
+        assert_eq!(required_scalar_words(&(BigInt::from(1u8) << 63)).unwrap(), 2);
+        let negative: BigInt = -(BigInt::from(1u8) << 63usize);
+        assert_eq!(required_scalar_words(&negative).unwrap(), 2);
+    }
+
+    #[test]
+    fn scalar_capacity_is_monotonic_for_repeated_widths() {
+        let narrow = required_scalar_words(&BigInt::from(7)).unwrap();
+        let wide = required_scalar_words(&(BigInt::from(1u8) << 511)).unwrap();
+        let wider = required_scalar_words(&(BigInt::from(1u8) << 1023)).unwrap();
+        assert!(narrow <= wide && wide <= wider);
+        assert_eq!(required_scalar_words(&BigInt::from(7)).unwrap(), narrow);
+        let negative: BigInt = -(BigInt::from(1u8) << 1023usize);
+        assert_eq!(required_scalar_words(&negative).unwrap(), wider);
+    }
     use mxx_ir_core::{
         expr::{IntExpr, ParamEnv},
         graph::{
@@ -727,18 +975,13 @@ mod tests {
         backend.warm_up_prepared_graph(&graph, &inputs, &ExecutionConfig::default()).unwrap();
         #[cfg(feature = "gpu-instrumentation")]
         {
-            let (program, execution) = backend.prepared_execution_for_test();
-            let runtime_inputs = program
-                .input_names
-                .iter()
-                .map(|(name, _)| {
-                    super::super::super::fleet::prepared_runtime_value(&inputs[name]).unwrap()
-                })
-                .collect::<Vec<_>>();
+            let execution = backend.prepared_execution_for_test();
             for _ in 0..300 {
                 reset_prepared_gpu_work_counters();
                 begin_prepared_gpu_work_gate();
-                let output = execution.run_with_runtime_inputs(&runtime_inputs).unwrap();
+                let mut sampling = SamplingMode::Fresh;
+                let output =
+                    execution.run_with_runtime_bindings(&inputs, &mut sampling, None).unwrap();
                 end_prepared_gpu_work_gate();
                 let mut counters = prepared_gpu_work_counters();
                 assert!(counters.production_kernels > 0);
@@ -779,7 +1022,7 @@ mod tests {
             assert_eq!(*actual, expected_real);
         }
         inputs.insert("offset".into(), RuntimeValue::Int(num_bigint::BigInt::from(1) << 128usize));
-        let error = execute_with_config(
+        execute_with_config(
             &graph,
             &mut backend,
             inputs,
@@ -787,8 +1030,6 @@ mod tests {
             SamplingMode::Fresh,
             ExecutionConfig::default(),
         )
-        .err()
-        .expect("oversized root integer must not write fixed staging");
-        assert!(error.to_string().contains("exceeds warmup width"));
+        .expect("arbitrary-precision root integer grows its execution-local scalar backing");
     }
 }

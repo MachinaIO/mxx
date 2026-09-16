@@ -3,8 +3,6 @@
 pub mod dataflow;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(feature = "gpu")]
-pub mod gpu_admission;
 pub mod harness;
 
 use mxx_ir_core::{

@@ -8,6 +8,8 @@ extern "C"
 {
 #endif
 
+    struct GpuPreparedPlanDescriptor;
+
     typedef enum GpuMatrixBatchOperation
     {
         GPU_MATRIX_BATCH_BINARY = 0,
@@ -41,6 +43,53 @@ extern "C"
         GpuMatrixRange output;
     } GpuMatrixBatchView;
 
+    typedef struct GpuPreparedArithmeticLayout
+    {
+        int kind;
+        int device;
+        size_t ring_dimension;
+        size_t limb_count;
+        size_t left_rows;
+        size_t left_columns;
+        size_t right_rows;
+        size_t right_columns;
+        size_t output_rows;
+        size_t output_columns;
+        size_t column_start;
+        size_t group_count;
+        size_t term_count;
+        size_t workspace_bytes;
+        size_t alignment;
+        size_t event_count;
+        unsigned int grid_x;
+        unsigned int grid_y;
+        unsigned int grid_z;
+        unsigned int block_x;
+        unsigned int block_y;
+        unsigned int block_z;
+        int thin;
+        int lazy_reduction;
+    } GpuPreparedArithmeticLayout;
+
+    typedef struct GpuPreparedRectLayout
+    {
+        size_t rows;
+        size_t columns;
+        size_t ring_dimension;
+        size_t limb_count;
+        size_t workspace_bytes;
+        size_t alignment;
+        size_t event_count;
+        unsigned int grid_x;
+        unsigned int grid_y;
+        unsigned int grid_z;
+        unsigned int block_x;
+        unsigned int block_y;
+        unsigned int block_z;
+        int stage_role;
+        int device;
+    } GpuPreparedRectLayout;
+
     struct GpuPreparedArithmetic;
     struct GpuPreparedInputCopy;
     struct GpuPreparedTranspose;
@@ -65,17 +114,44 @@ extern "C"
         const uint64_t *scalar_residues, size_t scalar_count,
         size_t automorphism_index,
         GpuPreparedArithmetic **plan);
+    int gpu_matrix_prepare_arithmetic_with_layout(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+        const size_t *rows, const size_t *offsets, size_t group_count,
+        size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+        const uint64_t *scalar_residues, size_t scalar_count,
+        size_t automorphism_index, const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedArithmetic **plan);
+    int gpu_matrix_query_arithmetic_layout(
+        size_t ring_dimension, size_t limb_count, size_t left_rows,
+        size_t left_columns, size_t right_rows, size_t right_columns,
+        size_t output_rows, size_t output_columns, size_t column_start,
+        size_t group_count, size_t term_count, int kind, int device,
+        int evaluation_format, int thin, int lazy_reduction,
+        GpuPreparedArithmeticLayout *out);
+    int gpu_matrix_query_input_copy_layout(
+        size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+        int device, GpuPreparedRectLayout *out);
+    int gpu_matrix_query_transpose_layout(
+        size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+        int device, GpuPreparedRectLayout *out);
     int gpu_matrix_submit_arithmetic(const GpuPreparedArithmetic *plan);
     void gpu_matrix_destroy_arithmetic_plan(GpuPreparedArithmetic *plan);
     int gpu_matrix_prepare_input_copy(
         GpuMatrix *out, const GpuMatrix *source_template,
         const GpuMatrixBatchView *view, GpuPreparedInputCopy **plan);
+    int gpu_matrix_prepare_input_copy_with_layout(
+        GpuMatrix *out, const GpuMatrix *source_template,
+        const GpuMatrixBatchView *view, const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedInputCopy **plan);
     int gpu_matrix_submit_input_copy(
         const GpuPreparedInputCopy *plan, const GpuMatrix *source);
     void gpu_matrix_destroy_input_copy(GpuPreparedInputCopy *plan);
     int gpu_matrix_prepare_transpose(
         GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
         GpuPreparedTranspose **plan);
+    int gpu_matrix_prepare_transpose_with_layout(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedTranspose **plan);
     int gpu_matrix_submit_transpose(const GpuPreparedTranspose *plan);
     void gpu_matrix_destroy_transpose(GpuPreparedTranspose *plan);
 

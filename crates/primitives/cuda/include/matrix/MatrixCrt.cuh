@@ -8,6 +8,8 @@ extern "C"
 {
 #endif
 
+    struct GpuPreparedPlanDescriptor;
+
     struct GpuPreparedModulusConversion;
     struct GpuPreparedCrtRecompose;
     struct GpuPreparedCenteredRebase;
@@ -47,6 +49,11 @@ extern "C"
         const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
         size_t reconstruction_stride, GpuMatrix *out,
         GpuPreparedCrtRecompose **plan);
+    int gpu_matrix_prepare_crt_recompose_with_layout(
+        const GpuMatrix *const *levels, size_t level_count,
+        const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
+        size_t reconstruction_stride, GpuMatrix *out,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedCrtRecompose **plan);
     int gpu_matrix_submit_crt_recompose(
         const GpuPreparedCrtRecompose *plan,
         const GpuMatrix *const *levels, size_t level_count);
@@ -61,6 +68,9 @@ extern "C"
     int gpu_matrix_prepare_centered_rebase(
         GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
         GpuPreparedCenteredRebase **plan);
+    int gpu_matrix_prepare_centered_rebase_with_layout(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedCenteredRebase **plan);
     int gpu_matrix_submit_centered_rebase(const GpuPreparedCenteredRebase *plan);
     void gpu_matrix_destroy_centered_rebase(GpuPreparedCenteredRebase *plan);
 
@@ -78,12 +88,22 @@ extern "C"
         const uint64_t *division_inverses, size_t inverse_count,
         uint64_t plaintext_modulus, const uint64_t *input_scales,
         GpuPreparedModulusConversion **plan);
+    int gpu_matrix_prepare_modulus_conversion_with_layout(
+        const GpuMatrix *source, const GpuMatrix *out, int conversion,
+        const uint64_t *division_inverses, size_t inverse_count,
+        uint64_t plaintext_modulus, const uint64_t *input_scales,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedModulusConversion **plan);
 
     int gpu_matrix_prepare_rns_conversion(
         const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
         uint64_t plaintext_modulus, const uint64_t *scales,
         const uint64_t *inverses, size_t inverse_count,
         GpuPreparedModulusConversion **plan);
+    int gpu_matrix_prepare_rns_conversion_with_layout(
+        const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
+        uint64_t plaintext_modulus, const uint64_t *scales,
+        const uint64_t *inverses, size_t inverse_count,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedModulusConversion **plan);
 
     int gpu_matrix_submit_modulus_conversion(
         const GpuPreparedModulusConversion *plan, GpuMatrix *out,

@@ -15,10 +15,15 @@ pub struct DrawSite {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum RecordedValue {
+    /// Complete canonical matrix artifact. These bytes are confidential
+    /// transcript material, not a sampler seed envelope.
     Matrix {
         matrix_type: ConcreteMatrixType,
         bytes: Vec<u8>,
     },
+    /// Complete canonical bounded-matrix artifact, including its semantic
+    /// kind and codec header. These bytes are confidential transcript
+    /// material, not a sampler seed envelope.
     SmallMatrix {
         schema: ConcreteBoundedMatrixSchema,
         semantic_kind: SmallMatrixSemanticKind,
@@ -38,7 +43,10 @@ pub struct TranscriptRecorder {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TranscriptReplayer {
-    entries: BTreeMap<DrawSite, RecordedValue>,
+    /// Session tapes are already complete values loaded at the session
+    /// boundary. Keep them in a fixed sorted cell array; replay lookup uses
+    /// binary search and does not rebuild a management map per execution.
+    entries: Box<[(DrawSite, RecordedValue)]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -65,7 +73,9 @@ impl TranscriptRecorder {
     }
 
     pub fn into_replayer(self) -> TranscriptReplayer {
-        TranscriptReplayer { entries: self.entries }
+        TranscriptReplayer {
+            entries: self.entries.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+        }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DrawSite, &RecordedValue)> {
@@ -74,12 +84,21 @@ impl TranscriptRecorder {
 }
 
 impl TranscriptReplayer {
+    #[cfg(feature = "gpu")]
+    pub(crate) fn from_entries(mut entries: Vec<(DrawSite, RecordedValue)>) -> Self {
+        entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        Self { entries: entries.into_boxed_slice() }
+    }
+
     pub fn get(&self, site: &DrawSite) -> Result<&RecordedValue, TranscriptError> {
-        self.entries.get(site).ok_or_else(|| TranscriptError::Missing(site.clone()))
+        self.entries
+            .binary_search_by(|entry| entry.0.cmp(site))
+            .map(|index| &self.entries[index].1)
+            .map_err(|_| TranscriptError::Missing(site.clone()))
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&DrawSite, &RecordedValue)> {
-        self.entries.iter()
+        self.entries.iter().map(|(site, value)| (site, value))
     }
 }
 
@@ -133,5 +152,32 @@ mod tests {
             TranscriptReplayer::default().get(&missing),
             Err(TranscriptError::Missing(missing))
         );
+    }
+
+    #[test]
+    fn record_replay_preserves_nested_and_parallel_draw_site_identity() {
+        let nested = DrawSite {
+            instantiation_path: vec![
+                InstantiationFrame { call: NodeId(10), loop_index: None },
+                InstantiationFrame { call: NodeId(20), loop_index: Some(3) },
+            ],
+            node: NodeId(99),
+            port: Port(0),
+        };
+        let parallel = DrawSite {
+            instantiation_path: vec![
+                InstantiationFrame { call: NodeId(10), loop_index: None },
+                InstantiationFrame { call: NodeId(20), loop_index: Some(4) },
+            ],
+            node: NodeId(99),
+            port: Port(0),
+        };
+        let mut recorder = TranscriptRecorder::default();
+        recorder.record(nested.clone(), value()).expect("nested draw");
+        recorder.record(parallel.clone(), value()).expect("parallel draw");
+        let replay = recorder.into_replayer();
+        assert_eq!(replay.get(&nested), Ok(&value()));
+        assert_eq!(replay.get(&parallel), Ok(&value()));
+        assert_ne!(nested, parallel);
     }
 }

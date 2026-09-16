@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <type_traits>
 #include <vector>
 
@@ -1319,6 +1321,120 @@ extern "C" int gpu_small_matrix_load_coefficients(
     return defer_status;
 }
 
+// Fixed-host replay upload for compact matrices.  The ordinary loader above
+// allocates a temporary pinned buffer on every call; this plan binds that
+// buffer and its terminal event once, so submit is only a memcpy plus the
+// destination's already-owned stream/event bookkeeping.
+struct GpuPreparedSmallUpload
+{
+    GpuSmallMatrix *matrix = nullptr;
+    const uint8_t *host_payload = nullptr;
+    size_t payload_len = 0;
+    GpuCudaResource completion;
+    mutable std::mutex mutex;
+    bool armed = false;
+};
+
+extern "C" int gpu_matrix_prepare_small_upload(
+    GpuSmallMatrix *mat, const uint8_t *payload, size_t payload_len,
+    const GpuPreparedPlanDescriptor *plan,
+    GpuPreparedSmallUpload **out_plan)
+{
+    if (!out_plan) return set_error("null prepared small upload output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution || !payload ||
+        !mat->owns_payload || payload_len != mat->payload_bytes)
+        return set_error("invalid prepared small upload arguments");
+    if (!plan || gpu_prepared_validate_descriptor(plan) != 0 ||
+        plan->allocation_count != 2 || plan->stream_count != 1)
+        return set_error("prepared small upload requires a saved descriptor");
+    const GpuPreparedResourceKey host_key{0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    if (gpu_prepared_require_allocation(plan, 0, GPU_PREPARED_PINNED_HOST, &host_key,
+            payload_len, 1) != 0 || plan->allocations[0].rows != 0 ||
+        plan->allocations[0].columns != 0 || plan->allocations[0].level != -1 ||
+        plan->allocations[0].format != -1)
+        return set_error("prepared small upload pinned staging claim differs from descriptor");
+    dim3 limb_id{};
+    GpuPreparedResourceKey upload_key{};
+    if (gpu_prepared_limb_key(mat->ctx, 0, 0, GPU_PREPARED_STAGE_UPLOAD,
+            &limb_id, &upload_key) != 0 ||
+        gpu_prepared_require_allocation(plan, 1, GPU_PREPARED_COMPLETION_EVENT,
+            &upload_key, 0, 1) != 0 ||
+        plan->allocations[1].rows != 0 || plan->allocations[1].columns != 0 ||
+        plan->allocations[1].level != -1 || plan->allocations[1].format != -1 ||
+        plan->streams[0].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        std::memcmp(&plan->streams[0].key, &upload_key, sizeof(upload_key)) != 0 ||
+        gpu_prepared_require_stream_slot(mat->ctx, limb_id.x, mat->stream,
+            plan->streams[0].pool_slot) != 0)
+        return set_error("prepared small upload resource claims differ from descriptor");
+    auto prepared = std::make_unique<GpuPreparedSmallUpload>();
+    prepared->matrix = mat;
+    prepared->host_payload = payload;
+    prepared->payload_len = payload_len;
+    const int status = prepared->completion.acquire(
+        mat->ctx, mat->device, GPU_PREPARED_COMPLETION_EVENT);
+    if (status != 0) return status;
+    *out_plan = prepared.release();
+    return 0;
+}
+
+extern "C" int gpu_matrix_submit_small_upload(GpuPreparedSmallUpload *plan)
+{
+    if (!plan || !plan->matrix || !plan->host_payload)
+        return set_error("invalid prepared small upload");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    if (plan->armed) return set_error("prepared small upload has unretired work");
+    if (small_set_device(plan->matrix) != 0) return 1;
+    cudaError_t err = cudaMemcpyAsync(
+        plan->matrix->payload, plan->host_payload, plan->payload_len,
+        cudaMemcpyHostToDevice, plan->matrix->stream);
+    if (err != cudaSuccess) return set_error(err);
+    if (small_record(plan->matrix, plan->matrix->stream) != 0) return 1;
+    err = cudaEventRecord(plan->completion.event, plan->matrix->stream);
+    if (err != cudaSuccess) return set_error(err);
+    plan->armed = true;
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_small_upload(
+    const GpuPreparedSmallUpload *plan, int *out_ready)
+{
+    if (!plan || !out_ready) return set_error("invalid prepared small upload query");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    *out_ready = 0;
+    if (!plan->armed) return 0;
+    const cudaError_t status = cudaEventQuery(plan->completion.event);
+    if (status == cudaSuccess) { *out_ready = 1; const_cast<GpuPreparedSmallUpload *>(plan)->armed = false; return 0; }
+    if (status == cudaErrorNotReady) return 0;
+    return set_error(status);
+}
+
+extern "C" int gpu_matrix_wait_small_upload(const GpuPreparedSmallUpload *plan)
+{
+    if (!plan) return set_error("invalid prepared small upload wait");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    if (!plan->armed) return 0;
+    const cudaError_t status = cudaEventSynchronize(plan->completion.event);
+    if (status != cudaSuccess) return set_error(status);
+    const_cast<GpuPreparedSmallUpload *>(plan)->armed = false;
+    return 0;
+}
+
+extern "C" int gpu_matrix_defer_small_upload_pinned_free(
+    const GpuPreparedSmallUpload *plan, void *pointer)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx ||
+        !plan->matrix->ctx->execution || !pointer || !plan->matrix->stream)
+        return set_error("invalid prepared small upload pinned free");
+    return gpu_defer_pinned_frees(plan->matrix->ctx, plan->matrix->device,
+        plan->matrix->stream, &pointer, 1);
+}
+
+extern "C" void gpu_matrix_destroy_small_upload(GpuPreparedSmallUpload *plan)
+{
+    delete plan;
+}
+
 extern "C" int gpu_small_matrix_prepare_readback(GpuSmallMatrix *mat, uint8_t *payload, size_t bytes)
 {
     if (!mat || !payload || bytes != mat->payload_bytes || mat->readback_host)
@@ -1744,21 +1860,30 @@ struct GpuPreparedSmallRhs
 
 namespace
 {
-int prepare_small_rhs_ntt(GpuPreparedSmallRhs &prepared)
+int prepare_small_rhs_ntt(GpuPreparedSmallRhs &prepared,
+    const GpuPreparedPlanDescriptor *descriptor)
 {
     const auto &constants = prepared.ctx->ring_device_constants[prepared.dispatch_slot];
-    const size_t poly_count = prepared.inner * prepared.columns;
+    size_t poly_count = 0;
+    if (!small_mul_size(prepared.inner, prepared.columns, &poly_count) || poly_count > UINT32_MAX)
+        return set_error("compact RHS launch geometry overflow");
+    size_t launch_index = 0;
     for (const PreparedSmallRhsGroup &group : prepared.groups) {
-        size_t butterflies = 0;
-        if (!small_mul_size(group.limb_count, poly_count, &butterflies) ||
-            !small_mul_size(butterflies, prepared.n / 2, &butterflies) ||
-            poly_count > UINT32_MAX)
-            return set_error(cudaErrorInvalidConfiguration);
-        const size_t first_blocks = (butterflies + kSmallThreads - 1) / kSmallThreads;
-        const size_t suffix_blocks = poly_count * (prepared.n / kCompactNttSuffixSize);
-        if (first_blocks > UINT32_MAX || suffix_blocks > UINT32_MAX)
-            return set_error(cudaErrorInvalidConfiguration);
-        const auto append = [&](int phase, uint32_t len, dim3 grid) {
+        size_t phase_count = 1;
+        if (prepared.n_u32 > kCompactNttSuffixSize) {
+            phase_count = 2;
+            for (uint32_t len = prepared.n_u32 >> 1; len > kCompactNttSuffixSize; len >>= 1)
+                ++phase_count;
+        }
+        for (size_t phase_index = 0; phase_index < phase_count; ++phase_index) {
+            if (!descriptor || launch_index >= descriptor->launch_count)
+                return set_error("saved compact RHS launch table is incomplete");
+            const auto &saved = descriptor->launches[launch_index++];
+            const int phase = prepared.n_u32 <= kCompactNttSuffixSize ? 0 :
+                phase_index == 0 ? 1 : phase_index + 1 == phase_count ? 3 : 2;
+            const uint32_t len = saved.len;
+            const dim3 grid = saved.grid;
+            auto append = [&](int phase, uint32_t len, dim3 grid) {
             auto launch = std::make_unique<PreparedSmallRhsExpansion>();
             launch->grid = grid;
             launch->payload = prepared.rhs->payload;
@@ -1806,18 +1931,61 @@ int prepare_small_rhs_ntt(GpuPreparedSmallRhs &prepared)
                     &launch->poly_count, &launch->n_u32};
             }
             prepared.expansion.push_back(std::move(launch));
-        };
-        if (prepared.n_u32 <= kCompactNttSuffixSize) {
-            append(0, 0, dim3(static_cast<uint32_t>(poly_count), static_cast<uint32_t>(group.limb_count)));
-        } else {
-            const dim3 grid(static_cast<uint32_t>(first_blocks));
-            append(1, 0, grid);
-            for (uint32_t len = prepared.n_u32 >> 1; len > kCompactNttSuffixSize; len >>= 1)
-                append(2, len, grid);
-            append(3, 0, dim3(static_cast<uint32_t>(suffix_blocks), static_cast<uint32_t>(group.limb_count)));
+            };
+            append(phase, len, grid);
         }
     }
+    if (launch_index != descriptor->launch_count)
+        return set_error("saved compact RHS launch table has trailing records");
     return 0;
+}
+
+int validate_saved_small_rhs_launches(const GpuPreparedSmallRhs &prepared,
+    const GpuPreparedPlanDescriptor *descriptor)
+{
+    if (!descriptor) return set_error("missing saved compact RHS launch table");
+    size_t launch_index = 0;
+    size_t poly_count = 0;
+    if (!small_mul_size(prepared.inner, prepared.columns, &poly_count) || poly_count > UINT32_MAX)
+        return set_error("compact RHS launch geometry overflow");
+    for (const auto &group : prepared.groups) {
+        size_t phase_count = 1;
+        if (prepared.n_u32 > kCompactNttSuffixSize) {
+            phase_count = 2;
+            for (uint32_t len = prepared.n_u32 >> 1; len > kCompactNttSuffixSize; len >>= 1)
+                ++phase_count;
+        }
+        size_t butterflies = 0;
+        if (!small_mul_size(group.limb_count, poly_count, &butterflies) ||
+            !small_mul_size(butterflies, prepared.n / 2, &butterflies))
+            return set_error("compact RHS launch geometry overflow");
+        const size_t first_blocks = (butterflies + kSmallThreads - 1) / kSmallThreads;
+        size_t suffix_blocks = 0;
+        if (!small_mul_size(poly_count, prepared.n / kCompactNttSuffixSize, &suffix_blocks))
+            return set_error("compact RHS suffix geometry overflow");
+        for (size_t phase_index = 0; phase_index < phase_count; ++phase_index) {
+            if (launch_index >= descriptor->launch_count)
+                return set_error("saved compact RHS launch table is incomplete");
+            const auto &launch = descriptor->launches[launch_index++];
+            const int phase = prepared.n_u32 <= kCompactNttSuffixSize ? 0 :
+                phase_index == 0 ? 1 : phase_index + 1 == phase_count ? 3 : 2;
+            const uint32_t len = phase == 2
+                ? (prepared.n_u32 >> 1) >> (phase_index - 1) : 0;
+            const dim3 expected_grid = phase == 0
+                ? dim3(static_cast<uint32_t>(poly_count), static_cast<uint32_t>(group.limb_count))
+                : phase == 3
+                ? dim3(static_cast<uint32_t>(suffix_blocks), static_cast<uint32_t>(group.limb_count))
+                : dim3(static_cast<uint32_t>(first_blocks));
+            if (launch.phase != phase || launch.grid.x != expected_grid.x ||
+                launch.grid.y != expected_grid.y || launch.grid.z != expected_grid.z ||
+                launch.block.x != kSmallThreads || launch.block.y != 1 || launch.block.z != 1 ||
+                launch.len != len || launch.limb_offset != group.limb_offset ||
+                launch.limb_count != group.limb_count || launch.narrow != (group.narrow ? 1 : 0))
+                return set_error("saved compact RHS launch geometry differs from descriptor");
+        }
+    }
+    return launch_index == descriptor->launch_count ? 0 :
+        set_error("saved compact RHS launch table has trailing records");
 }
 }
 
@@ -1826,10 +1994,13 @@ extern "C" int gpu_matrix_prepare_small_rhs(
     GpuMatrix *output,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
+    const GpuPreparedPlanDescriptor *plan,
     GpuPreparedSmallRhs **out_plan)
 {
     if (!out_plan) return set_error("null prepared compact RHS output");
     *out_plan = nullptr;
+    if (!plan || gpu_prepared_validate_descriptor(plan) != 0)
+        return set_error("prepared compact RHS requires a saved descriptor");
     if (!input_template || !output || !rhs_small || !input_template->ctx ||
         input_template->ctx != output->ctx || output->ctx != rhs_small->ctx ||
         input_template->format != GPU_POLY_FORMAT_EVAL || output->format != GPU_POLY_FORMAT_EVAL ||
@@ -1853,8 +2024,6 @@ extern "C" int gpu_matrix_prepare_small_rhs(
             prepared->ctx->limb_gpu_ids.size() < prepared->limbs ||
             !is_power_of_two_u32(prepared->n_u32))
             return set_error("invalid prepared compact RHS level");
-        if (small_set_device(rhs_small) != 0) return 1;
-
         for (size_t limb = 0; limb < prepared->limbs; ++limb)
         {
             const dim3 id = prepared->ctx->limb_gpu_ids[limb];
@@ -1912,16 +2081,40 @@ extern "C" int gpu_matrix_prepare_small_rhs(
             !small_mul_size(prepared->workspace_words_per_limb, prepared->n, &prepared->workspace_words_per_limb))
             return set_error("prepared compact RHS workspace size overflow");
         size_t workspace_u32_bytes = 0, workspace_u64_bytes = 0, workspace_bytes = 0;
-        if (gpu_matrix_query_small_rhs_workspace_bytes(prepared->ctx, input_template->level,
-                prepared->inner, prepared->columns, &workspace_u32_bytes, &workspace_u64_bytes) != 0 ||
+        if (!small_mul_size(prepared->workspace_words_per_limb, u32_limb_count, &workspace_u32_bytes) ||
+            !small_mul_size(workspace_u32_bytes, sizeof(uint32_t), &workspace_u32_bytes) ||
+            !small_mul_size(prepared->workspace_words_per_limb, u64_limb_count, &workspace_u64_bytes) ||
+            !small_mul_size(workspace_u64_bytes, sizeof(uint64_t), &workspace_u64_bytes) ||
             !small_add_size(workspace_u32_bytes, workspace_u64_bytes, &workspace_bytes) ||
             workspace_bytes > residency_budget_bytes)
-            return 2;
+            return set_error("prepared compact RHS workspace exceeds residency budget");
+        GpuPreparedResourceKey key{};
+        dim3 planned_limb{};
+        if (gpu_prepared_limb_key(prepared->ctx, input_template->level, 0,
+                GPU_PREPARED_STAGE_SMALL_RHS, &planned_limb, &key) != 0 ||
+            plan->allocation_count != 2 || plan->stream_count != 1 ||
+            gpu_prepared_require_allocation(plan, 0, GPU_PREPARED_COMPACT_WORKSPACE, &key,
+                workspace_u32_bytes, alignof(uint32_t)) != 0 ||
+            gpu_prepared_require_allocation(plan, 1, GPU_PREPARED_COMPACT_WORKSPACE, &key,
+                workspace_u64_bytes, alignof(uint64_t) ) != 0 ||
+            plan->allocations[0].rows != 0 || plan->allocations[0].columns != 0 ||
+            plan->allocations[0].level != input_template->level ||
+            plan->allocations[0].format != GPU_POLY_FORMAT_EVAL ||
+            plan->allocations[1].rows != 0 || plan->allocations[1].columns != 0 ||
+            plan->allocations[1].level != input_template->level ||
+            plan->allocations[1].format != GPU_POLY_FORMAT_EVAL ||
+            plan->streams[0].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+            std::memcmp(&plan->streams[0].key, &key, sizeof(key)) != 0 ||
+            gpu_prepared_require_stream_slot(prepared->ctx, planned_limb.x, prepared->stream,
+                plan->streams[0].pool_slot) != 0 ||
+            validate_saved_small_rhs_launches(*prepared, plan) != 0)
+            return set_error("prepared compact RHS owner differs from its saved descriptor");
         prepared->blocks.ends[0] = prepared->rows;
         prepared->blocks.input_offsets[0] = 0;
         prepared->blocks.input_pitches[0] = input_template->cols;
         prepared->blocks.output_offsets[0] = 0;
         prepared->blocks.output_pitches[0] = output->cols;
+        if (small_set_device(rhs_small) != 0) return 1;
         if (prepared->workspace_u32.acquire(prepared->ctx, prepared->device,
                 GPU_PREPARED_COMPACT_WORKSPACE, workspace_u32_bytes,
                 alignof(uint32_t), prepared->stream) != 0 ||
@@ -1929,7 +2122,7 @@ extern "C" int gpu_matrix_prepare_small_rhs(
                 GPU_PREPARED_COMPACT_WORKSPACE, workspace_u64_bytes,
                 alignof(uint64_t), prepared->stream) != 0)
             return 1;
-        if (prepare_small_rhs_ntt(*prepared) != 0)
+        if (prepare_small_rhs_ntt(*prepared, plan) != 0)
             return 1;
         for (PreparedSmallRhsGroup &group : prepared->groups)
         {
@@ -2472,15 +2665,6 @@ struct GpuPreparedPreimageCutoff {
 };
 
 namespace {
-void prepared_preimage_cutoff_layout(size_t coefficients, size_t magnitude_bytes,
-    size_t count, GpuPreparedWorkspaceLayout *layouts)
-{
-    layouts[0] = {coefficients * (1 + magnitude_bytes), alignof(uint8_t), GPU_PREPARED_COMPACT_WORKSPACE};
-    layouts[1] = {count * sizeof(CompactPreimageJob), alignof(CompactPreimageJob), GPU_PREPARED_COMPACT_WORKSPACE};
-    layouts[2] = {2 * count * sizeof(int32_t), alignof(int32_t), GPU_PREPARED_COMPACT_WORKSPACE};
-    layouts[3] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
-}
-
 __global__ void prepared_preimage_status_kernel(int32_t *success, size_t count,
                                                bool begin, bool continuation)
 {
@@ -2535,10 +2719,12 @@ __global__ void prepared_preimage_accept_kernel(
 extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
     GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
     const size_t *dst_rows, const size_t *dst_columns, size_t count,
-    int32_t *host_status, GpuPreparedPreimageCutoff **out)
+    int32_t *host_status, const GpuPreparedWorkspaceLayout *layouts, size_t layout_count,
+    GpuPreparedPreimageCutoff **out)
 {
     if (!destinations || !sources || !dst_rows || !dst_columns ||
-        !count || count > 65535 || !host_status || !out || !destinations[0] || !sources[0])
+        !count || count > 65535 || !host_status || !layouts || layout_count != count + 3 ||
+        !out || !destinations[0] || !sources[0])
         return set_error("invalid prepared preimage cutoff arguments");
     *out = nullptr;
     try {
@@ -2557,6 +2743,50 @@ extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
             !small_mul_size(plan->rows, plan->columns, &plan->coefficients) ||
             !small_mul_size(plan->coefficients, plan->n, &plan->coefficients))
             return set_error("invalid prepared preimage candidate geometry");
+        // Validate the complete job and descriptor bundle before preparing a
+        // destination cutoff or acquiring any staging/resource owner.
+        const size_t descriptor_bytes = count * sizeof(CompactPreimageJob);
+        const size_t success_bytes = 2 * count * sizeof(int32_t);
+        if (layouts[count].kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+            layouts[count].alignment != alignof(CompactPreimageJob) ||
+            layouts[count].bytes != descriptor_bytes ||
+            layouts[count + 1].kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+            layouts[count + 1].alignment != alignof(int32_t) ||
+            layouts[count + 1].bytes != success_bytes ||
+            layouts[count + 2].kind != GPU_PREPARED_COMPLETION_EVENT ||
+            layouts[count + 2].bytes != 0 || layouts[count + 2].alignment != 1)
+            return set_error("saved prepared preimage cutoff descriptor mismatch");
+        size_t expected_staging = 0;
+        if (!small_mul_size(plan->coefficients, 1 + first->magnitude_bytes, &expected_staging))
+            return set_error("prepared preimage cutoff staging size overflow");
+        for (size_t index = 0; index < count; ++index) {
+            auto *dst = destinations[index];
+            const auto *src = sources[index];
+            const auto &staging = layouts[index];
+            if (!dst || !src || dst->ctx != plan->ctx || src->ctx != plan->ctx ||
+                dst->device != plan->device || src->rows != plan->rows ||
+                src->cols != plan->columns || src->level < 0 ||
+                static_cast<size_t>(src->level + 1) != plan->limbs ||
+                src->format != GPU_POLY_FORMAT_COEFF ||
+                dst_rows[index] > dst->rows || plan->rows > dst->rows - dst_rows[index] ||
+                dst_columns[index] > dst->cols || plan->columns > dst->cols - dst_columns[index] ||
+                dst->magnitude_bytes != first->magnitude_bytes ||
+                dst->hard_cutoff_subset_count <= 0 || !dst->hard_cutoff_garner_inverses ||
+                !dst->hard_cutoff_modulus_words || !dst->hard_cutoff_half_modulus_words ||
+                !dst->hard_cutoff_bound_words || !dst->hard_cutoff_subset_indices ||
+                !dst->hard_cutoff_device_accepted || !dst->hard_cutoff_host_accepted ||
+                !dst->hard_cutoff_decision_ready ||
+                staging.kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+                staging.alignment != alignof(uint8_t) || staging.bytes != expected_staging)
+                return set_error("prepared preimage cutoff job or staging descriptor mismatch");
+            for (size_t previous = 0; previous < index; ++previous)
+                if (destinations[previous] == dst)
+                    return set_error("prepared preimage cutoff destinations must be distinct");
+            const size_t partition = src->ctx->limb_gpu_ids[0].x;
+            for (size_t limb = 0; limb < plan->limbs; ++limb)
+                if (src->ctx->limb_gpu_ids[limb].x != partition)
+                    return set_error("prepared preimage cutoff requires all limbs on one device");
+        }
         plan->jobs.resize(count);
         plan->destinations.assign(destinations, destinations + count);
         plan->sources.assign(sources, sources + count);
@@ -2577,7 +2807,10 @@ extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
             for (size_t previous = 0; previous < index; ++previous)
                 if (destinations[previous] == dst)
                     return set_error("prepared preimage cutoff destinations must be distinct");
-            if (gpu_small_matrix_prepare_preimage_hard_cutoff(dst) != 0) return 1;
+            const auto &staging_layout = layouts[index];
+            if (staging_layout.kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+                staging_layout.alignment != alignof(uint8_t))
+                return set_error("saved prepared preimage cutoff staging descriptor mismatch");
             const size_t partition = src->ctx->limb_gpu_ids[0].x;
             for (size_t limb = 0; limb < plan->limbs; ++limb)
                 if (src->ctx->limb_gpu_ids[limb].x != partition)
@@ -2586,6 +2819,8 @@ extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
             size_t bytes = 0;
             if (!small_mul_size(plan->coefficients, 1 + dst->magnitude_bytes, &bytes))
                 return set_error("prepared preimage staging size overflow");
+            if (staging_layout.bytes != bytes)
+                return set_error("saved prepared preimage cutoff staging geometry mismatch");
             auto staging = std::make_unique<GpuDeviceWorkspace>();
             if (staging->acquire(plan->ctx, plan->device, GPU_PREPARED_COMPACT_WORKSPACE,
                     bytes, alignof(uint8_t), plan->stream) != 0) return 1;
@@ -2602,13 +2837,22 @@ extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
             plan->maximum_bytes = std::max(plan->maximum_bytes, bytes);
             plan->staging.push_back(std::move(staging));
         }
-        GpuPreparedWorkspaceLayout layouts[4]{};
-        prepared_preimage_cutoff_layout(plan->coefficients, destinations[0]->magnitude_bytes, count, layouts);
-        if (plan->descriptors.acquire(plan->ctx, plan->device, layouts[1].kind,
-                layouts[1].bytes, layouts[1].alignment, plan->stream) != 0 ||
-            plan->success.acquire(plan->ctx, plan->device, GPU_PREPARED_COMPACT_WORKSPACE,
-                layouts[2].bytes, layouts[2].alignment, plan->stream) != 0 ||
-            plan->completion.acquire(plan->ctx, plan->device, GPU_PREPARED_COMPLETION_EVENT) != 0)
+        const auto &descriptor_layout = layouts[count];
+        const auto &success_layout = layouts[count + 1];
+        const auto &completion_layout = layouts[count + 2];
+        if (descriptor_layout.kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+            descriptor_layout.alignment != alignof(CompactPreimageJob) ||
+            descriptor_layout.bytes != descriptor_bytes ||
+            success_layout.kind != GPU_PREPARED_COMPACT_WORKSPACE ||
+            success_layout.alignment != alignof(int32_t) || success_layout.bytes != success_bytes ||
+            completion_layout.kind != GPU_PREPARED_COMPLETION_EVENT ||
+            completion_layout.bytes != 0 || completion_layout.alignment != 1)
+            return set_error("saved prepared preimage cutoff descriptor mismatch");
+        if (plan->descriptors.acquire(plan->ctx, plan->device, descriptor_layout.kind,
+                descriptor_layout.bytes, descriptor_layout.alignment, plan->stream) != 0 ||
+            plan->success.acquire(plan->ctx, plan->device, success_layout.kind,
+                success_layout.bytes, success_layout.alignment, plan->stream) != 0 ||
+            plan->completion.acquire(plan->ctx, plan->device, completion_layout.kind) != 0)
             return 1;
         auto error = cudaMemcpyAsync(plan->descriptors.data, plan->jobs.data(),
             count * sizeof(CompactPreimageJob), cudaMemcpyHostToDevice, plan->stream);
@@ -2620,35 +2864,61 @@ extern "C" int gpu_small_matrix_prepare_preimage_cutoff(
     } catch (const std::exception &error) { return set_error(error.what()); }
 }
 
-extern "C" int gpu_preimage_cutoff_layout(GpuSmallMatrix *output,
-    GpuPreparedWorkspaceLayout *layouts, size_t *count)
+extern "C" int gpu_preimage_cutoff_batch_layout(GpuSmallMatrix *output, size_t job_count,
+    GpuPreparedWorkspaceLayout *layouts, size_t capacity, size_t *count)
 {
-    if (!output || !layouts || !count) return set_error("invalid preimage cutoff layout");
-    size_t index = 0;
-    layouts[index++] = {sizeof(int32_t), alignof(int32_t), GPU_PREPARED_PINNED_HOST};
-    if (!output->hard_cutoff_subset_count) {
-        std::vector<int> subset;
-        std::vector<uint64_t> modulus, half, bound;
-        if (small_hard_cutoff_metadata(output, subset, modulus, half, bound) != 0) return 1;
-        const size_t bytes[] = {output->ctx->garner_inverse_table.size() * sizeof(uint64_t),
-            subset.size() * sizeof(int), modulus.size() * sizeof(uint64_t),
-            half.size() * sizeof(uint64_t), bound.size() * sizeof(uint64_t)};
-        for (size_t i = 0; i < 5; ++i) {
-            const size_t alignment = i == 1 ? alignof(int) : alignof(uint64_t);
-            layouts[index++] = {bytes[i], alignment, GPU_PREPARED_PINNED_HOST};
-            layouts[index++] = {bytes[i], alignment, GPU_PREPARED_COMPACT_WORKSPACE};
-        }
-        layouts[index++] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
-        layouts[index++] = {sizeof(int), alignof(int), GPU_PREPARED_COMPACT_WORKSPACE};
-        layouts[index++] = {sizeof(int), alignof(int), GPU_PREPARED_PINNED_HOST};
-    }
+    if (!output || !job_count || !layouts || !count || job_count > capacity ||
+        capacity - job_count < 3)
+        return set_error("invalid preimage cutoff batch layout");
     size_t coefficients = 0;
     if (!small_mul_size(output->rows, output->cols, &coefficients) ||
         !small_mul_size(coefficients, output->n, &coefficients) ||
         coefficients > SIZE_MAX / (1 + output->magnitude_bytes))
-        return set_error("preimage cutoff layout overflow");
-    prepared_preimage_cutoff_layout(coefficients, output->magnitude_bytes, 1, layouts + index);
-    *count = index + 4;
+        return set_error("preimage cutoff batch layout overflow");
+    size_t staging_bytes = 0;
+    if (!small_mul_size(coefficients, 1 + output->magnitude_bytes, &staging_bytes))
+        return set_error("preimage cutoff staging layout overflow");
+    for (size_t index = 0; index < job_count; ++index)
+        layouts[index] = {staging_bytes, alignof(uint8_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    size_t descriptor_bytes = 0, success_bytes = 0;
+    if (!small_mul_size(job_count, sizeof(CompactPreimageJob), &descriptor_bytes) ||
+        !small_mul_size(job_count, 2 * sizeof(int32_t), &success_bytes))
+        return set_error("preimage cutoff batch descriptor overflow");
+    layouts[job_count] = {descriptor_bytes, alignof(CompactPreimageJob),
+        GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[job_count + 1] = {success_bytes, alignof(int32_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[job_count + 2] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
+    *count = job_count + 3;
+    return 0;
+}
+
+extern "C" int gpu_preimage_cutoff_batch_layout_shape(
+    size_t ring_dimension, size_t rows, size_t columns, size_t magnitude_bytes,
+    size_t job_count, GpuPreparedWorkspaceLayout *layouts, size_t capacity, size_t *count)
+{
+    if (!ring_dimension || !rows || !columns || !job_count || !layouts || !count ||
+        job_count > capacity || capacity - job_count < 3)
+        return set_error("invalid preimage cutoff shape layout");
+    size_t coefficients = 0;
+    if (!small_mul_size(rows, columns, &coefficients) ||
+        !small_mul_size(coefficients, ring_dimension, &coefficients) ||
+        magnitude_bytes == SIZE_MAX ||
+        coefficients > SIZE_MAX / (1 + magnitude_bytes))
+        return set_error("preimage cutoff shape layout overflow");
+    size_t staging_bytes = 0;
+    if (!small_mul_size(coefficients, 1 + magnitude_bytes, &staging_bytes))
+        return set_error("preimage cutoff shape staging overflow");
+    for (size_t index = 0; index < job_count; ++index)
+        layouts[index] = {staging_bytes, alignof(uint8_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    size_t descriptor_bytes = 0, success_bytes = 0;
+    if (!small_mul_size(job_count, sizeof(CompactPreimageJob), &descriptor_bytes) ||
+        !small_mul_size(job_count, 2 * sizeof(int32_t), &success_bytes))
+        return set_error("preimage cutoff shape descriptor overflow");
+    layouts[job_count] = {descriptor_bytes, alignof(CompactPreimageJob),
+        GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[job_count + 1] = {success_bytes, alignof(int32_t), GPU_PREPARED_COMPACT_WORKSPACE};
+    layouts[job_count + 2] = {0, 1, GPU_PREPARED_COMPLETION_EVENT};
+    *count = job_count + 3;
     return 0;
 }
 

@@ -1,5 +1,6 @@
 use super::{
-    Backend, IndexRange, MatrixMulAccumulateRequest, PreimageRequest, PreimageTarget, SampleRange,
+    Backend, ExecutionStrategy, IndexRange, MatrixMulAccumulateRequest, PreimageRequest,
+    PreimageTarget, RuntimeValue, SampleRange,
 };
 use mxx_ir_core::{
     ParamEnv,
@@ -84,7 +85,7 @@ fn bounded_schema_parts(
 }
 
 #[cfg(feature = "gpu")]
-pub(super) fn decode_small_matrix_artifact<'a>(
+pub(crate) fn decode_small_matrix_artifact<'a>(
     expected_schema: &ConcreteBoundedMatrixSchema,
     bytes: &'a [u8],
     expected_semantic_kind: SmallMatrixSemanticKind,
@@ -257,6 +258,12 @@ pub enum PolyBackendError {
     GpuCalibration(String),
     #[error("GPU fleet submission failed: {0}")]
     GpuSubmission(String),
+    #[error("NotPrepared: prepared GPU graph is unavailable; call explicit warmup")]
+    NotPrepared,
+    #[error("PreparedExecutionRequired: individual GPU operations require prepared graph replay")]
+    PreparedExecutionRequired,
+    #[error("prepared graph contract differs from the requested graph")]
+    PreparedContractMismatch,
     #[cfg(feature = "gpu")]
     #[error("GPU admission failed: {0}")]
     GpuAdmission(#[from] crate::gpu_memory::GpuAdmissionError),
@@ -600,10 +607,23 @@ where
     T: PolyTrapdoorSampler<M = M>,
     T::Trapdoor: Clone + std::fmt::Debug,
 {
+    const EXECUTION_STRATEGY: ExecutionStrategy = ExecutionStrategy::Interpreted;
     type Matrix = M;
     type SmallMatrix = M::SmallMatrix;
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
+
+    fn execute_prepared_graph(
+        &mut self,
+        _spec_hash: [u8; 32],
+        _validated: &mxx_ir_core::ValidatedGraph,
+        _inputs: &BTreeMap<String, RuntimeValue<Self>>,
+        _context: crate::executor::PreparedExecutionContext<'_, Self>,
+    ) -> Result<crate::executor::ExecutionResult<Self>, Self::Error> {
+        Err(PolyBackendError::GpuSubmission(
+            "prepared execution is not supported by an interpreted backend".into(),
+        ))
+    }
 
     fn polynomial_from_values(
         &mut self,

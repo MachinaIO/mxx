@@ -1,4 +1,5 @@
 #include <cudaTypedefs.h>
+#include <array>
 #include <string>
 
 namespace
@@ -2456,6 +2457,168 @@ namespace
         Automorphism = 8,
     };
 
+    int query_arithmetic_layout(
+        size_t ring_dimension, size_t limb_count, size_t left_rows,
+        size_t left_columns, size_t right_rows, size_t right_columns,
+        size_t output_rows, size_t output_columns, size_t column_start,
+        size_t group_count, size_t term_count, int kind, int device,
+        int evaluation_format, int thin, int lazy_reduction,
+        GpuPreparedArithmeticLayout &out)
+    {
+        const auto checked_ceil_div_u32 = [](size_t value, size_t divisor,
+                                               unsigned int *result) {
+            if (!result || divisor == 0 ||
+                value > std::numeric_limits<size_t>::max() - (divisor - 1))
+                return false;
+            const size_t quotient = (value + divisor - 1) / divisor;
+            if (quotient > std::numeric_limits<unsigned int>::max()) return false;
+            *result = static_cast<unsigned int>(quotient);
+            return true;
+        };
+        if (ring_dimension < 2 || (ring_dimension & (ring_dimension - 1)) != 0 ||
+            limb_count == 0 || limb_count > kArithMetadataLimbs || kind < 0 || kind > 8 ||
+            output_rows == 0 || output_columns == 0)
+            return set_error("invalid prepared arithmetic layout request");
+        if (left_rows == 0 || left_columns == 0 || right_rows == 0 || right_columns == 0)
+            return set_error("prepared arithmetic layout has an empty operand");
+        if ((kind == static_cast<int>(PreparedArithmeticKind::Tensor) ||
+             kind == static_cast<int>(PreparedArithmeticKind::TensorSumRows) ||
+             kind == static_cast<int>(PreparedArithmeticKind::Multiply)) && !evaluation_format)
+            return set_error("prepared arithmetic product requires evaluation format");
+        const size_t cells = output_rows > std::numeric_limits<size_t>::max() / output_columns
+            ? 0 : output_rows * output_columns;
+        if (cells == 0 || cells > std::numeric_limits<size_t>::max() / ring_dimension)
+            return set_error("prepared arithmetic layout size overflow");
+        const size_t coefficients = cells * ring_dimension;
+        GpuPreparedArithmeticLayout layout{};
+        layout.kind = kind;
+        layout.device = device;
+        layout.ring_dimension = ring_dimension;
+        layout.limb_count = limb_count;
+        layout.left_rows = left_rows;
+        layout.left_columns = left_columns;
+        layout.right_rows = right_rows;
+        layout.right_columns = right_columns;
+        layout.output_rows = output_rows;
+        layout.output_columns = output_columns;
+        layout.column_start = column_start;
+        layout.group_count = group_count;
+        layout.term_count = term_count;
+        layout.workspace_bytes = 0;
+        layout.alignment = alignof(uint64_t);
+        layout.event_count = limb_count;
+        layout.block_x = 256;
+        layout.block_y = 1;
+        layout.block_z = 1;
+        layout.grid_z = static_cast<unsigned int>(limb_count);
+        layout.thin = thin != 0;
+        layout.lazy_reduction = lazy_reduction != 0;
+        if (kind == static_cast<int>(PreparedArithmeticKind::Multiply))
+        {
+            if (left_rows <= 4 && right_columns <= 4 && left_columns <= 16)
+            {
+                if (!checked_ceil_div_u32(ring_dimension, 256, &layout.grid_x) ||
+                    right_columns > std::numeric_limits<unsigned int>::max())
+                    return set_error("prepared arithmetic grid dimensions overflow");
+                layout.grid_y = static_cast<unsigned int>(right_columns);
+            }
+            else if (thin)
+            {
+                layout.block_x = kThinMatmulWarpSize;
+                layout.block_y = kThinMatmulColumnsPerBlock;
+                if (!checked_ceil_div_u32(right_columns, kThinMatmulColumnsPerBlock, &layout.grid_x))
+                    return set_error("prepared arithmetic grid dimensions overflow");
+                layout.grid_y = 1;
+                if (ring_dimension > std::numeric_limits<size_t>::max() -
+                        (kThinMatmulWarpSize - 1))
+                    return set_error("prepared arithmetic grid dimensions overflow");
+                const size_t grid_z = (ring_dimension + kThinMatmulWarpSize - 1) /
+                    kThinMatmulWarpSize;
+                layout.grid_z = static_cast<unsigned int>(std::min(
+                    grid_z, static_cast<size_t>(kMatmulMaxGridZ)));
+            }
+            else
+            {
+                layout.block_x = kMatmulTileN;
+                layout.block_y = kMatmulTileM;
+                if (!checked_ceil_div_u32(right_columns, kMatmulTileN, &layout.grid_x) ||
+                    !checked_ceil_div_u32(left_rows, kMatmulTileM, &layout.grid_y))
+                    return set_error("prepared arithmetic grid dimensions overflow");
+                layout.grid_z = static_cast<unsigned int>(std::min(ring_dimension, static_cast<size_t>(kMatmulMaxGridZ)));
+            }
+        }
+        else if (kind == static_cast<int>(PreparedArithmeticKind::TensorSumRows) && ring_dimension >= 256)
+        {
+            if (!checked_ceil_div_u32(ring_dimension, 256, &layout.grid_x))
+                return set_error("prepared arithmetic grid dimensions overflow");
+            layout.grid_y = static_cast<unsigned int>(std::min(cells, size_t{65535}));
+        }
+        else
+        {
+            if (!checked_ceil_div_u32(coefficients, 256, &layout.grid_x))
+                return set_error("prepared arithmetic grid dimensions overflow");
+            layout.grid_y = 1;
+        }
+        out = layout;
+        return 0;
+    }
+
+extern "C" int gpu_matrix_query_arithmetic_layout(
+    size_t ring_dimension, size_t limb_count, size_t left_rows,
+    size_t left_columns, size_t right_rows, size_t right_columns,
+    size_t output_rows, size_t output_columns, size_t column_start,
+    size_t group_count, size_t term_count, int kind, int device,
+    int evaluation_format, int thin, int lazy_reduction,
+    GpuPreparedArithmeticLayout *out)
+{
+    if (!out) return set_error("null prepared arithmetic layout output");
+    return query_arithmetic_layout(
+        ring_dimension, limb_count, left_rows, left_columns, right_rows,
+        right_columns, output_rows, output_columns, column_start,
+        group_count, term_count, kind, device, evaluation_format, thin,
+        lazy_reduction, *out);
+}
+
+static int query_rect_layout(
+    size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+    int device, int stage_role, GpuPreparedRectLayout &out)
+{
+    if (ring_dimension == 0 || limb_count == 0 || rows == 0 || columns == 0)
+        return set_error("invalid prepared rectangular layout request");
+    if (rows > std::numeric_limits<size_t>::max() / columns ||
+        rows * columns > std::numeric_limits<size_t>::max() / ring_dimension)
+        return set_error("prepared rectangular layout size overflow");
+    const size_t coefficients = rows * columns * ring_dimension;
+    if (coefficients > std::numeric_limits<size_t>::max() - 255)
+        return set_error("prepared rectangular layout grid overflow");
+    const size_t quotient = (coefficients + 255) / 256;
+    const size_t grid_x = stage_role == 2 ? std::min(quotient, size_t{65535}) : quotient;
+    if (grid_x > std::numeric_limits<unsigned int>::max())
+        return set_error("prepared rectangular layout grid overflow");
+    out = GpuPreparedRectLayout{
+        rows, columns, ring_dimension, limb_count, 0, alignof(uint64_t), limb_count,
+        static_cast<unsigned int>(grid_x), 1,
+        static_cast<unsigned int>(limb_count), 256, 1, 1, stage_role, device,
+    };
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_input_copy_layout(
+    size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+    int device, GpuPreparedRectLayout *out)
+{
+    if (!out) return set_error("null prepared input-copy layout output");
+    return query_rect_layout(ring_dimension, limb_count, rows, columns, device, 1, *out);
+}
+
+extern "C" int gpu_matrix_query_transpose_layout(
+    size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+    int device, GpuPreparedRectLayout *out)
+{
+    if (!out) return set_error("null prepared transpose layout output");
+    return query_rect_layout(ring_dimension, limb_count, rows, columns, device, 2, *out);
+}
+
     struct PreparedMatmulLaunch
     {
         const uint8_t *lhs_base;
@@ -2519,6 +2682,17 @@ namespace
         size_t automorphism_index;
         bool evaluation;
         unsigned log_n;
+        // Prepared resources are acquired in descriptor order: the optional
+        // workspace first, then one completion event per active limb.
+        GpuDeviceWorkspace workspace;
+        std::array<std::unique_ptr<GpuCudaResource>, kArithMetadataLimbs> completion;
+
+        ~GpuPreparedArithmeticState()
+        {
+            (void)workspace.release(stream);
+            for (auto &event : completion)
+                if (event) (void)event->release();
+        }
     };
 
     struct GpuPreparedInputCopyState
@@ -2535,6 +2709,13 @@ namespace
         int device;
         cudaStream_t stream;
         dim3 grid;
+        std::array<std::unique_ptr<GpuCudaResource>, kArithMetadataLimbs> completion;
+
+        ~GpuPreparedInputCopyState()
+        {
+            for (auto &event : completion)
+                if (event) (void)event->release();
+        }
     };
 
     int prepared_matrix_metadata(
@@ -2543,7 +2724,8 @@ namespace
 
     int prepare_copy_layout(
         GpuMatrix *out, const GpuMatrix *source,
-        const GpuMatrixBatchView *view, GpuPreparedInputCopyState &prepared)
+        const GpuMatrixBatchView *view, GpuPreparedInputCopyState &prepared,
+        const GpuPreparedLaunchLayout *saved_launch = nullptr)
     {
         if (!out || !source || !out->ctx || source->ctx != out->ctx ||
             source->level < 0 || out->level != source->level)
@@ -2554,7 +2736,10 @@ namespace
             return range.row_start <= range.row_end && range.row_end <= matrix->rows &&
                 range.column_start <= range.column_end && range.column_end <= matrix->cols;
         };
-        if (!valid(source, prepared.input_range) || !valid(out, prepared.output_range) ||
+        if (!valid(source, prepared.input_range) ||
+            (view && (!valid(source, view->right) || std::memcmp(&view->left, &view->right,
+                sizeof(GpuMatrixRange)) != 0)) ||
+            !valid(out, prepared.output_range) ||
             prepared.input_range.row_end - prepared.input_range.row_start !=
                 prepared.output_range.row_end - prepared.output_range.row_start ||
             prepared.input_range.column_end - prepared.input_range.column_start !=
@@ -2594,8 +2779,104 @@ namespace
         }
         const size_t rows = prepared.output_range.row_end - prepared.output_range.row_start;
         const size_t columns = prepared.output_range.column_end - prepared.output_range.column_start;
-        prepared.grid = dim3(static_cast<unsigned int>((rows * columns * prepared.n + 255) / 256), 1,
-                             static_cast<unsigned int>(prepared.level + 1));
+        if (saved_launch)
+        {
+            prepared.grid = saved_launch->grid;
+        }
+        else
+        {
+            GpuPreparedRectLayout layout{};
+            status = query_rect_layout(prepared.n, prepared.level + 1, rows, columns,
+                prepared.device, 1, layout);
+            if (status != 0) return status;
+            prepared.grid = dim3(layout.grid_x, layout.grid_y, layout.grid_z);
+        }
+        return 0;
+    }
+
+    std::atomic<size_t> input_copy_prepared_acquisitions{0};
+
+    int validate_saved_input_copy_descriptor(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedInputCopyState &prepared)
+    {
+        if (!layout || !out || !source || !out->ctx || source->level < 0 ||
+            source->ctx != out->ctx ||
+            out->format != source->format)
+            return set_error("invalid saved input copy descriptor owners");
+        if (layout->allocation_count != static_cast<size_t>(source->level + 1) ||
+            layout->stream_count != 1 || layout->launch_count != 1)
+            return set_error("saved input copy descriptor shape is invalid");
+        const auto &launch = layout->launches[0];
+        const size_t n = static_cast<size_t>(out->ctx->N);
+        const size_t limbs = static_cast<size_t>(source->level + 1);
+        if (!out->ctx->execution || out->level != source->level ||
+            out->ctx->limb_gpu_ids.size() < limbs)
+            return set_error("saved input copy descriptor owner metadata is invalid");
+        const GpuMatrixRange input = view ? view->left : GpuMatrixRange{0, source->rows, 0, source->cols};
+        const GpuMatrixRange output = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+        if (!n || !limbs || limbs > kArithMetadataLimbs ||
+            input.row_end < input.row_start || input.column_end < input.column_start ||
+            output.row_end < output.row_start || output.column_end < output.column_start ||
+            input.row_end - input.row_start != output.row_end - output.row_start ||
+            input.column_end - input.column_start != output.column_end - output.column_start)
+            return set_error("saved input copy descriptor geometry is invalid");
+        const size_t rows = output.row_end - output.row_start;
+        const size_t columns = output.column_end - output.column_start;
+        if (!rows || !columns || rows > SIZE_MAX / columns || rows * columns > SIZE_MAX / n)
+            return set_error("saved input copy descriptor dimensions overflow");
+        const size_t coefficients = rows * columns * n;
+        if (coefficients > SIZE_MAX - 255)
+            return set_error("saved input copy descriptor grid overflow");
+        const size_t expected_grid_x = (coefficients + 255) / 256;
+        if (expected_grid_x > std::numeric_limits<unsigned int>::max() ||
+            launch.phase != 0 || launch.len != n || launch.limb_offset != 0 ||
+            launch.limb_count != limbs || launch.narrow != 0 ||
+            launch.grid.x != expected_grid_x || launch.grid.y != 1 ||
+            launch.grid.z != limbs || launch.block.x != 256 ||
+            launch.block.y != 1 || launch.block.z != 1)
+            return set_error("saved input copy launch geometry differs from descriptor");
+        const int status = prepare_copy_layout(out, source, view, prepared, &launch);
+        if (status != 0) return status;
+        dim3 first{};
+        for (size_t limb = 0; limb < limbs; ++limb)
+        {
+            dim3 id{};
+            GpuPreparedResourceKey key{};
+            if (gpu_prepared_limb_key(out->ctx, source->level, limb,
+                    GPU_PREPARED_STAGE_TRANSFORM, &id, &key) != 0 ||
+                gpu_prepared_require_allocation(layout, limb,
+                    GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0)
+                return set_error("saved input copy completion event differs from descriptor");
+            const auto &entry = layout->allocations[limb];
+            if (entry.rows != 0 || entry.columns != 0 || entry.level != -1 || entry.format != -1)
+                return set_error("saved input copy completion event metadata is invalid");
+            if (limb == 0) first = id;
+        }
+        const auto &stream_entry = layout->streams[0];
+        GpuPreparedResourceKey stream_key{};
+        if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+            gpu_prepared_limb_key(out->ctx, source->level, 0, GPU_PREPARED_STAGE_TRANSFORM,
+                &first, &stream_key) != 0 || std::memcmp(&stream_entry.key, &stream_key, sizeof(stream_key)) != 0 ||
+            gpu_prepared_require_stream_slot(out->ctx, first.x, prepared.stream,
+                stream_entry.pool_slot) != 0)
+            return set_error("saved input copy stream differs from descriptor");
+        return 0;
+    }
+
+    int construct_saved_input_copy_resources(
+        GpuPreparedInputCopyState &prepared, const GpuPreparedPlanDescriptor *layout)
+    {
+        for (size_t limb = 0; limb <= prepared.level; ++limb)
+        {
+            const auto &entry = layout->allocations[limb];
+            auto event = std::make_unique<GpuCudaResource>();
+            const int status = event->acquire(
+                prepared.out->ctx, entry.key.device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status != 0) return status;
+            prepared.completion[limb] = std::move(event);
+            input_copy_prepared_acquisitions.fetch_add(1, std::memory_order_relaxed);
+        }
         return 0;
     }
 
@@ -2752,12 +3033,13 @@ namespace
         return 0;
     }
 
-    int prepare_arithmetic_plan(
+    int configure_arithmetic_plan(
         GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
         int kind, const size_t *rows, const size_t *offsets,
         size_t group_count, size_t term_count, const GpuMatrixBatchView *view,
         size_t column_start, const uint64_t *scalar_residues, size_t scalar_count,
-        size_t automorphism_index, GpuPreparedArithmeticState &prepared)
+        size_t automorphism_index, GpuPreparedArithmeticState &prepared,
+        const GpuPreparedArithmeticLayout *saved_geometry = nullptr)
     {
         if (!out || !lhs || !lhs->ctx || !out->ctx || out->ctx != lhs->ctx ||
             out->level != lhs->level || lhs->level < 0 || kind < 0 || kind > 8)
@@ -2769,7 +3051,6 @@ namespace
             return set_error("prepared arithmetic requires a right owner");
         if (rhs && (rhs->ctx != lhs->ctx || rhs->level != lhs->level))
             return set_error("prepared arithmetic context mismatch");
-        prepared = {};
         prepared.kind = static_cast<PreparedArithmeticKind>(kind);
         prepared.out = out;
         prepared.lhs = lhs;
@@ -2800,6 +3081,20 @@ namespace
         prepared.device = -1;
         status = matrix_limb_device(out, lhs->ctx->limb_gpu_ids[0], &prepared.device);
         if (status != 0) return status;
+        GpuPreparedArithmeticLayout structural{};
+        if (saved_geometry)
+            structural = *saved_geometry;
+        else
+        {
+            status = query_arithmetic_layout(
+                prepared.n, prepared.limb_count,
+                prepared.left_range.row_end - prepared.left_range.row_start,
+                prepared.left_columns, prepared.right_rows, prepared.right_columns,
+                output_rows, output_columns, column_start, group_count, term_count,
+                kind, prepared.device, lhs->format == GPU_POLY_FORMAT_EVAL, 0, 0,
+                structural);
+            if (status != 0) return status;
+        }
         if (kind == static_cast<int>(PreparedArithmeticKind::Copy))
         {
             if (lhs->format != out->format || output_rows != prepared.left_range.row_end - prepared.left_range.row_start ||
@@ -2807,8 +3102,7 @@ namespace
                 return set_error("prepared copy shape or format mismatch");
             status = prepare_block_metadata(prepared, lhs, lhs, out);
             if (status != 0) return status;
-            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
-                                 static_cast<unsigned int>(prepared.limb_count));
+            prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             return 0;
         }
         if (kind == static_cast<int>(PreparedArithmeticKind::Add))
@@ -2822,8 +3116,7 @@ namespace
                 return set_error("prepared add shape or format mismatch");
             status = prepare_block_metadata(prepared, lhs, rhs, out);
             if (status != 0) return status;
-            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
-                                 static_cast<unsigned int>(prepared.limb_count));
+            prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             return 0;
         }
         if (kind == static_cast<int>(PreparedArithmeticKind::Subtract))
@@ -2837,8 +3130,7 @@ namespace
                 return set_error("prepared subtract shape or format mismatch");
             status = prepare_block_metadata(prepared, lhs, rhs, out);
             if (status != 0) return status;
-            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
-                                 static_cast<unsigned int>(prepared.limb_count));
+            prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             return 0;
         }
         if (unary)
@@ -2863,8 +3155,7 @@ namespace
             }
             status = prepare_unary_metadata(prepared, lhs, out);
             if (status != 0) return status;
-            prepared.grid = dim3(static_cast<unsigned int>((output_rows * output_columns * prepared.n + 255) / 256), 1,
-                                 static_cast<unsigned int>(prepared.limb_count));
+            prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             return 0;
         }
         if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL ||
@@ -2901,15 +3192,11 @@ namespace
                 for (size_t term = 0; term < term_count; ++term)
                     if (rows[term] >= product_rows) return set_error("prepared tensor row index is invalid");
                 prepared.row_sum_separate_polynomials = prepared.n >= 256;
-                const size_t poly_count = output_rows * output_columns;
-                prepared.grid = prepared.row_sum_separate_polynomials
-                    ? dim3(static_cast<unsigned int>((prepared.n + 255) / 256), static_cast<unsigned int>(std::min(poly_count, size_t{65535})), static_cast<unsigned int>(prepared.limb_count))
-                    : dim3(static_cast<unsigned int>((poly_count * prepared.n + 255) / 256), 1, static_cast<unsigned int>(prepared.limb_count));
+                prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             }
             else
             {
-                const size_t count = output_rows * output_columns * prepared.n;
-                prepared.grid = dim3(static_cast<unsigned int>((count + 255) / 256), 1, static_cast<unsigned int>(prepared.limb_count));
+                prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             }
             return 0;
         }
@@ -2922,7 +3209,7 @@ namespace
             return set_error("prepared multiply shape is invalid");
         if (rows_count <= 4 && cols_count <= 4 && inner <= 16)
         {
-            prepared.grid = dim3(static_cast<unsigned int>((prepared.n + 255) / 256), static_cast<unsigned int>(cols_count), static_cast<unsigned int>(prepared.limb_count));
+            prepared.grid = dim3(structural.grid_x, structural.grid_y, structural.grid_z);
             return 0;
         }
         prepared.matmul_count = prepared.limb_count;
@@ -2958,18 +3245,274 @@ namespace
                 matrix_barrett_u32_reciprocal(lhs->ctx->moduli[limb], &launch.reciprocal);
             launch.lazy_reduction = launch.thin && matrix_lazy_dot_u64(inner, lhs->ctx->moduli[limb]);
             launch.modulus = lhs->ctx->moduli[limb];
-            if (launch.thin)
+            GpuPreparedArithmeticLayout matmul_layout{};
+            if (saved_geometry)
+                matmul_layout = structural;
+            else
             {
-                launch.block = dim3(kThinMatmulWarpSize, kThinMatmulColumnsPerBlock, 1);
-                launch.grid = dim3(static_cast<unsigned int>((cols_count + kThinMatmulColumnsPerBlock - 1) / kThinMatmulColumnsPerBlock), 1,
-                    static_cast<unsigned int>(std::min((prepared.n + kThinMatmulWarpSize - 1) / kThinMatmulWarpSize, kMatmulMaxGridZ)));
+                status = query_arithmetic_layout(
+                    prepared.n, prepared.limb_count, rows_count, inner,
+                    prepared.right_rows, cols_count, output_rows, output_columns,
+                    column_start, group_count, term_count, kind, prepared.device,
+                    true, launch.thin ? 1 : 0, launch.lazy_reduction ? 1 : 0,
+                    matmul_layout);
+                if (status != 0) return status;
+            }
+            launch.block = dim3(matmul_layout.block_x, matmul_layout.block_y, matmul_layout.block_z);
+            launch.grid = dim3(matmul_layout.grid_x, matmul_layout.grid_y, matmul_layout.grid_z);
+        }
+        return 0;
+    }
+
+    // Build only the launch record needed by a saved bind.  This deliberately
+    // does not call query_arithmetic_layout: that query is the legacy planning
+    // path and a saved descriptor must be the source of every prepared
+    // resource and geometry decision.  Older descriptors have no launch table
+    // for arithmetic, so the compact arithmetic geometry is constructed
+    // directly from the already-validated structural arguments.
+    int saved_arithmetic_geometry(
+        const GpuMatrix *lhs, const GpuMatrix *rhs, const GpuMatrix *out,
+        int kind, const GpuMatrixBatchView *view, size_t column_start,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedArithmeticLayout &geometry)
+    {
+        const GpuMatrix *effective_rhs = rhs ? rhs : lhs;
+        if (!lhs || !effective_rhs || !out || !lhs->ctx || lhs->level < 0 ||
+            out->ctx != lhs->ctx || effective_rhs->ctx != lhs->ctx || out->level != lhs->level)
+            return set_error("invalid saved arithmetic geometry owners");
+        const auto valid = [](const GpuMatrix *matrix, const GpuMatrixRange &range) {
+            return range.row_start <= range.row_end && range.row_end <= matrix->rows &&
+                range.column_start <= range.column_end && range.column_end <= matrix->cols;
+        };
+        const GpuMatrixRange left = view ? view->left : GpuMatrixRange{0, lhs->rows, 0, lhs->cols};
+        const GpuMatrixRange right = view ? view->right : GpuMatrixRange{0, effective_rhs->rows, 0, effective_rhs->cols};
+        const GpuMatrixRange output = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+        if (!valid(lhs, left) || !valid(effective_rhs, right) || !valid(out, output))
+            return set_error("saved arithmetic geometry range is invalid");
+        const size_t left_rows = left.row_end - left.row_start;
+        const size_t left_columns = left.column_end - left.column_start;
+        const size_t right_rows = right.row_end - right.row_start;
+        const size_t right_columns = right.column_end - right.column_start;
+        const size_t output_rows = output.row_end - output.row_start;
+        const size_t output_columns = output.column_end - output.column_start;
+        const size_t n = static_cast<size_t>(lhs->ctx->N);
+        const size_t limbs = static_cast<size_t>(lhs->level) + 1;
+        if (n < 2 || !n || !limbs || limbs > kArithMetadataLimbs ||
+            lhs->ctx->moduli.size() < limbs ||
+            !output_rows || !output_columns || !left_rows || !left_columns ||
+            !right_rows || !right_columns || kind < 0 || kind > 8)
+            return set_error("saved arithmetic geometry is empty or invalid");
+        if (output_rows > SIZE_MAX / output_columns ||
+            output_rows * output_columns > SIZE_MAX / n)
+            return set_error("saved arithmetic geometry size overflow");
+        const size_t cells = output_rows * output_columns;
+        const size_t coefficients = cells * n;
+        if (right_columns > SIZE_MAX / left_columns)
+            return set_error("saved arithmetic geometry column count overflow");
+        const size_t product_columns = left_columns * right_columns;
+        if (column_start > product_columns || output_columns > product_columns - column_start)
+            return set_error("saved arithmetic geometry column interval is invalid");
+        geometry = {};
+        geometry.kind = kind;
+        geometry.device = -1;
+        geometry.ring_dimension = n;
+        geometry.limb_count = limbs;
+        geometry.left_rows = left_rows;
+        geometry.left_columns = left_columns;
+        geometry.right_rows = right_rows;
+        geometry.right_columns = right_columns;
+        geometry.output_rows = output_rows;
+        geometry.output_columns = output_columns;
+        geometry.column_start = column_start;
+        geometry.alignment = alignof(uint64_t);
+        geometry.event_count = limbs;
+        geometry.block_x = 256;
+        geometry.block_y = 1;
+        geometry.block_z = 1;
+        geometry.grid_z = static_cast<unsigned int>(limbs);
+        if (limbs > std::numeric_limits<unsigned int>::max())
+            return set_error("saved arithmetic geometry limb count overflow");
+
+        // A descriptor may carry an explicit launch record.  Consume it
+        // verbatim after checking the fields that are meaningful for this
+        // operation; zero launch records are accepted for legacy arithmetic
+        // descriptors whose geometry is represented by the operation itself.
+        if (layout && layout->launch_count > 1)
+            return set_error("saved arithmetic geometry has multiple launches");
+        if (layout && layout->launch_count == 1)
+        {
+            const auto &launch = layout->launches[0];
+            if (!launch.grid.x || !launch.grid.y || !launch.grid.z ||
+                !launch.block.x || !launch.block.y || !launch.block.z)
+                return set_error("saved arithmetic launch geometry is empty");
+            geometry.grid_x = launch.grid.x;
+            geometry.grid_y = launch.grid.y;
+            geometry.grid_z = launch.grid.z;
+            geometry.block_x = launch.block.x;
+            geometry.block_y = launch.block.y;
+            geometry.block_z = launch.block.z;
+            return 0;
+        }
+        const auto ceil_div = [](size_t value, size_t divisor, unsigned int *result) {
+            if (!result || !divisor || value > SIZE_MAX - (divisor - 1)) return false;
+            const size_t quotient = (value + divisor - 1) / divisor;
+            if (quotient > std::numeric_limits<unsigned int>::max()) return false;
+            *result = static_cast<unsigned int>(quotient);
+            return true;
+        };
+        if (kind == static_cast<int>(PreparedArithmeticKind::Multiply))
+        {
+            const bool small = left_rows <= 4 && right_columns <= 4 && left_columns <= 16;
+            bool thin = !view && left_rows == 1;
+            if (thin)
+                for (size_t limb = 0; limb < limbs; ++limb)
+                    thin = thin && lhs->ctx->moduli[limb] > 1 &&
+                        lhs->ctx->moduli[limb] <= std::numeric_limits<uint32_t>::max();
+            if (small)
+            {
+                if (!ceil_div(n, 256, &geometry.grid_x) ||
+                    right_columns > std::numeric_limits<unsigned int>::max())
+                    return set_error("saved arithmetic grid dimensions overflow");
+                geometry.grid_y = static_cast<unsigned int>(right_columns);
+            }
+            else if (thin)
+            {
+                geometry.block_x = kThinMatmulWarpSize;
+                geometry.block_y = kThinMatmulColumnsPerBlock;
+                if (!ceil_div(right_columns, kThinMatmulColumnsPerBlock, &geometry.grid_x) ||
+                    n > SIZE_MAX - (kThinMatmulWarpSize - 1))
+                    return set_error("saved arithmetic grid dimensions overflow");
+                geometry.grid_y = 1;
+                geometry.grid_z = static_cast<unsigned int>(std::min(
+                    (n + kThinMatmulWarpSize - 1) / kThinMatmulWarpSize,
+                    kMatmulMaxGridZ));
             }
             else
             {
-                launch.block = dim3(kMatmulTileN, kMatmulTileM, 1);
-                launch.grid = dim3(static_cast<unsigned int>((cols_count + kMatmulTileN - 1) / kMatmulTileN), static_cast<unsigned int>((rows_count + kMatmulTileM - 1) / kMatmulTileM),
-                    static_cast<unsigned int>(std::min(prepared.n, kMatmulMaxGridZ)));
+                geometry.block_x = kMatmulTileN;
+                geometry.block_y = kMatmulTileM;
+                if (!ceil_div(right_columns, kMatmulTileN, &geometry.grid_x) ||
+                    !ceil_div(left_rows, kMatmulTileM, &geometry.grid_y))
+                    return set_error("saved arithmetic grid dimensions overflow");
+                geometry.grid_z = static_cast<unsigned int>(std::min(n, kMatmulMaxGridZ));
             }
+        }
+        else if (kind == static_cast<int>(PreparedArithmeticKind::TensorSumRows) && n >= 256)
+        {
+            if (!ceil_div(n, 256, &geometry.grid_x))
+                return set_error("saved arithmetic grid dimensions overflow");
+            geometry.grid_y = static_cast<unsigned int>(std::min(cells, size_t{65535}));
+        }
+        else if (!ceil_div(coefficients, 256, &geometry.grid_x))
+            return set_error("saved arithmetic grid dimensions overflow");
+        return 0;
+    }
+
+    int validate_saved_arithmetic_descriptor(
+        const GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+        int kind, const GpuMatrixBatchView *view, size_t column_start,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedArithmeticLayout &geometry,
+        size_t &workspace_bytes, size_t &workspace_alignment)
+    {
+        const GpuMatrix *effective_rhs = rhs ? rhs : lhs;
+        if (!layout || !out || !lhs || !effective_rhs || !lhs->ctx || !out->ctx ||
+            out->ctx != lhs->ctx || effective_rhs->ctx != lhs->ctx || out->level != lhs->level ||
+            lhs->level < 0)
+            return set_error("invalid saved arithmetic descriptor owners");
+        const size_t limbs = static_cast<size_t>(lhs->level) + 1;
+        if (layout->allocation_count != limbs && layout->allocation_count != limbs + 1)
+            return set_error("saved arithmetic descriptor allocation count mismatch");
+        // The planner writes one owner-stream footprint per active limb.  A
+        // shared-stream owner may repeat the same physical slot, but its key
+        // still carries that limb and must be checked independently.
+        if (layout->stream_count != limbs)
+            return set_error("saved arithmetic descriptor stream count mismatch");
+        if (out->ctx->limb_gpu_ids.size() < limbs)
+            return set_error("saved arithmetic owner has incomplete limb metadata");
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        if (matrix_limb_device(out, out->ctx->limb_gpu_ids[0], &device) != 0 ||
+            matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream) != 0 || !stream)
+            return set_error("saved arithmetic descriptor owner stream is unavailable");
+        int status = saved_arithmetic_geometry(
+            lhs, effective_rhs, out, kind, view, column_start, layout, geometry);
+        if (status != 0) return status;
+        geometry.device = device;
+        const size_t workspace_count = layout->allocation_count - limbs;
+        workspace_bytes = 0;
+        workspace_alignment = alignof(uint64_t);
+        GpuPreparedResourceKey first_key{};
+        for (size_t limb = 0; limb < limbs; ++limb)
+        {
+            dim3 id{};
+            GpuPreparedResourceKey key{};
+            status = gpu_prepared_limb_key(out->ctx, lhs->level, limb,
+                GPU_PREPARED_STAGE_ARITHMETIC, &id, &key);
+            if (status != 0) return status;
+            if (limb == 0) first_key = key;
+            if (gpu_prepared_require_allocation(layout, workspace_count + limb,
+                    GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0)
+                return set_error("saved arithmetic completion event differs from descriptor");
+            const auto &event_entry = layout->allocations[workspace_count + limb];
+            if (event_entry.rows != 0 || event_entry.columns != 0 ||
+                event_entry.level != -1 || event_entry.format != -1)
+                return set_error("saved arithmetic completion event metadata is invalid");
+        }
+        if (workspace_count)
+        {
+            const auto &entry = layout->allocations[0];
+            if (entry.kind != GPU_PREPARED_BATCH_WORKSPACE || entry.bytes == 0 ||
+                entry.alignment == 0 || entry.rows != geometry.output_rows ||
+                entry.columns != geometry.output_columns || entry.level != lhs->level ||
+                entry.format != lhs->format ||
+                entry.alignment > 256 || (entry.alignment & (entry.alignment - 1)) != 0)
+                return set_error("saved arithmetic workspace entry is invalid");
+            if (gpu_prepared_require_allocation(layout, 0, entry.kind, &first_key,
+                    entry.bytes, entry.alignment) != 0)
+                return set_error("saved arithmetic workspace differs from descriptor");
+            workspace_bytes = entry.bytes;
+            workspace_alignment = entry.alignment;
+        }
+        for (size_t limb = 0; limb < limbs; ++limb)
+        {
+            const auto &stream_entry = layout->streams[limb];
+            dim3 id{};
+            GpuPreparedResourceKey key{};
+            status = gpu_prepared_limb_key(out->ctx, lhs->level, limb,
+                GPU_PREPARED_STAGE_ARITHMETIC, &id, &key);
+            if (status != 0) return status;
+            cudaStream_t owner_stream = nullptr;
+            status = matrix_limb_stream(out, id, &owner_stream);
+            if (status != 0 || !owner_stream)
+                return set_error("saved arithmetic owner stream is unavailable");
+            if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+                gpu_prepared_require_stream_slot(out->ctx, id.x, owner_stream,
+                    stream_entry.pool_slot) != 0 ||
+                std::memcmp(&stream_entry.key, &key, sizeof(key)) != 0)
+                return set_error("saved arithmetic stream differs from descriptor");
+        }
+        return 0;
+    }
+
+    int construct_saved_arithmetic_resources(
+        GpuPreparedArithmeticState &prepared, size_t workspace_bytes,
+        size_t workspace_alignment)
+    {
+        // Keep this order identical to the descriptor writer: workspace first,
+        // followed by one completion event for each active limb.
+        if (workspace_bytes != 0)
+        {
+            const int status = prepared.workspace.acquire(
+                prepared.out->ctx, prepared.device, GPU_PREPARED_BATCH_WORKSPACE,
+                workspace_bytes, workspace_alignment, prepared.stream);
+            if (status != 0) return status;
+        }
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            auto event = std::make_unique<GpuCudaResource>();
+            const int status = event->acquire(
+                prepared.out->ctx, prepared.device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status != 0) return status;
+            prepared.completion[limb] = std::move(event);
         }
         return 0;
     }
@@ -2988,6 +3531,13 @@ namespace
 
     int prepared_arithmetic_finish(const GpuPreparedArithmeticState &prepared)
     {
+        for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+        {
+            if (!prepared.completion[limb]) continue;
+            const cudaError_t error = cudaEventRecord(
+                prepared.completion[limb]->event, prepared.stream);
+            if (error != cudaSuccess) return set_error(error);
+        }
         int status = matrix_record_all_limb_writes(prepared.out, prepared.stream, true);
         if (status != 0) return status;
         const dim3 first = prepared.out->ctx->limb_gpu_ids[0];
@@ -3002,6 +3552,45 @@ namespace
 
 } // namespace
 
+extern "C" int gpu_matrix_prepare_arithmetic_with_layout(
+    GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+    const size_t *rows, const size_t *offsets, size_t group_count,
+    size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+    const uint64_t *scalar_residues, size_t scalar_count, size_t automorphism_index,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedArithmetic **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared arithmetic layout is missing");
+    *plan = nullptr;
+    try
+    {
+        GpuPreparedArithmeticLayout geometry{};
+        size_t workspace_bytes = 0;
+        size_t workspace_alignment = alignof(uint64_t);
+        const int validation = validate_saved_arithmetic_descriptor(
+            out, lhs, rhs, kind, view, column_start, layout, geometry,
+            workspace_bytes, workspace_alignment);
+        if (validation != 0) return validation;
+
+        auto prepared = std::make_unique<GpuPreparedArithmeticState>();
+        const int status = configure_arithmetic_plan(
+            out, lhs, rhs, kind, rows, offsets, group_count, term_count, view,
+            column_start, scalar_residues, scalar_count, automorphism_index,
+            *prepared, &geometry);
+        if (status != 0) return status;
+        const int resource_status = construct_saved_arithmetic_resources(
+            *prepared, workspace_bytes, workspace_alignment);
+        if (resource_status != 0) return resource_status;
+        *plan = reinterpret_cast<GpuPreparedArithmetic *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+// Keep the legacy entry point after the descriptor-driven entry point.  This
+// makes the one-way call graph apparent in source as well as at runtime.
+// Standalone non-prepared arithmetic API. The saved prepared runtime consumes
+// gpu_matrix_prepare_arithmetic_with_layout directly.
 extern "C" int gpu_matrix_prepare_arithmetic(
     GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
     const size_t *rows, const size_t *offsets, size_t group_count,
@@ -3014,7 +3603,7 @@ extern "C" int gpu_matrix_prepare_arithmetic(
     try
     {
         auto prepared = std::make_unique<GpuPreparedArithmeticState>();
-        const int status = prepare_arithmetic_plan(
+        const int status = configure_arithmetic_plan(
             out, lhs, rhs, kind, rows, offsets, group_count, term_count,
             view, column_start, scalar_residues, scalar_count, automorphism_index, *prepared);
         if (status != 0) return status;
@@ -3159,6 +3748,8 @@ extern "C" void gpu_matrix_destroy_arithmetic_plan(GpuPreparedArithmetic *opaque
     delete reinterpret_cast<GpuPreparedArithmeticState *>(opaque);
 }
 
+// Standalone non-prepared copy API; descriptor-driven binds use the entry
+// immediately below and do not route through this planner.
 extern "C" int gpu_matrix_prepare_input_copy(
     GpuMatrix *out, const GpuMatrix *source_template,
     const GpuMatrixBatchView *view, GpuPreparedInputCopy **plan)
@@ -3174,6 +3765,38 @@ extern "C" int gpu_matrix_prepare_input_copy(
         return 0;
     }
     catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_input_copy_with_layout(
+    GpuMatrix *out, const GpuMatrix *source_template,
+    const GpuMatrixBatchView *view, const GpuPreparedPlanDescriptor *layout,
+    GpuPreparedInputCopy **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared input copy layout is missing");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedInputCopyState>();
+        const int validation = validate_saved_input_copy_descriptor(
+            out, source_template, view, layout, *prepared);
+        if (validation != 0) return validation;
+        const int resource_status = construct_saved_input_copy_resources(*prepared, layout);
+        if (resource_status != 0) return resource_status;
+        *plan = reinterpret_cast<GpuPreparedInputCopy *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" void gpu_matrix_test_reset_input_copy_bind_counters()
+{
+    input_copy_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_input_copy_prepared_acquisitions()
+{
+    return input_copy_prepared_acquisitions.load(std::memory_order_relaxed);
 }
 
 extern "C" int gpu_matrix_submit_input_copy(
@@ -3217,6 +3840,12 @@ extern "C" int gpu_matrix_submit_input_copy(
         prepared->output_range.row_start, prepared->output_range.column_start);
     cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) return set_error(error);
+    for (size_t limb = 0; limb <= prepared->level; ++limb)
+    {
+        if (!prepared->completion[limb]) continue;
+        error = cudaEventRecord(prepared->completion[limb]->event, prepared->stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
     status = matrix_record_all_limb_writes(prepared->out, prepared->stream, true);
     if (status != 0) return status;
     const dim3 first = prepared->out->ctx->limb_gpu_ids[0];
@@ -3493,14 +4122,25 @@ struct GpuPreparedTransposeState
     size_t rows;
     size_t count;
     size_t limb_count;
+    dim3 grid;
     int device;
     cudaStream_t stream;
     bool has_view;
+    std::array<std::unique_ptr<GpuCudaResource>, kArithMetadataLimbs> completion;
+
+    ~GpuPreparedTransposeState()
+    {
+        for (auto &event : completion)
+            if (event) (void)event->release();
+    }
 };
+
+static std::atomic<size_t> transpose_prepared_acquisitions{0};
 
 static int prepare_transpose_plan(
     GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
-    GpuPreparedTransposeState &prepared)
+    GpuPreparedTransposeState &prepared,
+    const GpuPreparedLaunchLayout *saved_launch = nullptr)
 {
     if (!out || !out->ctx || !out->ctx->execution)
         return set_error("invalid execution owner in prepared transpose");
@@ -3520,6 +4160,7 @@ static int prepare_transpose_plan(
             r.column_start <= r.column_end && r.column_end <= m->cols;
     };
     if (!valid(input, source) || !valid(output, out) ||
+        (view && std::memcmp(&view->left, &view->right, sizeof(GpuMatrixRange)) != 0) ||
         input.row_end - input.row_start != output.column_end - output.column_start ||
         input.column_end - input.column_start != output.row_end - output.row_start)
         return set_error("invalid prepared transpose view");
@@ -3568,8 +4209,100 @@ static int prepare_transpose_plan(
     prepared.count = prepared.rows * columns * n;
     if (prepared.count > std::numeric_limits<size_t>::max() / 256)
         return set_error("prepared transpose grid overflow");
+    if (saved_launch)
+    {
+        prepared.grid = saved_launch->grid;
+    }
+    else
+    {
+        GpuPreparedRectLayout layout{};
+        status = query_rect_layout(n, prepared.limb_count, prepared.rows, columns,
+            prepared.device, 2, layout);
+        if (status != 0) return status;
+        prepared.grid = dim3(layout.grid_x, layout.grid_y, layout.grid_z);
+    }
     prepared.out = out;
     prepared.source = source;
+    return 0;
+}
+
+static int validate_saved_transpose_descriptor(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedTransposeState &prepared)
+{
+    if (!layout || !out || !source || !out->ctx || out->ctx->N <= 0 ||
+        source->ctx != out->ctx || source->level < 0 ||
+        out->level != source->level || out->format != source->format ||
+        out->ctx->limb_gpu_ids.size() < static_cast<size_t>(source->level + 1) ||
+        !out->ctx->execution)
+        return set_error("invalid saved transpose descriptor owners");
+    const size_t limbs = static_cast<size_t>(source->level + 1);
+    if (!limbs || limbs > kArithMetadataLimbs || layout->allocation_count != limbs ||
+        layout->stream_count != 1 || layout->launch_count != 1)
+        return set_error("saved transpose descriptor shape is invalid");
+    const GpuMatrixRange input = view ? view->left : GpuMatrixRange{0, source->rows, 0, source->cols};
+    const GpuMatrixRange output = view ? view->output : GpuMatrixRange{0, out->rows, 0, out->cols};
+    if (input.row_end < input.row_start || input.column_end < input.column_start ||
+        output.row_end < output.row_start || output.column_end < output.column_start)
+        return set_error("saved transpose descriptor range is invalid");
+    const size_t rows = input.row_end - input.row_start;
+    const size_t columns = input.column_end - input.column_start;
+    if (!rows || !columns || rows > SIZE_MAX / columns ||
+        rows * columns > SIZE_MAX / static_cast<size_t>(out->ctx->N))
+        return set_error("saved transpose descriptor dimensions overflow");
+    const size_t coefficients = rows * columns * static_cast<size_t>(out->ctx->N);
+    if (coefficients > SIZE_MAX - 255)
+        return set_error("saved transpose descriptor grid overflow");
+    const size_t quotient = (coefficients + 255) / 256;
+    const size_t expected_grid_x = std::min(quotient, size_t{65535});
+    const auto &launch = layout->launches[0];
+    if (launch.phase != 0 || launch.len != static_cast<size_t>(out->ctx->N) ||
+        launch.limb_offset != 0 || launch.limb_count != limbs || launch.narrow != 0 ||
+        launch.grid.x != expected_grid_x || launch.grid.y != 1 ||
+        launch.grid.z != limbs || launch.block.x != 256 || launch.block.y != 1 ||
+        launch.block.z != 1)
+        return set_error("saved transpose launch geometry differs from descriptor");
+    const int status = prepare_transpose_plan(out, source, view, prepared, &launch);
+    if (status != 0) return status;
+    dim3 first{};
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        dim3 id{};
+        GpuPreparedResourceKey key{};
+        if (gpu_prepared_limb_key(out->ctx, source->level, limb,
+                GPU_PREPARED_STAGE_TRANSFORM, &id, &key) != 0 ||
+            gpu_prepared_require_allocation(layout, limb,
+                GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0)
+            return set_error("saved transpose completion event differs from descriptor");
+        const auto &entry = layout->allocations[limb];
+        if (entry.rows != 0 || entry.columns != 0 || entry.level != -1 || entry.format != -1)
+            return set_error("saved transpose completion event metadata is invalid");
+        if (limb == 0) first = id;
+    }
+    const auto &stream_entry = layout->streams[0];
+    GpuPreparedResourceKey stream_key{};
+    if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        gpu_prepared_limb_key(out->ctx, source->level, 0, GPU_PREPARED_STAGE_TRANSFORM,
+            &first, &stream_key) != 0 || std::memcmp(&stream_entry.key, &stream_key, sizeof(stream_key)) != 0 ||
+        gpu_prepared_require_stream_slot(out->ctx, first.x, prepared.stream,
+            stream_entry.pool_slot) != 0)
+        return set_error("saved transpose stream differs from descriptor");
+    return 0;
+}
+
+static int construct_saved_transpose_resources(
+    GpuPreparedTransposeState &prepared, const GpuPreparedPlanDescriptor *layout)
+{
+    for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+    {
+        const auto &entry = layout->allocations[limb];
+        auto event = std::make_unique<GpuCudaResource>();
+        const int status = event->acquire(
+            prepared.out->ctx, entry.key.device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) return status;
+        prepared.completion[limb] = std::move(event);
+        transpose_prepared_acquisitions.fetch_add(1, std::memory_order_relaxed);
+    }
     return 0;
 }
 
@@ -3581,12 +4314,16 @@ static int submit_transpose_plan(const GpuPreparedTransposeState &prepared)
     if (status != 0) return status;
     status = matrix_wait_all_limb_streams(prepared.out, prepared.device, prepared.stream);
     if (status != 0) return status;
-    const dim3 grid(static_cast<unsigned int>(std::min(prepared.count / 256 + (prepared.count % 256 != 0), size_t{65535})),
-                    1, static_cast<unsigned int>(prepared.limb_count));
-    transpose_all_limbs_kernel<<<grid, 256, 0, prepared.stream>>>(
+    transpose_all_limbs_kernel<<<prepared.grid, 256, 0, prepared.stream>>>(
         prepared.metadata, prepared.rows, prepared.count, static_cast<size_t>(prepared.source->ctx->N));
     error = cudaGetLastError();
     if (error != cudaSuccess) return set_error(error);
+    for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+    {
+        if (!prepared.completion[limb]) continue;
+        error = cudaEventRecord(prepared.completion[limb]->event, prepared.stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
     if (prepared.has_view)
     {
         status = matrix_record_all_limb_writes(prepared.out, prepared.stream, true);
@@ -3601,6 +4338,8 @@ static int submit_transpose_plan(const GpuPreparedTransposeState &prepared)
     return matrix_record_all_limb_writes(prepared.out, prepared.stream);
 }
 
+// Standalone non-prepared transpose API; descriptor-driven binds use the
+// saved-layout entry and do not route through this planner.
 extern "C" int gpu_matrix_prepare_transpose(
     GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
     GpuPreparedTranspose **plan)
@@ -3616,6 +4355,37 @@ extern "C" int gpu_matrix_prepare_transpose(
         return 0;
     }
     catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_transpose_with_layout(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedTranspose **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared transpose layout is missing");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedTransposeState>();
+        const int validation = validate_saved_transpose_descriptor(
+            out, source, view, layout, *prepared);
+        if (validation != 0) return validation;
+        const int resource_status = construct_saved_transpose_resources(*prepared, layout);
+        if (resource_status != 0) return resource_status;
+        *plan = reinterpret_cast<GpuPreparedTranspose *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" void gpu_matrix_test_reset_transpose_bind_counters()
+{
+    transpose_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_transpose_prepared_acquisitions()
+{
+    return transpose_prepared_acquisitions.load(std::memory_order_relaxed);
 }
 
 extern "C" int gpu_matrix_submit_transpose(const GpuPreparedTranspose *plan)

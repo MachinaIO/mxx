@@ -9,6 +9,8 @@ extern "C"
 {
 #endif
 
+    struct GpuPreparedPlanDescriptor;
+
     typedef struct GpuMatrixDecomposeWorkspaceBytes
     {
         // Empty when the coefficient source can be read directly.
@@ -44,6 +46,10 @@ extern "C"
     int gpu_matrix_prepare_gadget_decompose(
         const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out,
         int small, size_t dropped_moduli, GpuPreparedGadgetDecompose **plan);
+    int gpu_matrix_prepare_gadget_decompose_with_layout(
+        const GpuMatrix *src, uint32_t base_bits, GpuMatrix *out,
+        int small, size_t dropped_moduli, const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedGadgetDecompose **plan);
     int gpu_matrix_submit_gadget_decompose(const GpuPreparedGadgetDecompose *plan);
     void gpu_matrix_destroy_gadget_decompose(GpuPreparedGadgetDecompose *plan);
 

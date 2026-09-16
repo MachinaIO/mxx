@@ -392,19 +392,37 @@ struct GpuPreparedModulusConversion
     int device;
     cudaStream_t stream;
     RnsCompactMetadata rns_metadata;
-    RnsConversionMetadata *device_rns_metadata;
+    RnsConversionMetadata *device_rns_metadata = nullptr;
     bool rns_mod_down;
     size_t coefficient_count;
     int grid_blocks;
+    GpuDeviceWorkspace workspace;
+    std::array<std::unique_ptr<GpuCudaResource>, kCrtMaxLimbs> completion;
+    bool workspace_owned = false;
+    RnsConversionMetadata expanded_metadata{};
 
     ~GpuPreparedModulusConversion()
     {
-        if (!device_rns_metadata) return;
-        cudaSetDevice(device);
-        if (stream) cudaFreeAsync(device_rns_metadata, stream);
-        else cudaFree(device_rns_metadata);
+        if (!workspace_owned && device_rns_metadata)
+        {
+            cudaSetDevice(device);
+            if (stream) cudaFreeAsync(device_rns_metadata, stream);
+            else cudaFree(device_rns_metadata);
+        }
+        (void)workspace.release(stream);
+        for (auto &event : completion)
+            if (event) (void)event->release();
     }
 };
+
+static std::atomic<size_t> modulus_legacy_prepare_calls{0};
+static std::atomic<size_t> rns_legacy_prepare_calls{0};
+static std::atomic<size_t> modulus_prepared_acquisitions{0};
+static std::atomic<size_t> rns_prepared_acquisitions{0};
+static std::atomic<size_t> centered_legacy_prepare_calls{0};
+static std::atomic<size_t> centered_prepared_acquisitions{0};
+static std::atomic<size_t> crt_legacy_prepare_calls{0};
+static std::atomic<size_t> crt_prepared_acquisitions{0};
 
 struct GpuPreparedCrtRecompose
 {
@@ -421,19 +439,131 @@ struct GpuPreparedCrtRecompose
     std::vector<CrtLevelMetadata> levels;
     CrtOutputMetadata output_metadata{};
     GpuDeviceWorkspace metadata_workspace;
+    std::array<std::unique_ptr<GpuCudaResource>, kCrtMaxLimbs> completion;
 
     ~GpuPreparedCrtRecompose()
     {
         (void)metadata_workspace.release(stream);
+        for (auto &event : completion)
+            if (event) (void)event->release();
     }
 };
+
+static int validate_saved_stage_resources(
+    const GpuPreparedPlanDescriptor *layout, const GpuContext *ctx, int level,
+    int role, cudaStream_t stream, size_t rows, size_t columns, int format,
+    size_t *workspace_bytes, size_t *workspace_alignment)
+{
+    if (!layout || !ctx || level < 0 || !stream || !workspace_bytes || !workspace_alignment)
+        return set_error("invalid saved matrix stage resources");
+    const size_t limbs = static_cast<size_t>(level) + 1;
+    if (limbs > kCrtMaxLimbs || layout->allocation_count < limbs ||
+        layout->allocation_count > limbs + 1 || layout->stream_count != 1)
+        return set_error("saved matrix stage resource count is invalid");
+    const size_t workspace_count = layout->allocation_count - limbs;
+    *workspace_bytes = 0;
+    *workspace_alignment = alignof(uint64_t);
+    dim3 first{};
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        dim3 id{};
+        GpuPreparedResourceKey key{};
+        if (gpu_prepared_limb_key(ctx, level, limb, role, &id, &key) != 0 ||
+            gpu_prepared_require_allocation(layout, workspace_count + limb,
+                GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0)
+            return set_error("saved matrix completion event differs from descriptor");
+        const auto &entry = layout->allocations[workspace_count + limb];
+        if (entry.rows || entry.columns || entry.level != -1 || entry.format != -1)
+            return set_error("saved matrix completion event metadata is invalid");
+        if (limb == 0) first = id;
+    }
+    if (workspace_count)
+    {
+        GpuPreparedResourceKey key{};
+        if (gpu_prepared_limb_key(ctx, level, 0, role, &first, &key) != 0)
+            return -1;
+        const auto &entry = layout->allocations[0];
+        if (entry.kind != GPU_PREPARED_BATCH_WORKSPACE || !entry.bytes ||
+            entry.rows != rows || entry.columns != columns || entry.level != level ||
+            entry.format != format || entry.alignment == 0 || entry.alignment > 256 ||
+            (entry.alignment & (entry.alignment - 1)) != 0 ||
+            gpu_prepared_require_allocation(layout, 0, entry.kind, &key,
+                entry.bytes, entry.alignment) != 0)
+            return set_error("saved matrix workspace differs from descriptor");
+        *workspace_bytes = entry.bytes;
+        *workspace_alignment = entry.alignment;
+    }
+    const auto &footprint = layout->streams[0];
+    GpuPreparedResourceKey stream_key{};
+    if (footprint.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        gpu_prepared_limb_key(ctx, level, 0, role, &first, &stream_key) != 0 ||
+        std::memcmp(&footprint.key, &stream_key, sizeof(stream_key)) != 0 ||
+        gpu_prepared_require_stream_slot(ctx, first.x, stream, footprint.pool_slot) != 0)
+        return set_error("saved matrix stream differs from descriptor");
+    return 0;
+}
+
+static int validate_saved_matrix_launch(
+    const GpuPreparedPlanDescriptor *layout, size_t grid_blocks,
+    size_t ring_dimension, size_t limb_count)
+{
+    if (!layout || layout->launch_count != 1 || !grid_blocks ||
+        grid_blocks > std::numeric_limits<unsigned int>::max())
+        return set_error("saved matrix launch descriptor is invalid");
+    const auto &launch = layout->launches[0];
+    if (launch.phase != 0 || launch.grid.x != grid_blocks || launch.grid.y != 1 ||
+        launch.grid.z != 1 || launch.block.x != 128 || launch.block.y != 1 ||
+        launch.block.z != 1 || launch.len != ring_dimension ||
+        launch.limb_offset != 0 || launch.limb_count != limb_count || launch.narrow != 0)
+        return set_error("saved matrix launch differs from descriptor");
+    return 0;
+}
+
+template <size_t N>
+static int record_prepared_completion_events(
+    const std::array<std::unique_ptr<GpuCudaResource>, N> &completion,
+    size_t count, cudaStream_t stream)
+{
+    for (size_t limb = 0; limb < count; ++limb)
+    {
+        if (!completion[limb]) continue;
+        const cudaError_t error = cudaEventRecord(completion[limb]->event, stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
+    return 0;
+}
+
+static int construct_saved_stage_resources(
+    GpuContext *ctx, int device, cudaStream_t stream,
+    const GpuPreparedPlanDescriptor *layout, size_t limbs,
+    size_t workspace_bytes, size_t workspace_alignment, GpuDeviceWorkspace *workspace,
+    std::array<std::unique_ptr<GpuCudaResource>, kCrtMaxLimbs> &completion)
+{
+    if (workspace_bytes)
+    {
+        if (!workspace || workspace->acquire(ctx, device, GPU_PREPARED_BATCH_WORKSPACE,
+                workspace_bytes, workspace_alignment, stream) != 0)
+            return 1;
+    }
+    const size_t workspace_count = workspace_bytes ? 1 : 0;
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        auto event = std::make_unique<GpuCudaResource>();
+        const auto &entry = layout->allocations[workspace_count + limb];
+        const int status = event->acquire(ctx, entry.key.device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) return status;
+        completion[limb] = std::move(event);
+    }
+    return 0;
+}
 
 namespace
 {
 int prepare_crt_recompose_metadata(
     const GpuMatrix *const *levels, size_t level_count,
     const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
-    size_t reconstruction_stride, GpuMatrix *out, GpuPreparedCrtRecompose &prepared)
+    size_t reconstruction_stride, GpuMatrix *out, GpuPreparedCrtRecompose &prepared,
+    const GpuPreparedPlanDescriptor *saved_layout = nullptr)
 {
     if (!levels || !level_count || !plaintext_moduli || !reconstruction_residues || !out ||
         !out->ctx || !out->ctx->execution || out->format != GPU_POLY_FORMAT_COEFF ||
@@ -500,7 +630,7 @@ int prepare_crt_recompose_metadata(
         return set_error("prepared CRT recomposition exceeds CUDA grid capacity");
     prepared.device = target.device;
     prepared.grid_blocks = static_cast<int>(blocks);
-    if (level_count > 2)
+    if (level_count > 2 && !saved_layout)
     {
         size_t levels_bytes = 0;
         if (level_count > SIZE_MAX / sizeof(CrtLevelMetadata))
@@ -533,6 +663,7 @@ extern "C" int gpu_matrix_prepare_crt_recompose(
 {
     if (!plan) return set_error("null prepared CRT recomposition output");
     *plan = nullptr;
+    crt_legacy_prepare_calls.fetch_add(1, std::memory_order_relaxed);
     try
     {
         auto prepared = std::make_unique<GpuPreparedCrtRecompose>();
@@ -543,6 +674,72 @@ extern "C" int gpu_matrix_prepare_crt_recompose(
         return 0;
     }
     catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_crt_recompose_with_layout(
+    const GpuMatrix *const *levels, size_t level_count,
+    const uint64_t *plaintext_moduli, const uint64_t *reconstruction_residues,
+    size_t reconstruction_stride, GpuMatrix *out,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedCrtRecompose **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared CRT layout is missing");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedCrtRecompose>();
+        const int status = prepare_crt_recompose_metadata(
+            levels, level_count, plaintext_moduli, reconstruction_residues,
+            reconstruction_stride, out, *prepared, layout);
+        if (status != 0) return status;
+        size_t workspace_bytes = 0, workspace_alignment = alignof(uint64_t);
+        if (validate_saved_stage_resources(layout, out->ctx,
+                static_cast<int>(prepared->target_count - 1), GPU_PREPARED_STAGE_RECONSTRUCTION,
+                prepared->stream, out->rows, out->cols, out->format,
+                &workspace_bytes, &workspace_alignment) != 0 ||
+            validate_saved_matrix_launch(layout, static_cast<size_t>(prepared->grid_blocks),
+                prepared->ring_dimension, prepared->target_count) != 0)
+            return set_error("prepared CRT layout differs from native plan");
+        const int resource_status = construct_saved_stage_resources(
+            out->ctx, prepared->device, prepared->stream, layout,
+            prepared->target_count, workspace_bytes, workspace_alignment,
+            &prepared->metadata_workspace, prepared->completion);
+        if (resource_status != 0) return resource_status;
+        if (workspace_bytes && level_count > 2)
+        {
+            const size_t levels_bytes = level_count * sizeof(CrtLevelMetadata);
+            cudaError_t error = cudaSetDevice(prepared->device);
+            if (error == cudaSuccess)
+                error = cudaMemcpyAsync(prepared->metadata_workspace.data, prepared->levels.data(),
+                    levels_bytes, cudaMemcpyHostToDevice, prepared->stream);
+            if (error == cudaSuccess)
+                error = cudaMemcpyAsync(prepared->metadata_workspace.data + levels_bytes,
+                    &prepared->output_metadata, sizeof(CrtOutputMetadata),
+                    cudaMemcpyHostToDevice, prepared->stream);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        crt_prepared_acquisitions.fetch_add(
+            prepared->target_count + (workspace_bytes ? 1 : 0), std::memory_order_relaxed);
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" void gpu_matrix_test_reset_crt_recompose_bind_counters()
+{
+    crt_legacy_prepare_calls.store(0, std::memory_order_relaxed);
+    crt_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_crt_recompose_prepared_acquisitions()
+{
+    return crt_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_legacy_crt_recompose_prepare_calls()
+{
+    return crt_legacy_prepare_calls.load(std::memory_order_relaxed);
 }
 
 extern "C" int gpu_matrix_submit_crt_recompose(
@@ -593,7 +790,9 @@ extern "C" int gpu_matrix_submit_crt_recompose(
         gpu_matrix_retire_submitted_work(prepared->output);
         return set_error(error);
     }
-    int status = matrix_record_all_limb_writes(prepared->output, prepared->stream, true);
+    int status = record_prepared_completion_events(
+        prepared->completion, static_cast<size_t>(prepared->output->level + 1), prepared->stream);
+    if (status == 0) status = matrix_record_all_limb_writes(prepared->output, prepared->stream, true);
     if (status == 0)
     {
         const dim3 first = prepared->output->ctx->limb_gpu_ids[0];
@@ -617,7 +816,8 @@ namespace
     static int prepare_rns_modulus_conversion_plan(
         const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
         uint64_t plaintext_modulus, const uint64_t *inverses, size_t inverse_count,
-        const uint64_t *scales, GpuPreparedModulusConversion &prepared);
+        const uint64_t *scales, GpuPreparedModulusConversion &prepared,
+        const GpuPreparedPlanDescriptor *saved_layout = nullptr);
     static int submit_rns_modulus_conversion(
         const GpuPreparedModulusConversion *prepared, GpuMatrix *out,
         const GpuMatrix *source, const GpuMatrixBatchView *view,
@@ -628,7 +828,8 @@ static int prepare_modulus_conversion_plan(
     const GpuMatrix *source, const GpuMatrix *out, int conversion,
     const uint64_t *division_inverses, size_t inverse_count,
     uint64_t plaintext_modulus, const uint64_t *input_scales,
-    GpuPreparedModulusConversion &prepared)
+    GpuPreparedModulusConversion &prepared,
+    const GpuPreparedPlanDescriptor *saved_layout = nullptr)
 {
     if (!source || !out || !source->ctx || !out->ctx || out == source ||
         !source->ctx->execution || out->ctx->execution != source->ctx->execution ||
@@ -642,7 +843,7 @@ static int prepare_modulus_conversion_plan(
     if (conversion == 4)
         return prepare_rns_modulus_conversion_plan(
             source, out, static_cast<size_t>(source->level) + 1, plaintext_modulus,
-            division_inverses, inverse_count, input_scales, prepared);
+            division_inverses, inverse_count, input_scales, prepared, saved_layout);
     const size_t source_count = static_cast<size_t>(source->level) + 1;
     const size_t target_count = static_cast<size_t>(out->level) + 1;
     if (source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
@@ -732,6 +933,7 @@ extern "C" int gpu_matrix_prepare_modulus_conversion(
 {
     if (!plan) return set_error("null prepared conversion output");
     *plan = nullptr;
+    modulus_legacy_prepare_calls.fetch_add(1, std::memory_order_relaxed);
     try
     {
         auto prepared = std::make_unique<GpuPreparedModulusConversion>();
@@ -745,6 +947,62 @@ extern "C" int gpu_matrix_prepare_modulus_conversion(
     catch (const std::exception &error) { return set_error(error.what()); }
 }
 
+extern "C" int gpu_matrix_prepare_modulus_conversion_with_layout(
+    const GpuMatrix *source, const GpuMatrix *out, int conversion,
+    const uint64_t *division_inverses, size_t inverse_count,
+    uint64_t plaintext_modulus, const uint64_t *input_scales,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedModulusConversion **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared modulus conversion layout is missing");
+    // The legacy gpu_matrix_prepare_modulus_conversion( entry remains a
+    // separate non-prepared caller; this path never invokes it.
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedModulusConversion>();
+        const int status = prepare_modulus_conversion_plan(
+            source, out, conversion, division_inverses, inverse_count,
+            plaintext_modulus, input_scales, *prepared, layout);
+        if (status != 0) return status;
+        size_t workspace_bytes = 0, workspace_alignment = alignof(uint64_t);
+        if (validate_saved_stage_resources(layout, out->ctx, prepared->target_level,
+                GPU_PREPARED_STAGE_TRANSFORM, prepared->stream, prepared->rows,
+                prepared->columns, prepared->target_format, &workspace_bytes,
+                &workspace_alignment) != 0 ||
+            validate_saved_matrix_launch(layout, static_cast<size_t>(prepared->grid_blocks),
+                static_cast<size_t>(out->ctx->N),
+                static_cast<size_t>(prepared->target_level) + 1) != 0)
+            return set_error("prepared modulus conversion layout differs from native plan");
+        const int resource_status = construct_saved_stage_resources(
+            out->ctx, prepared->device, prepared->stream, layout,
+            static_cast<size_t>(prepared->target_level) + 1, workspace_bytes,
+            workspace_alignment, &prepared->workspace, prepared->completion);
+        if (resource_status != 0) return resource_status;
+        if (prepared->conversion == 4 && prepared->source_level >= 0 &&
+            static_cast<size_t>(prepared->source_level + 1) *
+                static_cast<size_t>(prepared->target_level + 1) > kCrtMaxLimbs)
+        {
+            if (!workspace_bytes) return set_error("saved RNS metadata workspace is missing");
+            prepared->device_rns_metadata = reinterpret_cast<RnsConversionMetadata *>(
+                prepared->workspace.data);
+            prepared->workspace_owned = true;
+            cudaError_t error = cudaSetDevice(prepared->device);
+            if (error == cudaSuccess)
+                error = cudaMemcpyAsync(prepared->device_rns_metadata,
+                    &prepared->expanded_metadata, sizeof(prepared->expanded_metadata),
+                    cudaMemcpyHostToDevice, prepared->stream);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        modulus_prepared_acquisitions.fetch_add(
+            static_cast<size_t>(prepared->target_level + 1) + (workspace_bytes != 0 ? 1 : 0),
+            std::memory_order_relaxed);
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
 extern "C" int gpu_matrix_prepare_rns_conversion(
     const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
     uint64_t plaintext_modulus, const uint64_t *scales, const uint64_t *inverses,
@@ -752,6 +1010,7 @@ extern "C" int gpu_matrix_prepare_rns_conversion(
 {
     if (!plan) return set_error("null prepared RNS conversion output");
     *plan = nullptr;
+    rns_legacy_prepare_calls.fetch_add(1, std::memory_order_relaxed);
     try
     {
         auto prepared = std::make_unique<GpuPreparedModulusConversion>();
@@ -762,6 +1021,91 @@ extern "C" int gpu_matrix_prepare_rns_conversion(
         return 0;
     }
     catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_rns_conversion_with_layout(
+    const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
+    uint64_t plaintext_modulus, const uint64_t *scales, const uint64_t *inverses,
+    size_t inverse_count, const GpuPreparedPlanDescriptor *layout,
+    GpuPreparedModulusConversion **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared RNS conversion layout is missing");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedModulusConversion>();
+        const int status = prepare_rns_modulus_conversion_plan(
+            source, out, digit_size, plaintext_modulus, inverses, inverse_count,
+            scales, *prepared, layout);
+        if (status != 0) return status;
+        size_t workspace_bytes = 0, workspace_alignment = alignof(uint64_t);
+        if (validate_saved_stage_resources(layout, out->ctx, prepared->target_level,
+                GPU_PREPARED_STAGE_TRANSFORM, prepared->stream, prepared->rows,
+                prepared->columns, prepared->target_format, &workspace_bytes,
+                &workspace_alignment) != 0 ||
+            validate_saved_matrix_launch(layout, static_cast<size_t>(prepared->grid_blocks),
+                static_cast<size_t>(out->ctx->N),
+                static_cast<size_t>(prepared->target_level) + 1) != 0)
+            return set_error("prepared RNS conversion layout differs from native plan");
+        const int resource_status = construct_saved_stage_resources(
+            out->ctx, prepared->device, prepared->stream, layout,
+            static_cast<size_t>(prepared->target_level) + 1, workspace_bytes,
+            workspace_alignment, &prepared->workspace, prepared->completion);
+        if (resource_status != 0) return resource_status;
+        if (static_cast<size_t>(prepared->source_level + 1) *
+                static_cast<size_t>(prepared->target_level + 1) > kCrtMaxLimbs)
+        {
+            if (!workspace_bytes) return set_error("saved RNS metadata workspace is missing");
+            prepared->device_rns_metadata = reinterpret_cast<RnsConversionMetadata *>(
+                prepared->workspace.data);
+            prepared->workspace_owned = true;
+            cudaError_t error = cudaSetDevice(prepared->device);
+            if (error == cudaSuccess)
+                error = cudaMemcpyAsync(prepared->device_rns_metadata,
+                    &prepared->expanded_metadata, sizeof(prepared->expanded_metadata),
+                    cudaMemcpyHostToDevice, prepared->stream);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        rns_prepared_acquisitions.fetch_add(
+            static_cast<size_t>(prepared->target_level + 1) + (workspace_bytes != 0 ? 1 : 0),
+            std::memory_order_relaxed);
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" void gpu_matrix_test_reset_modulus_conversion_bind_counters()
+{
+    modulus_legacy_prepare_calls.store(0, std::memory_order_relaxed);
+    modulus_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_modulus_conversion_prepared_acquisitions()
+{
+    return modulus_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_legacy_modulus_conversion_prepare_calls()
+{
+    return modulus_legacy_prepare_calls.load(std::memory_order_relaxed);
+}
+
+extern "C" void gpu_matrix_test_reset_rns_conversion_bind_counters()
+{
+    rns_legacy_prepare_calls.store(0, std::memory_order_relaxed);
+    rns_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_rns_conversion_prepared_acquisitions()
+{
+    return rns_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_legacy_rns_conversion_prepare_calls()
+{
+    return rns_legacy_prepare_calls.load(std::memory_order_relaxed);
 }
 
 extern "C" int gpu_matrix_submit_modulus_conversion(
@@ -799,7 +1143,9 @@ extern "C" int gpu_matrix_submit_modulus_conversion(
         prepared->columns, input_range.row_start * source->cols + input_range.column_start,
         source->cols, output_range.row_start * out->cols + output_range.column_start, out->cols);
     error = cudaGetLastError();
-    status = error == cudaSuccess ? matrix_record_all_limb_writes(out, stream, true) : set_error(error);
+    status = error == cudaSuccess ? record_prepared_completion_events(
+        prepared->completion, static_cast<size_t>(prepared->target_level + 1), stream) : set_error(error);
+    if (status == 0) status = matrix_record_all_limb_writes(out, stream, true);
     if (status == 0)
     {
         const dim3 first = out->ctx->limb_gpu_ids[0];
@@ -1023,7 +1369,53 @@ struct GpuPreparedCenteredRebaseState
     size_t blocks;
     int device;
     cudaStream_t stream;
+    GpuMatrixTransformPlan *forward = nullptr;
+    std::array<std::unique_ptr<GpuCudaResource>, kCrtMaxLimbs> completion;
+
+    ~GpuPreparedCenteredRebaseState()
+    {
+        if (forward) gpu_matrix_destroy_ntt_plan(forward);
+        for (auto &event : completion)
+            if (event) (void)event->release();
+    }
 };
+
+static int split_centered_rebase_layout(
+    const GpuPreparedPlanDescriptor *layout,
+    GpuPreparedPlanDescriptor *rebase,
+    GpuPreparedPlanDescriptor *forward)
+{
+    if (!layout || !rebase || !forward || layout->launch_count < 1)
+        return set_error("prepared centered rebase descriptor is incomplete");
+    *rebase = GpuPreparedPlanDescriptor{};
+    *forward = GpuPreparedPlanDescriptor{};
+    for (size_t index = 0; index < layout->allocation_count; ++index)
+    {
+        const auto &entry = layout->allocations[index];
+        auto *destination = entry.key.role == GPU_PREPARED_STAGE_NTT ? forward : rebase;
+        if (destination->allocation_count >= GPU_PREPARED_PLAN_MAX_ALLOCATIONS)
+            return set_error("prepared centered rebase allocation footprint is too large");
+        destination->allocations[destination->allocation_count++] = entry;
+    }
+    for (size_t index = 0; index < layout->stream_count; ++index)
+    {
+        const auto &entry = layout->streams[index];
+        auto *destination = entry.key.role == GPU_PREPARED_STAGE_NTT ? forward : rebase;
+        if (destination->stream_count >= GPU_PREPARED_PLAN_MAX_STREAMS)
+            return set_error("prepared centered rebase stream footprint is too large");
+        destination->streams[destination->stream_count++] = entry;
+    }
+    if (layout->launch_count >= GPU_PREPARED_PLAN_MAX_STREAMS)
+        return set_error("prepared centered rebase launch footprint is too large");
+    rebase->launch_count = 1;
+    rebase->launches[0] = layout->launches[0];
+    forward->launch_count = layout->launch_count - 1;
+    for (size_t index = 0; index < forward->launch_count; ++index)
+        forward->launches[index] = layout->launches[index + 1];
+    if (forward->allocation_count == 0 || forward->stream_count != 1 || forward->launch_count == 0)
+        return set_error("prepared centered rebase forward NTT footprint is missing");
+    return 0;
+}
 
 static int prepare_centered_rebase_plan(
     GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
@@ -1102,7 +1494,8 @@ static int submit_centered_rebase_plan(const GpuPreparedCenteredRebaseState &pre
         prepared.source->cols, prepared.output_range.row_start * prepared.out->cols +
             prepared.output_range.column_start, prepared.out->cols);
     error = cudaGetLastError();
-    status = error == cudaSuccess ? matrix_record_all_limb_writes(prepared.out, prepared.stream, true) : set_error(error);
+    status = error == cudaSuccess ? matrix_record_all_limb_writes(
+        prepared.out, prepared.stream, true) : set_error(error);
     if (status == 0)
     {
         const dim3 first = prepared.out->ctx->limb_gpu_ids[0];
@@ -1111,8 +1504,11 @@ static int submit_centered_rebase_plan(const GpuPreparedCenteredRebaseState &pre
         status = matrix_track_all_limb_consumers(
             prepared.source, prepared.device, prepared.stream, completion, true, true);
     }
-    if (status == 0 && prepared.out->format == GPU_POLY_FORMAT_EVAL)
-        status = run_matrix_transform_u64<true>(prepared.out, &prepared.output_range);
+    if (status == 0 && prepared.forward)
+        status = gpu_matrix_submit_ntt_plan(prepared.forward, prepared.out);
+    if (status == 0)
+        status = record_prepared_completion_events(
+            prepared.completion, prepared.target_count, prepared.stream);
     if (status != 0)
     {
         const int retired = gpu_matrix_retire_submitted_work(prepared.out);
@@ -1127,6 +1523,7 @@ extern "C" int gpu_matrix_prepare_centered_rebase(
 {
     if (!plan) return set_error("null prepared centered rebase output");
     *plan = nullptr;
+    centered_legacy_prepare_calls.fetch_add(1, std::memory_order_relaxed);
     try
     {
         auto prepared = std::make_unique<GpuPreparedCenteredRebaseState>();
@@ -1136,6 +1533,64 @@ extern "C" int gpu_matrix_prepare_centered_rebase(
         return 0;
     }
     catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_centered_rebase_with_layout(
+    GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+    const GpuPreparedPlanDescriptor *layout, GpuPreparedCenteredRebase **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared centered rebase layout is missing");
+    *plan = nullptr;
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedCenteredRebaseState>();
+        const int status = prepare_centered_rebase_plan(out, source, view, *prepared);
+        if (status != 0) return status;
+        GpuPreparedPlanDescriptor rebase_layout{};
+        GpuPreparedPlanDescriptor forward_layout{};
+        if (out->format == GPU_POLY_FORMAT_EVAL &&
+            split_centered_rebase_layout(layout, &rebase_layout, &forward_layout) != 0)
+            return set_error("prepared centered rebase forward NTT layout is missing");
+        const GpuPreparedPlanDescriptor *stage_layout =
+            out->format == GPU_POLY_FORMAT_EVAL ? &rebase_layout : layout;
+        size_t workspace_bytes = 0, workspace_alignment = alignof(uint64_t);
+        if (validate_saved_stage_resources(stage_layout, out->ctx, out->level,
+                GPU_PREPARED_STAGE_TRANSFORM, prepared->stream, prepared->out->rows,
+                prepared->out->cols, prepared->out->format, &workspace_bytes,
+                &workspace_alignment) != 0 || workspace_bytes != 0 ||
+            validate_saved_matrix_launch(stage_layout, prepared->blocks, prepared->n,
+                prepared->target_count) != 0)
+            return set_error("prepared centered rebase layout differs from native plan");
+        if (out->format == GPU_POLY_FORMAT_EVAL &&
+            gpu_matrix_prepare_ntt_plan_with_layout(out, nullptr, true,
+                &forward_layout, &prepared->forward) != 0)
+            return set_error("prepared centered rebase forward NTT layout differs");
+        const int resource_status = construct_saved_stage_resources(
+            out->ctx, prepared->device, prepared->stream, stage_layout, prepared->target_count,
+            0, alignof(uint64_t), nullptr, prepared->completion);
+        if (resource_status != 0) return resource_status;
+        centered_prepared_acquisitions.fetch_add(prepared->target_count, std::memory_order_relaxed);
+        *plan = reinterpret_cast<GpuPreparedCenteredRebase *>(prepared.release());
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" void gpu_matrix_test_reset_centered_rebase_bind_counters()
+{
+    centered_legacy_prepare_calls.store(0, std::memory_order_relaxed);
+    centered_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_centered_rebase_prepared_acquisitions()
+{
+    return centered_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_legacy_centered_rebase_prepare_calls()
+{
+    return centered_legacy_prepare_calls.load(std::memory_order_relaxed);
 }
 
 extern "C" int gpu_matrix_submit_centered_rebase(const GpuPreparedCenteredRebase *plan)
@@ -1399,7 +1854,8 @@ namespace
     static int prepare_rns_modulus_conversion_plan(
         const GpuMatrix *source, const GpuMatrix *out, size_t digit_size,
         uint64_t plaintext_modulus, const uint64_t *inverses, size_t inverse_count,
-        const uint64_t *scales, GpuPreparedModulusConversion &prepared)
+        const uint64_t *scales, GpuPreparedModulusConversion &prepared,
+        const GpuPreparedPlanDescriptor *saved_layout)
     {
         const size_t source_count = static_cast<size_t>(source->level) + 1;
         const size_t target_count = static_cast<size_t>(out->level) + 1;
@@ -1469,6 +1925,7 @@ namespace
         if (source->rows > SIZE_MAX / source->cols ||
             source->rows * source->cols > SIZE_MAX / static_cast<size_t>(out->ctx->N))
             return set_error("prepared RNS shape overflow");
+        prepared.expanded_metadata = expanded;
         prepared.coefficient_count = source->rows * source->cols * static_cast<size_t>(out->ctx->N);
         prepared.rns_mod_down = mod_down;
         const size_t total = prepared.coefficient_count * target_count * group_count;
@@ -1490,7 +1947,7 @@ namespace
         if (stream_status != 0 || !prepared.stream)
             return stream_status ? stream_status : set_error("null prepared RNS stream");
         prepared.device_rns_metadata = nullptr;
-        if (source_count * target_count > kCrtMaxLimbs)
+        if (!saved_layout && source_count * target_count > kCrtMaxLimbs)
         {
             cudaError_t error = cudaSetDevice(prepared.device);
             if (error != cudaSuccess) return set_error(error);
@@ -1631,7 +2088,9 @@ namespace
                 view->output.row_start * out->cols + view->output.column_start, out->cols);
         }
         error = cudaGetLastError();
-        status = error == cudaSuccess ? matrix_record_all_limb_writes(out, stream) : set_error(error);
+        status = error == cudaSuccess ? record_prepared_completion_events(
+            prepared->completion, static_cast<size_t>(prepared->target_level + 1), stream) : set_error(error);
+        if (status == 0) status = matrix_record_all_limb_writes(out, stream);
         if (status == 0)
         {
             const dim3 first = out->ctx->limb_gpu_ids[0];

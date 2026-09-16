@@ -1,11 +1,14 @@
 //! Fixed preimage acceptance and first-success publication.
 
 use super::{GpuDCRTPolyMatrix, GpuSmallMatrix};
-use crate::poly::dcrt::gpu::{
-    GpuPreparedPreimageCutoffOpaque, PinnedHostBuffer, gpu_small_matrix_begin_preimage_cutoff,
-    gpu_small_matrix_destroy_preimage_cutoff, gpu_small_matrix_finish_preimage_cutoff,
-    gpu_small_matrix_prepare_preimage_cutoff, gpu_small_matrix_submit_preimage_cutoff,
-    gpu_small_matrix_wait_preimage_cutoff, last_error_string,
+use crate::poly::{
+    PolyParams,
+    dcrt::gpu::{
+        GpuPreparedPreimageCutoffOpaque, PinnedHostBuffer, gpu_small_matrix_begin_preimage_cutoff,
+        gpu_small_matrix_destroy_preimage_cutoff, gpu_small_matrix_finish_preimage_cutoff,
+        gpu_small_matrix_prepare_preimage_cutoff, gpu_small_matrix_submit_preimage_cutoff,
+        gpu_small_matrix_wait_preimage_cutoff, last_error_string,
+    },
 };
 use std::{ptr::NonNull, sync::Arc};
 
@@ -24,19 +27,70 @@ pub struct GpuPreparedPreimageCutoff {
 unsafe impl Send for GpuPreparedPreimageCutoff {}
 
 impl GpuPreparedPreimageCutoff {
-    pub fn allocation_layout(
-        output: &GpuSmallMatrix,
+    /// Metadata-only cutoff planner used by the prepared resource resolver.
+    /// It mirrors the native geometry calculation without requiring a live
+    /// compact destination owner.
+    pub fn allocation_layout_for_shape(
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        magnitude_bytes: usize,
+        job_count: usize,
     ) -> Result<Vec<super::GpuPreparedWorkspaceLayout>, String> {
-        let mut layouts = [super::GpuPreparedWorkspaceLayout {
-            bytes: 0,
-            alignment: 1,
-            kind: super::GpuPreparedSlotKind::CompactWorkspace,
-        }; 18];
+        if job_count == 0 {
+            return Err("prepared preimage cutoff job count is zero".into());
+        }
+        let mut layouts =
+            vec![
+                super::GpuPreparedWorkspaceLayout {
+                    bytes: 0,
+                    alignment: 1,
+                    kind: super::GpuPreparedSlotKind::CompactWorkspace,
+                };
+                job_count.checked_add(3).ok_or("prepared preimage cutoff layout count overflow")?
+            ];
         let mut count = 0;
         let status = unsafe {
-            crate::poly::dcrt::gpu::gpu_preimage_cutoff_layout(
-                output.raw,
+            crate::poly::dcrt::gpu::gpu_preimage_cutoff_batch_layout_shape(
+                params.ring_dimension() as usize,
+                rows,
+                columns,
+                magnitude_bytes,
+                job_count,
                 layouts.as_mut_ptr(),
+                layouts.len(),
+                &mut count,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(layouts[..count].to_vec())
+    }
+
+    pub fn allocation_layout(
+        output: &GpuSmallMatrix,
+        job_count: usize,
+    ) -> Result<Vec<super::GpuPreparedWorkspaceLayout>, String> {
+        if job_count == 0 {
+            return Err("prepared preimage cutoff job count is zero".into());
+        }
+        let mut layouts =
+            vec![
+                super::GpuPreparedWorkspaceLayout {
+                    bytes: 0,
+                    alignment: 1,
+                    kind: super::GpuPreparedSlotKind::CompactWorkspace,
+                };
+                job_count.checked_add(3).ok_or("prepared preimage cutoff layout count overflow")?
+            ];
+        let mut count = 0;
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_preimage_cutoff_batch_layout(
+                output.raw,
+                job_count,
+                layouts.as_mut_ptr(),
+                layouts.len(),
                 &mut count,
             )
         };
@@ -53,10 +107,16 @@ impl GpuPreparedPreimageCutoff {
         (18, self.raw.as_ptr().cast())
     }
 
-    pub fn bind(
+    pub fn bind_with_layout(
         jobs: Vec<(Arc<GpuSmallMatrix>, Arc<GpuDCRTPolyMatrix>, usize, usize)>,
+        layouts: &[super::GpuPreparedWorkspaceLayout],
     ) -> Result<Self, String> {
         let first = jobs.first().ok_or("prepared preimage cutoff batch is empty")?;
+        let expected =
+            jobs.len().checked_add(3).ok_or("prepared preimage cutoff layout count overflow")?;
+        if layouts.len() != expected {
+            return Err("prepared preimage cutoff saved layout count mismatch".into());
+        }
         let mut status = PinnedHostBuffer::zeroed(&first.0.params, jobs.len());
         let destinations = jobs.iter().map(|job| job.0.raw).collect::<Vec<_>>();
         let sources = jobs.iter().map(|job| job.1.raw.cast_const()).collect::<Vec<_>>();
@@ -71,6 +131,8 @@ impl GpuPreparedPreimageCutoff {
                 columns.as_ptr(),
                 jobs.len(),
                 status.as_mut_slice().as_mut_ptr(),
+                layouts.as_ptr(),
+                layouts.len(),
                 &mut raw,
             )
         };
@@ -216,14 +278,14 @@ mod tests {
                 GpuPreparedInputCopy::bind(Arc::clone(output), Arc::clone(input), None).unwrap()
             })
             .collect::<Vec<_>>();
-        let mut command = GpuPreparedPreimageCutoff::bind(
-            actual
-                .iter()
-                .zip(&initial)
-                .map(|(dst, src)| (Arc::clone(dst), Arc::clone(src), 0, 0))
-                .collect(),
-        )
-        .unwrap();
+        let jobs = actual
+            .iter()
+            .zip(&initial)
+            .map(|(dst, src)| (Arc::clone(dst), Arc::clone(src), 0, 0))
+            .collect::<Vec<_>>();
+        let layouts =
+            GpuPreparedPreimageCutoff::allocation_layout(actual[0].as_ref(), jobs.len()).unwrap();
+        let mut command = GpuPreparedPreimageCutoff::bind_with_layout(jobs, &layouts).unwrap();
         command.begin().unwrap();
         command.submit().unwrap();
         for (copy, replacement) in copies.iter().zip(&replacements) {

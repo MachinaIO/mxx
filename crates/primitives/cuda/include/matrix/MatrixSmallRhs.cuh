@@ -1,6 +1,7 @@
 #pragma once
 
 #include "matrix/Matrix.cuh"
+#include "gpu_prepared_plan.cuh"
 
 #ifdef __cplusplus
 extern "C"
@@ -9,8 +10,13 @@ extern "C"
 
 typedef struct GpuSmallMatrix GpuSmallMatrix;
 typedef struct GpuPreparedSmallRhs GpuPreparedSmallRhs;
+typedef struct GpuPreparedSmallUpload GpuPreparedSmallUpload;
 typedef struct GpuPreparedPreimageCutoff GpuPreparedPreimageCutoff;
-int gpu_preimage_cutoff_layout(GpuSmallMatrix *output, GpuPreparedWorkspaceLayout *layouts, size_t *count);
+int gpu_preimage_cutoff_batch_layout(GpuSmallMatrix *output, size_t job_count,
+    GpuPreparedWorkspaceLayout *layouts, size_t capacity, size_t *count);
+int gpu_preimage_cutoff_batch_layout_shape(size_t ring_dimension, size_t rows, size_t columns,
+    size_t magnitude_bytes, size_t job_count, GpuPreparedWorkspaceLayout *layouts,
+    size_t capacity, size_t *count);
 int gpu_preimage_cutoff_is_ready(const GpuPreparedPreimageCutoff *plan, bool *ready);
 
 typedef struct GpuSmallMatrixAllocationReport
@@ -61,6 +67,14 @@ int gpu_small_matrix_load_coefficients(
     GpuSmallMatrix *mat,
     const uint8_t *payload,
     size_t payload_len);
+int gpu_matrix_prepare_small_upload(
+    GpuSmallMatrix *mat, const uint8_t *payload, size_t payload_len,
+    const GpuPreparedPlanDescriptor *plan,
+    GpuPreparedSmallUpload **out_plan);
+int gpu_matrix_submit_small_upload(GpuPreparedSmallUpload *plan);
+int gpu_matrix_query_small_upload(const GpuPreparedSmallUpload *plan, int *out_ready);
+int gpu_matrix_wait_small_upload(const GpuPreparedSmallUpload *plan);
+void gpu_matrix_destroy_small_upload(GpuPreparedSmallUpload *plan);
 int gpu_small_matrix_store_coefficients(
     const GpuSmallMatrix *mat,
     uint8_t *payload,
@@ -84,7 +98,8 @@ int gpu_small_matrix_pack_preimage_batch(
 int gpu_small_matrix_prepare_preimage_cutoff(
     GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
     const size_t *dst_rows, const size_t *dst_columns, size_t count,
-    int32_t *host_status, GpuPreparedPreimageCutoff **out);
+    int32_t *host_status, const GpuPreparedWorkspaceLayout *layouts, size_t layout_count,
+    GpuPreparedPreimageCutoff **out);
 int gpu_small_matrix_begin_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
 int gpu_small_matrix_submit_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
 int gpu_small_matrix_finish_preimage_cutoff(GpuPreparedPreimageCutoff *plan);
@@ -119,6 +134,7 @@ int gpu_matrix_prepare_small_rhs(
     GpuMatrix *output,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
+    const GpuPreparedPlanDescriptor *plan,
     GpuPreparedSmallRhs **out_plan);
 int gpu_matrix_submit_small_rhs(
     const GpuPreparedSmallRhs *plan,

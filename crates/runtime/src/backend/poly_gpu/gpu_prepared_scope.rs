@@ -5,25 +5,36 @@ use super::*;
 pub(super) fn instantiate(
     graph: &ValidatedGraph,
     wave_bound: std::num::NonZeroUsize,
-) -> Result<PreparedProgram, PreparedLoweringError> {
+) -> Result<GpuPreparation, PreparedLoweringError> {
     let mut compiler = ScopeInstantiator {
         graph,
-        program: PreparedProgram { instance_count: 1, ..PreparedProgram::default() },
+        program: GpuPreparation { instance_count: 1, ..GpuPreparation::default() },
         nodes: Vec::new(),
         families: BTreeMap::new(),
         next_node: 1,
         replay: Vec::new(),
         variant_environments: Vec::new(),
-        waves: Vec::new(),
         wave_bound,
         next_virtual_wire: u64::MAX,
     };
     let root = compiler.scope(&FrozenGraphScopeId::Root, &graph.bindings, &[])?;
+    compiler.program.trace_keys = root
+        .iter()
+        .map(|(source, prepared)| {
+            (
+                *prepared,
+                mxx_ir_core::types::WireId { instantiation_path: Vec::new(), wire: *source },
+            )
+        })
+        .collect();
     compiler.program.inputs = compiler
         .nodes
         .iter()
         .filter(|node| {
-            matches!(compiler.program.node_sources[&node.id].kind, NodeKind::Input { .. })
+            matches!(
+                compiler.program.node_sources[&node.id].kind,
+                NodeKind::Input { artifact: None, .. }
+            )
         })
         .flat_map(|node| compiler.program.node_bindings[&node.id].1.iter().copied())
         .collect();
@@ -70,6 +81,15 @@ pub(super) fn instantiate(
         .collect();
     compiler.program.outputs =
         graph.source.root_scope().outputs().iter().map(|wire| root[wire]).collect();
+    compiler.program.trace_wires = compiler
+        .program
+        .node_bindings
+        .values()
+        .flat_map(|(_, outputs)| outputs.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
     compiler.program.output_names = graph
         .source
         .outputs()
@@ -131,7 +151,7 @@ pub(super) fn instantiate(
         .collect();
     compiler.program.topology.nodes = compiler.nodes.into_boxed_slice();
     compiler.program.replay = compiler.replay.into_boxed_slice();
-    color_storage(&mut compiler.program, &compiler.waves);
+    color_storage(&mut compiler.program);
     Ok(compiler.program)
 }
 
@@ -140,91 +160,419 @@ fn family_leaf_wires(families: &BTreeMap<WireRef, Box<[WireRef]>>, wire: WireRef
     members.iter().flat_map(|member| family_leaf_wires(families, *member)).collect()
 }
 
-pub(super) fn color_storage(program: &mut PreparedProgram, waves: &[(u32, u32)]) {
-    let mut lifetimes = BTreeMap::<u64, (usize, usize, ConcreteWireType, ValueLocation)>::new();
-    for (position, node) in program.topology.nodes.iter().enumerate() {
-        let (arguments, outputs) = &program.node_bindings[&node.id];
-        for wire in outputs {
-            if let Some(location) = program.values.get(wire) {
-                lifetimes.entry(location.owner).and_modify(|entry| entry.1 = position).or_insert((
-                    position,
-                    position,
-                    program.wire_types[wire].clone(),
-                    location.clone(),
-                ));
+/// Assign physical owners after lowering has fixed the complete topology.
+///
+/// Reuse is valid only when every access to the previous owner happens-before
+/// the next owner's first write. Reuse also requires the complete fixed
+/// storage descriptor to match.
+pub(super) fn color_storage(program: &mut GpuPreparation) {
+    #[derive(Clone)]
+    struct StorageLifetime {
+        owner: u64,
+        order: usize,
+        rows: usize,
+        columns: usize,
+        level: usize,
+        format: PreparedFormat,
+        descriptor_compatible: bool,
+        device: i32,
+        reads: Vec<usize>,
+        writes: Vec<usize>,
+        pinned: bool,
+    }
+
+    // Alias views do not own storage. Resolve their owner to the source owner
+    // before collecting accesses, so a chain of slices/transposes cannot create
+    // duplicate physical allocations.
+    let mut parent = BTreeMap::<u64, u64>::new();
+    let mut ensure_owner = |owner: u64| {
+        parent.entry(owner).or_insert(owner);
+    };
+    for location in program.values.values() {
+        ensure_owner(location.owner);
+    }
+    for view in program.view_commands.values() {
+        match view {
+            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
+                ensure_owner(location.owner)
+            }
+            PreparedView::FixedCopies(copies) => {
+                for copy in copies {
+                    ensure_owner(copy.source.owner);
+                    ensure_owner(copy.destination.owner);
+                }
             }
         }
+    }
+    for selection in program.selection_commands.values() {
+        match selection {
+            PreparedSelection::Static { location } => ensure_owner(location.owner),
+            PreparedSelection::Dynamic { candidates, .. } |
+            PreparedSelection::Select { candidates, .. } => {
+                for location in candidates {
+                    ensure_owner(location.owner);
+                }
+            }
+            PreparedSelection::ScalarStatic { .. } |
+            PreparedSelection::ScalarDynamic { .. } |
+            PreparedSelection::ScalarSelect { .. } => {}
+        }
+    }
+    for members in program.family_members.values() {
+        for location in members {
+            ensure_owner(location.owner);
+        }
+    }
+    fn root(parent: &mut BTreeMap<u64, u64>, owner: u64) -> u64 {
+        let parent_owner = parent[&owner];
+        if parent_owner == owner {
+            owner
+        } else {
+            let root_owner = root(parent, parent_owner);
+            parent.insert(owner, root_owner);
+            root_owner
+        }
+    }
+    let mut union = |left: u64, right: u64| {
+        let left = root(&mut parent, left);
+        let right = root(&mut parent, right);
+        if left != right {
+            parent.insert(left, right);
+        }
+    };
+    for (node_id, view) in &program.view_commands {
+        if !matches!(view, PreparedView::Alias(_) | PreparedView::TransposeAlias(_)) {
+            continue;
+        }
+        let Some((_, outputs)) = program.node_bindings.get(node_id) else { continue };
+        let Some(output) = outputs.first().and_then(|wire| program.values.get(wire)) else {
+            continue
+        };
+        let source = match view {
+            PreparedView::Alias(source) | PreparedView::TransposeAlias(source) => source,
+            PreparedView::FixedCopies(_) => unreachable!(),
+        };
+        union(output.owner, source.owner);
+    }
+    for (node_id, selection) in &program.selection_commands {
+        let PreparedSelection::Static { location } = selection else { continue };
+        let Some((_, outputs)) = program.node_bindings.get(node_id) else { continue };
+        let Some(output) = outputs.first().and_then(|wire| program.values.get(wire)) else {
+            continue
+        };
+        union(output.owner, location.owner);
+    }
+    let canonical = |owner: u64, parent: &mut BTreeMap<u64, u64>| root(parent, owner);
+    for location in program.values.values_mut() {
+        location.owner = canonical(location.owner, &mut parent);
+    }
+    for view in program.view_commands.values_mut() {
+        match view {
+            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
+                location.owner = canonical(location.owner, &mut parent)
+            }
+            PreparedView::FixedCopies(copies) => {
+                for copy in copies {
+                    copy.source.owner = canonical(copy.source.owner, &mut parent);
+                    copy.destination.owner = canonical(copy.destination.owner, &mut parent);
+                }
+            }
+        }
+    }
+    for selection in program.selection_commands.values_mut() {
+        match selection {
+            PreparedSelection::Static { location } => {
+                location.owner = canonical(location.owner, &mut parent)
+            }
+            PreparedSelection::Dynamic { candidates, .. } |
+            PreparedSelection::Select { candidates, .. } => {
+                for location in candidates {
+                    location.owner = canonical(location.owner, &mut parent);
+                }
+            }
+            PreparedSelection::ScalarStatic { .. } |
+            PreparedSelection::ScalarDynamic { .. } |
+            PreparedSelection::ScalarSelect { .. } => {}
+        }
+    }
+    for members in program.family_members.values_mut() {
+        for location in members {
+            location.owner = canonical(location.owner, &mut parent);
+        }
+    }
+
+    let node_count = program.topology.nodes.len();
+    let node_devices = program
+        .topology
+        .nodes
+        .iter()
+        .map(|node| {
+            let mut devices = BTreeSet::new();
+            if let Some((arguments, outputs)) = program.node_bindings.get(&node.id) {
+                for wire in arguments.iter().chain(outputs.iter()) {
+                    if let Some(location) = program.values.get(wire) {
+                        devices.insert(location.device);
+                    }
+                    if let Some(members) = program.family_members.get(wire) {
+                        devices.extend(members.iter().map(|location| location.device));
+                    }
+                }
+            }
+            devices
+        })
+        .collect::<Vec<_>>();
+    let mut completion_to_node = BTreeMap::<u32, usize>::new();
+    for (index, node) in program.topology.nodes.iter().enumerate() {
+        completion_to_node.insert(node.id, index);
+        completion_to_node.insert(node.completion, index);
+    }
+    let mut predecessors = vec![BTreeSet::<usize>::new(); node_count];
+    for (index, node) in program.topology.nodes.iter().enumerate() {
+        for wait in node.waits.iter().copied() {
+            if let Some(previous) = completion_to_node.get(&wait) {
+                predecessors[index].insert(*previous);
+            }
+        }
+    }
+    for edge in &program.topology.edges {
+        if let (Some(from), Some(to)) =
+            (completion_to_node.get(&edge.from), completion_to_node.get(&edge.to))
+        {
+            predecessors[*to].insert(*from);
+        }
+    }
+    let mut indegree = predecessors.iter().map(BTreeSet::len).collect::<Vec<_>>();
+    let mut ready = (0..node_count).filter(|index| indegree[*index] == 0).collect::<BTreeSet<_>>();
+    let mut order = Vec::with_capacity(node_count);
+    while let Some(index) = ready.pop_first() {
+        order.push(index);
+        for (successor, dependencies) in predecessors.iter().enumerate() {
+            if dependencies.contains(&index) {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.insert(successor);
+                }
+            }
+        }
+    }
+    if order.len() != node_count {
+        // A malformed topology must not make two live regions alias. Leave all
+        // owners distinct; validation reports the topology error elsewhere.
+        return;
+    }
+    let mut ancestors = vec![BTreeSet::<usize>::new(); node_count];
+    for index in order {
+        for predecessor in &predecessors[index] {
+            ancestors[index].insert(*predecessor);
+            let inherited = ancestors[*predecessor].clone();
+            ancestors[index].extend(inherited);
+        }
+    }
+    let happens_before = |from: usize, to: usize| ancestors[to].contains(&from);
+
+    let mut lifetimes = BTreeMap::<u64, StorageLifetime>::new();
+    let mut next_order = 0;
+    let mut register = |location: &ValueLocation,
+                        lifetimes: &mut BTreeMap<u64, StorageLifetime>| {
+        let owner = canonical(location.owner, &mut parent);
+        let entry = lifetimes.entry(owner).or_insert_with(|| {
+            let order = next_order;
+            next_order += 1;
+            StorageLifetime {
+                owner,
+                order,
+                rows: 0,
+                columns: 0,
+                level: location.level,
+                format: location.format,
+                descriptor_compatible: true,
+                device: location.device,
+                reads: Vec::new(),
+                writes: Vec::new(),
+                pinned: false,
+            }
+        });
+        entry.rows = entry.rows.max(location.rows.end);
+        entry.columns = entry.columns.max(location.columns.end);
+        entry.descriptor_compatible &= entry.level == location.level &&
+            entry.format == location.format &&
+            entry.device == location.device;
+        entry.device = location.device;
+    };
+    for location in program.values.values() {
+        register(location, &mut lifetimes);
+    }
+    for view in program.view_commands.values() {
+        match view {
+            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
+                register(location, &mut lifetimes)
+            }
+            PreparedView::FixedCopies(copies) => {
+                for copy in copies {
+                    register(&copy.source, &mut lifetimes);
+                    register(&copy.destination, &mut lifetimes);
+                }
+            }
+        }
+    }
+    for selection in program.selection_commands.values() {
+        match selection {
+            PreparedSelection::Static { location } => register(location, &mut lifetimes),
+            PreparedSelection::Dynamic { candidates, .. } |
+            PreparedSelection::Select { candidates, .. } => {
+                for location in candidates {
+                    register(location, &mut lifetimes);
+                }
+            }
+            PreparedSelection::ScalarStatic { .. } |
+            PreparedSelection::ScalarDynamic { .. } |
+            PreparedSelection::ScalarSelect { .. } => {}
+        }
+    }
+    for members in program.family_members.values() {
+        for location in members {
+            register(location, &mut lifetimes);
+        }
+    }
+    let mut input_owners = BTreeSet::new();
+    for (node_index, node) in program.topology.nodes.iter().enumerate() {
+        let Some((arguments, outputs)) = program.node_bindings.get(&node.id) else { continue };
+        let input_node = matches!(
+            program.node_sources.get(&node.id).map(|source| &source.kind),
+            Some(NodeKind::Input { .. })
+        );
         for wire in arguments {
             if let Some(location) = program.values.get(wire) {
-                if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                    entry.1 = position;
+                let owner = canonical(location.owner, &mut parent);
+                lifetimes.get_mut(&owner).unwrap().reads.push(node_index);
+            }
+            if let Some(members) = program.family_members.get(wire) {
+                for location in members {
+                    let owner = canonical(location.owner, &mut parent);
+                    lifetimes.get_mut(&owner).unwrap().reads.push(node_index);
+                }
+            }
+        }
+        for wire in outputs {
+            if let Some(location) = program.values.get(wire) {
+                let owner = canonical(location.owner, &mut parent);
+                if input_node {
+                    input_owners.insert(owner);
+                }
+                let is_alias = matches!(node.command.operation, PreparedOperation::Alias) ||
+                    matches!(
+                        program.selection_commands.get(&node.id),
+                        Some(PreparedSelection::Static { .. })
+                    );
+                if !is_alias {
+                    lifetimes.get_mut(&owner).unwrap().writes.push(node_index);
                 }
             }
             if let Some(members) = program.family_members.get(wire) {
                 for location in members {
-                    if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                        entry.1 = position;
-                    }
+                    let owner = canonical(location.owner, &mut parent);
+                    lifetimes.get_mut(&owner).unwrap().reads.push(node_index);
                 }
             }
         }
     }
-    for (start, end) in waves {
-        let wave_end = program.topology.nodes.iter().rposition(|node| node.id < *end).unwrap_or(0);
-        for node in program.topology.nodes.iter().filter(|node| node.id >= *start && node.id < *end)
-        {
-            let (arguments, outputs) = &program.node_bindings[&node.id];
-            for wire in arguments.iter().chain(outputs) {
-                if let Some(location) = program.values.get(wire) {
-                    if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                        entry.1 = entry.1.max(wave_end);
-                    }
-                }
-                if let Some(members) = program.family_members.get(wire) {
-                    for location in members {
-                        if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                            entry.1 = entry.1.max(wave_end);
-                        }
-                    }
-                }
-            }
-        }
+    for owner in input_owners {
+        lifetimes.get_mut(&owner).unwrap().pinned = true;
     }
-    for wire in &program.outputs {
+    for wire in program.trace_wires.iter().chain(program.outputs.iter()) {
         if let Some(location) = program.values.get(wire) {
-            if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                entry.1 = program.topology.nodes.len();
-            }
+            lifetimes.get_mut(&canonical(location.owner, &mut parent)).unwrap().pinned = true;
         }
         if let Some(members) = program.family_members.get(wire) {
             for location in members {
-                if let Some(entry) = lifetimes.get_mut(&location.owner) {
-                    entry.1 = program.topology.nodes.len();
-                }
+                lifetimes.get_mut(&canonical(location.owner, &mut parent)).unwrap().pinned = true;
             }
         }
     }
-    let mut lifetimes = lifetimes.into_iter().collect::<Vec<_>>();
-    lifetimes.sort_by_key(|(_, (definition, ..))| *definition);
-    let mut classes =
-        BTreeMap::<(ConcreteWireType, PreparedFormat, usize, i32), Vec<(u64, usize)>>::new();
+    let accesses_by_owner = lifetimes
+        .values()
+        .map(|lifetime| {
+            let mut accesses = lifetime.reads.clone();
+            accesses.extend_from_slice(&lifetime.writes);
+            (lifetime.owner, accesses)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut lifetimes = lifetimes.into_values().collect::<Vec<_>>();
+    lifetimes.sort_by_key(|lifetime| {
+        (lifetime.writes.iter().copied().min().unwrap_or(usize::MAX), lifetime.order)
+    });
+    struct StorageColor {
+        rows: usize,
+        columns: usize,
+        order: usize,
+        level: usize,
+        format: PreparedFormat,
+        device: i32,
+        owner: u64,
+        reusable: bool,
+    }
+    let mut colors = Vec::<StorageColor>::new();
     let mut remap = BTreeMap::new();
-    let mut next_color = 0;
-    for (owner, (definition, last_use, ty, location)) in lifetimes {
-        let colors =
-            classes.entry((ty, location.format, location.level, location.device)).or_default();
-        let color = if let Some((color, available)) =
-            colors.iter_mut().find(|(_, available)| *available < definition)
-        {
-            *available = last_use;
-            *color
-        } else {
-            let color = next_color;
-            next_color += 1;
-            colors.push((color, last_use));
+    for lifetime in lifetimes {
+        let first_write = lifetime.writes.iter().copied().min();
+        let color = if lifetime.pinned || first_write.is_none() {
+            let color = colors.len();
+            colors.push(StorageColor {
+                rows: lifetime.rows,
+                columns: lifetime.columns,
+                order: lifetime.order,
+                level: lifetime.level,
+                format: lifetime.format,
+                device: lifetime.device,
+                owner: lifetime.owner,
+                reusable: false,
+            });
             color
+        } else {
+            let first_write = first_write.unwrap();
+            let candidate = colors
+                .iter()
+                .enumerate()
+                .filter(|(_, color)| {
+                    color.reusable &&
+                        color.device == lifetime.device &&
+                        color.level == lifetime.level &&
+                        color.format == lifetime.format &&
+                        lifetime.descriptor_compatible &&
+                        lifetime.rows <= color.rows &&
+                        lifetime.columns <= color.columns &&
+                        // The owner stored in a color is the last writer. Its
+                        // every access must happen before this first write.
+                        accesses_by_owner[&color.owner].iter().all(|access| {
+                            node_devices[*access].iter().all(|device| *device == lifetime.device) &&
+                                happens_before(*access, first_write)
+                        })
+                })
+                .map(|(index, color)| {
+                    (index, color.rows.saturating_mul(color.columns), color.order)
+                })
+                .min_by_key(|(_, capacity, order)| (*capacity, *order));
+            if let Some((color, ..)) = candidate {
+                colors[color].rows = colors[color].rows.max(lifetime.rows);
+                colors[color].columns = colors[color].columns.max(lifetime.columns);
+                colors[color].owner = lifetime.owner;
+                color
+            } else {
+                let color = colors.len();
+                colors.push(StorageColor {
+                    rows: lifetime.rows,
+                    columns: lifetime.columns,
+                    order: lifetime.order,
+                    level: lifetime.level,
+                    format: lifetime.format,
+                    device: lifetime.device,
+                    owner: lifetime.owner,
+                    reusable: lifetime.descriptor_compatible,
+                });
+                color
+            }
         };
-        remap.insert(owner, color);
+        remap.insert(lifetime.owner, color as u64);
     }
     let apply = |location: &mut ValueLocation| {
         if let Some(owner) = remap.get(&location.owner) {
@@ -266,6 +614,11 @@ pub(super) fn color_storage(program: &mut PreparedProgram, waves: &[(u32, u32)])
             apply(location);
         }
     }
+    program.storage_capacities = colors
+        .iter()
+        .enumerate()
+        .map(|(index, color)| (index as u64, (color.rows, color.columns)))
+        .collect();
     for (wire, binding) in &mut program.bindings {
         if let Some(location) = program.values.get(wire) {
             binding.owner = location.owner;
@@ -275,13 +628,12 @@ pub(super) fn color_storage(program: &mut PreparedProgram, waves: &[(u32, u32)])
 
 struct ScopeInstantiator<'a> {
     graph: &'a ValidatedGraph,
-    program: PreparedProgram,
+    program: GpuPreparation,
     nodes: Vec<PreparedTopologyNode>,
     families: BTreeMap<WireRef, Box<[WireRef]>>,
     next_node: u32,
     replay: Vec<PreparedReplayStep>,
     variant_environments: Vec<ParamEnv>,
-    waves: Vec<(u32, u32)>,
     wave_bound: std::num::NonZeroUsize,
     next_virtual_wire: u64,
 }
@@ -357,7 +709,8 @@ impl ScopeInstantiator<'_> {
                     let instantiated = self.scope(&child, &environment, &arguments)?;
                     self.variant_environments = enclosing_variants;
                     let body = self.replay.split_off(replay_start).into_boxed_slice();
-                    self.replay.push(PreparedReplayStep::Subgraph { body });
+                    self.replay
+                        .push(PreparedReplayStep::Subgraph { call: Some(NodeId(id.0)), body });
                     self.graph
                         .source
                         .scope(&child)
@@ -399,7 +752,6 @@ impl ScopeInstantiator<'_> {
                         .to_vec();
                     let mut members = vec![Vec::with_capacity(count); child_outputs.len()];
                     let width = self.wave_bound.get().min(count.max(1));
-                    let mut wave_start = self.next_node;
                     let wave_steps_start = self.replay.len();
                     let mut replay_waves = Vec::new();
                     for iteration in 0..count {
@@ -455,18 +807,17 @@ impl ScopeInstantiator<'_> {
                         let instantiated = self.scope(&child, &environment, &arguments)?;
                         self.variant_environments = enclosing_variants;
                         let body = self.replay.split_off(iteration_start).into_boxed_slice();
-                        self.replay.push(PreparedReplayStep::Subgraph { body });
+                        self.replay.push(PreparedReplayStep::Subgraph { call: None, body });
                         for (members, output) in members.iter_mut().zip(&child_outputs) {
                             members.push(instantiated[output]);
                         }
                         if (iteration + 1) % width == 0 || iteration + 1 == count {
-                            self.waves.push((wave_start, self.next_node));
                             replay_waves
                                 .push(self.replay.split_off(wave_steps_start).into_boxed_slice());
-                            wave_start = self.next_node;
                         }
                     }
                     self.replay.push(PreparedReplayStep::Parallel {
+                        call: NodeId(id.0),
                         counts: if counts.iter().any(|value| *value != count) {
                             counts.into_boxed_slice()
                         } else {
@@ -550,7 +901,6 @@ impl ScopeInstantiator<'_> {
                                 }
                             }
                         }
-                        let loop_start = self.next_node;
                         let mut bank_a = Vec::new();
                         for source in &arguments[..specification.carried_count] {
                             bank_a.push(self.copy(*source, None, environment)?);
@@ -594,9 +944,9 @@ impl ScopeInstantiator<'_> {
                         // Both tapes repeat: a linear last use is not a lifetime end
                         // until the back edge has retired. Keep every referenced owner
                         // through the loop's canonical-output copy.
-                        self.waves.push((loop_start, self.next_node));
                         let variable = counts.iter().any(|value| *value != count);
                         self.replay.push(PreparedReplayStep::Sequential {
+                            call: NodeId(id.0),
                             count,
                             counts: if variable { counts.into_boxed_slice() } else { Box::new([]) },
                             offsets: if variable {
@@ -644,14 +994,15 @@ impl ScopeInstantiator<'_> {
                 kind => {
                     let outputs = self.emit(kind.clone(), environment, arguments, types)?;
                     if *scope_id == FrozenGraphScopeId::Root &&
-                        matches!(kind, NodeKind::Input { .. })
+                        matches!(kind, NodeKind::Input { artifact: None, .. })
                     {
                         if let Some(ConcreteWireType::IndexedFamily { element, count }) =
                             self.program.wire_types.get(&outputs[0]).cloned()
                         {
                             let members =
                                 self.register_family_input(&element, count, outputs[0], &[])?;
-                            self.families.insert(outputs[0], members);
+                            self.families.insert(outputs[0], members.clone());
+                            self.program.family_wires.insert(outputs[0], members);
                         }
                     }
                     if !self.variant_environments.is_empty() {
@@ -718,7 +1069,20 @@ impl ScopeInstantiator<'_> {
                     outputs
                 }
             };
-            wires.extend(local_outputs.into_iter().zip(outputs));
+            for (source_wire, prepared_wire) in local_outputs.into_iter().zip(outputs) {
+                // Every instantiated wire gets a stable logical key. Loop
+                // replay adds its fixed iteration/path frame at execution;
+                // keeping the local source wire here prevents nested trace
+                // entries from falling back to physical node identities.
+                self.program.trace_keys.insert(
+                    prepared_wire,
+                    mxx_ir_core::types::WireId {
+                        instantiation_path: Vec::new(),
+                        wire: source_wire,
+                    },
+                );
+                wires.insert(source_wire, prepared_wire);
+            }
         }
         Ok(wires)
     }
@@ -738,6 +1102,12 @@ impl ScopeInstantiator<'_> {
         let mut operation = prepared_operation(&kind);
         if matches!(kind, NodeKind::EvaluateInt(_) | NodeKind::ConstantReal(_)) {
             operation = PreparedOperation::Scalar;
+        }
+        if matches!(kind, NodeKind::UniformIntervalSample { .. }) {
+            // The native GPU sampler has no lower-bound descriptor. Reject
+            // unsupported intervals while lowering instead of silently
+            // widening them to an incorrect distribution.
+            close_kind(kind.clone(), environment)?;
         }
         let outputs = types
             .iter()
@@ -832,6 +1202,7 @@ impl ScopeInstantiator<'_> {
         match &kind {
             NodeKind::FamilyPack { .. } => {
                 self.families.insert(outputs[0], arguments.clone().into_boxed_slice());
+                self.program.family_wires.insert(outputs[0], arguments.clone().into_boxed_slice());
                 self.program.family_members.insert(outputs[0], locations.into_boxed_slice());
             }
             NodeKind::FamilyGetDynamic | NodeKind::Select { .. } => {
@@ -945,7 +1316,8 @@ impl ScopeInstantiator<'_> {
             member_path.push(index);
             if let ConcreteWireType::IndexedFamily { element, count } = element {
                 let nested = self.register_family_input(element, *count, root, &member_path)?;
-                self.families.insert(wire, nested);
+                self.families.insert(wire, nested.clone());
+                self.program.family_wires.insert(wire, nested);
             } else {
                 self.program
                     .input_leaf_bindings
@@ -1194,6 +1566,23 @@ fn close_kind(
         }
         _ => {}
     }
+    if let NodeKind::UniformIntervalSample { matrix_type, range } = &kind {
+        let minimum =
+            range.minimum.evaluate(environment).map_err(|_| PreparedLoweringError::InvalidLoop)?;
+        let maximum =
+            range.maximum.evaluate(environment).map_err(|_| PreparedLoweringError::InvalidLoop)?;
+        let modulus = matrix_type
+            .modulus
+            .evaluate(environment)
+            .map_err(|_| PreparedLoweringError::InvalidLoop)?;
+        if minimum != num_bigint::BigInt::from(0) ||
+            maximum != modulus - num_bigint::BigInt::from(1)
+        {
+            return Err(PreparedLoweringError::InvalidContract(
+                "GPU prepared uniform interval requires the full residue range",
+            ));
+        }
+    }
     Ok(kind)
 }
 
@@ -1205,8 +1594,8 @@ mod tests {
             Graph, GraphOutput, NodeHandle, SubgraphHandle, ValueHandle,
             with_new_construction_scope,
         },
-        node::{ParallelLoop, SequentialLoop},
-        types::WireType,
+        node::{ParallelLoop, SampleRange, SequentialLoop},
+        types::{MatrixType, WireType},
         validate::validate,
     };
 
@@ -1235,6 +1624,48 @@ mod tests {
         })
     }
 
+    struct ScalarResourcePlanner;
+
+    impl crate::backend::poly_gpu::gpu_prepared_lowering::PreparedResourceBackend
+        for ScalarResourcePlanner
+    {
+        fn plan_owner(
+            &self,
+            _: &PreparedOwnerKey,
+            _: &PreparedStorePlan,
+            _: usize,
+        ) -> Result<(PreparedOwnerLayout, usize), String> {
+            unreachable!("scalar test graph has no matrix owners")
+        }
+
+        fn plan_stage(
+            &self,
+            _: &PreparedNativeRecipe,
+            _: &[PreparedStorePlan],
+            _: &[PreparedResolvedOwner],
+        ) -> Result<Option<PreparedPlanLayout>, String> {
+            unreachable!("scalar test graph has no native stages")
+        }
+
+        fn plan_replay_upload(
+            &self,
+            _: &PreparedNativeRecipe,
+            _: &PreparedReplayUploadRecipe,
+            _: &[PreparedStorePlan],
+            _: &[PreparedResolvedOwner],
+        ) -> Result<PreparedPlanLayout, String> {
+            unreachable!("scalar test graph has no replay uploads")
+        }
+
+        fn plan_schedule(
+            &self,
+            _: &PreparedNativeRecipe,
+            _: &[PreparedPlanLayout],
+        ) -> Result<PreparedPlanLayout, String> {
+            unreachable!("scalar test graph has no native schedules")
+        }
+    }
+
     fn freeze(output: ValueHandle) -> ValidatedGraph {
         use mxx_ir_core::graph::{CompileParameter, CompileParameterKind};
         let (graph, _) = Graph::freeze(
@@ -1257,6 +1688,170 @@ mod tests {
         validate(&graph, &bindings).unwrap()
     }
 
+    fn storage_location(owner: u64, rows: usize, columns: usize) -> ValueLocation {
+        ValueLocation {
+            owner,
+            rows: 0..rows,
+            columns: 0..columns,
+            level: 0,
+            format: PreparedFormat::Evaluation,
+            device: 0,
+        }
+    }
+
+    fn storage_node(id: u32, stream: u32, waits: &[u32]) -> PreparedTopologyNode {
+        PreparedTopologyNode {
+            id,
+            command: PreparedCommandRequirement {
+                operation: PreparedOperation::Gpu(PreparedGpuOperation::MatrixNegate),
+                inputs: 0,
+                outputs: 1,
+            },
+            stream,
+            waits: waits.into(),
+            completion: id,
+        }
+    }
+
+    fn storage_program(
+        nodes: Vec<PreparedTopologyNode>,
+        values: &[(u32, u64, usize, usize)],
+    ) -> GpuPreparation {
+        let mut program = GpuPreparation::default();
+        program.topology.nodes = nodes.into_boxed_slice();
+        for (node, owner, rows, columns) in values {
+            let wire = WireRef { node: NodeId(*node as u64), port: Port(0) };
+            program.values.insert(wire, storage_location(*owner, *rows, *columns));
+            program.wire_types.insert(
+                wire,
+                ConcreteWireType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
+                    modulus: 17.into(),
+                    ring_dimension: 1,
+                    rows: *rows,
+                    columns: *columns,
+                }),
+            );
+            program.node_bindings.insert(*node, (Box::new([]), vec![wire].into_boxed_slice()));
+        }
+        program
+    }
+
+    #[test]
+    fn test_gpu_prepared_storage_reuse_requires_explicit_happens_before() {
+        let program = storage_program(
+            vec![storage_node(1, 0, &[]), storage_node(2, 0, &[])],
+            &[(1, 11, 1, 1), (2, 22, 1, 1)],
+        );
+        let mut program = program;
+        color_storage(&mut program);
+        assert_ne!(
+            program.values[&WireRef { node: NodeId(1), port: Port(0) }].owner,
+            program.values[&WireRef { node: NodeId(2), port: Port(0) }].owner
+        );
+    }
+
+    #[test]
+    fn test_gpu_prepared_storage_reuse_uses_explicit_order_and_smallest_capacity() {
+        let mut program = storage_program(
+            vec![storage_node(1, 0, &[]), storage_node(2, 0, &[1]), storage_node(3, 0, &[2])],
+            &[(1, 11, 1, 1), (2, 22, 4, 4), (3, 33, 1, 1)],
+        );
+        color_storage(&mut program);
+        let owner = |node| program.values[&WireRef { node: NodeId(node), port: Port(0) }].owner;
+        assert_eq!(owner(1), owner(3));
+        assert_ne!(owner(1), owner(2));
+        assert_ne!(owner(2), owner(3));
+    }
+
+    #[test]
+    fn test_gpu_prepared_storage_reuse_rejects_cross_device_ancestor() {
+        let first = WireRef { node: NodeId(1), port: Port(0) };
+        let second = WireRef { node: NodeId(2), port: Port(0) };
+        let third = WireRef { node: NodeId(3), port: Port(0) };
+        let mut program = storage_program(
+            vec![storage_node(1, 0, &[]), storage_node(2, 1, &[1]), storage_node(3, 0, &[2])],
+            &[(1, 11, 1, 1), (2, 22, 1, 1), (3, 33, 1, 1)],
+        );
+        program.values.get_mut(&second).unwrap().device = 1;
+        program.node_bindings.get_mut(&2).unwrap().0 = vec![first].into_boxed_slice();
+        color_storage(&mut program);
+        assert_ne!(program.values[&first].owner, program.values[&third].owner);
+    }
+
+    #[test]
+    fn test_gpu_prepared_storage_does_not_reuse_pinned_output() {
+        let first = WireRef { node: NodeId(1), port: Port(0) };
+        let second = WireRef { node: NodeId(2), port: Port(0) };
+        let mut program = storage_program(
+            vec![storage_node(1, 0, &[]), storage_node(2, 0, &[])],
+            &[(1, 11, 1, 1), (2, 22, 1, 1)],
+        );
+        program.outputs = vec![first].into_boxed_slice();
+        color_storage(&mut program);
+        assert_ne!(program.values[&first].owner, program.values[&second].owner);
+    }
+
+    #[test]
+    fn test_gpu_prepared_storage_reuse_requires_matching_level_and_format() {
+        let first = WireRef { node: NodeId(1), port: Port(0) };
+        let second = WireRef { node: NodeId(2), port: Port(0) };
+        let third = WireRef { node: NodeId(3), port: Port(0) };
+        let mut program = storage_program(
+            vec![storage_node(1, 0, &[]), storage_node(2, 0, &[]), storage_node(3, 0, &[])],
+            &[(1, 11, 1, 1), (2, 22, 1, 1), (3, 33, 1, 1)],
+        );
+        program.values.get_mut(&second).unwrap().format = PreparedFormat::Coefficient;
+        program.values.get_mut(&third).unwrap().level = 1;
+        color_storage(&mut program);
+        assert_ne!(program.values[&first].owner, program.values[&second].owner);
+        assert_ne!(program.values[&first].owner, program.values[&third].owner);
+        assert_ne!(program.values[&second].owner, program.values[&third].owner);
+    }
+
+    #[test]
+    fn test_gpu_prepared_alias_chain_shares_base_owner_without_losing_offset() {
+        let first = WireRef { node: NodeId(1), port: Port(0) };
+        let second = WireRef { node: NodeId(2), port: Port(0) };
+        let mut program = storage_program(
+            vec![
+                storage_node(1, 0, &[]),
+                PreparedTopologyNode {
+                    id: 2,
+                    command: PreparedCommandRequirement {
+                        operation: PreparedOperation::Alias,
+                        inputs: 1,
+                        outputs: 1,
+                    },
+                    stream: 0,
+                    waits: vec![1].into_boxed_slice(),
+                    completion: 2,
+                },
+            ],
+            &[(1, 11, 4, 4), (2, 22, 2, 2)],
+        );
+        program
+            .node_bindings
+            .insert(2, (vec![first].into_boxed_slice(), vec![second].into_boxed_slice()));
+        program.view_commands.insert(
+            2,
+            PreparedView::Alias(ValueLocation {
+                owner: 11,
+                rows: 1..3,
+                columns: 1..3,
+                level: 0,
+                format: PreparedFormat::Evaluation,
+                device: 0,
+            }),
+        );
+        color_storage(&mut program);
+        assert_eq!(program.values[&first].owner, program.values[&second].owner);
+        let PreparedView::Alias(view) = &program.view_commands[&2] else {
+            panic!("expected alias view")
+        };
+        assert_eq!(view.rows, 1..3);
+        assert_eq!(view.columns, 1..3);
+    }
+
     #[test]
     fn test_gpu_prepared_subgraph_formals_bind_parent_scalar_slots() {
         let lhs = input("lhs");
@@ -1274,6 +1869,127 @@ mod tests {
             node.command.operation,
             PreparedOperation::ParallelLoop | PreparedOperation::SequentialLoop
         )));
+    }
+
+    #[test]
+    fn test_gpu_prepared_subgraph_compiles_warms_and_replays_scalar_result() {
+        use crate::{
+            backend::poly_gpu::{PreparedGpuProgram, gpu_prepared::PreparedRuntimeValue},
+            transcript::SamplingMode,
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        let lhs = input("lhs");
+        let rhs = input("rhs");
+        let call = NodeHandle::subgraph_call(body(), vec![lhs, rhs], vec![], vec![None, None]);
+        let graph = freeze(call.output(0).unwrap());
+        let program = instantiate(&graph, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+        assert!(program.resource_plan.resolve_prepared_resources(&ScalarResourcePlanner).is_ok());
+        for wire in program.node_bindings.values().flat_map(|(_, outputs)| outputs.iter()) {
+            assert!(program.trace_keys[wire].instantiation_path.is_empty());
+        }
+        let output_slot = program.scalar_slots[&program.outputs[0]];
+        let mut execution = PreparedGpuProgram::from_command_instances(
+            vec![Box::new([])],
+            Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
+            0,
+            0,
+        )
+        .from_preparation(program)
+        .unwrap();
+        execution
+            .initialize_runtime_roots(&[
+                PreparedRuntimeValue::Int(7.into()),
+                PreparedRuntimeValue::Int(11.into()),
+            ])
+            .unwrap();
+        let inputs = BTreeMap::from([
+            ("lhs".to_owned(), crate::backend::RuntimeValue::Int(7.into())),
+            ("rhs".to_owned(), crate::backend::RuntimeValue::Int(11.into())),
+        ]);
+        let mut sampling = SamplingMode::Fresh;
+        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling, None).unwrap();
+        assert_eq!(output.scalar_slot_values()[output_slot], ScalarValue::Int(18.into()));
+    }
+
+    #[test]
+    fn test_gpu_prepared_zero_iteration_loop_replays_canonical_input() {
+        use crate::{
+            backend::poly_gpu::{PreparedGpuProgram, gpu_prepared::PreparedRuntimeValue},
+            transcript::SamplingMode,
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+        let node = NodeHandle::sequential_loop(
+            body(),
+            vec![input("carried"), input("increment")],
+            vec![WireType::Int],
+            SequentialLoop {
+                count: IntExpr::constant(0),
+                index_slot: 0,
+                bindings: vec![],
+                carried_count: 1,
+            },
+        );
+        let graph = freeze(node.output(0).unwrap());
+        let program = instantiate(&graph, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+        let output_slot = program.scalar_slots[&program.outputs[0]];
+        let mut execution = PreparedGpuProgram::from_command_instances(
+            vec![Box::new([])],
+            Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
+            0,
+            0,
+        )
+        .from_preparation(program)
+        .unwrap();
+        execution
+            .initialize_runtime_roots(&[
+                PreparedRuntimeValue::Int(13.into()),
+                PreparedRuntimeValue::Int(5.into()),
+            ])
+            .unwrap();
+        let inputs = BTreeMap::from([
+            ("carried".to_owned(), crate::backend::RuntimeValue::Int(13.into())),
+            ("increment".to_owned(), crate::backend::RuntimeValue::Int(5.into())),
+        ]);
+        let mut sampling = SamplingMode::Fresh;
+        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling, None).unwrap();
+        assert_eq!(output.scalar_slot_values()[output_slot], ScalarValue::Int(13.into()));
+    }
+
+    #[test]
+    fn test_gpu_prepared_lowering_rejects_asymmetric_uniform_interval() {
+        let matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(1),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let sample = NodeHandle::new(
+            NodeKind::UniformIntervalSample {
+                matrix_type: matrix,
+                range: SampleRange {
+                    minimum: IntExpr::constant(-1),
+                    maximum: IntExpr::constant(1),
+                },
+            },
+            vec![],
+            vec![WireType::Matrix(MatrixType {
+                modulus: IntExpr::constant(17),
+                ring_dimension: IntExpr::constant(1),
+                rows: IntExpr::constant(1),
+                columns: IntExpr::constant(1),
+            })],
+        );
+        let error = instantiate(
+            &freeze(sample.output(0).unwrap()),
+            std::num::NonZeroUsize::new(1).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PreparedLoweringError::InvalidContract(
+                "GPU prepared uniform interval requires the full residue range"
+            )
+        );
     }
 
     #[test]
@@ -1329,7 +2045,7 @@ mod tests {
         );
         let graph = freeze(node.output(0).unwrap());
         let program = instantiate(&graph, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
-        let widths = |program: &PreparedProgram| {
+        let widths = |program: &GpuPreparation| {
             program
                 .replay
                 .iter()
@@ -1441,7 +2157,10 @@ mod tests {
 
     #[test]
     fn test_gpu_prepared_indexed_scalar_carried_replay_uses_finite_variants() {
-        use crate::backend::poly_gpu::{PreparedGpuFleetExecution, PreparedRuntimeValue};
+        use crate::{
+            backend::poly_gpu::{PreparedGpuProgram, gpu_prepared::PreparedRuntimeValue},
+            transcript::SamplingMode,
+        };
         use std::sync::Arc;
         let body = with_new_construction_scope(|scope| {
             let carried = input("carried");
@@ -1477,17 +2196,32 @@ mod tests {
             instantiate(&freeze(node.output(0).unwrap()), std::num::NonZeroUsize::new(2).unwrap())
                 .unwrap();
         let output = program.scalar_slots[&program.outputs[0]];
-        let execution = PreparedGpuFleetExecution::from_command_instances(
-            vec![(Box::new([]), Box::new([]))],
+        let mut execution = PreparedGpuProgram::from_command_instances(
+            vec![Box::new([])],
             Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
             0,
             0,
         )
-        .with_program(Arc::new(program))
+        .from_preparation(program)
         .unwrap();
+        let mut ledger = crate::gpu_memory::GpuMemoryLedger::synthetic_for_test(
+            &[crate::gpu_calibration::GpuDeviceMemory { total_bytes: 1 << 40, resident_bytes: 0 }],
+            &[0],
+            100,
+            Some(&[(0, 1)]),
+        )
+        .unwrap();
+        let mut allocator =
+            crate::backend::poly_gpu::gpu_prepared::LedgerScalarCapacityAllocator::new(&mut ledger);
         for start in 0..3 {
+            execution.initialize_runtime_roots(&[PreparedRuntimeValue::Int(start.into())]).unwrap();
+            let inputs = BTreeMap::from([(
+                "start".to_owned(),
+                crate::backend::RuntimeValue::Int(start.into()),
+            )]);
+            let mut sampling = SamplingMode::Fresh;
             let result = execution
-                .run_with_runtime_inputs(&[PreparedRuntimeValue::Int(start.into())])
+                .run_with_runtime_bindings(&inputs, &mut sampling, Some(&mut allocator))
                 .unwrap();
             let expected = num_bigint::BigInt::from(start) +
                 (0..count).map(num_bigint::BigInt::from).sum::<num_bigint::BigInt>();
@@ -1550,7 +2284,7 @@ mod tests {
             let (counts, waves) = bank
                 .iter()
                 .find_map(|step| match step {
-                    PreparedReplayStep::Parallel { counts, waves } => Some((counts, waves)),
+                    PreparedReplayStep::Parallel { counts, waves, .. } => Some((counts, waves)),
                     _ => None,
                 })
                 .unwrap();

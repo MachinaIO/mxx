@@ -120,7 +120,18 @@ pub struct SampleRange {
     pub maximum: BigInt,
 }
 
+/// Fixed execution contract of a backend.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionStrategy {
+    /// Run through the ordinary interpreted executor.
+    Interpreted,
+    /// Replay the immutable program published by warmup.
+    Prepared,
+}
+
 pub trait Backend {
+    /// The backend cannot switch execution modes based on a submission.
+    const EXECUTION_STRATEGY: ExecutionStrategy;
     type Matrix: Clone + Debug + PartialEq + Send + Sync + 'static;
     type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
     type Trapdoor: Clone + Debug + Send + Sync;
@@ -141,141 +152,38 @@ pub trait Backend {
         evaluation: bool,
     ) -> Result<Vec<BigInt>, Self::Error>;
 
-    /// Selects the graph identity for the next primitive. CPU and
-    /// non-fleet backends ignore this hook.
-    fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    /// Supplies IR provenance to an explicitly enabled GPU measurement observer.
-    #[cfg(feature = "gpu")]
-    fn observe_gpu_node(
+    /// Warm up a complete prepared inventory for `validated` before any node
+    /// executes. This is the sole explicit prepared setup boundary; replay
+    /// never performs admission or resource discovery. Backends without
+    /// prepared execution simply return `Ok(())`.
+    fn warm_up_prepared_graph(
         &mut self,
-        _scope: &mxx_ir_core::FrozenGraphScopeId,
-        _node: mxx_ir_core::types::NodeId,
-        _instances: usize,
-        _bindings: &mxx_ir_core::ParamEnv,
-    ) {
-    }
-
-    /// Measurement-only scope nesting; no production synchronization is implied.
-    #[cfg(feature = "gpu")]
-    fn observe_gpu_scope(&mut self, _entering: bool) {}
-
-    #[cfg(feature = "gpu")]
-    fn observe_gpu_omitted_nodes(
-        &mut self,
-        _scope: &mxx_ir_core::FrozenGraphScopeId,
-        _nodes: impl Iterator<Item = mxx_ir_core::types::NodeId>,
-    ) {
-    }
-
-    /// Prepares isolated calibration and admission after actual materialization.
-    /// Requests are ordered exactly as the following production batch, with each
-    /// destination placement explicit. A request whose invocation is a validated
-    /// IR node carries that node's metadata, which is the single authority for
-    /// the operation's resource identity; a request without it (fusion results,
-    /// sampler algorithm steps, artifact imports) is lowered from the invocation.
-    /// No production sampling state is exposed.
-    #[cfg(feature = "gpu")]
-    fn preflight_gpu_operations(
-        &mut self,
-        _requests: &[(
-            usize,
-            Option<crate::gpu_invocation::GpuNodeOperation>,
-            crate::gpu_invocation::GpuInvocation<
-                '_,
-                Self::Matrix,
-                Self::SmallMatrix,
-                Self::Trapdoor,
-            >,
-        )],
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-
-    /// Describes a staged preimage source without passing its loader to pilots.
-    #[cfg(feature = "gpu")]
-    fn gpu_preimage_source_layout(
-        &self,
-        ty: &ConcreteMatrixType,
-        _staging_bytes: &[u8],
-        global_column_start: usize,
-    ) -> Result<crate::gpu_invocation::GpuColumnSourceLayout, Self::Error> {
-        Ok(crate::gpu_invocation::GpuColumnSourceLayout::Logical {
-            matrix_type: ty.clone(),
-            global_column_start,
-        })
-    }
-
-    /// Derive and accept a complete prepared inventory for `validated` before
-    /// any node executes. The returned owner ends automatic admission when
-    /// execution exits, including error paths; returned values retain their own
-    /// resources. Backends without prepared admission return no owner.
-    /// With `warm_up = true`, explicitly allow resource-discovery GPU trials.
-    /// Production passes false and requires every trial-derived plan to exist
-    /// already on this backend for the graph's concrete parameters.
-    ///
-    /// `wave_bound` is the configured concurrency bound for sibling parallel
-    /// bodies (`ExecutionConfig::max_parallel_instances`), never the loop count
-    /// or the number of graph uses: production storage may be provisioned for
-    /// that many simultaneous bodies, and admission returns at most that wave.
-    /// Backing that scales with repeated iterations or graph occurrences is
-    /// forbidden; backing that scales with the configured bound is not.
-    fn prepare_graph_admission(
-        &mut self,
-        _spec_hash: [u8; 32],
         _validated: &mxx_ir_core::ValidatedGraph,
-        _capture_trace: bool,
         _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
-        _wave_bound: usize,
-        _warm_up: bool,
-    ) -> Result<Option<Box<dyn std::any::Any>>, Self::Error>
+        _config: &crate::executor::ExecutionConfig,
+    ) -> Result<(), Self::Error>
     where
         Self: Sized,
     {
-        Ok(None)
+        Ok(())
+    }
+
+    /// O(1) identity lookup for the program published by warmup.
+    fn prepared_spec_hash(&self) -> Option<[u8; 32]> {
+        None
     }
 
     /// Replays a fully prepared static graph without entering the ordinary
-    /// executor. Implementations return `None` when no executable was accepted
-    /// at the explicit warmup boundary; they must return an error for a graph
-    /// that was declared prepared but whose contract no longer matches.
+    /// executor. Prepared backends return a concrete result or a typed error.
     fn execute_prepared_graph(
         &mut self,
+        _spec_hash: [u8; 32],
         _validated: &mxx_ir_core::ValidatedGraph,
         _inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
-    ) -> Result<Option<crate::executor::ExecutionResult<Self>>, Self::Error>
+        _context: crate::executor::PreparedExecutionContext<'_, Self>,
+    ) -> Result<crate::executor::ExecutionResult<Self>, Self::Error>
     where
-        Self: Sized,
-    {
-        Ok(None)
-    }
-
-    /// Admit the bounded wave of sibling bodies to execute next for `request`.
-    /// Called once per wave, before that wave's lazy inputs are materialized.
-    ///
-    /// Admission is metadata-only: implementations must not materialize lazy
-    /// inputs, read artifact payloads, consume randomness, allocate dummy
-    /// values, or enqueue device work. The result is an internal input contract:
-    /// the executor consumes it verbatim, so an implementation must return
-    /// `1 <= wave_size <= request.caller_cap.min(request.remaining)` and one
-    /// frozen staging action per child output port. Build it through
-    /// `WaveAdmissionRequest::admission_of_size` (or `default_admission`) rather
-    /// than by hand. The default is the CPU policy: the whole remaining prefix
-    /// the caller allows, without reservation or discovery. A backend with
-    /// prepared storage commits exclusive capacity only after a metadata-only
-    /// candidate fits and returns its owned token in the admission. The token
-    /// survives nested execution and output publication, including error exits.
-    fn admit_wave(
-        &mut self,
-        request: &crate::executor::WaveAdmissionRequest<'_, Self>,
-    ) -> Result<crate::executor::WaveAdmission, Self::Error>
-    where
-        Self: Sized,
-    {
-        Ok(request.default_admission())
-    }
+        Self: Sized;
 
     fn placement_count(&self) -> usize {
         1

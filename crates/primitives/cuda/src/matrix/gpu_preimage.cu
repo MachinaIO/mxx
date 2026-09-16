@@ -53,9 +53,13 @@ extern "C" int gpu_preimage_prepare_phases(
     const GpuMatrix *a, const GpuMatrix *b, const GpuMatrix *d,
     const GpuMatrix *product, GpuMatrix *p1, const GpuMatrix *residual, GpuMatrix *gadget,
     uint32_t base_bits, double c, double smoothing, double sigma,
+    const GpuPreparedWorkspaceLayout *workspaces,
+    const GpuPreparedPlanDescriptor *p1_ntt_layout,
+    const GpuPreparedPlanDescriptor *gadget_ntt_layout,
     GpuPreparedPreimagePhases **out)
 try {
     if (!a || !b || !d || !product || !p1 || !residual || !gadget || !out ||
+        !workspaces || !p1_ntt_layout || !gadget_ntt_layout ||
         !a->rows || !p1->cols || !(c > 0) || !(smoothing > c) || !(sigma > 0) ||
         !base_bits || base_bits >= 63)
         return set_error("invalid prepared preimage phase arguments");
@@ -92,6 +96,14 @@ try {
     if (status != 0) return status;
     const auto selected = cudaSetDevice(plan->device);
     if (selected != cudaSuccess) return set_error(selected);
+    // Validate and materialize both saved NTT command tapes before acquiring
+    // any phase workspace. A malformed late descriptor therefore leaves no
+    // partially acquired phase resources behind.
+    status = gpu_matrix_prepare_ntt_plan_with_layout(
+        p1, nullptr, true, p1_ntt_layout, &plan->p1_ntt);
+    if (status == 0) status = gpu_matrix_prepare_ntt_plan_with_layout(
+        gadget, nullptr, true, gadget_ntt_layout, &plan->gadget_ntt);
+    if (status != 0) return status;
     for (size_t index = 0; index < 3; ++index) {
         plan->gram_bases[index] = matrix_limb_ptr_by_id(plan->gram[index], 0, plan->reference);
         if (!matrix_limb_metadata_by_id(plan->gram[index], plan->reference,
@@ -102,11 +114,20 @@ try {
     if (m / 2 != plan->d || plan->n > SIZE_MAX / m ||
         plan->n * m > SIZE_MAX / m / sizeof(double))
         return set_error("prepared preimage covariance size overflow");
-    GpuPreparedWorkspaceLayout layouts[6]{};
-    status = gpu_preimage_phase_layout(plan->ctx, plan->d, plan->columns, layouts);
-    if (status != 0) return status;
+    // Warmup owns phase geometry and NTT launch descriptors.  This bind path
+    // consumes those records directly; it must not call either planner again.
+    const auto &layouts = workspaces;
     const size_t roots_bytes = layouts[0].bytes;
     const size_t covariance_bytes = layouts[1].bytes;
+    if (layouts[0].kind != GPU_PREPARED_SAMPLER_WORKSPACE ||
+        layouts[1].kind != GPU_PREPARED_SAMPLER_WORKSPACE ||
+        layouts[2].kind != GPU_PREPARED_SAMPLER_WORKSPACE ||
+        layouts[3].kind != GPU_PREPARED_COMPLETION_EVENT || layouts[3].bytes != 0 ||
+        layouts[0].alignment != alignof(double) || layouts[1].alignment != alignof(double) ||
+        layouts[2].alignment != alignof(double) ||
+        !layouts[0].bytes || !layouts[1].bytes || !layouts[2].bytes ||
+        layouts[1].bytes != layouts[2].bytes)
+        return set_error("saved prepared preimage phase workspace descriptor mismatch");
     if (plan->roots.acquire(plan->ctx, plan->device, GPU_PREPARED_SAMPLER_WORKSPACE,
             roots_bytes, alignof(double), plan->stream) != 0 ||
         plan->updates.acquire(plan->ctx, plan->device, GPU_PREPARED_SAMPLER_WORKSPACE,
@@ -116,6 +137,11 @@ try {
         plan->completion.acquire(plan->ctx, plan->device, GPU_PREPARED_COMPLETION_EVENT) != 0)
         return 1;
     const auto *workspace = layouts + 4;
+    if (!workspace[0].bytes || workspace[0].alignment != alignof(int64_t) ||
+        workspace[0].kind != GPU_PREPARED_SAMPLER_WORKSPACE ||
+        workspace[1].alignment != alignof(double) ||
+        workspace[1].kind != GPU_PREPARED_SAMPLER_WORKSPACE)
+        return set_error("saved prepared preimage P1 workspace descriptor mismatch");
     if (plan->samples.acquire(plan->ctx, plan->device, workspace[0].kind,
             workspace[0].bytes, workspace[0].alignment, plan->stream) != 0 ||
         (workspace[1].bytes && plan->extra.acquire(plan->ctx, plan->device, workspace[1].kind,
@@ -146,9 +172,6 @@ try {
     plan->p1_grid = dim3((plan->columns * plan->n + 255) / 256, 1);
     plan->scatter_grid = dim3((2 * plan->d * plan->columns * plan->n + 255) / 256, 1, plan->limbs);
     plan->gadget_grid = dim3((plan->d * plan->columns * plan->n + 255) / 256, 1, plan->limbs);
-    status = gpu_matrix_prepare_ntt_plan(p1, nullptr, true, &plan->p1_ntt);
-    if (status == 0) status = gpu_matrix_prepare_ntt_plan(gadget, nullptr, true, &plan->gadget_ntt);
-    if (status != 0) return status;
     *out = plan.release();
     return 0;
 } catch (const std::exception &error) { return set_error(error.what()); }

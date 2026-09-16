@@ -1239,6 +1239,31 @@ impl GpuPreparedStorage {
         uninitialized_matrices: Option<&[GpuTracedClaim]>,
         workspaces: Option<&[GpuPreparedWorkspaceLayout]>,
     ) -> Result<Self, String> {
+        Self::new_impl(params, backing, uninitialized_matrices, workspaces, None)
+    }
+
+    /// Prepared-only constructor. Each appended matrix consumes the exact
+    /// owner layout planned for that claim; native creation rejects a context,
+    /// pool, shape or execution-class mismatch without selecting a fallback.
+    pub fn new_with_owner_layouts(
+        params: Option<&crate::poly::dcrt::gpu::GpuDCRTPolyParams>,
+        backing: Vec<GpuDCRTPolyMatrix>,
+        uninitialized_matrices: Option<&[GpuTracedClaim]>,
+        workspaces: Option<&[GpuPreparedWorkspaceLayout]>,
+        owner_layouts: &[crate::matrix::gpu_dcrt_poly::gpu_prepared_plan::PreparedOwnerLayout],
+    ) -> Result<Self, String> {
+        Self::new_impl(params, backing, uninitialized_matrices, workspaces, Some(owner_layouts))
+    }
+
+    fn new_impl(
+        params: Option<&crate::poly::dcrt::gpu::GpuDCRTPolyParams>,
+        backing: Vec<GpuDCRTPolyMatrix>,
+        uninitialized_matrices: Option<&[GpuTracedClaim]>,
+        workspaces: Option<&[GpuPreparedWorkspaceLayout]>,
+        owner_layouts: Option<
+            &[crate::matrix::gpu_dcrt_poly::gpu_prepared_plan::PreparedOwnerLayout],
+        >,
+    ) -> Result<Self, String> {
         let workspaces = workspaces.unwrap_or(&[]);
         let mut backing = backing;
         let shapes = uninitialized_matrices.unwrap_or(&[]);
@@ -1246,21 +1271,43 @@ impl GpuPreparedStorage {
             let params = params.ok_or_else(|| {
                 "uninitialized prepared backing requires its parameter ring".to_owned()
             })?;
+            if let Some(layouts) = owner_layouts {
+                if layouts.len() != shapes.len() {
+                    return Err(
+                        "prepared owner layout count does not match matrix claims".to_owned()
+                    );
+                }
+            }
             backing.reserve(shapes.len());
-            for claim in shapes {
+            for (index, claim) in shapes.iter().enumerate() {
                 let (rows, columns) = (claim.rows(), claim.columns());
                 if rows == 0 || columns == 0 {
                     return Err("uninitialized prepared backing requires nonzero rows and columns"
                         .to_owned());
                 }
-                backing.push(GpuDCRTPolyMatrix::new_empty_with_state(
-                    params,
-                    rows,
-                    columns,
-                    claim.level().expect("typed matrix claim"),
-                    claim.is_evaluation().expect("typed matrix claim"),
-                    None,
-                ));
+                let level = claim.level().expect("typed matrix claim");
+                let is_evaluation = claim.is_evaluation().expect("typed matrix claim");
+                let matrix = if let Some(layouts) = owner_layouts {
+                    GpuDCRTPolyMatrix::new_empty_with_owner_layout(
+                        params,
+                        rows,
+                        columns,
+                        level,
+                        is_evaluation,
+                        None,
+                        &layouts[index],
+                    )?
+                } else {
+                    GpuDCRTPolyMatrix::new_empty_with_state(
+                        params,
+                        rows,
+                        columns,
+                        level,
+                        is_evaluation,
+                        None,
+                    )
+                };
+                backing.push(matrix);
             }
         }
         let context = backing.first().map(|matrix| matrix.params().context_identity());
@@ -1953,6 +2000,41 @@ impl GpuMatrixReservation {
         Self::activate(self, following, extend)
     }
 
+    /// Activate an already-owned reservation table without moving its entries
+    /// into a temporary `Vec`. The table remains the sole owner while the
+    /// native dispatch is active and receives the returned reservation handles
+    /// when the dispatch is finished.
+    pub fn enter_borrowed(
+        reservations: &mut [Self],
+    ) -> Result<GpuBorrowedMatrixDispatch<'_>, String> {
+        if reservations.is_empty() {
+            return Err("cannot enter an empty prepared reservation table".into());
+        }
+        let pointers = reservations
+            .iter()
+            .map(|reservation| reservation.raw.expect("unconsumed reservation").as_ptr())
+            .collect::<Vec<_>>();
+        let mut raw = std::ptr::null_mut();
+        let mut base = 0usize;
+        let extending = unsafe { gpu_matrix_dispatch_active() } != 0;
+        let status = if extending {
+            unsafe { gpu_matrix_dispatch_extend(pointers.as_ptr(), pointers.len(), &mut base) }
+        } else {
+            unsafe { gpu_matrix_dispatch_enter(pointers.as_ptr(), pointers.len(), &mut raw) }
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        for reservation in reservations.iter_mut() {
+            reservation.raw = None;
+        }
+        Ok(GpuBorrowedMatrixDispatch {
+            raw: NonNull::new(raw),
+            extension: extending.then_some((base, pointers.len())),
+            reservations,
+        })
+    }
+
     fn activate(
         first: Self,
         mut following: Vec<Self>,
@@ -2014,6 +2096,45 @@ pub struct GpuMatrixDispatch {
     slots: Vec<Vec<GpuPreparedSlotIdentity>>,
     requests: Vec<Vec<GpuPreparedRequest>>,
     thread: PhantomData<Rc<()>>,
+}
+
+/// A dispatch borrowing a stable reservation table. Unlike `GpuMatrixDispatch`,
+/// it never moves slot/request metadata into temporary vectors; `finish` puts
+/// the native reservation handles back into the same entries.
+#[must_use]
+pub struct GpuBorrowedMatrixDispatch<'a> {
+    raw: Option<NonNull<DispatchOpaque>>,
+    extension: Option<(usize, usize)>,
+    reservations: &'a mut [GpuMatrixReservation],
+}
+
+impl GpuBorrowedMatrixDispatch<'_> {
+    pub fn finish(mut self) -> Result<(), String> {
+        let mut pointers = vec![std::ptr::null_mut(); self.reservations.len()];
+        let status = if let Some((base, count)) = self.extension.take() {
+            unsafe { gpu_matrix_dispatch_retract(base, count, 1, pointers.as_mut_ptr()) }
+        } else {
+            let raw = self.raw.take().expect("unfinished borrowed dispatch");
+            unsafe { gpu_matrix_dispatch_end(raw.as_ptr(), 1, pointers.as_mut_ptr()) }
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        for (reservation, pointer) in self.reservations.iter_mut().zip(pointers) {
+            reservation.raw = Some(NonNull::new(pointer).expect("dispatch returned reservation"));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for GpuBorrowedMatrixDispatch<'_> {
+    fn drop(&mut self) {
+        if let Some((base, count)) = self.extension.take() {
+            unsafe { gpu_matrix_dispatch_retract(base, count, 0, std::ptr::null_mut()) };
+        } else if let Some(raw) = self.raw.take() {
+            unsafe { gpu_matrix_dispatch_end(raw.as_ptr(), 0, std::ptr::null_mut()) };
+        }
+    }
 }
 
 impl GpuMatrixDispatch {

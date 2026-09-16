@@ -123,6 +123,8 @@ int gpu_defer_pinned_frees(
 
 /// Consumes both the event set and pinned pointer without a host wait.
 int gpu_event_set_defer_pinned_free(GpuContext *ctx, GpuEventSet *events, void *pointer);
+int gpu_event_set_defer_pinned_frees(
+    GpuContext *ctx, GpuEventSet *events, void *const *pointers, size_t count);
 
 // Wait for this pinned allocation to be recycled, without draining unrelated jobs.
 int gpu_wait_pinned_release(GpuContext *ctx, void *pointer);

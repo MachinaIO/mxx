@@ -12,6 +12,15 @@ unsafe extern "C" {
         dropped: usize,
         out: *mut *mut CompactDecomposeOpaque,
     ) -> i32;
+    fn gpu_small_matrix_prepare_decompose_with_layout(
+        source: *mut crate::poly::dcrt::gpu::GpuMatrixOpaque,
+        output: *mut crate::poly::dcrt::gpu::GpuSmallMatrixOpaque,
+        base_bits: u32,
+        small: bool,
+        dropped: usize,
+        layout: *const std::ffi::c_void,
+        out: *mut *mut CompactDecomposeOpaque,
+    ) -> i32;
     fn gpu_small_matrix_submit_decompose(plan: *const CompactDecomposeOpaque) -> i32;
     fn gpu_small_matrix_destroy_decompose(plan: *mut CompactDecomposeOpaque);
 }
@@ -73,6 +82,43 @@ impl GpuPreparedCompactDecompose {
                 source.params().base_bits(),
                 small,
                 layout.dropped_moduli,
+                &mut raw,
+            )
+        };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        Ok(Arc::new(Self {
+            raw: NonNull::new(raw).ok_or("native compact plan missing")?,
+            source,
+            output,
+        }))
+    }
+
+    /// Bind compact decomposition against the immutable descriptor assembled
+    /// during warmup. The native entry point validates the saved compact
+    /// payload, correction workspace, inverse-transform staging, and stream
+    /// claims before publishing the executable plan.
+    pub fn bind_with_layout(
+        source: Arc<GpuDCRTPolyMatrix>,
+        output: Arc<GpuSmallMatrix>,
+        small: bool,
+        digit_count: Option<usize>,
+        plan_layout: &crate::matrix::gpu_dcrt_poly::PreparedPlanLayout,
+    ) -> Result<Arc<Self>, String> {
+        let layout = source
+            .params()
+            .compact_decomposition_layout(small, digit_count)
+            .map_err(|error| error.to_string())?;
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe {
+            gpu_small_matrix_prepare_decompose_with_layout(
+                source.raw,
+                output.raw,
+                source.params().base_bits(),
+                small,
+                layout.dropped_moduli,
+                plan_layout.native_ptr().cast(),
                 &mut raw,
             )
         };

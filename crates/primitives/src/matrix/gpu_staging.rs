@@ -77,6 +77,21 @@ impl GpuDCRTPolyMatrix {
     ) -> Result<GpuCpuStagingLayout, String> {
         decode(parameters, bytes).map(|(layout, _)| layout)
     }
+
+    /// Fallible public staging loader. The complete payload is validated
+    /// before the destination matrix and pinned staging storage are created.
+    pub fn try_from_cpu_staging_bytes(
+        parameters: &GpuDCRTPolyParams,
+        bytes: &[u8],
+    ) -> Result<GpuDCRTPolyMatrix, String> {
+        let layout = Self::cpu_staging_layout(parameters, bytes)?;
+        Ok(<GpuDCRTPolyMatrix as crate::matrix::PolyMatrix>::from_cpu_staging_columns(
+            parameters,
+            bytes,
+            0,
+            layout.columns,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +133,7 @@ mod tests {
                     .zero_bytes(&parameters)
                     .is_err()
             );
+            assert!(GpuDCRTPolyMatrix::try_from_cpu_staging_bytes(&parameters, &[0xff]).is_err());
         }
     }
 

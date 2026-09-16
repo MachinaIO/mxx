@@ -659,6 +659,13 @@ impl SessionStore for FileArtifactStore {
             .find_map(|(stored_site, value)| (stored_site == site).then_some(value.clone())))
     }
 
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error> {
+        Ok(self.session(production)?.transcript)
+    }
+
     fn record_transcript_batch(
         &mut self,
         production: &ProductionId,
@@ -1380,6 +1387,18 @@ impl SessionStore for MemoryArtifactStore {
     ) -> Result<Option<RecordedValue>, Self::Error> {
         let session = self.open_session_record(production)?;
         Ok(session.transcript.get(site).cloned())
+    }
+
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error> {
+        Ok(self
+            .open_session_record(production)?
+            .transcript
+            .iter()
+            .map(|(site, value)| (site.clone(), value.clone()))
+            .collect())
     }
 
     fn record_transcript_batch(

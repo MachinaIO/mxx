@@ -8,10 +8,6 @@ pub mod gpu_calibration;
 #[cfg(feature = "gpu")]
 pub mod gpu_enqueue;
 #[cfg(feature = "gpu")]
-pub mod gpu_invocation;
-#[cfg(feature = "gpu")]
-pub mod gpu_measurement;
-#[cfg(feature = "gpu")]
 pub mod gpu_memory;
 #[cfg(feature = "gpu")]
 pub mod gpu_schedule;
@@ -23,7 +19,7 @@ pub use artifact::{
     ArtifactKey, ArtifactPayload, ArtifactStore, FileArtifactError, FileArtifactStore,
     FilesystemArtifactStore, MemoryArtifactStore,
 };
-pub use backend::{Backend, RuntimeValue};
+pub use backend::{Backend, ExecutionStrategy, RuntimeValue};
 pub use executor::{
     ExecutionConfig, ExecutionError, ExecutionResult, ExecutionTrace, PreimageProgressConfig,
     StagedFamilyLease, execute, execute_in_session, execute_in_session_with_config,

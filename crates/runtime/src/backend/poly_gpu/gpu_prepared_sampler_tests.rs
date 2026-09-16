@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     MemoryArtifactStore, RuntimeValue,
+    backend::Backend,
     executor::{ExecutionConfig, execute_with_config},
     transcript::SamplingMode,
 };

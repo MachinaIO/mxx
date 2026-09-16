@@ -2455,16 +2455,24 @@ extern "C"
         return 0;
     }
 
-    int gpu_event_set_defer_pinned_free(GpuContext *ctx, GpuEventSet *events, void *pointer)
+    int gpu_event_set_defer_pinned_frees(
+        GpuContext *ctx, GpuEventSet *events, void *const *pointers, size_t count)
     {
-        if (!ctx || !ctx->execution || !events || !pointer)
+        if (!ctx || !ctx->execution || !events || !pointers || !count)
             return set_error("invalid gpu_event_set_defer_pinned_free arguments");
         if (events->execution != ctx->execution)
             return set_error("pinned free completion belongs to another execution owner");
-        if (pinned_host_pool().mark_deferred(ctx, pointer) != 0)
-        {
-            ctx->execution->pinned_host_reclaimer->record_uncertain("foreign prepared pinned buffer");
-            return 1;
+        try {
+            for (size_t index = 0; index < count; ++index) {
+                if (!pointers[index]) continue;
+                if (pinned_host_pool().mark_deferred(ctx, pointers[index]) != 0) {
+                    ctx->execution->pinned_host_reclaimer->record_uncertain("foreign prepared pinned buffer");
+                    return 1;
+                }
+            }
+        } catch (const std::exception &error) {
+            ctx->execution->pinned_host_reclaimer->record_uncertain(error.what());
+            return set_error(error);
         }
         GpuAllocationActivity activity(ctx->execution.get(), -1);
         if (events->entries.size() == 1)
@@ -2477,7 +2485,14 @@ extern "C"
             {
                 if (entry.resource) entry.resource->detach_execution();
                 const int status = ctx->execution->pinned_host_reclaimer->enqueue(
-                    entry.device, entry.event, std::vector<void *>{pointer}, entry.resource);
+                    entry.device, entry.event,
+                    [&]() {
+                        std::vector<void *> values;
+                        values.reserve(count);
+                        for (size_t index = 0; index < count; ++index)
+                            if (pointers[index]) values.push_back(pointers[index]);
+                        return values;
+                    }(), entry.resource);
                 if (status == 0) delete events; // The reclaimer now owns the CUDA event.
                 return status;
             }
@@ -2505,10 +2520,14 @@ extern "C"
             ctx->execution->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
             return set_error(cudaGetErrorString(error)); // Keep ownership if completion is uncertain.
         }
-        void *pointers[] = {pointer};
-        const int status = gpu_defer_pinned_frees(ctx, device, stream, pointers, 1);
+        const int status = gpu_defer_pinned_frees(ctx, device, stream, pointers, count);
         destroy_event_set(events);
         return status;
+    }
+
+    int gpu_event_set_defer_pinned_free(GpuContext *ctx, GpuEventSet *events, void *pointer)
+    {
+        return gpu_event_set_defer_pinned_frees(ctx, events, &pointer, 1);
     }
 
     int gpu_event_set_wait(GpuEventSet *events)

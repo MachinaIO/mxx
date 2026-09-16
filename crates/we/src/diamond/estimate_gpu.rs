@@ -64,7 +64,7 @@ impl ReadyOutput {
             }
             Self::Trapdoor { public, secret } => {
                 let _ = public.wait_until_ready();
-                secret.wait_until_ready();
+                let _ = secret.wait_until_ready();
             }
             Self::SmallMatrix(matrix) => {
                 let _ = matrix.wait_until_ready();
@@ -150,7 +150,7 @@ impl DiamondGpuMeasurementBackend {
                 .sample_trapdoor(matrix, sigma, gadget_base, *digit_count)
                 .map_err(Self::backend_error)?;
             let _ = public.wait_until_ready();
-            secret.wait_until_ready();
+            let _ = secret.wait_until_ready();
             self.trapdoor_cache.insert(key.clone(), (Arc::new(public), Arc::new(secret)));
         }
         let (public, secret) =
@@ -333,7 +333,7 @@ impl DiamondGpuMeasurementBackend {
                 ConcreteWireType::Trapdoor { .. } => {
                     let (public, secret) = self.trapdoor(ty, bindings)?;
                     let _ = public.wait_until_ready();
-                    secret.wait_until_ready();
+                    let _ = secret.wait_until_ready();
                 }
                 _ => {}
             }

@@ -15,7 +15,7 @@ use crate::{
                 gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_centered_rebase,
                 gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
                 gpu_matrix_copy_device, gpu_matrix_create, gpu_matrix_create_p1_covariance_cache,
-                gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
+                gpu_matrix_create_prepared, gpu_matrix_crt_recompose, gpu_matrix_decompose_base,
                 gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_constant_columns, gpu_matrix_fill_small_decomposed_identity_chunk,
@@ -70,23 +70,33 @@ pub use gpu_view::{
 mod gpu_preimage_cutoff;
 #[path = "gpu_prepared.rs"]
 mod gpu_prepared;
+#[path = "gpu_prepared_plan.rs"]
+pub(crate) mod gpu_prepared_plan;
 pub use gpu_preimage_cutoff::GpuPreparedPreimageCutoff;
+pub(crate) use gpu_prepared_plan::GpuPreparedPlanDescriptor;
+pub use gpu_prepared_plan::{
+    PreparedAllocationKind, PreparedAllocationLayout, PreparedOwnerLayout,
+    PreparedOwnerLayoutCursor, PreparedPlanLayout, PreparedResourceKey, PreparedStreamFootprint,
+};
 #[path = "gpu_preimage_phases.rs"]
 mod gpu_preimage_phases;
-pub use gpu_preimage_phases::GpuPreparedPreimagePhases;
+pub use gpu_preimage_phases::{GpuPreparedPreimagePhases, GpuPreparedPreimagePhasesLayout};
 pub use gpu_prepared::{
-    GpuPreparedAccumulateCommand, GpuPreparedArithmetic, GpuPreparedArithmeticCommand,
-    GpuPreparedArithmeticKind, GpuPreparedCenteredRebase, GpuPreparedCompactDecompose,
+    GpuPreparedAccumulateCommand, GpuPreparedAccumulateLayout, GpuPreparedArithmetic,
+    GpuPreparedArithmeticCommand, GpuPreparedArithmeticKind, GpuPreparedCenteredRebase,
+    GpuPreparedCompactDecompose, GpuPreparedCompactUpload, GpuPreparedCompactUploadInFlight,
     GpuPreparedConstCoeffReadback, GpuPreparedConstCoeffReadbackInFlight, GpuPreparedCrtRecompose,
-    GpuPreparedCrtRecomposeInFlight, GpuPreparedGadgetDecompose, GpuPreparedHashSample,
-    GpuPreparedInputCopy, GpuPreparedInputCopyInFlight, GpuPreparedModulusCommand,
-    GpuPreparedModulusConversion, GpuPreparedRange, GpuPreparedRnsReconstruction,
-    GpuPreparedRnsReconstructionInFlight, GpuPreparedRnsUpload, GpuPreparedRnsUploadInFlight,
-    GpuPreparedSampling, GpuPreparedSamplingInFlight, GpuPreparedScalarBuffer,
-    GpuPreparedScalarMatrixSelect, GpuPreparedScalarOp, GpuPreparedScalarOpcode,
-    GpuPreparedScalarPack, GpuPreparedSchedule, GpuPreparedSchedulePlan, GpuPreparedSmallRhs,
-    GpuPreparedSmallRhsInFlight, GpuPreparedThreshold, GpuPreparedTransform, GpuPreparedTranspose,
-    GpuPreparedView,
+    GpuPreparedCrtRecomposeInFlight, GpuPreparedGadgetDecompose, GpuPreparedHashCompactCommand,
+    GpuPreparedHashCompactLayout, GpuPreparedHashSample, GpuPreparedInputCopy,
+    GpuPreparedInputCopyInFlight, GpuPreparedModulusCommand, GpuPreparedModulusConversion,
+    GpuPreparedRange, GpuPreparedRnsReconstruction, GpuPreparedRnsReconstructionInFlight,
+    GpuPreparedRnsUpload, GpuPreparedRnsUploadInFlight, GpuPreparedSampling,
+    GpuPreparedSamplingInFlight, GpuPreparedScalarBuffer, GpuPreparedScalarMatrixSelect,
+    GpuPreparedScalarOp, GpuPreparedScalarOpcode, GpuPreparedScalarPack, GpuPreparedSchedule,
+    GpuPreparedSchedulePlan, GpuPreparedSmallRhs, GpuPreparedSmallRhsInFlight,
+    GpuPreparedSmallUpload, GpuPreparedSmallUploadInFlight, GpuPreparedThreshold,
+    GpuPreparedTransform, GpuPreparedTranspose, GpuPreparedView, GpuScalarCapacityAllocator,
+    GpuScalarCapacityLease, PreparedArithmeticLayout, PreparedRectLayout,
 };
 
 #[path = "gpu_admission.rs"]
@@ -379,6 +389,25 @@ impl Drop for GpuSmallMatrix {
 }
 
 impl GpuSmallMatrix {
+    /// Upload a validated canonical payload into this already allocated owner.
+    /// This is the replay counterpart of `from_canonical_coefficients`: it
+    /// deliberately does not create another compact owner.
+    pub fn load_canonical_coefficients(&self, payload: &[u8]) -> Result<(), String> {
+        Self::validate_payload(
+            &self.params,
+            self.rows,
+            self.columns,
+            &self.max_coefficient_bound,
+            payload,
+        )
+        .map_err(|error| error.to_string())?;
+        let status = unsafe {
+            gpu_small_matrix_load_coefficients(self.raw, payload.as_ptr(), payload.len())
+        };
+        check_status(status, "gpu_small_matrix_load_coefficients");
+        Ok(())
+    }
+
     /// Resident coefficient payload, excluding preimage scratch and CUDA resources.
     pub fn resident_payload_bytes(&self) -> usize {
         self.resident_payload_bytes
@@ -479,8 +508,14 @@ impl AsRef<GpuSmallMatrix> for GpuSmallMatrixColumnView<'_> {
 impl GpuSmallMatrix {
     /// Wait only for this compact owner's last write event.
     pub fn wait_until_ready(&self) {
+        self.wait_until_ready_result().unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Wait for this compact owner's last write event and preserve native
+    /// failure information for higher-level result-based APIs.
+    pub fn wait_until_ready_result(&self) -> Result<(), String> {
         let status = unsafe { gpu_small_matrix_wait(self.raw) };
-        check_status(status, "gpu_small_matrix_wait");
+        if status == 0 { Ok(()) } else { Err(crate::poly::dcrt::gpu::last_error_string()) }
     }
 
     /// Bind inspection storage at setup under the same accepted resource permit.
@@ -1551,8 +1586,14 @@ impl GpuDCRTPolyMatrix {
 
     /// Waits for writes to this matrix without synchronizing unrelated device work.
     pub fn wait_until_ready(&self) {
+        self.wait_until_ready_result().unwrap_or_else(|error| panic!("{error}"));
+    }
+
+    /// Wait for writes and return native failures instead of panicking. This
+    /// is used by fleet owners that must propagate the first failed shard.
+    pub fn wait_until_ready_result(&self) -> Result<(), String> {
         let status = unsafe { gpu_matrix_wait(self.raw) };
-        check_status(status, "gpu_matrix_wait");
+        if status == 0 { Ok(()) } else { Err(crate::poly::dcrt::gpu::last_error_string()) }
     }
 
     /// Query every writer completion without waiting for device work. This
@@ -1628,6 +1669,49 @@ impl GpuDCRTPolyMatrix {
             release_observer: None,
             backing: None,
         }
+    }
+
+    /// Allocate one prepared owner using a previously planned, explicit stream
+    /// assignment. Native creation validates the execution-owner identity,
+    /// pool sizes and structural execution class and has no fallback stream
+    /// selection.
+    pub fn new_empty_with_owner_layout(
+        params: &GpuDCRTPolyParams,
+        nrow: usize,
+        ncol: usize,
+        level: usize,
+        is_ntt: bool,
+        initialize_descriptors: Option<bool>,
+        owner_layout: &PreparedOwnerLayout,
+    ) -> Result<Self, String> {
+        assert!(level < params.crt_depth(), "invalid level for matrix create");
+        let format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        let mut raw: *mut GpuMatrixOpaque = ptr::null_mut();
+        let status = unsafe {
+            gpu_matrix_create_prepared(
+                params.ctx_raw(),
+                level as i32,
+                nrow,
+                ncol,
+                format,
+                owner_layout.native_ptr(),
+                &mut raw as *mut *mut GpuMatrixOpaque,
+                initialize_descriptors.unwrap_or(true),
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(Self {
+            params: params.clone(),
+            nrow,
+            ncol,
+            level,
+            is_ntt,
+            raw,
+            release_observer: None,
+            backing: None,
+        })
     }
 
     pub(crate) fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
@@ -1815,7 +1899,7 @@ impl GpuDCRTPolyMatrix {
     /// production compact codec. Under closed native domains this claims the
     /// codec's submission stream and load transfer workspace in that order.
     pub fn load_compact_payload(
-        &mut self,
+        &self,
         payload: &[u8],
         max_coefficient_bits: u16,
     ) -> Result<(), String> {
@@ -1834,6 +1918,84 @@ impl GpuDCRTPolyMatrix {
             return Err(crate::poly::dcrt::gpu::last_error_string());
         }
         Ok(())
+    }
+
+    /// Validate and upload one complete compact-matrix artifact into this
+    /// existing owner. The decoder borrows the payload, so replay does not
+    /// allocate a decoded `Vec`; ownership of the fixed destination remains
+    /// with the prepared tape.
+    pub fn load_compact_bytes(&self, bytes: &[u8]) -> Result<(), String> {
+        let (max_coeff_bits, payload) = Self::validate_compact_bytes(
+            bytes,
+            self.nrow,
+            self.ncol,
+            self.level,
+            self.params.ring_dimension() as usize,
+            self.is_ntt,
+        )?;
+        let status = unsafe {
+            gpu_matrix_load_compact_bytes(self.raw, payload.as_ptr(), payload.len(), max_coeff_bits)
+        };
+        check_status(status, "gpu_matrix_load_compact_bytes");
+        if self.is_ntt {
+            let status = unsafe { gpu_matrix_ntt_all(self.raw) };
+            check_status(status, "gpu_matrix_ntt_all(replay compact)");
+        }
+        Ok(())
+    }
+
+    /// Validate a complete compact artifact without touching a device owner.
+    /// The returned payload borrows `bytes` and is suitable for a prepared
+    /// replay upload.
+    pub fn validate_compact_bytes<'a>(
+        bytes: &'a [u8],
+        rows: usize,
+        columns: usize,
+        level: usize,
+        ring_dimension: usize,
+        is_ntt: bool,
+    ) -> Result<(u16, &'a [u8]), String> {
+        let (
+            (
+                version,
+                format_tag,
+                encoded_level,
+                encoded_rows,
+                encoded_columns,
+                max_coeff_bits,
+                bytes_per_coeff,
+                payload,
+            ),
+            consumed,
+        ): ((u8, u8, u32, usize, usize, u16, u16, &[u8]), usize) =
+            bincode::borrow_decode_from_slice(bytes, bincode::config::standard())
+                .map_err(|error| format!("invalid compact matrix artifact: {error}"))?;
+        if consumed != bytes.len() || version != 1 {
+            return Err("invalid compact matrix artifact header".into());
+        }
+        let expected_format = if is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF };
+        if format_tag != expected_format as u8 ||
+            encoded_rows != rows ||
+            encoded_columns != columns ||
+            encoded_level as usize != level
+        {
+            return Err("compact matrix artifact does not match prepared destination".into());
+        }
+        let expected_bytes_per_coeff = ((max_coeff_bits as usize).div_ceil(8)) as u16;
+        if bytes_per_coeff != expected_bytes_per_coeff {
+            return Err("compact matrix artifact coefficient width mismatch".into());
+        }
+        let expected_payload = rows
+            .checked_mul(columns)
+            .and_then(|count| count.checked_mul(ring_dimension))
+            .and_then(|count| {
+                count.checked_mul(max_coeff_bits as usize).map(|bits| bits.div_ceil(8))
+            })
+            .ok_or_else(|| "compact matrix artifact size overflow".to_string())?;
+        if expected_payload != payload.len() {
+            return Err("compact matrix artifact payload is invalid".into());
+        }
+        Ok((max_coeff_bits, payload))
     }
 
     pub(crate) fn into_coeff_domain(mut self) -> Self {
@@ -6764,8 +6926,25 @@ mod tests {
         let params = gpu_params_from_cpu(&cpu);
         let source = Arc::new(gpu_constant_matrix(&params, 2, 3, 17).into_coeff_domain());
         let words_per_poly = source.level() + 1;
-        let plan =
-            GpuPreparedConstCoeffReadback::bind(Arc::clone(&source), words_per_poly, 0, 1).unwrap();
+        let readback_layout = PreparedPlanLayout::const_coeff_readback(
+            &params,
+            source.row_size(),
+            source.col_size(),
+            source.level(),
+            GPU_POLY_FORMAT_COEFF,
+            words_per_poly,
+            0,
+            1,
+        )
+        .unwrap();
+        let plan = GpuPreparedConstCoeffReadback::bind(
+            Arc::clone(&source),
+            words_per_poly,
+            0,
+            1,
+            readback_layout,
+        )
+        .unwrap();
         for clear in [false, true] {
             if clear {
                 let status = unsafe { gpu_matrix_zero(source.raw) };
@@ -6776,16 +6955,45 @@ mod tests {
             let in_flight = plan.submit().unwrap();
             assert_eq!(in_flight.wait().unwrap(), expected.as_slice());
         }
-        let nonconstant_plan =
-            GpuPreparedConstCoeffReadback::bind(Arc::clone(&source), words_per_poly, 1, 1).unwrap();
+        let nonconstant_plan = GpuPreparedConstCoeffReadback::bind(
+            Arc::clone(&source),
+            words_per_poly,
+            1,
+            1,
+            PreparedPlanLayout::const_coeff_readback(
+                &params,
+                source.row_size(),
+                source.col_size(),
+                source.level(),
+                GPU_POLY_FORMAT_COEFF,
+                words_per_poly,
+                1,
+                1,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let nonconstant = nonconstant_plan.submit().unwrap();
         assert!(nonconstant.wait().unwrap().iter().all(|word| *word == 0));
 
         let snapshot = source.to_rns_snapshot();
         let all_words_per_poly = (source.level() + 1) * params.ring_dimension() as usize;
-        let all_plan =
-            GpuPreparedConstCoeffReadback::bind_all(Arc::clone(&source), all_words_per_poly)
-                .unwrap();
+        let all_plan = GpuPreparedConstCoeffReadback::bind_all(
+            Arc::clone(&source),
+            all_words_per_poly,
+            PreparedPlanLayout::const_coeff_readback(
+                &params,
+                source.row_size(),
+                source.col_size(),
+                source.level(),
+                GPU_POLY_FORMAT_COEFF,
+                all_words_per_poly,
+                0,
+                params.ring_dimension() as usize,
+            )
+            .unwrap(),
+        )
+        .unwrap();
         let all_in_flight = all_plan.submit().unwrap();
         let actual = all_in_flight.wait().unwrap();
         let expected = snapshot
@@ -6814,11 +7022,22 @@ mod tests {
                 transform_to_eval,
                 None,
             ));
+            let upload_layout = PreparedPlanLayout::rns_upload(
+                &params,
+                target.row_size(),
+                target.col_size(),
+                target.level(),
+                GPU_POLY_FORMAT_COEFF,
+                transform_to_eval,
+                bytes_per_poly,
+            )
+            .unwrap();
             let plan = GpuPreparedRnsUpload::bind(
                 Arc::clone(&target),
                 bytes_per_poly,
                 GPU_POLY_FORMAT_COEFF,
                 transform_to_eval,
+                upload_layout,
             )
             .unwrap();
             for offset in [17usize, 29] {
@@ -6857,7 +7076,20 @@ mod tests {
         let cpu = DCRTPolyParams::new(32, 3, 30, 4, None, None);
         let params = gpu_params_from_cpu(&cpu);
         let source = Arc::new(gpu_constant_matrix(&params, 2, 3, 17).into_coeff_domain());
-        let plan = GpuPreparedRnsReconstruction::bind_all(Arc::clone(&source)).unwrap();
+        let plan = GpuPreparedRnsReconstruction::bind_all(
+            Arc::clone(&source),
+            PreparedPlanLayout::rns_reconstruction(
+                &params,
+                source.row_size(),
+                source.col_size(),
+                source.level(),
+                (source.level() + 1) * params.ring_dimension() as usize,
+                0,
+                params.ring_dimension() as usize,
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         for offset in [17usize, 29] {
             if offset != 17 {

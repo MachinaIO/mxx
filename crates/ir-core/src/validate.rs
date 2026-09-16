@@ -36,6 +36,9 @@ pub struct ValidatedScope {
 pub struct ValidatedGraph {
     pub source: Graph,
     pub bindings: ParamEnv,
+    /// Identity of this concrete graph instantiation, computed once during
+    /// validation so prepared execution can compare it in constant time.
+    pub spec_hash: crate::artifact::SpecHash,
     pub scopes: BTreeMap<FrozenGraphScopeId, ValidatedScope>,
     pub warnings: Vec<ElaborationWarning>,
 }
@@ -43,6 +46,10 @@ pub struct ValidatedGraph {
 impl ValidatedGraph {
     pub fn scope(&self, id: &FrozenGraphScopeId) -> Option<&ValidatedScope> {
         self.scopes.get(id)
+    }
+
+    pub fn spec_hash(&self) -> crate::artifact::SpecHash {
+        self.spec_hash.clone()
     }
 
     /// Resolve a validated wire in the environment of its actual invocation.
@@ -79,6 +86,8 @@ impl ValidatedGraph {
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    #[error(transparent)]
+    Encoding(#[from] crate::encoding::EncodingError),
     #[error(transparent)]
     Expression(#[from] ExprError),
     #[error(transparent)]
@@ -406,7 +415,14 @@ pub fn validate_with_manifests(
         scopes.insert(scope_id.clone(), validated);
     }
     validate_structural_boundaries(graph, bindings, &scopes)?;
-    Ok(ValidatedGraph { source: graph.clone(), bindings: bindings.clone(), scopes, warnings })
+    let spec_hash = crate::encoding::spec_hash(graph, bindings)?;
+    Ok(ValidatedGraph {
+        source: graph.clone(),
+        bindings: bindings.clone(),
+        spec_hash,
+        scopes,
+        warnings,
+    })
 }
 
 fn collect_scope_bindings(

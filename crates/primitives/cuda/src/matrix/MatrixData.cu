@@ -1,4 +1,5 @@
 #include "gpu_admission.cuh"
+#include "gpu_prepared_plan.cuh"
 
 GpuMatrix::GpuMatrix(GpuContext *context, size_t row_count, size_t column_count,
                      int active_level, GpuPolyFormat active_format)
@@ -517,12 +518,13 @@ extern "C" int gpu_matrix_query_allocation_bytes(
     return 0;
 }
 
-extern "C" int gpu_matrix_create(
+static int gpu_matrix_create_impl(
     GpuContext *ctx,
     int level,
     size_t rows,
     size_t cols,
     int format,
+    const GpuPreparedOwnerLayout *owner_layout,
     GpuMatrix **out,
     bool initialize_descriptors)
 {
@@ -540,6 +542,24 @@ extern "C" int gpu_matrix_create(
     if (plan_status != 0)
     {
         return plan_status;
+    }
+    if (owner_layout)
+    {
+        if (gpu_prepared_owner_layout_matches(ctx, owner_layout) != 0)
+            return -1;
+        if (owner_layout->execution_class != static_cast<int>(plan.totals.execution_class))
+            return set_error("prepared owner layout matrix execution class mismatch");
+        for (const auto &partition : plan.partitions)
+        {
+            const auto &selected = owner_layout->partitions[partition.partition];
+            if (selected.local_limb_count != partition.local_limb_count)
+                return set_error("prepared owner layout limb partition mismatch");
+            if (partition.local_limb_count != 0 && plan.count != 0 &&
+                (owner_layout->execution_class == GPU_MATRIX_SHARED_STREAM
+                    ? selected.shared_stream_slot >= selected.pool_size
+                    : selected.limb_stream_slots[partition.local_limb_count - 1] >= selected.pool_size))
+                return set_error("prepared owner layout stream assignment mismatch");
+        }
     }
 
     GpuAllocationActivity activity(ctx->execution.get(), -1);
@@ -590,9 +610,11 @@ extern "C" int gpu_matrix_create(
         cudaStream_t partition_stream = nullptr;
         if (shared_stream)
         {
-            const size_t stream_slot =
-                ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
-                stream_pool.size();
+            const size_t stream_slot = owner_layout
+                ? owner_layout->partitions[partition_idx].shared_stream_slot
+                : gpu_prepared_stream_slot(
+                    stream_pool.size(),
+                    ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed), 0);
             partition_stream = stream_pool[stream_slot];
         }
         auto &exec_states = mat->exec_limb_states[partition_idx];
@@ -609,9 +631,11 @@ extern "C" int gpu_matrix_create(
                 state.stream = partition_stream;
             else
             {
-                const size_t stream_slot =
-                    ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed) %
-                    stream_pool.size();
+                const size_t stream_slot = owner_layout
+                    ? owner_layout->partitions[partition_idx].limb_stream_slots[limb_idx]
+                    : gpu_prepared_stream_slot(
+                        stream_pool.size(),
+                        ctx->execution->next_compute_stream.fetch_add(1, std::memory_order_relaxed), 0);
                 state.stream = stream_pool[stream_slot];
             }
             if (!shared_stream || limb_idx == 0)
@@ -776,6 +800,25 @@ extern "C" int gpu_matrix_create(
 
     *out = mat;
     return 0;
+}
+
+extern "C" int gpu_matrix_create(
+    GpuContext *ctx, int level, size_t rows, size_t cols, int format,
+    GpuMatrix **out, bool initialize_descriptors)
+{
+    return gpu_matrix_create_impl(ctx, level, rows, cols, format, nullptr, out,
+        initialize_descriptors);
+}
+
+extern "C" int gpu_matrix_create_prepared(
+    GpuContext *ctx, int level, size_t rows, size_t cols, int format,
+    const GpuPreparedOwnerLayout *owner_layout, GpuMatrix **out,
+    bool initialize_descriptors)
+{
+    if (!owner_layout)
+        return set_error("prepared matrix creation requires an owner layout");
+    return gpu_matrix_create_impl(ctx, level, rows, cols, format, owner_layout, out,
+        initialize_descriptors);
 }
 
 extern "C" int gpu_matrix_zero(GpuMatrix *mat)

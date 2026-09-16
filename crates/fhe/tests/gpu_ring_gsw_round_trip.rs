@@ -1,7 +1,7 @@
 pub mod gpu_utils;
 pub mod utils;
 
-use gpu_utils::{centered, compile, input, integers, run};
+use gpu_utils::{centered, compile, input, integers, run, setup};
 use mxx_dsl::DslContext;
 use mxx_fhe::{FheScheme, RingCiphertext};
 use mxx_primitives::poly::PolyParams;
@@ -60,7 +60,9 @@ fn test_gpu_ring_gsw_round_trip() {
             .unwrap(),
         &mut backend,
     );
-    let (keys, keygen_seconds) = run(&graph, &mut backend, BTreeMap::new());
+    let keygen_inputs = BTreeMap::new();
+    setup(&graph, &mut backend, &keygen_inputs);
+    let (keys, keygen_seconds) = run(&graph, &mut backend, keygen_inputs);
     println!("FHE_PROGRESS scheme=ring_gsw stage=keygen seconds={keygen_seconds}");
     let encryption = compile(encryption, &mut backend);
     let evaluator = compile(
@@ -82,18 +84,17 @@ fn test_gpu_ring_gsw_round_trip() {
         message[exponent % n] = if exponent < n { 1 } else { -1 };
         let mut bit = vec![0i64; n];
         bit[0] = bit_value;
-        let (encrypted, encryption_seconds) = run(
-            &encryption,
-            &mut backend,
-            BTreeMap::from([
-                ("sk".into(), keys["sk"].clone()),
-                ("message".into(), input(&message)),
-                ("bit".into(), input(&bit)),
-            ]),
-        );
+        let encryption_inputs = BTreeMap::from([
+            ("sk".into(), keys["sk"].clone()),
+            ("message".into(), input(&message)),
+            ("bit".into(), input(&bit)),
+        ]);
+        setup(&encryption, &mut backend, &encryption_inputs);
+        let (encrypted, encryption_seconds) = run(&encryption, &mut backend, encryption_inputs);
         println!(
             "FHE_PROGRESS scheme=ring_gsw stage=encryption bit={bit_value} exponent={exponent} seconds={encryption_seconds}"
         );
+        setup(&evaluator, &mut backend, &encrypted);
         let (evaluated, _) = run(&evaluator, &mut backend, encrypted.clone());
         let mut stages = Vec::new();
         for (name, metadata, values, multiplier) in [
@@ -120,15 +121,13 @@ fn test_gpu_ring_gsw_round_trip() {
                     .unwrap(),
                 &mut backend,
             );
-            let (decoded, _) = run(
-                &decryption,
-                &mut backend,
-                BTreeMap::from([
-                    ("sk".into(), keys["sk"].clone()),
-                    ("a".into(), values["a"].clone()),
-                    ("b".into(), values["b"].clone()),
-                ]),
-            );
+            let decryption_inputs = BTreeMap::from([
+                ("sk".into(), keys["sk"].clone()),
+                ("a".into(), values["a"].clone()),
+                ("b".into(), values["b"].clone()),
+            ]);
+            setup(&decryption, &mut backend, &decryption_inputs);
+            let (decoded, _) = run(&decryption, &mut backend, decryption_inputs);
             let expected = message
                 .iter()
                 .map(|v| BigInt::from(v * multiplier).mod_floor(&BigInt::from(q.as_ref().clone())))

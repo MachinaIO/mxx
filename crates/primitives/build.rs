@@ -34,6 +34,8 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/gpu_admission.cuh");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
+        println!("cargo::rerun-if-changed=cuda/src/gpu_prepared_plan.cu");
+        println!("cargo::rerun-if-changed=cuda/include/gpu_prepared_plan.cuh");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixNTT.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixData.cu");

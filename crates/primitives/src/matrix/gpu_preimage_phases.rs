@@ -1,16 +1,35 @@
 //! Slot-owned Gaussian preimage phases, including content-dependent covariance.
 
-use super::GpuDCRTPolyMatrix;
-use crate::poly::dcrt::gpu::{
-    GpuPreparedPreimagePhasesOpaque, GpuRngSeed, gpu_preimage_destroy_phases,
-    gpu_preimage_prepare_phases, gpu_preimage_refresh_covariance, gpu_preimage_submit_gadget,
-    gpu_preimage_submit_p1, last_error_string,
+use super::{GpuDCRTPolyMatrix, GpuPreparedWorkspaceLayout, PreparedPlanLayout};
+use crate::{
+    matrix::PolyMatrix,
+    poly::{
+        PolyParams,
+        dcrt::gpu::{
+            GpuPreparedPreimagePhasesOpaque, GpuRngSeed, gpu_preimage_destroy_phases,
+            gpu_preimage_prepare_phases, gpu_preimage_refresh_covariance,
+            gpu_preimage_submit_gadget, gpu_preimage_submit_p1, last_error_string,
+        },
+    },
 };
 use std::{ptr::NonNull, sync::Arc};
 
 pub struct GpuPreparedPreimagePhases {
     raw: NonNull<GpuPreparedPreimagePhasesOpaque>,
     owners: [Arc<GpuDCRTPolyMatrix>; 7],
+}
+
+/// Warmup-owned phase resources.  The phase bind consumes these exact
+/// workspace and NTT launch descriptors; it never queries launch geometry or
+/// chooses a stream at bind time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuPreparedPreimagePhasesLayout {
+    pub workspaces: [GpuPreparedWorkspaceLayout; 6],
+    pub p1_ntt: PreparedPlanLayout,
+    pub gadget_ntt: PreparedPlanLayout,
+    pub rows: usize,
+    pub columns: usize,
+    pub digits: usize,
 }
 
 unsafe impl Send for GpuPreparedPreimagePhases {}
@@ -35,6 +54,36 @@ impl GpuPreparedPreimagePhases {
         }
         Ok(unsafe { layouts.assume_init() })
     }
+
+    pub fn plan_layout(
+        params: &crate::poly::dcrt::gpu::GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        digits: usize,
+    ) -> Result<GpuPreparedPreimagePhasesLayout, String> {
+        if rows == 0 || columns == 0 || digits == 0 {
+            return Err("prepared preimage phase shape is empty".into());
+        }
+        let workspaces = Self::allocation_layout(params, rows, columns)?;
+        let level = params.crt_depth() - 1;
+        let p1_ntt = PreparedPlanLayout::ntt(params, 2 * rows, columns, level, None, true)?;
+        let gadget_ntt = PreparedPlanLayout::ntt(
+            params,
+            rows * params.modulus_digits() * digits,
+            columns,
+            level,
+            None,
+            true,
+        )?;
+        Ok(GpuPreparedPreimagePhasesLayout {
+            workspaces,
+            p1_ntt,
+            gadget_ntt,
+            rows,
+            columns,
+            digits,
+        })
+    }
     /// # Safety
     /// Preparation only. The cutoff must outlive this plan and share its
     /// exclusive invocation; it cannot be reset until all readers complete.
@@ -55,13 +104,22 @@ impl GpuPreparedPreimagePhases {
 
     /// Owners are Gram A/B/D, perturbation product, P1 output, residual, gadget
     /// output. Contents may change each invocation, but their storage is fixed.
-    pub fn bind(
+    pub fn bind_with_layout(
         owners: [Arc<GpuDCRTPolyMatrix>; 7],
         base_bits: u32,
         c: f64,
         smoothing: f64,
         sigma: f64,
+        layout: &GpuPreparedPreimagePhasesLayout,
     ) -> Result<Self, String> {
+        if layout.rows != owners[0].row_size() ||
+            layout.columns != owners[3].col_size() ||
+            layout.digits == 0 ||
+            owners[6].row_size() !=
+                layout.rows * owners[0].params().modulus_digits() * layout.digits
+        {
+            return Err("prepared preimage phase saved layout mismatch".into());
+        }
         let mut raw = std::ptr::null_mut();
         let status = unsafe {
             gpu_preimage_prepare_phases(
@@ -76,6 +134,9 @@ impl GpuPreparedPreimagePhases {
                 c,
                 smoothing,
                 sigma,
+                layout.workspaces.as_ptr(),
+                layout.p1_ntt.native_ptr().cast(),
+                layout.gadget_ntt.native_ptr().cast(),
                 &mut raw,
             )
         };

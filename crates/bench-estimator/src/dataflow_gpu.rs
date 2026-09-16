@@ -21,22 +21,23 @@ fn error(e: impl fmt::Display) -> GpuMeasurementError {
     GpuMeasurementError(e.to_string())
 }
 
-fn finish(value: &RuntimeValue<GpuDcrtBackend>) {
+fn finish(value: &RuntimeValue<GpuDcrtBackend>) -> Result<(), GpuMeasurementError> {
     match value {
         RuntimeValue::Matrix(matrix) => {
-            let _ = matrix.wait_until_ready();
+            matrix.wait_until_ready().map_err(error)?;
         }
         RuntimeValue::SmallMatrix(matrix) => {
-            let _ = matrix.wait_until_ready();
+            matrix.wait_until_ready().map_err(error)?;
         }
         RuntimeValue::Trapdoor { public, secret, .. } => {
-            let _ = public.wait_until_ready();
+            public.wait_until_ready().map_err(error)?;
             if let Some(secret) = secret {
-                secret.wait_until_ready();
+                secret.wait_until_ready().map_err(error)?;
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn transfer_coefficient_count(ty: &ConcreteWireType) -> Result<usize, GpuMeasurementError> {
@@ -175,14 +176,6 @@ impl TransferMeasurements {
             if rings.contains_key(&ring_key) {
                 continue;
             }
-            let preparation =
-                encoding::hash_canonical(&("transfer parameter preparation", &ring_key))
-                    .map_err(error)?;
-            workers[0].backend.set_column_widths_for_operation(
-                preparation,
-                GpuColumnWidths { gpu0: Some(1), nonzero: None },
-            );
-            workers[0].backend.select_operation(preparation, true).map_err(error)?;
             let probe = workers[0]
                 .backend
                 .constant_matrix(&ty, &ConstantMatrix::Zero, &ParamEnv::default())
@@ -254,17 +247,8 @@ impl TransferMeasurements {
                     "full transfer capacity diagnostic; actual allocation determines success");
             }
             let operation = encoding::hash_canonical(&(kind, &ty)).map_err(error)?;
-            let width = matrix.columns.div_ceil(devices.len()).max(1);
-            backend.set_column_widths_for_operation(
-                operation,
-                GpuColumnWidths {
-                    gpu0: Some(width),
-                    nonzero: (devices.len() > 1).then_some(width),
-                },
-            );
-            backend.select_operation(operation, true).map_err(error)?;
             let value = transfer_fixture(&mut backend, &ty)?;
-            finish(&value);
+            finish(&value)?;
             let artifact_type = ArtifactType::from_wire_type(&ty).unwrap();
             let artifact_key = ArtifactKey {
                 production: ProductionId {
@@ -358,7 +342,7 @@ impl TransferMeasurements {
                         let restored =
                             decode_artifact(&mut backend, artifact_type.clone(), payload)
                                 .map_err(error)?;
-                        finish(&restored);
+                        finish(&restored)?;
                         restored_value = Some(restored);
                     }
                 }
@@ -407,6 +391,13 @@ impl TransferMeasurements {
         // backend calls are already timed separately. The scalar adds keep this graph live.
         let graph = crate::dataflow::dispatch_graph().map_err(error)?;
         let mut store = mxx_runtime::MemoryArtifactStore::default();
+        backend
+            .warm_up_prepared_graph(
+                &graph,
+                &BTreeMap::new(),
+                &mxx_runtime::ExecutionConfig::default(),
+            )
+            .map_err(error)?;
         let mut seconds = 0.0;
         for i in 0..harness.warm_up_iterations + harness.measured_iterations {
             let started = Instant::now();
@@ -512,13 +503,6 @@ mod tests {
             matrix: matrix.clone(),
             max_coefficient_bound: 257.into(),
         };
-        let operation = encoding::hash_canonical(&compact).unwrap();
-        let width = matrix.columns.div_ceil(devices.len());
-        fleet.set_column_widths_for_operation(
-            operation,
-            GpuColumnWidths { gpu0: Some(width), nonzero: (devices.len() > 1).then_some(width) },
-        );
-        fleet.select_operation(operation, true).unwrap();
         let value = transfer_fixture(&mut fleet, &compact).unwrap();
         let RuntimeValue::SmallMatrix(owner) = &value else {
             panic!("compact fixture");

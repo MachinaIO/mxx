@@ -13,6 +13,7 @@
 
 #include "../ChaCha.cu"
 #include "MatrixUtils.cu"
+#include "gpu_prepared_plan.cuh"
 #include "MatrixNTT.cu"
 #include "MatrixNTTBatch.cu"
 #include "MatrixArith.cu"
@@ -29,6 +30,7 @@
 #include "gpu_preimage.cu"
 #include "gpu_compact_decompose.cu"
 #include "gpu_schedule.cu"
+#include "../gpu_prepared_plan.cu"
 
 // Every native kernel specialization reachable from this translation unit is
 // loaded before setup residency is accepted. Keep this explicit inventory in

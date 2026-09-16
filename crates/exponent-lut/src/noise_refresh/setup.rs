@@ -13,8 +13,10 @@
 //! then targets `T_t = MS(A_{sum,t}) - (P_t/q_t) reduce(A')` with `B_P K_t=T_t`.
 //! Each distinct `P` has one preprocessing-fixed public matrix and trapdoor.
 //! Online evaluation forms one fresh `b_P=reduce(s) B_P+e_P` per group and
-//! uses `d_t=b_P K_t` for that group's slots. Neither the
-//! online secret `s` nor `b` crosses the artifact boundary.
+//! uses `d_t=b_P K_t` for that group's slots. The decoder/public-`b` values
+//! are built during encryption, exported as private typed artifacts, and
+//! imported by online evaluation; online does not reconstruct them. Neither
+//! the online secret `s` nor `b` crosses the artifact boundary.
 
 use crate::{
     bgg::{
@@ -36,7 +38,7 @@ use crate::{
             PreparedSparseLwrPrf, PreparedSparseLwrPrfDescriptor, PrfPublicSetup,
             SparseLwrPrfProgram,
         },
-        refresh::{RefreshError, RefreshPrfContract},
+        refresh::{RefreshError, RefreshPrfContract, group_refresh_levels},
         simulation::{AverageCaseConfig, ExponentLutAverageNoiseReport, ExponentLutNoiseReport},
     },
     program::ProgramValue,
@@ -48,7 +50,7 @@ use mxx_dsl::{
     Preimage,
 };
 use mxx_ir_core::{
-    BenchmarkRole, IntExpr, ParamEnv, ScopedWireRef,
+    BenchmarkRole, IntExpr, ParamEnv, ScopedWireRef, ValidatedGraph,
     artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
     encoding::spec_hash,
     graph::FrozenGraphScopeId,
@@ -153,6 +155,8 @@ pub struct RefreshPreprocessingArtifactNames {
     pub preimages: Vec<String>,
     /// Public value-readout and typed decomposition-cache artifacts.
     pub readout: String,
+    /// Public mask family used by encryption to prepare online readout masks.
+    pub readout_public_masks: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -406,7 +410,12 @@ impl RefreshPreprocessingProducer {
         for (name, preimage) in names.preimages.iter().zip(&ks) {
             context = context.private_output(name.clone(), preimage.clone())?;
         }
-        let context = context.public_output(names.readout.clone(), readout_artifacts.clone())?;
+        let context = context
+            .public_output(names.readout.clone(), readout_artifacts.clone())?
+            .public_output(
+                names.readout_public_masks.clone(),
+                request.public_prf.readout_public_masks,
+            )?;
         let built = context.build()?;
         // Read the actual artifact schemas once, while construction handles
         // are available. Retain only compact plans after the graph is frozen.
@@ -607,6 +616,373 @@ impl ImportedRefreshSetup {
     }
 }
 
+type RefreshDeclaration = RefreshPreprocessingDeclaration<
+    <BggScheme as ExponentLUTFixedRhsScheme>::FixedProductBinding,
+    <<BggScheme as ExponentLUTFixedRhsScheme>::PreparedFixedProduct as GraphValue>::Schema,
+>;
+
+/// Rebuilds the encryption and online graphs against the concrete production
+/// IDs returned by the preceding artifact executions.  Graphs built during
+/// planning use deterministic IDs only as templates; runtime callers must use
+/// these methods so an artifact can never be silently rebound by a manifest map.
+struct RefreshGraphFactory {
+    parameters: BggRefreshParameters,
+    program: SparseLwrPrfProgram,
+    declaration: RefreshDeclaration,
+    sampler: ExponentLutEncodingSampler,
+    online_secret: Mat,
+    initial_attribute: Mat,
+    public_readout_masks_schema: <Family<Mat> as GraphValue>::Schema,
+    compiler: ExponentLutEncodingCompiler,
+    producer_spec_hash: mxx_ir_core::artifact::SpecHash,
+    decode_length: usize,
+    encryption_schemas: Option<RefreshEncryptionSchemas>,
+}
+
+/// Typed schemas for the private artifacts emitted by the encryption graph.
+/// Keeping these at factory construction makes online graph creation a pure
+/// artifact-import operation; it never reconstructs secret-dependent values.
+struct RefreshEncryptionSchemas {
+    encrypted_input_vector: <Mat as GraphValue>::Schema,
+    online_readout_masks: <Family<Mat> as GraphValue>::Schema,
+    decoder_public_b: Vec<<Mat as GraphValue>::Schema>,
+    decoder_bases: Vec<<Mat as GraphValue>::Schema>,
+    decoder_group_slots: Vec<Vec<usize>>,
+    decoder_anchor: <Mat as GraphValue>::Schema,
+}
+
+/// Scatters modulus-grouped decoder artifacts back to their canonical CRT
+/// slot order. Group transport may sort by modulus, but refresh equations
+/// retain the original slot association.
+fn scatter_grouped_slots<T: Clone>(
+    group_slots: &[Vec<usize>],
+    grouped: &[T],
+    slot_count: usize,
+) -> Result<Vec<T>, RefreshSetupError> {
+    if group_slots.len() != grouped.len() {
+        return Err(RefreshSetupError::InvalidManifest);
+    }
+    let mut slots = vec![None; slot_count];
+    for (group, members) in group_slots.iter().enumerate() {
+        for &slot in members {
+            let destination = slots.get_mut(slot).ok_or(RefreshSetupError::InvalidManifest)?;
+            if destination.is_some() {
+                return Err(RefreshSetupError::InvalidManifest);
+            }
+            *destination = Some(grouped[group].clone());
+        }
+    }
+    slots.into_iter().map(|value| value.ok_or(RefreshSetupError::InvalidManifest)).collect()
+}
+
+impl RefreshGraphFactory {
+    fn validate_producer(
+        &self,
+        production: &ProductionId,
+        manifest: &Manifest,
+    ) -> Result<ImportedRefreshSetup, RefreshSetupError> {
+        if manifest.production_id != *production || production.spec_hash != self.producer_spec_hash
+        {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        ImportedRefreshSetup::import(
+            self.parameters.clone(),
+            self.program.clone(),
+            self.declaration.clone(),
+            manifest,
+        )
+    }
+
+    fn initial(
+        &self,
+        production: &ProductionId,
+        manifest: &Manifest,
+    ) -> Result<(ImportedRefreshSetup, BggEncodingWire), RefreshSetupError> {
+        let imported = self.validate_producer(production, manifest)?;
+        let initial_vector = self
+            .sampler
+            .sample_encodings_for_public_matrices(
+                self.online_secret.clone(),
+                Some(imported.setup_secret_t().clone()),
+                &[imported.state_public_key().clone()],
+                std::slice::from_ref(&self.initial_attribute),
+            )?
+            .into_iter()
+            .next()
+            .ok_or(RefreshSetupError::InvalidManifest)?;
+        Ok((
+            imported,
+            BggEncodingWire {
+                vector: initial_vector.vector,
+                plaintext: Some(self.initial_attribute.clone()),
+            },
+        ))
+    }
+
+    fn decoder_anchor(&self, imported: &ImportedRefreshSetup) -> Result<Mat, RefreshSetupError> {
+        let ring = self.parameters.layout.ring();
+        let gadget = ring.gadget(
+            self.online_secret.matrix_type().columns.clone(),
+            self.parameters.layout.gadget_base.clone(),
+            self.parameters.layout.digit_count,
+        );
+        Ok(self.online_secret.clone() * imported.a_prime.clone() -
+            self.initial_attribute.clone() * (imported.setup_secret_t.clone() * gadget))
+    }
+
+    fn encrypt(
+        &self,
+        production: ProductionId,
+        manifest: Manifest,
+    ) -> Result<(ValidatedGraph, RefreshEncryptionSchemas), RefreshSetupError> {
+        let (imported, initial) = self.initial(&production, &manifest)?;
+        let public_readout_masks = self.public_readout_masks_schema.artifact_input(
+            production.clone(),
+            &self.declaration.names.readout_public_masks,
+            ArtifactConfidentiality::Public,
+        )?;
+        let online_masks = self
+            .sampler
+            .sample_native_readout_masks(self.online_secret.clone(), &public_readout_masks)?;
+        let (public_b, decoder_bases) =
+            self.parameters.shared_decoder_bases(self.online_secret.clone(), &imported.public_b)?;
+        let groups = group_refresh_levels(self.parameters.switch_moduli.iter().cloned());
+        let decoder_group_slots = groups.values().cloned().collect::<Vec<_>>();
+        let decoder_public_b =
+            groups.values().map(|slots| public_b[slots[0]].schema()).collect::<Vec<_>>();
+        let decoder_bases_schemas =
+            groups.values().map(|slots| decoder_bases[slots[0]].schema()).collect::<Vec<_>>();
+        let anchor = self.decoder_anchor(&imported)?;
+        let schemas = RefreshEncryptionSchemas {
+            encrypted_input_vector: initial.vector.schema(),
+            online_readout_masks: online_masks.schema(),
+            decoder_public_b,
+            decoder_bases: decoder_bases_schemas,
+            decoder_group_slots,
+            decoder_anchor: anchor.schema(),
+        };
+        let mut graph = DslContext::new("refresh-parameter-search-encrypt")
+            // All secret-dependent material is exported with the ciphertext;
+            // online evaluation consumes only these private artifacts.
+            .private_output("online-readout-masks", online_masks)
+            .map_err(RefreshSetupError::from)?
+            .private_output("decoder-anchor", anchor)
+            .map_err(RefreshSetupError::from)?
+            .private_output("encrypted-input-vector", initial.vector)
+            .map_err(RefreshSetupError::from)?;
+        for (group, slots) in groups.values().enumerate() {
+            graph = graph
+                .private_output(format!("decoder-public-b-{group}"), public_b[slots[0]].clone())
+                .map_err(RefreshSetupError::from)?
+                .private_output(format!("decoder-bases-{group}"), decoder_bases[slots[0]].clone())
+                .map_err(RefreshSetupError::from)?;
+        }
+        let graph = graph
+            .build()?
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "validate encryption graph",
+                detail: error.to_string(),
+            })?;
+        Ok((graph, schemas))
+    }
+
+    fn online(
+        &self,
+        producer: ProductionId,
+        producer_manifest: Manifest,
+        encryption: ProductionId,
+        encryption_manifest: Manifest,
+        include_verification: bool,
+    ) -> Result<
+        (ValidatedGraph, Option<(ValidatedGraph, Vec<RefreshSimulationDecoderTarget>)>),
+        RefreshSetupError,
+    > {
+        let imported = self.validate_producer(&producer, &producer_manifest)?;
+        let schemas = self.encryption_schemas.as_ref().ok_or(RefreshSetupError::InvalidManifest)?;
+        if encryption_manifest.production_id != encryption {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        // The encryption graph's spec hash includes the preceding producer
+        // identity, so it necessarily changes when runtime artifact IDs are
+        // rebound. Validate the stored artifact contract instead of rebuilding
+        // that graph merely to recover a hash.
+        let has_private_artifacts = |prefix: &str| {
+            encryption_manifest.artifacts.iter().any(|(name, artifact)| {
+                (name == prefix ||
+                    name.starts_with(&format!("{prefix}.")) ||
+                    name.starts_with(&format!("{prefix}-"))) &&
+                    artifact.confidentiality == ArtifactConfidentiality::Private
+            })
+        };
+        for name in ["online-readout-masks", "decoder-anchor", "encrypted-input-vector"] {
+            if !has_private_artifacts(name) {
+                return Err(RefreshSetupError::InvalidManifest);
+            }
+        }
+        for name in ["decoder-public-b", "decoder-bases"] {
+            if !has_private_artifacts(name) {
+                return Err(RefreshSetupError::InvalidManifest);
+            }
+        }
+        let initial = BggEncodingWire {
+            vector: schemas.encrypted_input_vector.artifact_input(
+                encryption.clone(),
+                "encrypted-input-vector",
+                ArtifactConfidentiality::Private,
+            )?,
+            plaintext: Some(self.initial_attribute.clone()),
+        };
+        let online_masks = schemas.online_readout_masks.artifact_input(
+            encryption.clone(),
+            "online-readout-masks",
+            ArtifactConfidentiality::Private,
+        )?;
+        let groups = &schemas.decoder_group_slots;
+        let public_b_by_group = schemas
+            .decoder_public_b
+            .iter()
+            .enumerate()
+            .map(|(group, schema)| {
+                schema.artifact_input(
+                    encryption.clone(),
+                    format!("decoder-public-b-{group}"),
+                    ArtifactConfidentiality::Private,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RefreshSetupError::from)?;
+        let decoder_bases_by_group = schemas
+            .decoder_bases
+            .iter()
+            .enumerate()
+            .map(|(group, schema)| {
+                schema.artifact_input(
+                    encryption.clone(),
+                    format!("decoder-bases-{group}"),
+                    ArtifactConfidentiality::Private,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RefreshSetupError::from)?;
+        let anchor = schemas
+            .decoder_anchor
+            .artifact_input(encryption.clone(), "decoder-anchor", ArtifactConfidentiality::Private)
+            .map_err(RefreshSetupError::from)?;
+        let public_b_by_slot =
+            scatter_grouped_slots(groups, &public_b_by_group, self.parameters.switch_moduli.len())?;
+        let decoder_bases_by_slot = scatter_grouped_slots(
+            groups,
+            &decoder_bases_by_group,
+            self.parameters.switch_moduli.len(),
+        )?;
+        let scheme =
+            BggScheme::new(self.parameters.public_key_compiler(), self.compiler.exponent_layout);
+        let accumulation = with_benchmark_role(BenchmarkRole::EncodingPrfAccumulation, || {
+            imported.program_cache.evaluate(&scheme, ProgramValue::Scalar(initial.clone()))
+        })
+        .map_err(|error| RefreshSetupError::SetupStage {
+            stage: "evaluate online fixed-RHS PRF",
+            detail: error.to_string(),
+        })?;
+        let readout = self
+            .program
+            .evaluate_readout(&scheme, &accumulation, &imported.readout_artifacts, &online_masks)
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "evaluate online PRF readout",
+                detail: error.to_string(),
+            })?;
+        let refresh_manifest = self
+            .parameters
+            .refresh
+            .bind_online_outputs_with_decoder_bases(
+                &self.compiler,
+                &imported,
+                initial,
+                &self.program,
+                &readout,
+                public_b_by_slot,
+                decoder_bases_by_slot,
+            )
+            .map_err(|error| RefreshSetupError::SetupStage {
+                stage: "bind online refresh inputs",
+                detail: error.to_string(),
+            })?;
+        let refreshed =
+            self.parameters.refresh.refresh(&self.compiler, &refresh_manifest).map_err(
+                |error| RefreshSetupError::SetupStage {
+                    stage: "apply online refresh",
+                    detail: error.to_string(),
+                },
+            )?;
+        let benchmark_graph = DslContext::new("refresh-parameter-search-online-eval")
+            .private_output("refreshed-encoding-vector", refreshed.encoding().vector.clone())?
+            .build()?;
+        validate_cache_required_online_graph(&benchmark_graph)?;
+        let verification = if include_verification {
+            let residual = refreshed.encoding().vector.clone() - anchor.clone();
+            let decoder_residuals = (0..self.parameters.layout.public_key_columns())
+                .map(|column| {
+                    residual.clone().slice(
+                        None,
+                        Some(mxx_ir_core::node::IndexRange {
+                            start: column.into(),
+                            end: (column + 1).into(),
+                        }),
+                    )
+                })
+                .collect();
+            let verification = RefreshVerification::new(
+                refreshed.encoding().vector.clone(),
+                anchor,
+                residual,
+                decoder_residuals,
+                self.parameters.base_p,
+                self.decode_length,
+            )?;
+            let graph = verification
+                .add_outputs(
+                    DslContext::new("refresh-parameter-search-verification"),
+                    "residual",
+                    "decoded",
+                )?
+                .build()?;
+            let targets = decoder_targets(
+                &graph,
+                &verification,
+                self.decode_length,
+                self.parameters.base_p.into(),
+            )?;
+            Some((graph, targets))
+        } else {
+            None
+        };
+        let manifests =
+            BTreeMap::from([(producer, producer_manifest), (encryption, encryption_manifest)]);
+        let benchmark = benchmark_graph
+            .validate_with_manifests(&ParamEnv::default(), &manifests)
+            .map_err(|error| RefreshSetupError::SetupStage {
+            stage: "validate online benchmark artifacts",
+            detail: error.to_string(),
+        })?;
+        let verification = verification
+            .map(|(graph, targets)| {
+                graph
+                    .validate_with_manifests(&ParamEnv::default(), &manifests)
+                    .map(|graph| (graph, targets))
+                    .map_err(|error| RefreshSetupError::SetupStage {
+                        stage: "validate online verification artifacts",
+                        detail: error.to_string(),
+                    })
+            })
+            .transpose()?;
+        Ok((benchmark, verification))
+    }
+}
+
 /// Derives all preprocessing artifact names from the public setup identity.
 ///
 /// Slot-indexed names are emitted in CRT order, so an importer cannot silently
@@ -634,6 +1010,7 @@ impl RefreshPreprocessingArtifactNames {
             refresh_targets: (0..slot_count).map(|i| n("refresh-target", i)).collect(),
             preimages: (0..slot_count).map(|i| n("preimage", i)).collect(),
             readout: n("readout", 0),
+            readout_public_masks: n("readout-public-masks", 0),
         }
     }
 }
@@ -681,7 +1058,9 @@ pub(crate) fn validate_manifest<B, D: GraphValueSchema>(
             ArtifactType::from_wire_type(element).ok_or(RefreshSetupError::InvalidManifest)?;
         fields.push((name, ArtifactConfidentiality::Public, expected, count));
     }
-    if m.artifacts.len() != fields.len() {
+    let extra_public_masks =
+        m.artifacts.keys().filter(|name| name.contains("readout-public-masks")).count();
+    if m.artifacts.len() != fields.len() + extra_public_masks {
         return Err(RefreshSetupError::InvalidManifest);
     }
     for (name, confidentiality, expected, count) in fields {
@@ -1052,7 +1431,7 @@ impl RefreshParameterSimulationRequest {
         )?;
         let compiler =
             ExponentLutEncodingCompiler::with_layout(setup.public_key_compiler(), profile.layout);
-        let public_readout_masks = public_prf.readout_public_masks.clone();
+        let public_readout_masks_schema = public_prf.readout_public_masks.schema();
         let producer = RefreshPreprocessingProducer::build(RefreshPreprocessingRequest {
             program: program.clone(),
             layout: layout.clone(),
@@ -1087,7 +1466,7 @@ impl RefreshParameterSimulationRequest {
                 },
             )?;
         let producer_production =
-            ProductionId { spec_hash: producer_spec_hash, execution_nonce: [0x53; 32] };
+            ProductionId { spec_hash: producer_spec_hash.clone(), execution_nonce: [0x53; 32] };
         let mut producer_manifest = mxx_ir_core::artifact::export_validated_manifest(
             producer_production.clone(),
             &producer_validated,
@@ -1113,77 +1492,56 @@ impl RefreshParameterSimulationRequest {
                 detail: error.to_string(),
             },
         )?;
-        let imported = ImportedRefreshSetup::import(
-            setup.clone(),
-            program.clone(),
-            producer.declaration().clone(),
-            &producer_manifest,
-        )
-        .map_err(|error| RefreshSetupError::SetupStage {
-            stage: "import preprocessing manifest",
-            detail: error.to_string(),
-        })?;
         let mut verification_manifests = BTreeMap::new();
         verification_manifests.insert(producer_production.clone(), producer_manifest.clone());
-        let initial_vector = sampler
-            .sample_encodings_for_public_matrices(
-                online_secret.clone(),
-                Some(imported.setup_secret_t().clone()),
-                &[imported.state_public_key().clone()],
-                std::slice::from_ref(&initial_attribute),
-            )?
-            .into_iter()
-            .next()
-            .ok_or(RefreshSetupError::InvalidManifest)?;
-        let initial = BggEncodingWire {
-            vector: initial_vector.vector,
-            plaintext: Some(initial_attribute.clone()),
+        let graph_factory_base = RefreshGraphFactory {
+            parameters: setup.clone(),
+            program: program.clone(),
+            declaration: producer.declaration().clone(),
+            sampler: sampler.clone(),
+            online_secret: online_secret.clone(),
+            initial_attribute: initial_attribute.clone(),
+            public_readout_masks_schema,
+            compiler: compiler.clone(),
+            producer_spec_hash,
+            decode_length: self.decode_length,
+            encryption_schemas: None,
         };
-        let refresh_compiler = setup.refresh.clone();
-        let online_masks =
-            sampler.sample_native_readout_masks(online_secret.clone(), &public_readout_masks)?;
-        let scheme = BggScheme::new(setup.public_key_compiler(), compiler.exponent_layout);
-        let accumulation = with_benchmark_role(BenchmarkRole::EncodingPrfAccumulation, || {
-            imported.program_cache.evaluate(&scheme, ProgramValue::Scalar(initial.clone()))
-        })
+        let (encrypt_validated, encryption_schemas) =
+            graph_factory_base.encrypt(producer_production.clone(), producer_manifest.clone())?;
+        let graph_factory = RefreshGraphFactory {
+            encryption_schemas: Some(encryption_schemas),
+            ..graph_factory_base
+        };
+        let encryption_spec_hash =
+            spec_hash(&encrypt_validated.source, &encrypt_validated.bindings).map_err(|error| {
+                RefreshSetupError::SetupStage {
+                    stage: "hash encryption graph",
+                    detail: error.to_string(),
+                }
+            })?;
+        let encrypt_production =
+            ProductionId { spec_hash: encryption_spec_hash, execution_nonce: [0x54; 32] };
+        let encrypt_manifest = mxx_ir_core::artifact::export_validated_manifest(
+            encrypt_production.clone(),
+            &encrypt_validated,
+        )
         .map_err(|error| RefreshSetupError::SetupStage {
-            stage: "evaluate online fixed-RHS PRF",
+            stage: "export encryption manifest",
             detail: error.to_string(),
         })?;
-        let readout = program
-            .evaluate_readout(&scheme, &accumulation, &imported.readout_artifacts, &online_masks)
-            .map_err(|error| RefreshSetupError::SetupStage {
-                stage: "evaluate online PRF readout",
-                detail: error.to_string(),
-            })?;
-        let manifest = refresh_compiler
-            .bind_online_outputs(
-                &compiler,
-                &imported,
-                online_secret.clone(),
-                initial,
-                &program,
-                &readout,
-            )
-            .map_err(|error| RefreshSetupError::SetupStage {
-                stage: "bind online refresh inputs",
-                detail: error.to_string(),
-            })?;
-        let refreshed = refresh_compiler.refresh(&compiler, &manifest).map_err(|error| {
-            RefreshSetupError::SetupStage {
-                stage: "apply online refresh",
-                detail: error.to_string(),
-            }
-        })?;
-        let benchmark_online_graph = DslContext::new("refresh-parameter-search-online-eval")
-            .private_output("refreshed-encoding-vector", refreshed.encoding().vector.clone())?
-            .build()?;
-        validate_cache_required_online_graph(&benchmark_online_graph).map_err(|error| {
-            RefreshSetupError::SetupStage {
-                stage: "check online preparation boundary",
-                detail: error.to_string(),
-            }
-        })?;
+        verification_manifests.insert(encrypt_production.clone(), encrypt_manifest.clone());
+        let (benchmark_online, verification) = graph_factory.online(
+            producer_production.clone(),
+            producer_manifest.clone(),
+            encrypt_production.clone(),
+            encrypt_manifest.clone(),
+            !benchmark_only,
+        )?;
+        let benchmark_online_graph = BuiltGraph { graph: benchmark_online.source.clone() };
+        let (verification_graph, targets) = verification
+            .map(|(graph, targets)| (Some(graph), targets))
+            .unwrap_or((None, Vec::new()));
         let preprocessing_graph = BuiltGraph { graph: producer.built().graph.clone() };
         let benchmark_preprocessing_graph = BuiltGraph { graph: preprocessing_graph.graph.clone() };
         let public_identity = producer.declaration().identity;
@@ -1203,7 +1561,10 @@ impl RefreshParameterSimulationRequest {
                 preprocessing_graph: None,
                 verification_graph: None,
                 benchmark_preprocessing_graph,
+                benchmark_encrypt_graph: BuiltGraph { graph: encrypt_validated.source.clone() },
                 benchmark_online_graph,
+                encrypt_graph: BuiltGraph { graph: encrypt_validated.source.clone() },
+                graph_factory,
                 preprocessing_manifests: verification_manifests.clone(),
                 verification_manifests,
                 public_identity,
@@ -1213,36 +1574,17 @@ impl RefreshParameterSimulationRequest {
                 noise_snapshot,
             });
         }
-        let verification = crate::bgg::build_refresh_verification(
-            refreshed.encoding(),
-            &imported.a_prime,
-            &online_secret,
-            imported.setup_secret_t(),
-            &self.expected_plaintext,
-            setup.layout.gadget_base.clone(),
-            setup.layout.digit_count,
-            setup.base_p,
-            self.decode_length,
-        )?;
-        let verification_graph = verification
-            .add_outputs(
-                DslContext::new("refresh-parameter-search-verification"),
-                "residual",
-                "decoded",
-            )?
-            .build()?;
-        let targets = decoder_targets(
-            &verification_graph,
-            &verification,
-            self.decode_length,
-            setup.base_p.into(),
-        )?;
+        let verification_graph =
+            verification_graph.expect("full refresh bundle must include a verification graph");
         Ok(RefreshParameterSimulationBundle {
             selector_graph: BuiltGraph { graph: producer.built().graph.clone() },
             preprocessing_graph: Some(preprocessing_graph),
-            verification_graph: Some(verification_graph),
+            verification_graph: Some(BuiltGraph { graph: verification_graph.source.clone() }),
             benchmark_preprocessing_graph,
+            benchmark_encrypt_graph: BuiltGraph { graph: encrypt_validated.source.clone() },
             benchmark_online_graph,
+            encrypt_graph: BuiltGraph { graph: encrypt_validated.source.clone() },
+            graph_factory,
             preprocessing_manifests: verification_manifests.clone(),
             verification_manifests,
             public_identity,
@@ -1263,7 +1605,10 @@ pub struct RefreshParameterSimulationBundle {
     pub(crate) preprocessing_graph: Option<BuiltGraph>,
     pub(crate) verification_graph: Option<BuiltGraph>,
     benchmark_preprocessing_graph: BuiltGraph,
+    benchmark_encrypt_graph: BuiltGraph,
     benchmark_online_graph: BuiltGraph,
+    encrypt_graph: BuiltGraph,
+    graph_factory: RefreshGraphFactory,
     preprocessing_manifests: std::collections::BTreeMap<ProductionId, Manifest>,
     verification_manifests: std::collections::BTreeMap<ProductionId, Manifest>,
     public_identity: [u8; 32],
@@ -1271,6 +1616,25 @@ pub struct RefreshParameterSimulationBundle {
     metadata: std::collections::BTreeMap<String, RefreshSimulationMatrixInputMetadata>,
     targets: Vec<RefreshSimulationDecoderTarget>,
     pub(crate) noise_snapshot: BggNoiseSnapshot,
+}
+
+/// Trusted binding returned with a runtime encryption graph.
+///
+/// The binding carries the graph-derived specification hash and the exact
+/// preprocessing production identity used to build its artifact inputs. It
+/// is intentionally constructed by [`RefreshParameterSimulationBundle`] and
+/// cannot be recreated from an untrusted manifest alone.
+pub struct RefreshEncryptionBinding {
+    graph: ValidatedGraph,
+    producer: ProductionId,
+    spec_hash: mxx_ir_core::artifact::SpecHash,
+}
+
+impl RefreshEncryptionBinding {
+    /// Returns the validated encryption graph to execute.
+    pub fn graph(&self) -> &ValidatedGraph {
+        &self.graph
+    }
 }
 
 impl RefreshParameterSimulationBundle {
@@ -1354,6 +1718,61 @@ impl RefreshParameterSimulationBundle {
     /// followed by decoder-target construction and preimage sampling.
     pub fn benchmark_preprocessing_graph(&self) -> &BuiltGraph {
         &self.benchmark_preprocessing_graph
+    }
+    /// Returns the benchmark encryption graph that emits the private encoded
+    /// input artifact consumed by online evaluation.
+    pub fn benchmark_encrypt_graph(&self) -> &BuiltGraph {
+        &self.benchmark_encrypt_graph
+    }
+    /// Returns the encryption graph used to produce the private encoded input
+    /// artifact before online evaluation.
+    pub fn encrypt_graph(&self) -> &BuiltGraph {
+        &self.encrypt_graph
+    }
+    /// Rebuilds encryption against the exact preprocessing production and
+    /// manifest returned by the preceding execution. The returned binding
+    /// owns the graph and authenticates its derived specification hash for the
+    /// later online boundary; callers should execute [`RefreshEncryptionBinding::graph`].
+    pub fn encrypt_graph_for(
+        &self,
+        production: ProductionId,
+        manifest: Manifest,
+    ) -> Result<RefreshEncryptionBinding, RefreshSetupError> {
+        let (graph, _) = self.graph_factory.encrypt(production.clone(), manifest)?;
+        let spec_hash = spec_hash(&graph.source, &graph.bindings).map_err(|error| {
+            RefreshSetupError::SetupStage {
+                stage: "hash encryption graph",
+                detail: error.to_string(),
+            }
+        })?;
+        Ok(RefreshEncryptionBinding { graph, producer: production, spec_hash })
+    }
+    /// Rebuilds online evaluation against exact preprocessing and encryption
+    /// artifacts. The binding must be the value returned by
+    /// [`Self::encrypt_graph_for`] for the same producer. Both manifests are
+    /// checked against the trusted graph-derived identity before a validated
+    /// graph is returned.
+    pub fn online_graph_for(
+        &self,
+        producer: ProductionId,
+        producer_manifest: Manifest,
+        encryption: ProductionId,
+        encryption_manifest: Manifest,
+        encryption_binding: &RefreshEncryptionBinding,
+    ) -> Result<ValidatedGraph, RefreshSetupError> {
+        if encryption_binding.producer != producer ||
+            encryption_binding.spec_hash != encryption.spec_hash
+        {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        let (_, verification) = self.graph_factory.online(
+            producer,
+            producer_manifest,
+            encryption,
+            encryption_manifest,
+            true,
+        )?;
+        Ok(verification.expect("online graph factory requested verification").0)
     }
     /// Returns the benchmark online graph: independent encoding PRF
     /// evaluation followed by application of externally supplied decoder
@@ -1515,4 +1934,16 @@ fn decoder_targets<V: mxx_dsl::GraphValue>(
         decoder_anchor: decoder_zero.decoder_anchor.clone(),
         plaintext_modulus: decoder_zero.plaintext_modulus.clone(),
     }])
+}
+
+#[cfg(test)]
+mod grouped_decoder_tests {
+    use super::scatter_grouped_slots;
+
+    #[test]
+    fn nonmonotonic_moduli_restore_original_slot_order() {
+        let groups = vec![vec![1, 2], vec![0]];
+        let grouped = vec![15u8, 21u8];
+        assert_eq!(scatter_grouped_slots(&groups, &grouped, 3).unwrap(), vec![21, 15, 15]);
+    }
 }

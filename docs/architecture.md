@@ -218,16 +218,22 @@ Durable exported artifacts remain available for online execution.
 The RNS-BGG PRF round-trip integration warms representative primitives and host transfers
 at every actual CRT level, then measures one full preprocess/export/reopen/online execution.
 `MXX_EXPONENT_LUT_BENCH_WARMUPS` counts primitive warmups, not full round trips.
-For the RNS-BGG one-output PRF test, `MXX_EXPONENT_LUT_BENCH_STAGE=estimate`
-runs GPU-calibrated estimates of that exact producer and production-online
-graph instead of the round trip. Selector setup is charged to the single
-output; the online correctness oracle is excluded. The common estimator now tracks runtime storage boundaries across
+The RNS-BGG one-output PRF test always performs noise/report validation, then
+GPU-calibrated estimates of the exact preprocess, encrypt, and production-online
+graphs, followed by the full three-stage round trip. Selector setup is charged
+to the single output; the online correctness oracle is excluded. The common estimator now tracks runtime storage boundaries across
 Family, capture, subgraph, and sequential-loop values. It measures raw-RNS RAM
 staging/reloading and compact artifact encoding/writing/reading/decoding with the
 production backend and artifact store, then adds their invocation-weighted wall
 times to `total_time_seconds`. GPU-resident edges have no added transfer charge;
 `total_work_seconds` remains primitive GPU work. The runtime and estimator share
 the matrix-Family staging rule and artifact codecs.
+
+The NAND integration follows the same complete simulation, three-stage estimate,
+and three-stage round-trip order. `MXX_EXPONENT_LUT_NAND_SKIP_SAGE=1` is an
+explicit local mode that skips the lattice-estimator invocation and target
+comparison, and logs `lattice_security_check=skipped`. Otherwise the estimator
+runs and its result must meet `MXX_EXPONENT_LUT_NAND_SECURITY_BITS`.
 
 `dataflow` and `transfers` report the extra costs and counts separately. CPU IR
 dispatch is a measured scalar-node proxy, not a full protocol execution trace.
@@ -369,10 +375,13 @@ reuse `BggEncodingFamily` and output batches are ordinary `Family<Mat>` values,
 without separate PRF label/output wrappers. Each file groups a type's inherent
 methods into one implementation block; trait implementations remain separate. Shared
 manifest-based storage accounting belongs to `noise_refresh/simulation.rs`.
-The optional
-`ExponentLUTTerminalScheme` exposes raw row-output terms and finalization.
-Its common `PreparedTerminal` evaluator builds an ordered balanced sum and
-finalizes once, preserving the RNS-BGG aggregate-before-switch requirement.
+Terminal processing is RNS-BGG-specific and lives in `rns_bgg/terminal.rs`.
+`PreparedTerminal` owns ordered term artifacts, validates their identities on
+import, and builds the balanced raw aggregate before exactly one final
+ModDown. Its serialized descriptor is paired with an opaque
+`PreparedTerminalExpectation` retained from trusted preparation; import checks
+the expectation before reading any artifact. The scheme-independent readout module contains only declarations and
+the shared `ExponentLUTReadoutScheme` capability.
 The common readout module owns RowLutTable<C>, the public exponent-indexed
 table of polynomial rows. Its block-component count is static; RNS-BGG consumes
 RowLutTable<2> through its terminal samplers, with rectangular polynomial rows
@@ -405,12 +414,13 @@ shared fresh-error PRF outputs; both schemes contribute their actual
 gadget-dependent key columns. RNS-BGG resumable states have `2D` columns,
 where `D` is the next level's exact per-prime radix digit count; only the
 terminal chain endpoint has two polynomial columns.
-`noise_refresh/refresh.rs` contains no concrete backend types; matrix routing
-uses the segmented reduction in `utils.rs`, and backend adapters assemble their
-own cryptographic wires. Its common online evaluator owns homogeneous slot
-grouping, structural parallelism, mask/fresh-error addition before a single
-switch, decoder application order, and canonical CRT recomposition order.
-The witness path also uses `prepare_refresh_public_routes` for preprocessing:
+`noise_refresh/refresh.rs` owns the shared row-level refresh traversal and
+homogeneous slot grouping. BGG witness preparation and RNS-BGG direct
+preparation are concrete APIs, while `ExponentLUTRefreshScheme` remains the
+only refresh capability shared by both schemes. The common online evaluator
+owns structural parallelism, mask/fresh-error addition before a single switch,
+decoder application order, and canonical CRT recomposition order.
+The BGG witness path uses `prepare_refresh_public_routes` for preprocessing:
 it applies the prepared route witnesses, reduces the canonical ragged mask
 ranges and shares the fresh PRF source across CRT slots. BGG public routing
 reuses the decompositions persisted for online evaluation instead of rebuilding
@@ -424,12 +434,11 @@ longer duplicates those dimensions in a separate coverage record. The index
 retains RefreshTranscriptTopology itself plus cached mask prefixes. Setup output
 counts and index construction use the topology cardinality, counting fresh
 labels once across CRT slots.
-Both phases call the same graph-value routing traversal. The witness capability
-supplies the online row product through `route_refresh_row`; the backend builds
+Both phases call the same graph-value routing traversal. BGG's concrete methods
+supply the online row product and public scaling witnesses; the backend builds
 public digit offsets, which the common online aggregator adds after reduction.
-`RefreshPrfFamilyMaterial<V>` carries the scheme's row type. The common refresh
-module no longer imports concrete `Mat`, `Preimage` or `Ring` carriers. BGG's
-half-offset vector construction remains in `bgg/mod.rs`.
+`RefreshPrfFamilyMaterial<V>` carries the shared row type. BGG's half-offset
+vector construction remains in `bgg/mod.rs`.
 `RefreshVerification<V>` retains the backend's `GraphValue` carrier and the
 exact scalar residual operands used by threshold decoders. Relation arithmetic
 and component extraction belong to the backend: BGG's builder is in `bgg/mod.rs`;
@@ -441,17 +450,15 @@ PBC trusted bits and runtime input materialization remain application-owned.
 BGG selector sampling lives on `ExponentLutEncodingSampler::sample_pbc_selectors`
 in `bgg/mod.rs` and returns `Family<Mat>` directly; no selector-family wrapper
 or concrete sampler entrypoint is exported by the common PBC module.
-The three refresh contracts are `ExponentLUTRefreshScheme` for common public
-and encoding arithmetic, `ExponentLUTRefreshWitnessScheme` for witness-based
-anchor and online decoder-base preparation, and `ExponentLUTRefreshDirectScheme`
-for direct decoder issuance and weighted terminal/digit preparation. BGG supplies
-the witness capability; RNS-BGG supplies the direct capability. Neither implements
-dummy operations for the other decoder construction. The shared application
-continues to own preprocessing, online preparation and evaluation scheduling.
+`ExponentLUTRefreshScheme` is the sole refresh trait because its public and
+encoding arithmetic is implemented by both schemes. BGG witness operations are
+inherent `BggScheme` methods; RNS-BGG direct decoder, weighted terminal, and
+digit operations are inherent `RnsBggScheme` methods. The shared application
+continues to own preprocessing, online preparation, and evaluation scheduling.
 RNS-BGG constructs the output-key-shaped decoder
 `s*(A_sum-H*A_out)+e_dec`, bound to the combined masked target.
 `PreparedDirectRefreshSlot` prepares and evaluates scalar or structural terminal
-families through traits, sums raw terms, applies ordinary ModDown, subtracts the
+families through the concrete RNS-BGG API, sums raw terms, applies ordinary ModDown, subtracts the
 decoder, and only then extracts a CRT residue. RNS-BGG rounds each masked channel at spacing `H = q_ref / prime` before
 reconstructing the output with exact residue extension and public CRT
 idempotents. Its data targets contain `H * p_ref * mu * t * G_ref`, so the

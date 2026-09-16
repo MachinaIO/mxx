@@ -121,31 +121,24 @@ impl CompiledNandCircuit {
 }
 
 /// Backend-facing details for benchmark and adapter integrations.
-///
-/// These accessors are deliberately outside the normal crate-root API. Most
-/// callers only need [`CompiledNandCircuit::fixed_rhs`] and [`CompiledNandCircuit::output`].
-pub trait CompiledNandCircuitDetails {
+impl CompiledNandCircuit {
     /// Return the internal packed-state input used by adapter bindings.
-    fn state_input(&self) -> ProgramInputId;
-    fn rhs_ids(&self) -> &[RhsId];
-    fn circuit_input_indices(&self) -> &[usize];
-    fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>);
-}
-
-impl CompiledNandCircuitDetails for CompiledNandCircuit {
-    fn state_input(&self) -> ProgramInputId {
+    pub fn state_input(&self) -> ProgramInputId {
         self.state_input
     }
 
-    fn rhs_ids(&self) -> &[RhsId] {
+    /// Return the fixed right-hand-side identities used by the circuit.
+    pub fn rhs_ids(&self) -> &[RhsId] {
         &self.rhs_ids
     }
 
-    fn circuit_input_indices(&self) -> &[usize] {
+    /// Return the circuit-input positions associated with the compiled inputs.
+    pub fn circuit_input_indices(&self) -> &[usize] {
         &self.circuit_input_indices
     }
 
-    fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>) {
+    /// Consume the circuit and return its program and adapter metadata.
+    pub fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>) {
         (self.program, self.state_input, self.rhs_ids, self.circuit_input_indices)
     }
 }
@@ -364,7 +357,7 @@ fn multiply(lhs: [[u8; 3]; 3], rhs: [[u8; 3]; 3]) -> [[u8; 3]; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompiledNandCircuit, CompiledNandCircuitDetails, NandCircuit, NandCircuitError};
+    use super::{CompiledNandCircuit, NandCircuit, NandCircuitError};
     use crate::{ExpLayout, program::Gate};
 
     fn compile(circuit: NandCircuit, budget: usize) -> CompiledNandCircuit {

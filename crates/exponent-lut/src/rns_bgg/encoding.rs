@@ -1,4 +1,12 @@
 //! RNS-BGG secret sampling and online encoding operations.
+//!
+//! Public methods in this module build DSL graph values and sampling nodes;
+//! they do not execute a backend. Secrets stay in the scheme context, while
+//! public keys, mask banks, helper identities, levels, and family ranges are
+//! checked when graph values are connected. Encoding fresh errors use the
+//! configured Gaussian sigma and hard cutoff. The refresh decoder's CBD
+//! parameter is a separate contract and is not used here.
+#![warn(missing_docs)]
 use super::*;
 
 impl<R: GraphValue> GraphValue for RnsBggEncoding<R> {
@@ -64,6 +72,10 @@ impl RnsBggScheme {
             context: self.context,
         })
     }
+    /// Evaluate one private product for every member of an encoding family.
+    ///
+    /// The family body is generated in DSL space and each member reuses the
+    /// same prepared family contract; backend execution happens later.
     pub fn evaluate_mul_private_family(
         &self,
         input: &RnsBggEncodingFamily,
@@ -75,34 +87,8 @@ impl RnsBggScheme {
     ) -> Result<RnsBggEncodingFamily, RnsBggError> {
         self.check_encoding_family(input, &prepared.input)?;
         let rows = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let element = RnsBggEncoding {
-                row: input.rows.at(&index),
-                level: input.level,
-                key_id: input.key_id,
-                context: input.context,
-            };
-            let prepared = RnsBggPreparedPrivateMul {
-                input: RnsBggPublicKey {
-                    matrix: prepared.input.matrices.at(&index),
-                    level: prepared.input.level,
-                    id: prepared.input.id,
-                    context: prepared.input.context,
-                },
-                output: RnsBggPublicKey {
-                    matrix: prepared.output.matrices.at(&index),
-                    level: prepared.output.level,
-                    id: prepared.output.id,
-                    context: prepared.output.context,
-                },
-                rhs: RnsBggPrivateRhs {
-                    ciphertext: prepared.rhs.ciphertext.at(&index),
-                    lifted_ciphertext: prepared.rhs.lifted_ciphertext.at(&index),
-                    level: prepared.rhs.level,
-                    id: prepared.rhs.id,
-                    rhs_id: prepared.rhs.rhs_id,
-                    context: prepared.rhs.context,
-                },
-            };
+            let element = input.element_at_local(index.clone());
+            let prepared = prepared.element_at_local(index);
             self.evaluate_mul_private(&element, &prepared)
                 .map(|value| value.row)
                 .map_err(|_| DslError::Schema)
@@ -147,12 +133,13 @@ impl RnsBggScheme {
         if self.encoding_errors_noiseless {
             return Ok(ring.zero((rows, columns)));
         }
-        Ok(ring.gaussian(
-            (rows, columns),
-            self.parameters.encoding_error_sigma_expr(),
-            self.parameters.encoding_error_bound.clone(),
-        ))
+        let sigma = crate::utils::decimal_to_real_expr(self.parameters.encoding_error_sigma())
+            .map_err(|_| RnsBggError::Parameters("invalid encoding error sigma"))?;
+        Ok(ring.gaussian((rows, columns), sigma, self.parameters.encoding_error_bound().clone()))
     }
+    /// Sample the payload secret at the scheme's base level.
+    ///
+    /// The returned value is a DSL graph secret and is not a host plaintext.
     pub fn sample_payload_secret(&self) -> Result<RnsBggPayloadSecret, RnsBggError> {
         let ring = self.ring(0)?;
         Ok(RnsBggPayloadSecret {
@@ -161,6 +148,10 @@ impl RnsBggScheme {
             context: self.context,
         })
     }
+    /// Sample the online mask secret at the scheme's base level.
+    ///
+    /// The returned value remains in the scheme context and is reduced only
+    /// when an operation targets a concrete modulus-chain level.
     pub fn sample_mask_secret(&self) -> Result<RnsBggMaskSecret, RnsBggError> {
         let ring = self.ring(0)?;
         Ok(RnsBggMaskSecret {
@@ -184,7 +175,17 @@ impl RnsBggScheme {
         ]])
         .map_err(|e| RnsBggError::Graph(e.to_string()))
     }
-    pub fn payload_at(
+    /// Reduce the payload secret into the exact modulus of `level`.
+    ///
+    /// This only constructs the corresponding DSL reduction expression; it
+    /// does not sample, mutate, or rescale the secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RnsBggError::Context`] when the secret belongs to another
+    /// scheme context, or [`RnsBggError::Parameters`] when `level` is outside
+    /// the configured modulus chain.
+    pub fn reduce_payload_secret_modulus(
         &self,
         secret: &RnsBggPayloadSecret,
         level: usize,
@@ -195,7 +196,17 @@ impl RnsBggScheme {
         let modulus = BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
         Ok(secret.row.clone().reduce_modulus(modulus))
     }
-    pub fn mask_at(
+    /// Reduce the mask secret into the exact modulus of `level`.
+    ///
+    /// This only constructs the corresponding DSL reduction expression; it
+    /// does not sample, mutate, or rescale the secret.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RnsBggError::Context`] when the secret belongs to another
+    /// scheme context, or [`RnsBggError::Parameters`] when `level` is outside
+    /// the configured modulus chain.
+    pub fn reduce_mask_secret_modulus(
         &self,
         secret: &RnsBggMaskSecret,
         level: usize,
@@ -222,7 +233,7 @@ impl RnsBggScheme {
         {
             return Err(RnsBggError::Context);
         }
-        let s = self.mask_at(secret, key.level)?;
+        let s = self.reduce_mask_secret_modulus(secret, key.level)?;
         let row = s * key.matrix.clone() +
             material.row.clone() +
             self.small_error_row(key.level, self.parameters.component_columns(key.level)?)?;
@@ -246,6 +257,11 @@ impl RnsBggScheme {
         }
         Ok(())
     }
+    /// Build online mask rows for one sampled mask bank.
+    ///
+    /// Public bank branches are captured once and the indexed DSL body selects
+    /// the appropriate automorphism. Fresh Gaussian errors are sampled in the
+    /// graph at the bank level; this method does not execute the backend.
     pub fn prepare_online_masks(
         &self,
         secret: &RnsBggMaskSecret,
@@ -255,7 +271,7 @@ impl RnsBggScheme {
             return Err(RnsBggError::Context);
         }
         let level = bank.level;
-        let s = self.mask_at(secret, level)?;
+        let s = self.reduce_mask_secret_modulus(secret, level)?;
         let p = self.scalar(level, self.parameters.scale(level)?.clone())?;
         let gadget = self.state_gadget(level)?;
         let columns = self.parameters.component_columns(level)?;
@@ -285,6 +301,10 @@ impl RnsBggScheme {
             .collect();
         Ok(RnsBggOnlineMasks { id: bank.id, level, context: self.context, rows: Arc::new(rows) })
     }
+    /// Evaluate a prepared unary LUT and perform its single output ModDown.
+    ///
+    /// The helper table, mask-bank identity, level, and key identity are
+    /// checked before the raw accumulator is switched to the output modulus.
     pub fn evaluate_lut(
         &self,
         input: &RnsBggEncoding,
@@ -361,6 +381,10 @@ impl RnsBggScheme {
         }
         Ok(())
     }
+    /// Evaluate a prepared unary LUT independently for every family member.
+    ///
+    /// The family range is preserved and the shared online mask bank is
+    /// captured outside the indexed body.
     pub fn evaluate_lut_family(
         &self,
         input: &RnsBggEncodingFamily,
@@ -369,13 +393,8 @@ impl RnsBggScheme {
     ) -> Result<RnsBggEncodingFamily, RnsBggError> {
         self.check_encoding_family(input, &prepared.input)?;
         let rows = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let scalar = RnsBggEncoding {
-                row: input.rows.at(&index),
-                level: input.level,
-                key_id: input.key_id,
-                context: input.context,
-            };
-            self.evaluate_lut(&scalar, &prepared.prepared.at(&index), masks)
+            let scalar = input.element_at_local(index.clone());
+            self.evaluate_lut(&scalar, &prepared.prepared.at(index), masks)
                 .map(|value| value.row)
                 .map_err(|_| DslError::Schema)
         })?;
@@ -387,6 +406,10 @@ impl RnsBggScheme {
             range: input.range.clone(),
         })
     }
+    /// Apply an Add or public multiplication independently to a family.
+    ///
+    /// Both inputs must have matching level, key, context, and family range;
+    /// no backend work is performed while building this graph.
     pub fn evaluate_linear_family(
         &self,
         lhs: &RnsBggEncodingFamily,
@@ -396,11 +419,22 @@ impl RnsBggScheme {
         self.check_encoding_family(lhs, &prepared.lhs)?;
         self.check_encoding_family(rhs, &prepared.rhs)?;
         let rows = mxx_dsl::parallel(lhs.range.count().clone(), |index| {
-            let left = lhs.rows.at(&index);
-            Ok(match &prepared.operation {
-                LinearOperation::MulPublic(multiplier) => multiplier.at(&index) * left,
-                LinearOperation::Add => left + rhs.rows.at(&index),
-            })
+            let left = lhs.element_at_local(index.clone());
+            let right = rhs.element_at_local(index.clone());
+            let scalar_prepared = RnsBggPreparedLinear {
+                lhs: prepared.lhs.element_at_local(index.clone()),
+                rhs: prepared.rhs.element_at_local(index.clone()),
+                output: prepared.output.element_at_local(index.clone()),
+                operation: match &prepared.operation {
+                    LinearOperation::Add => LinearOperation::Add,
+                    LinearOperation::MulPublic(multiplier) => {
+                        LinearOperation::MulPublic(multiplier.at(index))
+                    }
+                },
+            };
+            self.evaluate_linear(&left, &right, &scalar_prepared)
+                .map(|value| value.row)
+                .map_err(|_| DslError::Schema)
         })
         .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         Ok(RnsBggEncodingFamily {
@@ -411,6 +445,10 @@ impl RnsBggScheme {
             range: lhs.range.clone(),
         })
     }
+    /// Reduce a family of encoding rows into one scalar encoding.
+    ///
+    /// The family sum is formed at the current level. Any later terminal
+    /// finalization remains an explicit operation.
     pub fn evaluate_reduce_family(
         &self,
         value: &RnsBggEncodingFamily,
@@ -430,7 +468,9 @@ impl RnsBggScheme {
             context: self.context,
         })
     }
-    pub fn evaluate_terminal<P>(
+    /// Build the terminal accumulator at the input modulus without executing
+    /// the backend or performing the final modulus switch.
+    pub fn evaluate_terminal_raw<P>(
         &self,
         input: &RnsBggEncoding,
         prepared: &RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, P>,
@@ -449,6 +489,11 @@ impl RnsBggScheme {
             stages: vec![prepared.id],
         })
     }
+    /// Apply the one final terminal ModDown to a raw accumulator.
+    ///
+    /// The raw value must come from the same scheme, terminal stage list, and
+    /// input level as `public`. This method constructs the graph switch; it
+    /// does not expose a backend result or permit an arbitrary switch level.
     pub fn finalize_terminal_encoding(
         &self,
         raw: RnsBggTerminalAccumulator<RnsBggRow>,
@@ -476,16 +521,22 @@ impl RnsBggScheme {
         self.check_encoding_family(input, &prepared.input)?;
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
         let input = input.clone().into_program()?;
-        let raw = crate::readout::evaluate_terminal_value(
+        let raw = crate::rns_bgg::terminal::evaluate_terminal_value(
             self,
             &input,
             &ProgramValue::Family(prepared.cache.clone()),
             masks,
             prepared.mode == RnsBggTerminalFamilyMode::Sum,
-            |raw| Ok(if prepared.finalize { raw.value.block_mod_switch(next) } else { raw.value }),
+            |raw| {
+                Ok(if prepared.finalization.is_finalized() {
+                    raw.value.block_mod_switch(next)
+                } else {
+                    raw.value
+                })
+            },
         )
         .map_err(|error| match error {
-            crate::readout::TerminalError::Scheme(error) => error,
+            crate::rns_bgg::TerminalError::Scheme(error) => error,
             error => RnsBggError::Graph(error.to_string()),
         })?;
         match raw {
@@ -494,6 +545,10 @@ impl RnsBggScheme {
         }
     }
 
+    /// Sample one private RHS ciphertext for a payload at a given level.
+    ///
+    /// The hash key and domain tag identify the fresh sampling source. The
+    /// returned ciphertext is preprocessing material and is not executed here.
     pub fn sample_private_rhs(
         &self,
         secret: &RnsBggPayloadSecret,
@@ -523,7 +578,7 @@ impl RnsBggScheme {
         level: usize,
     ) -> Result<(Mat, RnsBggRow), RnsBggError> {
         let next = level + 1;
-        let r = self.payload_at(secret, next)?;
+        let r = self.reduce_payload_secret_modulus(secret, next)?;
         let prefix = -r.entry(0, 0).clone();
         let scaled = self.scalar(next, self.parameters.scale(next)?.clone())? * r;
         let gadget = self.state_gadget(next)?;
@@ -600,11 +655,76 @@ impl RnsBggScheme {
             id,
         })
     }
-    /// `id` is a setup artifact identity, unique to this generated helper
-    /// material (including its mask bank). Persist it with the material and
-    /// reuse it on import; equal table/RHS identities alone are insufficient.
-    /// This caller contract avoids hashing ciphertext coefficients online.
+    /// Sample unary LUT helper material for a concrete table.
+    ///
+    /// The table is part of the helper identity and is required even when the
+    /// caller wants an identity transform; use the internal identity entry
+    /// point for that special operation. This constructs graph nodes and
+    /// samples fresh Gaussian errors; it does not prepare an input public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RnsBggError::Lut`] for a binary LUT or an invalid table, and
+    /// [`RnsBggError::Context`] for a secret/bank or RHS modulus mismatch.
     pub fn sample_lut_material(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        table: &LutTable,
+        bank: &RnsBggMaskBank,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        id: [u8; 32],
+    ) -> Result<RnsBggLutMaterial, RnsBggError> {
+        if table.rhs_width().is_some() {
+            return Err(RnsBggError::Lut);
+        }
+        self.sample_lut_material_with_options(secret, Some(table), None, bank, hash_key, tag, id)
+    }
+
+    /// Construct the identity helper used by composed selectors.
+    ///
+    /// This named entry point is intentionally separate from
+    /// [`Self::sample_lut_material`]: it has no registered table and its
+    /// identity operation is represented by `table = None` in the artifact
+    /// metadata. It constructs graph nodes and samples fresh Gaussian errors;
+    /// input public-key preparation remains a separate operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RnsBggError::Context`] when the secret or mask bank belongs to
+    /// another scheme context, or when the requested parameter level is
+    /// unavailable.
+    #[cfg(test)]
+    pub(super) fn sample_identity_lut_material(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        bank: &RnsBggMaskBank,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        id: [u8; 32],
+    ) -> Result<RnsBggLutMaterial, RnsBggError> {
+        self.sample_lut_material_with_options(secret, None, None, bank, hash_key, tag, id)
+    }
+
+    /// Internal selector-composition helper. The RHS is intentionally kept
+    /// separate from the public unary LUT contract and is never metadata for
+    /// a normal table helper.
+    #[cfg(test)]
+    pub(super) fn sample_identity_lut_material_with_rhs(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        rhs: RnsBggRhsPlaintext,
+        bank: &RnsBggMaskBank,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        id: [u8; 32],
+    ) -> Result<RnsBggLutMaterial, RnsBggError> {
+        self.sample_lut_material_with_options(secret, None, Some(rhs), bank, hash_key, tag, id)
+    }
+
+    /// Cryptographic common implementation for unary, identity, and selector
+    /// composition paths. These options are not exposed through the normal API.
+    fn sample_lut_material_with_options(
         &self,
         secret: &RnsBggPayloadSecret,
         table: Option<&LutTable>,
@@ -631,7 +751,7 @@ impl RnsBggScheme {
         let sigmas = layout
             .automorphism_indices(self.parameters.level(next)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
-        let r = self.payload_at(secret, next)?;
+        let r = self.reduce_payload_secret_modulus(secret, next)?;
         let prefix = r.entry(0, 0).clone();
         let root = tag.into();
         let mut branches = Vec::with_capacity(width);
@@ -704,7 +824,8 @@ impl RnsBggScheme {
         debug_assert_eq!(layout.width(), bank.branches.len());
         let columns = self.parameters.component_columns(level)?;
         let gadget = self.state_gadget(level)?;
-        let payload = self.payload_at(secret, level)?.map(|entry| entry * gadget.clone());
+        let payload =
+            self.reduce_payload_secret_modulus(secret, level)?.map(|entry| entry * gadget.clone());
         let transform = RnsBggMatrix::from_rows(
             self.scalar(level, -BigInt::from(scale * self.parameters.scale(level)?))? * payload,
             RnsBggRow::new([[ring.zero((1, columns)), ring.zero((1, columns))]])?,
@@ -712,10 +833,70 @@ impl RnsBggScheme {
         self.sample_terminal_material(secret, None, None, Some(&transform), bank, hash_key, tag, id)
             .map(ProgramValue::Scalar)
     }
-    /// `id` identifies the complete generated family and its mask bank.
-    /// Preserve it across artifact storage/import; allocate a new identity
-    /// when regenerating the material, even for the same table and RHS.
+    /// Sample a family of unary LUT helpers for one concrete table.
+    ///
+    /// The returned family is a graph-backed batch of helper ciphertexts. A
+    /// family may be reused only with the same table, mask-bank identity,
+    /// level, context, and member count; input public-key preparation is a
+    /// separate operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RnsBggError::Lut`] for a binary LUT and
+    /// [`RnsBggError::Context`] for an invalid family/bank context.
     pub fn sample_lut_material_family(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        table: &LutTable,
+        bank: &RnsBggMaskBank,
+        count: IntExpr,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        id: [u8; 32],
+    ) -> Result<RnsBggLutMaterialFamily, RnsBggError> {
+        if table.rhs_width().is_some() {
+            return Err(RnsBggError::Lut);
+        }
+        self.sample_lut_material_family_with_options(
+            secret,
+            Some(table),
+            None,
+            bank,
+            count,
+            hash_key,
+            tag,
+            id,
+        )
+    }
+
+    /// Internal identity-family helper for a selector family, where the RHS
+    /// is a composed multiplier and not LUT metadata.
+    #[cfg(test)]
+    pub(super) fn sample_identity_lut_material_family_with_rhs(
+        &self,
+        secret: &RnsBggPayloadSecret,
+        rhs: &RnsBggRhsPlaintextFamily,
+        bank: &RnsBggMaskBank,
+        count: IntExpr,
+        hash_key: Bytes,
+        tag: impl Into<HashTag>,
+        id: [u8; 32],
+    ) -> Result<RnsBggLutMaterialFamily, RnsBggError> {
+        self.sample_lut_material_family_with_options(
+            secret,
+            None,
+            Some(rhs),
+            bank,
+            count,
+            hash_key,
+            tag,
+            id,
+        )
+    }
+
+    /// Cryptographic common implementation for unary and selector-family
+    /// composition paths. These options are not exposed through the normal API.
+    fn sample_lut_material_family_with_options(
         &self,
         secret: &RnsBggPayloadSecret,
         table: Option<&LutTable>,
@@ -755,7 +936,7 @@ impl RnsBggScheme {
             let mut tag = root;
             tag.push(index.clone());
             let material = self
-                .sample_lut_material(
+                .sample_lut_material_with_options(
                     secret,
                     table,
                     rhs.map(|rhs| RnsBggRhsPlaintext {
@@ -908,7 +1089,7 @@ impl RnsBggScheme {
         };
         let masks =
             bank.branches.iter().map(|branch| (branch.sigma, branch)).collect::<BTreeMap<_, _>>();
-        let r = self.payload_at(secret, next)?;
+        let r = self.reduce_payload_secret_modulus(secret, next)?;
         let modulus = BigInt::from(self.parameters.level(next)?.modulus().as_ref().clone());
         let inverse =
             modular_inverse(&BigInt::from(sigmas.len()), &modulus).ok_or(RnsBggError::Lut)?;
@@ -1269,7 +1450,10 @@ pub(crate) mod private_mul_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(samplers.len(), 1);
-        assert_eq!(samplers[0].0, &parameters.encoding_error_sigma_expr());
+        assert_eq!(
+            samplers[0].0,
+            &crate::utils::decimal_to_real_expr(parameters.encoding_error_sigma()).unwrap()
+        );
         assert_eq!(samplers[0].1, &IntExpr::from(parameters.encoding_error_bound.clone()));
     }
 
@@ -1669,9 +1853,9 @@ pub(crate) mod private_mul_tests {
         );
         assert_eq!(output.level, 1);
 
-        let s = scheme.mask_at(&secrets.mask, 0).unwrap();
-        let r = scheme.payload_at(&secrets.payload, 0).unwrap();
-        let r_low = scheme.payload_at(&secrets.payload, 1).unwrap();
+        let s = scheme.reduce_mask_secret_modulus(&secrets.mask, 0).unwrap();
+        let r = scheme.reduce_payload_secret_modulus(&secrets.payload, 0).unwrap();
+        let r_low = scheme.reduce_payload_secret_modulus(&secrets.payload, 1).unwrap();
         let input_gadget = scheme.state_gadget(0).unwrap();
         let output_gadget = scheme.state_gadget(1).unwrap();
         let r = r.map(|entry| entry * input_gadget.clone());
@@ -1681,7 +1865,8 @@ pub(crate) mod private_mul_tests {
         let error_rhs = r_low.clone() * rhs.ciphertext.clone() -
             next_scale.clone() * nu.clone() * payload_row.clone();
         let error_out = output.row.clone() -
-            scheme.mask_at(&secrets.mask, 1).unwrap() * prepared.output.matrix.clone() +
+            scheme.reduce_mask_secret_modulus(&secrets.mask, 1).unwrap() *
+                prepared.output.matrix.clone() +
             next_scale.clone() *
                 mu.clone().reduce_modulus(q_low.clone()) *
                 nu.clone() *
@@ -1755,7 +1940,7 @@ pub(crate) mod private_mul_tests {
             .filter(|node| matches!(node.kind(), NodeKind::BlockModSwitch { .. }))
             .count();
         assert_eq!(switches, 6, "family size must not expand the operation body");
-        let s_low = scheme.mask_at(&secrets.mask, 1).unwrap();
+        let s_low = scheme.reduce_mask_secret_modulus(&secrets.mask, 1).unwrap();
         let payload_term = next_scale * mu.reduce_modulus(q_low.clone()) * nu * payload_row;
         let family_error = mxx_dsl::parallel(count, |index| {
             Ok(family_output.rows.at(&index) -
@@ -2061,10 +2246,11 @@ pub(super) mod prf_tests {
         let mut graph = DslContext::new("rns_bgg-composed-prf-relations");
         for (label, exponent) in expected.into_iter().enumerate() {
             let error = encoding.at(label).0.row -
-                scheme.mask_at(&secrets.mask, 2).unwrap() * key.at(label).0.matrix +
+                scheme.reduce_mask_secret_modulus(&secrets.mask, 2).unwrap() *
+                    key.at(label).0.matrix +
                 scheme.scalar(2, parameters.scale(2).unwrap().clone()).unwrap() *
                     layout.mono(&low, &BigInt::from(exponent)).unwrap() *
-                    scheme.payload_at(&secrets.payload, 2).unwrap();
+                    scheme.reduce_payload_secret_modulus(&secrets.payload, 2).unwrap();
             graph = graph.output(format!("error-{label}"), error).unwrap();
         }
         let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
@@ -2359,10 +2545,8 @@ pub(crate) mod encoding_tests {
             )
             .unwrap();
         let lut_material = scheme
-            .sample_lut_material(
+            .sample_identity_lut_material(
                 &payload_secret,
-                None,
-                None,
                 &bank,
                 seed.clone(),
                 b"lut".as_slice(),
@@ -2389,10 +2573,9 @@ pub(crate) mod encoding_tests {
             id: rand::random(),
         };
         let family_material = scheme
-            .sample_lut_material_family(
+            .sample_identity_lut_material_family_with_rhs(
                 &payload_secret,
-                None,
-                Some(&rhs),
+                &rhs,
                 &bank,
                 2.into(),
                 seed.clone(),
@@ -2650,25 +2833,35 @@ pub(crate) mod encoding_tests {
             )
             .unwrap();
         let q = parameters.level(1).unwrap().modulus();
-        let s = scheme.mask_at(&secret.mask, 1).unwrap();
-        let r = scheme.payload_at(&secret.payload, 1).unwrap();
+        let s = scheme.reduce_mask_secret_modulus(&secret.mask, 1).unwrap();
+        let r = scheme.reduce_payload_secret_modulus(&secret.payload, 1).unwrap();
 
         let mut graph = DslContext::new("rns_bgg-identity-selectors");
         for (case, selector) in [Some(0u8), Some(1), None].into_iter().enumerate() {
-            let material = scheme
-                .sample_lut_material(
-                    &secret.payload,
-                    None,
-                    selector.map(|bit| RnsBggRhsPlaintext {
-                        payload: scheme.scalar(1, bit).unwrap(),
-                        id: rand::random(),
-                    }),
-                    &bank,
-                    hash_key.clone(),
-                    format!("identity-{case}").into_bytes(),
-                    rand::random(),
-                )
-                .unwrap();
+            let material = match selector {
+                Some(bit) => scheme
+                    .sample_identity_lut_material_with_rhs(
+                        &secret.payload,
+                        RnsBggRhsPlaintext {
+                            payload: scheme.scalar(1, bit).unwrap(),
+                            id: rand::random(),
+                        },
+                        &bank,
+                        hash_key.clone(),
+                        format!("identity-{case}").into_bytes(),
+                        rand::random(),
+                    )
+                    .unwrap(),
+                None => scheme
+                    .sample_identity_lut_material(
+                        &secret.payload,
+                        &bank,
+                        hash_key.clone(),
+                        format!("identity-{case}").into_bytes(),
+                        rand::random(),
+                    )
+                    .unwrap(),
+            };
             assert_eq!(material.table_commitment(), None);
             assert_eq!(material.has_rhs(), selector.is_some());
             let prepared = scheme.prepare_lut(&key, &material, rand::random()).unwrap();
@@ -2777,8 +2970,7 @@ pub(crate) mod encoding_tests {
         let second_material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(&flip),
-                None,
+                &flip,
                 &mask1,
                 hash_key.clone(),
                 b"second".as_slice(),
@@ -2788,8 +2980,7 @@ pub(crate) mod encoding_tests {
         let material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &mask0,
                 hash_key.clone(),
                 b"shared-first-lut".as_slice(),
@@ -2834,8 +3025,8 @@ pub(crate) mod encoding_tests {
                 let value = flip.values()[table.values()[x + 2 * y]];
                 let expected_mu =
                     layout.mono(&scheme.ring(3).unwrap(), &BigInt::from(value)).unwrap();
-                let s = scheme.mask_at(&secret.mask, 3).unwrap();
-                let r = scheme.payload_at(&secret.payload, 3).unwrap();
+                let s = scheme.reduce_mask_secret_modulus(&secret.mask, 3).unwrap();
+                let r = scheme.reduce_payload_secret_modulus(&secret.payload, 3).unwrap();
                 let error =
                     second.row - s * second_prepared.output_key().matrix.clone() + expected_mu * r;
 
@@ -3414,10 +3605,9 @@ pub(crate) mod family_tests {
             )
             .unwrap();
         let material = scheme
-            .sample_lut_material_family(
+            .sample_identity_lut_material_family_with_rhs(
                 &secret.payload,
-                None,
-                Some(&selectors),
+                &selectors,
                 &rhs_bank,
                 4.into(),
                 hash_key.clone(),
@@ -3428,8 +3618,7 @@ pub(crate) mod family_tests {
         let lut_material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &bank,
                 hash_key,
                 b"shared-composed-lut".as_slice(),
@@ -3970,6 +4159,33 @@ mod program_tests {
         let online_bank = scheme.prepare_online_masks(&secret.mask, &bank).unwrap();
         let layout = ExpLayout { stride_log2: 0, width_log2: 2 };
         let table = LutTable::binary(2, 2, 2, vec![1, 1, 1, 0]).unwrap();
+        assert!(
+            scheme
+                .sample_lut_material(
+                    &secret.payload,
+                    &table,
+                    &bank,
+                    hash_key.clone(),
+                    b"rejected-binary-lut".as_slice(),
+                    rand::random(),
+                )
+                .is_err(),
+            "the public LUT helper contract accepts unary tables only"
+        );
+        assert!(
+            scheme
+                .sample_lut_material_family(
+                    &secret.payload,
+                    &table,
+                    &bank,
+                    2.into(),
+                    hash_key.clone(),
+                    b"rejected-binary-family".as_slice(),
+                    rand::random(),
+                )
+                .is_err(),
+            "the public LUT-family helper contract accepts unary tables only"
+        );
         let mut builder = ExponentLutProgramBuilder::new();
         builder.set_layout(layout, n as usize).unwrap();
         let input = builder
@@ -3995,17 +4211,17 @@ mod program_tests {
         let material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(table),
-                None,
+                table,
                 &bank,
                 hash_key.clone(),
                 b"shared-unary-lut".as_slice(),
                 rand::random(),
             )
             .unwrap();
+        assert!(!material.has_rhs(), "a normal unary helper never carries RHS metadata");
         assert!(
             scheme
-                .sample_lut_material(
+                .sample_lut_material_with_options(
                     &secret.payload,
                     Some(table),
                     Some(RnsBggRhsPlaintext {
@@ -4297,7 +4513,7 @@ pub(crate) mod terminal_tests {
                 rand::random(),
             )
             .unwrap();
-        use crate::readout::{PreparedTerminal, TerminalError};
+        use crate::rns_bgg::{PreparedTerminal, TerminalError};
         let public_a = (key_a.clone(), None);
         let public_b = (key_b.clone(), None);
         let prepared =
@@ -4435,8 +4651,9 @@ pub(crate) mod terminal_tests {
                 &scheme.prepare_input(&secret.payload, &key_a, high.identity(1)).unwrap(),
             )
             .unwrap();
-        assert!(scheme.evaluate_terminal(&wrong_input, &prepared_b, &online_bank).is_err());
-        let incomplete = scheme.evaluate_terminal(&wrong_input, &prepared_a, &online_bank).unwrap();
+        assert!(scheme.evaluate_terminal_raw(&wrong_input, &prepared_b, &online_bank).is_err());
+        let incomplete =
+            scheme.evaluate_terminal_raw(&wrong_input, &prepared_a, &online_bank).unwrap();
         assert!(scheme.finalize_terminal_encoding(incomplete, &public).is_err());
         let mut wrong = prepared_b.public_accumulator();
         wrong.context[0] ^= 1;
@@ -4527,7 +4744,7 @@ pub(crate) mod terminal_tests {
                 .finalize_terminal_public(prepared.public_accumulator())
                 .map_err(|_| mxx_dsl::DslError::Schema)?;
             let raw = scheme
-                .evaluate_terminal(&input, &prepared, &masks)
+                .evaluate_terminal_raw(&input, &prepared, &masks)
                 .map_err(|_| mxx_dsl::DslError::Schema)?;
             let output = scheme
                 .finalize_terminal_encoding(raw, &public)

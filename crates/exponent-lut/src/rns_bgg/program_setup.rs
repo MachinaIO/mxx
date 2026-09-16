@@ -9,36 +9,49 @@
 
 use super::*;
 use crate::{
-    program::{AttributeKnowledge, Gate, ProgramInputId, ProgramStep, RhsId, WireId},
+    program::{
+        AttributeKnowledge, Gate, ProgramFamilyId, ProgramInputId, ProgramStep, RhsId, WireId,
+    },
     scheme::{PreparedProgram, PreparedProgramDescriptor},
 };
 use mxx_ir_core::encoding::hash_canonical;
+use num_traits::ToPrimitive;
 
 /// A native polynomial exponent: this encodes X^native_exponent, not an
 /// unscaled selector. The application owns packing such as `lhs_width * bit`.
 #[derive(Clone)]
-pub struct RnsBggProgramInput {
+pub(crate) struct RnsBggProgramInput {
+    /// Input key level selected by the caller and checked against parameters.
     pub level: usize,
+    /// Native exponent of `X^b`; packing/stride is not applied a second time.
     pub native_exponent: BigInt,
 }
 
 /// Caller-owned domain separation. Use a fresh nonce for an independent setup;
 /// reuse it only when deliberately reconstructing the same setup's hash sites.
 /// The seed input is public hash-sampler entropy, not a payload or mask secret.
-pub struct RnsBggSetupDomain {
+pub(crate) struct RnsBggSetupDomain {
+    /// Public hash-sampler entropy supplied by the caller.
     pub seed: Bytes,
+    /// Domain label identifying the setup role.
     pub label: Vec<u8>,
+    /// Fresh setup identity nonce; reuse reconstructs the same sampling sites.
     pub nonce: [u8; 32],
 }
 
 /// Scalar plaintext bindings. Every declared input and RHS must appear exactly
 /// once. RHS exponents already include the Program's packing/stride.
-pub struct RnsBggProgramSetup {
+pub(crate) struct RnsBggProgramSetup {
+    /// Exactly the Program's declared scalar inputs.
     pub inputs: BTreeMap<ProgramInputId, RnsBggProgramInput>,
+    /// Exactly the Program's declared scalar RHS inputs.
     pub rhs: BTreeMap<RhsId, BigInt>,
+    /// Caller-owned seed, label, and nonce used for domain-separated setup.
     pub domain: RnsBggSetupDomain,
 }
 
+/// Serialized prepared-Program descriptor used by the authenticated export
+/// and import path. Its schema is owned by the prepared graph implementation.
 pub(super) type ProgramDescriptor = PreparedProgramDescriptor<
     <RnsBggProgramCache as GraphValue>::Schema,
     <(RnsBggPublicKey, Option<Mat>) as GraphValue>::Schema,
@@ -52,10 +65,14 @@ struct InputDescriptor {
     level: usize,
 }
 
+/// Stable identity metadata for one ordered private-RHS gate use.
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct GateRhsIdentity {
+    /// Ordered root or family gate instance consuming this RHS package.
     pub(super) gate: ProgramGateInstance,
+    /// Declared RHS identity referenced by the gate.
     pub(super) rhs: RhsId,
+    /// Stable sampled package identity, not a secret or ciphertext payload.
     pub(super) identity: [u8; 32],
 }
 
@@ -81,9 +98,12 @@ impl RnsBggProgramDescriptor {
 
 /// Public preprocessing and private input contributions, ready to export or
 /// evaluate. The mask secret is supplied only at online graph construction.
-pub struct RnsBggPreparedProgram {
+pub(crate) struct RnsBggPreparedProgram {
+    /// Prepared public graph and its authenticated descriptor state.
     pub(super) prepared: PreparedProgram<RnsBggScheme>,
+    /// Private input material retained for the caller's online encoding step.
     pub(super) inputs: BTreeMap<ProgramInputId, (RnsBggPublicKey, RnsBggInputMaterial)>,
+    /// Ordered RHS identities used to bind deterministic online helper reuse.
     pub(super) rhs: Vec<GateRhsIdentity>,
 }
 
@@ -95,56 +115,389 @@ fn program_error(error: impl std::fmt::Display) -> RnsBggError {
     RnsBggError::Graph(error.to_string())
 }
 
+/// The operation class required by one ordered program gate.  This is purely
+/// structural metadata: it never contains a secret, matrix, sampled helper,
+/// or runtime artifact.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum GateRequirement {
+    /// Level-preserving addition of two wires.
+    Add { lhs: WireId, rhs: WireId, output: WireId },
+    /// Level-preserving multiplication by a public wire.
+    MulPublic { private: WireId, public: WireId, output: WireId },
+    /// Private RHS multiplication, which transfers to the next level.
+    MulPrivate { lhs: WireId, rhs: RhsId, output: WireId },
+    /// Unary LUT helper application, which transfers to the next level.
+    Lut { input: WireId, lut_id: LutId, output: WireId },
+}
+
+/// One gate together with the scope identity and checked transfer levels used
+/// by every setup/interpreter.  `None` means that a family member's level is
+/// supplied by its bound runtime value rather than guessed by the host.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct GateRequirementRecord {
+    /// Root or local-family operation identity, preserving ordered scope.
+    pub(crate) instance: ProgramGateInstance,
+    /// Structural operation and its wire/RHS/LUT references.
+    pub(crate) gate: GateRequirement,
+    /// Input level, if statically known from verified metadata.
+    pub(crate) input_level: Option<usize>,
+    /// Output level after the checked operation transfer.
+    pub(crate) output_level: Option<usize>,
+    /// Whether the operation consumes a sampled LUT/RHS helper.
+    pub(crate) helper_required: bool,
+}
+
+/// Structural requirements for one indexed family invocation. This record is
+/// metadata only; it does not contain one entry per family member.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FamilyRequirementRecord {
+    /// Enclosing Program step containing the family body.
+    pub(crate) step: usize,
+    /// Structural family identity, separate from local wire IDs.
+    pub(crate) id: ProgramFamilyId,
+    /// Declared structural capacity; no host member expansion occurs.
+    pub(crate) capacity: usize,
+    /// Verified active range metadata for this invocation.
+    pub(crate) range: Option<FamilyRange>,
+    /// Ordered body gate requirements, visited once.
+    pub(crate) gates: Vec<GateRequirementRecord>,
+    /// Root output wire receiving the family aggregation.
+    pub(crate) output: WireId,
+}
+
+/// Verified levels for externally supplied indexed family values. The program
+/// itself remains the source of family shape and stride facts; this metadata
+/// supplies the runtime level facts needed to check linear gates without
+/// treating an unknown member level as compatible with every other level.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ProgramFamilyInputMetadata {
+    /// Verified levels for externally bound family wire members.
+    pub(crate) wire_levels: BTreeMap<crate::program::WireFamilyId, usize>,
+    /// Verified levels for externally bound family RHS members.
+    pub(crate) rhs_levels: BTreeMap<crate::program::RhsFamilyId, usize>,
+}
+
+/// The single structural contract consumed by program-driven setup.  It
+/// records declarations, level transfers, ordered gate identities, and family
+/// scopes while deliberately excluding all cryptographic values and sampling.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProgramRequirements {
+    /// Declaration-to-root-wire mapping.
+    pub(crate) input_wires: BTreeMap<ProgramInputId, WireId>,
+    /// Caller-provided scalar input levels.
+    pub(crate) input_levels: BTreeMap<ProgramInputId, usize>,
+    /// Statically known root wire levels.
+    pub(crate) wire_levels: BTreeMap<WireId, usize>,
+    /// Ordered root gate requirements.
+    pub(crate) gates: Vec<GateRequirementRecord>,
+    /// Symbolic family body requirements and verified ranges.
+    pub(crate) families: Vec<FamilyRequirementRecord>,
+    /// Output wires and their statically known levels.
+    pub(crate) outputs: Vec<(WireId, Option<usize>)>,
+}
+
+fn requirement_gate(gate: &Gate) -> GateRequirement {
+    match gate {
+        Gate::Add { lhs, rhs, output } => {
+            GateRequirement::Add { lhs: *lhs, rhs: *rhs, output: *output }
+        }
+        Gate::MulPublic { private, public, output } => {
+            GateRequirement::MulPublic { private: *private, public: *public, output: *output }
+        }
+        Gate::MulPrivate { lhs, rhs, output } => {
+            GateRequirement::MulPrivate { lhs: *lhs, rhs: *rhs, output: *output }
+        }
+        Gate::Lut { input, lut_id, output } => {
+            GateRequirement::Lut { input: *input, lut_id: *lut_id, output: *output }
+        }
+    }
+}
+
+fn gate_input_level(
+    gate: &GateRequirement,
+    levels: &BTreeMap<WireId, Option<usize>>,
+) -> Option<usize> {
+    match gate {
+        GateRequirement::Add { lhs, .. } | GateRequirement::MulPublic { private: lhs, .. } => {
+            levels.get(lhs).copied().flatten()
+        }
+        GateRequirement::MulPrivate { lhs, .. } | GateRequirement::Lut { input: lhs, .. } => {
+            levels.get(lhs).copied().flatten()
+        }
+    }
+}
+
+fn derive_scope_gates(
+    gates: impl IntoIterator<Item = (ProgramGateInstance, Gate)>,
+    mut levels: BTreeMap<WireId, Option<usize>>,
+) -> Result<(Vec<GateRequirementRecord>, BTreeMap<WireId, Option<usize>>), RnsBggError> {
+    let mut requirements = Vec::new();
+    for (instance, gate) in gates {
+        let required = requirement_gate(&gate);
+        let input_level = gate_input_level(&required, &levels);
+        let output = match &required {
+            GateRequirement::Add { lhs, rhs, output } => {
+                if let (Some(lhs), Some(rhs)) =
+                    (levels.get(lhs).copied().flatten(), levels.get(rhs).copied().flatten()) &&
+                    lhs != rhs
+                {
+                    return Err(RnsBggError::Context);
+                }
+                *output
+            }
+            GateRequirement::MulPublic { private, public, output } => {
+                if let (Some(private), Some(public)) =
+                    (levels.get(private).copied().flatten(), levels.get(public).copied().flatten()) &&
+                    private != public
+                {
+                    return Err(RnsBggError::Context);
+                }
+                *output
+            }
+            GateRequirement::MulPrivate { output, .. } | GateRequirement::Lut { output, .. } => {
+                *output
+            }
+        };
+        let output_level = match &required {
+            GateRequirement::MulPrivate { .. } | GateRequirement::Lut { .. } => input_level
+                .map(|level| level.checked_add(1).ok_or(RnsBggError::Context))
+                .transpose()?,
+            GateRequirement::Add { lhs, .. } | GateRequirement::MulPublic { private: lhs, .. } => {
+                levels.get(lhs).copied().flatten()
+            }
+        };
+        levels.insert(output, output_level);
+        requirements.push(GateRequirementRecord {
+            instance,
+            gate: required,
+            input_level,
+            output_level,
+            helper_required: matches!(gate, Gate::MulPrivate { .. } | Gate::Lut { .. }),
+        });
+    }
+    Ok((requirements, levels))
+}
+
+/// Derive the structural contract consumed by program-driven setup.
+///
+/// The scalar input levels and verified family metadata are caller/runtime
+/// facts; the frozen Program remains the source of ordered gates, wire
+/// declarations, family capacity, and local scope. The derivation performs no
+/// sampling, matrix construction, secret handling, artifact I/O, or backend
+/// execution. Missing or extra declarations and family metadata fail closed.
+/// Family bodies are walked once in a local namespace, with
+/// `FamilyProgram::bind_inputs` providing the root/local binding boundary;
+/// members are represented symbolically rather than expanded on the host.
+/// Private multiplication and LUT gates transfer to the next logical level,
+/// while addition and public multiplication preserve their level. A Program
+/// step index is never treated as a cryptographic level index.
+pub(crate) fn derive_program_requirements(
+    program: &ExponentLutProgram,
+    input_levels: &BTreeMap<ProgramInputId, usize>,
+    family_metadata: &ProgramFamilyBindings,
+    family_inputs: &ProgramFamilyInputMetadata,
+) -> Result<ProgramRequirements, RnsBggError> {
+    if !input_levels.keys().eq(program.inputs().keys()) {
+        return Err(RnsBggError::Parameters("missing or extra Program input"));
+    }
+    let required_family_ids = program
+        .steps()
+        .iter()
+        .filter_map(|operation| match operation {
+            ProgramStep::Family { id, .. } => Some(*id),
+            ProgramStep::Gate(_) => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let provided_family_ids = family_metadata
+        .canonical_entries()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<std::collections::BTreeSet<_>>();
+    if provided_family_ids != required_family_ids {
+        if required_family_ids.difference(&provided_family_ids).next().is_some() {
+            return Err(RnsBggError::Parameters("missing family range metadata"));
+        }
+        return Err(RnsBggError::Parameters("missing or extra family range metadata"));
+    }
+    let mut required_wire_families = std::collections::BTreeSet::new();
+    let mut required_rhs_families = std::collections::BTreeSet::new();
+    for operation in program.steps() {
+        if let ProgramStep::Family { body, .. } = operation {
+            for source in body.wire_inputs().values() {
+                if let crate::program::FamilySource::Member(id) = source {
+                    required_wire_families.insert(*id);
+                }
+            }
+            for source in body.rhs_inputs().values() {
+                if let crate::program::FamilySource::Member(id) = source {
+                    required_rhs_families.insert(*id);
+                }
+            }
+        }
+    }
+    let provided_wire_families =
+        family_inputs.wire_levels.keys().copied().collect::<std::collections::BTreeSet<_>>();
+    if provided_wire_families != required_wire_families {
+        if required_wire_families.difference(&provided_wire_families).next().is_some() {
+            return Err(RnsBggError::Parameters("missing family wire level metadata"));
+        }
+        return Err(RnsBggError::Parameters("missing or extra family wire level metadata"));
+    }
+    let provided_rhs_families =
+        family_inputs.rhs_levels.keys().copied().collect::<std::collections::BTreeSet<_>>();
+    if provided_rhs_families != required_rhs_families {
+        if required_rhs_families.difference(&provided_rhs_families).next().is_some() {
+            return Err(RnsBggError::Parameters("missing family RHS level metadata"));
+        }
+        return Err(RnsBggError::Parameters("missing or extra family RHS level metadata"));
+    }
+    let mut levels: BTreeMap<WireId, Option<usize>> = program
+        .input_wires()
+        .iter()
+        .map(|(input, wire)| (*wire, Some(input_levels[input])))
+        .collect();
+    let mut gates = Vec::new();
+    let mut families = Vec::new();
+    for (step, operation) in program.steps().iter().enumerate() {
+        match operation {
+            ProgramStep::Gate(gate) => {
+                let (mut records, next) = derive_scope_gates(
+                    [(ProgramGateInstance::Gate { step }, gate.clone())],
+                    levels,
+                )?;
+                levels = next;
+                gates.append(&mut records);
+            }
+            ProgramStep::Family { id, capacity, body, output, .. } => {
+                let range = family_metadata
+                    .range(*id)
+                    .ok_or(RnsBggError::Parameters("missing family range metadata"))?;
+                let range_capacity = range
+                    .capacity()
+                    .evaluate(&mxx_ir_core::ParamEnv::default())
+                    .ok()
+                    .and_then(|value| value.to_usize())
+                    .ok_or(RnsBggError::Parameters("family capacity is not concrete"))?;
+                if range_capacity != *capacity {
+                    return Err(RnsBggError::Context);
+                }
+                // Validate the active interval itself before any family body
+                // binding or later indexing. This rejects negative/empty or
+                // overflowing ranges even when the declared capacity matches.
+                validate_family_range(&range, &(*capacity).into())?;
+                let (local_levels, local_rhs_levels) =
+                    body.bind_inputs(
+                        |root| levels.get(&root).copied().ok_or(RnsBggError::Context),
+                        |family| {
+                            family_inputs.wire_levels.get(&family).copied().map(Some).ok_or(
+                                RnsBggError::Parameters("missing family wire level metadata"),
+                            )
+                        },
+                        |rhs| {
+                            if program.rhs_inputs().contains_key(&rhs) {
+                                Ok(None)
+                            } else {
+                                Err(RnsBggError::Context)
+                            }
+                        },
+                        |family| {
+                            family_inputs
+                                .rhs_levels
+                                .get(&family)
+                                .copied()
+                                .map(Some)
+                                .ok_or(RnsBggError::Parameters("missing family RHS level metadata"))
+                        },
+                    )?;
+                if local_rhs_levels.len() != body.rhs_inputs().len() {
+                    return Err(RnsBggError::Context);
+                }
+                let family_gates = body.gates().iter().enumerate().map(|(gate, value)| {
+                    (ProgramGateInstance::FamilyGate { step, gate, family: *id }, value.clone())
+                });
+                let (family_gates, local_levels) = derive_scope_gates(family_gates, local_levels)?;
+                let output_level = local_levels.get(&body.output()).copied().flatten();
+                levels.insert(*output, output_level);
+                families.push(FamilyRequirementRecord {
+                    step,
+                    id: *id,
+                    capacity: *capacity,
+                    range: Some(range.clone()),
+                    gates: family_gates,
+                    output: *output,
+                });
+            }
+        }
+    }
+    let wire_levels: BTreeMap<WireId, usize> =
+        levels.into_iter().filter_map(|(wire, level)| level.map(|level| (wire, level))).collect();
+    let outputs =
+        program.outputs().iter().map(|wire| (*wire, wire_levels.get(wire).copied())).collect();
+    Ok(ProgramRequirements {
+        input_wires: program.input_wires().clone(),
+        input_levels: input_levels.clone(),
+        wire_levels,
+        gates,
+        families,
+        outputs,
+    })
+}
+
+#[cfg(test)]
 fn scalar_levels(
     program: &ExponentLutProgram,
     inputs: &BTreeMap<ProgramInputId, usize>,
 ) -> Result<BTreeMap<WireId, usize>, RnsBggError> {
-    if !inputs.keys().eq(program.inputs().keys()) {
-        return Err(RnsBggError::Parameters("missing or extra Program input"));
+    if program.steps().iter().any(|step| matches!(step, ProgramStep::Family { .. })) {
+        return Err(RnsBggError::Parameters(
+            "program-driven setup does not support structural families",
+        ));
     }
-    let mut levels: BTreeMap<_, _> =
-        program.input_wires().iter().map(|(input, wire)| (*wire, inputs[input])).collect();
-    for step in program.steps() {
-        let ProgramStep::Gate(gate) = step else {
-            return Err(RnsBggError::Parameters(
-                "program-driven setup does not support structural families",
-            ));
-        };
-        let (output, level) = match gate {
-            Gate::MulPrivate { lhs, output, .. } | Gate::Lut { input: lhs, output, .. } => {
-                (*output, levels[lhs].checked_add(1).ok_or(RnsBggError::Context)?)
-            }
-            Gate::Add { lhs, rhs, output } |
-            Gate::MulPublic { private: lhs, public: rhs, output } => {
-                if levels[lhs] != levels[rhs] {
-                    return Err(RnsBggError::Context);
-                }
-                (*output, levels[lhs])
-            }
-        };
-        levels.insert(output, level);
-    }
-    Ok(levels)
+    Ok(derive_program_requirements(
+        program,
+        inputs,
+        &ProgramFamilyBindings::new(),
+        &ProgramFamilyInputMetadata::default(),
+    )?
+    .wire_levels)
 }
 
 impl RnsBggScheme {
     /// Prepare all four scalar gate kinds without caller-created helper maps.
+    ///
+    /// This is intentionally a scalar-only setup entry point: structural
+    /// family steps are rejected rather than silently expanded by the host.
+    /// It first derives and validates the structural requirements, then builds
+    /// a DSL graph containing sampled setup material. The method constructs
+    /// graph values; it does not execute a backend, run a security estimator,
+    /// or provide an oracle result. Secrets, setup seed/label/nonce, and native
+    /// exponents remain caller-owned. Missing or extra scalar inputs/RHS
+    /// bindings and level/stride mismatches are rejected before preparation.
     /// Multiplication/LUT advance one logical level; linear gates preserve it.
     /// The parameters already encode the CRT-drop cadence at each such level.
     /// Repeated RHS uses receive distinct level/instance-specific packages.
     /// A caller auditing average-case noise must likewise bind independent
     /// RHS noise sources per gate (ProgramBindings::gate_rhs), not assume that
     /// repeated plaintext declarations share one sampled ciphertext error.
-    pub fn prepare_program(
+    pub(crate) fn prepare_program(
         &self,
         program: ExponentLutProgram,
         secret: &RnsBggPayloadSecret,
         setup: RnsBggProgramSetup,
     ) -> Result<RnsBggPreparedProgram, RnsBggError> {
-        let levels = scalar_levels(
+        if program.steps().iter().any(|step| matches!(step, ProgramStep::Family { .. })) {
+            return Err(RnsBggError::Parameters(
+                "program-driven setup does not support structural families",
+            ));
+        }
+        let input_levels = setup.inputs.iter().map(|(id, input)| (*id, input.level)).collect();
+        let requirements = derive_program_requirements(
             &program,
-            &setup.inputs.iter().map(|(id, input)| (*id, input.level)).collect(),
+            &input_levels,
+            &ProgramFamilyBindings::new(),
+            &ProgramFamilyInputMetadata::default(),
         )?;
+        let levels = requirements.wire_levels.clone();
         if !setup.rhs.keys().eq(program.rhs_inputs().keys()) {
             return Err(RnsBggError::Parameters("missing or extra Program RHS"));
         }
@@ -255,8 +608,7 @@ impl RnsBggScheme {
                     )?;
                     let material = self.sample_lut_material(
                         secret,
-                        Some(program.lut(*lut_id).ok_or(RnsBggError::Lut)?),
-                        None,
+                        program.lut(*lut_id).ok_or(RnsBggError::Lut)?,
                         &bank,
                         setup.domain.seed.clone(),
                         material_id.as_slice(),
@@ -282,9 +634,16 @@ impl RnsBggScheme {
         Ok(RnsBggPreparedProgram { prepared, inputs, rhs })
     }
 
-    /// Restore authenticated setup metadata; no public preparation is rerun.
-    /// Runtime manifest validation remains an explicit graph validation step.
-    pub fn import_program(
+    /// Restore authenticated setup metadata without resampling public setup.
+    ///
+    /// The independently retained expectation must come from a trusted export,
+    /// not from the descriptor being imported. Import checks the Program's
+    /// ordered scalar inputs, RHS identities, and derived levels before it
+    /// creates lazy artifact inputs. It restores graph metadata only; it does
+    /// not execute a backend, rerun setup sampling, or substitute an oracle for
+    /// runtime manifest validation.
+    #[cfg(test)]
+    pub(crate) fn import_program(
         &self,
         program: ExponentLutProgram,
         descriptor: &RnsBggProgramDescriptor,
@@ -294,10 +653,19 @@ impl RnsBggScheme {
         if &descriptor.expectation()? != expected {
             return Err(RnsBggError::Context);
         }
-        let levels = scalar_levels(
+        if program.steps().iter().any(|step| matches!(step, ProgramStep::Family { .. })) {
+            return Err(RnsBggError::Parameters(
+                "program-driven setup does not support structural families",
+            ));
+        }
+        let input_levels = descriptor.inputs.iter().map(|(id, value)| (*id, value.level)).collect();
+        let requirements = derive_program_requirements(
             &program,
-            &descriptor.inputs.iter().map(|(id, value)| (*id, value.level)).collect(),
+            &input_levels,
+            &ProgramFamilyBindings::new(),
+            &ProgramFamilyInputMetadata::default(),
         )?;
+        let levels = requirements.wire_levels;
         let prepared = PreparedProgram::import(
             self.fixed_product_binding(),
             self.clone(),
@@ -311,11 +679,12 @@ impl RnsBggScheme {
         if !prepared.public_values().keys().eq(levels.keys()) {
             return Err(RnsBggError::Context);
         }
-        let expected_rhs: Vec<_> = prepared
-            .program
-            .gate_instances()
-            .filter_map(|(gate, operation)| {
-                if let Gate::MulPrivate { rhs, .. } = operation { Some((gate, *rhs)) } else { None }
+        let expected_rhs: Vec<_> = requirements
+            .gates
+            .iter()
+            .filter_map(|record| match record.gate {
+                GateRequirement::MulPrivate { rhs, .. } => Some((record.instance, rhs)),
+                _ => None,
             })
             .collect();
         if descriptor.rhs.iter().map(|rhs| (rhs.gate, rhs.rhs)).collect::<Vec<_>>() != expected_rhs
@@ -366,7 +735,13 @@ impl RnsBggScheme {
 
 impl RnsBggPreparedProgram {
     /// Append prepared public caches and private input contributions in one
-    /// operation. The caller can append explicit test-only outputs before build.
+    /// graph-building operation.
+    ///
+    /// The returned descriptor is export metadata and its expectation should be
+    /// retained independently of untrusted storage. This method writes graph
+    /// outputs for later artifact handling; it does not execute the backend or
+    /// serialize secret keys.
+    #[cfg(test)]
     pub fn export(
         &self,
         graph: DslContext,
@@ -391,13 +766,22 @@ impl RnsBggPreparedProgram {
         Ok((graph, RnsBggProgramDescriptor { prepared, inputs, rhs: self.rhs.clone() }))
     }
 
+    /// Borrow the prepared public wire values and their optional public rows.
+    ///
+    /// These values support graph construction and level/identity checks only;
+    /// this accessor neither executes the graph nor exposes private input
+    /// payloads.
     pub fn public_values(&self) -> &BTreeMap<WireId, (RnsBggPublicKey, Option<Mat>)> {
         self.prepared.public_values()
     }
 
-    /// Encode the setup-bound inputs using this online mask secret, prepare
-    /// mask-dependent helpers, and evaluate the frozen Program. No secret-key
-    /// oracle, readout conversion, or noise/security check is performed here.
+    /// Build the online encoding graph for the frozen Program.
+    ///
+    /// Setup-bound inputs are encoded with the caller-owned mask secret and
+    /// mask-dependent helpers are bound to the prepared graph. The result is a
+    /// DSL graph value; backend execution, readout conversion, noise auditing,
+    /// and secret-key oracle checks remain separate runtime operations.
+    #[cfg(test)]
     pub fn evaluate(
         &self,
         secret: &RnsBggMaskSecret,
@@ -421,9 +805,8 @@ impl RnsBggPreparedProgram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        nand_circuit::CompiledNandCircuitDetails,
-        program::{ExponentLutProgramBuilder, ProgramWireType},
+    use crate::program::{
+        ExponentLutProgramBuilder, FamilyProgram, FamilyWireSource, ProgramWireType,
     };
 
     fn fixture() -> (RnsBggScheme, ExponentLutProgram, ProgramInputId, RhsId) {
@@ -480,11 +863,46 @@ mod tests {
         }
     }
 
+    fn selection_family_fixture(
+        capacity: usize,
+    ) -> (
+        ExponentLutProgram,
+        ProgramInputId,
+        crate::program::WireFamilyId,
+        crate::program::RhsFamilyId,
+    ) {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
+        let input = builder
+            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
+            .unwrap();
+        let rhs_family = builder.rhs_family(2).unwrap();
+        let wire_family = builder.wire_family(2).unwrap();
+        let output = builder
+            .select(builder.input_wire(input).unwrap(), rhs_family, wire_family, capacity)
+            .unwrap();
+        builder.output(output).unwrap();
+        (builder.build().unwrap(), input, wire_family, rhs_family)
+    }
+
     #[test]
     fn test_program_setup_levels_domains_and_export_import() {
         let (scheme, program, input, rhs) = fixture();
         let secret = scheme.sample_payload_secret().unwrap();
         let nonce = rand::random();
+        let requirements = derive_program_requirements(
+            &program,
+            &BTreeMap::from([(input, 0)]),
+            &ProgramFamilyBindings::new(),
+            &ProgramFamilyInputMetadata::default(),
+        )
+        .unwrap();
+        assert_eq!(requirements.gates.len(), program.steps().len());
+        assert_eq!(requirements.outputs[0].1, Some(4));
+        assert!(requirements.gates.iter().enumerate().all(|(index, record)| {
+            record.instance == ProgramGateInstance::Gate { step: index }
+        }));
+        assert_eq!(requirements.gates.iter().filter(|record| record.helper_required).count(), 4);
         let prepared = scheme
             .prepare_program(program.clone(), &secret, setup(&scheme, input, rhs, nonce))
             .unwrap();
@@ -602,14 +1020,213 @@ mod tests {
             .unwrap();
         let rhs = builder.rhs_family(2).unwrap();
         let values = builder.wire_family(2).unwrap();
-        let output = builder.select(builder.input_wire(input).unwrap(), rhs, values, 2).unwrap();
+        let output = builder.select(builder.input_wire(input).unwrap(), rhs, values, 4).unwrap();
         builder.output(output).unwrap();
         let program = builder.build().unwrap();
+        let mut family_metadata = ProgramFamilyBindings::new();
+        family_metadata
+            .bind(ProgramFamilyId::from_index(0), FamilyRange::bounded(2, 2, 4).unwrap());
+        let family_inputs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(crate::program::WireFamilyId::from_index(0), 1)]),
+            rhs_levels: BTreeMap::from([(crate::program::RhsFamilyId::from_index(0), 0)]),
+        };
+        let requirements = derive_program_requirements(
+            &program,
+            &BTreeMap::from([(input, 0)]),
+            &family_metadata,
+            &family_inputs,
+        )
+        .unwrap();
+        assert_eq!(requirements.families.len(), 1);
+        assert_eq!(requirements.families[0].capacity, 4);
+        assert_eq!(
+            requirements.families[0].range,
+            family_metadata.range(ProgramFamilyId::from_index(0)).cloned()
+        );
+        assert!(
+            requirements.families[0]
+                .gates
+                .iter()
+                .all(|record| matches!(record.instance, ProgramGateInstance::FamilyGate { .. }))
+        );
         assert!(matches!(
             scalar_levels(&program, &BTreeMap::from([(input, 0)])),
             Err(RnsBggError::Parameters(
                 "program-driven setup does not support structural families"
             ))
+        ));
+    }
+
+    #[test]
+    fn test_program_requirements_family_bind_inputs_and_metadata() {
+        let (program, input, wire_family, rhs_family) = selection_family_fixture(4);
+        let family_id = ProgramFamilyId::from_index(0);
+        let mut ranges = ProgramFamilyBindings::new();
+        ranges.bind(family_id, FamilyRange::bounded(2, 2, 4).unwrap());
+        let family_inputs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(wire_family, 1)]),
+            rhs_levels: BTreeMap::from([(rhs_family, 0)]),
+        };
+        let requirements = derive_program_requirements(
+            &program,
+            &BTreeMap::from([(input, 0)]),
+            &ranges,
+            &family_inputs,
+        )
+        .unwrap();
+        assert_eq!(requirements.input_wires[&input], WireId::from_index(0));
+        assert_eq!(requirements.families[0].capacity, 4);
+        assert_eq!(requirements.families[0].range.as_ref().unwrap().start(), &2.into());
+        assert_eq!(requirements.families[0].gates.len(), 2);
+        assert!(requirements.families[0].gates.iter().all(|record| {
+            matches!(record.instance, ProgramGateInstance::FamilyGate { family, .. } if family == family_id)
+        }));
+
+        let missing_wire = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::new(),
+            rhs_levels: BTreeMap::from([(rhs_family, 0)]),
+        };
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &ranges,
+                &missing_wire
+            ),
+            Err(RnsBggError::Parameters("missing family wire level metadata"))
+        ));
+        let missing_rhs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(wire_family, 1)]),
+            rhs_levels: BTreeMap::new(),
+        };
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &ranges,
+                &missing_rhs
+            ),
+            Err(RnsBggError::Parameters("missing family RHS level metadata"))
+        ));
+        let mut extra_ranges = ranges.clone();
+        extra_ranges.bind(ProgramFamilyId::from_index(99), FamilyRange::full(1).unwrap());
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &extra_ranges,
+                &family_inputs
+            ),
+            Err(RnsBggError::Parameters("missing or extra family range metadata"))
+        ));
+        let extra_wire = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([
+                (wire_family, 1),
+                (crate::program::WireFamilyId::from_index(99), 1),
+            ]),
+            rhs_levels: BTreeMap::from([(rhs_family, 0)]),
+        };
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &ranges,
+                &extra_wire
+            ),
+            Err(RnsBggError::Parameters("missing or extra family wire level metadata"))
+        ));
+        let extra_rhs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(wire_family, 1)]),
+            rhs_levels: BTreeMap::from([
+                (rhs_family, 0),
+                (crate::program::RhsFamilyId::from_index(99), 0),
+            ]),
+        };
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &ranges,
+                &extra_rhs
+            ),
+            Err(RnsBggError::Parameters("missing or extra family RHS level metadata"))
+        ));
+        let mut wrong_range = ProgramFamilyBindings::new();
+        wrong_range.bind(family_id, FamilyRange::bounded(3, 2, 5).unwrap());
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &wrong_range,
+                &family_inputs
+            ),
+            Err(RnsBggError::Context)
+        ));
+
+        let mut invalid_range = ProgramFamilyBindings::new();
+        invalid_range.bind(family_id, FamilyRange::bounded(3, 2, 4).unwrap());
+        assert!(matches!(
+            derive_program_requirements(
+                &program,
+                &BTreeMap::from([(input, 0)]),
+                &invalid_range,
+                &family_inputs
+            ),
+            Err(RnsBggError::Context)
+        ));
+
+        let (larger, larger_input, larger_wire_family, larger_rhs_family) =
+            selection_family_fixture(8);
+        let mut larger_ranges = ProgramFamilyBindings::new();
+        larger_ranges.bind(family_id, FamilyRange::bounded(0, 8, 8).unwrap());
+        let larger_inputs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(larger_wire_family, 1)]),
+            rhs_levels: BTreeMap::from([(larger_rhs_family, 0)]),
+        };
+        let larger_requirements = derive_program_requirements(
+            &larger,
+            &BTreeMap::from([(larger_input, 0)]),
+            &larger_ranges,
+            &larger_inputs,
+        )
+        .unwrap();
+        assert_eq!(
+            larger_requirements.families[0].gates.len(),
+            requirements.families[0].gates.len()
+        );
+    }
+
+    #[test]
+    fn test_program_requirements_reject_member_level_mismatch_with_local_collision() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
+        let first = builder.wire_family(2).unwrap();
+        let second = builder.wire_family(2).unwrap();
+        let local_lhs = WireId::from_index(0);
+        let local_rhs = WireId::from_index(1);
+        let local_output = WireId::from_index(2);
+        let body = FamilyProgram::new(
+            BTreeMap::from([
+                (local_lhs, FamilyWireSource::Member(first)),
+                (local_rhs, FamilyWireSource::Member(second)),
+            ]),
+            BTreeMap::new(),
+            vec![Gate::Add { lhs: local_lhs, rhs: local_rhs, output: local_output }],
+            local_output,
+        )
+        .unwrap();
+        let output = builder.family(2, body).unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+        let mut ranges = ProgramFamilyBindings::new();
+        ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::bounded(1, 2, 2).unwrap());
+        let family_inputs = ProgramFamilyInputMetadata {
+            wire_levels: BTreeMap::from([(first, 0), (second, 1)]),
+            rhs_levels: BTreeMap::new(),
+        };
+        assert!(matches!(
+            derive_program_requirements(&program, &BTreeMap::new(), &ranges, &family_inputs),
+            Err(RnsBggError::Context)
         ));
     }
 
@@ -665,7 +1282,7 @@ mod tests {
             prepared.export(DslContext::new("nand-preprocessing"), "nand").unwrap();
         // Mirror the integration test's explicitly separate oracle extras.
         let level = prepared.public_values()[&compiled.program().outputs()[0]].0.level();
-        let payload = scheme.payload_at(&secret, level).unwrap();
+        let payload = scheme.reduce_payload_secret_modulus(&secret, level).unwrap();
         for column in 0..2 {
             graph = graph
                 .private_output(format!("oracle.{column}"), payload.entry(0, column).clone())

@@ -96,7 +96,9 @@ export MXX_EXPONENT_LUT_NAND_DEPTH=1
 export MXX_EXPONENT_LUT_NAND_CRT_BITS=40
 export MXX_EXPONENT_LUT_NAND_MAX_CRT_DEPTH=10
 export MXX_EXPONENT_LUT_NAND_SECURITY_BITS=100
-export MXX_EXPONENT_LUT_NAND_PREVALIDATED_SECURITY_BITS=107
+# This explicit mode skips Sage and the target comparison; it does not consume
+# or require a prevalidated-security environment variable.
+export MXX_EXPONENT_LUT_NAND_SKIP_SAGE=1
 export MXX_EXPONENT_LUT_NAND_NOISE_MODEL=average
 export MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS=1
 export MXX_EXPONENT_LUT_BENCH_WARMUPS=1

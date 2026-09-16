@@ -13,14 +13,13 @@ use mxx_bench_estimator::{
 use mxx_exponent_lut::{
     CompiledNandCircuit, ExpLayout, ExpectedEncoding, ExponentLut, NandCircuit,
     RuntimeConfiguration,
-    advanced::CompiledNandCircuitDetails,
     noise_refresh::simulation::AverageCaseConfig,
     program::{
         Gate, LutId, ProgramBindings, ProgramFamilyBindings, ProgramGateInstance, ProgramInputId,
     },
     rns_bgg::{
-        RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest,
-        noise::{RnsBggGateNoiseMaterial, RnsBggNoiseRhs, RnsBggNoiseValue},
+        RnsBggGateNoiseMaterial, RnsBggNoiseBound, RnsBggNoiseRhs, RnsBggNoiseValue,
+        RnsBggParameters, RnsBggPlanRequest,
     },
 };
 use mxx_primitives::poly::{
@@ -33,7 +32,7 @@ use mxx_primitives::poly::{
 use mxx_runtime::{ExecutionConfig, backend::poly::gpu::gpu_backend_on};
 use num_bigint::BigUint;
 use num_traits::One;
-use std::{collections::BTreeMap, process::Command, time::Duration};
+use std::{collections::BTreeMap, process::Command};
 
 fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
@@ -88,47 +87,6 @@ fn log_cost_report(stage: &str, report: &CostReport) {
         report.peak_memory_bytes,
         report.transmitted_bytes,
     );
-}
-
-/// Build the benchmark adapter only for the duration of one observation. The
-/// facade graph passed to this callback is the graph that will immediately be
-/// executed; no benchmark-only graph is constructed.
-fn benchmark_observer(
-    parameters: RnsBggParameters,
-    devices: Vec<i32>,
-) -> impl FnMut(&str, &mxx_ir_core::ValidatedGraph) -> Result<(), String> {
-    move |stage, graph| {
-        let backends = devices
-            .iter()
-            .map(|device| {
-                let rings = parameters.levels().iter().map(|parameter| {
-                    GpuDCRTPolyParams::new(
-                        parameter.ring_dimension(),
-                        parameter.to_crt().0,
-                        parameter.base_bits(),
-                        None,
-                    )
-                });
-                (gpu_backend_on(rings, [*device]), *device)
-            })
-            .collect();
-        let mut estimator = GpuNodeMeasurementBackend::new(
-            backends,
-            MeasurementHarnessConfig {
-                warm_up_iterations: env_usize("MXX_EXPONENT_LUT_BENCH_WARMUPS", 1),
-                measured_iterations: env_usize("MXX_EXPONENT_LUT_BENCH_ITERATIONS", 1),
-                memory_poll_interval: Duration::from_millis(1),
-            },
-        );
-        let report = measure_graphs(&[graph], &mut estimator)
-            .map_err(|error| format!("benchmark observation for {stage} failed: {error}"))?
-            .into_iter()
-            .next()
-            .expect("one graph produces one cost report");
-        log_cost_report(stage, &report);
-        drop(estimator);
-        Ok(())
-    }
 }
 
 fn balanced_circuit(depth: usize) -> NandCircuit {
@@ -228,6 +186,8 @@ fn noise_bindings(
 
 #[test]
 fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
+    // Compile the balanced NAND circuit into the native-exponent Program. Each
+    // pair of rounds represents one unary-LUT transition in the compiled graph.
     let depth = env_usize("MXX_EXPONENT_LUT_NAND_DEPTH", 1);
     let n = env_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 32);
     let large_parameter_run = env_flag("MXX_EXPONENT_LUT_NAND_LARGE_PARAMETER_RUN");
@@ -242,6 +202,9 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
     let compiled = circuit.compile(ExpLayout { stride_log2: 0, width_log2: 4 }, n, rounds).unwrap();
     assert_eq!(compiled.rhs_ids().len(), rounds);
     assert_eq!(compiled.program().steps().len(), rounds * 2);
+
+    // Describe the candidate CRT chain and its per-stage widths. The planner
+    // derives the encoding hard cutoff from sigma and audits the actual Program.
     let request = RnsBggPlanRequest {
         ring_dimension: n as u32,
         widths: (0..rounds).flat_map(|_| [8, 16]).collect(),
@@ -257,6 +220,8 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
     }
     let noiseless = env_flag("MXX_EXPONENT_LUT_NAND_NOISELESS");
     let parameter_only = env_flag("MXX_EXPONENT_LUT_NAND_PARAMETER_ONLY");
+    // Average-case is the default; selecting worst-case removes the variance
+    // acceptance model while retaining the same deterministic audit inputs.
     let failure_exponent =
         u32::try_from(env_usize("MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS", 1)).unwrap();
     let average = match std::env::var("MXX_EXPONENT_LUT_NAND_NOISE_MODEL").as_deref() {
@@ -273,6 +238,8 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
         &request.encoding_error_sigma,
     );
     let (inputs, rhs, helpers, gate_helpers) = noise_bindings(&compiled, &bound);
+    // Bind noise contracts to the exact input, RHS, LUT, and gate identities;
+    // no caller-provided slot count or anonymous helper is used here.
     let bindings = ProgramBindings::new()
         .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
         .rhs_values(rhs.iter().map(|(&id, value)| (id, value.clone())))
@@ -281,6 +248,8 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
     let ranges = ProgramFamilyBindings::new();
     let output = compiled.program().outputs()[0];
     let terminal_bounds = BTreeMap::from([(output, BigUint::one())]);
+    // Search CRT depth from the smallest candidate and retain only candidates
+    // passing both the Program audit and the selected noise model.
     let evaluate = |depth: usize| {
         let mut candidate = request.clone();
         candidate.terminal_depth = depth;
@@ -303,28 +272,29 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
     let (selected_depth, parameters, trace) = (1..=request.max_crt_depth)
         .find_map(|depth| evaluate(depth).map(|(parameters, trace)| (depth, parameters, trace)))
         .unwrap_or_else(|| panic!("no CRT depth passed the Program noise audit"));
-    let required_security_bits =
-        u64::try_from(env_usize("MXX_EXPONENT_LUT_NAND_SECURITY_BITS", 1)).unwrap();
-    let achieved = match std::env::var("MXX_EXPONENT_LUT_NAND_PREVALIDATED_SECURITY_BITS") {
-        Ok(value) => value.parse().unwrap(),
-        Err(std::env::VarError::NotPresent) => {
-            lattice_security_bits(parameters.level(0).unwrap(), &request.encoding_error_sigma)
-        }
-        Err(error) => panic!("invalid security evidence: {error}"),
+    let skip_sage = env_flag("MXX_EXPONENT_LUT_NAND_SKIP_SAGE");
+    let (security_bits_label, required_security_bits_label) = if skip_sage {
+        // This explicit local mode skips both Sage and the target comparison;
+        // it is useful only when parameter evidence is supplied elsewhere.
+        println!("lattice_security_check=skipped reason=MXX_EXPONENT_LUT_NAND_SKIP_SAGE");
+        ("skipped".to_owned(), "not_compared".to_owned())
+    } else {
+        // The default path always runs the estimator and checks its result
+        // against the requested target before any GPU graph work.
+        let required_security_bits =
+            u64::try_from(env_usize("MXX_EXPONENT_LUT_NAND_SECURITY_BITS", 1)).unwrap();
+        let achieved =
+            lattice_security_bits(parameters.level(0).unwrap(), &request.encoding_error_sigma);
+        assert!(achieved >= required_security_bits);
+        println!(
+            "nand_security_candidate ring_dimension={} crt_depth={} modulus_bits={} security_bits={} evidence=lattice-estimator-cli selected_depth={selected_depth}",
+            parameters.levels()[0].ring_dimension(),
+            parameters.levels()[0].crt_depth(),
+            parameters.levels()[0].modulus().as_ref().bits(),
+            achieved,
+        );
+        (achieved.to_string(), required_security_bits.to_string())
     };
-    assert!(achieved >= required_security_bits);
-    println!(
-        "nand_security_candidate ring_dimension={} crt_depth={} modulus_bits={} security_bits={} evidence={} selected_depth={selected_depth}",
-        parameters.levels()[0].ring_dimension(),
-        parameters.levels()[0].crt_depth(),
-        parameters.levels()[0].modulus().as_ref().bits(),
-        achieved,
-        match std::env::var("MXX_EXPONENT_LUT_NAND_PREVALIDATED_SECURITY_BITS") {
-            Ok(_) => "prevalidated",
-            Err(std::env::VarError::NotPresent) => "lattice-estimator-cli",
-            Err(error) => panic!("invalid prevalidated security bits: {error}"),
-        },
-    );
     println!(
         "nand_noise_audit model={} failure_exponent={} rounds={rounds} cadence={} crt_depth={} base_bits={} events={} bound={} lattice_security_bits={} required_lattice_security_bits={}",
         if average.is_some() { "average-case" } else { "worst-case" },
@@ -334,87 +304,107 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
         parameters.levels()[0].base_bits(),
         trace.joint_event_count,
         trace.wires[&output].bound.error,
-        achieved,
-        required_security_bits,
+        security_bits_label,
+        required_security_bits_label,
     );
     if parameter_only {
         return;
     }
 
+    // Compile one random assignment after parameter acceptance; fixed RHS binds
+    // that assignment to the immutable Program used by every following phase.
     let assignment = (0..circuit.input_count()).map(|_| rand::random::<bool>()).collect::<Vec<_>>();
     let expected = oracle(&circuit, &assignment);
+    let fixed = compiled.fixed_rhs(&assignment).unwrap();
     let devices = detected_gpu_device_ids();
     assert!(!devices.is_empty(), "NAND test requires a detected GPU");
-    let rings = parameters.levels().iter().map(|p| {
-        mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams::new(
-            p.ring_dimension(),
-            p.to_crt().0,
-            p.base_bits(),
-            None,
-        )
-    });
+
+    // Construct the facade with the real GPU backend. Graph planning is pure:
+    // it uses the same production builders but performs no admission or I/O.
+    let rings = parameters
+        .levels()
+        .iter()
+        .map(|p| GpuDCRTPolyParams::new(p.ring_dimension(), p.to_crt().0, p.base_bits(), None));
     let backend = gpu_backend_on(rings, devices.iter().copied());
     let context = rand::random();
-    let benchmark_stage = std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").unwrap_or_default();
-    if benchmark_stage != "" && benchmark_stage != "estimate" && benchmark_stage != "graph" {
-        panic!(
-            "MXX_EXPONENT_LUT_BENCH_STAGE must be `graph` or `estimate`, got {benchmark_stage:?}"
-        );
-    }
     let runtime = RuntimeConfiguration::new(backend, ExecutionConfig::default());
-    let graph_only_error = "graph-only benchmark observation requested";
-    let runtime = match benchmark_stage.as_str() {
-        "estimate" => {
-            runtime.with_graph_observer(benchmark_observer(parameters.clone(), devices.clone()))
-        }
-        "graph" => runtime.with_graph_observer(move |stage, graph| {
-            println!(
-                "nand_graph_stage={stage} facade_production_graph=true graph_name={}",
-                graph.source.name()
-            );
-            Err(graph_only_error.into())
-        }),
-        "" => runtime,
-        _ => unreachable!("benchmark stage was validated above"),
-    };
     #[cfg(feature = "test-utils")]
     let engine = if noiseless {
-        ExponentLut::new_noiseless_for_testing(parameters, context, runtime)
+        ExponentLut::new_noiseless_for_testing(parameters.clone(), context, runtime)
     } else {
-        ExponentLut::new(parameters, context, runtime)
+        ExponentLut::new(parameters.clone(), context, runtime)
     };
     #[cfg(not(feature = "test-utils"))]
     let engine = {
         if noiseless {
             panic!("MXX_EXPONENT_LUT_NAND_NOISELESS=1 requires feature `test-utils`");
         }
-        ExponentLut::new(parameters, context, runtime)
+        ExponentLut::new(parameters.clone(), context, runtime)
     };
     let secrets = compiled.sample_secrets(&engine).unwrap();
+
+    // Estimate all three exact facade graphs before the durable round trip.
+    let graphs = engine.benchmark_graphs(compiled.program(), &fixed, secrets.payload()).unwrap();
+    let backends = devices
+        .iter()
+        .map(|device| {
+            let rings = parameters.levels().iter().map(|parameter| {
+                GpuDCRTPolyParams::new(
+                    parameter.ring_dimension(),
+                    parameter.to_crt().0,
+                    parameter.base_bits(),
+                    None,
+                )
+            });
+            (gpu_backend_on(rings, [*device]), *device)
+        })
+        .collect();
+    let mut estimator = GpuNodeMeasurementBackend::new(
+        backends,
+        MeasurementHarnessConfig {
+            warm_up_iterations: env_usize("MXX_EXPONENT_LUT_BENCH_WARMUPS", 1),
+            measured_iterations: env_usize("MXX_EXPONENT_LUT_BENCH_ITERATIONS", 1),
+            ..Default::default()
+        },
+    );
+    for (stage, graph) in [
+        ("preprocess", &graphs.preprocess),
+        ("encrypt", &graphs.encrypt),
+        ("online_eval", &graphs.online_eval),
+    ] {
+        let report = measure_graphs(&[graph], &mut estimator)
+            .map_err(|error| format!("benchmark observation for {stage} failed: {error}"))
+            .expect("NAND facade graph estimate");
+        let report = report.into_iter().next().expect("one graph produces one cost report");
+        log_cost_report(stage, &report);
+    }
+    drop(estimator);
+
+    // Execute the same three production phases with explicit artifact roots.
     let base = std::env::var_os("MXX_EXPONENT_LUT_NAND_ARTIFACT_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
             std::env::temp_dir().join(format!("mxx-exponent-lut-{:032x}", rand::random::<u128>()))
         });
     std::fs::create_dir_all(&base).unwrap();
-    let prepared = match engine.preprocess(
-        compiled.program(),
-        compiled.fixed_rhs(&assignment).unwrap(),
-        secrets.payload(),
-        base.join("enc"),
-        base.join("eval"),
-    ) {
-        Ok(prepared) => prepared,
-        Err(error)
-            if benchmark_stage == "graph" && error.to_string().contains(graph_only_error) =>
-        {
-            return;
-        }
-        Err(error) => panic!("facade preprocessing failed: {error}"),
-    };
+    let stage_started = std::time::Instant::now();
+    let prepared = engine
+        .preprocess(
+            compiled.program(),
+            fixed,
+            secrets.payload(),
+            base.join("enc"),
+            base.join("eval"),
+        )
+        .unwrap();
+    println!("nand_round_trip_stage=preprocess seconds={}", stage_started.elapsed().as_secs_f64());
+    let stage_started = std::time::Instant::now();
     let encrypted =
         engine.encrypt(&prepared.encryption, secrets.mask(), base.join("input")).unwrap();
+    println!("nand_round_trip_stage=encrypt seconds={}", stage_started.elapsed().as_secs_f64());
+    let stage_started = std::time::Instant::now();
     let outputs = engine.online_eval(compiled.program(), &prepared.evaluation, &encrypted).unwrap();
+    println!("nand_round_trip_stage=online_eval seconds={}", stage_started.elapsed().as_secs_f64());
     let output = compiled.output(&outputs).unwrap();
     engine
         .assert_encoding(
@@ -423,10 +413,6 @@ fn test_gpu_nand_circuit_noise_search_and_artifact_round_trip() {
             &secrets,
         )
         .unwrap();
-    if benchmark_stage == "estimate" {
-        println!("nand_benchmark_stage=estimate");
-        return;
-    }
     println!(
         "nand_round_trip_ok=true strict_q_over_4=true expected_exponent={expected} stride_log2=0 readout_applied=false"
     );

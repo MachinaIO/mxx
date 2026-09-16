@@ -1,20 +1,26 @@
 //! Native exponent refresh: CRT routing, public preparation and online evaluation.
 //!
-//! Trait-based witness and direct-decoder paths keep aggregate-before-switch
-//! ordering explicit. Payload-secret/public work belongs to preprocessing;
-//! online preparation binds helpers/decoders to the current mask secret.
-//! BGG-specific witness binding and compilation live in the backend.
+//! The CRT traversal and row-level refresh operations remain shared between
+//! BGG and RNS-BGG. BGG witness preparation and RNS-BGG direct preparation are
+//! concrete backend operations; payload-secret/public work belongs to
+//! preprocessing, while online preparation binds helpers/decoders to the
+//! current mask secret.
 
-use super::{
-    ExponentLUTRefreshDirectScheme, ExponentLUTRefreshScheme, ExponentLUTRefreshWitnessScheme,
-};
+use super::ExponentLUTRefreshScheme;
 use crate::{
+    bgg::BggScheme,
     noise_refresh::{prf::SparseLwrPrfProgram, simulation::RefreshTranscriptTopology},
     noise_utils::NoiseMoments,
     program::ProgramValue,
-    readout::{TerminalError, ValueReadout},
+    readout::ValueReadout,
+    rns_bgg::{
+        RnsBggEncoding, RnsBggMaskBank, RnsBggMaskSecret, RnsBggMatrix, RnsBggOnlineMasks,
+        RnsBggPayloadSecret, RnsBggPreparedTerminal, RnsBggPublicKey, RnsBggRefreshLevel,
+        RnsBggRow, RnsBggScheme, RnsBggTerminalMaterial, TerminalError,
+    },
 };
-use mxx_dsl::{Bytes, DslError, Family, GraphValue, HashTag, Int};
+use mxx_bgg::BggEncodingWire;
+use mxx_dsl::{Bytes, DslError, Family, GraphValue, HashTag, Int, Mat, Preimage};
 use mxx_ir_core::IntExpr;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
@@ -614,20 +620,20 @@ impl<S: ExponentLUTRefreshScheme> Clone for RefreshSlotValues<S> {
 
 /// Per-slot preparation inputs. Scaling and the decoder witness come from
 /// preprocessing; the decoder base is generated for the current online secret.
-pub struct RefreshSlotPreparation<S: ExponentLUTRefreshWitnessScheme> {
-    pub level: S::RefreshLevel,
-    pub scaling: S::RefreshScaling,
-    pub decoder_base: S::RefreshDecoderBase,
-    pub witness: S::RefreshDecoderWitness,
+pub struct RefreshSlotPreparation {
+    pub level: IntExpr,
+    pub scaling: (Mat, Preimage),
+    pub decoder_base: Mat,
+    pub witness: Preimage,
 }
 
-pub fn prepare_refresh_slot<S: ExponentLUTRefreshWitnessScheme>(
-    scheme: &S,
-    state: &S::Encoding,
-    mask: S::RefreshRow,
-    fresh_error: S::RefreshRow,
-    preparation: RefreshSlotPreparation<S>,
-) -> RefreshSlotValues<S> {
+pub fn prepare_refresh_slot(
+    scheme: &BggScheme,
+    state: &BggEncodingWire,
+    mask: Mat,
+    fresh_error: Mat,
+    preparation: RefreshSlotPreparation,
+) -> RefreshSlotValues<BggScheme> {
     RefreshSlotValues {
         level: preparation.level,
         scaled_state: scheme.scale_refresh_input(state, &preparation.scaling),
@@ -681,13 +687,13 @@ pub fn evaluate_refresh<'a, S: ExponentLUTRefreshScheme + 'a>(
 /// The canonical label index owns ragged mask ranges and the single fresh
 /// source range. Only routes are slot-specific; fresh PRF outputs are shared.
 /// No target construction, decomposition or sampling occurs in this traversal.
-pub fn prepare_refresh_public_routes<S: ExponentLUTRefreshWitnessScheme>(
-    scheme: &S,
+pub fn prepare_refresh_public_routes(
+    scheme: &BggScheme,
     labels: &RefreshPrfLabelIndex,
-    outputs: Family<S::RefreshPublicRow>,
-    mask_routes: Family<S::RefreshPublicScaling>,
-    fresh_routes: Family<S::RefreshPublicScaling>,
-) -> Result<(Vec<S::RefreshPublicRow>, Vec<S::RefreshPublicRow>), DslError> {
+    outputs: Family<Mat>,
+    mask_routes: Family<Preimage>,
+    fresh_routes: Family<Preimage>,
+) -> Result<(Vec<Mat>, Vec<Mat>), DslError> {
     aggregate_refresh_routes(
         labels,
         outputs,
@@ -700,14 +706,14 @@ pub fn prepare_refresh_public_routes<S: ExponentLUTRefreshWitnessScheme>(
 
 /// Evaluate the same canonical routing schedule on online rows, then add the
 /// backend-prepared public offsets. Fresh inputs remain shared across slots.
-pub(crate) fn aggregate_refresh_prf<S: ExponentLUTRefreshWitnessScheme>(
-    scheme: &S,
-    family: &RefreshPrfFamilyMaterial<S::RefreshRow>,
-    mask_routes: Family<S::RefreshPublicScaling>,
-    fresh_routes: Family<S::RefreshPublicScaling>,
-    mask_offsets: Vec<S::RefreshRow>,
-    fresh_offsets: Vec<S::RefreshRow>,
-) -> Result<(Vec<S::RefreshRow>, Vec<S::RefreshRow>), DslError> {
+pub(crate) fn aggregate_refresh_prf(
+    scheme: &BggScheme,
+    family: &RefreshPrfFamilyMaterial<Mat>,
+    mask_routes: Family<Preimage>,
+    fresh_routes: Family<Preimage>,
+    mask_offsets: Vec<Mat>,
+    fresh_offsets: Vec<Mat>,
+) -> Result<(Vec<Mat>, Vec<Mat>), DslError> {
     if mask_offsets.len() != family.labels.topology.crt_slot_count ||
         fresh_offsets.len() != family.labels.topology.crt_slot_count
     {
@@ -785,13 +791,13 @@ fn aggregate_refresh_routes<V: GraphValue, R: GraphValue>(
 
 /// Prepare scaled public inputs and add routed mask/fresh-error keys before
 /// any destination-level switch. Both passes remain structural families.
-pub fn prepare_refresh_public_sums<S: ExponentLUTRefreshWitnessScheme>(
-    scheme: &S,
-    state: S::RefreshPublicRow,
-    scaling: Family<S::RefreshPublicScaling>,
-    masks: Family<S::RefreshPublicRow>,
-    fresh: Family<S::RefreshPublicRow>,
-) -> Result<Family<S::RefreshPublicRow>, DslError> {
+pub fn prepare_refresh_public_sums(
+    scheme: &BggScheme,
+    state: Mat,
+    scaling: Family<Preimage>,
+    masks: Family<Mat>,
+    fresh: Family<Mat>,
+) -> Result<Family<Mat>, DslError> {
     if scaling.count() != masks.count() || scaling.count() != fresh.count() {
         return Err(DslError::FamilyCountMismatch);
     }
@@ -809,20 +815,12 @@ pub fn prepare_refresh_public_sums<S: ExponentLUTRefreshWitnessScheme>(
 /// Setup guarantees that groups partition the slots and each level occurs once.
 /// Public anchors stay in group order; targets and witnesses return in slot order.
 /// The online secret is absent from this API and from the generated graph.
-pub fn prepare_refresh_decoders<S: ExponentLUTRefreshWitnessScheme>(
-    scheme: &S,
-    groups: &[(
-        S::RefreshLevel,
-        Vec<usize>,
-        Family<S::RefreshTargetScale>,
-        S::RefreshAnchorParameters,
-    )],
-    sums: Family<S::RefreshPublicRow>,
-    output: S::RefreshPublicRow,
-) -> Result<
-    (Vec<S::RefreshPublicRow>, Vec<S::RefreshPublicRow>, Vec<S::RefreshDecoderWitness>),
-    DslError,
-> {
+pub fn prepare_refresh_decoders(
+    scheme: &BggScheme,
+    groups: &[(IntExpr, Vec<usize>, Family<Mat>, crate::bgg::BggRefreshAnchorParameters)],
+    sums: Family<Mat>,
+    output: Mat,
+) -> Result<(Vec<Mat>, Vec<Mat>, Vec<Preimage>), DslError> {
     let mut public_anchors = Vec::with_capacity(groups.len());
     let mut targets_by_slot = BTreeMap::new();
     let mut witnesses_by_slot = BTreeMap::new();
@@ -858,19 +856,19 @@ pub fn prepare_refresh_decoders<S: ExponentLUTRefreshWitnessScheme>(
 /// order. Setup guarantees that groups partition the CRT slots and that each
 /// level occurs once. Cloning a base shares its sampled error across the group;
 /// a new call creates fresh bases for the next online execution.
-pub fn prepare_shared_decoder_bases<S: crate::noise_refresh::ExponentLUTRefreshWitnessScheme>(
-    groups: &[(S::RefreshLevel, Vec<usize>)],
-    public: &[S::RefreshPublicRow],
-    secret: &S::RefreshSecret,
-    parameters: &S::RefreshBaseParameters,
-) -> Result<(Vec<S::RefreshPublicRow>, Vec<S::RefreshDecoderBase>), DslError> {
+pub fn prepare_shared_decoder_bases(
+    groups: &[(IntExpr, Vec<usize>)],
+    public: &[Mat],
+    secret: &Mat,
+    parameters: &(mxx_ir_core::RealExpr, IntExpr),
+) -> Result<(Vec<Mat>, Vec<Mat>), DslError> {
     if groups.len() != public.len() {
         return Err(DslError::Schema);
     }
     let mut public_by_slot = BTreeMap::new();
     let mut bases_by_slot = BTreeMap::new();
     for ((level, slots), anchor) in groups.iter().zip(public) {
-        let base = S::sample_refresh_decoder_base(secret, anchor, level, parameters);
+        let base = BggScheme::sample_refresh_decoder_base(secret, anchor, level, parameters);
         for slot in slots {
             public_by_slot.insert(*slot, anchor.clone());
             bases_by_slot.insert(*slot, base.clone());
@@ -881,26 +879,30 @@ pub fn prepare_shared_decoder_bases<S: crate::noise_refresh::ExponentLUTRefreshW
 
 /// Construct the decoder target using the actual finalized public aggregate.
 /// No online secret is needed in this pass.
-pub fn prepare_direct_refresh_target<S: ExponentLUTRefreshScheme>(
-    scheme: &S,
-    raw_sum: S::RefreshPublicRow,
-    output_key: S::RefreshPublicRow,
-    scale: S::RefreshTargetScale,
-    level: &S::RefreshLevel,
-) -> S::RefreshPublicRow {
+pub(crate) fn prepare_direct_refresh_target(
+    scheme: &RnsBggScheme,
+    raw_sum: RnsBggMatrix,
+    output_key: RnsBggMatrix,
+    scale: mxx_dsl::Mat,
+    level: &RnsBggRefreshLevel,
+) -> RnsBggMatrix {
     let public = scheme.switch_refresh_public(raw_sum, level);
     let output = scheme.reduce_refresh_public(output_key, level);
-    let scaled = scheme.scale_refresh_public(output, scale);
-    scheme.subtract_refresh_public(public, scaled)
+    scheme.subtract_refresh_public(public, scheme.scale_refresh_public(output, scale))
 }
 
 /// A direct-decoder refresh slot compiled entirely before the online secret
 /// exists. Data, mask digits and fresh digits are all ordinary terminal terms.
-pub struct PreparedDirectRefreshSlot<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> {
-    pub level: S::RefreshLevel,
-    pub decoder_target: S::RefreshPublicRow,
-    pub(crate) terms: Vec<ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>>>,
-    pub(crate) offset: S::RefreshRow,
+pub struct PreparedDirectRefreshSlot {
+    pub level: RnsBggRefreshLevel,
+    pub decoder_target: RnsBggMatrix,
+    pub(crate) terms: Vec<
+        ProgramValue<
+            RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+            Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+        >,
+    >,
+    pub(crate) offset: RnsBggRow,
 }
 
 /// One slot's ordered terminal artifacts and decoding level. Keeping them in
@@ -911,13 +913,24 @@ pub struct PreparedDirectRefreshSlotDescriptor<L, D> {
     pub(crate) terms: Vec<D>,
 }
 
-impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefreshSlot<S> {
+impl PreparedDirectRefreshSlot {
     pub(crate) fn export(
         &self,
         graph: mxx_dsl::DslContext,
         prefix: &str,
-    ) -> Result<(mxx_dsl::DslContext, PreparedDirectRefreshSlotDescriptor<S::RefreshLevel,
-    <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema>), DslError>{
+    ) -> Result<
+        (
+            mxx_dsl::DslContext,
+            PreparedDirectRefreshSlotDescriptor<
+                RnsBggRefreshLevel,
+                <ProgramValue<
+                    RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+                    Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+                > as GraphValue>::Schema,
+            >,
+        ),
+        DslError,
+    > {
         let mut graph = graph
             .public_output(format!("{prefix}.target"), self.decoder_target.clone())?
             .public_output(format!("{prefix}.offset"), self.offset.clone())?;
@@ -932,13 +945,16 @@ impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefr
     /// Restore cached raw terms and target directly, without public arithmetic.
     pub(crate) fn import(
         descriptor: &PreparedDirectRefreshSlotDescriptor<
-            S::RefreshLevel,
-            <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
+            RnsBggRefreshLevel,
+            <ProgramValue<
+                RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+                Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+            > as GraphValue>::Schema,
         >,
         production: &mxx_ir_core::artifact::ProductionId,
         prefix: &str,
-        target: &<S::RefreshPublicRow as GraphValue>::Schema,
-        offset: &<S::RefreshRow as GraphValue>::Schema,
+        target: &<RnsBggMatrix as GraphValue>::Schema,
+        offset: &<RnsBggRow as GraphValue>::Schema,
     ) -> Result<Self, DslError> {
         use mxx_dsl::GraphValueSchema;
         use mxx_ir_core::artifact::ArtifactConfidentiality;
@@ -969,29 +985,35 @@ impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefr
         })
     }
 
-    pub fn terms(&self) -> &[ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>>] {
+    pub fn terms(
+        &self,
+    ) -> &[ProgramValue<
+        RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+        Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+    >] {
         &self.terms
     }
 
     pub fn new(
-        scheme: &S,
+        scheme: &RnsBggScheme,
         inputs: &[(
-            &crate::scheme::PublicProgramValue<S>,
-            &ProgramValue<S::TerminalMaterial, Family<S::TerminalMaterial>>,
+            &crate::scheme::PublicProgramValue<RnsBggScheme>,
+            &ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>,
         )],
-        output_key: S::RefreshPublicRow,
-        scale: S::RefreshTargetScale,
-        level: S::RefreshLevel,
-        offset: S::RefreshRow,
-    ) -> Result<Self, crate::readout::TerminalError<S::Error>> {
-        use crate::readout::TerminalError;
+        output_key: RnsBggMatrix,
+        scale: mxx_dsl::Mat,
+        level: RnsBggRefreshLevel,
+        offset: RnsBggRow,
+    ) -> Result<Self, TerminalError> {
+        use crate::rns_bgg::TerminalError;
         // Inputs are local arrays after digit routing/slicing. A scalar is
         // captured directly, and paired families have the same local count.
         let mut terms = Vec::with_capacity(inputs.len());
-        let raw = crate::readout::sum_terms(
+        let raw = crate::rns_bgg::terminal::sum_terms(
             inputs.iter().map(|(input, material)| {
-                let (cache, raw) =
-                    crate::readout::prepare_terminal_value(scheme, input, material, true, Ok)?;
+                let (cache, raw) = crate::rns_bgg::terminal::prepare_terminal_value(
+                    scheme, input, material, true, Ok,
+                )?;
                 terms.push(cache);
                 Ok(raw.at(0))
             }),
@@ -1008,10 +1030,10 @@ impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefr
     /// adds this public constant after ModDown, without changing any error.
     pub fn prepare_decoder(
         &self,
-        scheme: &S,
-        secret: &S::RefreshSecret,
-        parameters: &S::RefreshDecoderParameters,
-    ) -> S::RefreshDecoder {
+        scheme: &RnsBggScheme,
+        secret: &RnsBggMaskSecret,
+        parameters: &usize,
+    ) -> RnsBggRow {
         let decoder = scheme.prepare_direct_refresh_decoder(
             secret,
             self.decoder_target.clone(),
@@ -1025,18 +1047,20 @@ impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefr
     /// The evaluator receives helpers and a decoder, never the online secret.
     pub fn evaluate(
         &self,
-        scheme: &S,
-        inputs: &[(&crate::scheme::EncodingProgramValue<S>, &S::TerminalOnlineHelpers)],
-        decoder: S::RefreshDecoder,
-    ) -> Result<S::RefreshRow, crate::readout::TerminalError<S::Error>> {
-        use crate::readout::TerminalError;
+        scheme: &RnsBggScheme,
+        inputs: &[(&crate::scheme::EncodingProgramValue<RnsBggScheme>, &RnsBggOnlineMasks)],
+        decoder: RnsBggRow,
+    ) -> Result<RnsBggRow, TerminalError> {
+        use crate::rns_bgg::TerminalError;
         if inputs.len() != self.terms.len() {
             return Err(TerminalError::InputCount);
         }
-        let raw = crate::readout::sum_terms(
+        let raw = crate::rns_bgg::terminal::sum_terms(
             inputs.iter().zip(&self.terms).map(|((input, helpers), term)| {
-                crate::readout::evaluate_terminal_value(scheme, input, term, helpers, true, Ok)
-                    .map(|raw| raw.at(0))
+                crate::rns_bgg::terminal::evaluate_terminal_value(
+                    scheme, input, term, helpers, true, Ok,
+                )
+                .map(|raw| raw.at(0))
             }),
             |left, right| scheme.add_terminal_encoding(left, right).map_err(TerminalError::Scheme),
         )?;
@@ -1049,19 +1073,19 @@ impl<S: crate::noise_refresh::ExponentLUTRefreshDirectScheme> PreparedDirectRefr
 
 /// Fixed terminal data target and output-key scale for one CRT channel.
 /// `spacing` is H_t; the target already contains H_t times the desired scale.
-pub struct DirectRefreshChannel<S: ExponentLUTRefreshDirectScheme> {
-    pub level: S::RefreshLevel,
+pub struct DirectRefreshChannel {
+    pub level: RnsBggRefreshLevel,
     pub spacing: BigUint,
-    pub output_scale: S::RefreshTargetScale,
-    pub data: ProgramValue<S::TerminalMaterial, Family<S::TerminalMaterial>>,
+    pub output_scale: mxx_dsl::Mat,
+    pub data: ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>,
 }
 
 /// Public preparation for a complete refresh. Its terminal terms and decoder
 /// targets are cached once; only helpers and decoders depend on the online s.
-pub struct PreparedDirectRefresh<S: ExponentLUTRefreshDirectScheme> {
+pub struct PreparedDirectRefresh {
     pub(crate) labels: RefreshPrfLabelIndex,
-    pub(crate) slots: Vec<PreparedDirectRefreshSlot<S>>,
-    pub(crate) recomposition: S::RefreshRecomposition,
+    pub(crate) slots: Vec<PreparedDirectRefreshSlot>,
+    pub(crate) recomposition: crate::rns_bgg::RnsBggRefreshRecomposition,
 }
 
 /// Ordered refresh artifact declaration. Concrete bindings and schemas come
@@ -1087,19 +1111,28 @@ impl<B: Serialize, K: Serialize, L: Serialize, D: Serialize>
     }
 }
 
-impl<S: ExponentLUTRefreshDirectScheme> PreparedDirectRefresh<S> {
+impl PreparedDirectRefresh {
     pub fn export(
         &self,
-        scheme: &S,
+        scheme: &RnsBggScheme,
         graph: mxx_dsl::DslContext,
         prefix: &str,
-    ) -> Result<(mxx_dsl::DslContext, PreparedDirectRefreshDescriptor<
-        S::RefreshArtifactBinding,
-        <S::RefreshOutputKey as GraphValue>::Schema,
-        S::RefreshLevel,
-        <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
-    >), DslError>{
-        let key = S::refresh_output_key(&self.recomposition);
+    ) -> Result<
+        (
+            mxx_dsl::DslContext,
+            PreparedDirectRefreshDescriptor<
+                crate::rns_bgg::RnsBggArtifactBinding,
+                <RnsBggPublicKey as GraphValue>::Schema,
+                RnsBggRefreshLevel,
+                <ProgramValue<
+                    RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+                    Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+                > as GraphValue>::Schema,
+            >,
+        ),
+        DslError,
+    > {
+        let key = scheme.refresh_output_key(&self.recomposition);
         let mut graph = graph.public_output(format!("{prefix}.output-key"), key.clone())?;
         let mut slots = Vec::with_capacity(self.slots.len());
         for (index, slot) in self.slots.iter().enumerate() {
@@ -1122,20 +1155,24 @@ impl<S: ExponentLUTRefreshDirectScheme> PreparedDirectRefresh<S> {
     /// Reopen caches without repeating public sums or ModDown. Secret-dependent
     /// helpers and decoders remain in online preparation.
     pub fn import(
-        scheme: &S,
+        scheme: &RnsBggScheme,
         descriptor: &PreparedDirectRefreshDescriptor<
-            S::RefreshArtifactBinding,
-            <S::RefreshOutputKey as GraphValue>::Schema,
-            S::RefreshLevel,
-            <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema,
+            crate::rns_bgg::RnsBggArtifactBinding,
+            <RnsBggPublicKey as GraphValue>::Schema,
+            RnsBggRefreshLevel,
+            <ProgramValue<
+                RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+                Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+            > as GraphValue>::Schema,
         >,
         production: mxx_ir_core::artifact::ProductionId,
         expected_identity: [u8; 32],
     ) -> Result<Self, super::setup::RefreshSetupError>
     where
-        S::RefreshLevel: Serialize,
-        <ProgramValue<S::PreparedTerminal, Family<S::PreparedTerminal>> as GraphValue>::Schema:
-            Serialize,
+        <ProgramValue<
+            RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>,
+            Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
+        > as GraphValue>::Schema: Serialize,
     {
         use super::setup::RefreshSetupError;
         use mxx_dsl::GraphValueSchema;
@@ -1172,30 +1209,30 @@ impl<S: ExponentLUTRefreshDirectScheme> PreparedDirectRefresh<S> {
         Ok(Self { labels: descriptor.labels.clone(), slots, recomposition })
     }
 
-    pub fn recomposition(&self) -> &S::RefreshRecomposition {
+    pub fn recomposition(&self) -> &crate::rns_bgg::RnsBggRefreshRecomposition {
         &self.recomposition
     }
 
-    pub fn slots(&self) -> &[PreparedDirectRefreshSlot<S>] {
+    pub fn slots(&self) -> &[PreparedDirectRefreshSlot] {
         &self.slots
     }
 
     pub fn new(
-        scheme: &S,
-        data: &crate::scheme::PublicProgramValue<S>,
-        digits: &crate::scheme::PublicProgramValue<S>,
+        scheme: &RnsBggScheme,
+        data: &crate::scheme::PublicProgramValue<RnsBggScheme>,
+        digits: &crate::scheme::PublicProgramValue<RnsBggScheme>,
         readout: &ValueReadout,
         plan: &RefreshDigitPlan,
         labels: RefreshPrfLabelIndex,
-        secret: &S::RefreshDigitSecret,
-        bank: &S::RefreshDigitMaskBank,
-        channels: Vec<DirectRefreshChannel<S>>,
-        output_key: S::RefreshPublicRow,
-        recomposition: S::RefreshRecomposition,
+        secret: &RnsBggPayloadSecret,
+        bank: &RnsBggMaskBank,
+        channels: Vec<DirectRefreshChannel>,
+        output_key: RnsBggMatrix,
+        recomposition: crate::rns_bgg::RnsBggRefreshRecomposition,
         hash_key: Bytes,
         tag: HashTag,
         id: [u8; 32],
-    ) -> Result<Self, TerminalError<S::Error>> {
+    ) -> Result<Self, TerminalError> {
         if channels.len() != plan.mask_counts.len() {
             return Err(TerminalError::InputCount);
         }
@@ -1251,22 +1288,22 @@ impl<S: ExponentLUTRefreshDirectScheme> PreparedDirectRefresh<S> {
 
     pub fn prepare_decoders(
         &self,
-        scheme: &S,
-        secret: &S::RefreshSecret,
-        parameters: &S::RefreshDecoderParameters,
-    ) -> Vec<S::RefreshDecoder> {
+        scheme: &RnsBggScheme,
+        secret: &RnsBggMaskSecret,
+        parameters: &usize,
+    ) -> Vec<RnsBggRow> {
         self.slots.iter().map(|slot| slot.prepare_decoder(scheme, secret, parameters)).collect()
     }
 
     pub fn evaluate(
         &self,
-        scheme: &S,
-        data: &crate::scheme::EncodingProgramValue<S>,
-        digits: &crate::scheme::EncodingProgramValue<S>,
-        data_helpers: &S::TerminalOnlineHelpers,
-        digit_helpers: &S::TerminalOnlineHelpers,
-        decoders: Vec<S::RefreshDecoder>,
-    ) -> Result<S::Encoding, TerminalError<S::Error>> {
+        scheme: &RnsBggScheme,
+        data: &crate::scheme::EncodingProgramValue<RnsBggScheme>,
+        digits: &crate::scheme::EncodingProgramValue<RnsBggScheme>,
+        data_helpers: &RnsBggOnlineMasks,
+        digit_helpers: &RnsBggOnlineMasks,
+        decoders: Vec<RnsBggRow>,
+    ) -> Result<(RnsBggEncoding, Option<mxx_dsl::Mat>), TerminalError> {
         if decoders.len() != self.slots.len() {
             return Err(TerminalError::InputCount);
         }

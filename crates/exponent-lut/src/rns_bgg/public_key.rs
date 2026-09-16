@@ -1,5 +1,14 @@
 //! RNS-BGG public preparation and prepared artifact transport.
+//!
+//! Methods in this module construct preprocessing and online DSL graph
+//! values; they do not execute a backend. Public matrices and helper material
+//! are distinct from secret values. Every operation validates scheme context,
+//! modulus-chain level, key/material identity, and scalar or family range
+//! before connecting graph values. Artifact export/import carries an
+//! authenticated descriptor and rechecks its identity before reuse.
+#![warn(missing_docs)]
 use super::*;
+use sha2::Digest;
 
 impl<M: GraphValue> GraphValue for RnsBggPublicKeyFamily<M> {
     type Schema = RnsBggPublicKeyFamily<M::Schema>;
@@ -787,6 +796,34 @@ impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema, D: GraphValu
         }
     }
 }
+fn terminal_family_stage_identity<C: serde::Serialize, P: serde::Serialize>(
+    parameters: [u8; 32],
+    context: [u8; 32],
+    input_id: [u8; 32],
+    input_level: usize,
+    binding: &RnsBggLutBinding,
+    mode: RnsBggTerminalFamilyMode,
+    finalization: TerminalFinalization,
+    range: &FamilyRange,
+    cache: &C,
+    public: &P,
+) -> Result<[u8; 32], RnsBggError> {
+    let encoded = serde_json::to_vec(&(
+        parameters,
+        context,
+        input_id,
+        input_level,
+        binding,
+        mode,
+        finalization,
+        range,
+        cache,
+        public,
+    ))
+    .map_err(|_| RnsBggError::Context)?;
+    Ok(sha2::Sha256::digest(encoded).into())
+}
+
 impl RnsBggScheme {
     /// Decompose in the low ring once, then transport bounded digits to the
     /// input ring. The decomposition is independent of the input public key.
@@ -810,6 +847,7 @@ impl RnsBggScheme {
         rhs: &RnsBggPrivateRhs<RnsBggRhsFamily>,
         range: &FamilyRange,
     ) -> Result<RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>, RnsBggError> {
+        validate_family_range(range, rhs.ciphertext.count())?;
         let values = mxx_dsl::parallel(range.count().clone(), |index| {
             let element = RnsBggPrivateRhs {
                 ciphertext: rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone())))?,
@@ -855,6 +893,8 @@ impl RnsBggScheme {
         };
         Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
     }
+    /// Prepare a private product independently for every matching family
+    /// member while retaining one structural family body.
     pub fn prepare_mul_private_family(
         &self,
         input: &RnsBggPublicKeyFamily,
@@ -879,6 +919,11 @@ impl RnsBggScheme {
         if input.level != level || input.context != context {
             return Err(RnsBggError::Context);
         }
+        if let ProgramValue::Family(rhs) = rhs &&
+            rhs.ciphertext.count() != input.range.count()
+        {
+            return Err(RnsBggError::Context);
+        }
         let (ciphertext, lifted_ciphertext) = match rhs {
             ProgramValue::Scalar(rhs) => (
                 ProgramValue::Scalar(rhs.ciphertext.clone()),
@@ -891,15 +936,10 @@ impl RnsBggScheme {
         };
         let rhs = RnsBggPrivateRhs { ciphertext, lifted_ciphertext, level, context, id, rhs_id };
         let matrices = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let input = RnsBggPublicKey {
-                matrix: input.matrices.at(&index),
-                level: input.level,
-                context: input.context,
-                id: input.id,
-            };
+            let input = input.element_at_local(index.clone());
             let rhs = RnsBggPrivateRhs {
-                ciphertext: rhs.ciphertext.at(&index),
-                lifted_ciphertext: rhs.lifted_ciphertext.at(&index),
+                ciphertext: rhs.ciphertext.at(index.clone()),
+                lifted_ciphertext: rhs.lifted_ciphertext.at(index),
                 level: rhs.level,
                 context: rhs.context,
                 id: rhs.id,
@@ -919,6 +959,7 @@ impl RnsBggScheme {
         };
         Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
     }
+    /// Prepare an Add operation at one level without changing its modulus.
     pub fn prepare_add(
         &self,
         lhs: &RnsBggPublicKey,
@@ -970,6 +1011,10 @@ impl RnsBggScheme {
             operation: LinearOperation::MulPublic(multiplier),
         })
     }
+    /// Sample a public input key matrix from a domain-separated hash.
+    ///
+    /// The returned key is public graph material; the payload secret is added
+    /// later by `prepare_input` and `encode`.
     pub fn sample_input_key(
         &self,
         level: usize,
@@ -989,6 +1034,10 @@ impl RnsBggScheme {
             context: self.context,
         })
     }
+    /// Prepare the payload-dependent public contribution for an input key.
+    ///
+    /// This constructs preprocessing graph material from the secret and does
+    /// not execute or reveal the secret.
     pub fn prepare_input(
         &self,
         secret: &RnsBggPayloadSecret,
@@ -999,7 +1048,7 @@ impl RnsBggScheme {
         if payload.matrix_type() != &self.ring(key.level)?.matrix_type((1, 1)) {
             return Err(RnsBggError::Context);
         }
-        let r = self.payload_at(secret, key.level)?;
+        let r = self.reduce_payload_secret_modulus(secret, key.level)?;
         let scale = -BigInt::from(self.parameters.scale(key.level)?.clone());
         let gadget = self.state_gadget(key.level)?;
         let row =
@@ -1059,6 +1108,8 @@ impl RnsBggScheme {
         }
         Ok(RnsBggMaskBank { id, level, context: self.context, branches })
     }
+    /// Prepare one scalar LUT by decomposing helper material once and building
+    /// input-key-dependent branch products in the graph.
     pub fn prepare_lut(
         &self,
         input: &RnsBggPublicKey,
@@ -1068,11 +1119,7 @@ impl RnsBggScheme {
         if material.table.is_some() && material.rhs_id.is_some() {
             return Err(RnsBggError::Lut);
         }
-        let lifted = material
-            .branches
-            .iter()
-            .map(|(_, ciphertext)| self.prepare_digits(input.level, ciphertext.clone()))
-            .collect::<Result<Vec<_>, _>>()?;
+        let lifted = self.prepare_lut_material_digits(input.level, material)?;
         let (raw_public, branches) = self.prepare_lut_raw(input, material, &lifted)?;
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
         let output = RnsBggPublicKey {
@@ -1087,6 +1134,20 @@ impl RnsBggScheme {
             output,
             branches,
         })
+    }
+
+    /// Prepare material-only branch decompositions once. This depends on the
+    /// helper ciphertexts and level, but not on the input public key.
+    fn prepare_lut_material_digits(
+        &self,
+        level: usize,
+        material: &RnsBggLutMaterial,
+    ) -> Result<Vec<RnsBggDigits>, RnsBggError> {
+        material
+            .branches
+            .iter()
+            .map(|(_, ciphertext)| self.prepare_digits(level, ciphertext.clone()))
+            .collect()
     }
     /// Shared branch preparation; terminal batches retain K before its outer switch.
     pub(super) fn prepare_lut_raw(
@@ -1153,6 +1214,7 @@ impl RnsBggScheme {
         }
         Ok((raw_public, branches))
     }
+    /// Build the public CRT recomposition coefficients for a refresh output.
     pub fn prepare_refresh_recomposition(
         &self,
         output_key: RnsBggPublicKey,
@@ -1173,6 +1235,10 @@ impl RnsBggScheme {
             .collect::<Result<_, _>>()?;
         Ok(RnsBggRefreshRecomposition { output_key, coefficients })
     }
+    /// Export terminal public artifacts and its descriptor into a DSL graph.
+    ///
+    /// The descriptor records the expected production, parameter identity,
+    /// stage binding, and artifact names; import validates those identities.
     pub fn export_prepared_terminal(
         &self,
         prepared: &RnsBggPreparedTerminal,
@@ -1243,6 +1309,7 @@ impl RnsBggScheme {
         &self,
         family: &RnsBggPublicKeyFamily,
     ) -> Result<(), RnsBggError> {
+        validate_family_range(&family.range, family.range.capacity())?;
         if family.context != self.context ||
             matches!(&family.matrices, ProgramValue::Family(values) if values.count() != family.range.count()) ||
             family.matrices.element_schema().matrix_type() !=
@@ -1277,15 +1344,7 @@ impl RnsBggScheme {
         {
             return Err(RnsBggError::Context);
         }
-        if let (Ok(start), Ok(count), Ok(capacity)) = (
-            range.start().evaluate(&ParamEnv::default()),
-            range.count().evaluate(&ParamEnv::default()),
-            material.ciphertexts.count().evaluate(&ParamEnv::default()),
-        ) {
-            if start < 0.into() || count <= 0.into() || start + count > capacity {
-                return Err(RnsBggError::Context);
-            }
-        }
+        validate_family_range(range, &material.ciphertexts.count())?;
         let branches = material
             .masks
             .iter()
@@ -1322,6 +1381,10 @@ impl RnsBggScheme {
             branches,
         })
     }
+    /// Prepare a unary LUT for every member of a public-key family.
+    ///
+    /// Material-only digit decomposition is performed outside the indexed
+    /// body; input-key-dependent products remain inside the family body.
     pub fn prepare_lut_family(
         &self,
         input: &RnsBggPublicKeyFamily,
@@ -1332,26 +1395,49 @@ impl RnsBggScheme {
         if input.level != material.binding.level || input.context != material.binding.context {
             return Err(RnsBggError::Context);
         }
-        // Check concrete ranges here; symbolic bounds remain graph-validated.
-        if let (Ok(start), Ok(count), Ok(capacity)) = (
-            input.range.start().evaluate(&ParamEnv::default()),
-            input.range.count().evaluate(&ParamEnv::default()),
-            material.ciphertexts.count().evaluate(&ParamEnv::default()),
-        ) {
-            if start < 0.into() || count <= 0.into() || start + count > capacity {
-                return Err(RnsBggError::Context);
-            }
-        }
+        validate_family_range(&input.range, &material.ciphertexts.count())?;
+        let lifted_material = mxx_dsl::parallel(material.ciphertexts.count().clone(), |member| {
+            let ciphertexts = material.ciphertexts.at(member);
+            let lifted = ciphertexts
+                .0
+                .into_iter()
+                .map(|ciphertext| self.prepare_digits(input.level, ciphertext))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| DslError::Schema)?;
+            Ok(RnsBggLiftedBranches(lifted))
+        })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
         let prepared = mxx_dsl::parallel(input.range.count().clone(), |index| {
             let external = index.clone().add(Int::evaluate(input.range.start().clone()));
-            let scalar_material = material.at(external);
-            let key = RnsBggPublicKey {
-                matrix: input.matrices.at(&index),
-                level: input.level,
-                id: input.id,
-                context: input.context,
+            let scalar_material = material.element_at_external(external.clone());
+            let lifted_member = lifted_material.at(external);
+            let lifted = (0..material.masks.len())
+                .map(|branch| lifted_member.0[branch].clone())
+                .collect::<Vec<_>>();
+            let key = input.element_at_local(index);
+            let (raw_public, branches) = self
+                .prepare_lut_raw(&key, &scalar_material, &lifted)
+                .map_err(|_| DslError::Schema)?;
+            let next = BigInt::from(
+                self.parameters
+                    .level(input.level + 1)
+                    .map_err(|_| DslError::Schema)?
+                    .modulus()
+                    .as_ref()
+                    .clone(),
+            );
+            let output = RnsBggPublicKey {
+                matrix: raw_public.block_mod_switch(next),
+                level: input.level + 1,
+                id: output_id,
+                context: self.context,
             };
-            self.prepare_lut(&key, &scalar_material, output_id).map_err(|_| DslError::Schema)
+            Ok(RnsBggPreparedLut {
+                binding: scalar_material.binding(),
+                input: key,
+                output,
+                branches,
+            })
         })?;
         let matrices = prepared.field(|value| value.output.matrix)?;
         Ok(RnsBggPreparedLutFamily {
@@ -1391,11 +1477,16 @@ impl RnsBggScheme {
             return Err(RnsBggError::Context);
         }
         let matrices = mxx_dsl::parallel(lhs.range.count().clone(), |index| {
-            let left = lhs.matrices.at(&index);
-            Ok(match &multiplier {
-                Some(multiplier) => multiplier.at(&index) * left,
-                None => left + rhs.matrices.at(&index),
-            })
+            let left = lhs.element_at_local(index.clone());
+            let right = rhs.element_at_local(index.clone());
+            let prepared = match &multiplier {
+                Some(multiplier) => {
+                    self.prepare_mul_public(&left, &right, multiplier.at(index), output_id)
+                }
+                None => self.prepare_add(&left, &right, output_id),
+            }
+            .map_err(|_| DslError::Schema)?;
+            Ok(prepared.output.matrix)
         })
         .map_err(|e| RnsBggError::Graph(e.to_string()))?;
         Ok(RnsBggPreparedLinear {
@@ -1411,6 +1502,7 @@ impl RnsBggScheme {
             },
         })
     }
+    /// Prepare reduction of a family into one scalar public key.
     pub fn prepare_reduce_family(
         &self,
         value: &RnsBggPublicKeyFamily,
@@ -1506,6 +1598,7 @@ impl RnsBggScheme {
             range: range.clone(),
         })
     }
+    /// Export scalar linear-operation artifacts and an identity descriptor.
     pub fn export_prepared_linear(
         &self,
         prepared: &RnsBggPreparedLinear,
@@ -1562,6 +1655,7 @@ impl RnsBggScheme {
             operation,
         })
     }
+    /// Export family linear-operation artifacts with their range binding.
     pub fn export_prepared_linear_family(
         &self,
         prepared: &RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
@@ -1604,6 +1698,7 @@ impl RnsBggScheme {
             },
         ))
     }
+    /// Import and validate family linear artifacts from a production graph.
     pub fn import_prepared_linear_family(
         &self,
         descriptor: &RnsBggPreparedLinearDescriptor,
@@ -1641,6 +1736,7 @@ impl RnsBggScheme {
             operation,
         })
     }
+    /// Export a family reduction descriptor and its public artifacts.
     pub fn export_prepared_reduction(
         &self,
         prepared: &RnsBggPreparedReduction,
@@ -1673,6 +1769,7 @@ impl RnsBggScheme {
             },
         ))
     }
+    /// Import and validate a previously exported family reduction.
     pub fn import_prepared_reduction(
         &self,
         descriptor: &RnsBggPreparedLinearDescriptor,
@@ -1902,6 +1999,7 @@ impl RnsBggScheme {
             ArtifactConfidentiality::Public,
         )?)
     }
+    /// Export terminal readout material and its descriptor.
     pub fn export_prepared_readout(
         &self,
         prepared: &RnsBggPreparedReadout,
@@ -2080,6 +2178,9 @@ impl RnsBggScheme {
             terminal: RnsBggReadoutTerminal::Scalar { terminal, offset },
         })
     }
+    /// Prepare scalar terminal material and its raw public accumulator.
+    ///
+    /// Final terminal ModDown remains deferred to the explicit finalizer.
     pub fn prepare_terminal(
         &self,
         input: &RnsBggPublicKey,
@@ -2100,6 +2201,10 @@ impl RnsBggScheme {
             raw_public,
         })
     }
+    /// Finalize a raw terminal public accumulator with exactly one ModDown.
+    ///
+    /// The stage list and input level are checked before the output key is
+    /// constructed; this is graph construction, not backend execution.
     pub fn finalize_terminal_public(
         &self,
         raw: RnsBggTerminalAccumulator<RnsBggMatrix>,
@@ -2115,28 +2220,34 @@ impl RnsBggScheme {
             stages: raw.stages,
         })
     }
+
     /// Prepare shared or indexed row targets across the active input range.
     /// No member is enumerated on the host; key-dependent work stays structural.
-    pub fn prepare_terminal_family(
+    pub(crate) fn prepare_terminal_family(
         &self,
         input: &RnsBggPublicKeyFamily,
         material: &ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>,
         mode: RnsBggTerminalFamilyMode,
-        finalize: Option<bool>,
+        finalization: TerminalFinalization,
     ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
         self.check_public_family(input)?;
-        let finalize = finalize.unwrap_or(true);
         let binding = material.element_schema().material.binding();
         let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
-        let (cache, public) = crate::readout::prepare_terminal_value(
+        let (cache, public) = crate::rns_bgg::terminal::prepare_terminal_value(
             self,
             &input.clone().into_program()?,
             material,
             mode == RnsBggTerminalFamilyMode::Sum,
-            |raw| Ok(if finalize { raw.value.block_mod_switch(next) } else { raw.value }),
+            |raw| {
+                Ok(if finalization.is_finalized() {
+                    raw.value.block_mod_switch(next)
+                } else {
+                    raw.value
+                })
+            },
         )
         .map_err(|error| match error {
-            crate::readout::TerminalError::Scheme(error) => error,
+            crate::rns_bgg::TerminalError::Scheme(error) => error,
             error => RnsBggError::Graph(error.to_string()),
         })?;
         let ProgramValue::Family(cache) = cache else { return Err(RnsBggError::Context) };
@@ -2144,25 +2255,30 @@ impl RnsBggScheme {
             ProgramValue::Scalar(value) => Family::pack(vec![value])?,
             ProgramValue::Family(values) => values,
         };
-        let mut hash = Sha256::new();
-        hash.update(b"rns_bgg-terminal-stage");
-        hash.update(self.context);
-        hash.update(input.id);
-        hash.update(binding.material_id);
-        hash.update([u8::from(finalize)]);
-        hash.update([match mode {
-            RnsBggTerminalFamilyMode::Independent => 0,
-            RnsBggTerminalFamilyMode::Sum => 1,
-        }]);
+        let cache_schema = cache.schema();
+        let public_schema = public.schema();
+        let id = terminal_family_stage_identity(
+            self.parameter_identity(),
+            self.context,
+            input.id,
+            input.level,
+            &binding,
+            mode,
+            finalization,
+            &input.range,
+            &cache_schema,
+            &public_schema,
+        )?;
         Ok(RnsBggPreparedTerminalFamily {
             mode,
-            finalize,
+            finalization,
             input: input.clone(),
-            id: hash.finalize().into(),
+            id,
             cache,
             public,
         })
     }
+    /// Export family terminal artifacts and their authenticated descriptor.
     pub fn export_prepared_terminal_family(
         &self,
         prepared: &RnsBggPreparedTerminalFamily,
@@ -2177,7 +2293,7 @@ impl RnsBggScheme {
                 prefix: prefix.to_owned(),
                 parameters: self.parameter_identity(),
                 mode: prepared.mode,
-                finalize: prepared.finalize,
+                finalization: prepared.finalization,
                 id: prepared.id,
                 range: prepared.input.range.clone(),
                 cache: prepared.cache.schema(),
@@ -2195,9 +2311,31 @@ impl RnsBggScheme {
         stage_id: [u8; 32],
     ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
         let metadata = &descriptor.cache.element;
+        let expected_public_count = match descriptor.mode {
+            RnsBggTerminalFamilyMode::Independent => descriptor.range.count().clone(),
+            RnsBggTerminalFamilyMode::Sum => 1.into(),
+        };
+        if descriptor.cache.count != descriptor.range.count().clone() ||
+            descriptor.public.count != expected_public_count
+        {
+            return Err(RnsBggError::Context);
+        }
+        let expected_id = terminal_family_stage_identity(
+            self.parameter_identity(),
+            self.context,
+            metadata.input.id,
+            metadata.input.level,
+            binding,
+            descriptor.mode,
+            descriptor.finalization,
+            &descriptor.range,
+            &descriptor.cache,
+            &descriptor.public,
+        )?;
         if descriptor.parameters != self.parameter_identity() ||
             metadata.binding != *binding ||
             metadata.input.id != input_id ||
+            descriptor.id != expected_id ||
             descriptor.id != stage_id ||
             metadata.input.context != self.context
         {
@@ -2213,7 +2351,7 @@ impl RnsBggScheme {
         input.range = descriptor.range.clone();
         Ok(RnsBggPreparedTerminalFamily {
             mode: descriptor.mode,
-            finalize: descriptor.finalize,
+            finalization: descriptor.finalization,
             id: descriptor.id,
             input,
             cache,
@@ -2323,13 +2461,31 @@ impl ExponentProgramLowering for RnsBggPublicEvaluator<'_> {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Serialized description of a public linear operation and its family scope.
 pub enum RnsBggLinearOperation {
-    Add { rhs: [u8; 32], range: Option<FamilyRange> },
-    MulPublic { rhs: [u8; 32], range: Option<FamilyRange> },
-    Reduce { range: FamilyRange },
+    /// Add a public key identified by `rhs`.
+    Add {
+        /// Identity of the right-hand public key.
+        rhs: [u8; 32],
+        /// Active family range, or `None` for scalar inputs.
+        range: Option<FamilyRange>,
+    },
+    /// Multiply a private key by a public multiplier identified by `rhs`.
+    MulPublic {
+        /// Identity of the public multiplier source.
+        rhs: [u8; 32],
+        /// Active family range, or `None` for scalar inputs.
+        range: Option<FamilyRange>,
+    },
+    /// Reduce a family over its external range into a scalar result.
+    Reduce {
+        /// External family range being reduced.
+        range: FamilyRange,
+    },
 }
 
 impl RnsBggLinearOperation {
+    /// Return the family range expected by the operation's inputs.
     pub fn input_range(&self) -> Option<&FamilyRange> {
         match self {
             Self::Add { range, .. } | Self::MulPublic { range, .. } => range.as_ref(),
@@ -2337,6 +2493,7 @@ impl RnsBggLinearOperation {
         }
     }
 
+    /// Return the family range of the operation's output, if it remains a family.
     pub fn output_range(&self) -> Option<&FamilyRange> {
         match self {
             Self::Add { range, .. } | Self::MulPublic { range, .. } => range.as_ref(),
@@ -2388,13 +2545,19 @@ impl<M: GraphValue> LinearOperation<M> {
 /// A range denotes active family members; reduction has a scalar output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RnsBggLinearBinding {
+    /// Scheme context identity.
     pub context: [u8; 32],
+    /// Modulus-chain level of both inputs.
     pub level: usize,
+    /// Identity of the left/private input.
     pub lhs: [u8; 32],
+    /// Identity assigned to the prepared output.
     pub output: [u8; 32],
+    /// Operation kind and family scope.
     pub operation: RnsBggLinearOperation,
 }
 
+/// Serialized descriptor for scalar or family linear preparation.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RnsBggPreparedLinearDescriptor {
     key_storage: [ProgramValue<(), Vec<bool>>; 2],
@@ -2405,6 +2568,7 @@ pub struct RnsBggPreparedLinearDescriptor {
 }
 
 impl RnsBggPreparedLinearDescriptor {
+    /// Return the authenticated expected binding for this descriptor.
     pub fn binding(&self) -> &RnsBggLinearBinding {
         &self.binding
     }
@@ -2436,6 +2600,7 @@ pub struct RnsBggPreparedLutDescriptor<S = <RnsBggPreparedLut as GraphValue>::Sc
     schema: S,
 }
 
+/// Serialized descriptor for family LUT preparation and its range.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RnsBggPreparedLutFamilyDescriptor {
     pub(super) prepared:
@@ -2462,6 +2627,18 @@ pub(crate) mod terminal_artifact_tests {
     };
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn test_rns_bgg_family_range_checks_external_end_and_symbolic_bounds() {
+        let valid = FamilyRange::bounded(2, 2, 4).unwrap();
+        assert!(validate_family_range(&valid, &4.into()).is_ok());
+
+        let invalid_end = FamilyRange::bounded(3, 2, 4).unwrap();
+        assert!(validate_family_range(&invalid_end, &4.into()).is_err());
+
+        let symbolic_start = FamilyRange::bounded(IntExpr::LoopIndex(0), 2, 4).unwrap();
+        assert!(validate_family_range(&symbolic_start, &4.into()).is_err());
+    }
 
     #[test]
     fn test_rns_bgg_fixed_product_schema_preserves_family_bindings() {
@@ -2588,7 +2765,7 @@ pub(crate) mod terminal_artifact_tests {
                 rand::random(),
             )
             .unwrap();
-        use crate::readout::PreparedTerminal;
+        use crate::rns_bgg::PreparedTerminal;
         let materials = tables
             .iter()
             .enumerate()
@@ -2618,11 +2795,10 @@ pub(crate) mod terminal_artifact_tests {
             .iter()
             .map(|term| (term.binding().clone(), key.id, term.id()))
             .collect::<Vec<_>>();
-        let (mut producer, descriptor) =
+        let (mut producer, descriptor, expectation) =
             prepared.export(DslContext::new("rns_bgg-terminal-preprocessing"), "terminal").unwrap();
-        let descriptor: crate::readout::PreparedTerminalDescriptor<
-            <RnsBggScheme as ExponentLUTTerminalScheme>::TerminalDescriptor,
-        > = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
+        let descriptor: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
         let mut inputs = Vec::new();
         for x in 0..2 {
             let payload = high.polynomial((0..=x).map(|i| BigInt::from(u8::from(i == x)).into()));
@@ -2652,6 +2828,80 @@ pub(crate) mod terminal_artifact_tests {
         let production = produced.production_id.unwrap();
         drop(store);
         let mut store = FileArtifactStore::open(directory.path()).unwrap();
+        let mut renamed_term = serde_json::to_value(&descriptor).unwrap();
+        renamed_term["terms"][0]["prepared"][0] = serde_json::json!("terminal.term.renamed");
+        let renamed_term: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_value(renamed_term).unwrap();
+        assert!(
+            PreparedTerminal::import(
+                &scheme,
+                &renamed_term,
+                &expectation,
+                production.clone(),
+                &expected,
+            )
+            .is_err()
+        );
+        let mut renamed_output = serde_json::to_value(&descriptor).unwrap();
+        renamed_output["output_name"] = serde_json::json!("terminal.output.renamed");
+        let renamed_output: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_value(renamed_output).unwrap();
+        assert!(
+            PreparedTerminal::import(
+                &scheme,
+                &renamed_output,
+                &expectation,
+                production.clone(),
+                &expected,
+            )
+            .is_err()
+        );
+        let mut empty_branches = serde_json::to_value(&descriptor).unwrap();
+        empty_branches["terms"][0]["prepared"][1]["branches"] = serde_json::json!([]);
+        let empty_branches: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_value(empty_branches).unwrap();
+        assert!(
+            PreparedTerminal::import(
+                &scheme,
+                &empty_branches,
+                &expectation,
+                production.clone(),
+                &expected,
+            )
+            .is_err()
+        );
+        let mut incompatible_output = serde_json::to_value(&descriptor).unwrap();
+        incompatible_output["output_level"] = serde_json::json!(usize::MAX);
+        let incompatible_output: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_value(incompatible_output).unwrap();
+        assert!(
+            PreparedTerminal::import(
+                &scheme,
+                &incompatible_output,
+                &expectation,
+                production.clone(),
+                &expected,
+            )
+            .is_err()
+        );
+        let mut redirected = serde_json::to_value(&descriptor).unwrap();
+        redirected["prefix"] = serde_json::json!("redirected");
+        for (index, term) in redirected["terms"].as_array_mut().unwrap().iter_mut().enumerate() {
+            term["prepared"][0] = serde_json::json!(format!("redirected.term.{index}"));
+        }
+        redirected["output_name"] = serde_json::json!("redirected.output");
+        let redirected: crate::rns_bgg::PreparedTerminalDescriptor =
+            serde_json::from_value(redirected).unwrap();
+        assert!(
+            PreparedTerminal::import(
+                &scheme,
+                &redirected,
+                &expectation,
+                production.clone(),
+                &expected,
+            )
+            .is_err()
+        );
         let manifest = store.load_manifest(&production).unwrap();
         for (name, artifact) in &manifest.artifacts {
             assert!(!name.contains(".d."), "online helper persisted: {name}");
@@ -2662,24 +2912,54 @@ pub(crate) mod terminal_artifact_tests {
             };
             assert_eq!(artifact.confidentiality, expected, "{name}");
         }
-        let prepared =
-            PreparedTerminal::import(&scheme, &descriptor, production.clone(), &expected).unwrap();
+        let prepared = PreparedTerminal::import(
+            &scheme,
+            &descriptor,
+            &expectation,
+            production.clone(),
+            &expected,
+        )
+        .unwrap();
         let mut wrong = expected.clone();
         wrong[0].2[0] ^= 1;
         assert!(
-            PreparedTerminal::import(&scheme, &descriptor, production.clone(), &wrong).is_err()
+            PreparedTerminal::import(
+                &scheme,
+                &descriptor,
+                &expectation,
+                production.clone(),
+                &wrong
+            )
+            .is_err()
         );
         wrong = expected.clone();
         wrong[0].0.mask_bank[0] ^= 1;
         assert!(
-            PreparedTerminal::import(&scheme, &descriptor, production.clone(), &wrong).is_err()
+            PreparedTerminal::import(
+                &scheme,
+                &descriptor,
+                &expectation,
+                production.clone(),
+                &wrong
+            )
+            .is_err()
         );
         wrong = expected.clone();
         wrong.reverse();
         assert!(
-            PreparedTerminal::import(&scheme, &descriptor, production.clone(), &wrong).is_err()
+            PreparedTerminal::import(
+                &scheme,
+                &descriptor,
+                &expectation,
+                production.clone(),
+                &wrong
+            )
+            .is_err()
         );
-        assert!(PreparedTerminal::import(&scheme, &descriptor, production.clone(), &[]).is_err());
+        assert!(
+            PreparedTerminal::import(&scheme, &descriptor, &expectation, production.clone(), &[])
+                .is_err()
+        );
         let public = prepared.public();
         // Import each artifact port once, then share its graph value across s.
         let inputs = inputs
@@ -2900,8 +3180,7 @@ pub(crate) mod program_artifacts_tests {
         let scalar_material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &bank,
                 seed.clone(),
                 b"scalar".as_slice(),
@@ -2925,8 +3204,7 @@ pub(crate) mod program_artifacts_tests {
         let table_family_material = scheme
             .sample_lut_material_family(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &bank,
                 4.into(),
                 seed.clone(),
@@ -2934,6 +3212,7 @@ pub(crate) mod program_artifacts_tests {
                 rand::random(),
             )
             .unwrap();
+        assert_eq!(table_family_material.binding().rhs, None);
         let private_material = scheme
             .sample_private_rhs(
                 &secret.payload,
@@ -3105,7 +3384,7 @@ pub(crate) mod program_artifacts_tests {
                 ProgramValue::Family((
                     mxx_dsl::parallel(range.count().clone(), |index| {
                         Ok(table_family_material
-                            .at(index.add(Int::evaluate(range.start().clone()))))
+                            .element_at_external(index.add(Int::evaluate(range.start().clone()))))
                     })
                     .unwrap(),
                     range.clone(),
@@ -3802,8 +4081,7 @@ mod lut_artifact_tests {
         let material = scheme
             .sample_lut_material(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &bank,
                 seed.clone(),
                 b"helpers".as_slice(),
@@ -3835,8 +4113,7 @@ mod lut_artifact_tests {
         let family_material = scheme
             .sample_lut_material_family(
                 &secret.payload,
-                Some(&table),
-                None,
+                &table,
                 &bank,
                 4.into(),
                 seed,
@@ -3846,6 +4123,91 @@ mod lut_artifact_tests {
             .unwrap();
         let family_prepared =
             scheme.prepare_lut_family(&family_key, &family_material, rand::random()).unwrap();
+
+        let structural = DslContext::new("rns_bgg-lut-structure")
+            .output("prepared", family_prepared.output.matrices.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        fn descendant_lift_counts(
+            graph: &mxx_ir_core::Graph,
+            scope_id: &mxx_ir_core::graph::FrozenGraphScopeId,
+        ) -> (usize, usize) {
+            let scope = graph.scope(scope_id).unwrap();
+            let mut decompositions = 0;
+            let mut extends = 0;
+            for (index, node) in scope.nodes().iter().enumerate() {
+                decompositions += usize::from(matches!(
+                    node.kind(),
+                    mxx_ir_core::node::NodeKind::GadgetDecompose { .. }
+                ));
+                extends += usize::from(matches!(
+                    node.kind(),
+                    mxx_ir_core::node::NodeKind::CenteredExtend { .. }
+                ));
+                if let Some(child) =
+                    graph.child_scope_id(scope_id, mxx_ir_core::NodeId(index as u64))
+                {
+                    let (child_decompositions, child_extends) =
+                        descendant_lift_counts(graph, &child);
+                    decompositions += child_decompositions;
+                    extends += child_extends;
+                }
+            }
+            (decompositions, extends)
+        }
+        let mut material_candidates = 0;
+        let mut input_candidates = 0;
+        for (index, node) in structural.graph.root_scope().nodes().iter().enumerate() {
+            if matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)) {
+                let child = structural
+                    .graph
+                    .child_scope_id(
+                        &mxx_ir_core::graph::FrozenGraphScopeId::Root,
+                        mxx_ir_core::NodeId(index as u64),
+                    )
+                    .unwrap();
+                let child_scope = structural.graph.scope(&child).unwrap();
+                let direct_decompositions = child_scope
+                    .nodes()
+                    .iter()
+                    .filter(|node| {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::GadgetDecompose { .. })
+                    })
+                    .count();
+                let direct_extends = child_scope
+                    .nodes()
+                    .iter()
+                    .filter(|node| {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. })
+                    })
+                    .count();
+                let (decompositions, extends) = descendant_lift_counts(&structural.graph, &child);
+                let mxx_ir_core::node::NodeKind::ParallelLoop(spec) = node.kind() else {
+                    unreachable!()
+                };
+                if direct_decompositions > 0 {
+                    material_candidates += 1;
+                    assert_eq!(spec.count, mxx_ir_core::IntExpr::constant(4));
+                    assert_eq!((direct_decompositions, direct_extends), (8, 8));
+                    assert_eq!((decompositions, extends), (8, 8));
+                }
+                if direct_decompositions == 0 && decompositions > 0 {
+                    input_candidates += 1;
+                    assert_eq!(spec.count, mxx_ir_core::IntExpr::constant(2));
+                    assert!(child_scope.nodes().iter().any(|node| {
+                        matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_))
+                    }));
+                    assert_eq!((decompositions, extends), (4, 4));
+                }
+            }
+        }
+        assert_eq!(
+            material_candidates, 1,
+            "material branch lifting must have one sibling family loop"
+        );
+        assert_eq!(input_candidates, 1, "input-dependent lifting must have one member family loop");
+
         let family_expected =
             scheme.evaluate_lut_family(&family_input, &family_prepared, &online_bank).unwrap();
         let (family_graph, family_descriptor) =
@@ -4624,7 +4986,9 @@ pub(crate) mod terminal_family_tests {
             (RnsBggTerminalFamilyMode::Independent, "independent"),
             (RnsBggTerminalFamilyMode::Sum, "sum"),
         ] {
-            let prepared = scheme.prepare_terminal_family(&input, &material, mode, None).unwrap();
+            let prepared = scheme
+                .prepare_terminal_family(&input, &material, mode, TerminalFinalization::Finalize)
+                .unwrap();
             let (next, descriptor) =
                 scheme.export_prepared_terminal_family(&prepared, producer, prefix).unwrap();
             producer = next;
@@ -4651,6 +5015,59 @@ pub(crate) mod terminal_family_tests {
         let production = produced.production_id.unwrap();
         drop(store);
         let mut store = FileArtifactStore::open(directory.path()).unwrap();
+        let (descriptor, binding, stage_id) = &descriptors[0];
+        let mut tampered = descriptor.clone();
+        tampered.mode = RnsBggTerminalFamilyMode::Sum;
+        assert!(
+            scheme
+                .import_prepared_terminal_family(
+                    &tampered,
+                    production.clone(),
+                    binding,
+                    key.id,
+                    *stage_id,
+                )
+                .is_err()
+        );
+        let mut tampered = descriptor.clone();
+        tampered.finalization = TerminalFinalization::Deferred;
+        assert!(
+            scheme
+                .import_prepared_terminal_family(
+                    &tampered,
+                    production.clone(),
+                    binding,
+                    key.id,
+                    *stage_id,
+                )
+                .is_err()
+        );
+        let mut tampered = descriptor.clone();
+        tampered.range = FamilyRange::bounded(0, 2, 4).unwrap();
+        assert!(
+            scheme
+                .import_prepared_terminal_family(
+                    &tampered,
+                    production.clone(),
+                    binding,
+                    key.id,
+                    *stage_id,
+                )
+                .is_err()
+        );
+        let mut tampered = descriptor.clone();
+        tampered.public.count = 99.into();
+        assert!(
+            scheme
+                .import_prepared_terminal_family(
+                    &tampered,
+                    production.clone(),
+                    binding,
+                    key.id,
+                    *stage_id,
+                )
+                .is_err()
+        );
         // No online s was constructed in the producer. Both consumers use
         // fresh s and freshly prepared online masks with the same stored t-data.
         for online in 0..2 {
@@ -4832,7 +5249,7 @@ pub(crate) mod terminal_family_tests {
                 Some(sum) => sum.combine(raw_public).unwrap(),
                 None => raw_public,
             });
-            let raw_row = scheme.evaluate_terminal(&encoding, &prepared, &masks).unwrap();
+            let raw_row = scheme.evaluate_terminal_raw(&encoding, &prepared, &masks).unwrap();
             aggregate_rows = Some(match aggregate_rows {
                 Some(sum) => sum.combine(raw_row).unwrap(),
                 None => raw_row,
@@ -4840,7 +5257,7 @@ pub(crate) mod terminal_family_tests {
             let public = scheme.finalize_terminal_public(prepared.public_accumulator()).unwrap();
             let value = scheme
                 .finalize_terminal_encoding(
-                    scheme.evaluate_terminal(&encoding, &prepared, &masks).unwrap(),
+                    scheme.evaluate_terminal_raw(&encoding, &prepared, &masks).unwrap(),
                     &public,
                 )
                 .unwrap();
@@ -4864,12 +5281,32 @@ pub(crate) mod terminal_family_tests {
             context: scheme.context,
             range,
         };
+        // A scalar prepared term may broadcast to a scalar input, but it must
+        // not silently consume only member zero when the input is a family.
+        let scalar_key = scheme
+            .sample_input_key(0, seed.clone(), b"scalar-terminal".as_slice(), rand::random())
+            .unwrap();
+        let (scalar_prepared, _) =
+            scheme.prepare_terminal_term(&(scalar_key, None), &material).unwrap();
+        let family_input = encoding_input.clone().into_program().unwrap();
+        let family_with_scalar_prepared = crate::rns_bgg::terminal::evaluate_terminal_value(
+            &scheme,
+            &family_input,
+            &ProgramValue::Scalar(scalar_prepared),
+            &masks,
+            false,
+            |raw| Ok(raw.value),
+        );
+        assert!(matches!(
+            family_with_scalar_prepared,
+            Err(crate::rns_bgg::TerminalError::InputCount)
+        ));
         let prepared = scheme
             .prepare_terminal_family(
                 &public_input,
                 &ProgramValue::Scalar(material.clone()),
                 RnsBggTerminalFamilyMode::Independent,
-                None,
+                TerminalFinalization::Finalize,
             )
             .unwrap();
         let rows = scheme.evaluate_terminal_family(&encoding_input, &prepared, &masks).unwrap();
@@ -4878,11 +5315,47 @@ pub(crate) mod terminal_family_tests {
                 &public_input,
                 &ProgramValue::Scalar(material.clone()),
                 RnsBggTerminalFamilyMode::Sum,
-                None,
+                TerminalFinalization::Finalize,
             )
             .unwrap();
         let aggregate_encoding =
             scheme.evaluate_terminal_family(&encoding_input, &aggregate, &masks).unwrap();
+        let deferred = scheme
+            .prepare_terminal_family(
+                &public_input,
+                &ProgramValue::Scalar(material.clone()),
+                RnsBggTerminalFamilyMode::Sum,
+                TerminalFinalization::Deferred,
+            )
+            .unwrap();
+        assert_eq!(deferred.level(), public_input.level);
+        let deferred_rows =
+            scheme.evaluate_terminal_family(&encoding_input, &deferred, &masks).unwrap();
+        let deferred_switch = deferred_rows.at(0).block_mod_switch(BigInt::from(
+            scheme.parameters.level(public_input.level + 1).unwrap().modulus().as_ref().clone(),
+        ));
+        // The graph also contains internal modulus switches from preparation
+        // and evaluation.  The final switch is identified by the direct
+        // producer of each deferred output coefficient, so those ancestors
+        // are not counted. Each coefficient must have exactly one such layer;
+        // separate coefficients may have separate switch nodes.
+        let final_outputs = deferred_switch.flatten();
+        assert!(!final_outputs.is_empty());
+        assert!(final_outputs.iter().all(|output| {
+            matches!(output.node().kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
+        }));
+        let short_material =
+            ProgramValue::Family(mxx_dsl::parallel(1, |_| Ok(material.clone())).unwrap());
+        assert!(
+            scheme
+                .prepare_terminal_family(
+                    &public_input,
+                    &short_material,
+                    RnsBggTerminalFamilyMode::Independent,
+                    TerminalFinalization::Finalize,
+                )
+                .is_err()
+        );
         let expected_public = scheme.finalize_terminal_public(aggregate_public.unwrap()).unwrap();
         let expected_row =
             scheme.finalize_terminal_encoding(aggregate_rows.unwrap(), &expected_public).unwrap();
@@ -4930,7 +5403,7 @@ pub(crate) mod terminal_family_tests {
                 &public_input,
                 &indexed_material,
                 RnsBggTerminalFamilyMode::Independent,
-                None,
+                TerminalFinalization::Finalize,
             )
             .unwrap();
         let indexed_rows =
@@ -4940,7 +5413,7 @@ pub(crate) mod terminal_family_tests {
                 &public_input,
                 &indexed_material,
                 RnsBggTerminalFamilyMode::Sum,
-                None,
+                TerminalFinalization::Finalize,
             )
             .unwrap();
         let indexed_sum_rows =
@@ -4965,7 +5438,7 @@ pub(crate) mod terminal_family_tests {
                 .prepare_terminal(&key, &indexed_material.at(mxx_dsl::Int::constant(index)))
                 .unwrap();
             let raw_public = scalar.public_accumulator();
-            let raw_row = scheme.evaluate_terminal(&encoding, &scalar, &masks).unwrap();
+            let raw_row = scheme.evaluate_terminal_raw(&encoding, &scalar, &masks).unwrap();
             raw_public_sum = Some(match raw_public_sum {
                 Some(sum) => sum.combine(raw_public).unwrap(),
                 None => raw_public,
@@ -4977,7 +5450,7 @@ pub(crate) mod terminal_family_tests {
             let public = scheme.finalize_terminal_public(scalar.public_accumulator()).unwrap();
             let row = scheme
                 .finalize_terminal_encoding(
-                    scheme.evaluate_terminal(&encoding, &scalar, &masks).unwrap(),
+                    scheme.evaluate_terminal_raw(&encoding, &scalar, &masks).unwrap(),
                     &public,
                 )
                 .unwrap();

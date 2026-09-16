@@ -1,4 +1,12 @@
-//! Deterministic bounds and conditional moments for the common Program.
+//! Noise contracts, transfer rules, and audits for an RNS-BGG Program.
+//!
+//! This module is the analysis side of the RNS-BGG implementation. It builds
+//! a symbolic graph from public setup contracts; it does not execute a GPU
+//! graph or inspect ciphertext samples. Deterministic bounds are kept separate
+//! from conditional average-case moments. Fresh encoding errors use the
+//! configured Gaussian sigma and runtime cutoff, while refresh decoder noise
+//! remains the separate CBD contract carried by `decoder_eta`.
+#![warn(missing_docs)]
 use super::{
     RnsBggDerivedWorkload, RnsBggError, RnsBggNoiseBound, RnsBggParameterManifest,
     RnsBggParameters, RnsBggPlanRequest, canonical_encoding_sigma, encoding_error_bound,
@@ -24,6 +32,11 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
 impl RnsBggParameters {
+    /// Return the physical-coordinate variance of one encoding error.
+    ///
+    /// The stored decimal sigma is converted exactly to a rational before it
+    /// is squared. This value is used by conditional moment propagation only;
+    /// deterministic acceptance continues to use the hard cutoff.
     pub fn encoding_error_variance(&self) -> NonnegativeRational {
         let (mut numerator, exponent) = self.encoding_error_sigma.as_bigint_and_exponent();
         let denominator = if exponent >= 0 {
@@ -165,9 +178,16 @@ impl RnsBggParameters {
 
 /// A family envelope applies to each active member, never to its sum.
 /// `one_hot` is an explicit trusted payload contract; it never suppresses noise.
+/// A symbolic wire value used by deterministic and average-case noise audits.
+///
+/// The value describes a public contract, not a runtime ciphertext. Its
+/// `range` and `one_hot` fields carry trusted family-shape information used by
+/// the graph audit and never suppress sampled noise on their own.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggNoiseValue {
+    /// Modulus-chain level at which this value is represented.
     pub level: usize,
+    /// Deterministic coefficient and payload envelope for this value.
     pub bound: RnsBggNoiseBound,
     /// Squared coefficient norm of the reduced plaintext, bounded separately
     /// from l1 so public polynomial weights do not become monomial estimates.
@@ -178,8 +198,11 @@ pub struct RnsBggNoiseValue {
     /// centered coefficient/RHS/branch/remainder variance heuristics apply to
     /// deviations from these means, not to their deterministic bias.
     pub moments: Option<NoiseMoments>,
+    /// Whether the value is a known public polynomial rather than ciphertext.
     pub public: bool,
+    /// Active family range when this is a symbolic family member.
     pub range: Option<FamilyRange>,
+    /// Whether the payload contract guarantees a one-hot family selector.
     pub one_hot: bool,
 }
 
@@ -208,18 +231,24 @@ impl RnsBggNoiseValue {
     }
 }
 
+/// Public payload and selector contract for one private-product RHS input.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggNoiseRhs {
+    /// L1 payload bound of the RHS plaintext.
     pub payload_l1: BigUint,
+    /// Squared coefficient-norm bound of the RHS plaintext.
     pub payload_l2_squared: BigUint,
     /// The setup contract guarantees at most one nonzero coefficient-selector
     /// operand across precisely this active family range.
     pub one_hot: Option<FamilyRange>,
 }
 
+/// Public helper metadata and fresh-error gains for one gate instance.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggGateNoiseMaterial {
+    /// Modulus-chain level of the sampled helper material.
     pub level: usize,
+    /// LUT commitment when this material belongs to a LUT helper.
     pub table: Option<[u8; 32]>,
     /// Sum of active public multiplier l1 bounds in each composed branch.
     /// Zero selectors still contribute; zero public multipliers do not.
@@ -232,13 +261,17 @@ pub struct RnsBggGateNoiseMaterial {
 /// One public action applied to one fresh RHS source. The source identity is
 /// stable across graph reconstruction and is required for correlation-aware
 /// aggregation.
+/// One public action applied to a single sampled fresh-error source.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RnsBggNoiseAction {
+    /// Stable identity of the sampled fresh-error source.
     pub source: [u8; 32],
+    /// L1 and squared-L2 action gains applied to that source.
     pub gain: RightActionNoiseGain,
 }
 
 impl RnsBggNoiseAction {
+    /// Construct an action record for a sampled source and its public gain.
     pub fn new(source: [u8; 32], gain: RightActionNoiseGain) -> Self {
         Self { source, gain }
     }
@@ -305,6 +338,11 @@ impl RnsBggDerivedWorkload {
     /// Derive stage gains from the public helper material bound to a Program.
     /// This is deliberately the only production constructor: callers cannot
     /// independently claim a noise gain as a memory multiplicity.
+    /// Derive stage-level noise gains and commitments from a concrete Program.
+    ///
+    /// This is a symbolic setup operation. It reads public input/RHS/helper
+    /// contracts and family ranges, preserving source identity and liveness;
+    /// it does not sample, execute, or expand family members on the host.
     pub fn from_program(
         program: &ExponentLutProgram,
         bindings: &ProgramBindings<RnsBggNoiseValue, RnsBggNoiseRhs, RnsBggGateNoiseMaterial>,
@@ -330,6 +368,8 @@ impl RnsBggDerivedWorkload {
             payloads.insert(*wire, value.bound.payload_l1.clone());
         }
         for (step, operation) in program.steps().iter().enumerate() {
+            let mut family_operand_bounds = [None, None];
+            let mut family_public_multiplier_l1 = None;
             let (gate_kind, gains, material_required, operand_stages, logical_drop) =
                 match operation {
                     ProgramStep::Gate(gate) => {
@@ -374,6 +414,50 @@ impl RnsBggDerivedWorkload {
                         )
                     }
                     ProgramStep::Family { body, .. } => {
+                        let family_kind = match body.gates() {
+                            [Gate::Add { lhs, rhs, .. }] => {
+                                family_operand_bounds = [
+                                    body.wire_inputs().get(lhs).and_then(|source| match source {
+                                        crate::program::FamilySource::Member(family) => bindings
+                                            .wire_values
+                                            .get(family)
+                                            .map(|value| value.bound.clone()),
+                                        crate::program::FamilySource::Broadcast(_) => None,
+                                    }),
+                                    body.wire_inputs().get(rhs).and_then(|source| match source {
+                                        crate::program::FamilySource::Member(family) => bindings
+                                            .wire_values
+                                            .get(family)
+                                            .map(|value| value.bound.clone()),
+                                        crate::program::FamilySource::Broadcast(_) => None,
+                                    }),
+                                ];
+                                "family_add"
+                            }
+                            [Gate::MulPublic { private, public, .. }] => {
+                                family_operand_bounds[0] = body
+                                    .wire_inputs()
+                                    .get(private)
+                                    .and_then(|source| match source {
+                                        crate::program::FamilySource::Member(family) => bindings
+                                            .wire_values
+                                            .get(family)
+                                            .map(|value| value.bound.clone()),
+                                        crate::program::FamilySource::Broadcast(_) => None,
+                                    });
+                                family_operand_bounds[1] = body.wire_inputs().get(public).and_then(
+                                    |source| match source {
+                                        crate::program::FamilySource::Member(family) => bindings
+                                            .wire_values
+                                            .get(family)
+                                            .map(|value| value.bound.clone()),
+                                        crate::program::FamilySource::Broadcast(_) => None,
+                                    },
+                                );
+                                "family_mul_public"
+                            }
+                            _ => "family",
+                        };
                         let gains = bindings
                         .gate_helpers
                         .iter()
@@ -395,13 +479,28 @@ impl RnsBggDerivedWorkload {
                                 crate::program::FamilySource::Member(_) => None,
                             })
                             .collect::<Vec<_>>();
+                        let producer_for = |wire: &WireId| {
+                            body.wire_inputs().get(wire).and_then(|source| match source {
+                                crate::program::FamilySource::Broadcast(outer) => {
+                                    producers.get(outer).copied()
+                                }
+                                crate::program::FamilySource::Member(_) => None,
+                            })
+                        };
+                        let operand_stages = match body.gates() {
+                            [Gate::Add { lhs, rhs, .. }] => [producer_for(lhs), producer_for(rhs)],
+                            [Gate::MulPublic { private, public, .. }] => {
+                                [producer_for(private), producer_for(public)]
+                            }
+                            _ => [captured.first().copied(), captured.get(1).copied()],
+                        };
                         (
-                            "family".to_owned(),
+                            family_kind.to_owned(),
                             gains,
                             body.gates().iter().any(|gate| {
                                 matches!(gate, Gate::MulPrivate { .. } | Gate::Lut { .. })
                             }),
-                            [captured.first().copied(), captured.get(1).copied()],
+                            operand_stages,
                             body.gates().iter().any(|gate| {
                                 matches!(gate, Gate::MulPrivate { .. } | Gate::Lut { .. })
                             }),
@@ -523,7 +622,9 @@ impl RnsBggDerivedWorkload {
                         };
                         let (output, value) = match gate {
                             Gate::MulPublic { private, public, output } => {
-                                (*output, payload(private)? * payload(public)?)
+                                let public_payload = payload(public)?;
+                                family_public_multiplier_l1 = Some(public_payload.clone());
+                                (*output, payload(private)? * public_payload)
                             }
                             Gate::Add { lhs, rhs, output } => {
                                 (*output, payload(lhs)? + payload(rhs)?)
@@ -562,6 +663,11 @@ impl RnsBggDerivedWorkload {
                     .get(public)
                     .cloned()
                     .ok_or(RnsBggError::Parameters("missing derived public multiplier payload"))?,
+                ProgramStep::Family { .. } if gate_kind == "family_mul_public" => {
+                    family_public_multiplier_l1.ok_or(RnsBggError::Parameters(
+                        "missing derived family public multiplier payload",
+                    ))?
+                }
                 // One is the neutral L1 gain for operations without a public
                 // multiplier; it is not a substitute for missing binding data.
                 _ => BigUint::one(),
@@ -590,6 +696,7 @@ impl RnsBggDerivedWorkload {
                 output_payload_l1,
                 peak_live_values: program_live_values(program, step),
                 operand_stages,
+                family_operand_bounds,
                 logical_drop,
             });
         }
@@ -626,6 +733,11 @@ impl RnsBggDerivedWorkload {
     }
 }
 
+/// Hash a serializable sampling-domain label into a stable source identity.
+///
+/// Callers must include every value that distinguishes independent sampling
+/// domains. Equal identities mean that the audit must conservatively combine
+/// the corresponding linear actions as correlated uses of one source.
 pub fn stable_source_id<T: Serialize>(value: &T) -> [u8; 32] {
     Sha256::digest(serde_json::to_vec(value).expect("stable source identity serialization")).into()
 }
@@ -689,17 +801,27 @@ fn program_live_values(program: &ExponentLutProgram, stage: usize) -> usize {
         .max(1)
 }
 
+/// Symbolic noise trace produced by lowering one Program.
+///
+/// A raw trace has no acceptance claim. `audit_program` fills in the model,
+/// event count, and tail budget only after validating all public contracts.
 pub struct RnsBggNoiseTrace {
+    /// Acceptance model used by a successful full Program audit.
     /// None for a raw trace; set only by a successful full Program audit.
     pub acceptance: Option<NoiseModelKind>,
+    /// Number of physical coordinates included in the audited event union.
     pub joint_event_count: BigUint,
     /// Includes the configured tail correction, in physical coordinates.
     pub z_squared: Option<NonnegativeRational>,
+    /// Dependency graph used to deduplicate shared wire ancestry.
     pub dependencies: crate::noise_utils::NoiseDependencyGraph,
+    /// Noise values for Program wires.
     pub wires: BTreeMap<WireId, RnsBggNoiseValue>,
+    /// Noise values for gate instances, including family-body instances.
     pub gates: BTreeMap<ProgramGateInstance, RnsBggNoiseValue>,
 }
 
+/// Lower a Program into a symbolic RNS-BGG noise trace without accepting it.
 pub fn trace_program(
     parameters: &RnsBggParameters,
     program: &ExponentLutProgram,
@@ -851,9 +973,15 @@ impl RnsBggParameters {
                     let moments = value.moments.as_ref().ok_or(RnsBggError::Parameters(
                         "average-case input moment model is missing",
                     ))?;
+                    // Intermediate carriers still need q/8 clearance to
+                    // distinguish adjacent payload spacing. The final
+                    // carrier is different: its Boolean target is centered
+                    // at 0 or q/2, so the strict residual contract is q/4.
+                    let error_denominator =
+                        if value.level + 1 == self.levels.len() { 4u8 } else { 8u8 };
                     let modulus_limit = NonnegativeRational::new(
                         self.level(value.level)?.modulus().as_ref().clone(),
-                        8u8.into(),
+                        error_denominator.into(),
                     )
                     .expect("positive constant denominator");
                     moments.fits(&modulus_limit, z) &&
@@ -904,9 +1032,17 @@ impl RnsBggParameters {
     }
 }
 
+/// Program-lowering interpreter used internally by `trace_program`.
+///
+/// The evaluator is public because it appears as the associated noise state
+/// of the public scheme lowering interface; applications should normally use
+/// `trace_program` or `RnsBggParameters::audit_program` instead.
 pub struct RnsBggNoiseEvaluator<'a> {
+    /// Parameters defining level moduli, sigma, and error cutoff.
     pub(super) parameters: &'a RnsBggParameters,
+    /// Concrete family ranges used while assigning symbolic member values.
     pub(super) ranges: &'a ProgramFamilyBindings,
+    /// Per-gate values accumulated during lowering.
     pub(super) gates: BTreeMap<ProgramGateInstance, RnsBggNoiseValue>,
 }
 
@@ -1150,6 +1286,10 @@ impl ExponentProgramLowering for RnsBggNoiseEvaluator<'_> {
 }
 
 impl RnsBggNoiseEvaluator<'_> {
+    /// Reduce a family member envelope over a concrete active range.
+    ///
+    /// One-hot payloads retain their payload envelope while all sampled
+    /// selector errors remain in the deterministic and moment bounds.
     pub(super) fn reduce_add(
         &mut self,
         value: &RnsBggNoiseValue,
@@ -1323,12 +1463,178 @@ mod tests {
             output_payload_l1: BigUint::from(11u8),
             peak_live_values: 1,
             operand_stages: [Some(0), None],
+            family_operand_bounds: [None, None],
             logical_drop: false,
         };
         let history = vec![initial.clone(), lhs.clone()];
         let output = parameters.stage_noise_bound(0, &lhs, &stage, &history, &initial).unwrap();
         assert_eq!(output.error, BigUint::from(11u8));
         assert_eq!(output.payload_l1, BigUint::from(11u8));
+    }
+
+    #[test]
+    fn test_family_add_plan_matches_symbolic_audit() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 0 }, 16).unwrap();
+        let lhs_family = builder.wire_family(1).unwrap();
+        let rhs_family = builder.wire_family(1).unwrap();
+        let left = WireId::from_index(0);
+        let right = WireId::from_index(1);
+        let added = WireId::from_index(2);
+        let family_output = builder
+            .family(
+                3,
+                crate::program::FamilyProgram::new(
+                    BTreeMap::from([
+                        (left, crate::program::FamilyWireSource::Member(lhs_family)),
+                        (right, crate::program::FamilyWireSource::Member(rhs_family)),
+                    ]),
+                    BTreeMap::new(),
+                    vec![Gate::Add { lhs: left, rhs: right, output: added }],
+                    added,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let rhs_family_input = builder.rhs_family(1).unwrap();
+        let rhs = builder.rhs_input(rhs_family_input, 1, 1).unwrap();
+        let output = builder.private_mul(family_output, rhs).unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+        let range = FamilyRange::full(3).unwrap();
+        let mut ranges = ProgramFamilyBindings::new();
+        ranges.bind(ProgramFamilyId::from_index(0), range.clone());
+        let value = |error: u8, payload: u8| {
+            let mut value = RnsBggNoiseValue::public(0, error.into(), &[BigInt::from(payload)]);
+            value.range = Some(range.clone());
+            value.public = false;
+            value
+        };
+        let rhs_value = RnsBggNoiseRhs {
+            payload_l1: 1u8.into(),
+            payload_l2_squared: 1u8.into(),
+            one_hot: None,
+        };
+        let bindings = ProgramBindings::new()
+            .wire_families([(lhs_family, value(2, 1)), (rhs_family, value(3, 1))])
+            .rhs_values([(rhs, rhs_value.clone())])
+            .gate_helpers([(
+                ProgramGateInstance::Gate { step: 1 },
+                RnsBggGateNoiseMaterial {
+                    level: 0,
+                    table: None,
+                    fresh_error_gain: RightActionNoiseGain::unit(),
+                },
+            )]);
+        let request = RnsBggPlanRequest {
+            ring_dimension: 16,
+            widths: vec![1, 1],
+            encoding_error_sigma: 1.into(),
+            crt_bits: 30,
+            terminal_depth: 1,
+            max_crt_depth: 8,
+            terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
+        };
+        let (parameters, manifest) =
+            RnsBggParameters::plan_program(&request, &program, &bindings, &ranges).unwrap();
+        assert_eq!(manifest.derived_workload.stages()[0].gate_kind(), "family_add");
+        let trace = parameters
+            .audit_program(
+                &program,
+                &bindings,
+                &ranges,
+                &BTreeMap::from([(output, 1u8.into())]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(trace.wires[&family_output].bound.error, BigUint::from(15u8));
+        assert_eq!(manifest.noise_bounds[1], trace.wires[&family_output].bound);
+        assert_eq!(manifest.noise_bounds[2], trace.wires[&output].bound);
+    }
+
+    #[test]
+    fn test_family_mul_public_plan_preserves_non_unit_multiplier() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 0 }, 16).unwrap();
+        let private_family = builder.wire_family(1).unwrap();
+        let public_family = builder.wire_family(1).unwrap();
+        let private = WireId::from_index(0);
+        let public = WireId::from_index(1);
+        let product = WireId::from_index(2);
+        let family_output = builder
+            .family(
+                3,
+                crate::program::FamilyProgram::new(
+                    BTreeMap::from([
+                        (private, crate::program::FamilyWireSource::Member(private_family)),
+                        (public, crate::program::FamilyWireSource::Member(public_family)),
+                    ]),
+                    BTreeMap::new(),
+                    vec![Gate::MulPublic { private, public, output: product }],
+                    product,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let rhs_family = builder.rhs_family(1).unwrap();
+        let rhs = builder.rhs_input(rhs_family, 1, 1).unwrap();
+        let output = builder.private_mul(family_output, rhs).unwrap();
+        builder.output(output).unwrap();
+        let program = builder.build().unwrap();
+        let range = FamilyRange::full(3).unwrap();
+        let mut ranges = ProgramFamilyBindings::new();
+        ranges.bind(ProgramFamilyId::from_index(0), range.clone());
+        let mut private_value = RnsBggNoiseValue::public(0, 2u8.into(), &[BigInt::one()]);
+        private_value.range = Some(range.clone());
+        private_value.public = false;
+        let mut public_value = RnsBggNoiseValue::public(0, 0u8.into(), &[BigInt::from(3u8)]);
+        public_value.range = Some(range);
+        let bindings = ProgramBindings::new()
+            .wire_families([(private_family, private_value), (public_family, public_value)])
+            .rhs_values([(
+                rhs,
+                RnsBggNoiseRhs {
+                    payload_l1: 1u8.into(),
+                    payload_l2_squared: 1u8.into(),
+                    one_hot: None,
+                },
+            )])
+            .gate_helpers([(
+                ProgramGateInstance::Gate { step: 1 },
+                RnsBggGateNoiseMaterial {
+                    level: 0,
+                    table: None,
+                    fresh_error_gain: RightActionNoiseGain::unit(),
+                },
+            )]);
+        let request = RnsBggPlanRequest {
+            ring_dimension: 16,
+            widths: vec![1, 1],
+            encoding_error_sigma: 1.into(),
+            crt_bits: 30,
+            terminal_depth: 1,
+            max_crt_depth: 8,
+            terminal_value_bound: 1u8.into(),
+            operations_per_drop: 1,
+        };
+        let (parameters, manifest) =
+            RnsBggParameters::plan_program(&request, &program, &bindings, &ranges).unwrap();
+        assert_eq!(manifest.derived_workload.stages()[0].gate_kind(), "family_mul_public");
+        assert_eq!(manifest.derived_workload.stages()[0].public_multiplier_l1, BigUint::from(3u8));
+        let trace = parameters
+            .audit_program(
+                &program,
+                &bindings,
+                &ranges,
+                &BTreeMap::from([(output, 1u8.into())]),
+                None,
+            )
+            .unwrap();
+        assert_eq!(trace.wires[&family_output].bound.error, BigUint::from(18u8));
+        assert!(trace.wires[&family_output].bound.error > BigUint::from(6u8));
+        assert_eq!(manifest.noise_bounds[1], trace.wires[&family_output].bound);
+        assert_eq!(manifest.noise_bounds[2], trace.wires[&output].bound);
     }
 
     #[test]
@@ -1678,6 +1984,57 @@ mod tests {
                     &RnsBggNoiseBound {
                         error: &hold_modulus / 8u8 + 1u8,
                         payload_l1: BigUint::one(),
+                    },
+                )
+                .unwrap()
+        );
+
+        let terminal_level = parameters.levels().len() - 1;
+        let terminal_modulus = parameters.level(terminal_level).unwrap().modulus().as_ref().clone();
+        let just_below_q_over_four = (&terminal_modulus - 1u8) / 4u8;
+        let at_or_above_q_over_four = (&terminal_modulus + 3u8) / 4u8;
+        assert!(
+            parameters
+                .noise_fits(
+                    terminal_level,
+                    &RnsBggNoiseBound {
+                        error: just_below_q_over_four.clone(),
+                        payload_l1: BigUint::zero(),
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            !parameters
+                .noise_fits(
+                    terminal_level,
+                    &RnsBggNoiseBound {
+                        error: at_or_above_q_over_four.clone(),
+                        payload_l1: BigUint::zero(),
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            parameters
+                .terminal_noise_fits(
+                    terminal_level,
+                    &RnsBggTerminalNoise {
+                        error: just_below_q_over_four,
+                        coefficient_bound: BigUint::zero(),
+                        branches: 1,
+                    },
+                )
+                .unwrap()
+        );
+        assert!(
+            !parameters
+                .terminal_noise_fits(
+                    terminal_level,
+                    &RnsBggTerminalNoise {
+                        error: at_or_above_q_over_four,
+                        coefficient_bound: BigUint::zero(),
+                        branches: 1,
                     },
                 )
                 .unwrap()
@@ -2066,11 +2423,12 @@ mod tests {
         );
         assert!(check_direct(&direct_inputs, Some(&AverageCaseConfig::default())).is_err());
         // A zero center does not erase a nonzero mean interval. At exact
-        // modulus/8 clearance even zero centered variance must be rejected.
+        // modulus/4 clearance, the final q/2 Boolean carrier must still be
+        // rejected even with zero centered variance.
         let moments = direct_inputs.get_mut(&direct_input).unwrap().moments.as_mut().unwrap();
         moments.mean_radius = NonnegativeRational::new(
             parameters.level(1).unwrap().modulus().as_ref().clone(),
-            8u8.into(),
+            4u8.into(),
         )
         .unwrap();
         moments.variance = NonnegativeRational::zero();
@@ -2138,6 +2496,11 @@ impl RnsBggParameters {
         let operand = |stage_index: Option<usize>| {
             stage_index.and_then(|index| history.get(index + 1)).unwrap_or(initial)
         };
+        let family_operand = |slot: usize| {
+            stage.family_operand_bounds[slot]
+                .as_ref()
+                .unwrap_or_else(|| operand(stage.operand_stages[slot]))
+        };
         match stage.gate_kind.as_str() {
             "mul_private" => self.private_mul_noise_bound(
                 level,
@@ -2156,6 +2519,20 @@ impl RnsBggParameters {
                 error: &operand(stage.operand_stages[0]).error * &stage.public_multiplier_l1,
                 payload_l1: stage.output_payload_l1.clone(),
             }),
+            "family_add" => {
+                let count = BigUint::from(stage.branches);
+                Ok(RnsBggNoiseBound {
+                    error: count * (&family_operand(0).error + &family_operand(1).error),
+                    payload_l1: stage.output_payload_l1.clone(),
+                })
+            }
+            "family_mul_public" => {
+                let count = BigUint::from(stage.branches);
+                Ok(RnsBggNoiseBound {
+                    error: count * &family_operand(0).error * &stage.public_multiplier_l1,
+                    payload_l1: stage.output_payload_l1.clone(),
+                })
+            }
             _ => self.lut_noise_bound(
                 level,
                 input,
@@ -2166,8 +2543,16 @@ impl RnsBggParameters {
         }
     }
 
+    /// Check deterministic spacing and modulus clearance at one level.
+    ///
+    /// Intermediate carriers require q/8 clearance for adjacent payloads. A
+    /// last-level Boolean carrier instead uses the strict q/4 residual bound
+    /// implied by the q/2 encoding centers. This is a planner predicate, not a
+    /// decoder execution; terminal payload range is checked separately by the
+    /// Program audit.
     pub fn noise_fits(&self, level: usize, noise: &RnsBggNoiseBound) -> Result<bool, RnsBggError> {
-        let range_fits = self.level(level)?.modulus().as_ref() > &(&noise.error * 8u8);
+        let error_multiplier = if level + 1 == self.levels.len() { 4u8 } else { 8u8 };
+        let range_fits = self.level(level)?.modulus().as_ref() > &(&noise.error * error_multiplier);
         // Nonterminal states must resolve adjacent p_i-spaced payloads. A
         // held logical level has p_i=1 and needs no spacing check; the last
         // level is a terminal carrier with a separately audited range.
@@ -2530,22 +2915,38 @@ impl RnsBggParameters {
 
 /// Unresolved refresh workload. Input levels and noise come from the Program
 /// values passed to `plan_refresh`, rather than independently copied bounds.
+/// Public workload inputs for refresh planning.
+///
+/// `decoder_eta` belongs only to the refresh decoder CBD model; it is not the
+/// encoding-error distribution used by ordinary RNS-BGG gates.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggRefreshPlanRequest {
+    /// Number of data ciphertext branches entering refresh.
     pub data_branches: usize,
+    /// Number of PRF ciphertext branches entering refresh.
     pub prf_branches: usize,
+    /// Native digit base used by the refresh digit planner.
     pub base: usize,
+    /// Support bound of each fresh refresh digit.
     pub fresh_support: BigUint,
+    /// Deterministic bound supplied for fresh refresh errors.
     pub fresh_bound: BigUint,
+    /// CBD parameter for the refresh decoder noise only.
     pub decoder_eta: usize,
+    /// Number of refresh observations used by spacing/statistical checks.
     pub observations: BigUint,
+    /// Statistical failure budget in bits for refresh spacing.
     pub statistical_bits: usize,
 }
 
+/// Result of refresh noise and artifact-size planning.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RnsBggRefreshPlan {
+    /// Worst-case or average-case model used by the plan.
     pub model: NoiseModelKind,
+    /// Tail threshold when average-case acceptance was enabled.
     pub z_squared: Option<NonnegativeRational>,
+    /// Chosen fresh and mask digit schedule.
     pub digits: RefreshDigitPlan,
     /// Physical moments under the independent uniform native-digit model.
     /// One fresh source is reused across all CRT channels. These conditional
@@ -2553,9 +2954,13 @@ pub struct RnsBggRefreshPlan {
     pub fresh_uniform_moments: crate::noise_utils::NoiseMoments,
     /// Distinct centered mask distributions, in canonical CRT slot order.
     pub mask_uniform_moments: Vec<crate::noise_utils::NoiseMoments>,
+    /// Deterministic exposed error bound for each CRT slot.
     pub exposed_errors: Vec<BigUint>,
+    /// CRT spacing available to each exposed slot.
     pub spacings: Vec<BigUint>,
+    /// Number of distinct PRF outputs retained by the refresh plan.
     pub distinct_prf_outputs: BigUint,
+    /// Number of terminal digit emissions, including repeated spacing uses.
     pub terminal_digit_emissions: BigUint,
     /// Persistent bounded U/V, input keys, raw outputs, and shared helpers on
     /// the compact-digit GPU backend. This is artifact storage, not peak VRAM.
@@ -2874,14 +3279,19 @@ mod refresh_plan_tests {
 /// The terminal numerator keeps inherited/fresh/helper/internal-rounding terms
 /// separate until all stages have been added. Outer rounding occurs only once.
 pub struct RnsBggTerminalNoise {
+    /// Deterministic inherited, fresh, and rounding-error bound.
     pub error: BigUint,
+    /// Bound on the final integer coefficient or payload value.
     pub coefficient_bound: BigUint,
+    /// Total number of grouped terminal branches.
     pub branches: usize,
 }
 
 impl RnsBggParameters {
     /// Setup-time integer recovery and evaluation-noise checks at the terminal
     /// output level. Weights affect the required range, never the error gain.
+    /// The final q/2 Boolean centers accept only a strict residual below q/4;
+    /// the coefficient/range condition remains an independent check.
     pub fn terminal_noise_fits(
         &self,
         output_level: usize,
@@ -2889,7 +3299,7 @@ impl RnsBggParameters {
     ) -> Result<bool, RnsBggError> {
         let q = self.level(output_level)?.modulus();
         let error = &bound.error;
-        Ok(q.as_ref() > &((&bound.coefficient_bound + error) * 2u8) && q.as_ref() > &(error * 8u8))
+        Ok(q.as_ref() > &((&bound.coefficient_bound + error) * 2u8) && q.as_ref() > &(error * 4u8))
     }
 
     /// Conditional terminal moments from the same raw aggregate as

@@ -33,7 +33,6 @@ pub use rns_bgg::api::{
 /// the typed facade re-exported at the crate root instead.
 pub mod advanced {
     pub use crate::{
-        nand_circuit::CompiledNandCircuitDetails,
         program::{
             AttributeKnowledge, FamilyAggregation, FamilyProgram, FamilyRhsSource,
             FamilyWireSource, Gate, ProgramBindings, ProgramFamilyBindings, ProgramFamilyId,
@@ -41,8 +40,8 @@ pub mod advanced {
             ProgramWireType, RhsFamilyId, RhsId, WireFamilyId, WireId,
         },
         rns_bgg::api::{
-            ArtifactNamespace, ArtifactReferenceToken, ExponentLutBenchmarking,
-            FacadeBenchmarkGraphs, MaskSecret, OutputReferenceToken, PayloadSecret,
+            ArtifactNamespace, ArtifactReferenceToken, FacadeBenchmarkGraphs, MaskSecret,
+            OutputReferenceToken, PayloadSecret,
         },
     };
 }

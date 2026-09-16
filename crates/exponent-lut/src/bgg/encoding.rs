@@ -4011,7 +4011,7 @@ impl BggRefreshParameters {
             .into_iter()
             .map(|(modulus, slots)| (IntExpr::constant(BigInt::from(modulus)), slots))
             .collect::<Vec<_>>();
-        Ok(crate::noise_refresh::refresh::prepare_shared_decoder_bases::<BggScheme>(
+        Ok(crate::noise_refresh::refresh::prepare_shared_decoder_bases(
             &groups,
             public_b,
             &secret,
@@ -4038,6 +4038,42 @@ impl RefreshCompiler {
         program: &SparseLwrPrfProgram,
         outputs: &Family<Mat>,
     ) -> Result<RefreshSetupManifest, RefreshSetupError> {
+        if !same_matrix_type(
+            online_secret_s.matrix_type(),
+            &setup
+                .parameters()
+                .layout
+                .ring()
+                .matrix_type((1, setup.parameters().layout.secret_dimension)),
+        ) {
+            return Err(RefreshSetupError::IdentityMismatch);
+        }
+        let (public_b_by_slot, decoder_bases_by_slot) =
+            setup.parameters().shared_decoder_bases(online_secret_s, &setup.public_b)?;
+        self.bind_online_outputs_with_decoder_bases(
+            compiler,
+            setup,
+            state,
+            program,
+            outputs,
+            public_b_by_slot,
+            decoder_bases_by_slot,
+        )
+    }
+
+    /// Binds online outputs using decoder bases prepared by the encryption
+    /// stage. No secret sampler or secret input is captured by the resulting
+    /// online graph.
+    pub(crate) fn bind_online_outputs_with_decoder_bases(
+        &self,
+        compiler: &ExponentLutEncodingCompiler,
+        setup: &ImportedRefreshSetup,
+        state: BggEncodingWire,
+        program: &SparseLwrPrfProgram,
+        outputs: &Family<Mat>,
+        public_b_by_slot: Vec<Mat>,
+        decoder_bases_by_slot: Vec<Mat>,
+    ) -> Result<RefreshSetupManifest, RefreshSetupError> {
         if setup.parameters().refresh.crt_plaintext_moduli != self.crt_plaintext_moduli ||
             setup.parameters().refresh.reconstruction_coefficients !=
                 self.reconstruction_coefficients ||
@@ -4047,13 +4083,6 @@ impl RefreshCompiler {
             return Err(RefreshSetupError::IdentityMismatch);
         }
         if !same_matrix_type(
-            online_secret_s.matrix_type(),
-            &setup
-                .parameters()
-                .layout
-                .ring()
-                .matrix_type((1, setup.parameters().layout.secret_dimension)),
-        ) || !same_matrix_type(
             state.vector.matrix_type(),
             &setup
                 .parameters()
@@ -4063,11 +4092,6 @@ impl RefreshCompiler {
         ) {
             return Err(RefreshSetupError::IdentityMismatch);
         }
-        // Sample one fresh error per distinct public B_P in this execution.
-        // All anchors reduce the same integer secret; switching or independently
-        // resampling the secret would change the defining decoder equation.
-        let (public_b_by_slot, decoder_bases_by_slot) =
-            setup.parameters().shared_decoder_bases(online_secret_s, &setup.public_b)?;
         // Bind the actual output family once to the setup's canonical label schedule.
         // The immutable setup already owns its sampling parameters; copying them
         // into a temporary wrapper would only compare those copies with themselves.

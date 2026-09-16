@@ -2500,9 +2500,15 @@ where
             });
             self.streamed_exports.insert(name, (handle, descriptor));
         }
-        // Integer exports retain the scalar result contract. Their small resident
-        // values can also feed later arithmetic after the artifact is written.
-        if matches!(value, RuntimeValue::Int(_)) {
+        // Scalar integers retain their resident result contract. Non-session
+        // bounded-matrix exports do too: a bounded matrix must stay compact;
+        // replacing it with a lazy artifact would discard the `SmallMatrix`
+        // representation that the caller supplied and bounded operations consume.
+        // Session execution is the explicit artifact-only path, so it returns
+        // finalized outputs as lazy capabilities instead.
+        if matches!(value, RuntimeValue::Int(_)) ||
+            (self.session.is_none() && matches!(value, RuntimeValue::SmallMatrix(_)))
+        {
             Ok(value.clone())
         } else {
             Ok(replacement.expect("declared export"))
@@ -2543,8 +2549,13 @@ where
                 // to its own finalized artifact and descriptor. No resident
                 // value is discarded without retirement: a later consumer may
                 // have reimported this scalar after its original streaming export.
-                // Integers deliberately retain their scalar return contract.
-                if !matches!(outputs.get(name), Some(RuntimeValue::Int(_))) {
+                // Integers retain their scalar return contract. Non-session
+                // bounded matrices retain their compact return contract; a
+                // session is finalized as artifact-only and remains lazy.
+                let retain_resident = matches!(outputs.get(name), Some(RuntimeValue::Int(_))) ||
+                    (self.session.is_none() &&
+                        matches!(outputs.get(name), Some(RuntimeValue::SmallMatrix(_))));
+                if !retain_resident {
                     let previous = outputs.insert(
                         name.clone(),
                         RuntimeValue::LazyArtifact {

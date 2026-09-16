@@ -1537,31 +1537,26 @@ pub struct BggRefreshAnchorParameters {
     pub preimage_bound: IntExpr,
 }
 
-impl crate::noise_refresh::ExponentLUTRefreshWitnessScheme for BggScheme {
-    type RefreshScaling = (Mat, mxx_dsl::Preimage);
-    type RefreshDecoderBase = Mat;
-    type RefreshDecoderWitness = mxx_dsl::Preimage;
-
-    fn scale_refresh_input(&self, state: &BggEncodingWire, scaling: &Self::RefreshScaling) -> Mat {
+impl BggScheme {
+    pub(crate) fn scale_refresh_input(
+        &self,
+        state: &BggEncodingWire,
+        scaling: &(Mat, mxx_dsl::Preimage),
+    ) -> Mat {
         self.encoding.bgg.large_scalar_mul(state, &scaling.0, scaling.1.clone()).vector
     }
-    fn prepare_refresh_decoder(&self, base: Mat, witness: mxx_dsl::Preimage) -> Mat {
+    pub(crate) fn prepare_refresh_decoder(&self, base: Mat, witness: mxx_dsl::Preimage) -> Mat {
         witness.mul_small_rhs(base)
     }
 
-    type RefreshPublicScaling = mxx_dsl::Preimage;
-
-    fn route_refresh_row(&self, row: Mat, route: mxx_dsl::Preimage) -> Mat {
+    pub(crate) fn route_refresh_row(&self, row: Mat, route: mxx_dsl::Preimage) -> Mat {
         route.mul_small_rhs(row)
     }
 
-    fn scale_refresh_public_input(&self, state: Mat, scaling: mxx_dsl::Preimage) -> Mat {
+    pub(crate) fn scale_refresh_public_input(&self, state: Mat, scaling: mxx_dsl::Preimage) -> Mat {
         scaling.mul_small_rhs(state)
     }
-    type RefreshAnchor = mxx_dsl::Trapdoor;
-    type RefreshAnchorParameters = BggRefreshAnchorParameters;
-
-    fn sample_refresh_anchor(
+    pub(crate) fn sample_refresh_anchor(
         &self,
         level: &IntExpr,
         parameters: &BggRefreshAnchorParameters,
@@ -1575,22 +1570,23 @@ impl crate::noise_refresh::ExponentLUTRefreshWitnessScheme for BggScheme {
             parameters.preimage_bound.clone(),
         )
     }
-    fn refresh_anchor_public(&self, anchor: &mxx_dsl::Trapdoor) -> Mat {
+    pub(crate) fn refresh_anchor_public(&self, anchor: &mxx_dsl::Trapdoor) -> Mat {
         anchor.public_matrix()
     }
-    fn sample_refresh_witness(&self, anchor: &mxx_dsl::Trapdoor, target: Mat) -> mxx_dsl::Preimage {
+    pub(crate) fn sample_refresh_witness(
+        &self,
+        anchor: &mxx_dsl::Trapdoor,
+        target: Mat,
+    ) -> mxx_dsl::Preimage {
         let rows = anchor.public_matrix().matrix_type().columns.clone();
         let columns = target.matrix_type().columns.clone();
         anchor.sample_preimage(target, (rows, columns))
     }
-    type RefreshSecret = Mat;
-    type RefreshBaseParameters = (mxx_ir_core::RealExpr, IntExpr);
-
-    fn sample_refresh_decoder_base(
+    pub(crate) fn sample_refresh_decoder_base(
         secret: &Mat,
         public: &Mat,
         level: &IntExpr,
-        parameters: &Self::RefreshBaseParameters,
+        parameters: &(mxx_ir_core::RealExpr, IntExpr),
     ) -> Mat {
         let ring = mxx_dsl::Ring::new(level.clone(), public.matrix_type().ring_dimension.clone());
         let reduced = secret.clone().reduce_modulus(level.clone());

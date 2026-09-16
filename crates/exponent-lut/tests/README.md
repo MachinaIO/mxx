@@ -6,10 +6,11 @@ invocation, following `crates/we/tests/test_gpu_diamond_we.rs`.
 | File | Sequential stages |
 | --- | --- |
 | `noise_refresh.rs` | Noise simulation / parameter search, then benchmark estimation of preprocessing and online refresh |
-| `lwr_prf.rs` | Noise simulation for one PRF output, then GPU round trip including digit readout and artifact-store reopening |
+| `lwr_prf.rs` | Noise simulation/report validation, exact three-stage estimates, one three-stage GPU round trip, and strict digit readout |
 
-Set `MXX_EXPONENT_LUT_TEST_SCHEME=bgg` (default) or `rns-bgg` for either file.
-Both schemes and files use `MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL`:
+`noise_refresh.rs` supports `MXX_EXPONENT_LUT_TEST_SCHEME=bgg` (default) or
+`rns-bgg`. `lwr_prf.rs` is the RNS-BGG facade workflow. Both integration files
+use `MXX_EXPONENT_LUT_REFRESH_NOISE_MODEL`:
 `average-case` (default) or `worst-case`. This selects the acceptance bound,
 not just the printed report. `MXX_EXPONENT_LUT_REFRESH_SECURITY_BITS` sets the
 average-case failure exponent (small PRF default: 1; refresh default: 100).
@@ -19,7 +20,7 @@ The selector belongs to the test harness. Both implementations use
 
 ```sh
 MXX_EXPONENT_LUT_TEST_SCHEME=rns-bgg cargo test -r -p mxx-exponent-lut --features gpu --test noise_refresh test_gpu_exponent_lut_benchmark_estimate -- --nocapture
-MXX_EXPONENT_LUT_TEST_SCHEME=rns-bgg cargo test -r -p mxx-exponent-lut --features gpu --test lwr_prf test_gpu_lwr_prf_one_output_round_trip -- --nocapture
+cargo test -r -p mxx-exponent-lut --features gpu --test lwr_prf test_gpu_lwr_prf_one_output_round_trip -- --nocapture
 ```
 
 Run these commands in a GPU-visible environment. Runtime execution requires the
@@ -39,12 +40,11 @@ cargo test -r -p mxx-exponent-lut --features gpu --test noise_refresh \
 This uses the report's exact CRT primes, PRF block sizes, and mask/fresh digit
 counts. Public monomial labels and trusted one-hot bits remain structural setup
 inputs, as in the BGG estimator; hash-to-LWR-vector generation is outside this
-GPU estimate. `MXX_EXPONENT_LUT_BENCH_STAGE=preprocess` or `online_eval` selects
-one measured stage, allowing separate pods to share the work. Without that
-variable both stages are measured. `MXX_EXPONENT_LUT_BENCH_STAGE=graph` only
-builds and validates both graphs, reports their node counts and construction
-time, and returns before initializing CUDA. No PRF output family is materialized
-on the host for this input binding.
+GPU estimate. The `lwr_prf.rs` workflow always performs noise/report
+validation, exact preprocess/encrypt/online graph estimates, and then the full
+three-stage round trip. No stage-selection environment variable is supported,
+so a partial estimate cannot be mistaken for a complete run. No PRF output
+family is materialized on the host for this input binding.
 
 Without an accepted report, RNS-BGG uses a small correctness fixture (one two-member selector block, base-4
 digits, and a variable-width gadget encoding). `MXX_PRIMITIVE_TEST_RING_DIMENSION` controls
@@ -96,19 +96,27 @@ can be selected individually from the GPU-enabled integration target.
 Integration tests have no `#[ignore]` attributes. Select a test name to run
 only one workflow or parameter-search regression.
 
-The RNS-BGG `lwr_prf.rs` round trip also accepts
+The RNS-BGG `lwr_prf.rs` round trip accepts
 `MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT`. It reuses the archived CRT chain and PBC
-layout for one PRF output, with CBD noise and a scaled terminal digit so the
-error check implies exact digit recovery. The fixture samples a valid weight-h
-key on that layout; this timing test does not certify the key distribution.
-`MXX_EXPONENT_LUT_BENCH_STAGE=graph` builds and simulates without CUDA execution,
-and reports the exported artifact payload size.
+layout for one PRF output with the reviewed Gaussian encoding-error contract and
+scaled terminal digit, then estimates and executes preprocess, encrypt, and
+online evaluation in that order. The fixture samples a valid weight-h key on
+that layout; this timing test does not certify the key distribution. There is
+no partial-stage mode.
 
-For actual timing, `MXX_EXPONENT_LUT_BENCH_WARMUPS` selects full unmeasured round
-trips before exactly one measured round trip (default: zero warmups).
+The NAND GPU test runs the same simulation, exact three-stage estimate, and
+three-stage round trip. By default the NAND test runs the lattice estimator and
+checks its result against `MXX_EXPONENT_LUT_NAND_SECURITY_BITS`. An explicit
+`MXX_EXPONENT_LUT_NAND_SKIP_SAGE=1` skips both the estimator and that target
+comparison, and logs `lattice_security_check=skipped`; no prevalidated evidence
+is consumed by this mode.
+
+For benchmark calibration, `MXX_EXPONENT_LUT_BENCH_WARMUPS` and
+`MXX_EXPONENT_LUT_BENCH_ITERATIONS` control the estimator's unmeasured warmups
+and measured repetitions (both default to one). They do not repeat the facade
+round trip: the integration executes exactly one `preprocess`, one `encrypt`,
+and one `online_eval`, timing each phase separately. The round-trip timings
+include the phase's normal artifact and backend work; graph planning and
+estimator calibration occur before those phase timers.
 `MXX_EXPONENT_LUT_MAX_PARALLEL_INSTANCES` bounds sibling loop instances (default
 64), independently of matrix column distribution across all detected GPUs.
-Timings separate preprocessing including artifact writes, manifest reopening,
-online graph construction, online execution including residual construction,
-and host verification. Matrix outputs are fenced before stopping execution
-timers. Graph construction and backend initialization are outside those timers.

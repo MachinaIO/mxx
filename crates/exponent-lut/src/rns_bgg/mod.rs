@@ -1,23 +1,36 @@
 //! RNS-BGG parameters, polynomial blocks, relation carriers, and scheme capabilities.
-pub mod api;
-pub mod encoding;
+//!
+//! RNS-BGG consumes a frozen Exponent-LUT Program and evaluates scalar or
+//! symbolic family values over an ordered modulus-chain level. The normal
+//! application entry point is the crate-root facade; this module is the
+//! advanced backend surface used when callers need explicit parameters,
+//! artifacts, graph values, or noise reports.
+//!
+//! The lifecycle is deliberately split into preprocess, encrypt, and online
+//! evaluation. The methods here build DSL graph values and sampling nodes;
+//! backend execution is a later runtime operation. Parameter planning and
+//! noise auditing describe cryptographic and workload constraints, but are not
+//! a lattice-security estimator. Raw terminal accumulators stay in the
+//! trusted advanced path and are finalized by one explicit modulus switch.
+#![deny(missing_docs)]
+#[allow(missing_docs)]
+pub(crate) mod api;
+mod encoding;
 #[cfg(all(test, feature = "gpu"))]
 pub(crate) mod gpu;
-pub mod noise;
+mod noise;
 mod program_setup;
-pub mod public_key;
+mod public_key;
+pub(crate) mod terminal;
 use crate::{
     layout::ExpLayout,
-    noise_refresh::{ExponentLUTRefreshDirectScheme, ExponentLUTRefreshScheme},
+    noise_refresh::ExponentLUTRefreshScheme,
     noise_utils::RightActionNoiseGain,
     program::{
         ExponentLutProgram, ExponentProgramLowering, FamilyRange, LutId, LutTable,
         ProgramFamilyBindings, ProgramGateInstance, ProgramLoweringTypes, ProgramValue,
     },
-    readout::{
-        ExponentLUTReadoutScheme, ExponentLUTTerminalScheme, RowLutTable, ValueReadout,
-        ValueReadoutIdentity,
-    },
+    readout::{ExponentLUTReadoutScheme, RowLutTable, ValueReadout, ValueReadoutIdentity},
     scheme::{ExponentLUTEncodingScheme, ExponentLUTFixedRhsScheme},
     utils::modular_inverse,
 };
@@ -29,22 +42,33 @@ use mxx_dsl::{
     Mat, MatType, Preimage, Ring,
 };
 use mxx_ir_core::{
-    IntExpr, ParamEnv, Rational, RealExpr, ValueHandle,
+    IntExpr, ParamEnv, ValueHandle,
     artifact::{ArtifactConfidentiality, ProductionId},
     types::{MatrixType, WireType},
 };
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
-use noise::RnsBggNoiseValue;
+pub use noise::{
+    RnsBggGateNoiseMaterial, RnsBggNoiseAction, RnsBggNoiseEvaluator, RnsBggNoiseRhs,
+    RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggRefreshPlan, RnsBggRefreshPlanRequest,
+    stable_source_id, trace_program,
+};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
-pub use program_setup::*;
-pub use public_key::*;
+pub(crate) use program_setup::{
+    GateRequirement, ProgramFamilyInputMetadata, ProgramRequirements, RnsBggProgramInput,
+    RnsBggProgramSetup, RnsBggSetupDomain, derive_program_requirements,
+};
+pub use program_setup::{RnsBggProgramDescriptor, RnsBggProgramExpectation};
+use public_key::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     ops::{Add, Mul, Neg, Sub},
     sync::Arc,
+};
+pub use terminal::{
+    PreparedTerminal, PreparedTerminalDescriptor, PreparedTerminalExpectation, TerminalError,
 };
 use thiserror::Error;
 impl From<RnsBggError> for crate::noise_refresh::setup::RefreshSetupError {
@@ -54,16 +78,22 @@ impl From<RnsBggError> for crate::noise_refresh::setup::RefreshSetupError {
 }
 
 #[derive(Debug, Error)]
+/// Errors raised while constructing, validating, or planning an RNS-BGG graph.
 pub enum RnsBggError {
     #[error("invalid RNS-BGG parameters: {0}")]
+    /// A parameter, level, shape, or workload contract is invalid.
     Parameters(&'static str),
     #[error("RNS-BGG budget exceeded: {0}")]
+    /// A modulus, noise, or workload budget cannot be satisfied.
     Budget(&'static str),
     #[error("RNS-BGG key, level, or matrix context mismatch")]
+    /// Two graph values have incompatible context, level, identity, or shape.
     Context,
     #[error("invalid RNS-BGG LUT or RHS")]
+    /// A LUT or RHS contract is invalid for the requested operation.
     Lut,
     #[error("RNS-BGG graph construction failed: {0}")]
+    /// A DSL graph operation failed while constructing a value.
     Graph(String),
 }
 
@@ -89,8 +119,16 @@ pub struct RnsBggPrivateRhs<C = RnsBggMatrix, L = ()> {
 /// A selector generator is invoked once per member inside its consuming batch.
 /// Combined RHS values are already materialized graph families.
 #[derive(Clone)]
+/// A symbolic or materialized family of RHS ciphertexts.
 pub enum RnsBggRhsFamily {
-    Generated { body: mxx_dsl::Subgraph<Int, RnsBggMatrix>, count: IntExpr },
+    /// Generate each RHS from one shared graph body and a local family index.
+    Generated {
+        /// One structural body that generates ciphertexts by local index.
+        body: mxx_dsl::Subgraph<Int, RnsBggMatrix>,
+        /// Number of generated family members.
+        count: IntExpr,
+    },
+    /// Already materialized family ciphertexts.
     Values(Family<RnsBggMatrix>),
 }
 impl RnsBggRhsFamily {
@@ -118,25 +156,64 @@ pub struct RnsBggPreparedPrivateMul<K = RnsBggPublicKey, C = RnsBggMatrix, D = R
 }
 
 impl<C, L> RnsBggPrivateRhs<C, L> {
+    /// Return the logical RHS plaintext identity.
     pub fn rhs_id(&self) -> &[u8; 32] {
         &self.rhs_id
     }
+    /// Return the sampled ciphertext material identity.
     pub fn id(&self) -> &[u8; 32] {
         &self.id
     }
 }
 
 impl<K, C, D> RnsBggPreparedPrivateMul<K, C, D> {
+    /// Return the prepared output public key contract.
     pub fn output_key(&self) -> &K {
         &self.output
     }
 
+    /// Return the prepared RHS ciphertext and digit material.
     pub fn rhs(&self) -> &RnsBggPrivateRhs<C, D> {
         &self.rhs
     }
 }
 
+impl
+    RnsBggPreparedPrivateMul<
+        RnsBggPublicKeyFamily,
+        ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>,
+        ProgramValue<RnsBggDigits, Family<RnsBggDigits>>,
+    >
+{
+    /// Resolve one local family member without expanding the family on host.
+    pub(crate) fn element_at_local(&self, index: Int) -> RnsBggPreparedPrivateMul {
+        let rhs = RnsBggPrivateRhs {
+            ciphertext: self.rhs.ciphertext.at(index.clone()),
+            lifted_ciphertext: self.rhs.lifted_ciphertext.at(index.clone()),
+            level: self.rhs.level,
+            context: self.rhs.context,
+            id: self.rhs.id,
+            rhs_id: self.rhs.rhs_id,
+        };
+        RnsBggPreparedPrivateMul {
+            input: self.input.element_at_local(index.clone()),
+            output: self.output.element_at_local(index),
+            rhs,
+        }
+    }
+}
+
 impl RnsBggPublicKeyFamily {
+    /// Resolve one local family member while preserving family metadata.
+    pub(crate) fn element_at_local(&self, index: Int) -> RnsBggPublicKey {
+        RnsBggPublicKey {
+            matrix: self.matrices.at(index),
+            level: self.level,
+            id: self.id,
+            context: self.context,
+        }
+    }
+
     fn from_program(
         values: &RnsBggPublicProgramValue,
         count: IntExpr,
@@ -190,6 +267,16 @@ impl RnsBggPublicKeyFamily {
     }
 }
 impl RnsBggEncodingFamily {
+    /// Resolve one local family member while preserving family metadata.
+    pub(crate) fn element_at_local(&self, index: Int) -> RnsBggEncoding {
+        RnsBggEncoding {
+            row: self.rows.at(index),
+            level: self.level,
+            key_id: self.key_id,
+            context: self.context,
+        }
+    }
+
     fn from_program(
         values: &RnsBggEncodingProgramValue,
         count: IntExpr,
@@ -357,6 +444,7 @@ impl ExponentLUTFixedRhsScheme for RnsBggScheme {
 }
 
 #[derive(Clone, Debug)]
+/// Validated modulus-chain and encoding-noise parameters.
 pub struct RnsBggParameters {
     levels: Vec<DCRTPolyParams>,
     drops: Vec<BigUint>,
@@ -368,13 +456,20 @@ pub struct RnsBggParameters {
 /// Public workload inputs, independent of secret values and sampled noise.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RnsBggPlanRequest {
+    /// Ring dimension used by every modulus-chain level.
     pub ring_dimension: u32,
+    /// Branch width for each logical stage.
     pub widths: Vec<usize>,
     #[serde(with = "bigdecimal_string")]
+    /// Standard deviation of fresh encoding Gaussian errors.
     pub encoding_error_sigma: BigDecimal,
+    /// Target CRT prime size in bits.
     pub crt_bits: usize,
+    /// CRT depth reserved for the terminal level.
     pub terminal_depth: usize,
+    /// Maximum CRT depth considered by planning.
     pub max_crt_depth: usize,
+    /// Maximum terminal payload coefficient magnitude.
     pub terminal_value_bound: BigUint,
     /// Number of logical MulPrivate/LUT operations between physical drops.
     pub operations_per_drop: usize,
@@ -398,11 +493,17 @@ pub struct RnsBggStageWorkload {
     /// bound. This keeps non-sequential additions tied to their real SSA
     /// operands rather than to the preceding Program step.
     pub(crate) operand_stages: [Option<usize>; 2],
+    /// Direct noise bounds for family-member operands. Broadcast operands use
+    /// `operand_stages` and are resolved from the preceding stage history;
+    /// member operands have no producer stage in the outer Program and must
+    /// retain their symbolic binding bound here.
+    pub(crate) family_operand_bounds: [Option<RnsBggNoiseBound>; 2],
     /// Only multiplication/LUT-like operations consume a CRT drop budget.
     pub(crate) logical_drop: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Workload derived from a concrete Program and public helper contracts.
 pub struct RnsBggDerivedWorkload {
     pub(crate) stages: Vec<RnsBggStageWorkload>,
     pub(crate) program_commitment: Option<[u8; 32]>,
@@ -431,6 +532,7 @@ impl RnsBggDerivedWorkload {
                 output_payload_l1: BigUint::one(),
                 peak_live_values: 1,
                 operand_stages: [index.checked_sub(1), None],
+                family_operand_bounds: [None, None],
                 logical_drop: true,
             })
             .collect::<Vec<_>>();
@@ -466,18 +568,22 @@ impl RnsBggDerivedWorkload {
         Ok(())
     }
 
+    /// Return the ordered stage workload records.
     pub fn stages(&self) -> &[RnsBggStageWorkload] {
         &self.stages
     }
 
+    /// Return the optional frozen Program commitment.
     pub fn program_commitment(&self) -> Option<&[u8; 32]> {
         self.program_commitment.as_ref()
     }
 
+    /// Return the commitment covering all derived stage material.
     pub fn material_commitment(&self) -> &[u8; 32] {
         &self.material_commitment
     }
 
+    /// Return the commitment covering public planning inputs and ranges.
     pub fn planning_material_commitment(&self) -> &[u8; 32] {
         &self.planning_material_commitment
     }
@@ -524,47 +630,58 @@ fn stable_commitment<T: Serialize>(value: &T) -> [u8; 32] {
 }
 
 impl RnsBggStageWorkload {
+    /// Return the stable operation kind label.
     pub fn gate_kind(&self) -> &str {
         &self.gate_kind
     }
 
+    /// Return the number of active branches.
     pub fn branches(&self) -> usize {
         self.branches
     }
 
+    /// Return the fresh-error action gain.
     pub fn fresh_error_gain(&self) -> &RightActionNoiseGain {
         &self.fresh_error_gain
     }
 
+    /// Return stable identities of fresh-error sources used by this stage.
     pub fn fresh_error_sources(&self) -> &[[u8; 32]] {
         &self.fresh_error_sources
     }
 
+    /// Return the public multiplier L1 gain.
     pub fn public_multiplier_l1(&self) -> &BigUint {
         &self.public_multiplier_l1
     }
 
+    /// Return the derived output payload L1 bound.
     pub fn output_payload_l1(&self) -> &BigUint {
         &self.output_payload_l1
     }
 
+    /// Return the peak number of live symbolic values for this stage.
     pub fn peak_live_values(&self) -> usize {
         self.peak_live_values
     }
 
+    /// Return producer-stage indices for the operation operands.
     pub fn operand_stages(&self) -> [Option<usize>; 2] {
         self.operand_stages
     }
 
+    /// Return whether this stage consumes a logical CRT drop.
     pub fn logical_drop(&self) -> bool {
         self.logical_drop
     }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Deterministic coefficient-error and payload envelope.
 pub struct RnsBggNoiseBound {
     /// Bound on e in c = s*a - p*mu*r + e.
     pub error: BigUint,
+    /// L1 bound on the encoded payload polynomial.
     pub payload_l1: BigUint,
 }
 
@@ -582,20 +699,34 @@ impl RnsBggNoiseBound {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Serialized parameter certificate and its derived workload evidence.
 pub struct RnsBggParameterManifest {
+    /// Manifest schema version.
     pub schema_version: u32,
+    /// Original cryptographic planning request.
     pub workload: RnsBggPlanRequest,
+    /// Public workload derived from the frozen Program.
     pub derived_workload: RnsBggDerivedWorkload,
+    /// Ring dimension used by the certificate.
     pub ring_dimension: u32,
     #[serde(with = "bigdecimal_string")]
+    /// Canonical encoding Gaussian sigma.
     pub encoding_error_sigma: BigDecimal,
+    /// Hard cutoff derived from sigma.
     pub encoding_error_bound: BigUint,
+    /// Logical operations per physical modulus drop.
     pub operations_per_drop: usize,
+    /// CRT prime lists for each level.
     pub levels: Vec<Vec<u64>>,
+    /// Digit base width for each level.
     pub base_bits: Vec<u32>,
+    /// Physical modulus drops between logical levels.
     pub drops: Vec<BigUint>,
+    /// Payload scale at each level.
     pub payload_scales: Vec<BigUint>,
+    /// Deterministic noise envelope for each stage.
     pub noise_bounds: Vec<RnsBggNoiseBound>,
+    /// Estimated artifact/storage bytes, not a hard VRAM admission limit.
     pub estimated_bytes: BigUint,
     /// Arithmetic acceptance alone never certifies related-secret security.
     pub security_certified: bool,
@@ -641,6 +772,12 @@ fn encoding_error_bound(sigma: &BigDecimal) -> Result<BigUint, RnsBggError> {
 }
 
 impl RnsBggParameters {
+    /// Validate a modulus chain and derive the Gaussian cutoff and drop schedule.
+    ///
+    /// `levels` are ordered from the source ring toward the terminal ring;
+    /// `encoding_error_sigma` is the runtime fresh-error standard deviation,
+    /// and `operations_per_drop` controls how many logical operations share a
+    /// physical modulus transition.
     pub fn new(
         levels: Vec<DCRTPolyParams>,
         encoding_error_sigma: impl Into<BigDecimal>,
@@ -702,6 +839,7 @@ impl RnsBggParameters {
         Ok(())
     }
 
+    /// Return the ordered modulus-chain levels used by the scheme.
     pub fn levels(&self) -> &[DCRTPolyParams] {
         &self.levels
     }
@@ -724,9 +862,11 @@ impl RnsBggParameters {
             })
             .collect()
     }
+    /// Return one modulus-chain level, or an error for an unknown index.
     pub fn level(&self, level: usize) -> Result<&DCRTPolyParams, RnsBggError> {
         self.levels.get(level).ok_or(RnsBggError::Parameters("level outside modulus chain"))
     }
+    /// Return the modulus-drop scale associated with a level transition.
     pub fn scale(&self, level: usize) -> Result<&BigUint, RnsBggError> {
         self.drops.get(level).ok_or(RnsBggError::Parameters("level outside modulus chain"))
     }
@@ -736,27 +876,15 @@ impl RnsBggParameters {
         self.level(level)?;
         Ok(self.levels.get(level + 1).map_or(1, PolyParams::modulus_digits))
     }
-    pub fn encoding_error_sigma_expr(&self) -> RealExpr {
-        let (integer, exponent) = self.encoding_error_sigma.as_bigint_and_exponent();
-        if exponent >= 0 {
-            let denominator = BigInt::from(10u8).pow(exponent as u32);
-            RealExpr::Rational(Rational::new(integer, denominator).expect("positive denominator"))
-        } else {
-            RealExpr::Rational(
-                Rational::new(
-                    integer * BigInt::from(10u8).pow((-exponent) as u32),
-                    BigInt::from(1u8),
-                )
-                .expect("positive denominator"),
-            )
-        }
-    }
+    /// Return the canonical standard deviation of fresh encoding errors.
     pub fn encoding_error_sigma(&self) -> &BigDecimal {
         &self.encoding_error_sigma
     }
+    /// Return the hard coefficient cutoff derived from the encoding sigma.
     pub fn encoding_error_bound(&self) -> &BigUint {
         &self.encoding_error_bound
     }
+    /// Return the number of logical operations between physical drops.
     pub fn operations_per_drop(&self) -> usize {
         self.operations_per_drop
     }
@@ -788,7 +916,8 @@ impl RnsBggPlanRequest {
 }
 
 impl RnsBggParameterManifest {
-    pub const SCHEMA_VERSION: u32 = 2;
+    /// Version of the serialized manifest contract understood by this crate.
+    pub const SCHEMA_VERSION: u32 = 1;
 
     /// Restore the recorded bases, without generating a new prime pool, and
     /// verify every redundant certificate field before accepting the artifact.
@@ -1086,14 +1215,19 @@ mod parameter_tests {
 }
 
 #[derive(Clone)]
+/// Fixed-size matrix blocks used to keep the RNS-BGG graph structure explicit.
+/// Each entry is a DSL value with the same ring and compatible wire schema.
 pub struct Blocks<const R: usize, const C: usize, T = Mat> {
     entries: [[T; C]; R],
     matrix_type: MatrixType,
 }
 
+/// One-by-two block row used for encoded payloads and secrets.
 pub type RnsBggRow = Blocks<1, 2>;
 
+/// Two-by-two block matrix used for public keys and ciphertexts.
 pub type RnsBggMatrix = Blocks<2, 2>;
+/// Two-by-two block matrix whose entries are bounded preimage values.
 pub type RnsBggDigits = Blocks<2, 2, Preimage>;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -1101,9 +1235,11 @@ pub type RnsBggDigits = Blocks<2, 2, Preimage>;
     serialize = "[[T; C]; R]: Serialize",
     deserialize = "[[T; C]; R]: Deserialize<'de>"
 ))]
+/// Serializable schema for a fixed block matrix of graph values.
 pub struct BlocksType<const R: usize, const C: usize, T = MatType>([[T; C]; R]);
 
 impl<const R: usize, const C: usize, T: GraphValueSchema> BlocksType<R, C, T> {
+    /// Return the dense matrix wire shape represented by these blocks.
     pub fn matrix_type(&self) -> MatrixType {
         let wire = self.0[0][0].wire_types().into_iter().next().expect("matrix block");
         let mut matrix = match wire {
@@ -1121,6 +1257,7 @@ impl<const R: usize, const C: usize, T: GraphValueSchema> BlocksType<R, C, T> {
 pub struct RnsBggBranches(pub Vec<RnsBggMatrix>);
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Serializable schema for a structural list of branch matrices.
 pub struct RnsBggBranchesType(Vec<BlocksType<2, 2>>);
 
 impl GraphValue for RnsBggBranches {
@@ -1156,7 +1293,58 @@ impl GraphValueSchema for RnsBggBranchesType {
     }
 }
 
+/// Structural branch container for material-side digit decompositions.
+///
+/// This keeps all branches in one family element rather than creating a
+/// nested indexed family, which the DSL does not support.
+#[derive(Clone)]
+pub(crate) struct RnsBggLiftedBranches(pub Vec<RnsBggDigits>);
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct RnsBggLiftedBranchesType(pub Vec<<RnsBggDigits as GraphValue>::Schema>);
+
+impl GraphValue for RnsBggLiftedBranches {
+    type Schema = RnsBggLiftedBranchesType;
+
+    fn flatten(&self) -> Vec<ValueHandle> {
+        self.0.iter().flat_map(GraphValue::flatten).collect()
+    }
+
+    fn schema(&self) -> Self::Schema {
+        RnsBggLiftedBranchesType(self.0.iter().map(GraphValue::schema).collect())
+    }
+
+    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        let mut offset = 0usize;
+        let mut branches = Vec::with_capacity(schema.0.len());
+        for branch in &schema.0 {
+            let width = branch.wire_types().len();
+            let end = offset.checked_add(width).ok_or(DslError::Schema)?;
+            let value = RnsBggDigits::from_values(branch, &values[offset..end])?;
+            branches.push(value);
+            offset = end;
+        }
+        if offset != values.len() {
+            return Err(DslError::Schema);
+        }
+        Ok(Self(branches))
+    }
+}
+
+impl GraphValueSchema for RnsBggLiftedBranchesType {
+    type Value = RnsBggLiftedBranches;
+
+    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
+        RnsBggLiftedBranches(self.0.iter().map(|schema| schema.placeholders_from(next)).collect())
+    }
+
+    fn wire_types(&self) -> Vec<WireType> {
+        self.0.iter().flat_map(GraphValueSchema::wire_types).collect()
+    }
+}
+
 impl<const R: usize, const C: usize, T: GraphValue> Blocks<R, C, T> {
+    /// Construct blocks after checking that all entries have compatible schemas.
     pub fn new(entries: [[T; C]; R]) -> Result<Self, DslError> {
         if R == 0 || C == 0 {
             return Err(DslError::Schema);
@@ -1172,9 +1360,11 @@ impl<const R: usize, const C: usize, T: GraphValue> Blocks<R, C, T> {
         Ok(Self { entries, matrix_type })
     }
 
+    /// Return one block entry by its fixed row and column.
     pub fn entry(&self, row: usize, column: usize) -> &T {
         &self.entries[row][column]
     }
+    /// Return the dense matrix shape obtained by concatenating all blocks.
     pub fn matrix_type(&self) -> &MatrixType {
         &self.matrix_type
     }
@@ -1186,6 +1376,7 @@ impl<const R: usize, const C: usize, T: GraphValue> Blocks<R, C, T> {
 }
 
 impl<const R: usize, const C: usize> Blocks<R, C> {
+    /// Hash a fixed block matrix with a domain-separated tag for each entry.
     pub fn hash(ring: &Ring, key: Bytes, tag: impl Into<HashTag>, columns: usize) -> Self {
         let root = tag.into();
         Self::new(std::array::from_fn(|row| {
@@ -1200,18 +1391,22 @@ impl<const R: usize, const C: usize> Blocks<R, C> {
         .expect("one common scalar ring")
     }
 
+    /// Apply the same ring automorphism to every block entry.
     pub fn ring_automorphism(self, index: impl Into<IntExpr>) -> Self {
         let index = index.into();
         self.map(|value| value.ring_automorphism(index.clone()))
     }
+    /// Reduce every block entry into the requested modulus.
     pub fn reduce_modulus(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
         self.map(|value| value.reduce_modulus(modulus.clone()))
     }
+    /// Centered-extend every block entry into the requested modulus.
     pub fn centered_extend(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
         self.map(|value| value.centered_extend(modulus.clone()))
     }
+    /// Apply a block-aware modulus switch to every block entry when needed.
     pub fn block_mod_switch(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
         if self.entries[0][0].matrix_type().modulus == modulus {
@@ -1222,6 +1417,7 @@ impl<const R: usize, const C: usize> Blocks<R, C> {
 }
 
 impl RnsBggMatrix {
+    /// Combine two one-row block values into a two-row matrix.
     pub fn from_rows(top: RnsBggRow, bottom: RnsBggRow) -> Self {
         Self::new([
             top.entries.into_iter().next().expect("one row"),
@@ -1286,6 +1482,7 @@ impl<const R: usize, const C: usize, const K: usize> Mul<Blocks<C, K>> for Block
 }
 
 impl<const R: usize, const C: usize> Blocks<R, C, Preimage> {
+    /// Centered-extend each bounded preimage block into the requested modulus.
     pub fn centered_extend(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
         self.map(|value| value.centered_extend(modulus.clone()))
@@ -1467,18 +1664,21 @@ pub struct RnsBggPreparedLinear<K = RnsBggPublicKey, M = Mat> {
 }
 
 impl<K, M> RnsBggPreparedLinear<K, M> {
+    /// Return the public-key identity produced by this prepared operation.
     pub fn output_key(&self) -> &K {
         &self.output
     }
 }
 
 #[derive(Clone)]
+/// Secret payload row used to encrypt an input at one scheme level.
 pub struct RnsBggPayloadSecret {
     pub(crate) row: RnsBggRow,
     context: [u8; 32],
 }
 
 #[derive(Clone)]
+/// Secret mask row used to hide online input encodings.
 pub struct RnsBggMaskSecret {
     pub(crate) row: RnsBggRow,
     context: [u8; 32],
@@ -1501,6 +1701,7 @@ pub(crate) struct TestSecrets {
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Public key matrix together with its level and scheme identities.
 pub struct RnsBggPublicKey<M = RnsBggMatrix> {
     pub(crate) matrix: M,
     pub(crate) level: usize,
@@ -1509,6 +1710,7 @@ pub struct RnsBggPublicKey<M = RnsBggMatrix> {
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Encoded row bound to a public key and a modulus-chain level.
 pub struct RnsBggEncoding<R = RnsBggRow> {
     pub(crate) row: R,
     pub(crate) level: usize,
@@ -1523,6 +1725,7 @@ struct MaskBranch<M = RnsBggMatrix> {
 }
 
 #[derive(Clone)]
+/// Public mask ciphertext bank shared by LUT helpers at one level.
 pub struct RnsBggMaskBank {
     id: [u8; 32],
     level: usize,
@@ -1556,7 +1759,9 @@ pub struct RnsBggLutMaterial<M = RnsBggMatrix> {
 /// Encryption-time plaintext paired with a public artifact identity. The
 /// identity, never the plaintext, is supplied to the online program binding.
 pub struct RnsBggRhsPlaintext {
+    /// Plaintext payload consumed by the encryption graph.
     pub payload: Mat,
+    /// Stable caller-chosen identity used to bind the resulting ciphertext.
     pub id: [u8; 32],
 }
 
@@ -1570,6 +1775,7 @@ struct PreparedBranch<M = RnsBggMatrix, D = RnsBggDigits> {
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Prepared LUT helper that can be reused for online evaluations with matching identities.
 pub struct RnsBggPreparedLut<K = RnsBggPublicKey, M = RnsBggMatrix, D = RnsBggDigits> {
     binding: RnsBggLutBinding,
     input: K,
@@ -1578,6 +1784,7 @@ pub struct RnsBggPreparedLut<K = RnsBggPublicKey, M = RnsBggMatrix, D = RnsBggDi
 }
 
 impl RnsBggPreparedLut {
+    /// Reconstruct the public mask-bank metadata represented by this helper.
     pub fn mask_bank(&self) -> RnsBggMaskBank {
         RnsBggMaskBank {
             id: self.binding.mask_bank,
@@ -1606,45 +1813,56 @@ pub struct RnsBggScheme {
 }
 
 impl RnsBggPublicKey {
+    /// Return the public key matrix in its level ring.
     pub fn matrix(&self) -> &RnsBggMatrix {
         &self.matrix
     }
+    /// Return the modulus-chain level of this key.
     pub fn level(&self) -> usize {
         self.level
     }
+    /// Return the stable key identity used for binding.
     pub fn id(&self) -> &[u8; 32] {
         &self.id
     }
 }
 
 impl RnsBggEncoding {
+    /// Return the encoded row graph value.
     pub fn row(&self) -> &RnsBggRow {
         &self.row
     }
+    /// Return the modulus-chain level of this encoding.
     pub fn level(&self) -> usize {
         self.level
     }
 }
 
 impl RnsBggLutMaterial {
+    /// Return the optional commitment to the LUT table.
     pub fn table_commitment(&self) -> Option<&[u8; 32]> {
         self.table.as_ref()
     }
+    /// Indicate whether a fixed RHS was included in this material.
     pub fn has_rhs(&self) -> bool {
         self.rhs_id.is_some()
     }
 }
 
 impl RnsBggPreparedLut {
+    /// Return the LUT, level, and mask-bank identity binding.
     pub fn binding(&self) -> &RnsBggLutBinding {
         &self.binding
     }
+    /// Return the public key identity produced by this LUT.
     pub fn output_key(&self) -> &RnsBggPublicKey {
         &self.output
     }
 }
 
 impl RnsBggScheme {
+    /// Create a scheme context from validated parameters and a caller context identity.
+    /// The constructor does not sample secrets or execute any graph.
     pub fn new(parameters: RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
             parameter_identity: std::sync::OnceLock::new(),
@@ -1661,9 +1879,11 @@ impl RnsBggScheme {
         scheme.encoding_errors_noiseless = true;
         scheme
     }
+    /// Return the validated public parameters used by this scheme.
     pub fn parameters(&self) -> &RnsBggParameters {
         &self.parameters
     }
+    /// Return a DSL ring for a modulus-chain level.
     pub fn ring(&self, level: usize) -> Result<Ring, RnsBggError> {
         let parameters = self.parameters.level(level)?;
         Ok(Ring::new(
@@ -1692,6 +1912,7 @@ impl RnsBggScheme {
             None => Ok(self.ring(level)?.identity(1)),
         }
     }
+    /// Encode a scalar polynomial in the ring at a selected level.
     pub fn scalar(&self, level: usize, value: impl Into<BigInt>) -> Result<Mat, RnsBggError> {
         Ok(self.ring(level)?.polynomial([mxx_ir_core::IntExpr::constant(value.into())]))
     }
@@ -1707,13 +1928,17 @@ pub(self) fn sum<T: mxx_dsl::GraphValue + std::ops::Add<Output = T>>(
 /// CRT prime. The source is the preceding level; setup owns this contract.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct RnsBggRefreshLevel {
+    /// Output modulus-chain level after this refresh transition.
     pub output_level: usize,
+    /// CRT prime extracted from the output modulus.
     pub prime: BigInt,
 }
 
 /// Setup-owned output key and CRT idempotents in its full output ring.
 pub struct RnsBggRefreshRecomposition {
+    /// Public key for the recomposed output ring.
     pub output_key: RnsBggPublicKey,
+    /// CRT idempotent coefficients used to recombine residue outputs.
     pub coefficients: Vec<Mat>,
 }
 
@@ -1797,19 +2022,20 @@ impl ExponentLUTRefreshScheme for RnsBggScheme {
     }
 }
 
-impl ExponentLUTRefreshDirectScheme for RnsBggScheme {
-    type RefreshArtifactBinding = RnsBggArtifactBinding;
-    type RefreshOutputKey = RnsBggPublicKey;
-
-    fn refresh_artifact_binding(&self) -> RnsBggArtifactBinding {
+/* direct refresh operations are inherent RNS-BGG methods below */
+impl RnsBggScheme {
+    pub(crate) fn refresh_artifact_binding(&self) -> RnsBggArtifactBinding {
         self.artifact_binding()
     }
 
-    fn refresh_output_key(preparation: &RnsBggRefreshRecomposition) -> &RnsBggPublicKey {
+    pub(crate) fn refresh_output_key<'a>(
+        &self,
+        preparation: &'a RnsBggRefreshRecomposition,
+    ) -> &'a RnsBggPublicKey {
         &preparation.output_key
     }
 
-    fn import_refresh_recomposition(
+    pub(crate) fn import_refresh_recomposition(
         &self,
         key: RnsBggPublicKey,
     ) -> Result<(RnsBggRefreshRecomposition, BlocksType<2, 2>, BlocksType<1, 2>), RnsBggError> {
@@ -1824,14 +2050,15 @@ impl ExponentLUTRefreshDirectScheme for RnsBggScheme {
         Ok((self.prepare_refresh_recomposition(key)?, target, offset))
     }
 
-    type RefreshSecret = RnsBggMaskSecret;
-    type RefreshDecoderParameters = usize;
-
-    fn offset_refresh_decoder(&self, decoder: RnsBggRow, offset: RnsBggRow) -> RnsBggRow {
+    pub(crate) fn offset_refresh_decoder(
+        &self,
+        decoder: RnsBggRow,
+        offset: RnsBggRow,
+    ) -> RnsBggRow {
         decoder - offset
     }
 
-    fn prepare_direct_refresh_decoder(
+    pub(crate) fn prepare_direct_refresh_decoder(
         &self,
         secret: &RnsBggMaskSecret,
         target: RnsBggMatrix,
@@ -1839,7 +2066,9 @@ impl ExponentLUTRefreshDirectScheme for RnsBggScheme {
         eta: &usize,
     ) -> RnsBggRow {
         let ring = self.ring(level.output_level).expect("prepared output level");
-        let mask = self.mask_at(secret, level.output_level).expect("prepared secret context");
+        let mask = self
+            .reduce_mask_secret_modulus(secret, level.output_level)
+            .expect("prepared secret context");
         if *eta == 0 {
             return mask * target;
         }
@@ -1854,20 +2083,17 @@ impl ExponentLUTRefreshDirectScheme for RnsBggScheme {
         let error = crate::utils::balanced_sum_family(bits).expect("positive decoder eta");
         mask * target + error
     }
-    type RefreshDigitSecret = RnsBggPayloadSecret;
-    type RefreshDigitMaskBank = RnsBggMaskBank;
-
-    fn sample_refresh_digit_material(
+    pub(crate) fn sample_refresh_digit_material(
         &self,
-        secret: &Self::RefreshDigitSecret,
+        secret: &RnsBggPayloadSecret,
         readout: &crate::readout::ValueReadout,
-        bank: &Self::RefreshDigitMaskBank,
+        bank: &RnsBggMaskBank,
         routing: &crate::noise_refresh::refresh::RefreshDigitRouting,
         hash_key: mxx_dsl::Bytes,
         tag: mxx_dsl::HashTag,
         id: [u8; 32],
     ) -> Result<
-        (ProgramValue<Self::TerminalMaterial, Family<Self::TerminalMaterial>>, RnsBggRow),
+        (ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>, RnsBggRow),
         RnsBggError,
     > {
         use mxx_ir_core::{IntExpr, node::ConstantMatrix};
@@ -1933,14 +2159,17 @@ impl ExponentLUTRefreshDirectScheme for RnsBggScheme {
         ))
     }
 
-    fn refresh_terminal_public(
+    pub(crate) fn refresh_terminal_public(
         &self,
         raw: RnsBggTerminalAccumulator<RnsBggMatrix>,
     ) -> RnsBggMatrix {
         raw.value
     }
 
-    fn refresh_terminal_encoding(&self, raw: RnsBggTerminalAccumulator<RnsBggRow>) -> RnsBggRow {
+    pub(crate) fn refresh_terminal_encoding(
+        &self,
+        raw: RnsBggTerminalAccumulator<RnsBggRow>,
+    ) -> RnsBggRow {
         raw.value
     }
 }
@@ -1956,6 +2185,7 @@ pub struct RnsBggPreparedTerminalDescriptor<
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+/// Public identity binding parameters and scheme context for an artifact.
 pub struct RnsBggArtifactBinding {
     parameters: [u8; 32],
     context: [u8; 32],
@@ -2037,29 +2267,63 @@ pub(self) fn import_blocks<const R: usize, const C: usize>(
 /// Matrices contain only the active range; `range.start` identifies those
 /// members in external RHS/public-value families of the full capacity.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Public-key family values and the active range addressed by a graph.
 pub struct RnsBggPublicKeyFamily<M = ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>> {
+    /// Matrix values, either scalar or an indexed DSL family.
     pub matrices: M,
+    /// Modulus-chain level shared by all members.
     pub level: usize,
+    /// Stable public-key identity shared by all members.
     pub id: [u8; 32],
+    /// Scheme context identity shared by all members.
     pub context: [u8; 32],
+    /// Active local range within the external family capacity.
     pub range: FamilyRange,
 }
 
 #[derive(Clone)]
+/// Encoded-row family with key, level, and active-range metadata.
 pub struct RnsBggEncodingFamily {
+    /// Scalar or family rows consumed by the evaluator.
     pub rows: ProgramValue<RnsBggRow, Family<RnsBggRow>>,
+    /// Modulus-chain level shared by all members.
     pub level: usize,
+    /// Identity of the key used for encoding.
     pub key_id: [u8; 32],
+    /// Scheme context identity shared by all members.
     pub context: [u8; 32],
+    /// Active local range within the external family capacity.
     pub range: FamilyRange,
 }
 
+/// Encryption-time payload family and one identity for its resulting RHS artifact.
 pub struct RnsBggRhsPlaintextFamily {
+    /// Plaintext payloads indexed by the local family range.
     pub payloads: Family<Mat>,
+    /// Stable identity bound to the encrypted family artifact.
     pub id: [u8; 32],
 }
 
+/// Validate an active local range against the external family capacity.
+///
+/// Symbolic bounds are rejected here because these cryptographic wrappers
+/// must not construct a graph whose external indexing contract is undecidable.
+pub(crate) fn validate_family_range(
+    range: &FamilyRange,
+    external_capacity: &IntExpr,
+) -> Result<(), RnsBggError> {
+    let start = range.start().evaluate(&ParamEnv::default()).map_err(|_| RnsBggError::Context)?;
+    let count = range.count().evaluate(&ParamEnv::default()).map_err(|_| RnsBggError::Context)?;
+    let capacity =
+        external_capacity.evaluate(&ParamEnv::default()).map_err(|_| RnsBggError::Context)?;
+    if start < 0.into() || count <= 0.into() || capacity < 0.into() || start + count > capacity {
+        return Err(RnsBggError::Context);
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
+/// Materialized LUT helper family indexed by an external family value.
 pub struct RnsBggLutMaterialFamily {
     pub(self) binding: RnsBggLutBinding,
     /// Each member carries branch polynomial fields as a structural product.
@@ -2069,7 +2333,7 @@ pub struct RnsBggLutMaterialFamily {
 
 impl RnsBggLutMaterialFamily {
     /// Resolve one external member without expanding the structural family.
-    pub(self) fn at(&self, index: Int) -> RnsBggLutMaterial {
+    pub(crate) fn element_at_external(&self, index: Int) -> RnsBggLutMaterial {
         RnsBggLutMaterial {
             mask_bank: self.binding.mask_bank,
             id: self.binding.material_id,
@@ -2081,12 +2345,14 @@ impl RnsBggLutMaterialFamily {
         }
     }
 
+    /// Return the public binding shared by every family member.
     pub fn binding(&self) -> &RnsBggLutBinding {
         &self.binding
     }
 }
 
 #[derive(Clone)]
+/// Prepared LUT helpers for a family of public-key inputs.
 pub struct RnsBggPreparedLutFamily {
     pub(self) input: RnsBggPublicKeyFamily,
     pub(self) output: RnsBggPublicKeyFamily,
@@ -2094,18 +2360,21 @@ pub struct RnsBggPreparedLutFamily {
 }
 
 impl RnsBggPreparedLutFamily {
+    /// Return the public mask bank shared by this prepared family.
     pub fn mask_bank(&self) -> RnsBggMaskBank {
         self.prepared.at(0).mask_bank()
     }
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Prepared reduction of a family into one public-key output.
 pub struct RnsBggPreparedReduction<I = RnsBggPublicKeyFamily, K = RnsBggPublicKey> {
     pub(self) input: I,
     pub(self) output: K,
 }
 
 impl RnsBggPreparedReduction {
+    /// Return the public key identity produced by this reduction.
     pub fn output_key(&self) -> &RnsBggPublicKey {
         &self.output
     }
@@ -2113,16 +2382,24 @@ impl RnsBggPreparedReduction {
 
 /// Public metadata used in place of encryption-time RHS plaintexts.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+/// Public identities that bind a LUT, its mask bank, level, and optional RHS.
 pub struct RnsBggLutBinding {
+    /// Stable mask-bank identity.
     pub mask_bank: [u8; 32],
+    /// Stable material identity.
     pub material_id: [u8; 32],
+    /// Modulus-chain level where the material is valid.
     pub level: usize,
+    /// Scheme context identity.
     pub context: [u8; 32],
+    /// Optional LUT table commitment.
     pub table: Option<[u8; 32]>,
+    /// Optional fixed-RHS plaintext identity.
     pub rhs: Option<[u8; 32]>,
 }
 
 impl<M> RnsBggLutMaterial<M> {
+    /// Return the serializable public identity binding for this material.
     pub fn binding(&self) -> RnsBggLutBinding {
         RnsBggLutBinding {
             mask_bank: self.mask_bank,
@@ -2136,21 +2413,29 @@ impl<M> RnsBggLutMaterial<M> {
 }
 
 #[derive(Clone, PartialEq)]
+/// Online helper rows and their public LUT binding.
 pub struct RnsBggOnlineLutHelpers<R = RnsBggRow> {
+    /// Identity contract checked by online evaluation.
     pub binding: RnsBggLutBinding,
+    /// Secret-dependent mask rows prepared for this online session.
     pub masks: crate::rns_bgg::RnsBggOnlineMasks<R>,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Prepared operation selected by a compiled program step.
 pub enum PreparedGate<K = RnsBggPublicKey, M = RnsBggMatrix, P = Mat, D = RnsBggDigits> {
+    /// Prepared multiplication by a fixed private RHS.
     MulPrivate(RnsBggPreparedPrivateMul<K, M, D>),
+    /// Prepared public linear operation.
     Linear(RnsBggPreparedLinear<K, P>),
+    /// Prepared LUT operation with reusable branch material.
     Lut(RnsBggPreparedLut<K, M, D>),
     /// Only the output key is needed to bind an online aggregate.
     Reduction(K),
 }
 
 #[derive(Clone, PartialEq)]
+/// Per-program cache of prepared gates and known plaintext values.
 pub struct RnsBggProgramCache<G = PreparedGate, P = Mat> {
     pub(self) gates: BTreeMap<ProgramGateInstance, G>,
     pub(self) plaintexts: BTreeMap<ProgramGateInstance, P>,
@@ -2182,11 +2467,13 @@ impl<G, P> Default for RnsBggProgramCache<G, P> {
     }
 }
 
+/// Evaluator for public-key graph values and preparation artifacts.
 pub struct RnsBggPublicEvaluator<'a> {
     scheme: &'a RnsBggScheme,
     cache: &'a mut RnsBggProgramCache,
 }
 
+/// Evaluator for encoded rows and online helper artifacts.
 pub struct RnsBggEncodingEvaluator<'a> {
     scheme: &'a RnsBggScheme,
     cache: &'a RnsBggProgramCache,
@@ -2376,8 +2663,10 @@ impl ProgramLoweringTypes for RnsBggEncodingEvaluator<'_> {
     type Error = RnsBggError;
 }
 
+/// Program value carrying a public key and optional known plaintext.
 pub type RnsBggPublicProgramValue =
     ProgramValue<(RnsBggPublicKey, Option<Mat>), Family<(RnsBggPublicKey, Option<Mat>)>>;
+/// Program value carrying an encoded row and optional known plaintext.
 pub type RnsBggEncodingProgramValue =
     ProgramValue<(RnsBggEncoding, Option<Mat>), Family<(RnsBggEncoding, Option<Mat>)>>;
 
@@ -2385,10 +2674,13 @@ pub type RnsBggEncodingProgramValue =
 /// multiplication binds its identity to the already prepared ciphertext.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum RnsBggPublicRhs<M = RnsBggMatrix, D = RnsBggDigits> {
+    /// A sampled fixed RHS ciphertext and its bounded digit material.
     Fixed(RnsBggPrivateRhs<M, D>),
+    /// Identity-only marker for a RHS supplied by another trusted artifact.
     Identity([u8; 32]),
 }
 impl<M, D> RnsBggPublicRhs<M, D> {
+    /// Return the stable plaintext identity for this public RHS reference.
     pub fn id(&self) -> [u8; 32] {
         match self {
             Self::Fixed(rhs) => rhs.rhs_id,
@@ -2396,6 +2688,7 @@ impl<M, D> RnsBggPublicRhs<M, D> {
         }
     }
 }
+/// Public LUT material type used by program lowering.
 pub type RnsBggProgramMaterial = RnsBggLutMaterial;
 
 pub(self) fn lut_plaintext(
@@ -2442,8 +2735,15 @@ pub type RnsBggReadoutWeight = [Vec<BigInt>; 2];
 /// as public graph artifacts.
 #[derive(Clone, Serialize, Deserialize)]
 pub enum RnsBggReadoutWeights<R = Family<RnsBggRow>> {
+    /// One public row weight shared by every output member.
     Shared(RnsBggReadoutWeight),
-    Indexed { rows: R, coefficient_bound: BigUint },
+    /// Indexed public rows and their caller-provided coefficient bound.
+    Indexed {
+        /// Rows addressed by the output family index.
+        rows: R,
+        /// Maximum absolute coefficient used by deterministic noise bounds.
+        coefficient_bound: BigUint,
+    },
 }
 
 /// Public preprocessing ports, bound to a readout and terminal stage.
@@ -2456,6 +2756,7 @@ pub struct RnsBggPreparedReadoutDescriptor {
     weight: RnsBggReadoutWeights<()>,
 }
 
+/// Public readout material paired with a terminal family mode and target bound.
 pub struct RnsBggReadoutMaterial {
     mode: RnsBggTerminalFamilyMode,
     identity: ValueReadoutIdentity,
@@ -2500,18 +2801,21 @@ enum RnsBggReadoutTerminal {
 }
 
 impl RnsBggPreparedReadout {
+    /// Return the public mask bank required for a matching online secret.
     pub fn mask_bank(&self) -> RnsBggMaskBank {
         match &self.terminal {
             RnsBggReadoutTerminal::Scalar { terminal, .. } => terminal.mask_bank(),
             RnsBggReadoutTerminal::Family { terminal, .. } => terminal.mask_bank(),
         }
     }
+    /// Return the LUT binding for the prepared terminal material.
     pub fn binding(&self) -> crate::rns_bgg::RnsBggLutBinding {
         match &self.terminal {
             RnsBggReadoutTerminal::Scalar { terminal, .. } => terminal.binding().clone(),
             RnsBggReadoutTerminal::Family { terminal, .. } => terminal.binding(),
         }
     }
+    /// Return the prepared terminal material identity.
     pub fn id(&self) -> [u8; 32] {
         match &self.terminal {
             RnsBggReadoutTerminal::Scalar { terminal, .. } => terminal.id(),
@@ -2521,28 +2825,35 @@ impl RnsBggPreparedReadout {
 }
 
 #[derive(Clone)]
+/// Public terminal output values together with their readout weights.
 pub struct RnsBggReadoutPublicOutput {
+    /// Scalar or indexed public output values.
     pub values: ProgramValue<RnsBggMatrix, (Family<RnsBggMatrix>, FamilyRange)>,
     level: usize,
     weight: RnsBggReadoutWeights,
 }
 
 impl RnsBggReadoutPublicOutput {
+    /// Return the public readout weight contract.
     pub fn weight(&self) -> &RnsBggReadoutWeights {
         &self.weight
     }
 
+    /// Return the output modulus-chain level.
     pub fn level(&self) -> usize {
         self.level
     }
 }
 
+/// Encoded terminal output values at a single modulus-chain level.
 pub struct RnsBggReadoutEncodingOutput {
+    /// Scalar or indexed encoded output rows.
     pub values: ProgramValue<RnsBggRow, (Family<RnsBggRow>, FamilyRange)>,
     level: usize,
 }
 
 impl RnsBggReadoutEncodingOutput {
+    /// Return the output modulus-chain level.
     pub fn level(&self) -> usize {
         self.level
     }
@@ -2627,7 +2938,7 @@ impl ExponentLUTReadoutScheme for RnsBggScheme {
                     &key,
                     &preparation.terminal,
                     preparation.mode,
-                    None,
+                    TerminalFinalization::Finalize,
                 )?;
                 let offset = if preparation.mode == RnsBggTerminalFamilyMode::Sum {
                     ProgramValue::Scalar(match offset {
@@ -2713,7 +3024,7 @@ impl ExponentLUTReadoutScheme for RnsBggScheme {
                 if artifacts.identity != readout.identity() {
                     return Err(RnsBggError::Context);
                 }
-                let raw = self.evaluate_terminal(input, terminal, masks)?;
+                let raw = self.evaluate_terminal_raw(input, terminal, masks)?;
                 // The finalized matrix is already owned by the public readout output.
                 // Reuse that handle with the terminal binding; no public arithmetic
                 // or additional artifact is needed during online evaluation.
@@ -2761,6 +3072,7 @@ pub struct RnsBggTerminalMaterial<M = RnsBggLutMaterial, L = Vec<RnsBggDigits>> 
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
+/// Terminal target material retained between preprocessing and finalization.
 pub struct RnsBggPreparedTerminal<K = RnsBggPublicKey, M = RnsBggMatrix, P = M, D = RnsBggDigits> {
     pub(self) binding: RnsBggLutBinding,
     pub(self) input: K,
@@ -2779,6 +3091,7 @@ pub struct RnsBggTerminalAccumulator<T> {
     pub(self) stages: Vec<[u8; 32]>,
 }
 
+/// Public terminal key output after the final modulus transition.
 pub struct RnsBggTerminalPublicKey {
     pub(self) matrix: RnsBggMatrix,
     pub(self) level: usize,
@@ -2786,33 +3099,40 @@ pub struct RnsBggTerminalPublicKey {
     pub(self) stages: Vec<[u8; 32]>,
 }
 
+/// Encoded terminal row output after the final modulus transition.
 pub struct RnsBggTerminalEncoding {
     row: RnsBggRow,
     level: usize,
 }
 
 impl RnsBggTerminalPublicKey {
+    /// Return the terminal public matrix.
     pub fn matrix(&self) -> &RnsBggMatrix {
         &self.matrix
     }
+    /// Return the terminal output level.
     pub fn level(&self) -> usize {
         self.level
     }
 }
 
 impl RnsBggTerminalEncoding {
+    /// Return the terminal encoded row.
     pub fn row(&self) -> &RnsBggRow {
         &self.row
     }
+    /// Return the terminal output level.
     pub fn level(&self) -> usize {
         self.level
     }
 }
 
 impl<P> RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, P> {
+    /// Return the terminal LUT binding checked during import.
     pub fn binding(&self) -> &RnsBggLutBinding {
         &self.binding
     }
+    /// Return the terminal preparation identity.
     pub fn id(&self) -> [u8; 32] {
         self.id
     }
@@ -2835,6 +3155,7 @@ impl<P> RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, P> {
 }
 
 impl RnsBggPreparedTerminal {
+    /// Expose the raw public accumulator for trusted terminal aggregation.
     pub fn public_accumulator(&self) -> RnsBggTerminalAccumulator<RnsBggMatrix> {
         RnsBggTerminalAccumulator {
             value: self.raw_public.clone(),
@@ -2846,6 +3167,7 @@ impl RnsBggPreparedTerminal {
 }
 
 impl<T: std::ops::Add<Output = T>> RnsBggTerminalAccumulator<T> {
+    /// Combine accumulators only when their level and scheme context agree.
     pub fn combine(mut self, other: Self) -> Result<Self, RnsBggError> {
         if self.level != other.level || self.context != other.context {
             return Err(RnsBggError::Context);
@@ -2856,172 +3178,8 @@ impl<T: std::ops::Add<Output = T>> RnsBggTerminalAccumulator<T> {
     }
 }
 
-impl ExponentLUTTerminalScheme for RnsBggScheme {
-    fn reduce_terminal_public(
-        &self,
-        values: Family<Self::TerminalPublicAccumulator>,
-    ) -> Result<Self::TerminalPublicAccumulator, RnsBggError> {
-        let metadata = values.schema().element;
-        let value = crate::utils::balanced_sum_family(values.field(|value| value.value)?)
-            .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        Ok(RnsBggTerminalAccumulator {
-            value,
-            level: metadata.level,
-            context: metadata.context,
-            stages: metadata.stages,
-        })
-    }
-    fn reduce_terminal_encoding(
-        &self,
-        values: Family<Self::TerminalEncodingAccumulator>,
-    ) -> Result<Self::TerminalEncodingAccumulator, RnsBggError> {
-        let metadata = values.schema().element;
-        let value = crate::utils::balanced_sum_family(values.field(|value| value.value)?)
-            .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        Ok(RnsBggTerminalAccumulator {
-            value,
-            level: metadata.level,
-            context: metadata.context,
-            stages: metadata.stages,
-        })
-    }
-
-    type TerminalMaterial = RnsBggTerminalMaterial;
-    type TerminalOnlineHelpers = RnsBggOnlineMasks;
-    type PreparedTerminal = RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>;
-    type TerminalPublicAccumulator = RnsBggTerminalAccumulator<RnsBggMatrix>;
-    type TerminalEncodingAccumulator = RnsBggTerminalAccumulator<RnsBggRow>;
-    type TerminalPublicOutput = RnsBggTerminalPublicKey;
-    type TerminalEncodingOutput = RnsBggTerminalEncoding;
-    type TerminalDescriptor =
-        RnsBggPreparedTerminalDescriptor<(String, <Self::PreparedTerminal as GraphValue>::Schema)>;
-    type TerminalBinding = (RnsBggLutBinding, [u8; 32], [u8; 32]);
-
-    fn export_terminal_term(
-        &self,
-        term: &Self::PreparedTerminal,
-        graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, Self::TerminalDescriptor), RnsBggError> {
-        Ok((
-            graph.public_output(prefix, term.clone())?,
-            RnsBggPreparedTerminalDescriptor { prepared: (prefix.to_owned(), term.schema()) },
-        ))
-    }
-    fn import_terminal_term(
-        &self,
-        descriptor: &Self::TerminalDescriptor,
-        production: ProductionId,
-        expected: &Self::TerminalBinding,
-    ) -> Result<Self::PreparedTerminal, RnsBggError> {
-        let (prefix, schema) = &descriptor.prepared;
-        if schema.binding != expected.0 ||
-            schema.input.id != expected.1 ||
-            schema.id != expected.2 ||
-            schema.input.context != self.context
-        {
-            return Err(RnsBggError::Context);
-        }
-        let term = schema.artifact_input(production, prefix, ArtifactConfidentiality::Public)?;
-        self.check_key(&term.input)?;
-        Ok(term)
-    }
-    fn export_terminal_output(
-        &self,
-        public: &RnsBggTerminalPublicKey,
-        graph: mxx_dsl::DslContext,
-        prefix: &str,
-    ) -> Result<mxx_dsl::DslContext, RnsBggError> {
-        Ok(graph.public_output(prefix, public.matrix.clone())?)
-    }
-    fn import_terminal_output(
-        &self,
-        terms: &[Self::PreparedTerminal],
-        production: mxx_ir_core::artifact::ProductionId,
-        prefix: &str,
-    ) -> Result<RnsBggTerminalPublicKey, RnsBggError> {
-        let input_level = terms[0].input.level;
-        if terms.iter().any(|term| term.input.level != input_level) {
-            return Err(RnsBggError::Context);
-        }
-        let level = input_level + 1;
-        Ok(RnsBggTerminalPublicKey {
-            matrix: crate::rns_bgg::import_blocks(
-                &self.ring(level)?,
-                &production,
-                prefix,
-                terms[0].branches[0].lifted_ciphertext.entry(0, 0).matrix_type().columns.clone(),
-            ),
-            level,
-            context: self.context,
-            stages: terms.iter().map(|term| term.id).collect(),
-        })
-    }
-
-    fn prepare_terminal_term(
-        &self,
-        input: &Self::PublicKey,
-        material: &Self::TerminalMaterial,
-    ) -> Result<(Self::PreparedTerminal, Self::TerminalPublicAccumulator), RnsBggError> {
-        let prepared = self.prepare_terminal(&input.0, material)?;
-        let raw = RnsBggTerminalAccumulator {
-            value: prepared.raw_public,
-            level: prepared.input.level,
-            context: prepared.input.context,
-            stages: vec![prepared.id],
-        };
-        let cache = RnsBggPreparedTerminal {
-            binding: prepared.binding,
-            input: prepared.input,
-            id: prepared.id,
-            branches: prepared.branches,
-            raw_public: (),
-        };
-        Ok((cache, raw))
-    }
-
-    fn terminal_encoding_term(
-        &self,
-        input: &Self::Encoding,
-        prepared: &Self::PreparedTerminal,
-        helpers: &Self::TerminalOnlineHelpers,
-    ) -> Result<Self::TerminalEncodingAccumulator, RnsBggError> {
-        self.evaluate_terminal(&input.0, prepared, helpers)
-    }
-
-    fn add_terminal_public(
-        &self,
-        lhs: Self::TerminalPublicAccumulator,
-        rhs: Self::TerminalPublicAccumulator,
-    ) -> Result<Self::TerminalPublicAccumulator, RnsBggError> {
-        lhs.combine(rhs)
-    }
-
-    fn add_terminal_encoding(
-        &self,
-        lhs: Self::TerminalEncodingAccumulator,
-        rhs: Self::TerminalEncodingAccumulator,
-    ) -> Result<Self::TerminalEncodingAccumulator, RnsBggError> {
-        lhs.combine(rhs)
-    }
-
-    fn finish_terminal_public(
-        &self,
-        raw: Self::TerminalPublicAccumulator,
-    ) -> Result<Self::TerminalPublicOutput, RnsBggError> {
-        self.finalize_terminal_public(raw)
-    }
-
-    fn finish_terminal_encoding(
-        &self,
-        raw: Self::TerminalEncodingAccumulator,
-        public: &Self::TerminalPublicOutput,
-    ) -> Result<Self::TerminalEncodingOutput, RnsBggError> {
-        self.finalize_terminal_encoding(raw, public)
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// Controls whether terminal family members are finalized independently or summed.
 pub enum RnsBggTerminalFamilyMode {
     /// One separately finalized output per input member.
     Independent,
@@ -3029,9 +3187,24 @@ pub enum RnsBggTerminalFamilyMode {
     Sum,
 }
 
+/// Internal terminal preparation state. Ordinary readouts finalize; deferred
+/// preparation is reserved for internal raw aggregation or refresh flows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(super) enum TerminalFinalization {
+    Deferred,
+    Finalize,
+}
+
+impl TerminalFinalization {
+    pub(super) fn is_finalized(self) -> bool {
+        matches!(self, Self::Finalize)
+    }
+}
+
+/// Prepared terminal family retaining public matrices and finalization mode.
 pub struct RnsBggPreparedTerminalFamily {
     mode: RnsBggTerminalFamilyMode,
-    finalize: bool,
+    finalization: TerminalFinalization,
     input: RnsBggPublicKeyFamily,
     id: [u8; 32],
     cache: Family<RnsBggPreparedTerminal<RnsBggPublicKey, RnsBggMatrix, ()>>,
@@ -3039,24 +3212,30 @@ pub struct RnsBggPreparedTerminalFamily {
 }
 
 impl RnsBggPreparedTerminalFamily {
+    /// Return the public-key family consumed by this terminal.
     pub fn input_key(&self) -> &RnsBggPublicKeyFamily {
         &self.input
     }
+    /// Return the terminal LUT binding shared by the family.
     pub fn binding(&self) -> crate::rns_bgg::RnsBggLutBinding {
         self.cache.schema().element.binding
     }
+    /// Return the stable terminal identity.
     pub fn id(&self) -> [u8; 32] {
         self.id
     }
 
+    /// Return public terminal matrices before or after finalization.
     pub fn public_matrices(&self) -> &Family<RnsBggMatrix> {
         &self.public
     }
 
+    /// Return the level represented by the current finalization state.
     pub fn level(&self) -> usize {
-        self.input.level + usize::from(self.finalize)
+        self.input.level + usize::from(self.finalization.is_finalized())
     }
 
+    /// Return whether this family is independently finalized or summed.
     pub fn mode(&self) -> RnsBggTerminalFamilyMode {
         self.mode
     }
@@ -3076,6 +3255,7 @@ impl RnsBggPreparedTerminalFamily {
         }
     }
 
+    /// Return the public mask bank reused by this terminal family.
     pub fn mask_bank(&self) -> RnsBggMaskBank {
         self.cache.at(0).mask_bank()
     }
@@ -3087,7 +3267,7 @@ pub struct RnsBggPreparedTerminalFamilyDescriptor {
     prefix: String,
     parameters: [u8; 32],
     mode: RnsBggTerminalFamilyMode,
-    finalize: bool,
+    finalization: TerminalFinalization,
     id: [u8; 32],
     range: FamilyRange,
     cache:

@@ -423,7 +423,7 @@ fn test_rns_bgg_average_refresh_noise_simulation() {
             prf::{SparseLwrPrfProfile, SparseLwrPrfProgram},
         },
         noise_utils::{NonnegativeRational, RightActionNoiseGain},
-        rns_bgg::{RnsBggParameters, noise::RnsBggRefreshPlanRequest},
+        rns_bgg::{RnsBggParameters, RnsBggRefreshPlanRequest},
     };
     use std::collections::BTreeMap;
     let n = optional_usize("MXX_PRIMITIVE_TEST_RING_DIMENSION", 65536) as u32;
@@ -637,7 +637,7 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     if use_rns_bgg() {
         let graph_started = std::time::Instant::now();
         let average = selected_average_config();
-        let (parameters, residue_level, preprocessing, online, noise_report) =
+        let (parameters, residue_level, preprocessing, encrypt, online, noise_report) =
             if let Some(path) = std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT") {
                 rns_bgg::benchmark_refresh(std::path::Path::new(&path))
             } else {
@@ -646,24 +646,25 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
                     fixture.parameters,
                     fixture.residue_level.unwrap(),
                     fixture.benchmark_preprocessing,
+                    fixture.benchmark_encrypt,
                     fixture.benchmark_online,
                     fixture.noise_report,
                 )
             };
         let (preprocess_scopes, preprocess_nodes) =
             graph_scope_and_node_counts(&preprocessing.source);
+        let (encrypt_scopes, encrypt_nodes) = graph_scope_and_node_counts(&encrypt.source);
         let (online_scopes, online_nodes) = graph_scope_and_node_counts(&online.source);
         info!(
             elapsed_seconds = graph_started.elapsed().as_secs_f64(),
             preprocess_scopes,
             preprocess_nodes,
+            encrypt_scopes,
+            encrypt_nodes,
             online_scopes,
             online_nodes,
             "RNS-BGG benchmark graphs validated"
         );
-        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("graph") {
-            return;
-        }
         let devices = detected_gpu_device_ids();
         assert!(!devices.is_empty(), "benchmark estimate requires CUDA");
         let mut levels = parameters.levels().to_vec();
@@ -686,13 +687,9 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
             },
         );
         println!("rns_bgg_noise_simulation={noise_report}");
-        // Separate pods may measure the two stages without duplicating GPU work.
-        let selected_stage = std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").ok();
-        let stages = [("preprocess", &preprocessing), ("online_eval", &online)]
-            .into_iter()
-            .filter(|(name, _)| selected_stage.as_deref().is_none_or(|stage| stage == *name))
-            .collect::<Vec<_>>();
-        assert!(!stages.is_empty(), "unknown benchmark stage");
+        // Always estimate the complete lifecycle in its production order.
+        let stages =
+            [("preprocess", &preprocessing), ("encrypt", &encrypt), ("online_eval", &online)];
         for ((stage, _), report) in stages.iter().zip(measure_stages(&stages, &mut backend)) {
             log_report(stage, &report);
         }
@@ -746,14 +743,19 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
     let bundle_started = Instant::now();
     let bundle = prepared.bundle.as_ref().expect("accepted candidate bundle");
     let preprocessing_graph = bundle.benchmark_preprocessing_graph();
+    let encrypt_graph = bundle.benchmark_encrypt_graph();
     let online_graph = bundle.benchmark_online_graph();
     let (preprocessing_scope_count, preprocessing_node_count) =
         graph_scope_and_node_counts(&preprocessing_graph.graph);
+    let (encrypt_scope_count, encrypt_node_count) =
+        graph_scope_and_node_counts(&encrypt_graph.graph);
     let (online_scope_count, online_node_count) = graph_scope_and_node_counts(&online_graph.graph);
     info!(
         elapsed_seconds = bundle_started.elapsed().as_secs_f64(),
         preprocessing_scope_count,
         preprocessing_node_count,
+        encrypt_scope_count,
+        encrypt_node_count,
         online_scope_count,
         online_node_count,
         "acquired accepted Exponent-LUT graph bundle"
@@ -802,6 +804,23 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         node_count = validated_preprocessing_node_count,
         "Exponent-LUT preprocessing graph validation complete"
     );
+    let encrypt_validation_started = Instant::now();
+    info!(
+        scope_count = encrypt_scope_count,
+        node_count = encrypt_node_count,
+        "starting Exponent-LUT encryption graph validation"
+    );
+    let encrypt = encrypt_graph
+        .validate_with_manifests(&bindings, bundle.verification_manifests())
+        .expect("validate encryption graph");
+    let (validated_encrypt_scope_count, validated_encrypt_node_count) =
+        graph_scope_and_node_counts(&encrypt.source);
+    info!(
+        elapsed_seconds = encrypt_validation_started.elapsed().as_secs_f64(),
+        scope_count = validated_encrypt_scope_count,
+        node_count = validated_encrypt_node_count,
+        "Exponent-LUT encryption graph validation complete"
+    );
     let online_validation_started = Instant::now();
     info!(
         scope_count = online_scope_count,
@@ -819,7 +838,10 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         node_count = validated_online_node_count,
         "Exponent-LUT online graph validation complete"
     );
-    let stages = [("preprocess", &preprocessing), ("oneline_eval", &online)];
+    // Measure the same independent production graphs that make up the runtime
+    // lifecycle. The online graph consumes the private artifact emitted by
+    // encryption; correctness-only oracle work is not counted as production.
+    let stages = [("preprocess", &preprocessing), ("encrypt", &encrypt), ("online_eval", &online)];
     info!(
         report_origin = "current simulation",
         crt_depth = accepted.candidate.crt_depth,
@@ -910,7 +932,8 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
 
     let reports = measure_stages(&stages, &mut backend);
     log_preprocess_report(&reports[0]);
-    log_report("oneline_eval", &reports[1]);
+    log_report("encrypt", &reports[1]);
+    log_report("online_eval", &reports[2]);
     let peak_device_bytes =
         reports.iter().map(|report| report.resident_vram_bytes).max().unwrap_or_default();
     let peak_workspace_bytes =
@@ -938,7 +961,7 @@ fn test_gpu_exponent_lut_benchmark_estimate() {
         config.sparse_lwr_output_modulus,
     );
     let encoding_cost = sum_explicit_prf_roles(
-        &reports[1],
+        &reports[2],
         BenchmarkRole::EncodingPrfAccumulation,
         BenchmarkRole::EncodingReadout,
     )
@@ -6868,7 +6891,9 @@ pub mod parameter_search_tests {
 mod bgg_refresh_artifact_tests {
     use super as test_utils;
     use mxx_exponent_lut::{layout::ExpLayout, noise_refresh::prf::SparseLwrPrfProfile};
-    use mxx_ir_core::{ParamEnv, types::ConcreteMatrixType};
+    use mxx_ir_core::{
+        ParamEnv, artifact::ProductionId, encoding::spec_hash, types::ConcreteMatrixType,
+    };
     use mxx_primitives::{
         matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
         poly::{Poly, PolyParams, dcrt::poly::DCRTPoly},
@@ -6882,6 +6907,108 @@ mod bgg_refresh_artifact_tests {
     };
     use std::{collections::BTreeMap, num::NonZeroUsize};
     use test_utils::tiny_native_refresh_bundle;
+
+    /// Build and validate all BGG lifecycle graphs without a backend.  This
+    /// guards the artifact boundary used by the GPU test: encryption must be
+    /// an independent graph between preprocessing and online evaluation.
+    #[test]
+    fn bgg_refresh_graphs_have_three_stage_boundary() {
+        let (_parameters, bundle, _labels) = tiny_native_refresh_bundle();
+        let bindings = ParamEnv::default();
+        let preprocessing = bundle
+            .preprocessing_graph()
+            .validate_with_manifests(&bindings, bundle.preprocessing_manifests())
+            .expect("preprocessing graph validation");
+        let benchmark_preprocessing = bundle
+            .benchmark_preprocessing_graph()
+            .validate_with_manifests(&bindings, bundle.preprocessing_manifests())
+            .expect("benchmark preprocessing graph validation");
+        assert!(
+            benchmark_preprocessing
+                .source
+                .outputs()
+                .keys()
+                .all(|name| !name.starts_with("oracle-")),
+            "BGG benchmark preprocessing must exclude correctness-only oracle work"
+        );
+
+        // Rebind with IDs that do not occur in the deterministic planning
+        // template. This exercises the same factory path used after runtime
+        // execution, rather than merely adding the new IDs to a manifest map.
+        let producer_spec_hash = spec_hash(&preprocessing.source, &preprocessing.bindings).unwrap();
+        let producer =
+            ProductionId { spec_hash: producer_spec_hash.clone(), execution_nonce: [0xa1; 32] };
+        let mut producer_manifest = bundle
+            .preprocessing_manifests()
+            .values()
+            .find(|manifest| manifest.production_id.spec_hash == producer_spec_hash)
+            .cloned()
+            .unwrap_or_else(|| {
+                bundle
+                    .preprocessing_manifests()
+                    .values()
+                    .next()
+                    .expect("preprocessing manifest")
+                    .clone()
+            });
+        producer_manifest.production_id = producer.clone();
+        let encrypt_binding = bundle
+            .encrypt_graph_for(producer.clone(), producer_manifest.clone())
+            .expect("encryption graph validation");
+        let encrypt = encrypt_binding.graph();
+        let encryption = ProductionId {
+            spec_hash: spec_hash(&encrypt.source, &encrypt.bindings).unwrap(),
+            execution_nonce: [0xa2; 32],
+        };
+        let encryption_manifest =
+            mxx_ir_core::artifact::export_validated_manifest(encryption.clone(), &encrypt)
+                .expect("encryption manifest");
+        let online = bundle
+            .online_graph_for(
+                producer.clone(),
+                producer_manifest.clone(),
+                encryption.clone(),
+                encryption_manifest.clone(),
+                &encrypt_binding,
+            )
+            .expect("online graph validation");
+
+        // A manifest cannot self-authorize a different encryption graph: even
+        // when its production ID is changed consistently, the trusted binding
+        // returned by encrypt_graph_for must reject the altered spec hash.
+        let tampered_encryption = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([0x99; 32]),
+            execution_nonce: encryption.execution_nonce,
+        };
+        let mut tampered_manifest = encryption_manifest;
+        tampered_manifest.production_id = tampered_encryption.clone();
+        assert!(
+            bundle
+                .online_graph_for(
+                    producer,
+                    producer_manifest,
+                    tampered_encryption,
+                    tampered_manifest,
+                    &encrypt_binding,
+                )
+                .is_err(),
+            "tampered encryption spec hash must be rejected by the trusted binding"
+        );
+
+        assert_ne!(preprocessing.source.name(), encrypt.source.name());
+        assert_ne!(encrypt.source.name(), online.source.name());
+        assert!(
+            encrypt.source.outputs().contains_key("encrypted-input-vector"),
+            "encryption must export a private input artifact"
+        );
+        assert!(
+            online.source.scopes().values().flat_map(|scope| scope.nodes()).all(|node| !matches!(
+                node.kind(),
+                mxx_ir_core::node::NodeKind::UniformIntervalSample { .. }
+            )),
+            "online graph must not resample the mask secret"
+        );
+    }
 
     /// Real noisy execution, deliberately separate from the benchmark estimator.
     #[test]
@@ -7108,11 +7235,24 @@ mod bgg_refresh_artifact_tests {
         drop(store);
         let mut store = FileArtifactStore::open(directory.path()).unwrap();
         let manifest = store.load_manifest(&production).unwrap();
+        // Encryption is a separate artifact boundary.  The online graph is
+        // intentionally validated and executed only after this private input
+        // artifact has been produced.
+        let encrypt_binding =
+            bundle.encrypt_graph_for(production.clone(), manifest.clone()).unwrap();
+        let encrypt = encrypt_binding.graph();
+        let encrypted =
+            execute_in_session(&encrypt, &mut backend, BTreeMap::new(), &mut store, rng.random())
+                .expect("real encryption");
+        let encrypt_production = encrypted.production_id.expect("encryption production");
+        let encrypt_manifest = store.load_manifest(&encrypt_production).unwrap();
         let online = bundle
-            .verification_graph()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
+            .online_graph_for(
+                production,
+                manifest,
+                encrypt_production,
+                encrypt_manifest,
+                &encrypt_binding,
             )
             .unwrap();
         let mut previous_vector = None;
@@ -7249,11 +7389,23 @@ mod bgg_refresh_artifact_tests {
         let production = result.production_id.expect("preprocessing production");
         let manifest =
             store.manifest(&production).expect("preprocessing artifact manifest").clone();
+        let encrypt_binding = bundle
+            .encrypt_graph_for(production.clone(), manifest.clone())
+            .expect("artifact-backed encryption graph");
+        let encrypt = encrypt_binding.graph();
+        let encrypted =
+            execute_in_session(&encrypt, &mut backend, BTreeMap::new(), &mut store, [0x54; 32])
+                .expect("GPU encryption execution");
+        let encrypt_production = encrypted.production_id.expect("encryption production");
+        let encrypt_manifest =
+            store.manifest(&encrypt_production).expect("encryption artifact manifest").clone();
         let online = bundle
-            .verification_graph()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
+            .online_graph_for(
+                production,
+                manifest,
+                encrypt_production,
+                encrypt_manifest,
+                &encrypt_binding,
             )
             .expect("artifact-backed online graph");
         let online_inputs = BTreeMap::new();
@@ -7300,7 +7452,7 @@ mod bgg_refresh_artifact_tests {
 mod rns_bgg {
     //! Shared graph fixtures for RNS-BGG integration and backend regression tests.
     use bigdecimal::BigDecimal;
-    use mxx_dsl::{DslContext, Family, Mat};
+    use mxx_dsl::{DslContext, Family, GraphValue, GraphValueSchema, Mat};
     use mxx_exponent_lut::{
         layout::ExpLayout,
         noise_refresh::{
@@ -7310,11 +7462,11 @@ mod rns_bgg {
             },
             refresh::{DirectRefreshChannel, PreparedDirectRefresh, RefreshPrfLabelIndex},
         },
-        program::{FamilyRange, ProgramValue},
+        program::{FamilyRange, LutTable, ProgramValue},
         rns_bgg::{
-            RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest,
-            RnsBggPublicProgramValue, RnsBggRefreshLevel, RnsBggRhsPlaintextFamily, RnsBggRow,
-            RnsBggScheme,
+            RnsBggEncoding, RnsBggEncodingProgramValue, RnsBggNoiseBound, RnsBggOnlineMasks,
+            RnsBggParameters, RnsBggPlanRequest, RnsBggPublicProgramValue, RnsBggRefreshLevel,
+            RnsBggRhsPlaintextFamily, RnsBggRow, RnsBggScheme,
         },
     };
     use mxx_ir_core::{
@@ -7331,12 +7483,44 @@ mod rns_bgg {
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeMap;
 
+    type RnsBggEncodingSchema = <RnsBggEncoding as GraphValue>::Schema;
+    type RnsBggOnlineMasksSchema = <RnsBggOnlineMasks as GraphValue>::Schema;
+    type RnsBggRowSchema = <RnsBggRow as GraphValue>::Schema;
+    type RnsBggDecoderSchema = <Family<RnsBggRow> as GraphValue>::Schema;
+
     pub struct RnsBggRoundTrip {
         pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
         pub benchmark_preprocessing: ValidatedGraph,
+        pub benchmark_encrypt: ValidatedGraph,
         pub benchmark_online: ValidatedGraph,
-        pub online: Box<dyn Fn(ProductionId, Manifest) -> (ValidatedGraph, ValidatedGraph)>,
+        pub encrypt: Box<
+            dyn Fn(
+                ProductionId,
+                Manifest,
+            ) -> (
+                ValidatedGraph,
+                ValidatedGraph,
+                (
+                    RnsBggEncodingSchema,
+                    RnsBggEncodingSchema,
+                    RnsBggOnlineMasksSchema,
+                    RnsBggOnlineMasksSchema,
+                    RnsBggOnlineMasksSchema,
+                    RnsBggDecoderSchema,
+                    RnsBggRowSchema,
+                    RnsBggRowSchema,
+                ),
+            ),
+        >,
+        pub online: Box<
+            dyn Fn(
+                ProductionId,
+                Manifest,
+                ProductionId,
+                Manifest,
+            ) -> (ValidatedGraph, ValidatedGraph),
+        >,
         pub bounds: BTreeMap<String, (BigUint, BigUint)>,
         pub residue_level: Option<usize>,
         pub noise_report: serde_json::Value,
@@ -7347,8 +7531,9 @@ mod rns_bgg {
     /// BGG estimator; no host vector is allocated per PRF output or coefficient.
     pub fn benchmark_refresh(
         path: &std::path::Path,
-    ) -> (RnsBggParameters, usize, ValidatedGraph, ValidatedGraph, serde_json::Value) {
-        use mxx_exponent_lut::rns_bgg::noise::RnsBggRefreshPlan;
+    ) -> (RnsBggParameters, usize, ValidatedGraph, ValidatedGraph, ValidatedGraph, serde_json::Value)
+    {
+        use mxx_exponent_lut::rns_bgg::RnsBggRefreshPlan;
         use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
         let report: serde_json::Value =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
@@ -7566,29 +7751,98 @@ mod rns_bgg {
         let (data_key, data_material) = scheme
             .import_input_material(&data_descriptor, production.clone(), *data_key.id(), terminal)
             .unwrap();
+        // Encryption is its own graph: both the initial PRF input and the data
+        // payload are encoded here, then imported as private artifacts by the
+        // online graph below.  This keeps the benchmark and round-trip stage
+        // boundaries identical.
         let s = scheme.sample_mask_secret().unwrap();
-        let digits = prf
-            .evaluate(
-                &scheme,
-                RnsBggEncodingProgramValue::Scalar((
-                    scheme.encode(&s, &initial_key, &initial_material).unwrap(),
-                    None,
-                )),
-            )
-            .unwrap();
-        let data = RnsBggEncodingProgramValue::Scalar((
-            scheme.encode(&s, &data_key, &data_material).unwrap(),
-            None,
-        ));
+        let encrypted_initial = scheme.encode(&s, &initial_key, &initial_material).unwrap();
+        let encrypted_data = scheme.encode(&s, &data_key, &data_material).unwrap();
+        let initial_schema = encrypted_initial.schema();
+        let data_schema = encrypted_data.schema();
         let bank = |index: usize| match &refresh.slots()[0].terms()[index] {
             ProgramValue::Scalar(term) => term.mask_bank(),
             ProgramValue::Family(terms) => terms.at(0).mask_bank(),
         };
         let data_helpers = scheme.prepare_online_masks(&s, &bank(0)).unwrap();
         let prf_helpers = scheme.prepare_online_masks(&s, &bank(1)).unwrap();
-        let decoders = refresh.prepare_decoders(&scheme, &s, &2);
+        let decoders = Family::pack(refresh.prepare_decoders(&scheme, &s, &2)).unwrap();
+        let encrypt = DslContext::new("rns-bgg-refresh-encrypt-benchmark")
+            .private_output("data-helpers", data_helpers.clone())
+            .unwrap()
+            .private_output("prf-helpers", prf_helpers.clone())
+            .unwrap()
+            .private_output("decoders", decoders.clone())
+            .unwrap()
+            .private_output("encrypted-initial", encrypted_initial.row().clone())
+            .unwrap()
+            .private_output("encrypted-data", encrypted_data.row().clone())
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest.clone())]),
+            )
+            .unwrap();
+        let encrypt_production = ProductionId {
+            spec_hash: mxx_ir_core::encoding::spec_hash(&encrypt.source, &encrypt.bindings)
+                .unwrap(),
+            execution_nonce: rand::random(),
+        };
+        let encrypt_manifest =
+            mxx_ir_core::artifact::export_validated_manifest(encrypt_production.clone(), &encrypt)
+                .unwrap();
+        let initial = initial_schema
+            .artifact_input(
+                encrypt_production.clone(),
+                "encrypted-initial",
+                ArtifactConfidentiality::Private,
+            )
+            .unwrap();
+        let digits =
+            prf.evaluate(&scheme, RnsBggEncodingProgramValue::Scalar((initial, None))).unwrap();
+        let data = data_schema
+            .artifact_input(
+                encrypt_production.clone(),
+                "encrypted-data",
+                ArtifactConfidentiality::Private,
+            )
+            .unwrap();
+        let data = RnsBggEncodingProgramValue::Scalar((data, None));
+        let data_helpers = data_helpers
+            .schema()
+            .artifact_input(
+                encrypt_production.clone(),
+                "data-helpers",
+                ArtifactConfidentiality::Private,
+            )
+            .unwrap();
+        let prf_helpers = prf_helpers
+            .schema()
+            .artifact_input(
+                encrypt_production.clone(),
+                "prf-helpers",
+                ArtifactConfidentiality::Private,
+            )
+            .unwrap();
+        let decoders = decoders
+            .schema()
+            .artifact_input(
+                encrypt_production.clone(),
+                "decoders",
+                ArtifactConfidentiality::Private,
+            )
+            .unwrap();
         let (refreshed, _) = refresh
-            .evaluate(&scheme, &data, &digits, &data_helpers, &prf_helpers, decoders)
+            .evaluate(
+                &scheme,
+                &data,
+                &digits,
+                &data_helpers,
+                &prf_helpers,
+                (0..refresh.slots().len()).map(|index| decoders.at(index)).collect(),
+            )
             .unwrap();
         let online = DslContext::new("rns-bgg-refresh-online-benchmark")
             .output("refreshed", refreshed.row().clone())
@@ -7597,10 +7851,10 @@ mod rns_bgg {
             .unwrap()
             .validate_with_manifests(
                 &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
+                &BTreeMap::from([(production, manifest), (encrypt_production, encrypt_manifest)]),
             )
             .unwrap();
-        (parameters, output_level, producer, online, candidate.clone())
+        (parameters, output_level, producer, encrypt, online, candidate.clone())
     }
 
     pub fn refresh(
@@ -7617,7 +7871,7 @@ mod rns_bgg {
         // Trace the exact frozen product schedule consumed by preparation and
         // cached evaluation, including every ciphertext in the composed RHS.
         let execution = program.accumulation.clone();
-        let data_noise = mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
+        let data_noise = mxx_exponent_lut::rns_bgg::RnsBggNoiseValue {
             level: 1,
             bound: RnsBggNoiseBound { error: 26u8.into(), payload_l1: 1u8.into() },
             payload_l2_squared: 1u8.into(),
@@ -7635,7 +7889,7 @@ mod rns_bgg {
             range: None,
             one_hot: false,
         };
-        let refresh_request = mxx_exponent_lut::rns_bgg::noise::RnsBggRefreshPlanRequest {
+        let refresh_request = mxx_exponent_lut::rns_bgg::RnsBggRefreshPlanRequest {
             data_branches: n as usize,
             prf_branches: n as usize,
             base: 4,
@@ -7827,11 +8081,14 @@ mod rns_bgg {
                 rand::random(),
             )
             .unwrap();
+        // The public helper contract requires a concrete unary table. A
+        // width-one table with output value zero is the identity polynomial;
+        // its output width is the PRF's declared output modulus.
+        let identity_table = LutTable::unary(1, program.profile().p().unwrap(), vec![0]).unwrap();
         let next_material = scheme
             .sample_lut_material(
                 &r,
-                None,
-                None,
+                &identity_table,
                 &next_bank,
                 seed,
                 b"next".as_slice(),
@@ -7840,6 +8097,7 @@ mod rns_bgg {
             .unwrap();
         let next = scheme.prepare_lut(&output_key, &next_material, rand::random()).unwrap();
         let next_binding = next.binding().clone();
+        let next_input_id = *output_key.id();
         let next_output_id = *next.output_key().id();
         let (producer, refresh_descriptor) = prepared
             .export(&scheme, DslContext::new("rns_bgg-refresh-preprocess"), "refresh")
@@ -7850,14 +8108,17 @@ mod rns_bgg {
             .unwrap();
         let (producer, data_descriptor) =
             scheme.export_input_material(&data_key, &data_material, producer, "data").unwrap();
-        let benchmark_preprocessing =
-            producer.clone().build().unwrap().validate(&ParamEnv::default()).unwrap();
         let (mut producer, next_descriptor) =
             scheme.export_prepared_lut(&next, producer, "next").unwrap();
+        // Freeze the production preprocessing graph before adding the
+        // correctness-only oracle outputs below. The benchmark must measure
+        // only the cryptographic preprocessing work.
+        let benchmark_preprocessing =
+            producer.clone().build().unwrap().validate(&ParamEnv::default()).unwrap();
         // Private correctness oracle, separate from the public refresh bundle.
         for level in [2, 3] {
             let ring = scheme.ring(level).unwrap();
-            let payload = scheme.payload_at(&r, level).unwrap();
+            let payload = scheme.reduce_payload_secret_modulus(&r, level).unwrap();
             let gadget = if level == 2 {
                 let low = parameters.level(level + 1).unwrap();
                 scheme
@@ -7895,109 +8156,92 @@ mod rns_bgg {
             [parameters.component_columns(2).unwrap(), parameters.component_columns(3).unwrap()];
         let fresh_count = topology.fresh_digit_count;
         let fresh_weights = refresh_plan.digits.weights(fresh_count);
-        let online = Box::new(move |production: ProductionId, manifest: Manifest| {
-            for (name, artifact) in &manifest.artifacts {
-                if name.starts_with("refresh") || name.starts_with("prf") {
-                    assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
-                }
-            }
-            let descriptor =
-                serde_json::from_slice(&serde_json::to_vec(&refresh_descriptor).unwrap()).unwrap();
-            let refresh = PreparedDirectRefresh::import(
-                &scheme,
-                &descriptor,
-                production.clone(),
-                refresh_descriptor.identity().unwrap(),
-            )
-            .unwrap();
-            let prf = PreparedSparseLwrPrf::import(
-                &scheme,
-                program.clone(),
-                &prf_descriptor,
-                production.clone(),
-                prf_descriptor.identity().unwrap(),
-            )
-            .unwrap();
-            let (initial_key, initial_material) = scheme
+        let encryption_secret = scheme.sample_mask_secret().unwrap();
+        let encrypt_secret = encryption_secret.clone();
+        let encrypt_scheme = scheme.clone();
+        let encrypt_initial_descriptor = initial_descriptor.clone();
+        let encrypt_data_descriptor = data_descriptor.clone();
+        let encrypt_initial_key_id = *initial_key.id();
+        let encrypt_data_key_id = *data_key.id();
+        let encrypt_refresh_descriptor = refresh_descriptor.clone();
+        let encrypt_next_descriptor = next_descriptor.clone();
+        let encrypt_next_binding = next_binding.clone();
+        let encrypt = Box::new(move |production: ProductionId, manifest: Manifest| {
+            let (initial_key, initial_material) = encrypt_scheme
                 .import_input_material(
-                    &initial_descriptor,
+                    &encrypt_initial_descriptor,
                     production.clone(),
-                    *initial_key.id(),
+                    encrypt_initial_key_id,
                     0,
                 )
                 .unwrap();
-            let (data_key, data_material) = scheme
-                .import_input_material(&data_descriptor, production.clone(), *data_key.id(), 1)
-                .unwrap();
-            let next = scheme
-                .import_prepared_lut(
-                    &next_descriptor,
+            let (data_key, data_material) = encrypt_scheme
+                .import_input_material(
+                    &encrypt_data_descriptor,
                     production.clone(),
-                    &next_binding,
-                    *output_key.id(),
+                    encrypt_data_key_id,
+                    1,
+                )
+                .unwrap();
+            let initial =
+                encrypt_scheme.encode(&encrypt_secret, &initial_key, &initial_material).unwrap();
+            let data = encrypt_scheme.encode(&encrypt_secret, &data_key, &data_material).unwrap();
+            let initial_schema = initial.schema();
+            let data_schema = data.schema();
+            let encrypt_refresh = PreparedDirectRefresh::import(
+                &encrypt_scheme,
+                &encrypt_refresh_descriptor,
+                production.clone(),
+                encrypt_refresh_descriptor.identity().unwrap(),
+            )
+            .unwrap();
+            let encrypt_next = encrypt_scheme
+                .import_prepared_lut(
+                    &encrypt_next_descriptor,
+                    production.clone(),
+                    &encrypt_next_binding,
+                    next_input_id,
                     next_output_id,
                 )
                 .unwrap();
-            // No online secret exists before this point.
-            let s = scheme.sample_mask_secret().unwrap();
-            let initial = RnsBggEncodingProgramValue::Scalar((
-                scheme.encode(&s, &initial_key, &initial_material).unwrap(),
-                None,
-            ));
-            let digits = prf.evaluate(&scheme, initial).unwrap();
-            let data = RnsBggEncodingProgramValue::Scalar((
-                scheme.encode(&s, &data_key, &data_material).unwrap(),
-                None,
-            ));
-            let bank = match &refresh.slots()[0].terms()[1] {
+            let encrypt_bank0 = match &encrypt_refresh.slots()[0].terms()[0] {
                 ProgramValue::Scalar(term) => term.mask_bank(),
                 ProgramValue::Family(terms) => terms.at(0).mask_bank(),
             };
-            let terminal_helpers = scheme.prepare_online_masks(&s, &bank).unwrap();
-            let decoders = refresh.prepare_decoders(&scheme, &s, &2);
-            let refreshed = refresh
-                .evaluate(&scheme, &data, &digits, &terminal_helpers, &terminal_helpers, decoders)
+            let encrypt_bank1 = match &encrypt_refresh.slots()[0].terms()[1] {
+                ProgramValue::Scalar(term) => term.mask_bank(),
+                ProgramValue::Family(terms) => terms.at(0).mask_bank(),
+            };
+            let encrypt_decoders =
+                encrypt_refresh.prepare_decoders(&encrypt_scheme, &encrypt_secret, &2);
+            let data_helpers =
+                encrypt_scheme.prepare_online_masks(&encrypt_secret, &encrypt_bank0).unwrap();
+            let prf_helpers =
+                encrypt_scheme.prepare_online_masks(&encrypt_secret, &encrypt_bank1).unwrap();
+            let next_helpers = encrypt_scheme
+                .prepare_online_masks(&encrypt_secret, &encrypt_next.mask_bank())
                 .unwrap();
-            let (refreshed, _) = refreshed;
-            let refreshed = refreshed;
-            let (fresh_start, _) = labels.group_range(None);
-            let table = program.readout.canonical_coefficients().unwrap();
-            let columns = oracle_columns[0];
-            let expected_fresh = (0..2)
-                .map(|block| {
-                    Mat::concat(
-                        mxx_ir_core::node::ConcatAxis::Columns,
-                        (0..columns)
-                            .map(|column| {
-                                let component = block * columns + column;
-                                output_ring.polynomial((0..n as usize).map(|coefficient| {
-                                    fresh_weights
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(digit, weight)| {
-                                            let index = fresh_start +
-                                                (component * n as usize + coefficient) *
-                                                    fresh_count +
-                                                digit;
-                                            let exponent = vectors[index][selected];
-                                            let value = &table[exponent % n as usize];
-                                            let value = if exponent < n as usize {
-                                                value.clone()
-                                            } else {
-                                                BigInt::from(1u8) - value
-                                            };
-                                            value * BigInt::from(weight.clone())
-                                        })
-                                        .sum::<BigInt>()
-                                        .into()
-                                }))
-                            })
-                            .collect(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let benchmark_online = DslContext::new("rns_bgg-refresh-online-benchmark")
-                .output("refreshed", refreshed.row().clone())
+            let decoders = Family::pack(encrypt_decoders.clone()).unwrap();
+            let oracle_mask_2 =
+                encrypt_scheme.reduce_mask_secret_modulus(&encrypt_secret, 2).unwrap();
+            let oracle_mask_3 =
+                encrypt_scheme.reduce_mask_secret_modulus(&encrypt_secret, 3).unwrap();
+            let graph = DslContext::new("rns-bgg-refresh-encrypt")
+                .private_output("data-helpers", data_helpers.clone())
+                .unwrap()
+                .private_output("prf-helpers", prf_helpers.clone())
+                .unwrap()
+                .private_output("next-helpers", next_helpers.clone())
+                .unwrap()
+                .private_output("decoders", decoders.clone())
+                .unwrap()
+                .private_output("oracle-mask-2", oracle_mask_2.clone())
+                .unwrap()
+                .private_output("oracle-mask-3", oracle_mask_3.clone())
+                .unwrap()
+                .private_output("encrypted-initial", initial.row().clone())
+                .unwrap()
+                .private_output("encrypted-data", data.row().clone())
                 .unwrap()
                 .build()
                 .unwrap()
@@ -8006,51 +8250,290 @@ mod rns_bgg {
                     &BTreeMap::from([(production.clone(), manifest.clone())]),
                 )
                 .unwrap();
-            let continued = scheme
-                .evaluate_lut(
-                    &refreshed,
-                    &next,
-                    &scheme.prepare_online_masks(&s, &next.mask_bank()).unwrap(),
-                )
-                .unwrap();
-            let mut consumer = DslContext::new("rns_bgg-refresh-online");
-            for (level, encoding, key) in [
-                (2, &refreshed, &refresh.recomposition().output_key),
-                (3, &continued, next.output_key()),
-            ] {
-                let ring = scheme.ring(level).unwrap();
-                let expected = RnsBggRow::new([std::array::from_fn(|c| {
-                    ring.artifact_input(
-                        production.clone(),
-                        format!("oracle-{level}-{c}"),
-                        (1, oracle_columns[level - 2]),
-                        ArtifactConfidentiality::Private,
-                    )
-                })])
-                .unwrap();
-                let error = encoding.row().clone() -
-                    scheme.mask_at(&s, level).unwrap() * key.matrix().clone() +
-                    expected;
-                for c in 0..2 {
-                    let residual = if level == 2 {
-                        error.entry(0, c).clone() - expected_fresh[c].clone()
-                    } else {
-                        error.entry(0, c).clone()
-                    };
-                    consumer = consumer.output(format!("error-{level}-{c}"), residual).unwrap();
-                }
-            }
-            let consumer = consumer
+            let benchmark_graph = DslContext::new("rns-bgg-refresh-encrypt-benchmark")
+                .private_output("data-helpers", data_helpers.clone())
+                .unwrap()
+                .private_output("prf-helpers", prf_helpers.clone())
+                .unwrap()
+                .private_output("next-helpers", next_helpers.clone())
+                .unwrap()
+                .private_output("decoders", decoders.clone())
+                .unwrap()
+                .private_output("encrypted-initial", initial.row().clone())
+                .unwrap()
+                .private_output("encrypted-data", data.row().clone())
+                .unwrap()
                 .build()
                 .unwrap()
                 .validate_with_manifests(
                     &ParamEnv::default(),
-                    &BTreeMap::from([(production.clone(), manifest)]),
+                    &BTreeMap::from([(production, manifest)]),
                 )
                 .unwrap();
-            (consumer, benchmark_online)
+            (
+                graph,
+                benchmark_graph,
+                (
+                    initial_schema,
+                    data_schema,
+                    data_helpers.schema(),
+                    prf_helpers.schema(),
+                    next_helpers.schema(),
+                    decoders.schema(),
+                    oracle_mask_2.schema(),
+                    oracle_mask_3.schema(),
+                ),
+            )
         });
-        let (_, benchmark_online) = online(production, manifest);
+        let (
+            _,
+            benchmark_encrypt,
+            (
+                initial_schema,
+                data_schema,
+                data_helpers_schema,
+                prf_helpers_schema,
+                next_helpers_schema,
+                decoders_schema,
+                oracle_mask_2_schema,
+                oracle_mask_3_schema,
+            ),
+        ) = encrypt(production.clone(), manifest.clone());
+        let benchmark_encrypt_production = ProductionId {
+            spec_hash: mxx_ir_core::encoding::spec_hash(
+                &benchmark_encrypt.source,
+                &benchmark_encrypt.bindings,
+            )
+            .unwrap(),
+            execution_nonce: rand::random(),
+        };
+        let benchmark_encrypt_manifest = mxx_ir_core::artifact::export_validated_manifest(
+            benchmark_encrypt_production.clone(),
+            &benchmark_encrypt,
+        )
+        .unwrap();
+        let online_scheme = scheme.clone();
+        let online = Box::new(
+            move |production: ProductionId,
+                  manifest: Manifest,
+                  encrypt_production: ProductionId,
+                  encrypt_manifest: Manifest| {
+                for (name, artifact) in &manifest.artifacts {
+                    if name.starts_with("refresh") || name.starts_with("prf") {
+                        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+                    }
+                }
+                let descriptor =
+                    serde_json::from_slice(&serde_json::to_vec(&refresh_descriptor).unwrap())
+                        .unwrap();
+                let refresh = PreparedDirectRefresh::import(
+                    &online_scheme,
+                    &descriptor,
+                    production.clone(),
+                    refresh_descriptor.identity().unwrap(),
+                )
+                .unwrap();
+                let prf = PreparedSparseLwrPrf::import(
+                    &online_scheme,
+                    program.clone(),
+                    &prf_descriptor,
+                    production.clone(),
+                    prf_descriptor.identity().unwrap(),
+                )
+                .unwrap();
+                let next = online_scheme
+                    .import_prepared_lut(
+                        &next_descriptor,
+                        production.clone(),
+                        &next_binding,
+                        *output_key.id(),
+                        next_output_id,
+                    )
+                    .unwrap();
+                let initial = initial_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "encrypted-initial",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let initial = RnsBggEncodingProgramValue::Scalar((initial, None));
+                let digits = prf.evaluate(&online_scheme, initial).unwrap();
+                let data = data_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "encrypted-data",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let data = RnsBggEncodingProgramValue::Scalar((data, None));
+                let data_helpers = data_helpers_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "data-helpers",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let prf_helpers = prf_helpers_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "prf-helpers",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let next_helpers = next_helpers_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "next-helpers",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let decoders = decoders_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "decoders",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let oracle_mask_2 = oracle_mask_2_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "oracle-mask-2",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let oracle_mask_3 = oracle_mask_3_schema
+                    .artifact_input(
+                        encrypt_production.clone(),
+                        "oracle-mask-3",
+                        ArtifactConfidentiality::Private,
+                    )
+                    .unwrap();
+                let refreshed = refresh
+                    .evaluate(
+                        &online_scheme,
+                        &data,
+                        &digits,
+                        &data_helpers,
+                        &prf_helpers,
+                        (0..refresh.slots().len()).map(|index| decoders.at(index)).collect(),
+                    )
+                    .unwrap();
+                let (refreshed, _) = refreshed;
+                let refreshed = refreshed;
+                let (fresh_start, _) = labels.group_range(None);
+                let table = program.readout.canonical_coefficients().unwrap();
+                let columns = oracle_columns[0];
+                let expected_fresh = (0..2)
+                    .map(|block| {
+                        Mat::concat(
+                            mxx_ir_core::node::ConcatAxis::Columns,
+                            (0..columns)
+                                .map(|column| {
+                                    let component = block * columns + column;
+                                    output_ring.polynomial((0..n as usize).map(|coefficient| {
+                                        fresh_weights
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(digit, weight)| {
+                                                let index = fresh_start +
+                                                    (component * n as usize + coefficient) *
+                                                        fresh_count +
+                                                    digit;
+                                                let exponent = vectors[index][selected];
+                                                let value = &table[exponent % n as usize];
+                                                let value = if exponent < n as usize {
+                                                    value.clone()
+                                                } else {
+                                                    BigInt::from(1u8) - value
+                                                };
+                                                value * BigInt::from(weight.clone())
+                                            })
+                                            .sum::<BigInt>()
+                                            .into()
+                                    }))
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let continued =
+                    online_scheme.evaluate_lut(&refreshed, &next, &next_helpers).unwrap();
+                // The estimate covers the complete production computation:
+                // refresh followed by the continuation LUT.  The correctness
+                // consumer below adds only private oracle residuals, which are
+                // test instrumentation and are intentionally not benchmarked.
+                let benchmark_online = DslContext::new("rns_bgg-refresh-online-benchmark")
+                    .output("continued", continued.row().clone())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([
+                            (production.clone(), manifest.clone()),
+                            (encrypt_production.clone(), encrypt_manifest.clone()),
+                        ]),
+                    )
+                    .unwrap();
+                let mut consumer = DslContext::new("rns_bgg-refresh-online");
+                let has_oracle_artifacts =
+                    encrypt_manifest.artifacts.keys().any(|name| name.starts_with("oracle-mask-2"));
+                if has_oracle_artifacts {
+                    for (level, encoding, key) in [
+                        (2, &refreshed, &refresh.recomposition().output_key),
+                        (3, &continued, next.output_key()),
+                    ] {
+                        let ring = online_scheme.ring(level).unwrap();
+                        let expected = RnsBggRow::new([std::array::from_fn(|c| {
+                            ring.artifact_input(
+                                production.clone(),
+                                format!("oracle-{level}-{c}"),
+                                (1, oracle_columns[level - 2]),
+                                ArtifactConfidentiality::Private,
+                            )
+                        })])
+                        .unwrap();
+                        let oracle_mask =
+                            if level == 2 { oracle_mask_2.clone() } else { oracle_mask_3.clone() };
+                        let error =
+                            encoding.row().clone() - oracle_mask * key.matrix().clone() + expected;
+                        for c in 0..2 {
+                            let residual = if level == 2 {
+                                error.entry(0, c).clone() - expected_fresh[c].clone()
+                            } else {
+                                error.entry(0, c).clone()
+                            };
+                            consumer =
+                                consumer.output(format!("error-{level}-{c}"), residual).unwrap();
+                        }
+                    }
+                } else {
+                    // Benchmark-only encryption deliberately omits the private
+                    // correctness oracle, so its companion consumer exports the
+                    // production continuation without oracle residuals.
+                    consumer = consumer.output("continued", continued.row().clone()).unwrap();
+                }
+                let consumer = consumer
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([
+                            (production.clone(), manifest),
+                            (encrypt_production, encrypt_manifest),
+                        ]),
+                    )
+                    .unwrap();
+                (consumer, benchmark_online)
+            },
+        );
+        let (_, benchmark_online) = online(
+            production.clone(),
+            manifest.clone(),
+            benchmark_encrypt_production,
+            benchmark_encrypt_manifest,
+        );
         let next_bound =
             parameters.lut_noise_bound(2, data_bound, 1, &1u8.into(), 1u8.into()).unwrap();
         let bounds = (0..2)
@@ -8109,8 +8592,10 @@ mod rns_bgg {
             parameters,
             producer,
             online,
+            encrypt,
             bounds,
             benchmark_preprocessing,
+            benchmark_encrypt,
             benchmark_online,
             residue_level: Some(2),
             noise_report,
@@ -8141,7 +8626,19 @@ mod rns_bgg {
         drop(store);
         let mut store = FileArtifactStore::open(directory.path()).unwrap();
         let manifest = store.load_manifest(&production).unwrap();
-        let (consumer, _) = (fixture.online)(production, manifest);
+        // Encryption is a distinct artifact-producing phase.  The online
+        // graph can only consume the private ciphertext artifacts produced by
+        // this phase, so a successful preprocess alone is not sufficient.
+        let (encrypt, _, _) = (fixture.encrypt)(production.clone(), manifest.clone());
+        let encrypted =
+            execute(&encrypt, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let encrypt_production = encrypted.production_id.unwrap();
+        drop(store);
+        let mut store = FileArtifactStore::open(directory.path()).unwrap();
+        let encrypt_manifest = store.load_manifest(&encrypt_production).unwrap();
+        let (consumer, _) =
+            (fixture.online)(production, manifest, encrypt_production, encrypt_manifest);
         let result =
             execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
@@ -8156,10 +8653,10 @@ mod rns_bgg {
         parameters: &RnsBggParameters,
         execution: &mxx_exponent_lut::program::ExponentLutProgram,
         selector_counts: &[usize],
-    ) -> mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseTrace {
+    ) -> mxx_exponent_lut::rns_bgg::RnsBggNoiseTrace {
         let inputs = BTreeMap::from([(
             *execution.inputs().keys().next().unwrap(),
-            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseValue {
+            mxx_exponent_lut::rns_bgg::RnsBggNoiseValue {
                 level: 0,
                 bound: RnsBggNoiseBound {
                     error: parameters.encoding_error_bound().clone(),
@@ -8191,13 +8688,13 @@ mod rns_bgg {
                 panic!("composed PRF must contain direct products")
             };
             let (material, bound) =
-                mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
+                mxx_exponent_lut::rns_bgg::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
                     &(0..selector_counts[step])
                         .map(|index| {
-                            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseAction::new(
-                                mxx_exponent_lut::rns_bgg::noise::stable_source_id(&(
+                            mxx_exponent_lut::rns_bgg::RnsBggNoiseAction::new(
+                                mxx_exponent_lut::rns_bgg::stable_source_id(&(
                                     "noise-refresh-rhs",
                                     step,
                                     rhs,
@@ -8213,7 +8710,7 @@ mod rns_bgg {
             materials
                 .insert(mxx_exponent_lut::program::ProgramGateInstance::Gate { step }, material);
         }
-        mxx_exponent_lut::rns_bgg::noise::trace_program(
+        mxx_exponent_lut::rns_bgg::trace_program(
             parameters,
             execution,
             &mxx_exponent_lut::program::ProgramBindings::new()
@@ -8224,6 +8721,83 @@ mod rns_bgg {
         )
         .unwrap()
     }
+}
+
+#[test]
+fn test_rns_bgg_three_stage_graph_construction() {
+    // This is intentionally backend-free: invoking all three fixture
+    // closures catches missing artifact manifests during graph validation
+    // before the much slower GPU round trip is attempted.
+    let average = selected_average_config();
+    let fixture = rns_bgg::refresh(average.as_ref());
+    let benchmark_preprocessing_production = mxx_ir_core::artifact::ProductionId {
+        spec_hash: mxx_ir_core::encoding::spec_hash(
+            &fixture.benchmark_preprocessing.source,
+            &fixture.benchmark_preprocessing.bindings,
+        )
+        .unwrap(),
+        execution_nonce: [0x10; 32],
+    };
+    let benchmark_preprocessing_manifest = mxx_ir_core::artifact::export_validated_manifest(
+        benchmark_preprocessing_production,
+        &fixture.benchmark_preprocessing,
+    )
+    .unwrap();
+    assert!(
+        benchmark_preprocessing_manifest.artifacts.keys().all(|name| !name.starts_with("oracle-")),
+        "benchmark preprocessing must exclude correctness-only oracle artifacts"
+    );
+    let preprocessing_production = mxx_ir_core::artifact::ProductionId {
+        spec_hash: mxx_ir_core::encoding::spec_hash(
+            &fixture.producer.source,
+            &fixture.producer.bindings,
+        )
+        .unwrap(),
+        execution_nonce: [0x11; 32],
+    };
+    let preprocessing_manifest = mxx_ir_core::artifact::export_validated_manifest(
+        preprocessing_production.clone(),
+        &fixture.producer,
+    )
+    .unwrap();
+    let (encrypt, _, _) =
+        (fixture.encrypt)(preprocessing_production.clone(), preprocessing_manifest.clone());
+    assert_eq!(encrypt.source.name(), "rns-bgg-refresh-encrypt");
+    let encrypt_production = mxx_ir_core::artifact::ProductionId {
+        spec_hash: mxx_ir_core::encoding::spec_hash(&encrypt.source, &encrypt.bindings).unwrap(),
+        execution_nonce: [0x22; 32],
+    };
+    let encrypt_manifest =
+        mxx_ir_core::artifact::export_validated_manifest(encrypt_production.clone(), &encrypt)
+            .unwrap();
+    let (online, benchmark_online) = (fixture.online)(
+        preprocessing_production,
+        preprocessing_manifest,
+        encrypt_production,
+        encrypt_manifest,
+    );
+    assert_eq!(online.source.name(), "rns_bgg-refresh-online");
+    assert_eq!(benchmark_online.source.name(), "rns_bgg-refresh-online-benchmark");
+    assert!(
+        online.source.scopes().values().flat_map(|scope| scope.nodes()).all(|node| !matches!(
+            node.kind(),
+            mxx_ir_core::node::NodeKind::UniformIntervalSample { .. }
+        )),
+        "online graph must import secret-dependent artifacts instead of sampling a secret"
+    );
+    assert!(
+        benchmark_online.source.scopes().values().flat_map(|scope| scope.nodes()).all(
+            |node| !matches!(
+                node.kind(),
+                mxx_ir_core::node::NodeKind::UniformIntervalSample { .. }
+            )
+        ),
+        "benchmark online graph must not resample the mask secret"
+    );
+    assert!(
+        benchmark_online.source.outputs().keys().any(|name| name.starts_with("continued")),
+        "online estimate must retain the continuation LUT computation"
+    );
 }
 
 #[test]

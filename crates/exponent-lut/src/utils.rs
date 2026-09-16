@@ -2,10 +2,88 @@
 //! These functions construct graph expressions; they do not inspect runtime
 //! ciphertexts or add validation passes to their evaluation.
 use crate::ExponentLutError;
+use bigdecimal::BigDecimal;
 use mxx_dsl::{Family, GraphValue, Int, Mat};
-use mxx_ir_core::{IntExpr, ParamEnv};
+use mxx_ir_core::{IntExpr, ParamEnv, Rational, RealExpr};
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
+use std::{error::Error, fmt};
+
+/// Errors raised while converting a finite decimal into an exact IR real.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecimalExpressionError {
+    ExponentOutOfRange,
+    InvalidRational,
+}
+
+impl fmt::Display for DecimalExpressionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ExponentOutOfRange => formatter.write_str("decimal exponent is out of range"),
+            Self::InvalidRational => formatter.write_str("decimal is not a valid rational"),
+        }
+    }
+}
+
+impl Error for DecimalExpressionError {}
+
+/// Convert BigDecimal without floating-point rounding or unchecked exponent
+/// arithmetic. BigDecimal stores `integer * 10^(-exponent)`.
+pub(crate) fn decimal_to_real_expr(value: &BigDecimal) -> Result<RealExpr, DecimalExpressionError> {
+    let (integer, exponent) = value.as_bigint_and_exponent();
+    let magnitude = if exponent < 0 {
+        exponent.checked_neg().ok_or(DecimalExpressionError::ExponentOutOfRange)?
+    } else {
+        exponent
+    };
+    let magnitude =
+        u32::try_from(magnitude).map_err(|_| DecimalExpressionError::ExponentOutOfRange)?;
+    let power = BigInt::from(10u8).pow(magnitude);
+    let (numerator, denominator) =
+        if exponent < 0 { (integer * power, BigInt::from(1u8)) } else { (integer, power) };
+    Rational::new(numerator, denominator)
+        .map(RealExpr::Rational)
+        .map_err(|_| DecimalExpressionError::InvalidRational)
+}
+
+#[cfg(test)]
+mod decimal_tests {
+    use super::*;
+    use std::str::FromStr;
+
+    fn rational(numerator: i64, denominator: i64) -> RealExpr {
+        RealExpr::Rational(Rational::new(numerator.into(), denominator.into()).unwrap())
+    }
+
+    #[test]
+    fn decimal_expression_conversion_is_exact_and_checks_exponents() {
+        assert_eq!(decimal_to_real_expr(&BigDecimal::from(7u8)).unwrap(), rational(7, 1));
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::from_str("0.125").unwrap()).unwrap(),
+            rational(1, 8)
+        );
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::new(BigInt::from(12), 2)).unwrap(),
+            rational(3, 25)
+        );
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::new(BigInt::from(12), -2)).unwrap(),
+            rational(1200, 1)
+        );
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::from_str("4.0").unwrap()).unwrap(),
+            decimal_to_real_expr(&BigDecimal::from_str("4.00").unwrap()).unwrap()
+        );
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::new(BigInt::from(1u8), i64::MAX)),
+            Err(DecimalExpressionError::ExponentOutOfRange)
+        );
+        assert_eq!(
+            decimal_to_real_expr(&BigDecimal::new(BigInt::from(1u8), i64::MIN)),
+            Err(DecimalExpressionError::ExponentOutOfRange)
+        );
+    }
+}
 
 pub(crate) fn lut_coefficient(
     ring: &mxx_dsl::Ring,

@@ -112,7 +112,6 @@ pub trait ExponentLUTEncodingScheme {
 }
 
 pub type NoiseBindings<'a, S> = ProgramBindings<
-    'a,
     <S as ExponentLUTEncodingScheme>::NoiseState,
     <<S as ExponentLUTEncodingScheme>::NoiseEvaluator<'a> as ProgramLoweringTypes>::Rhs,
     <<S as ExponentLUTEncodingScheme>::NoiseEvaluator<'a> as ProgramLoweringTypes>::HelperSet,
@@ -143,8 +142,7 @@ where
 /// Wire, RHS, and helper family storage is paired with the external range it represents.
 /// Its packed index is `external - represented.start`; the active scope must
 /// be contained in that range by the preparation contract.
-pub type PublicBindings<'a, S> = ProgramBindings<
-    'a,
+pub type PublicBindings<S> = ProgramBindings<
     <S as ExponentLUTEncodingScheme>::PublicKey,
     <S as ExponentLUTEncodingScheme>::PublicRhs,
     ProgramValue<
@@ -154,8 +152,7 @@ pub type PublicBindings<'a, S> = ProgramBindings<
     (Family<<S as ExponentLUTEncodingScheme>::PublicKey>, crate::program::FamilyRange),
     (Family<<S as ExponentLUTEncodingScheme>::PublicRhs>, crate::program::FamilyRange),
 >;
-pub type EncodingBindings<'a, S> = ProgramBindings<
-    'a,
+pub type EncodingBindings<S> = ProgramBindings<
     <S as ExponentLUTEncodingScheme>::Encoding,
     <S as ExponentLUTEncodingScheme>::EncodingRhs,
     ProgramValue<
@@ -397,10 +394,11 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
     pub fn new(
         scheme: S,
         program: ExponentLutProgram,
-        bindings: &PublicBindings<'_, S>,
+        bindings: &PublicBindings<S>,
         ranges: ProgramFamilyBindings,
         shared_cache: Option<S::Cache>,
     ) -> Result<Self, ProgramLowerError<S::Error>> {
+        bindings.validate_for_program(&program)?;
         let shared_cache = shared_cache.unwrap_or_default();
         let mut cache = S::Cache::default();
         let mut family_caches = BTreeMap::new();
@@ -419,16 +417,19 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
         for (step, operation) in program.steps().iter().enumerate() {
             match operation {
                 ProgramStep::Gate(operation) => {
-                    let helpers = indexed_helpers(bindings.helpers, &Int::constant(0));
-                    let gate_helpers = bindings
-                        .gate_helpers
-                        .map(|values| indexed_helpers(values, &Int::constant(0)));
+                    let helpers = indexed_helpers(&bindings.helpers, &Int::constant(0));
+                    let gate_helpers = (!bindings.gate_helpers.is_empty())
+                        .then(|| indexed_helpers(&bindings.gate_helpers, &Int::constant(0)));
                     let (output, value) = lower_gate(
                         &program,
                         operation,
                         ProgramGateInstance::Gate { step },
                         &public_values,
-                        bindings.rhs_inputs,
+                        |id| {
+                            bindings
+                                .rhs_for_gate(ProgramGateInstance::Gate { step }, id)
+                                .ok_or(ProgramValidationError::MissingRuntimeRhs(id))
+                        },
                         (&helpers, gate_helpers.as_ref()),
                         &mut scheme.public_evaluator(&mut cache, &shared_cache, &ranges),
                     )?;
@@ -464,15 +465,13 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
                                 },
                                 |rhs| {
                                     bindings
-                                        .rhs_inputs
-                                        .get(&rhs)
+                                        .rhs_scalar(rhs)
                                         .cloned()
                                         .ok_or(mxx_dsl::DslError::Schema)
                                 },
                                 |family| {
                                     bindings
-                                        .rhs_families
-                                        .get(&family)
+                                        .rhs_family_value(family)
                                         .map(|(values, represented)| {
                                             values.at(external
                                                 .clone()
@@ -484,11 +483,8 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
                             Ok((
                                 wires,
                                 rhs,
-                                indexed_helpers(bindings.helpers, &external),
-                                bindings
-                                    .gate_helpers
-                                    .map(|values| indexed_helpers(values, &external))
-                                    .unwrap_or_default(),
+                                indexed_helpers(&bindings.helpers, &external),
+                                indexed_helpers(&bindings.gate_helpers, &external),
                                 shared_cache.clone(),
                             ))
                         },
@@ -513,8 +509,9 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
 
     pub fn evaluate(
         &self,
-        bindings: &EncodingBindings<'_, S>,
+        bindings: &EncodingBindings<S>,
     ) -> Result<BTreeMap<WireId, S::Encoding>, ProgramLowerError<S::Error>> {
+        bindings.validate_for_program(&self.program)?;
         let mut values = self
             .program
             .input_wires()
@@ -531,16 +528,19 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
         for (step, operation) in self.program.steps().iter().enumerate() {
             match operation {
                 ProgramStep::Gate(operation) => {
-                    let helpers = indexed_helpers(bindings.helpers, &Int::constant(0));
-                    let gate_helpers = bindings
-                        .gate_helpers
-                        .map(|values| indexed_helpers(values, &Int::constant(0)));
+                    let helpers = indexed_helpers(&bindings.helpers, &Int::constant(0));
+                    let gate_helpers = (!bindings.gate_helpers.is_empty())
+                        .then(|| indexed_helpers(&bindings.gate_helpers, &Int::constant(0)));
                     let (output, value) = lower_gate(
                         &self.program,
                         operation,
                         ProgramGateInstance::Gate { step },
                         &values,
-                        bindings.rhs_inputs,
+                        |id| {
+                            bindings
+                                .rhs_for_gate(ProgramGateInstance::Gate { step }, id)
+                                .ok_or(ProgramValidationError::MissingRuntimeRhs(id))
+                        },
                         (&helpers, gate_helpers.as_ref()),
                         &mut self.scheme.encoding_evaluator(
                             &self.cache,
@@ -579,15 +579,13 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
                                 },
                                 |rhs| {
                                     bindings
-                                        .rhs_inputs
-                                        .get(&rhs)
+                                        .rhs_scalar(rhs)
                                         .cloned()
                                         .ok_or(mxx_dsl::DslError::Schema)
                                 },
                                 |family| {
                                     bindings
-                                        .rhs_families
-                                        .get(&family)
+                                        .rhs_family_value(family)
                                         .map(|(values, represented)| {
                                             values.at(external
                                                 .clone()
@@ -599,11 +597,8 @@ impl<S: ExponentLUTEncodingScheme> PreparedProgram<S> {
                             Ok((
                                 wires,
                                 rhs,
-                                indexed_helpers(bindings.helpers, &external),
-                                bindings
-                                    .gate_helpers
-                                    .map(|values| indexed_helpers(values, &external))
-                                    .unwrap_or_default(),
+                                indexed_helpers(&bindings.helpers, &external),
+                                indexed_helpers(&bindings.gate_helpers, &external),
                                 local_cache,
                                 self.shared_cache.clone(),
                             ))

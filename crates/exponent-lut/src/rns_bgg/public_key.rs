@@ -2561,7 +2561,6 @@ pub(crate) mod terminal_artifact_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 2,
@@ -2832,7 +2831,6 @@ pub(crate) mod program_artifacts_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![4],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -3130,14 +3128,12 @@ pub(crate) mod program_artifacts_tests {
         let prepared = PreparedProgram::new(
             scheme.clone(),
             frozen.clone(),
-            &ProgramBindings::new(
-                &public_inputs,
-                &scalar_rhs_bindings,
-                &rhs_bindings,
-                &public_members,
-                &BTreeMap::new(),
-                Some(&public_helpers),
-            ),
+            &ProgramBindings::new()
+                .inputs(public_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_values(scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_family_values(rhs_bindings.iter().map(|(&id, value)| (id, value.clone())))
+                .wire_families(public_members.iter().map(|(&id, value)| (id, value.clone())))
+                .gate_helpers(public_helpers.iter().map(|(&id, value)| (id, value.clone()))),
             ranges.clone(),
             None,
         )
@@ -3202,14 +3198,18 @@ pub(crate) mod program_artifacts_tests {
             "one shared online mask bank, not one sampler per gate"
         );
         let online = prepared
-            .evaluate(&ProgramBindings::new(
-                &online_inputs,
-                &online_scalar_rhs_bindings,
-                &online_rhs_bindings,
-                &online_members,
-                &BTreeMap::new(),
-                Some(&online_helpers),
-            ))
+            .evaluate(
+                &ProgramBindings::new()
+                    .inputs(online_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_values(
+                        online_scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
+                    )
+                    .rhs_family_values(
+                        online_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
+                    )
+                    .wire_families(online_members.iter().map(|(&id, value)| (id, value.clone())))
+                    .gate_helpers(online_helpers.iter().map(|(&id, value)| (id, value.clone()))),
+            )
             .unwrap();
         let (mut producer, descriptor) = prepared
             .export(
@@ -3345,14 +3345,18 @@ pub(crate) mod program_artifacts_tests {
             ),
         )]);
         let actual = restored
-            .evaluate(&ProgramBindings::new(
-                &online_inputs,
-                &online_scalar_rhs_bindings,
-                &online_rhs_bindings,
-                &online_members,
-                &BTreeMap::new(),
-                Some(&online_helpers),
-            ))
+            .evaluate(
+                &ProgramBindings::new()
+                    .inputs(online_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_values(
+                        online_scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
+                    )
+                    .rhs_family_values(
+                        online_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
+                    )
+                    .wire_families(online_members.iter().map(|(&id, value)| (id, value.clone())))
+                    .gate_helpers(online_helpers.iter().map(|(&id, value)| (id, value.clone()))),
+            )
             .unwrap();
         let consumer =
             observed_outputs(DslContext::new("rns_bgg-program-consumer"), &restored, &actual)
@@ -3483,7 +3487,6 @@ mod linear_artifact_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -4143,7 +4146,6 @@ pub(crate) mod readout_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![width],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -4530,7 +4532,6 @@ pub(crate) mod terminal_family_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![2],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 2,
@@ -4763,7 +4764,6 @@ pub(crate) mod terminal_family_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![2],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,

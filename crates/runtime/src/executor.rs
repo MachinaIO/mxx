@@ -2537,6 +2537,27 @@ where
                         layout: None,
                     },
                 );
+                // One scalar wire may have several exported names (and even
+                // different confidentiality declarations). Its live graph value
+                // uses one lazy alias, but each returned named output must refer
+                // to its own finalized artifact and descriptor. No resident
+                // value is discarded without retirement: a later consumer may
+                // have reimported this scalar after its original streaming export.
+                // Integers deliberately retain their scalar return contract.
+                if !matches!(outputs.get(name), Some(RuntimeValue::Int(_))) {
+                    let previous = outputs.insert(
+                        name.clone(),
+                        RuntimeValue::LazyArtifact {
+                            production: production.clone(),
+                            name: name.clone(),
+                            index: None,
+                            descriptor: descriptor.clone(),
+                        },
+                    );
+                    if let Some(previous) = previous {
+                        self.retire_value(previous)?;
+                    }
+                }
                 continue;
             }
             let Some(output) = outputs.get(name) else {
@@ -2778,6 +2799,20 @@ where
                 (name.clone(), descriptor)
             })
             .collect::<BTreeMap<_, _>>();
+        let finalized_family_descriptors = outputs
+            .iter()
+            .filter_map(|(name, value)| {
+                if matches!(value, RuntimeValue::StagedArtifactFamily { .. }) {
+                    manifest
+                        .artifacts
+                        .get(name)
+                        .cloned()
+                        .map(|descriptor| (name.clone(), descriptor))
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeMap<_, _>>();
         if self.session.is_some() {
             self.artifact_store.finalize_session(manifest).map_err(Self::artifact_error)?;
         } else {
@@ -2801,6 +2836,25 @@ where
                     descriptor: replacement_descriptors[&name].clone(),
                 },
             );
+        }
+        // Direct root-family exports were already written under their final
+        // production identity. Finalization changes their returned capability
+        // from staged to durable just as it does for copied temporary families.
+        // Non-exported staged outputs retain their explicit lease contract.
+        for (name, descriptor) in finalized_family_descriptors {
+            if matches!(outputs.get(&name), Some(RuntimeValue::StagedArtifactFamily { .. })) {
+                let previous = outputs.insert(
+                    name.clone(),
+                    RuntimeValue::LazyArtifactFamily {
+                        production: production.clone(),
+                        name,
+                        descriptor,
+                    },
+                );
+                if let Some(previous) = previous {
+                    self.retire_value(previous)?;
+                }
+            }
         }
         Ok((Some(production), handles))
     }

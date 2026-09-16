@@ -32,13 +32,24 @@ use mxx_primitives::{
     },
     sampler::{PolyTrapdoorSampler, trapdoor::gpu::GpuDCRTPolyTrapdoorSampler},
 };
-use std::collections::BTreeMap;
+use std::{
+    cell::RefCell,
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+};
+
+#[path = "gpu_admission_recipe.rs"]
+mod gpu_admission_recipe;
+use gpu_admission_recipe::ScopeDemandRecipe;
+#[path = "gpu_admission_child.rs"]
+mod gpu_admission_child;
+use gpu_admission_child::ChildNodePlan;
 
 /// Possible source boundaries and a descending list of containing owner widths.
 /// Capacities are not execution intervals. For alternative family layouts, rank
 /// k contains the kth largest per-device fragment of every possible selected
 /// member; without placement metadata the global fragment list is the bound.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct GpuInventoryValue {
     pub cuts: Vec<usize>,
     pub capacities: Vec<usize>,
@@ -304,6 +315,83 @@ enum ValueOrigin {
     },
 }
 
+#[derive(Default)]
+struct DiagnosticLabels {
+    values: Vec<String>,
+    omitted: usize,
+}
+
+impl DiagnosticLabels {
+    fn push(&mut self, value: String) {
+        if self.values.iter().any(|known| known == &value) {
+            return;
+        }
+        if self.values.len() < 3 {
+            self.values.push(value);
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut values = self.values.join(",");
+        if self.omitted != 0 {
+            write!(values, ",+{}", self.omitted).expect("String write");
+        }
+        values
+    }
+}
+
+#[derive(Default)]
+struct DemandDiagnosticMeta {
+    // A claim key can represent many demand occurrences. These fields are
+    // deliberately an envelope and bounded samples, not per-owner attribution.
+    begin: usize,
+    end: usize,
+    initialized: bool,
+    origins: DiagnosticLabels,
+    owners: DiagnosticLabels,
+}
+
+impl DemandDiagnosticMeta {
+    fn include(&mut self, demand: &MatrixDemand) {
+        if !self.initialized {
+            self.begin = demand.begin;
+            self.end = demand.end;
+            self.initialized = true;
+        } else {
+            self.begin = self.begin.min(demand.begin);
+            self.end = self.end.max(demand.end);
+        }
+        self.origins.push(match &demand.origins {
+            ResourceOrigins::Placement => "placement/all-devices".to_owned(),
+            ResourceOrigins::One(index) => format!("sibling/{index}"),
+            ResourceOrigins::Shared(indices) => format!("siblings/{indices:?}"),
+        });
+        for owner in &demand.owners {
+            self.owners.push(match owner {
+                ValueOrigin::Direct { instance, wire, members } => format!(
+                    "direct/{:?}/node{}:{} members={}",
+                    instance,
+                    wire.node.0,
+                    wire.port.0,
+                    members.len()
+                ),
+                ValueOrigin::Child { instance, wire, output, parallel, claim, .. } => format!(
+                    "child/{instance}/node{}:{}->node{}:{} parallel={} claim={claim}",
+                    wire.node.0, wire.port.0, output.node.0, output.port.0, parallel
+                ),
+            });
+        }
+    }
+}
+
+#[derive(Default)]
+struct DemandDiagnosticGroup {
+    bytes: usize,
+    claims: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MemberProjection {
     Same,
@@ -420,6 +508,10 @@ struct WorkspaceDemand {
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct GpuContextDemand {
     aliases: Vec<Arc<ValueAliases>>,
+    /// Absolute scope position of a locally enveloped alternative group.
+    /// Alternative merging must not turn a node-local claim into a scope-wide
+    /// lifetime, otherwise a later disjoint node cannot reuse its capacity.
+    alternative_anchor: Option<usize>,
     // Zero represents one unmerged scope; combined scopes record their count.
     instance_count: usize,
     workspace_demands: Vec<WorkspaceDemand>,
@@ -491,9 +583,19 @@ fn merge_claim_envelope(
 
 struct ClaimProjection {
     claims: Vec<GpuTracedClaim>,
+    provenance: Vec<ClaimProvenance>,
     workspace_indices: Vec<usize>,
     demand_indices: Vec<usize>,
     matrix_indices: Vec<Vec<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClaimProvenance {
+    OrdinaryCapacity,
+    SlotExact,
+    RequiredExact,
+    AlternativeEnvelopeIncrement,
+    Workspace,
 }
 
 fn source_levels(layout: Option<&GpuInventoryValue>, full_level: usize) -> Vec<usize> {
@@ -516,6 +618,7 @@ fn source_levels(layout: Option<&GpuInventoryValue>, full_level: usize) -> Vec<u
 impl GpuContextDemand {
     fn same_timeline(&self, other: &Self) -> bool {
         self.instance_count == other.instance_count &&
+            self.alternative_anchor == other.alternative_anchor &&
             self.matrix_claims == other.matrix_claims &&
             self.matrix_alternative_claims == other.matrix_alternative_claims &&
             self.matrix_required_claims == other.matrix_required_claims &&
@@ -556,6 +659,8 @@ impl GpuContextDemand {
     /// ordinary outputs and unresolved aliases always remain separate owners.
     pub fn simultaneous(instances: impl IntoIterator<Item = Self>) -> Self {
         let instances = instances.into_iter().collect::<Vec<_>>();
+        let alternative_anchor =
+            instances.iter().flat_map(|instance| instance.alternative_anchor).min();
         let source_claims = instances
             .iter()
             .map(|instance| {
@@ -572,6 +677,7 @@ impl GpuContextDemand {
             .flat_map(|instance| instance.matrix_claim_envelope())
             .collect::<Vec<_>>();
         let mut merged = Self::default();
+        merged.alternative_anchor = alternative_anchor;
         let mut matrices = Vec::<(usize, usize, usize, MatrixDemand)>::new();
         let mut source_demand_maps = instances
             .iter()
@@ -792,6 +898,16 @@ impl GpuContextDemand {
             // Repeating an unchanged class is not a new unresolved alternative.
             return;
         }
+        let anchor = self
+            .alternative_anchor
+            .into_iter()
+            .chain(other.alternative_anchor)
+            .chain(self.matrix_demands.iter().map(|demand| demand.begin))
+            .chain(self.workspace_demands.iter().map(|demand| demand.begin))
+            .chain(other.matrix_demands.iter().map(|demand| demand.begin))
+            .chain(other.workspace_demands.iter().map(|demand| demand.begin))
+            .min()
+            .unwrap_or(0);
         if self.same_timeline(&other) {
             self.aliases = (0..self.aliases.len().max(other.aliases.len()))
                 .map(|index| {
@@ -912,6 +1028,7 @@ impl GpuContextDemand {
         }
         // Alternatives are one enclosing scope's conservative envelope.
         self.instance_count = 0;
+        self.alternative_anchor = Some(anchor);
         self.matrix_demands = self_matrix_demands
             .into_iter()
             .map(|demand| (demand, &self_slot_map))
@@ -927,7 +1044,7 @@ impl GpuContextDemand {
                     }
                 }
                 demand.origins = ResourceOrigins::One(0);
-                demand.begin = 0;
+                demand.begin = anchor;
                 demand.end = self.matrix_until[demand.capacity_slot];
                 (demand.rows, demand.columns) = self.matrices[demand.capacity_slot];
                 demand.preparation = None;
@@ -955,7 +1072,7 @@ impl GpuContextDemand {
                     .collect(),
                 origins: ResourceOrigins::One(0),
                 capacity_slot,
-                begin: 0,
+                begin: anchor,
                 end,
                 layout,
                 shared,
@@ -1105,6 +1222,7 @@ impl GpuContextDemand {
             .map(|(slot, _)| *slot)
             .collect::<HashSet<_>>();
         let mut claims = Vec::new();
+        let mut provenance = Vec::new();
         let mut matrix_indices = Vec::with_capacity(self.matrices.len());
         for (slot, &(rows, columns)) in self.matrices.iter().enumerate() {
             let capacity = (rows.max(1), columns.max(1));
@@ -1113,12 +1231,15 @@ impl GpuContextDemand {
                 if ordinary.contains(&slot) {
                     indices.push(claims.len());
                     claims.push(GpuTracedClaim::matrix(capacity.0, capacity.1, full_level, true));
+                    provenance.push(ClaimProvenance::OrdinaryCapacity);
                 }
                 indices.push(claims.len());
                 claims.push(*exact);
+                provenance.push(ClaimProvenance::SlotExact);
             } else if ordinary.contains(&slot) || !alternative_slots.contains(&slot) {
                 indices.push(claims.len());
                 claims.push(GpuTracedClaim::matrix(capacity.0, capacity.1, full_level, true));
+                provenance.push(ClaimProvenance::OrdinaryCapacity);
             }
             matrix_indices.push(indices);
         }
@@ -1126,6 +1247,7 @@ impl GpuContextDemand {
         for &(slot, claim) in &self.matrix_required_claims {
             let index = claims.len();
             claims.push(claim);
+            provenance.push(ClaimProvenance::RequiredExact);
             required_indices.entry(slot).or_default().push((claim, index));
             if slot < matrix_indices.len() {
                 matrix_indices[slot].push(index);
@@ -1136,7 +1258,10 @@ impl GpuContextDemand {
             let base_len = base.len();
             let envelope = self.matrix_claim_envelope();
             let merged = merge_claim_envelope(&base, &envelope);
-            claims.extend(merged.into_iter().skip(base_len));
+            for claim in merged.into_iter().skip(base_len) {
+                claims.push(claim);
+                provenance.push(ClaimProvenance::AlternativeEnvelopeIncrement);
+            }
             let mut claim_pools = HashMap::<TracedClaimKey, Vec<usize>>::new();
             for (index, claim) in claims.iter().copied().enumerate() {
                 claim_pools.entry(claim_key(claim)).or_default().push(index);
@@ -1162,6 +1287,7 @@ impl GpuContextDemand {
             .map(|layout| {
                 let index = claims.len();
                 claims.push(GpuTracedClaim::workspace(*layout));
+                provenance.push(ClaimProvenance::Workspace);
                 index
             })
             .collect::<Vec<_>>();
@@ -1194,7 +1320,7 @@ impl GpuContextDemand {
                 matrix_indices[demand.capacity_slot][0]
             })
             .collect::<Vec<_>>();
-        ClaimProjection { claims, workspace_indices, demand_indices, matrix_indices }
+        ClaimProjection { claims, provenance, workspace_indices, demand_indices, matrix_indices }
     }
 
     /// Indices in `claims()` retained at each sibling's supplied host frontier.
@@ -1654,6 +1780,83 @@ pub struct GpuScopeResources {
     pub value_layouts: Vec<BTreeMap<WireRef, GpuInventoryValue>>,
 }
 
+/// Candidate-independent metadata for one admission scope. Width and wave
+/// probes reuse this analysis; child scopes still build their own instance
+/// because loop bindings can change their resolved selections.
+struct AdmissionInvariant<'a> {
+    optimizer: crate::executor::gpu_plan::InventoryPlan,
+    liveness: crate::executor::gpu_plan::OwnerLiveness<'a>,
+    streamed_outputs: std::collections::BTreeSet<WireRef>,
+}
+
+fn admission_recipe_supported(validated: &ValidatedGraph) -> bool {
+    validated
+        .root_scope()
+        .execution_order
+        .iter()
+        .all(|node| !matches!(node.kind(), NodeKind::SequentialLoop(_) | NodeKind::SubgraphCall(_)))
+}
+
+#[derive(Default, Clone, Copy)]
+struct AdmissionDiagnosticCounters {
+    root_builder_calls: usize,
+    child_builder_calls: usize,
+    dynamic_child_calls: usize,
+}
+
+thread_local! {
+    static ADMISSION_DIAGNOSTIC_COUNTERS: RefCell<Option<AdmissionDiagnosticCounters>> =
+        const { RefCell::new(None) };
+}
+
+fn admission_diagnostics_enabled() -> bool {
+    matches!(std::env::var("MXX_GPU_ADMISSION_DIAGNOSTICS").as_deref(), Ok("1"))
+}
+
+fn admission_extreme_breakdown_enabled() -> bool {
+    matches!(std::env::var("MXX_GPU_ADMISSION_EXTREME_BREAKDOWN").as_deref(), Ok("1"))
+}
+
+fn admission_extreme_breakdown_requested(enabled: bool, device_count: usize) -> bool {
+    enabled && device_count > 1
+}
+
+fn start_admission_diagnostics(enabled: bool) {
+    ADMISSION_DIAGNOSTIC_COUNTERS.with(|counters| {
+        *counters.borrow_mut() = enabled.then(AdmissionDiagnosticCounters::default);
+    });
+}
+
+fn record_admission_builder(scope_id: &FrozenGraphScopeId) {
+    ADMISSION_DIAGNOSTIC_COUNTERS.with(|counters| {
+        let mut counters = counters.borrow_mut();
+        let Some(counters) = counters.as_mut() else { return };
+        if *scope_id == FrozenGraphScopeId::Root {
+            counters.root_builder_calls += 1;
+        } else {
+            counters.child_builder_calls += 1;
+        }
+    });
+}
+
+fn finish_admission_diagnostics(enabled: bool) -> AdmissionDiagnosticCounters {
+    if !enabled {
+        ADMISSION_DIAGNOSTIC_COUNTERS.with(|counters| {
+            *counters.borrow_mut() = None;
+        });
+        return AdmissionDiagnosticCounters::default();
+    }
+    ADMISSION_DIAGNOSTIC_COUNTERS.with(|counters| counters.borrow_mut().take().unwrap_or_default())
+}
+
+fn record_dynamic_child() {
+    ADMISSION_DIAGNOSTIC_COUNTERS.with(|counters| {
+        if let Some(counters) = counters.borrow_mut().as_mut() {
+            counters.dynamic_child_calls += 1;
+        }
+    });
+}
+
 impl GpuDcrtBackend {
     /// Trace the exact claims of sampling one trapdoor class and preparing its
     /// preimage covariance cache, on the still-open domains of device 0.
@@ -2083,6 +2286,27 @@ impl GpuDcrtBackend {
             &FrozenGraphScopeId::Root,
             &validated.bindings,
         )?;
+        let optimizer = crate::executor::gpu_plan::inventory_plan(validated, capture_trace);
+        let liveness = crate::executor::gpu_plan::owner_liveness(
+            validated,
+            &FrozenGraphScopeId::Root,
+            &validated.bindings,
+            &optimizer,
+            capture_trace,
+        )
+        .map_err(|error| match error {
+            crate::executor::gpu_plan::LivenessError::InvalidInteger => {
+                PolyBackendError::InvalidInteger
+            }
+        })?;
+        let invariant = AdmissionInvariant {
+            optimizer,
+            liveness,
+            streamed_outputs: crate::executor::gpu_plan::streamed_root_outputs(
+                validated,
+                &FrozenGraphScopeId::Root,
+            ),
+        };
         let maximum = validated
             .root_scope()
             .wire_types
@@ -2116,11 +2340,84 @@ impl GpuDcrtBackend {
         // envelope. Shrinking the cap only after rejecting every wave would
         // wrongly provision W = 1 for a graph that can run more bodies at a
         // smaller legal width.
-        let (wave, cap, demand, value_layouts) = match select_wave_and_width(
-            wave_bound.max(1),
-            maximum,
-            |wave, width| {
-                let demand = self.graph_admission_demand(
+        let search_started = std::time::Instant::now();
+        let diagnostics_enabled = admission_diagnostics_enabled();
+        start_admission_diagnostics(diagnostics_enabled);
+        let mut candidate_count = 0usize;
+        let mut rejected_one_column = None;
+        // Root ParallelLoops always stage every result, independently of wave
+        // size. Their demand stays dynamic; their returned descriptor layouts
+        // and subsequent scalar layout propagation can be compiled once.
+        let recipe_supported = admission_recipe_supported(validated);
+        let mut compiled_recipe: Option<ScopeDemandRecipe> = None;
+        if admission_extreme_breakdown_requested(
+            admission_extreme_breakdown_enabled(),
+            self.devices.len(),
+        ) {
+            if !recipe_supported {
+                finish_admission_diagnostics(diagnostics_enabled);
+                return Err(PolyBackendError::GpuSubmission(
+                    "MXX_GPU_ADMISSION_EXTREME_BREAKDOWN=1 requires recipe-supported root graph"
+                        .into(),
+                ));
+            }
+            let recorder = RefCell::new(ScopeDemandRecipe::default());
+            let maximum_demand = self.graph_admission_demand_with_invariant(
+                validated,
+                &FrozenGraphScopeId::Root,
+                &validated.bindings,
+                Some(&operations),
+                capture_trace,
+                Some(&input_columns),
+                maximum,
+                wave_bound.max(1),
+                false,
+                Some(&invariant),
+                Some(&recorder),
+            )?;
+            let mut recipe = recorder.into_inner();
+            recipe.finish(&maximum_demand.0, maximum_demand.1.clone(), maximum_demand.2.clone());
+            drop(maximum_demand);
+            compiled_recipe = Some(recipe);
+            let recipe = compiled_recipe.as_ref().expect("extreme recipe compiled");
+            let maximum_contexts = recipe.replay(self, validated, maximum, wave_bound.max(1))?;
+            let maximum_report = self.extreme_demand_breakdown(
+                &format!("configured-max wave={} width={maximum}", wave_bound.max(1)),
+                &maximum_contexts,
+                &inventory,
+                available,
+            )?;
+            println!("gpu_admission_extreme_breakdown\n{maximum_report}");
+            drop(maximum_contexts);
+            drop(maximum_report);
+            let minimum_contexts = recipe.replay(self, validated, 1, 1)?;
+            let minimum_report = self.extreme_demand_breakdown(
+                "wave-1-width-1",
+                &minimum_contexts,
+                &inventory,
+                available,
+            )?;
+            println!("gpu_admission_extreme_breakdown\n{minimum_report}");
+            finish_admission_diagnostics(diagnostics_enabled);
+            return Err(PolyBackendError::GpuSubmission(
+                "MXX_GPU_ADMISSION_EXTREME_BREAKDOWN completed; normal admission search intentionally skipped"
+                    .into(),
+            ));
+        }
+        let selected_result = select_wave_and_width(wave_bound.max(1), maximum, |wave, width| {
+            candidate_count += 1;
+            let candidate_started = std::time::Instant::now();
+            if diagnostics_enabled {
+                println!("gpu_admission_candidate_start wave={wave} scratch_columns={width}");
+            }
+            let recorder = (recipe_supported && compiled_recipe.is_none())
+                .then(|| RefCell::new(ScopeDemandRecipe::default()));
+            let built = if let Some(recipe) = &compiled_recipe {
+                recipe
+                    .replay(self, validated, width, wave)
+                    .map(|contexts| (contexts, Vec::new(), BTreeMap::new()))
+            } else {
+                self.graph_admission_demand_with_invariant(
                     validated,
                     &FrozenGraphScopeId::Root,
                     &validated.bindings,
@@ -2130,15 +2427,92 @@ impl GpuDcrtBackend {
                     width,
                     wave,
                     false,
-                )?;
-                let requested = self.prepared_demand_bytes(&demand.0, &inventory)?;
-                let fits = requested
-                    .iter()
-                    .zip(available)
-                    .all(|(requested, available)| requested <= available);
-                Ok::<_, PolyBackendError>(fits.then_some(demand))
-            },
-        )? {
+                    Some(&invariant),
+                    recorder.as_ref(),
+                )
+            };
+            let demand = match built {
+                Ok(demand) => demand,
+                Err(error) => {
+                    if diagnostics_enabled {
+                        println!(
+                            "gpu_admission_candidate_end wave={wave} scratch_columns={width} status=error elapsed_ms={}",
+                            candidate_started.elapsed().as_millis()
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            if compiled_recipe.is_none() &&
+                let Some(recorder) = recorder
+            {
+                let mut recipe = recorder.into_inner();
+                recipe.finish(&demand.0, demand.1.clone(), demand.2.clone());
+                if diagnostics_enabled {
+                    let (fixed, dynamic) = recipe.event_counts();
+                    println!(
+                        "gpu_admission_recipe fixed_events={fixed} dynamic_events={dynamic} child_events={}",
+                        recipe.child_event_count()
+                    );
+                }
+                compiled_recipe = Some(recipe);
+            }
+            let requested = match self.prepared_demand_bytes(&demand.0, &inventory) {
+                Ok(requested) => requested,
+                Err(error) => {
+                    if diagnostics_enabled {
+                        println!(
+                            "gpu_admission_candidate_end wave={wave} scratch_columns={width} status=error elapsed_ms={}",
+                            candidate_started.elapsed().as_millis()
+                        );
+                    }
+                    return Err(error);
+                }
+            };
+            let fits = requested
+                .iter()
+                .zip(available)
+                .all(|(requested, available)| requested <= available);
+            if diagnostics_enabled {
+                println!(
+                    "gpu_admission_candidate_end wave={wave} scratch_columns={width} requested_bytes={requested:?} available_bytes={available:?} fits={fits} elapsed_ms={}",
+                    candidate_started.elapsed().as_millis()
+                );
+            }
+            let (contexts, input_layouts, mut value_layouts) = demand;
+            if !fits && wave == 1 && width == 1 {
+                // The selector always reaches this final candidate before
+                // reporting no fit. Retain its already-computed contexts so
+                // failure diagnostics do not rebuild the complete graph.
+                rejected_one_column = Some(contexts);
+                return Ok(None);
+            }
+            if fits && let Some(recipe) = &compiled_recipe {
+                value_layouts.clone_from(&recipe.layouts);
+            }
+            Ok::<_, PolyBackendError>(fits.then_some((contexts, input_layouts, value_layouts)))
+        });
+        let diagnostic_counters = finish_admission_diagnostics(diagnostics_enabled);
+        tracing::debug!(
+            candidate_count,
+            elapsed_ms = search_started.elapsed().as_millis() as u64,
+            wave_bound,
+            maximum_width = maximum,
+            "prepared graph wave/width candidate search complete"
+        );
+        if diagnostics_enabled {
+            println!(
+                "gpu_admission_search_end root_nodes={} root_builder_calls={} child_builder_calls={} dynamic_child_calls={} candidate_count={} elapsed_ms={}",
+                validated.root_scope().execution_order.len(),
+                diagnostic_counters.root_builder_calls,
+                diagnostic_counters.child_builder_calls,
+                diagnostic_counters.dynamic_child_calls,
+                candidate_count,
+                search_started.elapsed().as_millis()
+            );
+        }
+        let selected = selected_result?;
+        let (wave, cap, demand, value_layouts) = match selected {
             Some((wave, scratch_columns, demand)) => {
                 tracing::debug!(
                     wave,
@@ -2150,26 +2524,189 @@ impl GpuDcrtBackend {
             None => {
                 // No pair fits: report the smallest candidate's exact demand, the
                 // one-column single-body prefix, so the error names a real bound.
-                let demand = self
-                    .graph_admission_demand(
-                        validated,
-                        &FrozenGraphScopeId::Root,
-                        &validated.bindings,
-                        Some(&operations),
-                        capture_trace,
-                        Some(&input_columns),
-                        1,
-                        1,
-                        false,
-                    )?
-                    .0;
+                let demand = rejected_one_column.expect(
+                    "wave/width selector must evaluate the one-column single-body candidate",
+                );
                 let requested = self.prepared_demand_bytes(&demand, &inventory)?;
+                let breakdown = self.prepared_demand_breakdown(&demand, &inventory, available)?;
                 return Err(PolyBackendError::GpuSubmission(format!(
-                    "retained graph owners and one-column scratch exceed the setup memory budget: requested bytes per device {requested:?}, available bytes per device {available:?}"
+                    "retained graph owners and one-column scratch exceed the setup memory budget: requested bytes per device {requested:?}, available bytes per device {available:?}\nGPU admission breakdown (failure-only, top 8 groups per device):\n{breakdown}"
                 )));
             }
         };
         Ok((wave, cap, GpuScopeResources { contexts: demand, value_layouts: vec![value_layouts] }))
+    }
+
+    /// Add the claims made by `stream_scalar_export` at the producer. The
+    /// executor materializes a second matrix owner for the readback while the
+    /// original output owner is still live, then releases the readback claims
+    /// before the next root node. This is distinct from final output
+    /// persistence, which sees only the stored artifact handle.
+    fn add_streamed_scalar_export_claims(
+        &self,
+        output: &ConcreteWireType,
+        wire: WireRef,
+        layout: Option<&GpuInventoryValue>,
+        position: usize,
+        lazy_import_already_accounted: bool,
+        store_cache: &mut BTreeMap<
+            (String, usize, usize, usize, usize),
+            GpuPreparedWorkspaceLayout,
+        >,
+        demand: &mut BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
+        recipe: Option<&RefCell<ScopeDemandRecipe>>,
+    ) -> Result<(), PolyBackendError> {
+        if matches!(output, ConcreteWireType::IndexedFamily { .. }) {
+            return Ok(());
+        }
+        let owner = ValueOrigin::Direct { instance: Some(0), wire, members: Vec::new() };
+        let Some(matrix_type) = output.matrix_type() else { return Ok(()) };
+        // `matrix_to_bytes` reads each fleet shard independently. Reuse the
+        // largest per-device fragment capacity, rather than charging every
+        // device for the global column count when the output is sharded.
+        let columns = layout
+            .and_then(|layout| layout.capacities.first().copied())
+            .filter(|&columns| columns != 0)
+            .unwrap_or(matrix_type.columns);
+        let params = self.devices[0].1.parameters(matrix_type)?;
+        let lazy_import =
+            layout.is_some_and(|layout| layout.lazy) && !lazy_import_already_accounted;
+        let (import_matrices, import_layouts) = if lazy_import {
+            import_inventory(params, output, columns)?
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let bounded_output = bound_of(output).is_some();
+        let full_level = params.crt_depth() - 1;
+        // Selection/placement alternatives may have discarded concrete
+        // fragments while retaining possible levels. Match the retained-output
+        // path: an unresolved format can be either coefficient or evaluation.
+        let levels = source_levels(layout, full_level);
+        let formats = layout
+            .and_then(|layout| layout.fragments.as_deref())
+            .into_iter()
+            .flatten()
+            .map(|fragment| fragment.evaluation)
+            .collect::<std::collections::BTreeSet<_>>();
+        let formats = if formats.is_empty() {
+            vec![false, true]
+        } else {
+            formats.into_iter().collect::<Vec<_>>()
+        };
+        let bounded_bound = bound_of(output).map(|(_, bound)| bound);
+        let make_base_alternative = || -> Result<GpuContextDemand, PolyBackendError> {
+            let mut alternative = GpuContextDemand::default();
+            // Lazy artifact values are materialized before encoding. These are
+            // the same import destination and staging claims returned by
+            // `import_inventory`; resident values skip this block.
+            for &(rows, columns) in &import_matrices {
+                alternative.matrix(position, position, rows, columns);
+                alternative.matrix_demands.last_mut().unwrap().owners = vec![owner.clone()];
+            }
+            for &layout in &import_layouts {
+                alternative.workspace(position, position, layout, false);
+                alternative.workspace_demands.last_mut().unwrap().owners = vec![owner.clone()];
+            }
+            if let Some(bound) = bounded_bound.as_ref().filter(|_| lazy_import) {
+                // ImportCompact uses one compact payload as decode scratch,
+                // while the materialized bounded value remains in a separate
+                // compact destination for the subsequent export.
+                let destination = compact_payload(params, matrix_type.rows, columns, bound)?;
+                alternative.workspace(position, position, destination, false);
+                alternative.workspace_demands.last_mut().unwrap().owners = vec![owner.clone()];
+            }
+            Ok(alternative)
+        };
+        let mut export_alternatives = GpuContextDemand::default();
+        if bounded_output {
+            // Bounded exports do not depend on CRT level or evaluation format:
+            // their prepared contract is import/destination resources plus one
+            // completion event. Avoid constructing the same alternative once
+            // per level/format pair.
+            let mut alternative = make_base_alternative()?;
+            alternative.workspace(
+                position,
+                position,
+                GpuPreparedWorkspaceLayout {
+                    kind: GpuPreparedSlotKind::CompletionEvent,
+                    bytes: 0,
+                    alignment: 1,
+                },
+                false,
+            );
+            alternative.workspace_demands.last_mut().unwrap().owners = vec![owner.clone()];
+            export_alternatives = alternative;
+        } else {
+            for level in levels {
+                for &evaluation in &formats {
+                    let mut alternative = make_base_alternative()?;
+                    // `matrix_to_bytes` claims a clone/readback matrix while the
+                    // original output owner remains occupied. The matching level
+                    // and format are required by the prepared-slot broker.
+                    alternative.matrix_claim(
+                        position,
+                        position,
+                        GpuTracedClaim::matrix(matrix_type.rows, columns, level, evaluation),
+                    );
+                    alternative.matrix_demands.last_mut().unwrap().owners = vec![owner.clone()];
+                    let cache_key = (
+                        matrix_type.modulus.to_string(),
+                        matrix_type.ring_dimension,
+                        matrix_type.rows,
+                        columns,
+                        level,
+                    );
+                    let store = if let Some(&store) = store_cache.get(&cache_key) {
+                        store
+                    } else {
+                        let store = params
+                            .compact_transfer_workspace(
+                                level,
+                                matrix_type.rows,
+                                columns,
+                                GpuCompactTransferKind::Store,
+                            )
+                            .map_err(PolyBackendError::GpuSubmission)?;
+                        store_cache.insert(cache_key, store);
+                        store
+                    };
+                    for layout in [
+                        GpuPreparedWorkspaceLayout {
+                            kind: GpuPreparedSlotKind::SubmissionStream,
+                            bytes: 0,
+                            alignment: 1,
+                        },
+                        store,
+                    ] {
+                        alternative.workspace(position, position, layout, false);
+                        alternative.workspace_demands.last_mut().unwrap().owners =
+                            vec![owner.clone()];
+                    }
+                    export_alternatives.include_alternative(alternative);
+                }
+            }
+        }
+        let context = &mut demand
+            .entry((matrix_type.modulus.to_string(), matrix_type.ring_dimension))
+            .or_insert_with(|| (matrix_type.clone(), GpuContextDemand::default()))
+            .1;
+        // The export alternatives are simultaneous with the retained graph,
+        // but mutually exclusive with one another.
+        if let Some(recipe) = recipe {
+            recipe.borrow_mut().alternative(matrix_type, &export_alternatives);
+        }
+        context.append_alternative_group(export_alternatives);
+        Ok(())
+    }
+
+    /// `stream_scalar_export` replaces a resident scalar with a descriptor
+    /// after serialization. Later consumers must therefore plan a fresh import
+    /// from the descriptor, just like an artifact input.
+    fn mark_streamed_scalar_output_lazy(output: &ConcreteWireType, layout: &mut GpuInventoryValue) {
+        let Some(matrix_type) = output.matrix_type() else { return };
+        let mut descriptor = GpuInventoryValue::new(vec![0, matrix_type.columns]);
+        descriptor.lazy = true;
+        *layout = descriptor;
     }
 
     /// Setup-time native byte demand of one prepared demand snapshot on every
@@ -2216,6 +2753,365 @@ impl GpuDcrtBackend {
                 Ok(bytes)
             })
             .collect()
+    }
+
+    /// Temporary, opt-in diagnosis for a suspected retained-owner overestimate.
+    /// This reports exactly the slots counted by `prepared_demand_bytes`, but
+    /// does not treat a lifetime envelope as evidence that those slots overlap
+    /// during execution. It intentionally returns no admission result.
+    fn extreme_demand_breakdown(
+        &self,
+        pair: &str,
+        demand: &BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
+        inventory: &[(usize, Arc<GpuPreparedStorage>)],
+        available: &[usize],
+    ) -> Result<String, PolyBackendError> {
+        if !inventory.is_empty() {
+            return Err(PolyBackendError::GpuSubmission(
+                "extreme demand provenance requires an empty prepared inventory".into(),
+            ));
+        }
+        let mut report = String::new();
+        writeln!(
+            report,
+            "pair={pair} note=lifetime_envelopes_are_metadata_not_overlap_proof claim_categories=claim-projection-provenance"
+        )
+            .expect("String write");
+        let canonical_by_device = self.prepared_demand_bytes(demand, inventory)?;
+        for (device, (_, backend)) in self.devices.iter().enumerate() {
+            let mut used = HashSet::new();
+            let mut device_bytes = 0usize;
+            let canonical = canonical_by_device[device];
+            writeln!(
+                report,
+                "device={device} available_bytes={}",
+                available.get(device).copied().unwrap_or(0)
+            )
+            .expect("String write");
+            for ((modulus, ring_dimension), (ty, context)) in demand {
+                let params = backend.parameters(ty)?;
+                let (matrices, layouts) = context.missing(params, inventory, device, &mut used)?;
+                let claims = matrices
+                    .into_iter()
+                    .chain(layouts.into_iter().map(GpuTracedClaim::workspace))
+                    .collect::<Vec<_>>();
+                let slots = GpuPreparedSlotSnapshot::plan(params, &claims)
+                    .map_err(PolyBackendError::GpuCalibration)?;
+                if claims.len() != slots.len() {
+                    return Err(PolyBackendError::GpuSubmission(
+                        "extreme demand breakdown slot/claim count mismatch".into(),
+                    ));
+                }
+                let projection = context.claim_projection(params.crt_depth().saturating_sub(1));
+                let claim_provenance = if claims == projection.claims {
+                    projection.provenance.iter().copied().map(Some).collect::<Vec<_>>()
+                } else if claims.len() == projection.claims.len() + 1 &&
+                    claims[1..] == projection.claims[..] &&
+                    claims[0].kind() == GpuPreparedSlotKind::Matrix
+                {
+                    // `missing` adds this minimum matrix owner for a
+                    // workspace-only storage. It is not an emitted
+                    // ClaimProjection claim, so keep that fact explicit.
+                    std::iter::once(None)
+                        .chain(projection.provenance.iter().copied().map(Some))
+                        .collect::<Vec<_>>()
+                } else {
+                    return Err(PolyBackendError::GpuSubmission(
+                        "extreme demand provenance cannot reconcile prepared claim selection"
+                            .into(),
+                    ));
+                };
+                let mut metadata = BTreeMap::<TracedClaimKey, DemandDiagnosticMeta>::new();
+                for (index, matrix) in context.matrix_demands.iter().enumerate() {
+                    let claim = projection.claims[projection.demand_indices[index]];
+                    metadata.entry(claim_key(claim)).or_default().include(matrix);
+                }
+                for workspace in &context.workspace_demands {
+                    let claim = GpuTracedClaim::workspace(workspace.layout);
+                    metadata.entry(claim_key(claim)).or_default().include(&MatrixDemand {
+                        owners: workspace.owners.clone(),
+                        origins: workspace.origins.clone(),
+                        capacity_slot: workspace.capacity_slot,
+                        begin: workspace.begin,
+                        end: workspace.end,
+                        rows: 0,
+                        columns: 0,
+                        preparation: None,
+                        ordinary: false,
+                        claim: Some(claim),
+                    });
+                }
+                let mut context_bytes = 0usize;
+                let mut context_slots = 0usize;
+                let mut matrix_slots = 0usize;
+                let mut workspace_slots = 0usize;
+                let mut categories = BTreeMap::<
+                    &str,
+                    (
+                        usize,
+                        usize,
+                        DiagnosticLabels,
+                        DiagnosticLabels,
+                        usize,
+                        usize,
+                        usize,
+                        BTreeSet<String>,
+                    ),
+                >::new();
+                for ((claim, slot), provenance) in
+                    claims.into_iter().zip(slots).zip(claim_provenance)
+                {
+                    let identity = slot.identity();
+                    if matches!(
+                        identity.kind(),
+                        GpuPreparedSlotKind::PinnedHost |
+                            GpuPreparedSlotKind::CompletionEvent |
+                            GpuPreparedSlotKind::SubmissionStream
+                    ) {
+                        continue;
+                    }
+                    let bytes = identity.requested_backing_bytes();
+                    if claim.kind() == GpuPreparedSlotKind::Matrix {
+                        matrix_slots += 1;
+                    } else {
+                        workspace_slots += 1;
+                    }
+                    let category = if claim.kind() == GpuPreparedSlotKind::Matrix {
+                        match provenance {
+                            Some(ClaimProvenance::OrdinaryCapacity) => "matrix_ordinary_capacity",
+                            Some(ClaimProvenance::SlotExact) => "matrix_slot_exact",
+                            Some(ClaimProvenance::RequiredExact) => "matrix_required_exact",
+                            Some(ClaimProvenance::AlternativeEnvelopeIncrement) => {
+                                "matrix_alternative_envelope_increment"
+                            }
+                            Some(ClaimProvenance::Workspace) => "matrix_other",
+                            None => "matrix_synthetic_workspace_backing",
+                        }
+                    } else if claim.kind() == GpuPreparedSlotKind::CompactPayload {
+                        "compact_payload"
+                    } else {
+                        match claim.kind() {
+                            GpuPreparedSlotKind::BatchWorkspace => "workspace_batch",
+                            GpuPreparedSlotKind::TransformWorkspace => "workspace_transform",
+                            GpuPreparedSlotKind::CompactWorkspace => "workspace_compact",
+                            GpuPreparedSlotKind::SamplerWorkspace => "workspace_sampler",
+                            GpuPreparedSlotKind::TransferWorkspace => "workspace_transfer",
+                            _ => "workspace_other",
+                        }
+                    };
+                    let capacity_class = if claim.kind() == GpuPreparedSlotKind::Matrix {
+                        format!(
+                            "matrix:{:?}",
+                            super::gpu_prepare::matrix_capacity_class(
+                                identity.rows(),
+                                identity.columns()
+                            )
+                        )
+                    } else {
+                        format!(
+                            "bytes:{}",
+                            super::gpu_prepare::capacity_class(identity.requested_backing_bytes())
+                        )
+                    };
+                    let entry = categories.entry(category).or_insert_with(|| {
+                        (
+                            0,
+                            0,
+                            DiagnosticLabels::default(),
+                            DiagnosticLabels::default(),
+                            0,
+                            0,
+                            0,
+                            BTreeSet::new(),
+                        )
+                    });
+                    if entry.1 == 0 {
+                        if let Some(details) = metadata.get(&claim_key(claim)) {
+                            entry.4 = details.begin;
+                            entry.5 = details.end;
+                        }
+                    } else if let Some(details) = metadata.get(&claim_key(claim)) {
+                        entry.4 = entry.4.min(details.begin);
+                        entry.5 = entry.5.max(details.end);
+                    }
+                    entry.0 = entry.0.checked_add(bytes).ok_or(PolyBackendError::InvalidInteger)?;
+                    entry.1 += 1;
+                    entry.6 = entry.6.max(bytes);
+                    entry.7.insert(capacity_class);
+                    if let Some(details) = metadata.get(&claim_key(claim)) {
+                        for value in &details.origins.values {
+                            entry.2.push(value.clone());
+                        }
+                        for value in &details.owners.values {
+                            entry.3.push(value.clone());
+                        }
+                    }
+                    context_bytes =
+                        context_bytes.checked_add(bytes).ok_or(PolyBackendError::InvalidInteger)?;
+                    context_slots += 1;
+                }
+                device_bytes = device_bytes
+                    .checked_add(context_bytes)
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+                let fraction =
+                    if canonical == 0 { 0.0 } else { context_bytes as f64 / (canonical as f64) };
+                writeln!(
+                    report,
+                    "  context={modulus}:{ring_dimension} bytes={context_bytes} fraction_of_reported_device_total={fraction:.6} slots={context_slots} matrix_slots={matrix_slots} workspace_slots={workspace_slots}"
+                )
+                .expect("String write");
+                for (category, (bytes, slots, origins, owners, begin, end, largest, classes)) in
+                    categories
+                {
+                    writeln!(
+                        report,
+                        "    category={category} bytes={bytes} slots={slots} largest_slot_bytes={largest} capacity_classes={classes:?} lifetime_envelope={begin}..{end} origin_samples=[{}] owner_samples=[{}]",
+                        origins.render(),
+                        owners.render(),
+                    )
+                    .expect("String write");
+                }
+            }
+            // Recompute the canonical value after the detailed walk. This
+            // guards the report against category or context accounting drift.
+            if canonical != device_bytes {
+                return Err(PolyBackendError::GpuSubmission(format!(
+                    "extreme demand breakdown does not reconcile on device {device}: categories={device_bytes} prepared_demand_bytes={canonical}"
+                )));
+            }
+            writeln!(
+                report,
+                "  context_sum_bytes={device_bytes} prepared_demand_bytes={canonical} reconciles=true"
+            )
+            .expect("String write");
+        }
+        Ok(report.trim_end().to_owned())
+    }
+
+    /// Explain a rejected setup snapshot without changing admission. This is
+    /// intentionally called only for the final no-fit candidate: normal wave
+    /// search must not emit one line per candidate or retain diagnostic state.
+    fn prepared_demand_breakdown(
+        &self,
+        demand: &BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
+        inventory: &[(usize, Arc<GpuPreparedStorage>)],
+        available: &[usize],
+    ) -> Result<String, PolyBackendError> {
+        const TOP_GROUPS: usize = 8;
+        let mut report = String::new();
+        for (device, (_, backend)) in self.devices.iter().enumerate() {
+            let mut used = HashSet::new();
+            let mut groups = BTreeMap::<String, DemandDiagnosticGroup>::new();
+            let mut requested = 0usize;
+            for (ty, context) in demand.values() {
+                let params = backend.parameters(ty)?;
+                let (matrices, layouts) = context.missing(params, inventory, device, &mut used)?;
+                let claims = matrices
+                    .into_iter()
+                    .chain(layouts.into_iter().map(GpuTracedClaim::workspace))
+                    .collect::<Vec<_>>();
+                if claims.is_empty() {
+                    continue;
+                }
+                let slots = GpuPreparedSlotSnapshot::plan(params, &claims)
+                    .map_err(PolyBackendError::GpuCalibration)?;
+                let projection = context.claim_projection(params.crt_depth().saturating_sub(1));
+                let mut metadata = BTreeMap::<TracedClaimKey, DemandDiagnosticMeta>::new();
+                for (index, matrix) in context.matrix_demands.iter().enumerate() {
+                    let claim = projection.claims[projection.demand_indices[index]];
+                    metadata.entry(claim_key(claim)).or_default().include(matrix);
+                }
+                for workspace in &context.workspace_demands {
+                    let claim = GpuTracedClaim::workspace(workspace.layout);
+                    let entry = metadata.entry(claim_key(claim)).or_default();
+                    // Workspace demands carry the same lifetime/owner metadata
+                    // as matrix demands, so adapt only the shape fields here.
+                    let synthetic = MatrixDemand {
+                        owners: workspace.owners.clone(),
+                        origins: workspace.origins.clone(),
+                        capacity_slot: workspace.capacity_slot,
+                        begin: workspace.begin,
+                        end: workspace.end,
+                        rows: 0,
+                        columns: 0,
+                        preparation: None,
+                        ordinary: false,
+                        claim: Some(claim),
+                    };
+                    entry.include(&synthetic);
+                }
+                for (claim, slot) in claims.into_iter().zip(slots) {
+                    let identity = slot.identity();
+                    if matches!(
+                        identity.kind(),
+                        GpuPreparedSlotKind::PinnedHost |
+                            GpuPreparedSlotKind::CompletionEvent |
+                            GpuPreparedSlotKind::SubmissionStream
+                    ) {
+                        continue;
+                    }
+                    let bytes = identity.requested_backing_bytes();
+                    requested =
+                        requested.checked_add(bytes).ok_or(PolyBackendError::InvalidInteger)?;
+                    let details = metadata.get(&claim_key(claim));
+                    let (begin, end, origin_samples, owner_samples) = details.map_or_else(
+                        || (0, 0, "unknown".to_owned(), "unknown".to_owned()),
+                        |details| {
+                            (
+                                details.begin,
+                                details.end,
+                                details.origins.render(),
+                                details.owners.render(),
+                            )
+                        },
+                    );
+                    let key = format!(
+                        "ctx={}:{} kind={:?} shape={}x{} level={:?} eval={:?} life_envelope={begin}..{end} origin_samples=[{origin_samples}] owner_samples=[{owner_samples}]",
+                        ty.modulus,
+                        ty.ring_dimension,
+                        claim.kind(),
+                        claim.rows(),
+                        claim.columns(),
+                        claim.level(),
+                        claim.is_evaluation(),
+                    );
+                    let group = groups.entry(key).or_default();
+                    group.bytes =
+                        group.bytes.checked_add(bytes).ok_or(PolyBackendError::InvalidInteger)?;
+                    group.claims += 1;
+                }
+            }
+            let mut ranked = groups.into_iter().collect::<Vec<_>>();
+            ranked.sort_by(|(left, left_group), (right, right_group)| {
+                right_group.bytes.cmp(&left_group.bytes).then_with(|| left.cmp(right))
+            });
+            let omitted_bytes = ranked
+                .iter()
+                .skip(TOP_GROUPS)
+                .try_fold(0usize, |total, (_, group)| total.checked_add(group.bytes))
+                .ok_or(PolyBackendError::InvalidInteger)?;
+            writeln!(
+                report,
+                "device={device} requested_bytes={requested} available_bytes={} placement_replication=one-demand-per-configured-device metadata=claim-group-lifetime-envelope-and-samples top_groups={}",
+                available.get(device).copied().unwrap_or(0),
+                ranked.len().min(TOP_GROUPS),
+            )
+            .expect("String write");
+            for (index, (key, group)) in ranked.into_iter().take(TOP_GROUPS).enumerate() {
+                writeln!(
+                    report,
+                    "  rank={} bytes={} claims={} {key}",
+                    index + 1,
+                    group.bytes,
+                    group.claims,
+                )
+                .expect("String write");
+            }
+            if omitted_bytes != 0 {
+                writeln!(report, "  omitted_groups_bytes={omitted_bytes}").expect("String write");
+            }
+        }
+        Ok(report.trim_end().to_owned())
     }
 
     fn prepare_graph_storage(
@@ -2763,6 +3659,43 @@ impl GpuDcrtBackend {
         ),
         PolyBackendError,
     > {
+        self.graph_admission_demand_with_invariant(
+            validated,
+            scope_id,
+            bindings,
+            operations,
+            capture_trace,
+            input_columns,
+            scratch_columns,
+            wave,
+            warm_up,
+            None,
+            None,
+        )
+    }
+
+    fn graph_admission_demand_with_invariant(
+        &mut self,
+        validated: &ValidatedGraph,
+        scope_id: &FrozenGraphScopeId,
+        bindings: &ParamEnv,
+        operations: Option<&[InventoryOperation]>,
+        capture_trace: bool,
+        input_columns: Option<&BTreeMap<WireRef, GpuInventoryValue>>,
+        scratch_columns: usize,
+        wave: usize,
+        warm_up: bool,
+        invariant: Option<&AdmissionInvariant<'_>>,
+        recipe: Option<&RefCell<ScopeDemandRecipe>>,
+    ) -> Result<
+        (
+            BTreeMap<(String, usize), (ConcreteMatrixType, GpuContextDemand)>,
+            Vec<GpuInventoryValue>,
+            BTreeMap<WireRef, GpuInventoryValue>,
+        ),
+        PolyBackendError,
+    > {
+        record_admission_builder(scope_id);
         let scope = validated.source.scope(scope_id).ok_or_else(|| {
             PolyBackendError::GpuSubmission("graph has no requested scope".into())
         })?;
@@ -2776,28 +3709,42 @@ impl GpuDcrtBackend {
             &resolved
         };
 
-        let optimizer = if *scope_id == FrozenGraphScopeId::Root {
-            crate::executor::gpu_plan::inventory_plan(validated, capture_trace)
+        let local_invariant = if invariant.is_none() {
+            let optimizer = if *scope_id == FrozenGraphScopeId::Root {
+                crate::executor::gpu_plan::inventory_plan(validated, capture_trace)
+            } else {
+                crate::executor::gpu_plan::InventoryPlan::default()
+            };
+            let liveness = crate::executor::gpu_plan::owner_liveness(
+                validated,
+                scope_id,
+                bindings,
+                &optimizer,
+                capture_trace,
+            )
+            .map_err(|error| match error {
+                crate::executor::gpu_plan::LivenessError::InvalidInteger => {
+                    PolyBackendError::InvalidInteger
+                }
+            })?;
+            Some(AdmissionInvariant {
+                optimizer,
+                liveness,
+                streamed_outputs: crate::executor::gpu_plan::streamed_root_outputs(
+                    validated, scope_id,
+                ),
+            })
         } else {
-            crate::executor::gpu_plan::InventoryPlan::default()
+            None
         };
+        let invariant = invariant.or(local_invariant.as_ref()).expect("admission invariant");
+        let optimizer = &invariant.optimizer;
+        let liveness = &invariant.liveness;
+        let streamed_outputs = &invariant.streamed_outputs;
         let mut column_layouts = BTreeMap::<WireRef, GpuInventoryValue>::new();
         if let Some(inputs) = input_columns {
             column_layouts.extend(inputs.iter().map(|(wire, cuts)| (*wire, cuts.clone())));
         }
-        let liveness = crate::executor::gpu_plan::owner_liveness(
-            validated,
-            scope_id,
-            bindings,
-            &optimizer,
-            capture_trace,
-        )
-        .map_err(|error| match error {
-            crate::executor::gpu_plan::LivenessError::InvalidInteger => {
-                PolyBackendError::InvalidInteger
-            }
-        })?;
-
         let unsupported = |kind: &NodeKind| {
             PolyBackendError::GpuSubmission(format!(
                 "prepared GPU admission has no compiled runner for {kind:?}"
@@ -2806,9 +3753,12 @@ impl GpuDcrtBackend {
         // Demand per parameter context, keyed by the context's matrix type
         // identity (modulus and ring dimension); replicated on every device.
         let mut demand = BTreeMap::<(String, usize), (ConcreteMatrixType, GpuContextDemand)>::new();
+        let mut export_store_cache =
+            BTreeMap::<(String, usize, usize, usize, usize), GpuPreparedWorkspaceLayout>::new();
         let position = std::cell::Cell::new(0usize);
         let until = std::cell::Cell::new(0usize);
         let shared_layout = std::cell::Cell::new(false);
+        let recording = std::cell::Cell::new(true);
         let owners = std::cell::RefCell::new(Vec::<(WireRef, Vec<usize>)>::new());
         let add_matrix = |demand: &mut BTreeMap<_, (ConcreteMatrixType, GpuContextDemand)>,
                           ty: &ConcreteMatrixType,
@@ -2828,6 +3778,11 @@ impl GpuDcrtBackend {
                     members: path.clone(),
                 })
                 .collect();
+            if recording.get() &&
+                let Some(recipe) = recipe
+            {
+                recipe.borrow_mut().matrix(ty, context.matrix_demands.last().unwrap());
+            }
         };
         let add_layouts = |demand: &mut BTreeMap<_, (ConcreteMatrixType, GpuContextDemand)>,
                            ty: &ConcreteMatrixType,
@@ -2847,6 +3802,11 @@ impl GpuDcrtBackend {
                         members: path.clone(),
                     })
                     .collect();
+                if recording.get() &&
+                    let Some(recipe) = recipe
+                {
+                    recipe.borrow_mut().workspace(ty, context.workspace_demands.last().unwrap());
+                }
             }
         };
         let add_typed_matrix =
@@ -2867,12 +3827,18 @@ impl GpuDcrtBackend {
                         members: path.clone(),
                     })
                     .collect();
+                if recording.get() &&
+                    let Some(recipe) = recipe
+                {
+                    recipe.borrow_mut().matrix(ty, context.matrix_demands.last().unwrap());
+                }
             };
         let add_claim_alternatives =
             |demand: &mut BTreeMap<_, (ConcreteMatrixType, GpuContextDemand)>,
              ty: &ConcreteMatrixType,
              alternatives: &[Vec<GpuTracedClaim>]| {
                 let mut groups = BTreeMap::new();
+                let was_recording = recording.replace(false);
                 for claims in alternatives {
                     let mut alternative = BTreeMap::new();
                     push_traced(&mut alternative, ty, claims, &add_typed_matrix, &add_layouts);
@@ -2884,27 +3850,37 @@ impl GpuDcrtBackend {
                     }
                 }
                 for (key, (alternative_ty, alternative_demand)) in groups {
+                    if was_recording && let Some(recipe) = recipe {
+                        recipe.borrow_mut().alternative(&alternative_ty, &alternative_demand);
+                    }
                     let entry = demand
                         .entry(key)
                         .or_insert_with(|| (alternative_ty.clone(), GpuContextDemand::default()));
                     entry.1.append_alternative_group(alternative_demand);
                 }
+                recording.set(was_recording);
             };
         let parameters =
             |backend: &Self, ty: &ConcreteMatrixType| backend.devices[0].1.parameters(ty).cloned();
         for (node_position, handle) in checked.execution_order.iter().enumerate() {
+            recording.set(true);
             position.set(node_position);
             until.set(node_position);
             owners.borrow_mut().clear();
             let id = mxx_ir_core::types::NodeId(node_position as u64);
-            let retained_until = |port: usize| liveness.output_end(node_position, port);
-            let arguments = scope
-                .arguments(handle)
-                .ok_or_else(|| PolyBackendError::GpuSubmission("missing node arguments".into()))?;
+            let retained_until = |port: usize| liveness.original_output_end(node_position, port);
             let (operation, prepared) = &operations[node_position];
+            // `GpuNodeOperation` was lowered once before candidate probing and
+            // already owns the validated argument-wire list. Reusing it avoids
+            // another scope-map lookup for every node in every candidate.
+            let arguments = operation.argument_wires();
             let argument_types = operation.arguments();
             let output_types = operation.outputs();
             let kind = handle.kind();
+            // Child scopes are recorded as explicit events. Their bound-index
+            // inputs and staging decisions are re-evaluated by the child
+            // evaluator during replay, while native parent events are reused.
+            let mut streamed_scalar_exports = Vec::<(WireRef, ConcreteWireType)>::new();
             // The executor prepares all loop inputs before running any body
             // node. Their owners and import scratch overlap even when the IR
             // declares an input after another input's final consumer.
@@ -2918,6 +3894,21 @@ impl GpuDcrtBackend {
                 if let Some(source) = liveness.alias_source(wire) {
                     if let Some(boundaries) = column_layouts.get(source).cloned() {
                         column_layouts.insert(wire, boundaries);
+                        if streamed_outputs.contains(&wire) {
+                            self.add_streamed_scalar_export_claims(
+                                output,
+                                wire,
+                                column_layouts.get(&wire),
+                                node_position,
+                                false,
+                                &mut export_store_cache,
+                                &mut demand,
+                                recipe.filter(|_| recording.get()),
+                            )?;
+                            if !matches!(output, ConcreteWireType::IndexedFamily { .. }) {
+                                streamed_scalar_exports.push((wire, output.clone()));
+                            }
+                        }
                         continue;
                     }
                 }
@@ -2927,6 +3918,19 @@ impl GpuDcrtBackend {
                 }
                 let Some(ty) = leaf.matrix_type() else { continue };
                 if matches!(kind, NodeKind::Input { .. }) && column_layouts.contains_key(&wire) {
+                    if streamed_outputs.contains(&wire) {
+                        self.add_streamed_scalar_export_claims(
+                            output,
+                            wire,
+                            column_layouts.get(&wire),
+                            node_position,
+                            false,
+                            &mut export_store_cache,
+                            &mut demand,
+                            recipe.filter(|_| recording.get()),
+                        )?;
+                        streamed_scalar_exports.push((wire, output.clone()));
+                    }
                     continue;
                 }
                 // The production operation owns column projection. Structural
@@ -3244,6 +4248,21 @@ impl GpuDcrtBackend {
                 }
                 layout.bound_fragment_capacities();
                 column_layouts.insert(wire, layout);
+                if streamed_outputs.contains(&wire) {
+                    self.add_streamed_scalar_export_claims(
+                        output,
+                        wire,
+                        column_layouts.get(&wire),
+                        node_position,
+                        matches!(kind, NodeKind::FamilyGetDynamic | NodeKind::Select { .. }),
+                        &mut export_store_cache,
+                        &mut demand,
+                        recipe.filter(|_| recording.get()),
+                    )?;
+                    if !matches!(output, ConcreteWireType::IndexedFamily { .. }) {
+                        streamed_scalar_exports.push((wire, output.clone()));
+                    }
+                }
             }
             // Inputs already on the device keep their native owners.
             // Merely borrowing them neither imports nor allocates another copy.
@@ -3252,6 +4271,11 @@ impl GpuDcrtBackend {
                     .get(&WireRef { node: id, port: Port(0) })
                     .is_some_and(|layout| layout.borrowed)
             {
+                for (wire, output) in streamed_scalar_exports.drain(..) {
+                    if let Some(layout) = column_layouts.get_mut(&wire) {
+                        Self::mark_streamed_scalar_output_lazy(&output, layout);
+                    }
+                }
                 continue;
             }
             // Static family access only clones a value/descriptor. Dynamic
@@ -3266,6 +4290,11 @@ impl GpuDcrtBackend {
                         !column_layouts.get(wire).is_some_and(|layout| layout.lazy)
                     }))
             {
+                for (wire, output) in streamed_scalar_exports.drain(..) {
+                    if let Some(layout) = column_layouts.get_mut(&wire) {
+                        Self::mark_streamed_scalar_output_lazy(&output, layout);
+                    }
+                }
                 continue;
             }
             // Only materializing consumers create owners for lazy inputs. Packs
@@ -3302,7 +4331,7 @@ impl GpuDcrtBackend {
                         }
                         node_position
                     } else {
-                        liveness.until(*wire).unwrap_or(node_position)
+                        liveness.cached_value_end(*wire).unwrap_or(node_position)
                     };
                     Some((*wire, argument_types[index].clone(), end))
                 })
@@ -3391,271 +4420,81 @@ impl GpuDcrtBackend {
                     }
                 }
             }
+            // Input and selection paths are fully accounted above: only after
+            // their resident/import owner handling does the executor's export
+            // replacement become the lazy descriptor seen by later consumers.
+            // Generic producers stay pending until their producer destination
+            // and retained-owner accounting below has completed.
+            if matches!(
+                kind,
+                NodeKind::Input { .. } |
+                    NodeKind::FamilyGetStatic { .. } |
+                    NodeKind::FamilyGetDynamic |
+                    NodeKind::Select { .. }
+            ) {
+                for (wire, output) in streamed_scalar_exports.drain(..) {
+                    if let Some(layout) = column_layouts.get_mut(&wire) {
+                        Self::mark_streamed_scalar_output_lazy(&output, layout);
+                    }
+                }
+            }
             until.set(node_position);
             owners.borrow_mut().clear();
             for output in imports {
                 if let Some(ty) = output.matrix_type() {
                     let params = parameters(self, ty)?;
+                    let was_recording = recording.get();
+                    if was_recording && let Some(recipe) = recipe {
+                        recipe.borrow_mut().dynamic(
+                            ty,
+                            gpu_admission_recipe::import_event(
+                                params.clone(),
+                                output.clone(),
+                                position.get(),
+                                until.get(),
+                            ),
+                        );
+                        recording.set(false);
+                    }
                     let (matrices, layouts) = import_inventory(&params, &output, scratch_columns)?;
                     for (rows, columns) in matrices {
                         add_matrix(&mut demand, ty, rows, columns);
                     }
                     add_layouts(&mut demand, ty, layouts);
+                    recording.set(was_recording);
                 }
             }
-            // Fold alternative child peaks; only simultaneously admitted
-            // siblings multiply the bound, never the total iteration count.
-            if let Some(child_id) = validated.source.child_scope_id(scope_id, id) {
-                let (child_bindings, loop_slot, count) = match kind {
-                    NodeKind::SubgraphCall(call) => (&call.bindings, None, 1),
-                    NodeKind::ParallelLoop(body) => (
-                        &body.bindings,
-                        Some(body.index_slot),
-                        body.count
-                            .evaluate(bindings)
-                            .ok()
-                            .and_then(|value| value.to_usize())
-                            .ok_or(PolyBackendError::InvalidInteger)?,
-                    ),
-                    NodeKind::SequentialLoop(body) => (
-                        &body.bindings,
-                        Some(body.index_slot),
-                        body.count
-                            .evaluate(bindings)
-                            .ok()
-                            .and_then(|value| value.to_usize())
-                            .ok_or(PolyBackendError::InvalidInteger)?,
-                    ),
-                    _ => unreachable!("validated child scope"),
-                };
-                if count == 0 {
-                    // Zero-iteration carried aliases were bound by owner lowering.
-                    continue;
-                }
-                let mut child_inputs = arguments
-                    .iter()
-                    .map(|wire| column_layouts.get(wire).cloned().unwrap_or_default())
-                    .zip(validated.source.scope(&child_id).unwrap().inputs().iter().copied())
-                    .map(|(mut cuts, wire)| {
-                        if matches!(kind, NodeKind::ParallelLoop(_)) &&
-                            !matches!(
-                                validated.scope(&child_id).unwrap().wire_types[&wire],
-                                ConcreteWireType::IndexedFamily { .. }
-                            )
-                        {
-                            cuts.lazy = false;
-                        }
-                        (wire, cuts)
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                let parallel_wave =
-                    if matches!(kind, NodeKind::ParallelLoop(_)) { wave.min(count) } else { 1 };
-                let mut child =
-                    BTreeMap::<(String, usize), (ConcreteMatrixType, GpuContextDemand)>::new();
-                let mut child_outputs = Vec::<GpuInventoryValue>::new();
-                // Walk finite alternatives on CPU and immediately fold their
-                // resource bounds. Never store descriptors for future bodies.
-                // Explicit discovery caches primitive classes, so repeated
-                // bindings do not add GPU probes. Production only looks up
-                // those templates and errors if warmup missed a class.
-                for index in 0..count {
-                    let child_env = bindings
-                        .child(child_bindings, loop_slot.map(|slot| (slot, index)))
-                        .map_err(|_| PolyBackendError::InvalidInteger)?;
-                    let (alternative, outputs, _) = self.graph_admission_demand(
-                        validated,
-                        &child_id,
-                        &child_env,
-                        None,
-                        capture_trace,
-                        Some(&child_inputs),
-                        scratch_columns,
-                        if matches!(kind, NodeKind::ParallelLoop(_)) {
-                            parallel_wave
-                        } else {
-                            wave
-                        },
-                        warm_up,
-                    )?;
-                    if let NodeKind::SequentialLoop(body) = kind {
-                        // The next iteration receives these actual carried
-                        // layouts, not the original loop inputs. In particular,
-                        // a staged descriptor can become an eager fragmented
-                        // owner (or the reverse) after the first iteration.
-                        for (wire, layout) in validated
-                            .source
-                            .scope(&child_id)
-                            .unwrap()
-                            .inputs()
-                            .iter()
-                            .take(body.carried_count)
-                            .zip(&outputs)
-                        {
-                            child_inputs.insert(*wire, layout.clone());
-                        }
-                    }
-                    for (key, (ty, alternative)) in alternative {
-                        child
-                            .entry(key)
-                            .or_insert_with(|| (ty, GpuContextDemand::default()))
-                            .1
-                            .include_alternative(alternative);
-                    }
-                    if child_outputs.is_empty() || matches!(kind, NodeKind::SequentialLoop(_)) {
-                        // A sequential loop returns only its final iteration's
-                        // layout. Earlier iterations contribute to peak demand
-                        // above, but are not alternative returned partitions.
-                        child_outputs = outputs;
-                    } else {
-                        for (layout, alternative) in child_outputs.iter_mut().zip(outputs) {
-                            layout.include_alternative(alternative);
-                        }
-                    }
-                }
-                // Inventory reads the executor's shared per-port staging
-                // decision instead of a second, node-level rule, using the same
-                // configured wave the backing is provisioned for: a parallel
-                // loop whose whole count fits one wave keeps its members as
-                // device owners, exactly as production does when it admits that
-                // wave. A body the fleet cannot run simultaneously is never
-                // planned as unstaged.
-                let staged_ports = if matches!(kind, NodeKind::ParallelLoop(_)) {
-                    let child_scope =
-                        validated.source.scope(&child_id).expect("validated child scope");
-                    let retained = crate::executor::retained_loop_output_ports(
-                        validated,
-                        scope_id,
-                        id,
-                        child_scope.outputs(),
-                    );
-                    crate::executor::staged_loop_outputs(scope_id, count, parallel_wave, &retained)
-                } else {
-                    Vec::new()
-                };
-                // Per output port: a staged port returns a fresh complete matrix
-                // through host storage, so its previous device fragments do not
-                // survive; an unstaged port keeps the child's derived layout and
-                // lives until its own owner end. A retained child output that
-                // maps to any unstaged port stays charged to that port's end.
-                let mut output_end = node_position;
-                for (port, boundaries) in child_outputs.into_iter().enumerate() {
-                    if staged_ports.get(port).copied().unwrap_or(false) {
-                        let Some(output) = output_types.get(port) else { continue };
-                        let mut leaf = output;
-                        while let ConcreteWireType::IndexedFamily { element, .. } = leaf {
-                            leaf = element;
-                        }
-                        if let Some(ty) = leaf.matrix_type() {
-                            let mut layout = GpuInventoryValue::new(vec![0, ty.columns]);
-                            layout.lazy = true;
-                            column_layouts
-                                .insert(WireRef { node: id, port: Port(port as u32) }, layout);
-                        }
-                    } else {
-                        column_layouts
-                            .insert(WireRef { node: id, port: Port(port as u32) }, boundaries);
-                        output_end = output_end.max(retained_until(port));
-                    }
-                }
-                // Provision the same simultaneous resource lifetimes as live
-                // admission. A single resolved child preserves shared owner
-                // identities; unresolved alternatives remain containing bounds.
-                for (_, (ty, child)) in &child {
-                    let child = Arc::new(GpuContextDemand::simultaneous(
-                        std::iter::repeat_with(|| child.clone()).take(parallel_wave),
-                    ));
-                    let child_projection =
-                        child.claim_projection(parameters(self, ty)?.crt_depth() - 1);
-                    let typed_claims = child.matrix_claim_envelope();
-                    let child_scope = validated.source.scope(&child_id).unwrap();
-                    let child_for_escaping = Arc::clone(&child);
-                    let escaping = |claims: &[usize]| {
-                        child_scope
-                            .outputs()
-                            .iter()
-                            .enumerate()
-                            .filter(|(port, _)| !staged_ports.get(*port).copied().unwrap_or(false))
-                            .flat_map(|(port, output)| {
-                                let child_for_claim = Arc::clone(&child_for_escaping);
-                                claims.iter().copied().map(move |claim| ValueOrigin::Child {
-                                    instance: 0,
-                                    wire: WireRef { node: id, port: Port(port as u32) },
-                                    output: *output,
-                                    parallel: matches!(kind, NodeKind::ParallelLoop(_)),
-                                    demand: Arc::clone(&child_for_claim),
-                                    claim,
-                                })
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    owners.borrow_mut().clear();
-                    for (index, ((rows, columns), end)) in
-                        child.matrices.iter().zip(&child.matrix_until).enumerate()
-                    {
-                        until.set(if *end == usize::MAX { output_end } else { node_position });
-                        add_matrix(&mut demand, ty, *rows, *columns);
-                        if *end == usize::MAX {
-                            demand
-                                .get_mut(&(ty.modulus.to_string(), ty.ring_dimension))
-                                .unwrap()
-                                .1
-                                .matrix_demands
-                                .last_mut()
-                                .unwrap()
-                                .owners = escaping(&child_projection.matrix_indices[index]);
-                        }
-                    }
-                    // The parent keeps the child's ordinary capacity shapes
-                    // above, but exact traced formats/levels are additional
-                    // simultaneous owners when the child alternatives share a
-                    // slot. Carry that canonical envelope into setup storage
-                    // so retained parent owners cannot consume the only exact
-                    // slot needed by a full live wave.
-                    for claim in typed_claims {
-                        until.set(node_position);
-                        add_typed_matrix(&mut demand, ty, claim);
-                    }
-                    for (index, ((layout, end), shared)) in child
-                        .layouts
+            // Evaluate each child with its actual binding and candidate, then
+            // project it through the same append operation used by recipe replay.
+            if validated.source.child_scope_id(scope_id, id).is_some() {
+                let mut plan = ChildNodePlan {
+                    scope_id: scope_id.clone(),
+                    bindings: bindings.clone(),
+                    operation: operation.clone(),
+                    node_position,
+                    input_layouts: arguments
                         .iter()
-                        .zip(&child.layout_until)
-                        .zip(&child.layout_shared)
-                        .enumerate()
-                    {
-                        until.set(if *end == usize::MAX { output_end } else { node_position });
-                        shared_layout.set(*shared);
-                        add_layouts(&mut demand, ty, vec![*layout]);
-                        shared_layout.set(false);
-                        if *end == usize::MAX {
-                            demand
-                                .get_mut(&(ty.modulus.to_string(), ty.ring_dimension))
-                                .unwrap()
-                                .1
-                                .workspace_demands
-                                .last_mut()
-                                .unwrap()
-                                .owners = escaping(std::slice::from_ref(
-                                &child_projection.workspace_indices[index],
-                            ));
-                        }
-                    }
+                        .filter_map(|wire| {
+                            column_layouts.get(wire).map(|layout| (*wire, layout.clone()))
+                        })
+                        .collect(),
+                    output_ends: (0..output_types.len()).map(retained_until).collect(),
+                    capture_trace,
+                    expected_layout_updates: BTreeMap::new(),
+                };
+                let child =
+                    self.evaluate_child_node(validated, &plan, scratch_columns, wave, warm_up)?;
+                child.append(&mut demand);
+                column_layouts.extend(
+                    child.layout_updates.iter().map(|(wire, layout)| (*wire, layout.clone())),
+                );
+                plan.expected_layout_updates = child.layout_updates;
+                if let Some(recipe) = recipe {
+                    recipe.borrow_mut().child(plan);
                 }
-                if matches!(kind, NodeKind::SequentialLoop(_)) {
-                    // The preceding iteration's carried outputs remain live
-                    // while the next body computes their replacements.
-                    until.set(node_position);
-                    owners.borrow_mut().clear();
-                    for (_, ty) in output_types.iter().flat_map(family_leaves) {
-                        if let ConcreteWireType::Matrix(ty) = ty {
-                            add_matrix(&mut demand, ty, ty.rows, ty.columns);
-                        } else if let Some((ty, bound)) = bound_of(ty) {
-                            let params = parameters(self, ty)?;
-                            add_layouts(
-                                &mut demand,
-                                ty,
-                                vec![compact_payload(&params, ty.rows, ty.columns, &bound)?],
-                            );
-                        }
+                for (wire, output) in streamed_scalar_exports.drain(..) {
+                    if let Some(layout) = column_layouts.get_mut(&wire) {
+                        Self::mark_streamed_scalar_output_lazy(&output, layout);
                     }
                 }
                 continue;
@@ -3790,13 +4629,7 @@ impl GpuDcrtBackend {
                 for (ty, aliases) in outputs {
                     let end = aliases
                         .iter()
-                        .map(|wire| {
-                            if checked.liveness.retained.contains(wire) {
-                                usize::MAX
-                            } else {
-                                liveness.until(*wire).unwrap_or(node_position)
-                            }
-                        })
+                        .map(|wire| liveness.cached_value_end(*wire).unwrap_or(node_position))
                         .max()
                         .unwrap_or(node_position);
                     until.set(end);
@@ -3933,6 +4766,11 @@ impl GpuDcrtBackend {
                                 .last_mut()
                                 .unwrap()
                                 .preparation = Some((owner, ordinal, evaluation));
+                            if recording.get() &&
+                                let Some(recipe) = recipe
+                            {
+                                recipe.borrow_mut().preparation((owner, ordinal, evaluation));
+                            }
                         }
                     }
                 }
@@ -3948,6 +4786,41 @@ impl GpuDcrtBackend {
                     let scratch_rows = operation.scratch_rows()?;
                     let output_layout = column_layouts.get(&WireRef { node: id, port: Port(0) });
                     let possible_levels = source_levels(output_layout, level);
+                    let was_recording = recording.get();
+                    if was_recording && let Some(recipe) = recipe {
+                        let formats = output_layout
+                            .and_then(|layout| layout.fragments.as_deref())
+                            .into_iter()
+                            .flatten()
+                            .map(|fragment| fragment.evaluation)
+                            .collect::<std::collections::BTreeSet<_>>();
+                        let formats = if formats.is_empty() {
+                            vec![false, true]
+                        } else {
+                            formats.into_iter().collect()
+                        };
+                        let copies =
+                            if matches!(operation, PreparedOperation::MultiplyCompact { .. }) {
+                                optimizer.outputs.get(&id).map_or(1, Vec::len)
+                            } else {
+                                1
+                            };
+                        let scalar_input = argument_types.iter().any(|ty| matches!(ty, ConcreteWireType::Matrix(ty) if ty.rows == 1 && ty.columns == 1));
+                        recipe.borrow_mut().dynamic(
+                            ty,
+                            gpu_admission_recipe::primitive_event(
+                                operation.clone(),
+                                params.clone(),
+                                ty.clone(),
+                                possible_levels.clone(),
+                                formats,
+                                copies,
+                                scalar_input,
+                                node_position,
+                            )?,
+                        );
+                        recording.set(false);
+                    }
                     if possible_levels.iter().any(|possible| *possible != level) {
                         let formats = output_layout
                             .and_then(|layout| layout.fragments.as_deref())
@@ -4009,6 +4882,7 @@ impl GpuDcrtBackend {
                     shared_layout.set(true);
                     add_layouts(&mut demand, ty, shared);
                     shared_layout.set(false);
+                    recording.set(was_recording);
                 }
             }
             // Kind-specific native scratch at the candidate range width.
@@ -4126,6 +5000,21 @@ impl GpuDcrtBackend {
                     // The real trapdoor is already a retained input. Synthetic
                     // trapdoor construction belongs only to explicit discovery.
                     let mut claims = Vec::new();
+                    let was_recording = recording.get();
+                    if was_recording && let Some(recipe) = recipe {
+                        recipe.borrow_mut().dynamic(
+                            ty,
+                            gpu_admission_recipe::preimage_event(
+                                plan.clone(),
+                                params.clone(),
+                                public.rows,
+                                ty.clone(),
+                                bound.clone(),
+                                node_position,
+                            ),
+                        );
+                        recording.set(false);
+                    }
                     let width = ty.columns.min(scratch_columns);
                     claims.extend(
                         plan.tile_claims(&params, public.rows, width)
@@ -4153,24 +5042,57 @@ impl GpuDcrtBackend {
                             .collect(),
                     );
                     shared_layout.set(false);
+                    recording.set(was_recording);
                 }
                 NodeKind::Concat { axis: ConcatAxis::Rows } => {
                     // Fused row sums reduce large groups through one-row
                     // intermediates; provision one per concatenated block.
                     if let ConcreteWireType::Matrix(ty) = &output_types[0] {
+                        let was_recording = recording.get();
+                        if was_recording && let Some(recipe) = recipe {
+                            recipe.borrow_mut().dynamic(
+                                ty,
+                                gpu_admission_recipe::row_scratch_event(
+                                    ty.columns,
+                                    argument_types.len(),
+                                    node_position,
+                                ),
+                            );
+                            recording.set(false);
+                        }
                         for _ in argument_types {
                             add_matrix(&mut demand, ty, 1, ty.columns.min(scratch_columns));
                         }
+                        recording.set(was_recording);
                     }
                 }
                 NodeKind::Tensor => {
                     if let ConcreteWireType::Matrix(ty) = &output_types[0] {
+                        let was_recording = recording.get();
+                        if was_recording && let Some(recipe) = recipe {
+                            recipe.borrow_mut().dynamic(
+                                ty,
+                                gpu_admission_recipe::row_scratch_event(
+                                    ty.columns,
+                                    1,
+                                    node_position,
+                                ),
+                            );
+                            recording.set(false);
+                        }
                         add_matrix(&mut demand, ty, 1, ty.columns.min(scratch_columns));
+                        recording.set(was_recording);
                     }
                 }
                 _ => {}
             }
+            for (wire, output) in streamed_scalar_exports.drain(..) {
+                if let Some(layout) = column_layouts.get_mut(&wire) {
+                    Self::mark_streamed_scalar_output_lazy(&output, layout);
+                }
+            }
         }
+        recording.set(true);
         owners.borrow_mut().clear();
         position.set(checked.execution_order.len());
         until.set(position.get());
@@ -4189,12 +5111,25 @@ impl GpuDcrtBackend {
             while let ConcreteWireType::IndexedFamily { element, .. } = output_type {
                 output_type = element;
             }
-            if *scope_id == FrozenGraphScopeId::Root &&
-                column_layouts.get(output).is_some_and(|layout| layout.lazy)
-            {
+            // A root parallel-loop family is encoded and stored member by
+            // member while its wave executes. `persist_outputs` receives only
+            // the resulting staged-family descriptor, so it does not perform
+            // a second export at this final graph position. Its transfer
+            // claims are already represented by the loop's wave demand.
+            if streamed_outputs.contains(output) {
+                continue;
+            }
+            // Each non-streamed export is persisted after the preceding one;
+            // its claims therefore begin and end at this export position.
+            // This lets the broker reuse one transfer buffer between outputs.
+            until.set(position.get());
+            if column_layouts.get(output).is_some_and(|layout| layout.lazy) {
                 // materialize_output recursively loads the entire requested
                 // family. Every imported member remains owned by the result;
                 // only its transfer scratch can be reused between members.
+                // Root parallel-loop exports are excluded: execution writes
+                // those members one wave at a time through the staged-family
+                // path, then returns a descriptor without reloading them.
                 until.set(usize::MAX);
                 for (path, leaf) in family_leaves(declared_output) {
                     *owners.borrow_mut() = vec![(*output, path)];
@@ -4213,12 +5148,26 @@ impl GpuDcrtBackend {
                 owners.borrow_mut().clear();
                 if let Some(ty) = output_type.matrix_type() {
                     let params = parameters(self, ty)?;
+                    let was_recording = recording.get();
+                    if was_recording && let Some(recipe) = recipe {
+                        recipe.borrow_mut().dynamic(
+                            ty,
+                            gpu_admission_recipe::import_event(
+                                params.clone(),
+                                output_type.clone(),
+                                position.get(),
+                                until.get(),
+                            ),
+                        );
+                        recording.set(false);
+                    }
                     let (matrices, layouts) =
                         import_inventory(&params, output_type, scratch_columns)?;
                     for (rows, columns) in matrices {
                         add_matrix(&mut demand, ty, rows, columns);
                     }
                     add_layouts(&mut demand, ty, layouts);
+                    recording.set(was_recording);
                 }
             }
             match output_type {
@@ -4260,6 +5209,11 @@ impl GpuDcrtBackend {
                 }
                 _ => {}
             }
+            // The executor persists outputs in this declaration order. Give
+            // each export its own logical host step so a transfer buffer is
+            // reused by the next export instead of being charged as
+            // simultaneously live with every later output.
+            position.set(position.get().saturating_add(1));
         }
         // Keep a compact reverse alias graph. Value queries resolve only the
         // requested member paths; nested repeated packs never expand eagerly.
@@ -4326,6 +5280,1185 @@ impl GpuDcrtBackend {
 
 #[cfg(test)]
 mod tests {
+    use super::GpuInventoryValue;
+    use mxx_ir_core::types::{Port, WireRef};
+    use std::cell::RefCell;
+
+    fn assert_recipe_matches_candidates(
+        backend: &mut super::GpuDcrtBackend,
+        graph: &mxx_ir_core::ValidatedGraph,
+        inputs: Option<&BTreeMap<WireRef, GpuInventoryValue>>,
+    ) {
+        assert!(
+            super::admission_recipe_supported(graph),
+            "this regression graph must exercise the recipe, not fallback"
+        );
+        let operations = super::GpuDcrtBackend::lower_inventory_scope(
+            &backend.devices[0].1,
+            graph,
+            &FrozenGraphScopeId::Root,
+            &graph.bindings,
+        )
+        .unwrap();
+        let optimizer = crate::executor::gpu_plan::inventory_plan(graph, false);
+        let liveness = crate::executor::gpu_plan::owner_liveness(
+            graph,
+            &FrozenGraphScopeId::Root,
+            &graph.bindings,
+            &optimizer,
+            false,
+        )
+        .unwrap();
+        let invariant = super::AdmissionInvariant {
+            optimizer,
+            liveness,
+            streamed_outputs: crate::executor::gpu_plan::streamed_root_outputs(
+                graph,
+                &FrozenGraphScopeId::Root,
+            ),
+        };
+        let recorder = RefCell::new(super::ScopeDemandRecipe::default());
+        super::start_admission_diagnostics(true);
+        let initial = backend
+            .graph_admission_demand_with_invariant(
+                graph,
+                &FrozenGraphScopeId::Root,
+                &graph.bindings,
+                Some(&operations),
+                false,
+                inputs,
+                3,
+                2,
+                false,
+                Some(&invariant),
+                Some(&recorder),
+            )
+            .unwrap();
+        let mut recipe = recorder.into_inner();
+        recipe.finish(&initial.0, initial.1, initial.2);
+        let candidates = [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)];
+        let replayed = candidates
+            .iter()
+            .map(|&(wave, width)| recipe.replay(backend, graph, width, wave).unwrap())
+            .collect::<Vec<_>>();
+        let counters = super::finish_admission_diagnostics(true);
+        assert_eq!(
+            counters.root_builder_calls, 1,
+            "candidate replay must not walk the root IR again"
+        );
+        assert!(candidates.len() > 1);
+        assert_eq!(counters.dynamic_child_calls, recipe.child_event_count() * candidates.len());
+        if recipe.child_event_count() > 0 {
+            assert!(
+                counters.child_builder_calls > counters.dynamic_child_calls,
+                "bound child bodies must be evaluated in both compilation and replay"
+            );
+        }
+        let mut replay_bytes = BTreeMap::new();
+        let mut oracle_bytes = BTreeMap::new();
+        for ((wave, width), contexts) in candidates.into_iter().zip(replayed) {
+            let expected = backend
+                .graph_admission_demand(
+                    graph,
+                    &FrozenGraphScopeId::Root,
+                    &graph.bindings,
+                    Some(&operations),
+                    false,
+                    inputs,
+                    width,
+                    wave,
+                    false,
+                )
+                .unwrap();
+            assert!(
+                contexts == expected.0,
+                "recipe contexts mismatch at wave={wave} width={width}"
+            );
+            assert!(
+                recipe.outputs == expected.1 && recipe.layouts == expected.2,
+                "recipe output layout mismatch at wave={wave} width={width}"
+            );
+            let inventory = Vec::new();
+            replay_bytes.insert(
+                (wave, width),
+                backend.prepared_demand_bytes(&contexts, &inventory).unwrap(),
+            );
+            oracle_bytes.insert(
+                (wave, width),
+                backend.prepared_demand_bytes(&expected.0, &inventory).unwrap(),
+            );
+            assert_eq!(replay_bytes[&(wave, width)], oracle_bytes[&(wave, width)]);
+            let available = vec![0; backend.devices.len()];
+            assert_eq!(
+                backend.prepared_demand_breakdown(&contexts, &inventory, &available).unwrap(),
+                backend.prepared_demand_breakdown(&expected.0, &inventory, &available).unwrap()
+            );
+        }
+        for available in std::iter::once(0)
+            .chain(oracle_bytes.values().filter_map(|bytes| bytes.iter().max().copied()))
+        {
+            let select = |bytes: &BTreeMap<(usize, usize), Vec<usize>>| {
+                super::select_wave_and_width(2, 3, |wave, width| {
+                    Ok::<_, ()>(
+                        bytes[&(wave, width)].iter().all(|&bytes| bytes <= available).then_some(()),
+                    )
+                })
+                .unwrap()
+            };
+            assert_eq!(
+                select(&replay_bytes),
+                select(&oracle_bytes),
+                "selection mismatch at available={available}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_transfer_workspaces_are_sequential_capacity() {
+        let claim = super::GpuTracedClaim::matrix(2, 3, 0, true);
+        let layout = super::GpuPreparedWorkspaceLayout {
+            kind: super::GpuPreparedSlotKind::TransferWorkspace,
+            bytes: 1024,
+            alignment: 1,
+        };
+        let mut exports = super::GpuContextDemand::default();
+        for position in [10, 11] {
+            // A streamed matrix export retains the original and one
+            // readback clone concurrently, plus two transfer workspaces.
+            exports.matrix_claim(position, position, claim);
+            exports.matrix_claim(position, position, claim);
+            exports.workspace(position, position, layout, false);
+            exports.workspace(position, position, layout, false);
+        }
+        assert!(exports.matrix_demands.iter().all(|demand| demand.begin <= demand.end));
+        assert!(exports.workspace_demands.iter().all(|demand| demand.begin <= demand.end));
+        assert_eq!(exports.matrices.len(), 2, "original plus clone are reused per export");
+        assert_eq!(exports.layouts.len(), 2, "two transfer buffers are reused per export");
+        assert_eq!(exports.workspace_demands.len(), 4, "two simultaneous buffers per export");
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_streamed_private_matrix_input_export_claims() {
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let context = DslContext::new("admission-streamed-private-input");
+        let input = ring.input("input", (2, 3));
+        let graph = context
+            .private_output("output", input)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let input_wire = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find_map(|(position, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { .. }).then_some(
+                    WireRef { node: mxx_ir_core::types::NodeId(position as u64), port: Port(0) },
+                )
+            })
+            .unwrap();
+        let mut layout = GpuInventoryValue::new(vec![0, 3]);
+        layout.fragments = Some(
+            vec![super::super::gpu_prepare::MatrixInputFragment {
+                device,
+                context: params.context_identity(),
+                start: 0,
+                end: 3,
+                level: params.crt_depth() - 1,
+                evaluation: true,
+            }]
+            .into(),
+        );
+        layout.bound_fragment_capacities();
+        let input_columns = BTreeMap::from([(input_wire, layout)]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        assert_recipe_matches_candidates(&mut backend, &graph, Some(&input_columns));
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                Some(&input_columns),
+                3,
+                1,
+                false,
+            )
+            .unwrap();
+        let (_, demand) = demand.values().next().unwrap();
+        assert!(
+            demand.matrix_demands.iter().all(|claim| claim.begin <= claim.end) &&
+                demand.workspace_demands.iter().all(|claim| claim.begin <= claim.end),
+            "production admission must never emit an inverted lifetime interval"
+        );
+        assert!(demand.matrix_claim_envelope().iter().any(|claim| {
+            claim.kind() == super::GpuPreparedSlotKind::Matrix && claim.level().is_some()
+        }));
+        assert!(demand.workspace_demands.iter().any(|workspace| {
+            workspace.begin == 0 &&
+                workspace.end == 0 &&
+                workspace.layout.kind == super::GpuPreparedSlotKind::SubmissionStream
+        }));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_streamed_dynamic_selection_keeps_level_format_alternatives() {
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let context = DslContext::new("admission-streamed-dynamic-selection");
+        let index = context.input::<mxx_dsl::Int>("index", mxx_dsl::IntType).unwrap();
+        let left = ring.input("left", (1, 1));
+        let right = ring.input("right", (1, 1));
+        let selected = mxx_dsl::select(index, vec![left, right]).unwrap();
+        let graph = context
+            .private_output("selected", selected)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut input_columns = BTreeMap::new();
+        for (position, node) in graph.root_scope().execution_order.iter().enumerate() {
+            let mxx_ir_core::node::NodeKind::Input { name, .. } = node.kind() else { continue };
+            let level = if name == "left" {
+                0
+            } else if name == "right" {
+                1
+            } else {
+                continue
+            };
+            let wire = WireRef { node: mxx_ir_core::types::NodeId(position as u64), port: Port(0) };
+            let mut layout = GpuInventoryValue::new(vec![0, 1]);
+            layout.fragments = Some(
+                vec![super::super::gpu_prepare::MatrixInputFragment {
+                    device,
+                    context: params.context_identity(),
+                    start: 0,
+                    end: 1,
+                    level,
+                    evaluation: level == 1,
+                }]
+                .into(),
+            );
+            layout.bound_fragment_capacities();
+            input_columns.insert(wire, layout);
+        }
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        assert_recipe_matches_candidates(&mut backend, &graph, Some(&input_columns));
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                Some(&input_columns),
+                1,
+                1,
+                false,
+            )
+            .unwrap();
+        let (_, demand) = demand.values().next().unwrap();
+        let typed_claims = demand.matrix_claim_envelope();
+        let mut alternatives =
+            typed_claims.iter().map(|claim| (claim.level(), claim.is_evaluation()));
+        assert!(
+            alternatives
+                .clone()
+                .any(|(level, evaluation)| level == Some(0) && evaluation == Some(false))
+        );
+        assert!(
+            alternatives.any(|(level, evaluation)| level == Some(1) && evaluation == Some(true))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_artifact_input_reexport_includes_import_and_readback() {
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 3,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let manifest = Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(
+                "input".into(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::Matrix(ty.clone()),
+                    family_count: None,
+                    confidentiality: ArtifactConfidentiality::Private,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        let input = ring.artifact_input(
+            production.clone(),
+            "input",
+            (2, 3),
+            ArtifactConfidentiality::Private,
+        );
+        let graph = DslContext::new("admission-artifact-input-reexport")
+            .private_output("output", input)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let input_wire = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find_map(|(position, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { .. }).then_some(
+                    WireRef { node: mxx_ir_core::types::NodeId(position as u64), port: Port(0) },
+                )
+            })
+            .unwrap();
+        let mut input_layout = GpuInventoryValue::new(vec![0, ty.columns]);
+        input_layout.lazy = true;
+        let input_columns = BTreeMap::from([(input_wire, input_layout)]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        assert_recipe_matches_candidates(&mut backend, &graph, Some(&input_columns));
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                Some(&input_columns),
+                ty.columns,
+                1,
+                false,
+            )
+            .unwrap();
+        let (_, demand) = demand.values().next().unwrap();
+        assert!(demand.matrix_demands.len() >= 2, "import destination and readback clone");
+        assert!(
+            demand.workspace_demands.iter().any(|workspace| {
+                workspace.layout.kind == GpuPreparedSlotKind::SubmissionStream
+            })
+        );
+        assert!(
+            demand.workspace_demands.iter().any(|workspace| {
+                workspace.layout.kind != GpuPreparedSlotKind::SubmissionStream
+            })
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_static_staged_family_reexport_includes_import_and_readback() {
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let production =
+            ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
+        let ty = ConcreteMatrixType {
+            rows: 1,
+            columns: 1,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        let manifest = Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(
+                "members".into(),
+                ManifestArtifact {
+                    artifact_type: ArtifactType::Matrix(ty.clone()),
+                    family_count: Some(2),
+                    confidentiality: ArtifactConfidentiality::Private,
+                    content_hash: None,
+                    layout: None,
+                },
+            )]),
+        };
+        let family = ring.family_artifact_input(
+            production.clone(),
+            "members",
+            2,
+            (1, 1),
+            ArtifactConfidentiality::Private,
+        );
+        let graph = DslContext::new("admission-static-staged-family-reexport")
+            .private_output("selected", family.at(0))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .unwrap();
+        let input_wire = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find_map(|(position, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { .. }).then_some(
+                    WireRef { node: mxx_ir_core::types::NodeId(position as u64), port: Port(0) },
+                )
+            })
+            .unwrap();
+        let mut input_layout = GpuInventoryValue::new(vec![0, ty.columns]);
+        input_layout.lazy = true;
+        let input_columns = BTreeMap::from([(input_wire, input_layout)]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                Some(&input_columns),
+                ty.columns,
+                1,
+                false,
+            )
+            .unwrap();
+        let (_, demand) = demand.values().next().unwrap();
+        assert!(demand.matrix_demands.len() >= 2, "static selection import and readback clone");
+        assert!(
+            demand.workspace_demands.iter().any(|workspace| {
+                workspace.layout.kind == GpuPreparedSlotKind::SubmissionStream
+            })
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_lazy_bounded_reexport_keeps_import_and_destination_payloads() {
+        use mxx_ir_core::artifact::{
+            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+            SpecHash,
+        };
+
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let ty = ConcreteMatrixType {
+            rows: 2,
+            columns: 1,
+            ring_dimension: n as usize,
+            modulus: params.modulus().as_ref().clone().into(),
+        };
+        for preimage in [false, true] {
+            let production = ProductionId {
+                spec_hash: SpecHash(rand::random()),
+                execution_nonce: rand::random(),
+            };
+            let artifact_type = if preimage {
+                ArtifactType::Preimage { matrix: ty.clone(), max_coefficient_bound: 7.into() }
+            } else {
+                ArtifactType::SmallMatrix { matrix: ty.clone(), max_coefficient_bound: 7.into() }
+            };
+            let manifest = Manifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([(
+                    "compact".into(),
+                    ManifestArtifact {
+                        artifact_type,
+                        family_count: None,
+                        confidentiality: ArtifactConfidentiality::Private,
+                        content_hash: None,
+                        layout: None,
+                    },
+                )]),
+            };
+            let graph = if preimage {
+                let input = ring.preimage_artifact_input(
+                    production.clone(),
+                    "compact",
+                    (2, 1),
+                    7,
+                    ArtifactConfidentiality::Private,
+                );
+                DslContext::new("admission-lazy-preimage-reexport")
+                    .private_output("output", input)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([(production.clone(), manifest.clone())]),
+                    )
+                    .unwrap()
+            } else {
+                let input = ring.small_matrix_artifact_input(
+                    production.clone(),
+                    "compact",
+                    (2, 1),
+                    7,
+                    ArtifactConfidentiality::Private,
+                );
+                DslContext::new("admission-lazy-small-matrix-reexport")
+                    .private_output("output", input)
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_manifests(
+                        &ParamEnv::default(),
+                        &BTreeMap::from([(production, manifest)]),
+                    )
+                    .unwrap()
+            };
+            let input_wire = graph
+                .root_scope()
+                .execution_order
+                .iter()
+                .enumerate()
+                .find_map(|(position, node)| {
+                    matches!(node.kind(), mxx_ir_core::node::NodeKind::Input { .. }).then_some(
+                        WireRef {
+                            node: mxx_ir_core::types::NodeId(position as u64),
+                            port: Port(0),
+                        },
+                    )
+                })
+                .unwrap();
+            let mut input_layout = GpuInventoryValue::new(vec![0, ty.columns]);
+            input_layout.lazy = true;
+            let input_columns = BTreeMap::from([(input_wire, input_layout)]);
+            let mut backend = crate::backend::poly_gpu::gpu_backend_on([params.clone()], [device]);
+            assert_recipe_matches_candidates(&mut backend, &graph, Some(&input_columns));
+            let (demand, _, _) = backend
+                .graph_admission_demand(
+                    &graph,
+                    &FrozenGraphScopeId::Root,
+                    &ParamEnv::default(),
+                    None,
+                    false,
+                    Some(&input_columns),
+                    ty.columns,
+                    1,
+                    false,
+                )
+                .unwrap();
+            let (_, demand) = demand.values().next().unwrap();
+            let compact_payloads = demand
+                .workspace_demands
+                .iter()
+                .filter(|workspace| workspace.layout.kind == GpuPreparedSlotKind::CompactPayload)
+                .count();
+            let input_position = input_wire.node.0 as usize;
+            let compact_payloads_at_input = demand
+                .workspace_demands
+                .iter()
+                .filter(|workspace| {
+                    workspace.layout.kind == GpuPreparedSlotKind::CompactPayload &&
+                        workspace.begin == input_position &&
+                        workspace.end == input_position
+                })
+                .count();
+            let completion_events = demand
+                .workspace_demands
+                .iter()
+                .filter(|workspace| workspace.layout.kind == GpuPreparedSlotKind::CompletionEvent)
+                .count();
+            assert!(
+                compact_payloads >= 2,
+                "lazy bounded export needs import scratch plus retained destination: {compact_payloads}"
+            );
+            assert!(
+                compact_payloads_at_input >= 2,
+                "lazy bounded export must overlap import scratch and destination at the producer: {compact_payloads_at_input}"
+            );
+            assert_eq!(
+                completion_events,
+                1 + super::import_inventory(
+                    &params,
+                    &graph.root_scope().wire_types[&input_wire],
+                    ty.columns
+                )
+                .unwrap()
+                .1
+                .iter()
+                .filter(|layout| layout.kind == GpuPreparedSlotKind::CompletionEvent)
+                .count(),
+                "bounded export resources must not multiply by unresolved CRT levels/formats"
+            );
+            let operations = super::GpuDcrtBackend::lower_inventory_scope(
+                &backend.devices[0].1,
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &graph.bindings,
+            )
+            .unwrap();
+            let optimizer = crate::executor::gpu_plan::inventory_plan(&graph, false);
+            let liveness = crate::executor::gpu_plan::owner_liveness(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &graph.bindings,
+                &optimizer,
+                false,
+            )
+            .unwrap();
+            let invariant = super::AdmissionInvariant {
+                optimizer,
+                liveness,
+                streamed_outputs: crate::executor::gpu_plan::streamed_root_outputs(
+                    &graph,
+                    &FrozenGraphScopeId::Root,
+                ),
+            };
+            for (wave, width) in [(1, 1), (1, ty.columns), (2, 1)] {
+                let uncached = backend
+                    .graph_admission_demand(
+                        &graph,
+                        &FrozenGraphScopeId::Root,
+                        &graph.bindings,
+                        Some(&operations),
+                        false,
+                        Some(&input_columns),
+                        width,
+                        wave,
+                        false,
+                    )
+                    .unwrap();
+                let cached = backend
+                    .graph_admission_demand_with_invariant(
+                        &graph,
+                        &FrozenGraphScopeId::Root,
+                        &graph.bindings,
+                        Some(&operations),
+                        false,
+                        Some(&input_columns),
+                        width,
+                        wave,
+                        false,
+                        Some(&invariant),
+                        None,
+                    )
+                    .unwrap();
+                assert!(
+                    cached.0 == uncached.0 && cached.1 == uncached.1 && cached.2 == uncached.2,
+                    "cached lazy bounded demand mismatch at wave={wave}, width={width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_reloads_exported_fresh_bounded_scalar_for_later_multiply() {
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let context = DslContext::new("admission-exported-fresh-bounded-reload");
+        let key = ring.bytes_input("key", 32);
+        // Use the complete configured gadget decomposition. A one-digit small
+        // decomposition is not a legal native layout for this full CRT chain.
+        let digits = params.compact_decomposition_layout(false, None).unwrap().rows_per_input_row;
+        let bounded = ring.hash_decomposed(key, b"reload".as_slice(), (2 * digits, 1), 16, digits);
+        let matrix = ring.input("matrix", (2, 2 * digits));
+        let product = matrix.mul_small_rhs(bounded.clone());
+        let graph = context
+            .private_output("bounded", bounded)
+            .unwrap()
+            .output("product", product)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        let key_value = RuntimeValue::Bytes((0..32).map(|value| value as u8).collect());
+        // Hash resource classes must be discovered before production demand is
+        // queried; this is the same warmup/production sequence as execution.
+        drop(
+            backend
+                .prepare_graph_admission(
+                    &graph,
+                    false,
+                    &BTreeMap::from([("key".into(), key_value)]),
+                    1,
+                    true,
+                )
+                .unwrap(),
+        );
+        assert_recipe_matches_candidates(&mut backend, &graph, None);
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                None,
+                1,
+                1,
+                false,
+            )
+            .unwrap();
+        let compact_payloads = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.workspace_demands)
+            .filter(|workspace| workspace.layout.kind == GpuPreparedSlotKind::CompactPayload)
+            .count();
+        let pinned_uploads = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.workspace_demands)
+            .filter(|workspace| workspace.layout.kind == GpuPreparedSlotKind::PinnedHost)
+            .count();
+        let hash_position = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find_map(|(position, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::HashSample { .. })
+                    .then_some(position)
+            })
+            .expect("fresh bounded producer");
+        let producer_compact_payloads = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.workspace_demands)
+            .filter(|workspace| {
+                workspace.layout.kind == GpuPreparedSlotKind::CompactPayload &&
+                    workspace.begin == hash_position &&
+                    workspace.end == hash_position
+            })
+            .count();
+        let producer_export_events = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.workspace_demands)
+            .filter(|workspace| {
+                workspace.layout.kind == GpuPreparedSlotKind::CompletionEvent &&
+                    workspace.begin == hash_position &&
+                    workspace.end == hash_position
+            })
+            .count();
+        assert!(
+            compact_payloads >= 2,
+            "reloading the exported bounded scalar needs scratch plus destination: {compact_payloads}"
+        );
+        assert!(pinned_uploads >= 1, "ImportCompact reload needs upload staging");
+        assert!(
+            producer_compact_payloads >= 1 && producer_export_events >= 1,
+            "fresh bounded producer destination and export completion must overlap at producer position {hash_position}: compact={producer_compact_payloads}, events={producer_export_events}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_graph_admission_reloads_exported_child_matrix_before_later_consumer() {
+        use mxx_dsl::{Mat, MatType, Subgraph};
+
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let context = DslContext::new("admission-exported-child-matrix-reload");
+        let child = Subgraph::<Mat, Mat>::define(
+            "identity-child-matrix",
+            MatType(ring.matrix_type((1, 1))),
+            |value| Ok(value),
+        )
+        .unwrap();
+        let child_value = child.call(ring.input("child_input", (1, 1))).unwrap();
+        let product = child_value.clone() * ring.input("factor", (1, 1));
+        let graph = context
+            .private_output("child", child_value)
+            .unwrap()
+            .output("product", product)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let zero = || {
+            RuntimeValue::matrix(
+                GpuDCRTPolyMatrix::new_zero_with_state(&params, 1, 1, params.crt_depth() - 1, true)
+                    .into(),
+            )
+        };
+        let inputs = BTreeMap::from([("child_input".into(), zero()), ("factor".into(), zero())]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        drop(backend.prepare_graph_admission(&graph, false, &inputs, 1, true).unwrap());
+        let (demand, _, _) = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                None,
+                false,
+                None,
+                1,
+                1,
+                false,
+            )
+            .unwrap();
+        let child_position = graph
+            .root_scope()
+            .execution_order
+            .iter()
+            .enumerate()
+            .find_map(|(position, node)| {
+                matches!(node.kind(), mxx_ir_core::node::NodeKind::SubgraphCall(_))
+                    .then_some(position)
+            })
+            .expect("child call");
+        let reloaded_matrices = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.matrix_demands)
+            .filter(|matrix| matrix.begin > child_position)
+            .count();
+        let import_workspaces = demand
+            .values()
+            .flat_map(|(_, demand)| &demand.workspace_demands)
+            .filter(|workspace| {
+                workspace.begin > child_position &&
+                    matches!(
+                        workspace.layout.kind,
+                        GpuPreparedSlotKind::SubmissionStream | GpuPreparedSlotKind::PinnedHost
+                    )
+            })
+            .count();
+        assert!(
+            reloaded_matrices >= 1 && import_workspaces >= 1,
+            "exported child matrix must be re-imported before its later consumer: matrices={reloaded_matrices}, workspaces={import_workspaces}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_cached_admission_invariant_matches_uncached_candidates() {
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let family = mxx_dsl::parallel(2, |_| Ok(ring.input("input", (2, 3)))).unwrap();
+        let graph = DslContext::new("cached-admission-invariant")
+            .private_output("output", family)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        assert_recipe_matches_candidates(&mut backend, &graph, None);
+        let operations = super::GpuDcrtBackend::lower_inventory_scope(
+            &backend.devices[0].1,
+            &graph,
+            &FrozenGraphScopeId::Root,
+            &graph.bindings,
+        )
+        .unwrap();
+        let optimizer = crate::executor::gpu_plan::inventory_plan(&graph, false);
+        let liveness = crate::executor::gpu_plan::owner_liveness(
+            &graph,
+            &FrozenGraphScopeId::Root,
+            &graph.bindings,
+            &optimizer,
+            false,
+        )
+        .unwrap();
+        let invariant = super::AdmissionInvariant {
+            optimizer,
+            liveness,
+            streamed_outputs: crate::executor::gpu_plan::streamed_root_outputs(
+                &graph,
+                &FrozenGraphScopeId::Root,
+            ),
+        };
+        for (wave, width) in [(1, 1), (1, 3), (2, 1), (2, 3)] {
+            let uncached = backend
+                .graph_admission_demand(
+                    &graph,
+                    &FrozenGraphScopeId::Root,
+                    &graph.bindings,
+                    Some(&operations),
+                    false,
+                    None,
+                    width,
+                    wave,
+                    false,
+                )
+                .unwrap();
+            let cached = backend
+                .graph_admission_demand_with_invariant(
+                    &graph,
+                    &FrozenGraphScopeId::Root,
+                    &graph.bindings,
+                    Some(&operations),
+                    false,
+                    None,
+                    width,
+                    wave,
+                    false,
+                    Some(&invariant),
+                    None,
+                )
+                .unwrap();
+            assert!(cached.0 == uncached.0, "demand mismatch at wave={wave}, width={width}");
+            assert!(cached.1 == uncached.1, "input layout mismatch at wave={wave}, width={width}");
+            assert!(cached.2 == uncached.2, "value layout mismatch at wave={wave}, width={width}");
+        }
+    }
+
+    #[test]
+    fn admission_diagnostic_labels_are_bounded_and_stable() {
+        let mut labels = super::DiagnosticLabels::default();
+        labels.push("wire/node1:0".to_owned());
+        labels.push("wire/node2:0".to_owned());
+        labels.push("wire/node3:0".to_owned());
+        labels.push("wire/node4:0".to_owned());
+        labels.push("wire/node2:0".to_owned());
+        assert_eq!(labels.render(), "wire/node1:0,wire/node2:0,wire/node3:0,+1");
+    }
+
+    #[test]
+    fn extreme_breakdown_requires_a_multi_device_backend() {
+        assert!(!super::admission_extreme_breakdown_requested(false, 4));
+        assert!(!super::admission_extreme_breakdown_requested(true, 0));
+        assert!(!super::admission_extreme_breakdown_requested(true, 1));
+        assert!(super::admission_extreme_breakdown_requested(true, 2));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_admission_recipe_nested_bindings_and_sequential_fallback() {
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            return
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 3, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let members = ring.input_family("members", 2, (2, 3));
+        let family = mxx_dsl::parallel(3, |index| {
+            let selected = members.at(index % 2);
+            mxx_dsl::iterate(2, selected, |_, state| Ok(-state))
+        })
+        .unwrap();
+        let graph = DslContext::new("recipe-nested-bindings")
+            .private_output("family", family.clone())
+            .unwrap()
+            .output("selected", -family.at(1))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        assert!(super::admission_recipe_supported(&graph));
+        assert!(
+            !crate::executor::gpu_plan::streamed_root_outputs(&graph, &FrozenGraphScopeId::Root)
+                .is_empty()
+        );
+        assert!(
+            graph
+                .root_scope()
+                .execution_order
+                .iter()
+                .any(|node| matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)))
+        );
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        assert_recipe_matches_candidates(&mut backend, &graph, None);
+
+        let state =
+            mxx_dsl::iterate(2, ring.input("state", (2, 3)), |_, state| Ok(-state)).unwrap();
+        let graph = DslContext::new("recipe-sequential-fallback")
+            .output("state", state)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        assert!(!super::admission_recipe_supported(&graph));
+        let inputs = BTreeMap::new();
+        let (wave, width, actual) =
+            backend.graph_resource_demand(&graph, false, &inputs, 2, &[usize::MAX]).unwrap();
+        assert_eq!((wave, width), (2, 3));
+        let expected = backend
+            .graph_admission_demand(
+                &graph,
+                &FrozenGraphScopeId::Root,
+                &graph.bindings,
+                None,
+                false,
+                Some(&inputs),
+                width,
+                wave,
+                false,
+            )
+            .unwrap();
+        assert!(actual.contexts == expected.0 && actual.value_layouts == vec![expected.2]);
+    }
+
     #[test]
     fn test_inventory_alternative_layout_preserves_all_source_levels() {
         use super::{super::gpu_prepare::MatrixInputFragment, GpuInventoryValue, source_levels};
@@ -4551,6 +6684,61 @@ mod tests {
         assert!(claims.iter().any(|claim| {
             claim.rows() == 2 && claim.level() == Some(1) && claim.is_evaluation() == Some(false)
         }));
+    }
+
+    #[test]
+    fn test_node_local_alternatives_keep_absolute_anchor_for_later_reuse() {
+        use super::{
+            GpuContextDemand, GpuPreparedSlotKind, GpuPreparedWorkspaceLayout, GpuTracedClaim,
+        };
+
+        let local_group = |position, level| {
+            let mut demand = GpuContextDemand::default();
+            demand.matrix_claim(position, position, GpuTracedClaim::matrix(1, 1, level, false));
+            demand.matrix_claim(position, position, GpuTracedClaim::matrix(1, 1, level + 1, false));
+            demand.workspace(
+                position,
+                position,
+                GpuPreparedWorkspaceLayout {
+                    bytes: 64,
+                    alignment: 8,
+                    kind: GpuPreparedSlotKind::BatchWorkspace,
+                },
+                false,
+            );
+            demand.workspace(
+                position,
+                position,
+                GpuPreparedWorkspaceLayout {
+                    bytes: 64,
+                    alignment: 8,
+                    kind: GpuPreparedSlotKind::BatchWorkspace,
+                },
+                false,
+            );
+            demand
+        };
+
+        let mut first = local_group(7, 1);
+        first.include_alternative(local_group(7, 2));
+        assert!(first.matrix_demands.iter().all(|demand| demand.begin == 7));
+        assert!(first.workspace_demands.iter().all(|demand| demand.begin == 7));
+
+        let mut later = local_group(19, 1);
+        later.include_alternative(local_group(19, 2));
+        let combined = GpuContextDemand::simultaneous([first, later]);
+        assert!(combined.matrix_demands.iter().any(|demand| demand.begin == 7));
+        assert!(combined.matrix_demands.iter().any(|demand| demand.begin == 19));
+        assert!(combined.workspace_demands.iter().any(|demand| demand.begin == 7));
+        assert!(combined.workspace_demands.iter().any(|demand| demand.begin == 19));
+        assert_eq!(combined.matrices.len(), 2, "disjoint matrix alternatives reuse capacity");
+        assert_eq!(combined.layouts.len(), 2, "disjoint workspace alternatives reuse capacity");
+        assert_eq!(combined.matrix_demands.len(), 8, "same-node matrix multiplicity is preserved");
+        assert_eq!(
+            combined.workspace_demands.len(),
+            4,
+            "same-node workspace multiplicity is preserved"
+        );
     }
 
     #[test]

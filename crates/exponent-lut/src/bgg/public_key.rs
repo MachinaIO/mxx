@@ -636,14 +636,25 @@ impl ExponentLutPublicKeyCompiler {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, mxx_dsl::DslError>>()?;
-        let helpers = helpers
+        let helpers: BTreeMap<
+            _,
+            crate::program::ProgramValue<
+                LutPublicHelperSet,
+                (Family<LutPublicHelperSet>, FamilyRange),
+            >,
+        > = helpers
             .iter()
             .map(|(id, value)| (*id, crate::program::ProgramValue::Scalar(value.clone())))
             .collect();
         Ok(crate::scheme::PreparedProgram::new(
             BggScheme::new(self.public_key.clone(), self.exponent_layout),
             program.clone(),
-            &ProgramBindings::new(inputs, rhs_inputs, &selectors, &values, &helpers, None),
+            &ProgramBindings::new()
+                .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_values(rhs_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_family_values(selectors.iter().map(|(&id, value)| (id, value.clone())))
+                .wire_families(values.iter().map(|(&id, value)| (id, value.clone())))
+                .helpers(helpers.iter().map(|(&id, value)| (id, value.clone()))),
             ranges.clone(),
             None,
         )?)

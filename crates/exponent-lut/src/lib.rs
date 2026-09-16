@@ -18,10 +18,34 @@ mod utils;
 
 pub use layout::{ExpLayout, LayoutError};
 pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
-pub use program::{
-    AttributeKnowledge, FamilyAggregation, FamilyProgram, FamilyRhsSource, FamilyWireSource, Gate,
-    ProgramFamilyId, ProgramInputId, ProgramStep, ProgramWireType, RhsId, WireFamilyId, WireId,
+pub use noise_refresh::prf::SparseLwrPrfProfile;
+pub use program::ExponentLutProgram;
+pub use rns_bgg::api::{
+    ArtifactWorkingDirectory, EncodedOutput, EncodedOutputs, EncodingSecrets, EncryptionArtifacts,
+    EvaluationArtifacts, ExecutionError, ExpectedEncoding, ExponentLut, FixedRhs, InputArtifacts,
+    PreprocessedProgram, RuntimeConfiguration, SparseLwrPrfProgram, SparseLwrPrfSelectorKey,
 };
+
+/// Advanced compatibility surface for backend adapters and migration tooling.
+///
+/// These types expose the frozen Program binding and durable-artifact details
+/// used by the cryptographic implementations. Ordinary applications should use
+/// the typed facade re-exported at the crate root instead.
+pub mod advanced {
+    pub use crate::{
+        nand_circuit::CompiledNandCircuitDetails,
+        program::{
+            AttributeKnowledge, FamilyAggregation, FamilyProgram, FamilyRhsSource,
+            FamilyWireSource, Gate, ProgramBindings, ProgramFamilyBindings, ProgramFamilyId,
+            ProgramGateInstance, ProgramInputId, ProgramStep, ProgramValidationError, ProgramValue,
+            ProgramWireType, RhsFamilyId, RhsId, WireFamilyId, WireId,
+        },
+        rns_bgg::api::{
+            ArtifactNamespace, ArtifactReferenceToken, ExponentLutBenchmarking,
+            FacadeBenchmarkGraphs, MaskSecret, OutputReferenceToken, PayloadSecret,
+        },
+    };
+}
 use thiserror::Error;
 
 /// Shared declaration and graph-construction errors, independent of a backend.

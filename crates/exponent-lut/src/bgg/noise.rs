@@ -3453,14 +3453,19 @@ pub fn simulate_program(
         return Err(ProgramNoiseError::FamilyShapeMismatch);
     }
 
-    let bindings = ProgramBindings::new(
-        &scalar_inputs,
-        &rhs_inputs,
-        &rhs_families,
-        &wire_values,
-        &helpers,
-        None,
-    );
+    let bindings = scalar_inputs
+        .into_iter()
+        .fold(ProgramBindings::new(), |bindings, (id, value)| bindings.input(id, value));
+    let bindings =
+        rhs_inputs.into_iter().fold(bindings, |bindings, (id, value)| bindings.rhs(id, value));
+    let bindings = rhs_families
+        .into_iter()
+        .fold(bindings, |bindings, (id, value)| bindings.rhs_family(id, value));
+    let bindings = wire_values
+        .into_iter()
+        .fold(bindings, |bindings, (id, value)| bindings.wire_family(id, value));
+    let bindings =
+        helpers.into_iter().fold(bindings, |bindings, (id, value)| bindings.helper(id, value));
     let (wires, interpreter, dependencies) = crate::scheme::trace_noise::<super::BggScheme>(
         program,
         BggNoiseModel {

@@ -1795,6 +1795,14 @@ pub struct BuiltGraph {
 }
 
 impl BuiltGraph {
+    /// Validate artifact connections against an already checked manifest catalog.
+    pub fn validate_with_catalog(
+        &self,
+        bindings: &ParamEnv,
+        catalog: &mxx_ir_core::artifact::ArtifactCatalog,
+    ) -> Result<mxx_ir_core::validate::ValidatedGraph, ValidationBuildError> {
+        self.validate_with_manifests(bindings, catalog.manifests())
+    }
     pub fn validate(
         &self,
         bindings: &ParamEnv,

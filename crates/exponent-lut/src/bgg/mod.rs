@@ -455,14 +455,9 @@ mod tests {
                 exponent,
             ),
             program,
-            &ProgramBindings::new(
-                &BTreeMap::new(),
-                &public_rhs,
-                &BTreeMap::new(),
-                &BTreeMap::from([(members, (public_members, FamilyRange::full(3).unwrap()))]),
-                &BTreeMap::new(),
-                None,
-            ),
+            &ProgramBindings::new()
+                .rhs_values(public_rhs.iter().map(|(&id, value)| (id, value.clone())))
+                .wire_family(members, (public_members, FamilyRange::full(3).unwrap())),
             ranges,
             Some(shared_cache),
         )
@@ -540,14 +535,11 @@ mod tests {
         );
         let member_encodings = Family::pack(encodings.clone()).unwrap();
         let outputs = prepared
-            .evaluate(&ProgramBindings::new(
-                &BTreeMap::new(),
-                &BTreeMap::from([(rhs_id, ())]),
-                &BTreeMap::new(),
-                &BTreeMap::from([(members, (member_encodings, FamilyRange::full(3).unwrap()))]),
-                &BTreeMap::new(),
-                None,
-            ))
+            .evaluate(
+                &ProgramBindings::new()
+                    .rhs(rhs_id, ())
+                    .wire_family(members, (member_encodings, FamilyRange::full(3).unwrap())),
+            )
             .unwrap();
         let actual = &outputs[&output];
         let key = &prepared.public_values()[&output];
@@ -666,14 +658,11 @@ mod tests {
             let cached = prepared.shared_cache.gate_entry(at).unwrap();
             assert_eq!(cached.value_handle().node(), decomposition.value_handle().node());
             let outputs = prepared
-                .evaluate(&ProgramBindings::new(
-                    &BTreeMap::new(),
-                    &BTreeMap::from([(rhs_id, ())]),
-                    &BTreeMap::new(),
-                    &members,
-                    &BTreeMap::new(),
-                    None,
-                ))
+                .evaluate(
+                    &ProgramBindings::new()
+                        .rhs(rhs_id, ())
+                        .wire_families(members.iter().map(|(&id, value)| (id, value.clone()))),
+                )
                 .unwrap();
             let actual = &outputs[&output];
             let residual = actual.vector.clone() - mask.clone() * key.clone() +
@@ -1042,14 +1031,10 @@ mod tests {
                     exponent,
                 ),
                 program.clone(),
-                &ProgramBindings::new(
-                    &public_inputs,
-                    &public_rhs,
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    Some(&public_helpers),
-                ),
+                &ProgramBindings::new()
+                    .inputs(public_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_values(public_rhs.iter().map(|(&id, value)| (id, value.clone())))
+                    .gate_helpers(public_helpers.iter().map(|(&id, value)| (id, value.clone()))),
                 ProgramFamilyBindings::new(),
                 None,
             )
@@ -1084,14 +1069,14 @@ mod tests {
                 let inputs = BTreeMap::from([(input, encoding)]);
                 let rhs = BTreeMap::from([(rhs_id, ())]);
                 let values = prepared
-                    .evaluate(&ProgramBindings::new(
-                        &inputs,
-                        &rhs,
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        Some(&encoding_helpers),
-                    ))
+                    .evaluate(
+                        &ProgramBindings::new()
+                            .inputs(inputs.into_iter())
+                            .rhs_values(rhs.into_iter())
+                            .gate_helpers(
+                                encoding_helpers.iter().map(|(&id, value)| (id, value.clone())),
+                            ),
+                    )
                     .unwrap();
                 let actual = &values[&output];
                 assert!(actual.plaintext.is_none());

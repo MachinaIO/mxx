@@ -562,7 +562,7 @@ impl<E: ExponentProgramLowering> ExponentProgramLowering for DependencyEvaluator
 
 pub(crate) fn trace_dependencies<E: ExponentProgramLowering>(
     program: &ExponentLutProgram,
-    bindings: &ProgramBindings<'_, E::Wire, E::Rhs, E::HelperSet>,
+    bindings: &ProgramBindings<E::Wire, E::Rhs, E::HelperSet>,
     ranges: &ProgramFamilyBindings,
     evaluator: E,
     mut reduce: impl FnMut(
@@ -577,45 +577,53 @@ where
 {
     let mut evaluator =
         DependencyEvaluator { inner: evaluator, graph: NoiseDependencyGraph::default() };
-    let inputs = bindings
+    let inputs: BTreeMap<_, _> = bindings
         .inputs
         .iter()
         .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Input(*id))))
         .collect();
-    let rhs = bindings
-        .rhs_inputs
-        .iter()
-        .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Rhs(*id))))
+    let rhs: BTreeMap<_, _> = bindings
+        .rhs_scalars()
+        .map(|(id, v)| (id, evaluator.bind(v, NoiseBinding::Rhs(id))))
         .collect();
-    let families = bindings
+    let families: BTreeMap<_, _> = bindings
         .wire_values
         .iter()
         .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Family(*id))))
         .collect();
-    let rhs_families = bindings
-        .rhs_families
-        .iter()
-        .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::RhsFamily(*id))))
+    let rhs_families: BTreeMap<_, _> = bindings
+        .rhs_families()
+        .map(|(id, v)| (id, evaluator.bind(v, NoiseBinding::RhsFamily(id))))
         .collect();
-    let helpers = bindings
+    let helpers: BTreeMap<_, _> = bindings
         .helpers
         .iter()
         .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Helper(*id))))
         .collect();
-    let gate_helpers = bindings.gate_helpers.map(|values| {
-        values
-            .iter()
-            .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::GateHelper(*id))))
-            .collect()
-    });
-    let bindings = ProgramBindings::new(
-        &inputs,
-        &rhs,
-        &rhs_families,
-        &families,
-        &helpers,
-        gate_helpers.as_ref(),
-    );
+    let gate_helpers = bindings
+        .gate_helpers
+        .iter()
+        .map(|(id, value)| (*id, evaluator.bind(value, NoiseBinding::GateHelper(*id))))
+        .collect::<Vec<_>>();
+    let mut bindings = ProgramBindings::new();
+    for (id, value) in inputs {
+        bindings = bindings.input(id, value);
+    }
+    for (id, value) in rhs {
+        bindings = bindings.rhs(id, value);
+    }
+    for (id, value) in rhs_families {
+        bindings = bindings.rhs_family(id, value);
+    }
+    for (id, value) in families {
+        bindings = bindings.wire_family(id, value);
+    }
+    for (id, value) in helpers {
+        bindings = bindings.helper(id, value);
+    }
+    for (id, value) in gate_helpers {
+        bindings = bindings.gate_helper(id, value);
+    }
     let wires = crate::program::lower_program(
         program,
         &bindings,

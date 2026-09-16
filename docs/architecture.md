@@ -53,6 +53,24 @@ semantics, while their mathematical bounds and proofs remain application-owned.
 
 ### `mxx-dsl`
 
+Artifact connections use core-owned `ArtifactCatalog` metadata through
+`BuiltGraph::validate_with_catalog`; the DSL does not open stores or execute
+graphs. Existing `GraphValueSchema::artifact_input` preserves composite types.
+Runtime `ArtifactCheckpoint<D, I>` stores versioned application descriptors and
+expected identities, borrowing execution results so callers retain ownership of
+resident outputs and staged leases. Reopening requires trusted production,
+identity, descriptor-digest, and canonical catalog-digest anchors and a finalized
+file-store session. Checkpoint creation accepts only finalized lazy artifact
+outputs whose names, descriptors, family cardinalities, and handle indices match
+the manifest; zero-length families intentionally have no handles.
+Producers use `execute_in_session_with_config` with an explicit fresh execution
+nonce; ordinary `execute_with_config` writes artifacts but does not create the
+finalized session required by this durable checkpoint contract.
+It validates metadata, not private payload integrity or lattice security.
+Application importers retain their parameter, key, level, and Program checks.
+The estimator's `measure_graphs` collects all caller-selected stages before
+measurement and reports them in order; hardware and execution remain separate.
+
 Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
 The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
 Indexed `Family<T>` values preserve composite element schemas. `parallel` and `iterate` create
@@ -251,6 +269,28 @@ metadata. The interface does not expose separate `PublicValue` or
 `EncodingValue` associated types. Common Program lowering resolves captures and
 indexed inputs and constructs one DSL `parallel` for the complete Family body;
 primitive adapters receive only scalar values.
+
+`RnsBggScheme::prepare_program` provides program-driven scalar setup: applications
+supply native plaintext exponents, input levels, a payload secret, and a seed/domain
+root. The scheme derives dataflow levels and per-instance RHS/LUT material, including
+distinct RHS packages when a declaration is consumed at multiple levels. Typed
+`ProgramBindings::gate_rhs` overrides apply only to root multiplication gates;
+family bindings retain their structural capture/member contract. The scalar setup
+API explicitly rejects structural families rather than expanding them on the host.
+`RnsBggPreparedProgram` exports prepared caches and private input contributions as
+one typed descriptor bundle, and imports it against an independently trusted
+`RnsBggProgramExpectation`. Online evaluation receives the mask secret and constructs
+encoding/helper bindings internally. Applications still own graph build/validation,
+artifact runtime execution, security/noise checks, and explicit test-only oracle
+outputs; no secret-key oracle is included in the production export bundle.
+
+The `mxx-exponent-lut` crate root exposes only the typed application facade:
+`NandCircuit`/`CompiledNandCircuit`, `SparseLwrPrfProgram`, phase artifacts,
+`EncodingSecrets`, and `ExpectedEncoding`. Frozen binding maps, gate-instance
+identifiers, family ranges, and durable artifact namespace/token details remain
+available under the explicit `advanced` namespace (and their owning modules) for
+backend adapters and migration tooling; ordinary callers do not need to construct
+those low-level values.
 
 `program::ProgramValue<S, F>` is the common scalar/family carrier at application
 boundaries. `FamilySource` describes shared versus indexed references for both

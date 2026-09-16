@@ -308,6 +308,24 @@ pub enum EstimateError {
     LogicalByteTotalOverflow,
 }
 
+/// A measurement backend whose collection pass is completed before reporting.
+pub trait CollectedMeasurementBackend: MeasurementBackend {
+    fn measure_collected(&mut self) -> Result<(), Self::Error>;
+}
+
+/// Collect all stages, measure their shared classes once, then report each stage
+/// in caller order. Backend lifetime, hardware, and oracle inclusion stay explicit.
+pub fn measure_graphs<B: CollectedMeasurementBackend>(
+    graphs: &[&ValidatedGraph],
+    backend: &mut B,
+) -> Result<Vec<CostReport>, EstimateError> {
+    for graph in graphs {
+        estimate(graph, backend)?;
+    }
+    backend.measure_collected().map_err(|error| EstimateError::Backend(error.to_string()))?;
+    graphs.iter().map(|graph| estimate(graph, backend)).collect()
+}
+
 /// Estimates an unlimited-resource DAG schedule. GPU fleet limits are reflected
 /// by primitive measurements; they do not impose an additional graph-level cap.
 pub fn estimate<B: MeasurementBackend>(
@@ -1386,6 +1404,57 @@ fn wire_type_depends_on(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_measure_graphs_collects_before_measurement_and_reporting() {
+        use std::convert::Infallible;
+        struct OrderedBackend {
+            measured: bool,
+            events: Vec<&'static str>,
+        }
+        impl super::MeasurementBackend for OrderedBackend {
+            type Error = Infallible;
+            fn persistent_bytes(&self, wire_type: &super::ConcreteWireType) -> u64 {
+                wire_type.matrix_type().map_or(0, |matrix| (matrix.rows * matrix.columns) as u64)
+            }
+            fn measure(
+                &mut self,
+                graph: &str,
+                node: &super::MeasurementNode<'_>,
+                bindings: &mxx_ir_core::ParamEnv,
+            ) -> Result<super::NodeMeasurement, Self::Error> {
+                assert!(!graph.is_empty());
+                assert!(!node.concrete_output_types.is_empty());
+                assert_eq!(bindings, &mxx_ir_core::ParamEnv::default());
+                self.events.push(if self.measured { "report" } else { "collect" });
+                Ok(super::NodeMeasurement::default())
+            }
+        }
+        impl super::CollectedMeasurementBackend for OrderedBackend {
+            fn measure_collected(&mut self) -> Result<(), Self::Error> {
+                assert!(!self.measured);
+                self.events.push("measure");
+                self.measured = true;
+                Ok(())
+            }
+        }
+        let ring = mxx_dsl::Ring::new(257, 8);
+        let graph = mxx_dsl::DslContext::new("measurement-order")
+            .output("value", -ring.input("input", (1, 1)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&mxx_ir_core::ParamEnv::default())
+            .unwrap();
+        let mut backend = OrderedBackend { measured: false, events: Vec::new() };
+        let reports = super::measure_graphs(&[&graph, &graph], &mut backend).unwrap();
+        assert_eq!(reports.len(), 2);
+        let boundary = backend.events.iter().position(|event| *event == "measure").unwrap();
+        assert!(boundary >= 2);
+        assert!(backend.events[..boundary].iter().all(|event| *event == "collect"));
+        assert!(backend.events[boundary + 1..].iter().all(|event| *event == "report"));
+        assert!(backend.events.len() > boundary + 2);
+    }
+
     use super::*;
     use mxx_dsl::{DslContext, Int, IntType, Ring, Subgraph, iterate, parallel};
     use std::{collections::BTreeSet, convert::Infallible};

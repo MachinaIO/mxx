@@ -1238,7 +1238,6 @@ pub(crate) mod private_mul_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(4u8),
             crt_bits: 32,
             terminal_depth: 1,
@@ -1281,7 +1280,6 @@ pub(crate) mod private_mul_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(4u8),
             crt_bits: 32,
             terminal_depth: 1,
@@ -1338,7 +1336,6 @@ pub(crate) mod private_mul_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -1838,7 +1835,6 @@ pub(super) mod prf_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: 8,
             widths: vec![1, 1],
-            slots: vec![2, 2],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -1951,7 +1947,6 @@ pub(super) mod prf_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 1],
-            slots: vec![2, 2],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -2119,7 +2114,6 @@ mod linear_tests {
         let request = RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -2330,7 +2324,6 @@ pub(crate) mod encoding_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -2609,7 +2602,6 @@ pub(crate) mod encoding_tests {
         let request = RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -2988,7 +2980,6 @@ mod common_prf_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 1, native_width],
-            slots: widths.iter().copied().chain([1]).collect(),
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -3261,27 +3252,21 @@ mod common_prf_tests {
             let prepared = crate::scheme::PreparedProgram::new(
                 scheme.clone(),
                 family_program.clone(),
-                &crate::program::ProgramBindings::new(
-                    &public_inputs,
-                    &BTreeMap::new(),
-                    &public_rhs,
-                    &public_values,
-                    &BTreeMap::new(),
-                    None,
-                ),
+                &crate::program::ProgramBindings::new()
+                    .inputs(public_inputs.into_iter())
+                    .rhs_family_values(public_rhs.into_iter())
+                    .wire_families(public_values.into_iter()),
                 ranges,
                 None,
             )
             .unwrap();
             let evaluated = prepared
-                .evaluate(&crate::program::ProgramBindings::new(
-                    &online_inputs,
-                    &BTreeMap::new(),
-                    &online_rhs,
-                    &online_values,
-                    &BTreeMap::new(),
-                    None,
-                ))
+                .evaluate(
+                    &crate::program::ProgramBindings::new()
+                        .inputs(online_inputs.into_iter())
+                        .rhs_family_values(online_rhs.into_iter())
+                        .wire_families(online_values.into_iter()),
+                )
                 .unwrap();
             let output_key =
                 RnsBggPublicProgramValue::Scalar(prepared.public_values()[&family_output].clone());
@@ -3382,7 +3367,6 @@ pub(crate) mod family_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 4],
-            slots: vec![2, 1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -3509,8 +3493,14 @@ pub(crate) mod family_tests {
                 0,
                 None,
                 &[
-                    crate::noise_utils::RightActionNoiseGain::unit(),
-                    crate::noise_utils::RightActionNoiseGain::unit(),
+                    crate::rns_bgg::noise::RnsBggNoiseAction::new(
+                        crate::rns_bgg::noise::stable_source_id(&("encoding-one-hot", 0usize)),
+                        crate::noise_utils::RightActionNoiseGain::unit(),
+                    ),
+                    crate::rns_bgg::noise::RnsBggNoiseAction::new(
+                        crate::rns_bgg::noise::stable_source_id(&("encoding-one-hot", 1usize)),
+                        crate::noise_utils::RightActionNoiseGain::unit(),
+                    ),
                 ],
             )
             .unwrap();
@@ -3565,7 +3555,6 @@ pub(crate) mod family_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -3754,21 +3743,16 @@ pub(crate) mod family_tests {
                 _ => unreachable!(),
             },
         };
-        let online_helpers = BTreeMap::new();
         let mut ranges = ProgramFamilyBindings::new();
         ranges.bind(ProgramFamilyId::from_index(0), range.clone());
         ranges.bind(ProgramFamilyId::from_index(1), range.clone());
         let program = PreparedProgram::new(
             scheme.clone(),
             program,
-            &ProgramBindings::new(
-                &public_inputs,
-                &BTreeMap::new(),
-                &rhs_bindings,
-                &public_members,
-                &BTreeMap::new(),
-                None,
-            ),
+            &ProgramBindings::new()
+                .inputs(public_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_family_values(rhs_bindings.iter().map(|(&id, value)| (id, value.clone())))
+                .wire_families(public_members.iter().map(|(&id, value)| (id, value.clone()))),
             ranges,
             None,
         )
@@ -3829,14 +3813,14 @@ pub(crate) mod family_tests {
             ),
         )]);
         let program_values = program
-            .evaluate(&ProgramBindings::new(
-                &online_inputs,
-                &BTreeMap::new(),
-                &online_rhs_bindings,
-                &online_members,
-                &BTreeMap::new(),
-                Some(&online_helpers),
-            ))
+            .evaluate(
+                &ProgramBindings::new()
+                    .inputs(online_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_family_values(
+                        online_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
+                    )
+                    .wire_families(online_members.iter().map(|(&id, value)| (id, value.clone()))),
+            )
             .unwrap();
         let (program_output, _) = &program_values[&output_id];
         let (program_key, _) = &program.public_values()[&output_id];
@@ -3946,7 +3930,6 @@ mod program_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, 4],
-            slots: vec![1, 1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 1,
@@ -4084,14 +4067,10 @@ mod program_tests {
             let prepared = PreparedProgram::new(
                 scheme.clone(),
                 program.clone(),
-                &ProgramBindings::new(
-                    &public_inputs,
-                    &public_rhs,
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    &BTreeMap::new(),
-                    Some(&helpers),
-                ),
+                &ProgramBindings::new()
+                    .inputs(public_inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_values(public_rhs.iter().map(|(&id, value)| (id, value.clone())))
+                    .gate_helpers(helpers.iter().map(|(&id, value)| (id, value.clone()))),
                 ProgramFamilyBindings::new(),
                 None,
             )
@@ -4117,14 +4096,14 @@ mod program_tests {
                     (weight_input, (weight_encoding.clone(), Some(weight.clone()))),
                 ]);
                 let values = prepared
-                    .evaluate(&ProgramBindings::new(
-                        &inputs,
-                        &rhs,
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        &BTreeMap::new(),
-                        Some(&online_helpers),
-                    ))
+                    .evaluate(
+                        &ProgramBindings::new()
+                            .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                            .rhs_values(rhs.iter().map(|(&id, value)| (id, value.clone())))
+                            .gate_helpers(
+                                online_helpers.iter().map(|(&id, value)| (id, value.clone())),
+                            ),
+                    )
                     .unwrap();
                 let (actual, actual_plaintext) = &values[&output];
                 assert!(actual_plaintext.is_none());
@@ -4136,14 +4115,14 @@ mod program_tests {
                 wrong_helper.binding.material_id[0] ^= 1;
                 assert!(
                     prepared
-                        .evaluate(&ProgramBindings::new(
-                            &inputs,
-                            &rhs,
-                            &BTreeMap::new(),
-                            &BTreeMap::new(),
-                            &BTreeMap::new(),
-                            Some(&wrong_helpers),
-                        ))
+                        .evaluate(
+                            &ProgramBindings::new()
+                                .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                                .rhs_values(rhs.iter().map(|(&id, value)| (id, value.clone())))
+                                .gate_helpers(
+                                    wrong_helpers.iter().map(|(&id, value)| (id, value.clone())),
+                                )
+                        )
                         .is_err(),
                     "a helper from another artifact must not match by table/RHS alone"
                 );
@@ -4151,14 +4130,16 @@ mod program_tests {
                     BTreeMap::from([(rhs_input, RnsBggPublicRhs::Identity(rand::random()))]);
                 assert!(
                     prepared
-                        .evaluate(&ProgramBindings::new(
-                            &inputs,
-                            &wrong_rhs,
-                            &BTreeMap::new(),
-                            &BTreeMap::new(),
-                            &BTreeMap::new(),
-                            Some(&online_helpers)
-                        ))
+                        .evaluate(
+                            &ProgramBindings::new()
+                                .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                                .rhs_values(
+                                    wrong_rhs.iter().map(|(&id, value)| (id, value.clone()))
+                                )
+                                .gate_helpers(
+                                    online_helpers.iter().map(|(&id, value)| (id, value.clone())),
+                                )
+                        )
                         .is_err()
                 );
                 let expected = scheme.scalar(2, 4u8).unwrap() *
@@ -4257,7 +4238,6 @@ pub(crate) mod terminal_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![4],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 3,
@@ -4475,7 +4455,6 @@ pub(crate) mod terminal_tests {
         let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![2],
-            slots: vec![1],
             encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
             crt_bits: 30,
             terminal_depth: 3,

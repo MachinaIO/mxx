@@ -6,13 +6,14 @@ use crate::gpu_calibration::{
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
+    artifact::ArtifactType,
     graph::FrozenGraphScopeId,
     node::NodeKind,
     types::{NodeId, Port, WireRef},
 };
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) type Operations = BTreeMap<NodeId, Result<Option<[u8; 32]>, String>>;
 
@@ -177,7 +178,9 @@ pub enum LivenessError {
 /// - packed families retaining their members, with known selections extending only the selected
 ///   member and unresolved selections covering every alternative,
 /// - a zero-count sequential loop forwarding its carried aliases, and
-/// - a materialized child input staying borrowed until its body returns.
+/// - a materialized child input staying borrowed until its body returns, and
+/// - root exports being replaced by artifact handles immediately after their producing node,
+///   including parallel-loop families whose members are written one wave at a time by the executor.
 ///
 /// This is what GPU inventory charges and what a later whole-wave admission
 /// must consume, so it lives in the GPU planning module instead of in one
@@ -186,8 +189,60 @@ pub struct OwnerLiveness<'a> {
     validated: &'a ValidatedGraph,
     scope_id: &'a FrozenGraphScopeId,
     capture_trace: bool,
-    until: BTreeMap<WireRef, usize>,
+    /// Logical cached-value lifetime, including uses through a lazy artifact
+    /// descriptor and aliases after the original resident value is exported.
+    cached_until: BTreeMap<WireRef, usize>,
+    /// Lifetime of the resident owner produced by a node. Streamed root
+    /// outputs end at their producer because the executor replaces them with
+    /// a lazy artifact immediately after export.
+    original_until: BTreeMap<WireRef, usize>,
     aliases: BTreeMap<WireRef, WireRef>,
+}
+
+/// Precompute the root wires whose executor path streams an artifact at the
+/// producer. Admission and liveness query this set repeatedly while walking
+/// the graph; constructing it once avoids rescanning every declared output for
+/// each retained wire and node output.
+pub(crate) fn streamed_root_outputs(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+) -> BTreeSet<WireRef> {
+    let mut streamed = BTreeSet::new();
+    if scope_id != &FrozenGraphScopeId::Root {
+        return streamed;
+    }
+    let scope = validated.source.scope(scope_id).expect("validated scope");
+    let exported = validated
+        .source
+        .outputs()
+        .values()
+        .filter(|output| output.confidentiality.is_some())
+        .map(|output| output.value)
+        .collect::<BTreeSet<_>>();
+    let checked = validated.scope(scope_id).expect("validated scope");
+    for &wire in scope.outputs() {
+        if !exported.contains(&wire) {
+            continue;
+        }
+        let Some(ty) = checked.wire_types.get(&wire) else { continue };
+        // Scalar exports are written immediately after their producer. A family
+        // is streamed only when its producer is a parallel loop: the executor's
+        // staged-family path serializes each member as each wave completes.
+        let is_streamed = match ty {
+            mxx_ir_core::types::ConcreteWireType::IndexedFamily { element, .. } => {
+                checked
+                    .execution_order
+                    .get(wire.node.0 as usize)
+                    .is_some_and(|node| matches!(node.kind(), NodeKind::ParallelLoop(_))) &&
+                    ArtifactType::from_wire_type(element).is_some()
+            }
+            _ => ArtifactType::from_wire_type(ty).is_some(),
+        };
+        if is_streamed {
+            streamed.insert(wire);
+        }
+    }
+    streamed
 }
 
 impl<'a> OwnerLiveness<'a> {
@@ -196,13 +251,13 @@ impl<'a> OwnerLiveness<'a> {
         self.aliases.get(&wire)
     }
 
-    /// Owner end of `wire`, or `None` when the wire has no derived end.
-    pub fn until(&self, wire: WireRef) -> Option<usize> {
-        self.until.get(&wire).copied()
+    /// Logical cached-value end of `wire`, or `None` when no end is derived.
+    pub fn cached_value_end(&self, wire: WireRef) -> Option<usize> {
+        self.cached_until.get(&wire).copied()
     }
 
-    /// Owner end of one output port of the node at `position`.
-    pub fn output_end(&self, position: usize, port: usize) -> usize {
+    /// Backing owner end of one output port at `position`.
+    pub fn original_output_end(&self, position: usize, port: usize) -> usize {
         let checked = self.validated.scope(self.scope_id).expect("validated scope");
         let handle = &checked.execution_order[position];
         let id = NodeId(position as u64);
@@ -210,7 +265,7 @@ impl<'a> OwnerLiveness<'a> {
         let mut end = if self.capture_trace {
             usize::MAX
         } else {
-            self.until.get(&wire).copied().unwrap_or(position)
+            self.original_until.get(&wire).copied().unwrap_or(position)
         };
         if matches!(handle.kind(), NodeKind::Select { .. }) {
             // Select materializes and caches only the chosen candidate. Its
@@ -219,13 +274,17 @@ impl<'a> OwnerLiveness<'a> {
             // use without importing all candidates.
             let scope = self.validated.source.scope(self.scope_id).expect("validated scope");
             for candidate in scope.arguments(handle).expect("validated arguments").iter().skip(1) {
-                end = end.max(self.until.get(candidate).copied().unwrap_or(position));
+                end = end.max(self.original_until.get(candidate).copied().unwrap_or(position));
             }
         }
-        if matches!(handle.kind(), NodeKind::Input { .. }) {
+        if matches!(handle.kind(), NodeKind::Input { .. }) &&
+            self.scope_id != &FrozenGraphScopeId::Root
+        {
             // The executor borrows the complete child input map. A child input
             // materialized from a staged family therefore stays alive until the
-            // body returns, even after its last wire use.
+            // body returns, even after its last wire use. Root inputs do not
+            // have this borrowed child-map lifetime and may be streamed at
+            // their producer like any other root output.
             end.max(checked.execution_order.len())
         } else {
             end
@@ -284,12 +343,32 @@ pub fn owner_liveness<'a>(
             _ => {}
         }
     }
-    let mut until = checked.liveness.last_use.clone();
+    let mut cached_until = checked.liveness.last_use.clone();
+    let streamed_outputs = streamed_root_outputs(validated, scope_id);
     for wire in &checked.liveness.retained {
-        until.insert(*wire, usize::MAX);
+        if !streamed_outputs.contains(wire) {
+            cached_until.insert(*wire, usize::MAX);
+        }
     }
     for (&wire, &end) in &optimizer.borrowed_until {
-        until.entry(wire).and_modify(|previous| *previous = (*previous).max(end)).or_insert(end);
+        cached_until
+            .entry(wire)
+            .and_modify(|previous| *previous = (*previous).max(end))
+            .or_insert(end);
+    }
+    if scope_id != &FrozenGraphScopeId::Root {
+        // The executor borrows the complete child input map. Keep every child
+        // input cached until the body returns, even when its last direct wire
+        // use is earlier than that boundary.
+        let body_end = checked.execution_order.len();
+        for (position, handle) in checked.execution_order.iter().enumerate() {
+            if matches!(handle.kind(), NodeKind::Input { .. }) {
+                cached_until
+                    .entry(WireRef { node: NodeId(position as u64), port: Port(0) })
+                    .and_modify(|end| *end = (*end).max(body_end))
+                    .or_insert(body_end);
+            }
+        }
     }
     // Propagate alias lifetimes backwards, including nested packs/selections.
     // Dynamic selections retain every candidate until the selection dies.
@@ -297,8 +376,8 @@ pub fn owner_liveness<'a>(
         for port in 0..handle.output_types().len() {
             let wire = WireRef { node: NodeId(position as u64), port: Port(port as u32) };
             if let Some(source) = aliases.get(&wire) {
-                let end = until.get(&wire).copied().unwrap_or(position);
-                until
+                let end = cached_until.get(&wire).copied().unwrap_or(position);
+                cached_until
                     .entry(*source)
                     .and_modify(|previous| *previous = (*previous).max(end))
                     .or_insert(end);
@@ -312,7 +391,7 @@ pub fn owner_liveness<'a>(
                 NodeKind::Select { .. }
         ) {
             let output = WireRef { node: NodeId(position as u64), port: Port(0) };
-            let end = until.get(&output).copied().unwrap_or(position);
+            let end = cached_until.get(&output).copied().unwrap_or(position);
             // Resolved selections already propagated to their exact source;
             // unresolved selections retain every possible source instead.
             if aliases.contains_key(&output) {
@@ -320,14 +399,18 @@ pub fn owner_liveness<'a>(
             }
             let sources = scope.arguments(handle).expect("validated arguments");
             for wire in sources {
-                until
+                cached_until
                     .entry(wire)
                     .and_modify(|previous| *previous = (*previous).max(end))
                     .or_insert(end);
             }
         }
     }
-    Ok(OwnerLiveness { validated, scope_id, capture_trace, until, aliases })
+    let mut original_until = cached_until.clone();
+    for wire in streamed_outputs {
+        original_until.insert(wire, wire.node.0 as usize);
+    }
+    Ok(OwnerLiveness { validated, scope_id, capture_trace, cached_until, original_until, aliases })
 }
 
 #[cfg(test)]
@@ -376,6 +459,164 @@ mod tests {
     };
 
     #[test]
+    fn test_streamed_scalar_root_export_ends_at_producer() {
+        let ring = Ring::new(97u64, 8usize);
+        for streamed in [false, true] {
+            let value = ring.gaussian((1, 1), 3, 19);
+            let context = if streamed {
+                DslContext::new("streamed-root-export").private_output("value", value).unwrap()
+            } else {
+                DslContext::new("retained-root-output").output("value", value).unwrap()
+            };
+            let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let wire = validated.source.outputs()["value"].value;
+            let position = wire.node.0 as usize;
+            assert_eq!(
+                streamed_root_outputs(&validated, &FrozenGraphScopeId::Root).contains(&wire),
+                streamed
+            );
+            let lifetime = owner_liveness(
+                &validated,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                &InventoryPlan::default(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                lifetime.original_output_end(position, wire.port.0 as usize),
+                if streamed { position } else { usize::MAX },
+            );
+        }
+
+        let input = ring.input("streamed-input", (1, 1));
+        let validated = DslContext::new("streamed-root-input")
+            .private_output("value", input)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let wire = validated.source.outputs()["value"].value;
+        let position = wire.node.0 as usize;
+        let lifetime = owner_liveness(
+            &validated,
+            &FrozenGraphScopeId::Root,
+            &ParamEnv::default(),
+            &InventoryPlan::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(lifetime.original_output_end(position, 0), position);
+    }
+
+    #[test]
+    fn test_streamed_scalar_owner_is_released_before_later_consumer() {
+        let ring = Ring::new(97u64, 8usize);
+        let key = ring.bytes_input("key", 32);
+        let bounded = ring.hash_small_decomposed(key, b"reload".as_slice(), (2, 1), 16, 1);
+        let first_matrix = ring.input("first-matrix", (2, 2));
+        let first_product = first_matrix.mul_small_rhs(bounded.clone());
+        // Keep a second, separated consumer so the cached descriptor lifetime
+        // cannot accidentally be shortened to the first reload. The second
+        // matrix and product also model intervening native allocations.
+        let second_matrix = ring.input("second-matrix", (2, 2));
+        let second_product = second_matrix.mul_small_rhs(bounded.clone());
+        let validated = DslContext::new("streamed-owner-before-consumer")
+            .private_output("bounded", bounded)
+            .unwrap()
+            .output("first-product", first_product)
+            .unwrap()
+            .output("second-product", second_product)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let wire = validated.source.outputs()["bounded"].value;
+        let position = wire.node.0 as usize;
+        let lifetime = owner_liveness(
+            &validated,
+            &FrozenGraphScopeId::Root,
+            &ParamEnv::default(),
+            &InventoryPlan::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            lifetime.original_output_end(position, wire.port.0 as usize),
+            position,
+            "stream export releases the resident owner; the later consumer reloads its descriptor"
+        );
+        assert!(
+            lifetime.cached_value_end(wire).is_some_and(|end| end > position),
+            "cached descriptor lifetime must reach the later separated consumer"
+        );
+    }
+
+    #[test]
+    fn test_streamed_parallel_family_export_ends_at_producer() {
+        use mxx_dsl::{Family, parallel};
+
+        let ring = Ring::new(97u64, 8usize);
+        for streamed in [false, true] {
+            let family = parallel(3, |_| Ok(ring.gaussian((1, 1), 3, 19))).unwrap();
+            let context = if streamed {
+                DslContext::new("streamed-family-export").private_output("values", family).unwrap()
+            } else {
+                DslContext::new("retained-family-output").output("values", family).unwrap()
+            };
+            let validated = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
+            let wire = validated.source.outputs()["values"].value;
+            let position = wire.node.0 as usize;
+            assert!(matches!(
+                validated.root_scope().execution_order[position].kind(),
+                NodeKind::ParallelLoop(_)
+            ));
+            let lifetime = owner_liveness(
+                &validated,
+                &FrozenGraphScopeId::Root,
+                &ParamEnv::default(),
+                &InventoryPlan::default(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                lifetime.original_output_end(position, wire.port.0 as usize),
+                if streamed { position } else { usize::MAX },
+            );
+        }
+
+        // A packed family is persisted by the final output pass rather than
+        // by the parallel-loop wave writer. It must therefore retain its
+        // owner, even when its element type is artifact-compatible.
+        let packed =
+            Family::pack(vec![ring.gaussian((1, 1), 3, 19), ring.gaussian((1, 1), 3, 19)]).unwrap();
+        let validated = DslContext::new("retained-packed-family")
+            .private_output("values", packed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let wire = validated.source.outputs()["values"].value;
+        let position = wire.node.0 as usize;
+        assert!(matches!(
+            validated.root_scope().execution_order[position].kind(),
+            NodeKind::FamilyPack { .. }
+        ));
+        let lifetime = owner_liveness(
+            &validated,
+            &FrozenGraphScopeId::Root,
+            &ParamEnv::default(),
+            &InventoryPlan::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(lifetime.original_output_end(position, wire.port.0 as usize), usize::MAX);
+    }
+
+    #[test]
     fn test_known_packed_selection_extends_only_its_selected_owner() {
         use mxx_dsl::{Family, Int};
         use mxx_ir_core::IntExpr;
@@ -410,15 +651,15 @@ mod tests {
                 let members = scope.arguments(scope.node(family_wire.node).unwrap()).unwrap();
                 let plan = InventoryPlan::default();
                 let lifetime = owner_liveness(&validated, &scope_id, &env, &plan, false).unwrap();
-                assert_eq!(lifetime.until(members[selected]), Some(usize::MAX));
+                assert_eq!(lifetime.cached_value_end(members[selected]), Some(usize::MAX));
                 assert_eq!(
-                    lifetime.until(members[1 - selected]),
+                    lifetime.cached_value_end(members[1 - selected]),
                     Some(if keep_family { usize::MAX } else { get_position })
                 );
                 let captured = owner_liveness(&validated, &scope_id, &env, &plan, true).unwrap();
                 for wire in members {
                     assert_eq!(
-                        captured.output_end(wire.node.0 as usize, wire.port.0 as usize),
+                        captured.original_output_end(wire.node.0 as usize, wire.port.0 as usize),
                         usize::MAX
                     );
                 }

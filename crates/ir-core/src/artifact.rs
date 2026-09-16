@@ -26,6 +26,112 @@ pub struct Manifest {
     pub artifacts: BTreeMap<String, ManifestArtifact>,
 }
 
+/// Validated manifests used to connect independently produced graphs.
+/// This validates metadata, not artifact payload integrity or cryptographic security.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ArtifactCatalog {
+    manifests: BTreeMap<ProductionId, Manifest>,
+}
+
+#[derive(Debug, Error)]
+pub enum ArtifactCatalogError {
+    #[error("manifest production does not match its catalog key")]
+    ProductionMismatch,
+    #[error("manifest IR version is unsupported")]
+    VersionMismatch,
+    #[error("conflicting manifests for the same production")]
+    Conflict,
+    #[error(transparent)]
+    InvalidManifest(#[from] ManifestValidationError),
+}
+
+impl ArtifactCatalog {
+    pub fn from_manifest(manifest: Manifest) -> Result<Self, ArtifactCatalogError> {
+        let mut catalog = Self::default();
+        catalog.insert(manifest.production_id.clone(), manifest)?;
+        Ok(catalog)
+    }
+    pub fn insert(
+        &mut self,
+        production: ProductionId,
+        manifest: Manifest,
+    ) -> Result<(), ArtifactCatalogError> {
+        if production != manifest.production_id {
+            return Err(ArtifactCatalogError::ProductionMismatch);
+        }
+        if manifest.ir_version != IR_VERSION {
+            return Err(ArtifactCatalogError::VersionMismatch);
+        }
+        validate_manifest(&manifest)?;
+        if let Some(previous) = self.manifests.get(&production) {
+            if previous != &manifest {
+                return Err(ArtifactCatalogError::Conflict);
+            }
+            return Ok(());
+        }
+        self.manifests.insert(production, manifest);
+        Ok(())
+    }
+
+    /// Merge transactionally: a conflict leaves this catalog unchanged.
+    pub fn merge(&mut self, other: Self) -> Result<(), ArtifactCatalogError> {
+        for (production, manifest) in &other.manifests {
+            if self.manifests.get(production).is_some_and(|old| old != manifest) {
+                return Err(ArtifactCatalogError::Conflict);
+            }
+        }
+        self.manifests.extend(other.manifests);
+        Ok(())
+    }
+
+    pub fn manifests(&self) -> &BTreeMap<ProductionId, Manifest> {
+        &self.manifests
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::*;
+
+    #[test]
+    fn test_catalog_validation_conflicts_and_transactional_merge() {
+        let production = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::new(),
+        };
+        let mut catalog = ArtifactCatalog::from_manifest(manifest.clone()).unwrap();
+        catalog.insert(production.clone(), manifest.clone()).unwrap();
+        let mut wrong = production.clone();
+        wrong.execution_nonce[0] ^= 1;
+        assert!(catalog.insert(wrong, manifest.clone()).is_err());
+        let mut invalid = manifest.clone();
+        invalid.ir_version += 1;
+        assert!(catalog.insert(production.clone(), invalid).is_err());
+        let mut conflict = manifest.clone();
+        conflict.artifacts.insert(
+            "value".into(),
+            ManifestArtifact {
+                artifact_type: ArtifactType::Bytes { length: 1 },
+                family_count: None,
+                confidentiality: ArtifactConfidentiality::Private,
+                content_hash: None,
+                layout: None,
+            },
+        );
+        let other = ArtifactCatalog::from_manifest(conflict.clone()).unwrap();
+        assert!(catalog.merge(other).is_err());
+        assert_eq!(catalog.manifests()[&production], manifest);
+        conflict.artifacts.get_mut("value").unwrap().content_hash = Some([0; 32]);
+        assert!(ArtifactCatalog::from_manifest(conflict).is_err());
+        let mut second = manifest.clone();
+        second.production_id.execution_nonce[1] ^= 1;
+        catalog.merge(ArtifactCatalog::from_manifest(second).unwrap()).unwrap();
+        assert_eq!(catalog.manifests().len(), 2);
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum ArtifactConfidentiality {
     Public,

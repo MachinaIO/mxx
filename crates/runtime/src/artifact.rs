@@ -218,6 +218,23 @@ impl FileArtifactStore {
         &self.root
     }
 
+    /// Checkpoint metadata may only refer to a finalized runtime session.
+    pub fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, FileArtifactError> {
+        let session: FileSession = Self::read_encoded(&self.session_path(production))?;
+        if session.descriptor.production_id != *production ||
+            session.descriptor.ir_version != IR_VERSION ||
+            session.status != SessionStatus::Finalized
+        {
+            return Err(FileArtifactError::InvalidManifest(
+                "checkpoint production is not finalized".into(),
+            ));
+        }
+        self.load_manifest(production)
+    }
+
     pub fn family_hash_verification_count(&self) -> usize {
         self.family_hash_verifications
     }

@@ -265,6 +265,380 @@ fn monomial_input<B: Backend>(
         .unwrap_or_else(|error| panic!("native monomial input: {error}"))
 }
 
+/// Execute the reviewed RNS-BGG path through the crate-root facade. Parameter
+/// and noise reporting remains explicit in the surrounding integration test;
+/// this function deliberately does not construct descriptor maps, readout
+/// helpers, or manual oracle graphs.
+fn run_cpu_rns_bgg_facade_round_trip() {
+    use mxx_exponent_lut::{
+        EncodingSecrets, ExpLayout, ExpectedEncoding, ExponentLut, RuntimeConfiguration,
+        SparseLwrPrfProfile, SparseLwrPrfProgram,
+        rns_bgg::{RnsBggParameters, RnsBggPlanRequest},
+    };
+    use mxx_runtime::ExecutionConfig;
+    use tempfile::tempdir;
+
+    let n = 32u32;
+    let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 3, width_log2: 2 }, 2).unwrap();
+    let request = RnsBggPlanRequest {
+        ring_dimension: n,
+        widths: vec![1; 8],
+        encoding_error_sigma: BigDecimal::from(4u8),
+        crt_bits: 32,
+        terminal_depth: 1,
+        max_crt_depth: 32,
+        terminal_value_bound: BigUint::one(),
+        operations_per_drop: 1,
+    };
+    let (parameters, manifest) = RnsBggParameters::plan_fixture(&request).unwrap();
+    println!(
+        "prf_facade_parameter_report ring_dimension={} encoding_error_sigma={} encoding_error_bound={} estimated_bytes={}",
+        n,
+        parameters.encoding_error_sigma(),
+        parameters.encoding_error_bound(),
+        manifest.estimated_bytes
+    );
+    let context = [0x53; 32];
+    let backend = mxx_runtime::backend::poly::cpu_backend(parameters.levels().iter().cloned());
+    let engine = ExponentLut::new(
+        parameters,
+        context,
+        RuntimeConfiguration::new(backend, ExecutionConfig::default()),
+    );
+    let compiled = SparseLwrPrfProgram::new(profile, 4, 4).unwrap();
+    let selector = compiled.selector_key(1, &[0], [0x91; 32]).unwrap();
+    let fixed = compiled.fixed_rhs(&[0], &selector).unwrap();
+    let secrets: EncodingSecrets = compiled.sample_secrets(&engine);
+    let encryption_dir = tempdir().unwrap();
+    let evaluation_dir = tempdir().unwrap();
+    let prepared = engine
+        .preprocess(
+            compiled.program(),
+            fixed,
+            secrets.payload(),
+            encryption_dir.path(),
+            evaluation_dir.path(),
+        )
+        .unwrap();
+    let input_dir = tempdir().unwrap();
+    let input = engine.encrypt(&prepared.encryption, secrets.mask(), input_dir.path()).unwrap();
+    let outputs = engine.online_eval(compiled.program(), &prepared.evaluation, &input).unwrap();
+    let output = compiled.output(&outputs).unwrap();
+    engine.assert_encoding(output, ExpectedEncoding::PrfDigit(1.into()), &secrets).unwrap();
+}
+
+/// Execute the GPU variant through the same facade and, when requested, measure
+/// the exact graphs captured by its stage observer.
+fn run_gpu_rns_bgg_facade_round_trip() {
+    use mxx_exponent_lut::{
+        EncodingSecrets, ExpectedEncoding, ExponentLut, RuntimeConfiguration, SparseLwrPrfProfile,
+        SparseLwrPrfProgram,
+        advanced::ExponentLutBenchmarking,
+        rns_bgg::{RnsBggParameters, RnsBggPlanRequest},
+    };
+    use mxx_ir_core::ValidatedGraph;
+    use mxx_primitives::poly::dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids};
+    use mxx_runtime::ExecutionConfig;
+    use std::sync::{Arc, Mutex};
+    use tempfile::tempdir;
+
+    let settings = PrfTestParameters::from_env();
+    let accepted_report = std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT");
+    let (parameters, n, q_native, p, universe, weight, security_bits, encoding_bound) =
+        if let Some(path) = accepted_report {
+            let report: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).expect("accepted report readable"))
+                    .expect("accepted report JSON");
+            let accepted = rns_bgg::parse_accepted_facade_report(&report, settings.security as u64);
+            let n = accepted.n;
+            let primes: Vec<Vec<u64>> = serde_json::from_value(accepted.level_primes.clone())
+                .expect("accepted report level primes");
+            let (encoding_sigma, encoding_bound) = rns_bgg::report_encoding_noise(&report);
+            let parameters = RnsBggParameters::new(
+                primes
+                    .into_iter()
+                    .map(|primes| {
+                        DCRTPolyParams::new(
+                            n,
+                            primes.len(),
+                            accepted.crt_bits,
+                            accepted.base_bits,
+                            Some(primes),
+                            None,
+                        )
+                    })
+                    .collect(),
+                encoding_sigma.clone(),
+                1,
+            )
+            .expect("accepted report RNS-BGG parameters");
+            assert_eq!(parameters.encoding_error_bound(), &encoding_bound);
+            let q_native = accepted.q_native;
+            let p = accepted.p;
+            let universe = accepted.universe;
+            let weight = accepted.weight;
+            let security_bits = accepted.security_bits as usize;
+            println!(
+                "prf_facade_accepted_report path={:?} security_bits={} encoding_error_sigma={} encoding_error_bound={}",
+                report.get("report_id"),
+                security_bits,
+                encoding_sigma,
+                encoding_bound
+            );
+            // The archived report stores the accepted layout seed directly.
+            // Validate its complete public identity before any facade graph is
+            // constructed; a regenerated layout is not an equivalent fixture.
+            rns_bgg::validate_facade_pbc_layout(&accepted);
+            (parameters, n, q_native, p, universe, weight, security_bits, encoding_bound)
+        } else {
+            let n = 1u32 << settings.log_n;
+            let request = RnsBggPlanRequest {
+                ring_dimension: n,
+                widths: vec![
+                    1;
+                    PbcParameters::paper_evaluation(settings.universe, settings.weight)
+                        .bucket_count +
+                        2
+                ],
+                encoding_error_sigma: BigDecimal::from(4u8),
+                crt_bits: settings.crt_bits,
+                terminal_depth: 1,
+                max_crt_depth: settings.depth.max(32),
+                terminal_value_bound: BigUint::one(),
+                operations_per_drop: 1,
+            };
+            let (parameters, manifest) = RnsBggParameters::plan_fixture(&request).unwrap();
+            let encoding_bound = parameters.encoding_error_bound().clone();
+            println!(
+                "prf_facade_parameter_report ring_dimension={} encoding_error_sigma={} encoding_error_bound={} estimated_bytes={} security_bits={}",
+                n,
+                parameters.encoding_error_sigma(),
+                parameters.encoding_error_bound(),
+                manifest.estimated_bytes,
+                settings.security
+            );
+            (
+                parameters,
+                n,
+                settings.q_native,
+                settings.p,
+                settings.universe,
+                settings.weight,
+                settings.security,
+                encoding_bound,
+            )
+        };
+    let width_log2 = q_native.trailing_zeros() - 1;
+    assert!(width_log2 <= n.trailing_zeros());
+    let profile = SparseLwrPrfProfile::new(
+        mxx_exponent_lut::ExpLayout { stride_log2: n.trailing_zeros() - width_log2, width_log2 },
+        p / 2,
+    )
+    .unwrap();
+    let pbc = PbcParameters::paper_evaluation(universe, weight);
+    let support = (0..weight).collect::<Vec<_>>();
+    let accepted_pbc = std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT").map(|path| {
+        let report: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).expect("accepted report readable"))
+                .expect("accepted report JSON");
+        rns_bgg::parse_accepted_facade_report(&report, settings.security as u64)
+    });
+    let public_layout = if let Some(accepted) = &accepted_pbc {
+        let public_layout = rns_bgg::validate_facade_pbc_layout(accepted);
+        assert_eq!(public_layout.parameters, pbc);
+        public_layout
+    } else {
+        generate_key_layout(&pbc, PbcRootSeed([0x91; 32]), &support).unwrap().public_layout
+    };
+    assert_eq!(
+        PbcActiveCellIndex::build(&public_layout)
+            .unwrap()
+            .bucket_active_widths()
+            .collect::<Vec<_>>(),
+        accepted_pbc.as_ref().map_or_else(
+            || {
+                PbcActiveCellIndex::build(&public_layout)
+                    .unwrap()
+                    .bucket_active_widths()
+                    .collect::<Vec<_>>()
+            },
+            |accepted| accepted.selector_counts.clone(),
+        )
+    );
+    let parameter_levels = parameters.levels().to_vec();
+    let model = mxx_exponent_lut::noise_refresh::simulation::NoiseModelKind::from_env().unwrap();
+    println!(
+        "prf_facade_parameter_report ring_dimension={} encoding_error_sigma={} encoding_error_bound={} security_bits={} accepted_report={}",
+        n,
+        parameters.encoding_error_sigma(),
+        parameters.encoding_error_bound(),
+        security_bits,
+        std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT").is_some()
+    );
+    println!(
+        "prf_noise_simulation model={model:?} failure_exponent={security_bits} encoding_error_sigma={} encoding_error_bound={} report_bound_reconciled=true",
+        parameters.encoding_error_sigma(),
+        encoding_bound
+    );
+    let compiled = SparseLwrPrfProgram::new(
+        profile,
+        public_layout.bucket_width,
+        public_layout.parameters.bucket_count,
+    )
+    .unwrap();
+    let selector = if let Some(accepted) = &accepted_pbc {
+        compiled
+            .selector_key_from_layout_seed(
+                universe,
+                &support,
+                accepted.pbc_seed,
+                accepted.pbc_accepted_attempt,
+            )
+            .expect("accepted report selector schedule must match its public layout")
+    } else {
+        compiled.selector_key(universe, &support, [0x91; 32]).unwrap()
+    };
+    let fixed = compiled.fixed_rhs(&vec![0; universe], &selector).unwrap();
+
+    let benchmark_stage = std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").unwrap_or_default();
+    if benchmark_stage != "" && benchmark_stage != "estimate" && benchmark_stage != "graph" {
+        panic!(
+            "MXX_EXPONENT_LUT_BENCH_STAGE must be `graph` or `estimate`, got {benchmark_stage:?}"
+        );
+    }
+    if benchmark_stage == "graph" {
+        let runtime = RuntimeConfiguration::new(
+            mxx_runtime::backend::poly::cpu_backend(parameter_levels.iter().cloned()),
+            ExecutionConfig::default(),
+        );
+        let engine = ExponentLut::new(parameters, [0x53; 32], runtime);
+        let secrets = compiled.sample_secrets(&engine);
+        let graphs = engine
+            .benchmark_graphs(compiled.program(), &fixed, secrets.payload())
+            .expect("facade graph planning");
+        for (stage, graph) in [
+            ("preprocess", &graphs.preprocess),
+            ("encrypt", &graphs.encrypt),
+            ("online_eval", &graphs.online_eval),
+        ] {
+            println!(
+                "prf_graph_stage={stage} facade_production_graph=true graph_name={}",
+                graph.source.name()
+            );
+        }
+        return;
+    }
+
+    let devices = detected_gpu_device_ids();
+    assert!(!devices.is_empty(), "GPU round trip requires a detected device");
+    if benchmark_stage == "estimate" {
+        let rings = parameters.levels().iter().map(|level| {
+            GpuDCRTPolyParams::new(
+                level.ring_dimension(),
+                level.to_crt().0,
+                level.base_bits(),
+                None,
+            )
+        });
+        let runtime = RuntimeConfiguration::new(
+            mxx_runtime::backend::poly::gpu::gpu_backend_on(rings, devices.clone()),
+            ExecutionConfig::default(),
+        );
+        let engine = ExponentLut::new(parameters.clone(), [0x53; 32], runtime);
+        let secrets: EncodingSecrets = compiled.sample_secrets(&engine);
+        let graphs = engine
+            .benchmark_graphs(compiled.program(), &fixed, secrets.payload())
+            .expect("facade graph planning must not execute production stages");
+        use mxx_bench_estimator::{
+            gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig, measure_graphs,
+        };
+        let observer_parameters = parameters.clone();
+        let mut estimator = GpuNodeMeasurementBackend::new(
+            devices
+                .iter()
+                .map(|device| {
+                    let rings = observer_parameters.levels().iter().map(|level| {
+                        GpuDCRTPolyParams::new(
+                            level.ring_dimension(),
+                            level.to_crt().0,
+                            level.base_bits(),
+                            None,
+                        )
+                    });
+                    (mxx_runtime::backend::poly::gpu::gpu_backend_on(rings, [*device]), *device)
+                })
+                .collect(),
+            MeasurementHarnessConfig {
+                warm_up_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_WARMUPS")
+                    .map(|value| value.parse().unwrap())
+                    .unwrap_or(1),
+                measured_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_ITERATIONS")
+                    .map(|value| value.parse().unwrap())
+                    .unwrap_or(1),
+                ..Default::default()
+            },
+        );
+        for (stage, graph) in [
+            ("preprocess", &graphs.preprocess),
+            ("encrypt", &graphs.encrypt),
+            ("online_eval", &graphs.online_eval),
+        ] {
+            let report = measure_graphs(&[graph], &mut estimator)
+                .map_err(|error| format!("benchmark observation for {stage} failed: {error}"))
+                .expect("facade graph estimate");
+            let report = report.into_iter().next().expect("one graph produces one cost report");
+            let information_bits = p.ilog2();
+            println!(
+                "prf_one_output_estimate stage={stage} total_work_seconds={} cumulative_wave_seconds={} ideal_dag_seconds={} information_bits={information_bits} stage_work_per_information_bit={} stage_cumulative_wave_per_information_bit={} oracle_online_work_excluded=true preprocessing_includes_public_output_projection=true",
+                report.total_work_seconds,
+                report.total_time_seconds,
+                report.critical_path_seconds,
+                report.total_work_seconds / f64::from(information_bits),
+                report.total_time_seconds / f64::from(information_bits),
+            );
+        }
+        return;
+    }
+    let rings = parameters.levels().iter().map(|level| {
+        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
+    });
+    let observed = Arc::new(Mutex::new(Vec::<(String, ValidatedGraph)>::new()));
+    let observer_output = observed.clone();
+    let runtime = RuntimeConfiguration::new(
+        mxx_runtime::backend::poly::gpu::gpu_backend_on(rings, devices),
+        ExecutionConfig::default(),
+    )
+    .with_graph_observer(move |stage, graph| {
+        observer_output.lock().unwrap().push((stage.to_owned(), graph.clone()));
+        Ok(())
+    });
+    let engine = ExponentLut::new(parameters, [0x53; 32], runtime);
+    let secrets: EncodingSecrets = compiled.sample_secrets(&engine);
+    let encryption_dir = tempdir().unwrap();
+    let evaluation_dir = tempdir().unwrap();
+    let stage_started = std::time::Instant::now();
+    let prepared = engine
+        .preprocess(
+            compiled.program(),
+            fixed,
+            secrets.payload(),
+            encryption_dir.path(),
+            evaluation_dir.path(),
+        )
+        .unwrap();
+    println!("prf_roundtrip_stage=preprocess seconds={}", stage_started.elapsed().as_secs_f64());
+    let input_dir = tempdir().unwrap();
+    let stage_started = std::time::Instant::now();
+    let input = engine.encrypt(&prepared.encryption, secrets.mask(), input_dir.path()).unwrap();
+    println!("prf_roundtrip_stage=encrypt seconds={}", stage_started.elapsed().as_secs_f64());
+    let stage_started = std::time::Instant::now();
+    let online_result = engine.online_eval(compiled.program(), &prepared.evaluation, &input);
+    println!("prf_roundtrip_stage=online_eval seconds={}", stage_started.elapsed().as_secs_f64());
+    let outputs = online_result.unwrap();
+    let output = compiled.output(&outputs).unwrap();
+    engine.assert_encoding(output, ExpectedEncoding::PrfDigit(1.into()), &secrets).unwrap();
+}
+
 #[test]
 #[serial_test::serial]
 fn test_gpu_lwr_prf_one_output_round_trip() {
@@ -273,120 +647,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
         .with_test_writer()
         .try_init();
     if use_rns_bgg() {
-        let started = std::time::Instant::now();
-        let fixture = rns_bgg_prf();
-        println!("prf_graph_seconds={}", started.elapsed().as_secs_f64());
-        println!("prf_noise_simulation={}", fixture.noise_report);
-        let manifest = mxx_ir_core::artifact::export_validated_manifest(
-            ProductionId {
-                spec_hash: spec_hash(&fixture.producer.source, &fixture.producer.bindings).unwrap(),
-                execution_nonce: rand::random(),
-            },
-            &fixture.producer,
-        )
-        .unwrap();
-        let artifact_payload_bytes: u128 = manifest
-            .artifacts
-            .values()
-            .map(|artifact| {
-                let bytes = match &artifact.artifact_type {
-                    ArtifactType::Matrix(matrix) => {
-                        let parameters = fixture
-                            .parameters
-                            .levels()
-                            .iter()
-                            .find(|p| BigInt::from(p.modulus().as_ref().clone()) == matrix.modulus)
-                            .unwrap();
-                        matrix.rows as u128 *
-                            matrix.columns as u128 *
-                            matrix.ring_dimension as u128 *
-                            parameters.to_crt().0.len() as u128 *
-                            8
-                    }
-                    ArtifactType::SmallMatrix { matrix, max_coefficient_bound } |
-                    ArtifactType::Preimage { matrix, max_coefficient_bound } => {
-                        matrix.rows as u128 *
-                            matrix.columns as u128 *
-                            matrix.ring_dimension as u128 *
-                            (1 + max_coefficient_bound
-                                .to_biguint()
-                                .unwrap()
-                                .bits()
-                                .div_ceil(8)
-                                .max(1)) as u128
-                    }
-                    ArtifactType::Bytes { length } => *length as u128,
-                    other => panic!("unexpected PRF artifact: {other:?}"),
-                };
-                bytes * artifact.family_count.unwrap_or(1) as u128
-            })
-            .sum();
-        println!("prf_artifact_payload_bytes={artifact_payload_bytes}");
-        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("graph") {
-            return;
-        }
-        if std::env::var("MXX_EXPONENT_LUT_BENCH_STAGE").as_deref() == Ok("estimate") {
-            use mxx_bench_estimator::{
-                estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
-            };
-            use mxx_primitives::poly::dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids};
-            let online = (fixture.online)(manifest.production_id.clone(), manifest, false);
-            let devices = detected_gpu_device_ids();
-            assert!(!devices.is_empty(), "benchmark estimate requires CUDA");
-            println!("prf_estimate_gpu_devices={devices:?}");
-            let backends = devices
-                .into_iter()
-                .map(|device| {
-                    let rings = fixture.parameters.levels().iter().map(|p| {
-                        GpuDCRTPolyParams::new(
-                            p.ring_dimension(),
-                            p.to_crt().0,
-                            p.base_bits(),
-                            None,
-                        )
-                    });
-                    (gpu_backend_on(rings, [device]), device)
-                })
-                .collect();
-            let mut estimator = GpuNodeMeasurementBackend::new(
-                backends,
-                MeasurementHarnessConfig {
-                    warm_up_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_WARMUPS")
-                        .map(|v| v.parse().unwrap())
-                        .unwrap_or(1),
-                    measured_iterations: std::env::var("MXX_EXPONENT_LUT_BENCH_ITERATIONS")
-                        .map(|v| v.parse().unwrap())
-                        .unwrap_or(1),
-                    ..Default::default()
-                },
-            );
-            let stages = [("preprocess", &fixture.producer), ("online_eval", &online)];
-            for (_, graph) in stages {
-                estimate(graph, &mut estimator).expect("collect one-output PRF operations");
-            }
-            estimator.measure_collected().expect("measure one-output PRF operations");
-            let bits = fixture.noise_report["lwr_p"].as_u64().unwrap().ilog2();
-            for (stage, graph) in stages {
-                let report = estimate(graph, &mut estimator).expect("estimate one-output PRF");
-                println!(
-                    "prf_one_output_estimate={}",
-                    serde_json::json!({
-                        "scheme": "rns-bgg", "stage": stage, "output_count": 1,
-                        "information_bits": bits,
-                        "work_seconds_per_information_bit": report.total_work_seconds / f64::from(bits),
-                        "estimated_seconds_per_information_bit": report.total_time_seconds / f64::from(bits),
-                        "selector_setup_amortized": false,
-                        "verification_oracle_included": false,
-                        "runtime_family_staging_timed": true,
-                        "artifact_io_timed": true,
-                        "executor_dispatch_model": "measured scalar IR node proxy",
-                        "report": report,
-                    })
-                );
-            }
-            return;
-        }
-        run_rns_bgg(fixture);
+        run_gpu_rns_bgg_facade_round_trip();
         return;
     }
 
@@ -726,7 +987,7 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     );
     {
         use mxx_bench_estimator::{
-            estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+            gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig, measure_graphs,
         };
         let backends = devices
             .iter()
@@ -745,13 +1006,10 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
             },
         );
         let stages = [("preprocess", &preprocessing), ("online", &estimate_online)];
-        for (_, graph) in stages {
-            estimate(graph, &mut estimator).expect("collect exact PRF graph measurements");
-        }
-        estimator.measure_collected().expect("measure exact PRF operations");
+        let reports = measure_graphs(&stages.map(|entry| entry.1), &mut estimator)
+            .expect("measure exact PRF operations");
         let information_bits = p.ilog2();
-        for (stage, graph) in stages {
-            let report = estimate(graph, &mut estimator).expect("estimate exact PRF graph");
+        for ((stage, _), report) in stages.into_iter().zip(reports) {
             println!(
                 "prf_one_output_estimate stage={stage} total_work_seconds={} cumulative_wave_seconds={} ideal_dag_seconds={} information_bits={information_bits} stage_work_per_information_bit={} stage_cumulative_wave_per_information_bit={} oracle_online_work_excluded=true preprocessing_includes_public_output_projection=true",
                 report.total_work_seconds,
@@ -842,24 +1100,17 @@ fn test_gpu_lwr_prf_one_output_round_trip() {
     }
 }
 
+/// Retains the former descriptor-level construction as an explicit diagnostic
+/// fixture only. The reviewed round-trip above uses the crate-root facade.
+#[test]
+#[ignore = "legacy low-level RNS-BGG diagnostic fixture"]
+fn test_legacy_gpu_rns_bgg_descriptor_round_trip() {
+    run_rns_bgg(rns_bgg_prf());
+}
+
 #[test]
 fn test_cpu_rns_bgg_lwr_prf_one_output_round_trip() {
-    use mxx_primitives::matrix::PolyMatrix;
-    rns_bgg::run(
-        rns_bgg_prf(),
-        |parameters| mxx_runtime::backend::poly::cpu_backend(parameters.levels().iter().cloned()),
-        |_| {},
-        |matrix, name, q, bound| {
-            for row in 0..matrix.row_size() {
-                for col in 0..matrix.col_size() {
-                    for value in matrix.entry(row, col).coeffs_biguints() {
-                        let magnitude = value.clone().min(q - &value);
-                        assert!(&magnitude <= bound, "{name}: {magnitude} > {bound}");
-                    }
-                }
-            }
-        },
-    );
+    run_cpu_rns_bgg_facade_round_trip();
 }
 
 fn run_rns_bgg(fixture: rns_bgg::RnsBggRoundTrip) {
@@ -916,7 +1167,7 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             RnsBggRow, RnsBggScheme,
         },
     };
-    use mxx_ir_core::artifact::Manifest;
+    use mxx_ir_core::artifact::ArtifactCatalog;
     use rns_bgg::{RnsBggRoundTrip, trace_prf};
     let (parameters, layout, counts, selected, labels, p_lwr) = if let Some(path) =
         std::env::var_os("MXX_EXPONENT_LUT_BENCH_ACCEPTED_REPORT")
@@ -1020,10 +1271,9 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             .map(|v| v.parse().unwrap())
             .unwrap_or(4);
         let layout = ExpLayout { stride_log2: 0, width_log2: n.trailing_zeros() };
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
+        let (parameters, _) = RnsBggParameters::plan_fixture(&RnsBggPlanRequest {
             ring_dimension: n,
             widths: vec![1, n as usize],
-            slots: vec![2, 1],
             encoding_error_sigma: BigDecimal::from(4u8),
             crt_bits: 32,
             terminal_depth: 2,
@@ -1162,76 +1412,80 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
     let (producer, readout_descriptor) =
         scheme.export_prepared_readout(&readout, producer, "readout").unwrap();
     let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-    let online = Box::new(move |production: ProductionId, manifest: Manifest, verify: bool| {
-        let prf_descriptor =
-            serde_json::from_slice(&serde_json::to_vec(&prf_descriptor).unwrap()).unwrap();
-        let prepared = PreparedSparseLwrPrf::import(
-            &scheme,
-            program.clone(),
-            &prf_descriptor,
-            production.clone(),
-            prf_descriptor.identity().unwrap(),
-        )
-        .unwrap();
-        let readout_descriptor =
-            serde_json::from_slice(&serde_json::to_vec(&readout_descriptor).unwrap()).unwrap();
-        let readout = scheme
-            .import_prepared_readout(
-                &readout_descriptor,
+    let expected_identity = prf_descriptor.identity().unwrap();
+    let artifacts = rns_bgg::PrfArtifacts {
+        prf: prf_descriptor,
+        input: input_descriptor,
+        readout: readout_descriptor,
+    };
+    let online = Box::new(
+        move |artifacts: &rns_bgg::PrfArtifacts,
+              production: ProductionId,
+              catalog: &ArtifactCatalog,
+              verify: bool| {
+            let prepared = PreparedSparseLwrPrf::import(
+                &scheme,
+                program.clone(),
+                &artifacts.prf,
                 production.clone(),
-                &program.readout,
-                &readout.binding(),
-                *public.scalar().unwrap().0.id(),
-                readout.id(),
+                expected_identity,
             )
             .unwrap();
-        let public_result =
-            scheme.project_readout(&program.readout, &public, &readout, &()).unwrap();
-        let (key, material) = scheme
-            .import_input_material(&input_descriptor, production.clone(), *key.id(), 0)
-            .unwrap();
-        let s = scheme.sample_mask_secret().unwrap();
-        let input = ProgramValue::Scalar((scheme.encode(&s, &key, &material).unwrap(), None));
-        let encoded = ProgramValue::Scalar(prepared.evaluate(&scheme, input).unwrap().at(0));
-        let masks = scheme.prepare_online_masks(&s, &readout.mask_bank()).unwrap();
-        let value = scheme.evaluate_readout(&program.readout, &encoded, &readout, &masks).unwrap();
-        if !verify {
-            // Estimate the same production output, excluding the secret-key
-            // correctness oracle that the round trip evaluates separately.
-            return DslContext::new("rns_bgg-prf-production-online")
-                .output("value", value.values.scalar().unwrap().clone())
+            let readout = scheme
+                .import_prepared_readout(
+                    &artifacts.readout,
+                    production.clone(),
+                    &program.readout,
+                    &readout.binding(),
+                    *public.scalar().unwrap().0.id(),
+                    readout.id(),
+                )
+                .unwrap();
+            let public_result =
+                scheme.project_readout(&program.readout, &public, &readout, &()).unwrap();
+            let (key, material) = scheme
+                .import_input_material(&artifacts.input, production.clone(), *key.id(), 0)
+                .unwrap();
+            let s = scheme.sample_mask_secret().unwrap();
+            let input = ProgramValue::Scalar((scheme.encode(&s, &key, &material).unwrap(), None));
+            let encoded = ProgramValue::Scalar(prepared.evaluate(&scheme, input).unwrap().at(0));
+            let masks = scheme.prepare_online_masks(&s, &readout.mask_bank()).unwrap();
+            let value =
+                scheme.evaluate_readout(&program.readout, &encoded, &readout, &masks).unwrap();
+            if !verify {
+                // Estimate the same production output, excluding the secret-key
+                // correctness oracle that the round trip evaluates separately.
+                return DslContext::new("rns_bgg-prf-production-online")
+                    .output("value", value.values.scalar().unwrap().clone())
+                    .unwrap()
+                    .build()
+                    .unwrap()
+                    .validate_with_catalog(&ParamEnv::default(), catalog)
+                    .unwrap();
+            }
+
+            let d = &program.readout.canonical_coefficients().unwrap()[exponent % layout.width()];
+            let expected =
+                if exponent < layout.width() { d.clone() } else { BigInt::from(1u8) - d };
+            let expected = expected * BigInt::from(digit_scale.clone());
+            let low = scheme.ring(output_level).unwrap();
+            let expected =
+                RnsBggRow::new([[low.polynomial([expected.into()]), low.polynomial([0.into()])]])
+                    .unwrap();
+            let error = value.values.scalar().unwrap().clone() -
+                scheme.mask_at(&s, output_level).unwrap() *
+                    public_result.values.scalar().unwrap().clone() -
+                expected;
+            let consumer = DslContext::new("rns_bgg-prf-online")
+                .output("error", error)
                 .unwrap()
                 .build()
                 .unwrap()
-                .validate_with_manifests(
-                    &ParamEnv::default(),
-                    &BTreeMap::from([(production, manifest)]),
-                )
+                .validate_with_catalog(&ParamEnv::default(), catalog)
                 .unwrap();
-        }
-        let d = &program.readout.canonical_coefficients().unwrap()[exponent % layout.width()];
-        let expected = if exponent < layout.width() { d.clone() } else { BigInt::from(1u8) - d };
-        let expected = expected * BigInt::from(digit_scale.clone());
-        let low = scheme.ring(output_level).unwrap();
-        let expected =
-            RnsBggRow::new([[low.polynomial([expected.into()]), low.polynomial([0.into()])]])
-                .unwrap();
-        let error = value.values.scalar().unwrap().clone() -
-            scheme.mask_at(&s, output_level).unwrap() *
-                public_result.values.scalar().unwrap().clone() -
-            expected;
-        let consumer = DslContext::new("rns_bgg-prf-online")
-            .output("error", error)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production.clone(), manifest)]),
-            )
-            .unwrap();
-        consumer
-    });
+            consumer
+        },
+    );
     let noise_report = serde_json::json!({"scheme": "rns-bgg", "model": model, "worst_bound": worst_bound.to_string(), "output_count": 1, "n": n, "selector_counts": counts, "lwr_p": p_lwr, "output_level": output_level, "digit_scale": reported_scale, "readout_error_bound": terminal_noise.error.to_string(), "readout_value_bound": terminal_noise.coefficient_bound.to_string()});
     let bounds = (0..2)
         .map(|column| {
@@ -1244,16 +1498,21 @@ fn rns_bgg_prf() -> rns_bgg::RnsBggRoundTrip {
             )
         })
         .collect();
-    RnsBggRoundTrip { parameters, producer, online, bounds, noise_report }
+    RnsBggRoundTrip {
+        parameters,
+        producer,
+        artifacts,
+        expected_identity,
+        online,
+        bounds,
+        noise_report,
+    }
 }
 
 mod rns_bgg {
     use bigdecimal::BigDecimal;
     use mxx_exponent_lut::rns_bgg::{RnsBggNoiseBound, RnsBggParameters};
-    use mxx_ir_core::{
-        ValidatedGraph,
-        artifact::{Manifest, ProductionId},
-    };
+    use mxx_ir_core::{ValidatedGraph, artifact::ProductionId};
     use mxx_runtime::{
         Backend, ExecutionConfig, RuntimeValue,
         artifact::{ArtifactStore, FileArtifactStore},
@@ -1284,6 +1543,147 @@ mod rns_bgg {
         (sigma, bound)
     }
 
+    pub(super) struct AcceptedFacadeReport {
+        pub n: u32,
+        pub crt_bits: usize,
+        pub base_bits: u32,
+        pub q_native: usize,
+        pub p: usize,
+        pub universe: usize,
+        pub weight: usize,
+        pub pbc_seed: [u8; 32],
+        pub pbc_layout_id: [u8; 32],
+        pub pbc_accepted_attempt: u32,
+        pub pbc_blocks: usize,
+        pub selector_counts: Vec<usize>,
+        pub level_primes: serde_json::Value,
+        pub security_bits: u64,
+    }
+
+    fn required_u64(object: &serde_json::Value, field: &str) -> u64 {
+        object[field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("accepted report must contain integer {field}"))
+    }
+
+    fn security_floor(object: &serde_json::Value, field: &str) -> u64 {
+        if let Some(bits) = object.get("integer_floor").and_then(serde_json::Value::as_u64) {
+            return bits;
+        }
+        let minimum = object
+            .get("minimum_classical_bits")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_else(|| {
+                panic!("accepted report must contain {field}.minimum_classical_bits")
+            });
+        assert!(
+            minimum.is_finite() && minimum >= 0.0,
+            "accepted report {field} security is invalid"
+        );
+        minimum.floor() as u64
+    }
+
+    /// Parse the reviewed numerical report used by the facade benchmark.
+    /// There is intentionally no security fallback: a report is usable only
+    /// when its candidate acceptance and achieved security evidence are both
+    /// explicit and meet the configured target.
+    pub(super) fn parse_accepted_facade_report(
+        report: &serde_json::Value,
+        configured_target: u64,
+    ) -> AcceptedFacadeReport {
+        let meta = report
+            .get("numerical_run")
+            .unwrap_or_else(|| panic!("accepted report must contain numerical_run"));
+        let candidate = report
+            .get("selected_candidate")
+            .unwrap_or_else(|| panic!("accepted report must contain selected_candidate"));
+        let accepted = candidate
+            .get("correctness_accepted")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                panic!("accepted report must contain selected_candidate.correctness_accepted")
+            });
+        assert!(accepted, "accepted report candidate is not correctness-accepted");
+
+        let report_target = meta
+            .get("security_target_bits")
+            .or_else(|| report.get("security_target_bits"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(configured_target);
+        let target = configured_target.max(report_target);
+        let security_bits = if let Some(bits) = report
+            .get("achieved_security_bits")
+            .or_else(|| candidate.get("security_bits"))
+            .and_then(serde_json::Value::as_u64)
+        {
+            bits
+        } else {
+            let lwe = report
+                .get("lwe_security")
+                .unwrap_or_else(|| panic!("accepted report must contain lwe_security"));
+            let lwr = report
+                .get("lwr_security")
+                .unwrap_or_else(|| panic!("accepted report must contain lwr_security"));
+            security_floor(lwe, "lwe_security").min(security_floor(lwr, "lwr_security"))
+        };
+        assert!(
+            security_bits >= target,
+            "accepted report security {security_bits} is below target {target}"
+        );
+
+        let selector_counts: Vec<usize> = serde_json::from_value(meta["selector_counts"].clone())
+            .expect("accepted report selector_counts must be an integer array");
+        assert!(!selector_counts.is_empty(), "accepted report selector_counts must not be empty");
+        let pbc_blocks = required_u64(meta, "pbc_blocks") as usize;
+        assert_eq!(selector_counts.len(), pbc_blocks, "accepted report PBC block count mismatch");
+        // The established numerical report schema records the accepted layout
+        // seed produced by `PbcPublicLayout::build(..., 0)` and predates a
+        // separate attempt field.  A newer report may carry the same value
+        // explicitly; any other structural identity is still checked below.
+        let pbc_accepted_attempt =
+            meta.get("pbc_accepted_attempt").and_then(serde_json::Value::as_u64).unwrap_or(0)
+                as u32;
+        AcceptedFacadeReport {
+            n: required_u64(meta, "n") as u32,
+            crt_bits: required_u64(meta, "crt_bits") as usize,
+            base_bits: required_u64(meta, "base_bits") as u32,
+            q_native: required_u64(meta, "lwr_q") as usize,
+            p: required_u64(meta, "lwr_p") as usize,
+            universe: required_u64(meta, "lwr_dimension") as usize,
+            weight: required_u64(meta, "lwr_weight") as usize,
+            pbc_seed: serde_json::from_value(meta["pbc_seed"].clone())
+                .expect("accepted report pbc_seed must be 32 bytes"),
+            pbc_layout_id: serde_json::from_value(meta["pbc_layout_id"].clone())
+                .expect("accepted report pbc_layout_id must be 32 bytes"),
+            pbc_accepted_attempt,
+            pbc_blocks,
+            selector_counts,
+            level_primes: candidate["level_primes"].clone(),
+            security_bits,
+        }
+    }
+
+    pub(super) fn validate_facade_pbc_layout(
+        accepted: &AcceptedFacadeReport,
+    ) -> mxx_exponent_lut::noise_refresh::pbc::PbcPublicLayout {
+        use mxx_exponent_lut::noise_refresh::pbc::{
+            PbcActiveCellIndex, PbcLayoutSeed, PbcParameters, PbcPublicLayout,
+        };
+        let parameters = PbcParameters::paper_evaluation(accepted.universe, accepted.weight);
+        let layout = PbcPublicLayout::build(
+            &parameters,
+            PbcLayoutSeed(accepted.pbc_seed),
+            accepted.pbc_accepted_attempt,
+        )
+        .expect("accepted report PBC layout is valid");
+        assert_eq!(layout.layout_id.0, accepted.pbc_layout_id);
+        let counts =
+            PbcActiveCellIndex::build(&layout).unwrap().bucket_active_widths().collect::<Vec<_>>();
+        assert_eq!(counts, accepted.selector_counts);
+        assert_eq!(counts.len(), accepted.pbc_blocks);
+        layout
+    }
+
     #[test]
     fn accepted_report_encoding_noise_round_trip_and_tamper_rejection() {
         let report = serde_json::json!({
@@ -1300,12 +1700,92 @@ mod rns_bgg {
         assert!(std::panic::catch_unwind(|| report_encoding_noise(&tampered)).is_err());
     }
 
+    #[test]
+    fn accepted_facade_report_rejects_missing_or_low_security() {
+        let zero_seed = vec![0u8; 32];
+        let zero_layout_id = vec![0u8; 32];
+        let base = serde_json::json!({
+            "numerical_run": {
+                "n": 16, "crt_bits": 32, "base_bits": 16,
+                "lwr_q": 8, "lwr_p": 4, "lwr_dimension": 1, "lwr_weight": 1,
+                "pbc_blocks": 4, "pbc_seed": zero_seed,
+                "pbc_layout_id": zero_layout_id,
+                "selector_counts": [1, 1, 1, 1]
+            },
+            "selected_candidate": {"correctness_accepted": true, "level_primes": []},
+            "lwe_security": {"minimum_classical_bits": 101.0},
+            "lwr_security": {"integer_floor": 99}
+        });
+        assert!(std::panic::catch_unwind(|| parse_accepted_facade_report(&base, 100)).is_err());
+        let mut missing = base.clone();
+        missing.as_object_mut().unwrap().remove("lwr_security");
+        assert!(std::panic::catch_unwind(|| parse_accepted_facade_report(&missing, 100)).is_err());
+    }
+
+    #[test]
+    fn accepted_facade_report_rejects_pbc_seed_or_count_mismatch() {
+        use mxx_exponent_lut::noise_refresh::pbc::{
+            PbcActiveCellIndex, PbcLayoutSeed, PbcParameters, PbcPublicLayout,
+        };
+        let parameters = PbcParameters::paper_evaluation(1, 1);
+        let layout = PbcPublicLayout::build(&parameters, PbcLayoutSeed([7; 32]), 0).unwrap();
+        let counts =
+            PbcActiveCellIndex::build(&layout).unwrap().bucket_active_widths().collect::<Vec<_>>();
+        let seed = vec![7u8; 32];
+        let layout_id = layout.layout_id.0.to_vec();
+        let report = serde_json::json!({
+            "numerical_run": {
+                "n": 16, "crt_bits": 32, "base_bits": 16,
+                "lwr_q": 8, "lwr_p": 4, "lwr_dimension": 1, "lwr_weight": 1,
+                "pbc_blocks": counts.len(), "pbc_seed": seed,
+                "pbc_layout_id": layout_id, "selector_counts": counts
+            },
+            "selected_candidate": {"correctness_accepted": true, "level_primes": []},
+            "lwe_security": {"minimum_classical_bits": 101.0},
+            "lwr_security": {"integer_floor": 100}
+        });
+        let accepted = parse_accepted_facade_report(&report, 100);
+        assert!(validate_facade_pbc_layout(&accepted).parameters.validate().is_ok());
+
+        let mut wrong_seed = report.clone();
+        wrong_seed["numerical_run"]["pbc_seed"][0] = serde_json::json!(8);
+        let wrong_seed = parse_accepted_facade_report(&wrong_seed, 100);
+        assert!(std::panic::catch_unwind(|| validate_facade_pbc_layout(&wrong_seed)).is_err());
+
+        let mut wrong_counts = report;
+        wrong_counts["numerical_run"]["selector_counts"][0] = serde_json::json!(0);
+        let wrong_counts = parse_accepted_facade_report(&wrong_counts, 100);
+        assert!(std::panic::catch_unwind(|| validate_facade_pbc_layout(&wrong_counts)).is_err());
+    }
+
     pub struct RnsBggRoundTrip {
         pub parameters: RnsBggParameters,
         pub producer: ValidatedGraph,
-        pub online: Box<dyn Fn(ProductionId, Manifest, bool) -> ValidatedGraph>,
+        pub artifacts: PrfArtifacts,
+        pub expected_identity: [u8; 32],
+        pub online: Box<
+            dyn Fn(
+                &PrfArtifacts,
+                ProductionId,
+                &mxx_ir_core::artifact::ArtifactCatalog,
+                bool,
+            ) -> ValidatedGraph,
+        >,
         pub bounds: BTreeMap<String, (BigUint, BigUint)>,
         pub noise_report: serde_json::Value,
+    }
+
+    type PrfDescriptor = mxx_exponent_lut::noise_refresh::prf::PreparedSparseLwrPrfDescriptor<
+        <mxx_exponent_lut::rns_bgg::RnsBggScheme as mxx_exponent_lut::scheme::ExponentLUTFixedRhsScheme>::FixedProductBinding,
+        <<mxx_exponent_lut::rns_bgg::RnsBggScheme as mxx_exponent_lut::scheme::ExponentLUTFixedRhsScheme>::PreparedFixedProduct as mxx_dsl::GraphValue>::Schema,
+    >;
+
+    /// Application descriptors stay typed across the durable runtime checkpoint.
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    pub struct PrfArtifacts {
+        pub prf: PrfDescriptor,
+        pub input: mxx_exponent_lut::rns_bgg::RnsBggInputMaterialDescriptor,
+        pub readout: mxx_exponent_lut::rns_bgg::RnsBggPreparedReadoutDescriptor,
     }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -1518,7 +1998,7 @@ mod rns_bgg {
             let mut store = FileArtifactStore::new(&directory_path).unwrap();
             let round_trip_started = std::time::Instant::now();
             let started = std::time::Instant::now();
-            let produced = execute_with_config(
+            let produced = mxx_runtime::execute_in_session_with_config(
                 &fixture.producer,
                 &mut backend,
                 BTreeMap::from([(
@@ -1526,7 +2006,7 @@ mod rns_bgg {
                     RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
                 )]),
                 &mut store,
-                SamplingMode::Fresh,
+                rand::random(),
                 config,
             )
             .unwrap();
@@ -1539,15 +2019,31 @@ mod rns_bgg {
             println!(
                 "prf_preprocess_complete iteration={iteration} measured={measured} seconds={preprocess_seconds}"
             );
-            let production = produced.production_id.unwrap();
-            drop(produced.outputs);
+            let checkpoint = mxx_runtime::checkpoint::ArtifactCheckpoint::from_execution(
+                &produced,
+                &mut store,
+                fixture.artifacts.clone(),
+                fixture.expected_identity,
+            )
+            .unwrap();
+            let metadata_path = directory_path
+                .join(format!("preprocess-{:02x?}.json", checkpoint.production().execution_nonce));
+            checkpoint.write(&metadata_path).unwrap();
+            let production = checkpoint.production().clone();
+            drop(produced);
             drop(store);
             let started = std::time::Instant::now();
-            let mut store = FileArtifactStore::open(&directory_path).unwrap();
-            let manifest = store.load_manifest(&production).unwrap();
+            let (mut store, checkpoint) =
+                checkpoint.reopen(&directory_path, &metadata_path).unwrap();
+            let manifest = checkpoint.catalog().manifests()[&production].clone();
             let reopen_seconds = started.elapsed().as_secs_f64();
             let started = std::time::Instant::now();
-            let consumer = (fixture.online)(production.clone(), manifest.clone(), true);
+            let consumer = (fixture.online)(
+                checkpoint.descriptor(),
+                production.clone(),
+                checkpoint.catalog(),
+                true,
+            );
             let online_graph_seconds = started.elapsed().as_secs_f64();
             let mut checkpoint_seconds = 0.0;
             let consumer = if durable {
@@ -1691,10 +2187,19 @@ mod rns_bgg {
                 mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
-                    &vec![
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit();
-                        counts[step]
-                    ],
+                    &(0..counts[step])
+                        .map(|index| {
+                            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseAction::new(
+                                mxx_exponent_lut::rns_bgg::noise::stable_source_id(&(
+                                    "lwr-prf-rhs",
+                                    step,
+                                    rhs,
+                                    index,
+                                )),
+                                mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .unwrap();
             rhs_bounds.insert(*rhs, bound);
@@ -1704,14 +2209,10 @@ mod rns_bgg {
         mxx_exponent_lut::rns_bgg::noise::trace_program(
             parameters,
             execution,
-            &mxx_exponent_lut::program::ProgramBindings::new(
-                &inputs,
-                &rhs_bounds,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                Some(&materials),
-            ),
+            &mxx_exponent_lut::program::ProgramBindings::new()
+                .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_values(rhs_bounds.iter().map(|(&id, value)| (id, value.clone())))
+                .gate_helpers(materials.iter().map(|(&id, value)| (id, value.clone()))),
             &mxx_exponent_lut::program::ProgramFamilyBindings::new(),
         )
         .unwrap()

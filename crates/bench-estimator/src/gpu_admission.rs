@@ -482,6 +482,41 @@ impl GpuGraphInventory {
         self.inventory.sources.clear();
     }
 
+    fn scope_until(
+        graph: &mxx_ir_core::ValidatedGraph,
+        scope: &FrozenGraphScopeId,
+        instances: &[crate::dataflow::ScopeSiblingState],
+        optimizer: &InventoryPlan,
+    ) -> Result<Vec<Vec<Vec<usize>>>, GpuMeasurementError> {
+        instances
+            .par_iter()
+            .map(|instance| {
+                let liveness = owner_liveness(graph, scope, &instance.bindings, optimizer, false)
+                    .map_err(|_| {
+                    GpuMeasurementError("invalid active-scope owner liveness".into())
+                })?;
+                Ok(graph
+                    .scope(scope)
+                    .unwrap()
+                    .execution_order
+                    .par_iter()
+                    .enumerate()
+                    .map(|(node, handle)| {
+                        (0..handle.output_types().len())
+                            .map(|port| {
+                                let wire = WireRef {
+                                    node: NodeId(node as u64),
+                                    port: mxx_ir_core::types::Port(port as u32),
+                                };
+                                liveness.cached_value_end(wire).unwrap_or(node)
+                            })
+                            .collect()
+                    })
+                    .collect())
+            })
+            .collect::<Result<Vec<_>, GpuMeasurementError>>()
+    }
+
     fn available(&self) -> GpuAdmissionInventory {
         let mut inventory = self.inventory.clone();
         for (key, contexts) in &mut inventory.contexts {
@@ -668,40 +703,7 @@ impl GpuGraphInventory {
                 } else {
                     InventoryPlan::default()
                 };
-                let until = instances
-                    .par_iter()
-                    .map(|instance| {
-                        let liveness =
-                            owner_liveness(graph, scope, &instance.bindings, &optimizer, false)
-                                .map_err(|_| {
-                                    GpuMeasurementError(
-                                        "invalid active-scope owner liveness".into(),
-                                    )
-                                })?;
-                        Ok(graph
-                            .scope(scope)
-                            .unwrap()
-                            .execution_order
-                            .par_iter()
-                            .enumerate()
-                            .map(|(node, handle)| {
-                                (0..handle.output_types().len())
-                                    .map(|port| {
-                                        let wire = WireRef {
-                                            node: NodeId(node as u64),
-                                            port: mxx_ir_core::types::Port(port as u32),
-                                        };
-                                        if matches!(handle.kind(), NodeKind::Input { .. }) {
-                                            liveness.until(wire).unwrap_or(node)
-                                        } else {
-                                            liveness.output_end(node, port)
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .collect())
-                    })
-                    .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
+                let until = Self::scope_until(graph, scope, &instances, &optimizer)?;
                 self.frames.push(GpuScopeFrame {
                     scope: scope.clone(),
                     resources,
@@ -1656,7 +1658,7 @@ impl LoopAdmissionRequest<'_> {
                     .iter()
                     .filter(|(wire, _)| {
                         (wire.node.0 < node.0 || (issued && wire.node == node)) &&
-                            liveness.output_end(wire.node.0 as usize, wire.port.0 as usize) >=
+                            liveness.cached_value_end(**wire).unwrap_or(node.0 as usize) >=
                                 node.0 as usize
                     })
                     .map(|(&wire, layout)| GpuRetainedValue {
@@ -1769,12 +1771,182 @@ mod tests {
                 })
                 .map(|entry| entry.0)
                 .expect("each artifact input has one scalar scale consumer");
-            assert_eq!(liveness.until(wire), Some(scale_position));
+            assert_eq!(liveness.cached_value_end(wire), Some(scale_position));
             assert!(
-                liveness.output_end(wire.node.0 as usize, 0) > scale_position,
-                "the old child-input borrowing extension must not define root input retirement"
+                liveness.original_output_end(wire.node.0 as usize, 0) <= scale_position,
+                "root input retirement must not use the child-input borrowing extension"
             );
         }
+    }
+
+    #[test]
+    fn test_exported_non_input_matrix_survives_reimport_until_second_consumer() {
+        let ring = Ring::new(257, 16);
+        let source = ring.input("source", (2, 2));
+        let produced = source.clone() + source;
+        let first = produced.clone() + produced.clone();
+        let spacer = ring.input("spacer", (2, 2));
+        let spacer_product = spacer.clone() + spacer;
+        let second = produced.clone() + spacer_product.clone();
+        let graph = DslContext::new("streamed-non-input-matrix-reimport")
+            .private_output("produced", produced)
+            .unwrap()
+            .output("first", first)
+            .unwrap()
+            .output("spacer", spacer_product)
+            .unwrap()
+            .output("second", second)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let root = FrozenGraphScopeId::Root;
+        let checked = graph.root_scope();
+        let produced_wire = graph.source.outputs()["produced"].value;
+        let consumers = checked
+            .execution_order
+            .iter()
+            .enumerate()
+            .filter(|(_, handle)| {
+                graph
+                    .source
+                    .scope(&root)
+                    .unwrap()
+                    .arguments(handle)
+                    .is_some_and(|arguments| arguments.contains(&produced_wire))
+            })
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert!(consumers.len() >= 2, "the exported matrix must have two consumers");
+        let second_consumer = *consumers.last().unwrap();
+        assert!(
+            second_consumer > consumers[0] + 1,
+            "the consumers must be separated by an intervening operation: {consumers:?}"
+        );
+
+        let liveness =
+            owner_liveness(&graph, &root, &graph.bindings, &inventory_plan(&graph, false), false)
+                .unwrap();
+        assert_eq!(
+            liveness.original_output_end(produced_wire.node.0 as usize, 0),
+            produced_wire.node.0 as usize,
+            "export releases the original resident owner at its producer"
+        );
+        assert!(
+            liveness.cached_value_end(produced_wire).is_some_and(|end| end >= second_consumer),
+            "the lazy descriptor must remain live through the later consumer"
+        );
+
+        let values = checked
+            .wire_types
+            .iter()
+            .map(|(&wire, ty)| (wire, ValueLayout::Leaf(ty.clone(), ValueStorage::Device, None)))
+            .collect();
+        let request = LoopAdmissionRequest {
+            graph: &graph,
+            scope: &root,
+            node: NodeId(second_consumer as u64),
+            bindings: &graph.bindings,
+            total_count: 1,
+            first_index: 0,
+            inputs: &[],
+            siblings: &[],
+            active_instance: 0,
+            broadcasts: &Default::default(),
+            arguments: &[],
+            input_modes: &[],
+            values: &values,
+            retained_outputs: &[],
+            ancestors: &[],
+        };
+        let frames = request.gpu_retained_scopes().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(
+            frames[0].values.iter().any(|entry| entry.wire == produced_wire),
+            "pruning at the second consumer must retain the reimportable exported source"
+        );
+
+        // Exercise the production inventory's frame initialization data and
+        // pruning path with the same source owner that a reimport uses. This
+        // catches a regression where frame.until follows only the original
+        // resident owner lifetime and drops the exported descriptor early.
+        let owner =
+            crate::dataflow::LayoutOwner { id: 0, members: BTreeMap::new(), component: None };
+        let owner_value = ValueLayout::Leaf(
+            checked.wire_types[&produced_wire].clone(),
+            ValueStorage::Device,
+            Some(owner.clone()),
+        );
+        let owner_values = BTreeMap::from([(produced_wire, owner_value)]);
+        let instance = crate::dataflow::ScopeSiblingState {
+            index: 0,
+            bindings: graph.bindings.clone(),
+            inputs: Vec::new(),
+            values: owner_values.clone(),
+        };
+        let until = GpuGraphInventory::scope_until(
+            &graph,
+            &root,
+            std::slice::from_ref(&instance),
+            &inventory_plan(&graph, false),
+        )
+        .unwrap();
+        let resources = Arc::new(GpuScopeResources {
+            contexts: BTreeMap::new(),
+            value_layouts: vec![BTreeMap::from([(
+                produced_wire,
+                mxx_runtime::backend::poly_gpu::GpuInventoryValue::new(vec![0, 2]),
+            )])],
+        });
+        let mut inventory = GpuGraphInventory {
+            root: resources.clone(),
+            frames: vec![GpuScopeFrame {
+                scope: root.clone(),
+                resources,
+                progress: vec![GpuScopeProgress::Before(second_consumer)],
+                until,
+                issued: BTreeMap::new(),
+                initial: BTreeMap::new(),
+                placement: None,
+                returned: BTreeSet::new(),
+                staged: Vec::new(),
+                parallel: false,
+                column_cap: 2,
+                selected_node: None,
+            }],
+            pending: None,
+            owners: BTreeMap::from([(owner.clone(), BTreeMap::new())]),
+            inventory: GpuAdmissionInventory {
+                contexts: BTreeMap::new(),
+                sources: BTreeMap::new(),
+                column_cap: 2,
+            },
+        };
+        inventory
+            .inventory
+            .bind_sources(&owner_values, &inventory.frames[0].resources.value_layouts[0]);
+        let request = LoopAdmissionRequest {
+            graph: &graph,
+            scope: &root,
+            node: NodeId(second_consumer as u64),
+            bindings: &graph.bindings,
+            total_count: 1,
+            first_index: 0,
+            inputs: &[],
+            siblings: &[],
+            active_instance: 0,
+            broadcasts: &Default::default(),
+            arguments: &[],
+            input_modes: &[],
+            values: &owner_values,
+            retained_outputs: &[],
+            ancestors: &[],
+        };
+        let available = inventory.at_scope(&request);
+        assert!(inventory.owners.contains_key(&owner));
+        assert!(inventory.inventory.sources.contains_key(&owner));
+        assert!(available.sources.contains_key(&owner));
     }
 
     #[test]

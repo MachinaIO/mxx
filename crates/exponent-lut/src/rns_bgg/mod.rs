@@ -1,12 +1,15 @@
 //! RNS-BGG parameters, polynomial blocks, relation carriers, and scheme capabilities.
+pub mod api;
 pub mod encoding;
 #[cfg(all(test, feature = "gpu"))]
 pub(crate) mod gpu;
 pub mod noise;
+mod program_setup;
 pub mod public_key;
 use crate::{
     layout::ExpLayout,
     noise_refresh::{ExponentLUTRefreshDirectScheme, ExponentLUTRefreshScheme},
+    noise_utils::RightActionNoiseGain,
     program::{
         ExponentLutProgram, ExponentProgramLowering, FamilyRange, LutId, LutTable,
         ProgramFamilyBindings, ProgramGateInstance, ProgramLoweringTypes, ProgramValue,
@@ -34,6 +37,7 @@ use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use noise::RnsBggNoiseValue;
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
+pub use program_setup::*;
 pub use public_key::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -366,7 +370,6 @@ pub struct RnsBggParameters {
 pub struct RnsBggPlanRequest {
     pub ring_dimension: u32,
     pub widths: Vec<usize>,
-    pub slots: Vec<usize>,
     #[serde(with = "bigdecimal_string")]
     pub encoding_error_sigma: BigDecimal,
     pub crt_bits: usize,
@@ -375,6 +378,187 @@ pub struct RnsBggPlanRequest {
     pub terminal_value_bound: BigUint,
     /// Number of logical MulPrivate/LUT operations between physical drops.
     pub operations_per_drop: usize,
+}
+
+/// Auditable workload derived from a concrete Program and its public helper
+/// bindings. Callers should obtain this from `from_program`; the uniform
+/// constructor exists only for low-level parameter fixtures that have no
+/// Program to inspect.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RnsBggStageWorkload {
+    pub(crate) gate_kind: String,
+    pub(crate) branches: usize,
+    pub(crate) fresh_error_gain: RightActionNoiseGain,
+    pub(crate) fresh_error_sources: Vec<[u8; 32]>,
+    pub(crate) public_multiplier_l1: BigUint,
+    pub(crate) output_payload_l1: BigUint,
+    pub(crate) peak_live_values: usize,
+    /// Producer stage for the first and (when applicable) second operand.
+    /// `None` denotes a declared input, whose initial bound is the encoding
+    /// bound. This keeps non-sequential additions tied to their real SSA
+    /// operands rather than to the preceding Program step.
+    pub(crate) operand_stages: [Option<usize>; 2],
+    /// Only multiplication/LUT-like operations consume a CRT drop budget.
+    pub(crate) logical_drop: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RnsBggDerivedWorkload {
+    pub(crate) stages: Vec<RnsBggStageWorkload>,
+    pub(crate) program_commitment: Option<[u8; 32]>,
+    /// Commitment to public helper/noise contracts and family ranges used by
+    /// planning. It intentionally excludes sampled ciphertext and secret data.
+    pub(crate) planning_material_commitment: [u8; 32],
+    pub(crate) material_commitment: [u8; 32],
+}
+
+impl RnsBggDerivedWorkload {
+    /// Build a conservative fixture workload without conflating memory with
+    /// noise. Production callers should use `from_program` in `noise.rs`.
+    pub(crate) fn uniform(stage_count: usize, branches: &[usize]) -> Result<Self, RnsBggError> {
+        if branches.len() != stage_count || branches.iter().any(|value| *value == 0) {
+            return Err(RnsBggError::Parameters("invalid derived workload dimensions"));
+        }
+        let stages = branches
+            .iter()
+            .enumerate()
+            .map(|(index, branches)| RnsBggStageWorkload {
+                gate_kind: "fixture".to_owned(),
+                branches: *branches,
+                fresh_error_gain: RightActionNoiseGain::unit(),
+                fresh_error_sources: Vec::new(),
+                public_multiplier_l1: BigUint::one(),
+                output_payload_l1: BigUint::one(),
+                peak_live_values: 1,
+                operand_stages: [index.checked_sub(1), None],
+                logical_drop: true,
+            })
+            .collect::<Vec<_>>();
+        let planning_material_commitment = stable_commitment(&("fixture-planning-material",));
+        let material_commitment =
+            derived_workload_commitment(None, &planning_material_commitment, &stages)?;
+        Ok(Self {
+            stages,
+            program_commitment: None,
+            planning_material_commitment,
+            material_commitment,
+        })
+    }
+
+    fn validate(&self, stages: usize) -> Result<(), RnsBggError> {
+        if self.stages.len() != stages ||
+            self.stages.iter().any(|stage| {
+                stage.branches == 0 ||
+                    stage.peak_live_values == 0 ||
+                    stage.output_payload_l1.is_zero()
+            })
+        {
+            return Err(RnsBggError::Parameters("invalid derived workload"));
+        }
+        let expected = derived_workload_commitment(
+            self.program_commitment.as_ref(),
+            &self.planning_material_commitment,
+            &self.stages,
+        )?;
+        if self.material_commitment != expected {
+            return Err(RnsBggError::Parameters("derived workload commitment mismatch"));
+        }
+        Ok(())
+    }
+
+    pub fn stages(&self) -> &[RnsBggStageWorkload] {
+        &self.stages
+    }
+
+    pub fn program_commitment(&self) -> Option<&[u8; 32]> {
+        self.program_commitment.as_ref()
+    }
+
+    pub fn material_commitment(&self) -> &[u8; 32] {
+        &self.material_commitment
+    }
+
+    pub fn planning_material_commitment(&self) -> &[u8; 32] {
+        &self.planning_material_commitment
+    }
+
+    pub(crate) fn logical_stage_schedule(&self) -> Vec<bool> {
+        self.stages.iter().map(|stage| stage.logical_drop).collect()
+    }
+
+    pub(crate) fn drop_schedule(
+        &self,
+        operations_per_drop: usize,
+    ) -> Result<Vec<bool>, RnsBggError> {
+        if operations_per_drop == 0 {
+            return Err(RnsBggError::Parameters("operations_per_drop must be positive"));
+        }
+        let logical = self.stages.iter().filter(|stage| stage.logical_drop).count();
+        let mut seen = 0usize;
+        Ok(self
+            .stages
+            .iter()
+            .map(|stage| {
+                if !stage.logical_drop {
+                    return false;
+                }
+                seen += 1;
+                seen % operations_per_drop == 0 || seen == logical
+            })
+            .collect())
+    }
+}
+
+fn derived_workload_commitment(
+    program_commitment: Option<&[u8; 32]>,
+    planning_material_commitment: &[u8; 32],
+    stages: &[RnsBggStageWorkload],
+) -> Result<[u8; 32], RnsBggError> {
+    let encoded = serde_json::to_vec(&(program_commitment, planning_material_commitment, stages))
+        .map_err(|_| RnsBggError::Parameters("cannot serialize derived workload"))?;
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn stable_commitment<T: Serialize>(value: &T) -> [u8; 32] {
+    Sha256::digest(serde_json::to_vec(value).expect("canonical commitment serialization")).into()
+}
+
+impl RnsBggStageWorkload {
+    pub fn gate_kind(&self) -> &str {
+        &self.gate_kind
+    }
+
+    pub fn branches(&self) -> usize {
+        self.branches
+    }
+
+    pub fn fresh_error_gain(&self) -> &RightActionNoiseGain {
+        &self.fresh_error_gain
+    }
+
+    pub fn fresh_error_sources(&self) -> &[[u8; 32]] {
+        &self.fresh_error_sources
+    }
+
+    pub fn public_multiplier_l1(&self) -> &BigUint {
+        &self.public_multiplier_l1
+    }
+
+    pub fn output_payload_l1(&self) -> &BigUint {
+        &self.output_payload_l1
+    }
+
+    pub fn peak_live_values(&self) -> usize {
+        self.peak_live_values
+    }
+
+    pub fn operand_stages(&self) -> [Option<usize>; 2] {
+        self.operand_stages
+    }
+
+    pub fn logical_drop(&self) -> bool {
+        self.logical_drop
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -399,7 +583,9 @@ impl RnsBggNoiseBound {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RnsBggParameterManifest {
+    pub schema_version: u32,
     pub workload: RnsBggPlanRequest,
+    pub derived_workload: RnsBggDerivedWorkload,
     pub ring_dimension: u32,
     #[serde(with = "bigdecimal_string")]
     pub encoding_error_sigma: BigDecimal,
@@ -583,8 +769,6 @@ impl RnsBggPlanRequest {
         }
         let stages = self.widths.len();
         if stages == 0 ||
-            self.slots.len() != stages ||
-            self.slots.contains(&0) ||
             self.widths.iter().any(|w| !w.is_power_of_two() || *w > self.ring_dimension as usize) ||
             self.terminal_depth == 0 ||
             self.max_crt_depth < self.terminal_depth ||
@@ -604,11 +788,24 @@ impl RnsBggPlanRequest {
 }
 
 impl RnsBggParameterManifest {
+    pub const SCHEMA_VERSION: u32 = 2;
+
     /// Restore the recorded bases, without generating a new prime pool, and
     /// verify every redundant certificate field before accepting the artifact.
     /// This verifies arithmetic consistency, not artifact authenticity.
     pub fn validate(&self) -> Result<RnsBggParameters, RnsBggError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(RnsBggError::Parameters("unsupported RNS-BGG manifest schema"));
+        }
         self.workload.validate()?;
+        let stage_count = self.workload.widths.len();
+        self.derived_workload.validate(stage_count)?;
+        let logical_count = self
+            .derived_workload
+            .logical_stage_schedule()
+            .into_iter()
+            .filter(|logical| *logical)
+            .count();
         let workload_sigma = canonical_encoding_sigma(self.workload.encoding_error_sigma.clone())?;
         let manifest_sigma = canonical_encoding_sigma(self.encoding_error_sigma.clone())?;
         if self.ring_dimension != self.workload.ring_dimension ||
@@ -616,7 +813,7 @@ impl RnsBggParameterManifest {
             self.encoding_error_sigma != workload_sigma ||
             self.encoding_error_bound != encoding_error_bound(&workload_sigma)? ||
             self.operations_per_drop != self.workload.operations_per_drop ||
-            self.levels.len() != self.workload.widths.len() + 1 ||
+            self.levels.len() != logical_count + 1 ||
             self.base_bits.len() != self.levels.len() ||
             self.levels
                 .iter()
@@ -642,28 +839,49 @@ impl RnsBggParameterManifest {
                 .map_err(|_| RnsBggError::Parameters("invalid manifest prime basis"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let parameters = RnsBggParameters::new(
+        let parameters = RnsBggParameters::new_unchecked_schedule(
             levels,
             self.encoding_error_sigma.clone(),
+            self.encoding_error_bound.clone(),
             self.workload.operations_per_drop,
         )?;
         if parameters.encoding_error_bound != self.encoding_error_bound {
             return Err(RnsBggError::Parameters("manifest encoding error cutoff mismatch"));
         }
-        let stages = self.workload.widths.len();
+        let drop_schedule =
+            self.derived_workload.drop_schedule(self.workload.operations_per_drop)?;
+        let logical_drop_schedule = self
+            .derived_workload
+            .logical_stage_schedule()
+            .into_iter()
+            .zip(drop_schedule)
+            .filter_map(|(logical, drop)| logical.then_some(drop))
+            .collect::<Vec<_>>();
         for (operation, pair) in parameters.levels.windows(2).enumerate() {
-            let must_drop =
-                (operation + 1) % self.workload.operations_per_drop == 0 || operation + 1 == stages;
+            let must_drop = logical_drop_schedule[operation];
             if (pair[0] == pair[1]) == must_drop {
                 return Err(RnsBggError::Parameters("manifest levels do not match drop cadence"));
             }
         }
-        if parameters.audit(&self.workload)? != *self {
+        if parameters.audit(&self.workload, &self.derived_workload)? != *self {
             return Err(RnsBggError::Parameters(
                 "manifest certificate does not match workload and bases",
             ));
         }
         Ok(parameters)
+    }
+
+    /// Validate a manifest against the concrete Program-derived workload used
+    /// to create it. Plain `validate` checks arithmetic self-consistency only;
+    /// this method binds the commitment to caller-held public evidence.
+    pub fn validate_with_workload(
+        &self,
+        workload: &RnsBggDerivedWorkload,
+    ) -> Result<RnsBggParameters, RnsBggError> {
+        if &self.derived_workload != workload {
+            return Err(RnsBggError::Parameters("derived workload commitment mismatch"));
+        }
+        self.validate()
     }
 }
 
@@ -679,7 +897,6 @@ mod parameter_tests {
                 .map(|value| value.parse().unwrap())
                 .unwrap_or(16),
             widths: vec![1],
-            slots: vec![1],
             encoding_error_sigma: BigDecimal::from(1u8),
             crt_bits: 16,
             terminal_depth: 1,
@@ -697,6 +914,11 @@ mod parameter_tests {
         let restored = decoded.validate().unwrap();
         assert_eq!(decoded, manifest);
         assert_eq!(restored.drops, parameters.drops);
+        let mut shortened = decoded.clone();
+        shortened.derived_workload.stages.pop();
+        let shortened: RnsBggParameterManifest =
+            serde_json::from_slice(&serde_json::to_vec(&shortened).unwrap()).unwrap();
+        assert!(shortened.validate().is_err());
         assert_eq!(parameters.encoding_error_bound, BigUint::from(6u8));
         for (actual, expected) in restored.levels.iter().zip(&parameters.levels) {
             assert_eq!(actual.to_crt(), expected.to_crt());
@@ -705,6 +927,9 @@ mod parameter_tests {
         }
         // Each mutation changes an independently checked artifact claim.
         let mut invalid = Vec::new();
+        let mut changed = manifest.clone();
+        changed.schema_version = 1;
+        invalid.push(changed);
         let mut changed = manifest.clone();
         changed.noise_bounds[1].error = BigUint::zero();
         invalid.push(changed);
@@ -731,9 +956,6 @@ mod parameter_tests {
         changed.levels[1] = changed.levels[0].clone();
         invalid.push(changed);
         let mut changed = manifest.clone();
-        changed.workload.slots[0] += 1;
-        invalid.push(changed);
-        let mut changed = manifest.clone();
         changed.ring_dimension *= 2;
         invalid.push(changed);
         let mut changed = manifest.clone();
@@ -741,6 +963,21 @@ mod parameter_tests {
         invalid.push(changed);
         let mut changed = manifest.clone();
         changed.operations_per_drop += 1;
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.derived_workload.stages[0].fresh_error_gain.l1 += 1u8;
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.derived_workload.stages[0].peak_live_values += 1;
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.derived_workload.program_commitment = Some([9u8; 32]);
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.derived_workload.material_commitment = [9u8; 32];
+        invalid.push(changed);
+        let mut changed = manifest.clone();
+        changed.derived_workload.planning_material_commitment = [9u8; 32];
         invalid.push(changed);
         for (index, changed) in invalid.into_iter().enumerate() {
             assert!(changed.validate().is_err(), "accepted altered certificate {index}");
@@ -806,19 +1043,12 @@ mod parameter_tests {
             RnsBggParameters::plan(&changed),
             Err(RnsBggError::Budget("terminal range"))
         ));
-        let mut changed = base;
-        changed.slots[0] = usize::MAX;
-        assert!(matches!(
-            RnsBggParameters::plan(&changed),
-            Err(RnsBggError::Budget("evaluation noise"))
-        ));
     }
 
     #[test]
     fn test_rns_bgg_cadence_repeats_bases_and_rejects_invalid_schedule() {
         let mut workload = request();
         workload.widths = vec![1; 3];
-        workload.slots = vec![1; 3];
         workload.operations_per_drop = 2;
         let (parameters, manifest) = RnsBggParameters::plan(&workload).unwrap();
         assert_eq!(parameters.operations_per_drop(), 2);
@@ -840,7 +1070,6 @@ mod parameter_tests {
 
         let mut short = request();
         short.widths = vec![1; 2];
-        short.slots = vec![1; 2];
         short.operations_per_drop = 3;
         let (short_parameters, _) = RnsBggParameters::plan(&short).unwrap();
         assert_eq!(short_parameters.levels()[0], short_parameters.levels()[1]);

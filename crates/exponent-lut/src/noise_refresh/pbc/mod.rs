@@ -130,6 +130,7 @@ pub use artifacts::{
     canonical_component_name, public_family_artifact_name, selector_bit_family_name,
     selector_family_artifact_name, selector_family_artifact_name_from_names,
 };
+pub(crate) use schedule::generate_key_layout_from_layout_seed;
 pub use schedule::{
     PbcGeneratedKeyLayout, PbcPrivateSchedule, canonical_decode, clear_pbc_inner_product,
     dense_binary_support, generate_key_layout, support_from_dense,

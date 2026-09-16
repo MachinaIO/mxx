@@ -7656,10 +7656,9 @@ mod rns_bgg {
         // in addition to the preceding PRF and following LUT. Choose before
         // constructing ciphertext graphs so rejected candidates allocate no graph.
         for terminal_depth in 2..=29 {
-            let candidate = RnsBggParameters::plan(&RnsBggPlanRequest {
+            let candidate = RnsBggParameters::plan_fixture(&RnsBggPlanRequest {
                 ring_dimension: n,
                 widths: vec![1, n as usize, 1],
-                slots: vec![2, 1, 1],
                 encoding_error_sigma: encoding_error_sigma.clone(),
                 crt_bits: 30,
                 terminal_depth,
@@ -8195,10 +8194,19 @@ mod rns_bgg {
                 mxx_exponent_lut::rns_bgg::noise::RnsBggGateNoiseMaterial::from_one_hot_labels(
                     step,
                     None,
-                    &vec![
-                        mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit();
-                        selector_counts[step]
-                    ],
+                    &(0..selector_counts[step])
+                        .map(|index| {
+                            mxx_exponent_lut::rns_bgg::noise::RnsBggNoiseAction::new(
+                                mxx_exponent_lut::rns_bgg::noise::stable_source_id(&(
+                                    "noise-refresh-rhs",
+                                    step,
+                                    rhs,
+                                    index,
+                                )),
+                                mxx_exponent_lut::noise_utils::RightActionNoiseGain::unit(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
                 )
                 .unwrap();
             rhs_bounds.insert(*rhs, bound);
@@ -8208,14 +8216,10 @@ mod rns_bgg {
         mxx_exponent_lut::rns_bgg::noise::trace_program(
             parameters,
             execution,
-            &mxx_exponent_lut::program::ProgramBindings::new(
-                &inputs,
-                &rhs_bounds,
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                Some(&materials),
-            ),
+            &mxx_exponent_lut::program::ProgramBindings::new()
+                .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                .rhs_values(rhs_bounds.iter().map(|(&id, value)| (id, value.clone())))
+                .gate_helpers(materials.iter().map(|(&id, value)| (id, value.clone()))),
             &mxx_exponent_lut::program::ProgramFamilyBindings::new(),
         )
         .unwrap()

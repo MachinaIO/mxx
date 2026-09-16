@@ -296,6 +296,23 @@ pub fn generate_key_layout(
     )
 }
 
+/// Reconstruct one previously accepted public layout and its private schedule
+/// from the serialized layout seed.  This is crate-visible because durable
+/// reviewed reports store the accepted attempt seed rather than the root seed;
+/// callers must still validate the resulting public layout identity.
+pub(crate) fn generate_key_layout_from_layout_seed(
+    parameters: &PbcParameters,
+    layout_seed: super::PbcLayoutSeed,
+    accepted_attempt: u32,
+    sparse_support: &[usize],
+) -> Result<PbcGeneratedKeyLayout, PbcError> {
+    parameters.validate()?;
+    let support = ValidatedSupport::new(parameters, sparse_support)?;
+    let layout = PbcPublicLayout::build(parameters, layout_seed, accepted_attempt)?;
+    let private_schedule = schedule(&layout, &support)?;
+    Ok(PbcGeneratedKeyLayout { public_layout: layout, private_schedule })
+}
+
 pub(super) fn retry_layout(
     parameters: &PbcParameters,
     root_seed: PbcRootSeed,

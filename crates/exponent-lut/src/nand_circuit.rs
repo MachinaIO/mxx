@@ -1,7 +1,6 @@
 //! Compilation of Boolean NAND circuits to the fixed-width Exponent-LUT IR.
 //!
-//! The compiler is the host-side part of the construction in §5.2 of the
-//! accompanying paper.  A three-register program is packed as
+//! A three-register program is packed as
 //! `R0 + 2 * R1 + 4 * R2`; each instruction is consequently one binary LUT
 //! with an 8-valued left input and a 2-valued right input.  The right input is
 //! always an original circuit bit.  In particular, an evaluated intermediate
@@ -64,31 +63,89 @@ pub struct CompiledNandCircuit {
     state_input: ProgramInputId,
     rhs_ids: Vec<RhsId>,
     circuit_input_indices: Vec<usize>,
+    input_count: usize,
 }
 
 impl CompiledNandCircuit {
+    /// Bind circuit bits using the exponent packing committed by the Program.
+    /// The packed initial register state is (0, 1, 0), hence native exponent 2.
+    pub fn fixed_rhs(&self, assignment: &[bool]) -> Result<crate::FixedRhs, crate::ExecutionError> {
+        if assignment.len() != self.input_count {
+            return Err(crate::rns_bgg::api::ExecutionError::invalid(
+                "circuit assignment length mismatch",
+            ));
+        }
+        let stride = self.program.layout().expect("compiled layout").exponent.stride_log2;
+        Ok(crate::FixedRhs {
+            program: self.program.id(),
+            inputs: [(
+                self.state_input,
+                crate::rns_bgg::RnsBggProgramInput {
+                    level: 0,
+                    native_exponent: num_bigint::BigInt::from(2u8) << stride,
+                },
+            )]
+            .into(),
+            rhs: self
+                .rhs_ids
+                .iter()
+                .zip(&self.circuit_input_indices)
+                .map(|(id, input)| {
+                    let scale =
+                        self.program.rhs_exponent_scale_log2(*id).expect("compiled RHS scale");
+                    (*id, num_bigint::BigInt::from(u8::from(assignment[*input])) << scale)
+                })
+                .collect(),
+            sparse_lwr: None,
+        })
+    }
+
+    pub fn sample_secrets<B: mxx_runtime::Backend>(
+        &self,
+        engine: &crate::ExponentLut<B>,
+    ) -> Result<crate::EncodingSecrets, crate::ExecutionError> {
+        Ok(engine.sample_secrets(false))
+    }
+
+    pub fn output<'a>(
+        &self,
+        outputs: &'a crate::EncodedOutputs,
+    ) -> Result<&'a crate::EncodedOutput, crate::ExecutionError> {
+        outputs.for_program(self.program.id())
+    }
+
     /// The immutable Exponent-LUT program.
     pub const fn program(&self) -> &ExponentLutProgram {
         &self.program
     }
+}
 
-    /// The sole program input, carrying packed state and bound to `mono_m(2)`.
-    pub const fn state_input(&self) -> ProgramInputId {
+/// Backend-facing details for benchmark and adapter integrations.
+///
+/// These accessors are deliberately outside the normal crate-root API. Most
+/// callers only need [`CompiledNandCircuit::fixed_rhs`] and [`CompiledNandCircuit::output`].
+pub trait CompiledNandCircuitDetails {
+    /// Return the internal packed-state input used by adapter bindings.
+    fn state_input(&self) -> ProgramInputId;
+    fn rhs_ids(&self) -> &[RhsId];
+    fn circuit_input_indices(&self) -> &[usize];
+    fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>);
+}
+
+impl CompiledNandCircuitDetails for CompiledNandCircuit {
+    fn state_input(&self) -> ProgramInputId {
         self.state_input
     }
 
-    /// RHS declarations in the order of the binary LUT rounds.
-    pub fn rhs_ids(&self) -> &[RhsId] {
+    fn rhs_ids(&self) -> &[RhsId] {
         &self.rhs_ids
     }
 
-    /// Original circuit input read by each corresponding RHS round.
-    pub fn circuit_input_indices(&self) -> &[usize] {
+    fn circuit_input_indices(&self) -> &[usize] {
         &self.circuit_input_indices
     }
 
-    /// Consumes the wrapper and returns the program and its binding metadata.
-    pub fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>) {
+    fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>) {
         (self.program, self.state_input, self.rhs_ids, self.circuit_input_indices)
     }
 }
@@ -177,7 +234,7 @@ impl NandCircuit {
         let mut circuit_input_indices = Vec::with_capacity(instructions.len());
 
         for (round, instruction) in instructions.iter().enumerate() {
-            let rhs = builder.rhs_input(rhs_family, STATE_WIDTH, RHS_WIDTH)?;
+            let rhs = builder.packed_rhs_input(rhs_family, STATE_WIDTH, RHS_WIDTH)?;
             let output_width = if round + 1 == instructions.len() { 2 } else { STATE_WIDTH };
             let values = (0..RHS_WIDTH)
                 .flat_map(|bit| {
@@ -196,7 +253,13 @@ impl NandCircuit {
 
         builder.output(state)?;
         let program = builder.build()?;
-        Ok(CompiledNandCircuit { program, state_input, rhs_ids, circuit_input_indices })
+        Ok(CompiledNandCircuit {
+            program,
+            state_input,
+            rhs_ids,
+            circuit_input_indices,
+            input_count: self.input_count,
+        })
     }
 
     fn reachable_round_count(
@@ -301,7 +364,7 @@ fn multiply(lhs: [[u8; 3]; 3], rhs: [[u8; 3]; 3]) -> [[u8; 3]; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompiledNandCircuit, NandCircuit, NandCircuitError};
+    use super::{CompiledNandCircuit, CompiledNandCircuitDetails, NandCircuit, NandCircuitError};
     use crate::{ExpLayout, program::Gate};
 
     fn compile(circuit: NandCircuit, budget: usize) -> CompiledNandCircuit {

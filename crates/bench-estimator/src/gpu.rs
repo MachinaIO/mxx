@@ -3593,6 +3593,12 @@ impl GpuNodeMeasurementBackend {
     }
 }
 
+impl crate::CollectedMeasurementBackend for GpuNodeMeasurementBackend {
+    fn measure_collected(&mut self) -> Result<(), Self::Error> {
+        GpuNodeMeasurementBackend::measure_collected(self)
+    }
+}
+
 impl MeasurementBackend for GpuNodeMeasurementBackend {
     type Error = GpuMeasurementError;
 

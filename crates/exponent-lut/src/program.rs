@@ -16,7 +16,7 @@
 //! The builder validates wire, table, family-range, and gate-order obligations
 //! before either backend performs matrix lowering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use mxx_ir_core::IntExpr;
 use num_traits::ToPrimitive;
@@ -183,6 +183,8 @@ pub struct RhsInputDeclaration {
     lhs_width: usize,
     rhs_width: usize,
     exponent_scale_log2: u32,
+    /// Packed binary tables place the RHS above the LHS exponent bits.
+    packed: bool,
     /// Whether the RHS relation exposes its plaintext attribute publicly.
     plaintext_knowledge: AttributeKnowledge,
 }
@@ -325,6 +327,12 @@ impl ProgramFamilyBindings {
 
     pub(crate) fn range(&self, id: ProgramFamilyId) -> Option<&FamilyRange> {
         self.ranges.get(&id)
+    }
+
+    /// Canonical ordered entries for commitments. JSON object keys cannot
+    /// represent typed family IDs, so commitments encode the map as a list.
+    pub(crate) fn canonical_entries(&self) -> Vec<(ProgramFamilyId, FamilyRange)> {
+        self.ranges.iter().map(|(id, range)| (*id, range.clone())).collect()
     }
 }
 
@@ -534,6 +542,18 @@ pub enum ProgramValidationError {
     MissingRuntimeRhs(RhsId),
     #[error("runtime helper set for LUT is missing: {0:?}")]
     MissingRuntimeLutHelpers(LutId),
+    #[error("runtime input binding is not declared by the program: {0:?}")]
+    UnexpectedRuntimeInput(ProgramInputId),
+    #[error("runtime RHS binding is not declared by the program: {0:?}")]
+    UnexpectedRuntimeRhs(String),
+    #[error("runtime wire-family binding is not used by the program: {0:?}")]
+    UnexpectedRuntimeWireFamily(WireFamilyId),
+    #[error("runtime LUT helper binding is not declared by the program: {0:?}")]
+    UnexpectedRuntimeLutHelper(LutId),
+    #[error("runtime gate helper binding is not required by the program: {0:?}")]
+    UnexpectedRuntimeGateHelper(ProgramGateInstance),
+    #[error("runtime RHS binding has the wrong scalar/family variant: {0:?}")]
+    RuntimeRhsVariantMismatch(String),
     #[error("program public multiplication requires a public attribute wire")]
     PublicAttributeRequired(WireId),
     #[error("program layout is required before declaring RHS inputs or building")]
@@ -753,7 +773,28 @@ impl ExponentLutProgramBuilder {
     ) -> Result<RhsId, ProgramValidationError> {
         let exponent_scale_log2 =
             self.layout.ok_or(ProgramValidationError::MissingProgramLayout)?.exponent.stride_log2;
-        self.rhs_input_derived(family, lhs_width, rhs_width, exponent_scale_log2)
+        self.rhs_input_derived(family, lhs_width, rhs_width, exponent_scale_log2, false)
+    }
+
+    /// Declare a binary-table RHS whose digit occupies the bits above the LHS.
+    /// Its scale is derived from the layout and LHS width, never caller supplied.
+    pub fn packed_rhs_input(
+        &mut self,
+        family: RhsFamilyId,
+        lhs_width: usize,
+        rhs_width: usize,
+    ) -> Result<RhsId, ProgramValidationError> {
+        if !lhs_width.is_power_of_two() {
+            return Err(ProgramValidationError::WidthMismatch);
+        }
+        let scale = self
+            .layout
+            .ok_or(ProgramValidationError::MissingProgramLayout)?
+            .exponent
+            .stride_log2
+            .checked_add(lhs_width.trailing_zeros())
+            .ok_or(ProgramValidationError::WidthMismatch)?;
+        self.rhs_input_derived(family, lhs_width, rhs_width, scale, true)
     }
 
     /// Declares a RHS using the native exponent scale committed by the
@@ -764,6 +805,7 @@ impl ExponentLutProgramBuilder {
         lhs_width: usize,
         rhs_width: usize,
         exponent_scale_log2: u32,
+        packed: bool,
     ) -> Result<RhsId, ProgramValidationError> {
         if lhs_width == 0 || rhs_width == 0 || !rhs_width.is_power_of_two() {
             return Err(ProgramValidationError::WidthMismatch);
@@ -787,6 +829,7 @@ impl ExponentLutProgramBuilder {
                     lhs_width,
                     rhs_width,
                     exponent_scale_log2,
+                    packed,
                     plaintext_knowledge: self
                         .rhs_families
                         .get(&family)
@@ -1121,7 +1164,13 @@ pub(crate) fn validate_builder(
             !declaration.rhs_width.is_power_of_two() ||
             builder.rhs_families.get(&declaration.family).map(|family| family.width) !=
                 Some(declaration.rhs_width) ||
-            declaration.exponent_scale_log2 != layout.exponent.stride_log2 ||
+            (declaration.packed && !declaration.lhs_width.is_power_of_two()) ||
+            Some(declaration.exponent_scale_log2) !=
+                layout.exponent.stride_log2.checked_add(if declaration.packed {
+                    declaration.lhs_width.trailing_zeros()
+                } else {
+                    0
+                }) ||
             declaration
                 .exponent_scale_log2
                 .checked_add(declaration.rhs_width.trailing_zeros())
@@ -1678,27 +1727,269 @@ pub enum ProgramLowerError<E: Error + Send + Sync + 'static> {
 /// never expands a family into host-side members. Inputs declared public must
 /// carry their public plaintext metadata. All values and prepared helpers must
 /// belong to the layout and scheme used to prepare this Program.
-pub struct ProgramBindings<'a, W, R, H, WF = W, RF = R> {
-    pub inputs: &'a BTreeMap<ProgramInputId, W>,
-    pub rhs_inputs: &'a BTreeMap<RhsId, R>,
-    pub rhs_families: &'a BTreeMap<RhsFamilyId, RF>,
-    pub wire_values: &'a BTreeMap<WireFamilyId, WF>,
-    pub helpers: &'a BTreeMap<LutId, H>,
+pub struct ProgramBindings<W, R, H, WF = W, RF = R> {
+    pub(crate) inputs: BTreeMap<ProgramInputId, W>,
+    pub(crate) rhs: BTreeMap<RuntimeRhsId, RuntimeRhs<R, RF>>,
+    gate_rhs: BTreeMap<ProgramGateInstance, (RhsId, R)>,
+    pub(crate) wire_values: BTreeMap<WireFamilyId, WF>,
+    pub(crate) helpers: BTreeMap<LutId, H>,
     /// Instance material takes precedence over reusable table-only material.
     /// Fixed private-product material is bound to its operation instance here.
-    pub gate_helpers: Option<&'a BTreeMap<ProgramGateInstance, H>>,
+    pub(crate) gate_helpers: BTreeMap<ProgramGateInstance, H>,
 }
 
-impl<'a, W, R, H, WF, RF> ProgramBindings<'a, W, R, H, WF, RF> {
-    pub fn new(
-        inputs: &'a BTreeMap<ProgramInputId, W>,
-        rhs_inputs: &'a BTreeMap<RhsId, R>,
-        rhs_families: &'a BTreeMap<RhsFamilyId, RF>,
-        wire_values: &'a BTreeMap<WireFamilyId, WF>,
-        helpers: &'a BTreeMap<LutId, H>,
-        gate_helpers: Option<&'a BTreeMap<ProgramGateInstance, H>>,
+#[derive(Clone)]
+pub(crate) enum RuntimeRhs<R, RF> {
+    Scalar(R),
+    Family(RF),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum RuntimeRhsId {
+    Scalar(RhsId),
+    Family(RhsFamilyId),
+}
+
+impl<W, R, H, WF, RF> Default for ProgramBindings<W, R, H, WF, RF> {
+    fn default() -> Self {
+        Self {
+            inputs: BTreeMap::new(),
+            rhs: BTreeMap::new(),
+            gate_rhs: BTreeMap::new(),
+            wire_values: BTreeMap::new(),
+            helpers: BTreeMap::new(),
+            gate_helpers: BTreeMap::new(),
+        }
+    }
+}
+
+impl<W, R, H, WF, RF> ProgramBindings<W, R, H, WF, RF> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Checks that the typed binding namespaces do not contain values which
+    /// this program cannot consume. Missing values remain reported at the
+    /// exact declaration/gate that needs them during lowering.
+    pub(crate) fn validate_for_program(
+        &self,
+        program: &ExponentLutProgram,
+    ) -> Result<(), ProgramValidationError> {
+        for id in self.inputs.keys() {
+            if !program.input_wires.contains_key(id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeInput(*id));
+            }
+        }
+        let scalar_rhs: BTreeSet<_> = self.rhs_scalars().map(|(id, _)| id).collect();
+        for (instance, (rhs, _)) in &self.gate_rhs {
+            let valid = match instance {
+                ProgramGateInstance::Gate { step } => matches!(
+                    program.steps.get(*step),
+                    Some(ProgramStep::Gate(Gate::MulPrivate { rhs: declared, .. })) if declared == rhs
+                ),
+                _ => false,
+            };
+            if !valid {
+                return Err(ProgramValidationError::UnexpectedRuntimeRhs(format!(
+                    "gate {instance:?}, scalar {rhs:?}"
+                )));
+            }
+        }
+        let family_rhs: BTreeSet<_> = self.rhs_families().map(|(id, _)| id).collect();
+        for id in scalar_rhs {
+            if !program.rhs_inputs.contains_key(&id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeRhs(format!("scalar {id:?}")));
+            }
+        }
+        let mut used_rhs_families = BTreeSet::new();
+        let mut used_wire_families = BTreeSet::new();
+        let mut required_gate_helpers = BTreeSet::new();
+        let mut required_luts = BTreeSet::new();
+        for (step, operation) in program.steps.iter().enumerate() {
+            match operation {
+                ProgramStep::Gate(gate) => {
+                    let instance = ProgramGateInstance::Gate { step };
+                    match gate {
+                        Gate::MulPrivate { .. } | Gate::Lut { .. } => {
+                            required_gate_helpers.insert(instance);
+                        }
+                        Gate::MulPublic { .. } | Gate::Add { .. } => {}
+                    }
+                    if let Gate::Lut { lut_id, .. } = gate {
+                        required_luts.insert(*lut_id);
+                    }
+                }
+                ProgramStep::Family { id, body, .. } => {
+                    for source in body.rhs_inputs.values() {
+                        if let FamilyRhsSource::Member(id) = source {
+                            used_rhs_families.insert(*id);
+                        }
+                    }
+                    for source in body.wire_inputs.values() {
+                        if let FamilyWireSource::Member(id) = source {
+                            used_wire_families.insert(*id);
+                        }
+                    }
+                    for (index, gate) in body.gates.iter().enumerate() {
+                        let instance =
+                            ProgramGateInstance::FamilyGate { step, gate: index, family: *id };
+                        match gate {
+                            Gate::MulPrivate { .. } | Gate::Lut { .. } => {
+                                required_gate_helpers.insert(instance);
+                            }
+                            Gate::MulPublic { .. } | Gate::Add { .. } => {}
+                        }
+                        if let Gate::Lut { lut_id, .. } = gate {
+                            required_luts.insert(*lut_id);
+                        }
+                    }
+                }
+            }
+        }
+        for id in family_rhs {
+            if !used_rhs_families.contains(&id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeRhs(format!("family {id:?}")));
+            }
+        }
+        for id in self.wire_values.keys() {
+            if !used_wire_families.contains(id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeWireFamily(*id));
+            }
+        }
+        for id in self.helpers.keys() {
+            if !program.luts.contains_key(id) || !required_luts.contains(id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeLutHelper(*id));
+            }
+        }
+        for id in self.gate_helpers.keys() {
+            if !required_gate_helpers.contains(id) {
+                return Err(ProgramValidationError::UnexpectedRuntimeGateHelper(*id));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn input(mut self, id: ProgramInputId, value: W) -> Self {
+        self.inputs.insert(id, value);
+        self
+    }
+
+    pub fn inputs(mut self, values: impl IntoIterator<Item = (ProgramInputId, W)>) -> Self {
+        self.inputs.extend(values);
+        self
+    }
+
+    pub fn rhs(mut self, id: RhsId, value: R) -> Self {
+        self.rhs.insert(RuntimeRhsId::Scalar(id), RuntimeRhs::Scalar(value));
+        self
+    }
+
+    /// Bind one root multiplication's RHS material. This takes precedence over
+    /// a declaration-wide scalar binding, allowing the same plaintext RHS to
+    /// have different cryptographic material at different consuming levels.
+    /// Indexed body overrides are rejected; families keep their structural bindings.
+    pub fn gate_rhs(mut self, gate: ProgramGateInstance, id: RhsId, value: R) -> Self {
+        self.gate_rhs.insert(gate, (id, value));
+        self
+    }
+
+    pub(crate) fn rhs_for_gate(&self, gate: ProgramGateInstance, id: RhsId) -> Option<&R> {
+        self.gate_rhs
+            .get(&gate)
+            .filter(|(bound, _)| *bound == id)
+            .map(|(_, value)| value)
+            .or_else(|| self.rhs_scalar(id))
+    }
+
+    pub fn rhs_values(mut self, values: impl IntoIterator<Item = (RhsId, R)>) -> Self {
+        self.rhs.extend(
+            values
+                .into_iter()
+                .map(|(id, value)| (RuntimeRhsId::Scalar(id), RuntimeRhs::Scalar(value))),
+        );
+        self
+    }
+
+    pub fn rhs_family(mut self, id: RhsFamilyId, value: RF) -> Self {
+        self.rhs.insert(RuntimeRhsId::Family(id), RuntimeRhs::Family(value));
+        self
+    }
+
+    pub fn rhs_family_values(
+        mut self,
+        values: impl IntoIterator<Item = (RhsFamilyId, RF)>,
     ) -> Self {
-        Self { inputs, rhs_inputs, rhs_families, wire_values, helpers, gate_helpers }
+        self.rhs.extend(
+            values
+                .into_iter()
+                .map(|(id, value)| (RuntimeRhsId::Family(id), RuntimeRhs::Family(value))),
+        );
+        self
+    }
+
+    pub fn wire_family(mut self, id: WireFamilyId, value: WF) -> Self {
+        self.wire_values.insert(id, value);
+        self
+    }
+
+    pub fn wire_families(mut self, values: impl IntoIterator<Item = (WireFamilyId, WF)>) -> Self {
+        self.wire_values.extend(values);
+        self
+    }
+
+    pub fn helper(mut self, id: LutId, value: H) -> Self {
+        self.helpers.insert(id, value);
+        self
+    }
+
+    pub fn helpers(mut self, values: impl IntoIterator<Item = (LutId, H)>) -> Self {
+        self.helpers.extend(values);
+        self
+    }
+
+    pub fn gate_helper(mut self, id: ProgramGateInstance, value: H) -> Self {
+        self.gate_helpers.insert(id, value);
+        self
+    }
+
+    pub fn gate_helpers(
+        mut self,
+        values: impl IntoIterator<Item = (ProgramGateInstance, H)>,
+    ) -> Self {
+        self.gate_helpers.extend(values);
+        self
+    }
+
+    pub(crate) fn rhs_scalar(&self, id: RhsId) -> Option<&R> {
+        match self.rhs.get(&RuntimeRhsId::Scalar(id)) {
+            Some(RuntimeRhs::Scalar(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rhs_family_value(&self, id: RhsFamilyId) -> Option<&RF> {
+        match self.rhs.get(&RuntimeRhsId::Family(id)) {
+            Some(RuntimeRhs::Family(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn rhs_scalars(&self) -> impl Iterator<Item = (RhsId, &R)> {
+        self.rhs.iter().filter_map(|(id, value)| match (id, value) {
+            (RuntimeRhsId::Scalar(id), RuntimeRhs::Scalar(value)) => Some((*id, value)),
+            (RuntimeRhsId::Family(_), RuntimeRhs::Family(_)) |
+            (RuntimeRhsId::Family(_), RuntimeRhs::Scalar(_)) |
+            (RuntimeRhsId::Scalar(_), RuntimeRhs::Family(_)) => None,
+        })
+    }
+
+    pub(crate) fn rhs_families(&self) -> impl Iterator<Item = (RhsFamilyId, &RF)> {
+        self.rhs.iter().filter_map(|(id, value)| match (id, value) {
+            (RuntimeRhsId::Scalar(_), RuntimeRhs::Family(_)) => None,
+            (RuntimeRhsId::Family(id), RuntimeRhs::Family(value)) => Some((*id, value)),
+            (RuntimeRhsId::Scalar(_), RuntimeRhs::Scalar(_)) |
+            (RuntimeRhsId::Family(_), RuntimeRhs::Scalar(_)) => None,
+        })
     }
 }
 
@@ -1709,17 +2000,19 @@ type LoweringError<B> = <B as ProgramLoweringTypes>::Error;
 
 /// One gate dispatch for root and indexed scopes; family construction remains
 /// structural in `lower_program`, and scheme operations own only arithmetic.
-pub(crate) fn lower_gate<B: ExponentProgramLowering>(
+pub(crate) fn lower_gate<'a, B: ExponentProgramLowering>(
     program: &ExponentLutProgram,
     gate: &Gate,
     at: ProgramGateInstance,
     wires: &BTreeMap<WireId, B::Wire>,
-    rhs_inputs: &BTreeMap<RhsId, B::Rhs>,
+    rhs: impl Fn(RhsId) -> Result<&'a B::Rhs, ProgramValidationError>,
     helpers: (&BTreeMap<LutId, B::HelperSet>, Option<&BTreeMap<ProgramGateInstance, B::HelperSet>>),
     backend: &mut B,
-) -> Result<(WireId, B::Wire), ProgramLowerError<B::Error>> {
+) -> Result<(WireId, B::Wire), ProgramLowerError<B::Error>>
+where
+    B::Rhs: 'a,
+{
     let wire = |id: &WireId| wires.get(id).ok_or(ProgramValidationError::UndefinedWire(*id));
-    let rhs = |id: RhsId| rhs_inputs.get(&id).ok_or(ProgramValidationError::MissingRuntimeRhs(id));
     let (output, value) = match gate {
         Gate::MulPublic { private, public, output } => {
             let public_value = wire(public)?;
@@ -1761,7 +2054,15 @@ pub(crate) fn lower_body<B: ExponentProgramLowering>(
 ) -> Result<B::Wire, ProgramLowerError<B::Error>> {
     for (gate_index, gate) in body.gates().iter().enumerate() {
         let at = ProgramGateInstance::FamilyGate { step: step_index, gate: gate_index, family };
-        let (output, value) = lower_gate(program, gate, at, &wires, rhs_inputs, helpers, backend)?;
+        let (output, value) = lower_gate(
+            program,
+            gate,
+            at,
+            &wires,
+            |id| rhs_inputs.get(&id).ok_or(ProgramValidationError::MissingRuntimeRhs(id)),
+            helpers,
+            backend,
+        )?;
         wires.insert(output, value);
     }
     wires.remove(&body.output()).ok_or_else(|| ProgramValidationError::InvalidOutput.into())
@@ -1770,9 +2071,9 @@ pub(crate) fn lower_body<B: ExponentProgramLowering>(
 /// Resolves bindings and evaluates a frozen program through an opaque
 /// interpreter.  The program layer owns only SSA traversal and structural
 /// family control; every carried value is selected by `B`.
-pub(crate) fn lower_program<B>(
+pub(crate) fn lower_program<'a, B>(
     program: &ExponentLutProgram,
-    bindings: &ProgramBindings<'_, LoweringWire<B>, LoweringRhs<B>, LoweringHelpers<B>>,
+    bindings: &'a ProgramBindings<LoweringWire<B>, LoweringRhs<B>, LoweringHelpers<B>>,
     family_ranges: &ProgramFamilyBindings,
     backend: &mut B,
     mut reduce: impl FnMut(
@@ -1785,6 +2086,7 @@ pub(crate) fn lower_program<B>(
 where
     B: ExponentProgramLowering,
 {
+    bindings.validate_for_program(program)?;
     let mut wires = BTreeMap::new();
     for (input_id, wire_id) in program.input_wires() {
         let value = bindings
@@ -1804,8 +2106,12 @@ where
                     gate,
                     at,
                     &wires,
-                    bindings.rhs_inputs,
-                    (bindings.helpers, bindings.gate_helpers),
+                    |id| {
+                        bindings
+                            .rhs_for_gate(at, id)
+                            .ok_or(ProgramValidationError::MissingRuntimeRhs(id))
+                    },
+                    (&bindings.helpers, Some(&bindings.gate_helpers)),
                     backend,
                 )?;
                 wires.insert(output, value);
@@ -1838,15 +2144,13 @@ where
                     },
                     |rhs| {
                         bindings
-                            .rhs_inputs
-                            .get(&rhs)
+                            .rhs_scalar(rhs)
                             .cloned()
                             .ok_or_else(|| ProgramValidationError::MissingRuntimeRhs(rhs).into())
                     },
                     |family| {
                         bindings
-                            .rhs_families
-                            .get(&family)
+                            .rhs_family_value(family)
                             .cloned()
                             .ok_or_else(|| ProgramValidationError::WidthMismatch.into())
                     },
@@ -1859,7 +2163,7 @@ where
                     body,
                     family_wires,
                     &family_rhs,
-                    (bindings.helpers, bindings.gate_helpers),
+                    (&bindings.helpers, Some(&bindings.gate_helpers)),
                     backend,
                 )?;
                 let at = ProgramGateInstance::FamilyReduction { step: step_index };
@@ -1891,6 +2195,32 @@ pub(crate) fn canonical_program_id(bytes: &[u8]) -> ExponentLutProgramId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_gate_rhs_override_preserves_scalar_fallback_and_rejects_wrong_sites() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        builder.set_layout(crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 }, 16).unwrap();
+        let input = builder
+            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
+            .unwrap();
+        let family = builder.rhs_family(1).unwrap();
+        let rhs = builder.rhs_input(family, 2, 1).unwrap();
+        let first = builder.private_mul(builder.input_wire(input).unwrap(), rhs).unwrap();
+        let second = builder.private_mul(first, rhs).unwrap();
+        builder.output(second).unwrap();
+        let program = builder.build().unwrap();
+        let first = ProgramGateInstance::Gate { step: 0 };
+        let second = ProgramGateInstance::Gate { step: 1 };
+        let bindings = ProgramBindings::<(), u32, ()>::new().rhs(rhs, 7).gate_rhs(second, rhs, 11);
+        bindings.validate_for_program(&program).unwrap();
+        assert_eq!(bindings.rhs_for_gate(first, rhs), Some(&7));
+        assert_eq!(bindings.rhs_for_gate(second, rhs), Some(&11));
+        let wrong = bindings.gate_rhs(ProgramGateInstance::Gate { step: 99 }, rhs, 13);
+        assert!(wrong.validate_for_program(&program).is_err());
+        let wrong =
+            ProgramBindings::<(), u32, ()>::new().gate_rhs(second, RhsId::from_index(99), 13);
+        assert!(wrong.validate_for_program(&program).is_err());
+    }
 
     #[test]
     fn gate_instances_cover_each_multiplication_and_family_body() {
@@ -2368,8 +2698,19 @@ mod tests {
         let rhs_families = BTreeMap::from([(selectors, TestRhs::Members)]);
         let wire_families = BTreeMap::from([(values, TestWire::Members(vec![10, 20, 30, 40, 50]))]);
         let helpers = BTreeMap::new();
+        let bindings = inputs
+            .into_iter()
+            .fold(ProgramBindings::new(), |bindings, (id, value)| bindings.input(id, value));
         let bindings =
-            ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers, None);
+            rhs.into_iter().fold(bindings, |bindings, (id, value)| bindings.rhs(id, value));
+        let bindings = rhs_families
+            .into_iter()
+            .fold(bindings, |bindings, (id, value)| bindings.rhs_family(id, value));
+        let bindings = wire_families
+            .into_iter()
+            .fold(bindings, |bindings, (id, value)| bindings.wire_family(id, value));
+        let bindings =
+            helpers.into_iter().fold(bindings, |bindings, (id, value)| bindings.helper(id, value));
         let mut ranges = ProgramFamilyBindings::new();
         ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::bounded(3, 2, 4).unwrap());
         let lowered = lower_program(
@@ -2512,8 +2853,19 @@ mod tests {
         let rhs_families = BTreeMap::new();
         let wire_families = BTreeMap::from([(members, TestWire::Members(vec![2, 3, 5]))]);
         let helpers = BTreeMap::from([(lut, 4)]);
+        let bindings = inputs
+            .into_iter()
+            .fold(ProgramBindings::new(), |bindings, (id, value)| bindings.input(id, value));
         let bindings =
-            ProgramBindings::new(&inputs, &rhs, &rhs_families, &wire_families, &helpers, None);
+            rhs.into_iter().fold(bindings, |bindings, (id, value)| bindings.rhs(id, value));
+        let bindings = rhs_families
+            .into_iter()
+            .fold(bindings, |bindings, (id, value)| bindings.rhs_family(id, value));
+        let bindings = wire_families
+            .into_iter()
+            .fold(bindings, |bindings, (id, value)| bindings.wire_family(id, value));
+        let bindings =
+            helpers.into_iter().fold(bindings, |bindings, (id, value)| bindings.helper(id, value));
         let mut ranges = ProgramFamilyBindings::new();
         ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::full(3).unwrap());
         let mut backend = TestBackend { lut_gate: None };

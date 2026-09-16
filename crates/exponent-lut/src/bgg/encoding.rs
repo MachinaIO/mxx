@@ -18,8 +18,8 @@ use std::{collections::BTreeMap, sync::Arc};
 
 #[cfg(test)]
 use crate::program::{
-    FamilyRange, ProgramBindings, ProgramFamilyBindings, ProgramInputId, ProgramValidationError,
-    RhsId, WireId,
+    FamilyRange, LutId, ProgramBindings, ProgramFamilyBindings, ProgramInputId,
+    ProgramValidationError, RhsId, WireId,
 };
 use crate::{
     bgg::{
@@ -942,7 +942,7 @@ impl ExponentLutEncodingCompiler {
         helpers: &LutHelperMap,
         cache: Option<&ProgramCacheBindings>,
     ) -> Result<BTreeMap<WireId, BggEncodingWire>, BggError> {
-        let rhs = rhs.keys().map(|id| (*id, ())).collect();
+        let rhs: BTreeMap<RhsId, ()> = rhs.keys().map(|id| (*id, ())).collect();
         let selectors = selectors
             .iter()
             .map(|(id, family)| {
@@ -974,7 +974,10 @@ impl ExponentLutEncodingCompiler {
                 ))
             })
             .collect::<Result<BTreeMap<_, _>, mxx_dsl::DslError>>()?;
-        let helpers = helpers
+        let helpers: BTreeMap<
+            LutId,
+            crate::program::ProgramValue<LutHelperSet, (Family<LutHelperSet>, FamilyRange)>,
+        > = helpers
             .iter()
             .map(|(id, value)| (*id, crate::program::ProgramValue::Scalar(value.clone())))
             .collect();
@@ -995,7 +998,14 @@ impl ExponentLutEncodingCompiler {
             public_values: BTreeMap::new(),
         };
         prepared
-            .evaluate(&ProgramBindings::new(inputs, &rhs, &selectors, &values, &helpers, None))
+            .evaluate(
+                &ProgramBindings::new()
+                    .inputs(inputs.iter().map(|(&id, value)| (id, value.clone())))
+                    .rhs_values(rhs.into_iter())
+                    .rhs_family_values(selectors.into_iter())
+                    .wire_families(values.into_iter())
+                    .helpers(helpers.into_iter()),
+            )
             .map_err(Into::into)
     }
 
@@ -1925,14 +1935,11 @@ mod tests {
             })
             .unwrap();
         let outputs = preprocessing
-            .evaluate(&ProgramBindings::new(
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::new(),
-                &BTreeMap::from([(members, (encoding_values, FamilyRange::full(2).unwrap()))]),
-                &BTreeMap::from([(lut, crate::program::ProgramValue::Scalar(private_helpers))]),
-                None,
-            ))
+            .evaluate(
+                &ProgramBindings::new()
+                    .wire_family(members, (encoding_values, FamilyRange::full(2).unwrap()))
+                    .helper(lut, crate::program::ProgramValue::Scalar(private_helpers)),
+            )
             .unwrap();
         DslContext::new("family-lut-public-to-encoding-cache")
             .output("vector", outputs[&output].vector.clone())

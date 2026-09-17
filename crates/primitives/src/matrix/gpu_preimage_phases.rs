@@ -1,6 +1,8 @@
 //! Slot-owned Gaussian preimage phases, including content-dependent covariance.
 
-use super::{GpuDCRTPolyMatrix, GpuPreparedWorkspaceLayout, PreparedPlanLayout};
+use super::{
+    GpuDCRTPolyMatrix, GpuPreparedWorkspaceLayout, PreparedOwnerLayout, PreparedPlanLayout,
+};
 use crate::{
     matrix::PolyMatrix,
     poly::{
@@ -60,20 +62,31 @@ impl GpuPreparedPreimagePhases {
         rows: usize,
         columns: usize,
         digits: usize,
+        p1_owner: &PreparedOwnerLayout,
+        gadget_owner: &PreparedOwnerLayout,
     ) -> Result<GpuPreparedPreimagePhasesLayout, String> {
         if rows == 0 || columns == 0 || digits == 0 {
             return Err("prepared preimage phase shape is empty".into());
         }
         let workspaces = Self::allocation_layout(params, rows, columns)?;
         let level = params.crt_depth() - 1;
-        let p1_ntt = PreparedPlanLayout::ntt(params, 2 * rows, columns, level, None, true)?;
-        let gadget_ntt = PreparedPlanLayout::ntt(
+        let p1_ntt = PreparedPlanLayout::ntt_with_owner(
             params,
-            rows * params.modulus_digits() * digits,
+            2 * rows,
             columns,
             level,
             None,
             true,
+            p1_owner,
+        )?;
+        let gadget_ntt = PreparedPlanLayout::ntt_with_owner(
+            params,
+            rows * params.modulus_digits(),
+            columns,
+            level,
+            None,
+            true,
+            gadget_owner,
         )?;
         Ok(GpuPreparedPreimagePhasesLayout {
             workspaces,
@@ -115,8 +128,7 @@ impl GpuPreparedPreimagePhases {
         if layout.rows != owners[0].row_size() ||
             layout.columns != owners[3].col_size() ||
             layout.digits == 0 ||
-            owners[6].row_size() !=
-                layout.rows * owners[0].params().modulus_digits() * layout.digits
+            owners[6].row_size() != layout.rows * owners[0].params().modulus_digits()
         {
             return Err("prepared preimage phase saved layout mismatch".into());
         }

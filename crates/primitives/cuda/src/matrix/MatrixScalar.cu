@@ -220,21 +220,13 @@ struct GpuPreparedScalarBuffer {
     cudaStream_t stream = nullptr;
     size_t count = 0, words = 0;
     uint64_t *host = nullptr;
-    // Explicit scalar capacity growth is admitted and ledgered by Rust before
-    // this pointer is published. It is distinct from operation scratch and
-    // never grows implicitly during a prepared submit.
-    uint64_t *dynamic_data = nullptr;
     GpuDeviceWorkspace workspace;
     std::shared_ptr<GpuCudaResource> completion, readback;
     bool finalized = false;
-    uint64_t *data() const { return dynamic_data ? dynamic_data : reinterpret_cast<uint64_t *>(workspace.data); }
+    uint64_t *data() const { return reinterpret_cast<uint64_t *>(workspace.data); }
     uint64_t *status() const { return data() + count * words; }
     size_t bytes() const { return count * (words + 1) * 8; }
     ~GpuPreparedScalarBuffer() {
-        if (!finalized && dynamic_data) {
-            (void)cudaSetDevice(device);
-            (void)cudaFreeAsync(dynamic_data, stream);
-        }
         if (!finalized) (void)workspace.release(stream);
     }
 };
@@ -287,61 +279,6 @@ extern "C" int gpu_matrix_upload_scalar_buffer(const GpuPreparedScalarBuffer *bu
     }
     return error == cudaSuccess ? 0 : set_error(error);
 }
-extern "C" int gpu_matrix_resize_scalar_buffer(GpuPreparedScalarBuffer *buffer, size_t words, uint64_t *host)
-try {
-    if (!buffer || !host || !words || words == SIZE_MAX || words <= buffer->words ||
-        buffer->count > SIZE_MAX / (words + 1) / 8)
-        return set_error("invalid scalar buffer growth");
-    auto error = cudaSetDevice(buffer->device);
-    size_t words_with_status = 0, elements = 0, bytes = 0;
-    if (!scalar_checked_mul_size(words, 1, &words_with_status) || words_with_status == SIZE_MAX ||
-        !scalar_checked_mul_size(buffer->count, words_with_status + 1, &elements) ||
-        !scalar_checked_mul_size(elements, sizeof(uint64_t), &bytes))
-        return set_error("scalar buffer growth overflow");
-    uint64_t *replacement = nullptr;
-    if (error == cudaSuccess) {
-        gpu_test_record_cuda_allocation();
-        error = cudaMallocAsync(reinterpret_cast<void **>(&replacement), bytes, buffer->stream);
-    }
-    if (error == cudaSuccess) error = cudaMemsetAsync(replacement, 0, bytes, buffer->stream);
-    if (error != cudaSuccess) {
-        if (replacement) (void)cudaFreeAsync(replacement, buffer->stream);
-        return set_error(error);
-    }
-    if (buffer->dynamic_data) {
-        error = cudaFreeAsync(buffer->dynamic_data, buffer->stream);
-        if (error != cudaSuccess) {
-            (void)cudaFreeAsync(replacement, buffer->stream);
-            return set_error(error);
-        }
-    }
-    if (error == cudaSuccess) error = cudaEventRecord(buffer->completion->event, buffer->stream);
-    if (error != cudaSuccess) {
-        (void)cudaFreeAsync(replacement, buffer->stream);
-        return set_error(error);
-    }
-    buffer->dynamic_data = replacement;
-    buffer->words = words;
-    buffer->host = host;
-    return 0;
-} catch (const std::exception &error) { return set_error(error.what()); }
-extern "C" int gpu_matrix_query_scalar_buffer_completion(
-    const GpuPreparedScalarBuffer *buffer, int *out_ready)
-{
-    if (!buffer || !out_ready) return set_error("invalid scalar completion query");
-    auto error = cudaSetDevice(buffer->device);
-    if (error == cudaSuccess) {
-        error = cudaEventQuery(buffer->completion->event);
-        if (error == cudaErrorNotReady) {
-            (void)cudaGetLastError();
-            *out_ready = 0;
-            return 0;
-        }
-    }
-    if (error != cudaSuccess) return set_error(error);
-    *out_ready = 1;
-    return 0;
-}
 extern "C" int gpu_matrix_read_scalar_buffer(const GpuPreparedScalarBuffer *buffer)
 {
     auto error = cudaSetDevice(buffer->device);
@@ -378,16 +315,11 @@ try {
     // event before the asynchronous device frees proves that every preceding
     // H2D copy has stopped using the pending host allocations.
     if (error == cudaSuccess) error = cudaEventRecord(buffer->readback->event, buffer->stream);
-    if (error == cudaSuccess && buffer->dynamic_data) {
-        error = cudaFreeAsync(buffer->dynamic_data, buffer->stream);
-        if (error == cudaSuccess) buffer->dynamic_data = nullptr;
-    }
     if (error == cudaSuccess) {
         const int status = buffer->workspace.release(buffer->stream);
         if (status != 0) error = cudaErrorUnknown;
     }
-    // The ledger lease must not observe completion until the final dynamic
-    // free (and the prepared workspace release) has been queued.
+    // Completion is recorded after the prepared workspace release is queued.
     if (error == cudaSuccess) error = cudaEventRecord(buffer->completion->event, buffer->stream);
     if (error != cudaSuccess) {
         buffer->anchor->ctx->execution->unretired_work.store(true, std::memory_order_release);
@@ -580,14 +512,11 @@ struct GpuPreparedScalarOp {
     const GpuPreparedScalarBuffer *output = nullptr;
     std::vector<const GpuPreparedScalarBuffer *> sources;
     GpuDeviceWorkspace workspace;
+    std::shared_ptr<GpuCudaResource> completion;
     size_t workspace_bytes = 0;
-    uint8_t *dynamic_workspace = nullptr;
+    bool finalized = false;
     ~GpuPreparedScalarOp() {
-        if (dynamic_workspace && output && output->anchor && output->anchor->ctx) {
-            (void)cudaSetDevice(output->device);
-            (void)cudaFreeAsync(dynamic_workspace, output->stream);
-        }
-        (void)workspace.release(output ? output->stream : nullptr);
+        if (!finalized) (void)workspace.release(output ? output->stream : nullptr);
     }
 };
 extern "C" size_t gpu_matrix_scalar_op_workspace_bytes(size_t left, size_t right, size_t output, size_t candidate_count)
@@ -641,8 +570,9 @@ try {
     dim3 limb = output.owner->anchor->ctx->limb_gpu_ids[0];
     GpuPreparedResourceKey key{};
     if (gpu_prepared_limb_key(output.owner->anchor->ctx, 0, 0, GPU_PREPARED_STAGE_SCALAR_OP, &limb, &key) != 0 ||
-        saved_plan->allocation_count != 1 || saved_plan->stream_count != 1 ||
+        saved_plan->allocation_count != 2 || saved_plan->stream_count != 1 ||
         gpu_prepared_require_allocation(saved_plan, 0, GPU_PREPARED_BATCH_WORKSPACE, &key, workspace_bytes, 8) != 0 ||
+        gpu_prepared_require_allocation(saved_plan, 1, GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0 ||
         saved_plan->allocations[0].rows != 0 || saved_plan->allocations[0].columns != 0 ||
         saved_plan->allocations[0].level != 0 || saved_plan->allocations[0].format != GPU_POLY_FORMAT_COEFF ||
         validate_scalar_stream(saved_plan, output.owner->anchor->ctx, 0,
@@ -652,6 +582,10 @@ try {
     const int status = plan->workspace.acquire(output.owner->anchor->ctx, output.owner->device, GPU_PREPARED_BATCH_WORKSPACE,
         workspace_bytes, 8, output.owner->stream);
     if (status != 0) return status;
+    plan->completion = std::make_shared<GpuCudaResource>();
+    if (plan->completion->acquire(output.owner->anchor->ctx, output.owner->device,
+                                  GPU_PREPARED_COMPLETION_EVENT) != 0)
+        return set_error("scalar operation completion event allocation failed");
     plan->record.scratch = reinterpret_cast<uint64_t *>(plan->workspace.data);
     if (candidate_count) {
         auto *destination = reinterpret_cast<PreparedScalarView *>(plan->record.scratch + plan->record.scratch_words * 3);
@@ -663,44 +597,34 @@ try {
     }
     *out = plan.release(); return 0;
 } catch (const std::exception &error) { return set_error(error.what()); }
-extern "C" int gpu_matrix_resize_scalar_op_workspace(GpuPreparedScalarOp *plan, size_t words)
+extern "C" int gpu_matrix_finalize_scalar_op(
+    GpuPreparedScalarOp *plan, GpuEventSet **out_completion)
 try {
-    if (!plan || !plan->output || !words || words == SIZE_MAX)
-        return set_error("invalid scalar operation workspace growth");
-    const size_t required_words = words + 1;
-    size_t scratch_elements = 0, scratch_bytes = 0, candidate_bytes = 0, required_bytes = 0;
-    if (!scalar_checked_mul_size(required_words, 3, &scratch_elements) ||
-        !scalar_checked_mul_size(scratch_elements, sizeof(uint64_t), &scratch_bytes) ||
-        !scalar_checked_mul_size(plan->candidate_refs.size(), sizeof(PreparedScalarView), &candidate_bytes) ||
-        scratch_bytes > SIZE_MAX - candidate_bytes)
-        return set_error("scalar operation workspace overflow");
-    required_bytes = scratch_bytes + candidate_bytes;
-    if (required_bytes <= plan->workspace_bytes) return 0;
+    if (!plan || !out_completion || plan->finalized || !plan->output ||
+        !plan->output->anchor || !plan->output->anchor->ctx ||
+        !plan->output->anchor->ctx->execution || !plan->completion)
+        return set_error("invalid scalar operation finalization");
+    *out_completion = nullptr;
+    auto completion = std::make_unique<GpuEventSet>();
+    completion->execution = plan->output->anchor->ctx->execution;
     cudaError_t error = cudaSetDevice(plan->output->device);
-    uint8_t *replacement = nullptr;
     if (error == cudaSuccess) {
-        gpu_test_record_cuda_allocation();
-        error = cudaMallocAsync(reinterpret_cast<void **>(&replacement), required_bytes, plan->output->stream);
+        const int status = plan->workspace.release(plan->output->stream);
+        if (status != 0) error = cudaErrorUnknown;
     }
-    if (error == cudaSuccess) error = cudaMemsetAsync(replacement, 0, required_bytes, plan->output->stream);
+    // The preclaimed final completion is recorded after every workspace free
+    // has been queued, so it is the ledger's proof of release.
+    if (error == cudaSuccess) error = cudaEventRecord(plan->completion->event, plan->output->stream);
     if (error != cudaSuccess) {
-        if (replacement) (void)cudaFreeAsync(replacement, plan->output->stream);
+        plan->completion->quarantine();
+        plan->output->anchor->ctx->execution->unretired_work.store(true, std::memory_order_release);
+        plan->output->anchor->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
         return set_error(error);
     }
-    if (plan->dynamic_workspace) {
-        error = cudaFreeAsync(plan->dynamic_workspace, plan->output->stream);
-        if (error != cudaSuccess) {
-            (void)cudaFreeAsync(replacement, plan->output->stream);
-            return set_error(error);
-        }
-    }
-    if (error == cudaSuccess) error = cudaEventRecord(plan->output->completion->event, plan->output->stream);
-    if (error != cudaSuccess) {
-        (void)cudaFreeAsync(replacement, plan->output->stream);
-        return set_error(error);
-    }
-    plan->dynamic_workspace = replacement;
-    plan->workspace_bytes = required_bytes;
+    completion->entries.push_back(
+        {plan->completion->event, plan->output->device, std::move(plan->completion)});
+    plan->finalized = true;
+    *out_completion = completion.release();
     return 0;
 } catch (const std::exception &error) { return set_error(error.what()); }
 extern "C" int gpu_matrix_submit_scalar_op(GpuPreparedScalarOp *plan)
@@ -729,8 +653,7 @@ extern "C" int gpu_matrix_submit_scalar_op(GpuPreparedScalarOp *plan)
     plan->record.right = view(plan->right_ref);
     plan->record.output = view(plan->output_ref);
     plan->record.scratch_words = required_words;
-    plan->record.scratch = reinterpret_cast<uint64_t *>(
-        plan->dynamic_workspace ? plan->dynamic_workspace : plan->workspace.data);
+    plan->record.scratch = reinterpret_cast<uint64_t *>(plan->workspace.data);
     if (!plan->candidate_refs.empty()) {
         for (size_t index = 0; index < plan->candidate_refs.size(); ++index)
             plan->candidate_views[index] = view(plan->candidate_refs[index]);
@@ -748,6 +671,7 @@ extern "C" int gpu_matrix_submit_scalar_op(GpuPreparedScalarOp *plan)
     prepared_scalar_op_kernel<<<1, 1, 0, plan->output->stream>>>(plan->record);
     error = cudaGetLastError();
     if (error == cudaSuccess) error = cudaEventRecord(plan->output->completion->event, plan->output->stream);
+    if (error == cudaSuccess) error = cudaEventRecord(plan->completion->event, plan->output->stream);
     if (error != cudaSuccess) return set_error(error);
     for (auto *source : plan->sources) {
         error = cudaStreamWaitEvent(source->stream, plan->output->completion->event, 0);
@@ -1060,7 +984,9 @@ try {
         saved_plan->allocations[1].level != -1 || saved_plan->allocations[1].format != -1 ||
         validate_scalar_stream(saved_plan, output->ctx, output->level,
             GPU_PREPARED_STAGE_SCALAR_PACK, plan->stream, 0) != 0)
+    {
         return set_error("scalar pack owner differs from its saved descriptor");
+    }
     if (output->format == GPU_POLY_FORMAT_EVAL) {
         GpuPreparedPlanDescriptor ntt_layout{};
         ntt_layout.allocation_count = 1;

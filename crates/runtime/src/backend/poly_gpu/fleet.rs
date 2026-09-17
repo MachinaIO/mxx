@@ -11,6 +11,7 @@ pub(crate) fn prepared_runtime_value(
             Ok(super::PreparedRuntimeValue::HostMatrix {
                 matrix_type: matrix_type.clone(),
                 bytes: bytes.as_ref().clone().into_boxed_slice(),
+                staging_contract: None,
             })
         }
         crate::backend::RuntimeValue::Matrix(value) => {
@@ -24,21 +25,34 @@ pub(crate) fn prepared_runtime_value(
         }
         crate::backend::RuntimeValue::Real(value) => Ok(super::PreparedRuntimeValue::Real(*value)),
         crate::backend::RuntimeValue::Bool(value) => Ok(super::PreparedRuntimeValue::Bool(*value)),
-        crate::backend::RuntimeValue::Bytes(value) |
-        crate::backend::RuntimeValue::TypedBlob(value) => {
+        crate::backend::RuntimeValue::Bytes(value) => {
             Ok(super::PreparedRuntimeValue::Bytes(value.as_slice().to_owned().into_boxed_slice()))
         }
+        crate::backend::RuntimeValue::TypedBlob(value) => Ok(
+            super::PreparedRuntimeValue::TypedBlob(value.as_slice().to_owned().into_boxed_slice()),
+        ),
         crate::backend::RuntimeValue::IndexedFamily(values) => {
             let members =
                 values.iter().map(prepared_runtime_value).collect::<Result<Vec<_>, _>>()?;
             Ok(super::PreparedRuntimeValue::Family(members.into()))
         }
-        crate::backend::RuntimeValue::Trapdoor { secret: Some(secret), public, .. } => {
-            Ok(super::PreparedRuntimeValue::Trapdoor {
-                secret: Arc::clone(secret),
-                public: Arc::clone(public),
-            })
-        }
+        crate::backend::RuntimeValue::Trapdoor {
+            secret: Some(secret),
+            public,
+            matrix_type,
+            sigma,
+            gadget_base,
+            digit_count,
+            gadget_small,
+        } => Ok(super::PreparedRuntimeValue::Trapdoor {
+            secret: Arc::clone(secret),
+            public: Arc::clone(public),
+            matrix_type: matrix_type.clone(),
+            sigma: *sigma,
+            gadget_base: gadget_base.clone(),
+            digit_count: *digit_count,
+            gadget_small: *gadget_small,
+        }),
         _ => Err(PolyBackendError::GpuSubmission(
             "prepared input kind has no fixed runtime binding".into(),
         )),
@@ -54,22 +68,15 @@ pub(crate) fn prepared_runtime_value_for_warmup(
 ) -> Result<super::PreparedRuntimeValue, PolyBackendError> {
     match value {
         crate::backend::RuntimeValue::HostMatrix { matrix_type, bytes } => {
-            let parameters = backend
-                .devices
-                .iter()
-                .map(|(_, device)| {
-                    device
-                        .parameters(matrix_type)
-                        .map_err(|_| PolyBackendError::InvalidConstantShape)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            for parameters in &parameters {
-                GpuDCRTPolyMatrix::cpu_staging_layout(parameters, bytes)
-                    .map_err(PolyBackendError::GpuSubmission)?;
-            }
+            let (layout, device_parameters) =
+                prepared_host_matrix_contract(backend, matrix_type, bytes)?;
             Ok(super::PreparedRuntimeValue::HostMatrix {
                 matrix_type: matrix_type.clone(),
                 bytes: bytes.as_ref().clone().into_boxed_slice(),
+                staging_contract: Some(PreparedHostMatrixContract {
+                    layout,
+                    device_parameters: device_parameters.into_boxed_slice(),
+                }),
             })
         }
         crate::backend::RuntimeValue::IndexedFamily(values) => {
@@ -81,6 +88,41 @@ pub(crate) fn prepared_runtime_value_for_warmup(
         }
         _ => prepared_runtime_value(value),
     }
+}
+
+fn prepared_host_matrix_contract(
+    backend: &GpuDcrtBackend,
+    matrix_type: &ConcreteMatrixType,
+    bytes: &[u8],
+) -> Result<
+    (
+        mxx_primitives::matrix::gpu_dcrt_poly::GpuCpuStagingLayout,
+        Vec<(i32, mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams)>,
+    ),
+    PolyBackendError,
+> {
+    let mut layout = None;
+    let mut device_parameters = Vec::with_capacity(backend.devices.len());
+    for (device_id, device) in &backend.devices {
+        let parameters = device
+            .parameters(matrix_type)
+            .map_err(|_| PolyBackendError::InvalidConstantShape)?
+            .clone();
+        let device_layout = GpuDCRTPolyMatrix::cpu_staging_layout(&parameters, bytes)
+            .map_err(PolyBackendError::GpuSubmission)?;
+        if let Some(expected) = layout {
+            if expected != device_layout {
+                return Err(PolyBackendError::GpuSubmission(
+                    "GPU RNS staging layout differs between prepared device contexts".into(),
+                ));
+            }
+        } else {
+            layout = Some(device_layout);
+        }
+        device_parameters.push((*device_id, parameters));
+    }
+    let layout = layout.ok_or(PolyBackendError::InvalidConstantShape)?;
+    Ok((layout, device_parameters))
 }
 
 use crate::{
@@ -123,20 +165,15 @@ use std::{
     },
 };
 
-#[path = "gpu_claims.rs"]
-mod gpu_claims;
 #[path = "gpu_inventory.rs"]
-mod gpu_inventory;
+pub(crate) mod gpu_inventory;
 #[path = "gpu_prepare.rs"]
 mod gpu_prepare;
-use super::gpu_prepared::PreparedGpuProgram;
+use super::gpu_prepared::{PreparedGpuProgram, PreparedHostMatrixContract};
 pub(crate) use gpu_inventory::PreparedScheduleStreamKey;
 pub use gpu_prepare::{
     MatrixDescriptor as GpuMatrixDescriptor,
     MatrixFragmentDescriptor as GpuMatrixFragmentDescriptor,
-    MatrixInputFragment as GpuMatrixInputFragment, MatrixInputLayout as GpuMatrixInputLayout,
-    MatrixInputRequest as GpuMatrixInputRequest, MatrixSlotContext as GpuMatrixSlotContext,
-    MatrixSlotInventory as GpuMatrixSlotInventory, PreparedMatrixSource as GpuMatrixInputSource,
 };
 
 type DeviceBackend = PolyBackend<
@@ -254,7 +291,8 @@ pub struct GpuFleetMatrix {
     input_layout: Arc<[gpu_prepare::MatrixInputFragment]>,
     // A prepared execution slot remains pinned while the returned resident
     // value is alive. Ordinary values leave this empty.
-    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
+    prepared_codec_wire: Option<mxx_ir_core::types::WireRef>,
 }
 
 impl PartialEq for GpuFleetMatrix {
@@ -298,14 +336,25 @@ impl GpuFleetMatrix {
             shards: Arc::new(shards),
             input_layout,
             prepared_lease: None,
+            prepared_codec_wire: None,
         }
     }
 
     pub(super) fn with_prepared_lease(
         mut value: Self,
-        lease: Arc<super::gpu_prepared::PreparedGpuFleetOutput>,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
     ) -> Self {
         value.prepared_lease = Some(lease);
+        value
+    }
+
+    pub(super) fn with_prepared_codec_binding(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
+        wire: mxx_ir_core::types::WireRef,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value.prepared_codec_wire = Some(wire);
         value
     }
 
@@ -333,6 +382,7 @@ impl GpuFleetMatrix {
             shards: Arc::new(shards),
             input_layout,
             prepared_lease: None,
+            prepared_codec_wire: None,
         }
     }
 
@@ -371,7 +421,7 @@ pub struct GpuFleetSmallMatrix {
     columns: usize,
     // Keep compact allocations alive until the last logical alias is dropped.
     shards: Arc<Vec<GpuColumnShard<Arc<GpuSmallMatrix>>>>,
-    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
 }
 
 impl PartialEq for GpuFleetSmallMatrix {
@@ -404,7 +454,7 @@ impl GpuFleetSmallMatrix {
 
     pub(super) fn with_prepared_lease(
         mut value: Self,
-        lease: Arc<super::gpu_prepared::PreparedGpuFleetOutput>,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
     ) -> Self {
         value.prepared_lease = Some(lease);
         value
@@ -455,7 +505,7 @@ impl From<GpuSmallMatrix> for GpuFleetSmallMatrix {
 #[derive(Clone, Debug)]
 pub struct GpuFleetTrapdoor {
     pub(super) values: Arc<Vec<Arc<GpuDCRTTrapdoor>>>,
-    pub(super) prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuFleetOutput>>,
+    pub(super) prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
 }
 
 impl GpuFleetTrapdoor {
@@ -485,21 +535,6 @@ fn validate_shards<T>(
     assert_eq!(next, columns, "fleet shards must cover every logical column exactly once");
 }
 
-impl GpuFleetTrapdoor {
-    /// Prepare the fixed covariance owner consumed by subsequent Preimage
-    /// sampling. Explicit benchmark setup calls this before its storage seal,
-    /// matching production trapdoor preparation without a sampler trial.
-    pub fn prepare_preimage_cache(&self, sigma: f64, public_rows: usize) {
-        self.values.par_iter().for_each(|trapdoor| {
-            let parameters = trapdoor.r.params();
-            <GpuDCRTPolyTrapdoorSampler as mxx_primitives::sampler::PolyTrapdoorSampler>::new(
-                parameters, sigma,
-            )
-            .prepare_preimage_cache(parameters, trapdoor, public_rows);
-        });
-    }
-}
-
 impl fmt::Display for GpuFleetTrapdoor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "GPU trapdoor replicated on {} device(s)", self.values.len())
@@ -515,6 +550,27 @@ pub struct GpuDcrtBackend {
     prepared_graph: Option<PreparedGpuProgram>,
     prepared_spec_hash: Option<[u8; 32]>,
     prepared_ledger: Option<crate::gpu_memory::GpuMemoryLedger>,
+}
+
+fn rollback_failed_warmup_ledger(
+    ledger: &mut Option<crate::gpu_memory::GpuMemoryLedger>,
+    had_ledger: bool,
+    checkpoint: Option<crate::gpu_memory::GpuWarmupCheckpoint>,
+) {
+    if had_ledger {
+        if let (Some(ledger), Some(checkpoint)) = (ledger.as_mut(), checkpoint) {
+            ledger.rollback_warmup(checkpoint);
+        }
+    } else {
+        // The first warmup may install the ledger while provisioning its
+        // initial backing. Roll back its speculative inventory but retain the
+        // ledger while release probes are pending; dropping it would destroy
+        // the only charge-owned completion resources and permit over-admit on
+        // an immediate retry.
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.rollback_all_warmup();
+        }
+    }
 }
 
 impl GpuDcrtBackend {
@@ -540,7 +596,25 @@ impl GpuDcrtBackend {
             self.prepared_spec_hash == Some(spec_hash.0) &&
             self.prepared_graph.is_some()
         {
-            return Ok(());
+            // Graph/config identity alone is insufficient: resource planning
+            // also depends on each input's fixed shape, placement/context,
+            // family structure, byte kind, and trapdoor sampler metadata.
+            let prepared_inputs = inputs
+                .iter()
+                .map(|(name, value)| {
+                    prepared_runtime_value_for_warmup(self, value)
+                        .map(|value| (name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            if self
+                .prepared_graph
+                .as_ref()
+                .expect("prepared graph checked above")
+                .input_contract_matches(&prepared_inputs)
+                .map_err(PolyBackendError::GpuSubmission)?
+            {
+                return Ok(());
+            }
         }
         // Capture export metadata before publishing a new program.  This is
         // warmup-only graph access; production execute consumes the immutable
@@ -551,6 +625,7 @@ impl GpuDcrtBackend {
         let previous_spec_hash = self.prepared_spec_hash;
         let previous_wave_bound = self.prepared_wave_bound;
         let previous_live_executions = self.prepared_live_executions;
+        let had_ledger = self.prepared_ledger.is_some();
         let warmup_checkpoint =
             self.prepared_ledger.as_ref().map(|ledger| ledger.warmup_checkpoint());
         // Warmup is transactional across all discovery caches as well as the
@@ -562,6 +637,7 @@ impl GpuDcrtBackend {
             inputs,
             wave_bound.get(),
             config.max_live_gpu_executions.get(),
+            &artifact_descriptors,
         );
         let warmup = warmup.and_then(|_| {
             if self.prepared_graph.is_some() {
@@ -573,11 +649,13 @@ impl GpuDcrtBackend {
             }
         });
         if warmup.is_err() {
-            if let (Some(ledger), Some(checkpoint)) =
-                (self.prepared_ledger.as_mut(), warmup_checkpoint)
-            {
-                ledger.rollback_warmup(checkpoint);
-            }
+            // Native candidate commands and region views must be gone before
+            // rollback starts asynchronous storage teardown. Otherwise their
+            // last Arc can outlive the charge journal and make a failed
+            // replacement look like an accepted owner.
+            let failed_candidate = self.prepared_graph.take();
+            drop(failed_candidate);
+            rollback_failed_warmup_ledger(&mut self.prepared_ledger, had_ledger, warmup_checkpoint);
             self.prepared_graph = previous_graph;
             self.prepared_wave_bound = previous_wave_bound;
             self.prepared_live_executions = previous_live_executions;
@@ -588,7 +666,6 @@ impl GpuDcrtBackend {
             self.prepared_spec_hash = Some(spec_hash.0);
             if let Some(execution) = self.prepared_graph.as_mut() {
                 execution.set_spec_hash(spec_hash.0);
-                execution.set_artifact_descriptors(artifact_descriptors);
             }
         }
         warmup
@@ -814,7 +891,10 @@ impl Backend for GpuDcrtBackend {
                 sampling_mode = SamplingMode::Record(recorder.as_mut().expect("recorder bound"));
                 None
             } else {
-                Some(TranscriptReplayer::from_entries(entries))
+                Some(
+                    TranscriptReplayer::from_entries(entries)
+                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?,
+                )
             }
         } else {
             None
@@ -823,18 +903,8 @@ impl Backend for GpuDcrtBackend {
             sampling_mode = SamplingMode::Replay(replayer);
         }
 
-        let mut scalar_allocator = self
-            .prepared_ledger
-            .as_mut()
-            .map(super::gpu_prepared::LedgerScalarCapacityAllocator::new);
         let execution = execution
-            .run_with_runtime_bindings(
-                inputs,
-                &mut sampling_mode,
-                scalar_allocator.as_mut().map(|allocator| {
-                    allocator as &mut dyn mxx_primitives::matrix::gpu_dcrt_poly::GpuScalarCapacityAllocator
-                }),
-            )
+            .run_with_runtime_bindings(inputs, &mut sampling_mode)
             .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
         if let (Some(production), Some(recorder), Some(store)) =
             (session.as_ref(), recorder.as_ref(), transcript_store.as_deref_mut())
@@ -847,7 +917,6 @@ impl Backend for GpuDcrtBackend {
                 .record_transcript_batch(production, &entries)
                 .map_err(PolyBackendError::GpuSubmission)?;
         }
-        let execution = Arc::new(execution);
         if context.capture_trace {
             let trace = context.trace.as_deref_mut().ok_or_else(|| {
                 PolyBackendError::GpuSubmission(
@@ -865,7 +934,12 @@ impl Backend for GpuDcrtBackend {
             production_id: session,
             artifact_handles: BTreeMap::new(),
             staged_family_leases: Vec::new(),
-            prepared_outputs: Some(Arc::new(Arc::clone(&execution))),
+            prepared_outputs: Some(
+                self.prepared_graph
+                    .as_ref()
+                    .expect("prepared graph checked immediately before output publication")
+                    .output_lease(execution.slot()),
+            ),
         })
     }
 
@@ -1433,6 +1507,16 @@ impl Backend for GpuDcrtBackend {
             .shards
             .iter()
             .map(|shard| {
+                if let Some(lease) = &value.prepared_lease {
+                    let wire = value.prepared_codec_wire.ok_or_else(|| {
+                        PolyBackendError::GpuSubmission(
+                            "prepared output matrix has no immutable codec binding".into(),
+                        )
+                    })?;
+                    return lease
+                        .matrix_to_bytes_for_wire(&shard.value, wire, shard.device_id)
+                        .map_err(PolyBackendError::GpuSubmission);
+                }
                 let (_, device) = self
                     .devices
                     .iter()
@@ -1636,5 +1720,40 @@ impl Backend for GpuDcrtBackend {
             .map(|(_, backend)| backend.trapdoor_from_bytes(ty, bytes).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(GpuFleetTrapdoor { values: Arc::new(values), prepared_lease: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rollback_failed_warmup_ledger;
+    use crate::{gpu_calibration::GpuDeviceMemory, gpu_memory::GpuMemoryLedger};
+
+    #[test]
+    fn failed_initial_warmup_retains_ledger_for_retry() {
+        let mut ledger = Some(
+            GpuMemoryLedger::synthetic_for_test(
+                &[GpuDeviceMemory { total_bytes: 1024, resident_bytes: 0 }],
+                &[0],
+                100,
+                Some(&[(0, 7)]),
+            )
+            .expect("synthetic ledger"),
+        );
+        ledger
+            .as_mut()
+            .expect("initial ledger")
+            .begin_prepared_provisioning(&[17], &[3])
+            .expect("speculative initial charge")
+            .commit();
+        assert_eq!(ledger.as_ref().expect("initial ledger").devices()[0].allocation_bytes, 17);
+        assert_eq!(
+            ledger.as_ref().expect("initial ledger").devices()[0].pinned_allocation_bytes,
+            3
+        );
+
+        rollback_failed_warmup_ledger(&mut ledger, false, None);
+        let ledger = ledger.expect("ledger owns any release-pending probes");
+        assert_eq!(ledger.devices()[0].allocation_bytes, 0);
+        assert_eq!(ledger.devices()[0].pinned_allocation_bytes, 0);
     }
 }

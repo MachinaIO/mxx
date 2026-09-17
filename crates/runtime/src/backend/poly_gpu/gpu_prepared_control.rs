@@ -5,8 +5,7 @@
 //! allocates storage, or builds a schedule.
 
 use super::gpu_prepared_lowering::{
-    FixedCopy, GpuPreparation, PreparedOperation, PreparedScalar, ScalarOpcode, ScalarValue,
-    ValueLocation,
+    GpuPreparation, PreparedOperation, PreparedScalar, ScalarOpcode, ScalarValue, ValueLocation,
 };
 use mxx_ir_core::node::{IntBinaryOp, IntCompareOp, RealBinaryOp};
 use num_bigint::BigInt;
@@ -225,8 +224,22 @@ pub enum PreparedControlCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PreparedExecutableCommand {
     Control(usize),
+    /// Ordered transcript capture from a fixed native sampler command.  The
+    /// descriptor and staging indices are resolved during warmup; execution
+    /// never scans commands to discover a draw boundary.
+    SnapshotDraw {
+        descriptor: usize,
+        command: usize,
+        staging: usize,
+        variant: usize,
+        variant_indices: Box<[usize]>,
+    },
     Native {
         index: usize,
+        /// Direct warmup link to the corresponding SnapshotDraw descriptor.
+        /// Non-sampling commands carry `None`; replay never scans descriptor
+        /// tables to rediscover sampling ownership.
+        descriptor: Option<usize>,
         variant: usize,
         variant_indices: Box<[usize]>,
     },
@@ -235,8 +248,8 @@ pub enum PreparedExecutableCommand {
         count: usize,
         counts: Box<[usize]>,
         offsets: Box<[usize]>,
-        banks: [Box<[PreparedExecutableCommand]>; 2],
-        tail: Box<[PreparedExecutableCommand]>,
+        variants: Box<[Box<[PreparedExecutableCommand]>]>,
+        variant_indices: Box<[usize]>,
     },
     Subgraph {
         call: Option<mxx_ir_core::types::NodeId>,
@@ -282,16 +295,6 @@ fn validate_fixed_location_pair(
 ) -> Result<(), String> {
     if source.device != output.device || source.shape() != output.shape() {
         return Err("prepared fixed locations are incompatible".into());
-    }
-    Ok(())
-}
-
-fn validate_fixed_copies(copies: &[FixedCopy]) -> Result<(), String> {
-    if copies
-        .iter()
-        .any(|copy| validate_fixed_location_pair(&copy.source, &copy.destination).is_err())
-    {
-        return Err("prepared fixed view copy has incompatible locations".into());
     }
     Ok(())
 }
@@ -405,41 +408,22 @@ pub fn build_control_commands(
                 }
             }
             PreparedOperation::Alias => {
-                if let Some(view) = program.view_commands.get(&node.id) {
-                    match view {
-                        super::gpu_prepared_lowering::PreparedView::Alias(location) |
-                        super::gpu_prepared_lowering::PreparedView::TransposeAlias(location) => {
-                            PreparedControlCommand::Alias {
-                                source: location.clone(),
-                                output: location.clone(),
-                            }
-                        }
-                        super::gpu_prepared_lowering::PreparedView::FixedCopies(copies) => {
-                            validate_fixed_copies(copies)?;
-                            return Err(format!(
-                                "view node {} requires an owner-bound copy command",
-                                node.id
-                            ));
-                        }
-                    }
-                } else {
-                    let (inputs, outputs) = program
-                        .node_bindings
-                        .get(&node.id)
-                        .ok_or_else(|| format!("alias node {} has no bindings", node.id))?;
-                    let source = inputs
-                        .first()
-                        .and_then(|wire| program.values.get(wire))
-                        .cloned()
-                        .ok_or_else(|| format!("alias node {} has no source", node.id))?;
-                    let output = outputs
-                        .first()
-                        .and_then(|wire| program.values.get(wire))
-                        .cloned()
-                        .ok_or_else(|| format!("alias node {} has no output", node.id))?;
-                    validate_fixed_location_pair(&source, &output)?;
-                    PreparedControlCommand::Alias { source, output }
-                }
+                let (inputs, outputs) = program
+                    .node_bindings
+                    .get(&node.id)
+                    .ok_or_else(|| format!("alias node {} has no bindings", node.id))?;
+                let source = inputs
+                    .first()
+                    .and_then(|wire| program.values.get(wire))
+                    .cloned()
+                    .ok_or_else(|| format!("alias node {} has no source", node.id))?;
+                let output = outputs
+                    .first()
+                    .and_then(|wire| program.values.get(wire))
+                    .cloned()
+                    .ok_or_else(|| format!("alias node {} has no output", node.id))?;
+                validate_fixed_location_pair(&source, &output)?;
+                PreparedControlCommand::Alias { source, output }
             }
             PreparedOperation::Selection => {
                 if program.selection_commands.get(&node.id).is_some_and(|selection| match selection
@@ -947,13 +931,6 @@ mod tests {
         };
         assert!(validate_fixed_location_pair(&location(0, 1), &location(1, 1)).is_err());
         assert!(validate_fixed_location_pair(&location(0, 1), &location(0, 2)).is_err());
-        assert!(
-            validate_fixed_copies(&[FixedCopy {
-                source: location(0, 1),
-                destination: location(0, 2)
-            },])
-            .is_err()
-        );
     }
 
     #[test]

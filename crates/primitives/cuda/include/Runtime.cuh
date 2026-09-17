@@ -128,6 +128,8 @@ int gpu_event_set_defer_pinned_frees(
 
 // Wait for this pinned allocation to be recycled, without draining unrelated jobs.
 int gpu_wait_pinned_release(GpuContext *ctx, void *pointer);
+// Nonblocking readiness for this pinned allocation's reclaimer job.
+int gpu_query_pinned_release(GpuContext *ctx, void *pointer, int *out_ready);
 
 int gpu_event_set_wait(GpuEventSet *events);
 void gpu_event_set_destroy(GpuEventSet *events);
@@ -141,6 +143,11 @@ const char *gpu_last_error();
 
 void *gpu_pinned_alloc(GpuContext *ctx, size_t bytes, size_t alignment);
 int gpu_pinned_free(void *ptr);
+// Releases a prepared backing without caching it. When the backing is still
+// leased to a caller, the function leaves it owned by that lease and reports
+// retention through `out_retained`; the lease or its reclaimer will release it
+// after the caller's ownership ends.
+int gpu_pinned_free_uncached(void *ptr, int *out_retained);
 
 
 #ifdef __cplusplus

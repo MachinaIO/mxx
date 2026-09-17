@@ -91,10 +91,6 @@ int gpu_small_matrix_decompose_base(
     const GpuMatrixRange *source_views,
     const GpuMatrixRange *destination_view);
 int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat);
-int gpu_small_matrix_pack_preimage_batch(
-    GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
-    const size_t *dst_rows, const size_t *dst_columns, size_t count, int32_t *accepted);
-
 int gpu_small_matrix_prepare_preimage_cutoff(
     GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
     const size_t *dst_rows, const size_t *dst_columns, size_t count,

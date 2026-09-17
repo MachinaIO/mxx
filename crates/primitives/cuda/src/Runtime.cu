@@ -206,6 +206,21 @@ struct PinnedHostReclaimer
         return failed ? -1 : (pending.empty() && active == 0 ? 1 : 0);
     }
 
+    // Nonblocking readiness for one pointer. A pointer remains pending until
+    // the reclaimer has completed its CUDA event, released the prepared lease,
+    // and returned it to the pinned pool.
+    int query_pointer(void *pointer)
+    {
+        if (!pointer) return 1;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (failed) return -1;
+        if (active_pointer_set.find(pointer) != active_pointer_set.end()) return 0;
+        for (const auto &job : pending)
+            if (std::find(job.pointers.begin(), job.pointers.end(), pointer) != job.pointers.end())
+                return 0;
+        return 1;
+    }
+
     // Wait only for the job containing this pinned allocation. Completion
     // notification uses the existing queue lock, not a device-wide fence.
     int wait_pointer(void *pointer)
@@ -220,16 +235,18 @@ struct PinnedHostReclaimer
             Job selected = std::move(*it);
             pending.erase(it);
             ++active;
+            for (void *active_pointer : selected.pointers) active_pointer_set.insert(active_pointer);
             lock.unlock();
             const int status = process(selected);
             lock.lock();
+            for (void *active_pointer : selected.pointers) active_pointer_set.erase(active_pointer);
             --active;
             idle.notify_all();
             return status;
         }
         idle.wait(lock, [&]() {
             if (failed) return true;
-            if (active_pointers && std::find(active_pointers->begin(), active_pointers->end(), pointer) != active_pointers->end()) return false;
+            if (active_pointer_set.find(pointer) != active_pointer_set.end()) return false;
             for (const auto &job : pending)
                 if (std::find(job.pointers.begin(), job.pointers.end(), pointer) != job.pointers.end()) return false;
             return true;
@@ -353,15 +370,15 @@ private:
                 job = std::move(pending.front());
                 pending.pop_front();
                 ++active;
-                active_pointers = &job.pointers;
+                for (void *active_pointer : job.pointers) active_pointer_set.insert(active_pointer);
             }
 
             process(job);
 
             {
                 std::lock_guard<std::mutex> lock(mutex);
+                for (void *active_pointer : job.pointers) active_pointer_set.erase(active_pointer);
                 --active;
-                active_pointers = nullptr;
                 idle.notify_all();
             }
         }
@@ -373,7 +390,7 @@ private:
     std::condition_variable idle;
     std::deque<Job> pending;
     std::thread worker;
-    const std::vector<void *> *active_pointers = nullptr;
+    std::unordered_set<void *> active_pointer_set;
     size_t active = 0;
     bool stopping = false;
     bool joined = false;
@@ -1228,6 +1245,16 @@ extern "C" int gpu_wait_pinned_release(GpuContext *ctx, void *pointer)
     auto *reclaimer = ctx->execution->pinned_host_reclaimer;
     if (reclaimer->wait_pointer(pointer) == 0) return 0;
     return set_error(reclaimer->failure_message().c_str());
+}
+
+extern "C" int gpu_query_pinned_release(GpuContext *ctx, void *pointer, int *out_ready)
+{
+    if (!ctx || !ctx->execution || !ctx->execution->pinned_host_reclaimer || !out_ready)
+        return set_error("invalid gpu_query_pinned_release arguments");
+    const int status = ctx->execution->pinned_host_reclaimer->query_pointer(pointer);
+    if (status < 0) return set_error("pinned-host reclamation failed");
+    *out_ready = status;
+    return 0;
 }
 
 extern "C" int gpu_context_admission_is_required(const GpuContext *ctx)
@@ -2687,13 +2714,13 @@ extern "C"
                 set_error("invalid pinned allocation context or alignment");
                 return nullptr;
             }
-            const int device = ctx->gpu_ids.front();
-            GpuAllocationActivity activity(ctx->execution.get(), device);
             void *prepared = nullptr;
             int handled = 0;
             if (gpu_prepared_pinned_claim(ctx, bytes, alignment, &prepared, &handled) != 0)
                 return nullptr;
             if (handled) return prepared;
+            const int device = ctx->gpu_ids.front();
+            GpuAllocationActivity activity(ctx->execution.get(), device);
             cudaError_t err = cudaSetDevice(device);
             if (err != cudaSuccess)
             {
@@ -2752,6 +2779,43 @@ extern "C"
         const cudaError_t selected = cudaGetDevice(&device);
         if (selected != cudaSuccess) return set_error(cudaGetErrorString(selected));
         const cudaError_t error = pinned_host_pool().release(ptr, device);
+        return error == cudaSuccess ? 0 : set_error(cudaGetErrorString(error));
+    }
+
+    int gpu_pinned_free_uncached(void *ptr, int *out_retained)
+    {
+        if (!out_retained) return set_error("missing pinned retention output");
+        *out_retained = 0;
+        if (!ptr) return 0;
+        int device = 0;
+        const cudaError_t selected = cudaGetDevice(&device);
+        if (selected != cudaSuccess) return set_error(cudaGetErrorString(selected));
+        auto &pool = pinned_host_pool();
+        int allocation_device = device;
+        {
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            auto found = pool.allocated.find(ptr);
+            if (found != pool.allocated.end()) {
+                allocation_device = found->second.device;
+                if (found->second.prepared) {
+                    // Storage destruction cannot revoke a caller's CPU lease
+                    // (or a reclaimer's pending DMA lease). Keep both the pool
+                    // registration and slot backing intact until that lease
+                    // performs the ordinary release path.
+                    *out_retained = 1;
+                    return 0;
+                }
+                pool.allocated.erase(found);
+                auto ready = pool.ready.find(allocation_device);
+                if (ready != pool.ready.end()) {
+                    for (auto &block : ready->second)
+                        if (block.pointer == ptr) block = {};
+                }
+            }
+        }
+        GpuAllocationActivity activity(nullptr, allocation_device);
+        const cudaError_t error = cudaFreeHost(ptr);
+        if (error != cudaSuccess) gpu_device_mark_allocation_unknown(allocation_device);
         return error == cudaSuccess ? 0 : set_error(cudaGetErrorString(error));
     }
 }

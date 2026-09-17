@@ -9,10 +9,12 @@ struct GpuPreparedRegion;
 struct GpuMatrixReservation;
 struct GpuPreparedClaimHandle;
 struct GpuMatrixDispatchPermit;
-struct GpuPreparedWorkspaceLease;
 struct GpuPreparedPinnedLease;
 struct GpuPreparedResourceLease;
 struct GpuPreparedProvisioningPermit;
+struct GpuPreparedWorkspaceStorage;
+struct GpuPreparedWorkspaceReservation;
+struct GpuPreparedWorkspaceLease;
 
 // Negative native status returned when a valid prepared claim lost its slot
 // to a concurrent pre-submission reservation.
@@ -49,6 +51,65 @@ struct GpuPreparedWorkspaceLayout {
     size_t bytes;
     size_t alignment;
     GpuPreparedSlotKind kind;
+};
+
+// Exact placement for one workspace-only claim.  Unlike a matrix claim this
+// has no rows, columns, level or format: the context, physical partition,
+// device and existing compute-stream slot are the complete placement.
+struct GpuPreparedWorkspaceClaim {
+    GpuPreparedWorkspaceLayout layout;
+    int device;
+    size_t partition;
+    size_t stream_slot;
+};
+
+// Stable metadata for a workspace-only owner.  No matrix geometry or matrix
+// backing identity is manufactured for these slots.
+struct GpuPreparedWorkspaceSlotIdentity {
+    uint64_t storage_id;
+    uint64_t execution_owner_identity;
+    uint64_t context_identity;
+    uint64_t slot_id;
+    size_t slot_index;
+    size_t partition;
+    size_t stream_slot;
+    size_t bytes;
+    size_t alignment;
+    int device;
+    GpuPreparedSlotKind kind;
+};
+
+struct GpuPreparedWorkspaceAccounting {
+    size_t device_bytes;
+    size_t pinned_bytes;
+    size_t resource_slots;
+    size_t slot_count;
+};
+
+struct GpuPreparedWorkspaceDeviceAccounting {
+    int device;
+    size_t partition;
+    size_t device_bytes;
+    size_t pinned_bytes;
+    size_t resource_slots;
+};
+
+struct GpuPreparedWorkspaceRequest {
+    uint64_t storage_id;
+    size_t slot;
+    int device;
+    size_t partition;
+    size_t stream_slot;
+    size_t bytes;
+    size_t alignment;
+    GpuPreparedSlotKind kind;
+};
+
+struct GpuPreparedWorkspaceLeaseInfo {
+    void *data;
+    cudaStream_t resource_stream;
+    cudaEvent_t completion_event;
+    GpuPreparedWorkspaceSlotIdentity identity;
 };
 
 // Concrete request bound to one native slot identity. Matrix shape/format or
@@ -141,6 +202,43 @@ int gpu_prepared_provision_finish(GpuPreparedProvisioningPermit *permit);
 void gpu_prepared_provision_cancel(GpuPreparedProvisioningPermit *permit);
 int gpu_prepared_provisioning_active(const GpuContext *context);
 
+// Construct and release an owner containing only the exact workspace claims.
+// This path does not call matrix allocation, matrix descriptor initialization,
+// owner-layout generation, or any dummy matrix constructor.  Claims may span
+// every physical partition of one execution context.
+int gpu_prepared_workspace_storage_create(
+    GpuContext *context, const GpuPreparedWorkspaceClaim *claims, size_t count,
+    GpuPreparedWorkspaceStorage **out);
+void gpu_prepared_workspace_storage_destroy(GpuPreparedWorkspaceStorage *storage);
+int gpu_prepared_workspace_storage_identity(
+    const GpuPreparedWorkspaceStorage *storage, uint64_t *out_storage_id,
+    uint64_t *out_execution_id, uint64_t *out_context_id);
+int gpu_prepared_workspace_slot_identity(
+    const GpuPreparedWorkspaceStorage *storage, size_t slot,
+    GpuPreparedWorkspaceSlotIdentity *out);
+int gpu_prepared_workspace_storage_accounting(
+    const GpuPreparedWorkspaceStorage *storage,
+    GpuPreparedWorkspaceAccounting *out);
+int gpu_prepared_workspace_device_accounting(
+    const GpuPreparedWorkspaceStorage *storage, size_t partition,
+    GpuPreparedWorkspaceDeviceAccounting *out);
+int gpu_prepared_workspace_storage_reserve(
+    GpuPreparedWorkspaceStorage *storage, const GpuPreparedWorkspaceRequest *requests,
+    size_t count, GpuPreparedWorkspaceReservation **out);
+void gpu_prepared_workspace_reservation_destroy(GpuPreparedWorkspaceReservation *reservation);
+int gpu_prepared_workspace_reservation_lease(
+    GpuPreparedWorkspaceReservation *reservation, size_t request_index,
+    GpuPreparedWorkspaceLease **out);
+int gpu_prepared_workspace_lease_info(
+    const GpuPreparedWorkspaceLease *lease, GpuPreparedWorkspaceLeaseInfo *out);
+int gpu_prepared_workspace_lease_release(
+    GpuPreparedWorkspaceLease *lease, cudaStream_t completed_stream);
+void gpu_prepared_workspace_lease_destroy(GpuPreparedWorkspaceLease *lease);
+int gpu_prepared_workspace_storage_start_release(
+    GpuPreparedWorkspaceStorage *storage, void **out);
+int gpu_prepared_workspace_release_complete(const void *release, int *out_complete);
+void gpu_prepared_workspace_release_destroy(void *release);
+
 // Explicit setup only. The caller transfers ownership of the backing matrices
 // through owner/release_owner on success. Optional typed workspaces, missing
 // matrix completion events and slot reuse events are allocated at this boundary.
@@ -151,6 +249,13 @@ int gpu_prepared_storage_create(
     const GpuPreparedWorkspaceLayout *workspaces, size_t workspace_count, void *owner,
     void (*release_owner)(void *), GpuPreparedStorage **out);
 void gpu_prepared_storage_destroy(GpuPreparedStorage *storage);
+// Begin an asynchronous teardown using the storage owner's preclaimed
+// completion event. The returned probe retains native backing until its event
+// is complete; callers must keep its charge reserved until then.
+int gpu_prepared_storage_start_release(
+    GpuPreparedStorage *storage, void **out);
+int gpu_prepared_release_complete(const void *release, int *out_complete);
+void gpu_prepared_release_destroy(void *release);
 int gpu_prepared_storage_identity(
     const GpuPreparedStorage *storage, uint64_t *out_storage_id,
     uint64_t *out_execution_id, int *out_device);
@@ -185,6 +290,11 @@ int gpu_prepared_storages_occupancy(
 // establishes initial residency. Opaque CUDA demand is outside this contract.
 int gpu_prepared_storages_finish_setup(GpuPreparedStorage *const *storages, size_t count);
 
+// Seal the audited allocation surface before first-generation prepared
+// backing is provisioned. The dispatcher then obtains its initial epoch
+// receipt before native storage construction.
+int gpu_prepared_setup_begin(GpuContext *context);
+
 // Atomically claims the complete slot list, without activating thread-local
 // dispatch. The token can move to another host thread. Any failure rolls back
 // every claim made by this call. The first successful reservation permanently
@@ -203,12 +313,12 @@ int gpu_matrix_activate_claims(
     const GpuPreparedClaimHandle *claims, const GpuPreparedRegion *region,
     GpuMatrixReservation **out);
 void gpu_matrix_claim_handle_destroy(GpuPreparedClaimHandle *claims);
-// Claim whole native slots for a containing region. Nested regions transfer
-// exclusion from their parent without releasing slots to external admissions.
-// Success with a null output means capacity changed/is busy; all acquired slots
-// have been rolled back. Nonzero status is an actual API or CUDA error.
-int gpu_prepared_region_create(GpuPreparedStorage *storage, const GpuPreparedRegion *parent,
-    const size_t *slots, size_t count, GpuPreparedRegion **out);
+// Claim whole native slots for one independent region. Regions never borrow
+// authority from another region. Success with a null output means capacity
+// changed/is busy; all acquired slots have been rolled back. Nonzero status is
+// an actual API or CUDA error.
+int gpu_prepared_region_create(GpuPreparedStorage *storage, const size_t *slots,
+    size_t count, GpuPreparedRegion **out);
 void gpu_prepared_region_destroy(GpuPreparedRegion *region);
 // Poll external idle slots' release events. Wait only for explicitly selected
 // slot indices; region-owned capacity keeps its internal event-ordered reuse.
@@ -263,6 +373,16 @@ int gpu_matrix_reservation_partition(
 int gpu_matrix_dispatch_enter(
     GpuMatrixReservation *const *reservations, size_t count,
     GpuMatrixDispatchPermit **out);
+int gpu_matrix_dispatch_enter_with_workspaces(
+    GpuMatrixReservation *const *reservations, size_t count,
+    GpuPreparedWorkspaceReservation *const *workspace_reservations,
+    size_t workspace_count, GpuMatrixDispatchPermit **out);
+// Install the exact positional workspace/resource claims that native submit
+// code will consume for this dispatch.  Each request must identify one slot
+// already transferred to the active permit; acquisition never searches other
+// reservations for a shape-compatible substitute.
+int gpu_matrix_dispatch_set_workspace_claims(
+    const GpuPreparedWorkspaceRequest *requests, size_t count);
 // On successful complete dispatch, a nonnull out retains the reservation for
 // each input in its original order. Its capacity must equal the input count.
 // Null out cancels all reservations, including during unwinding.
@@ -315,7 +435,15 @@ struct GpuDeviceWorkspace {
     GpuDeviceWorkspace &operator=(const GpuDeviceWorkspace &) = delete;
     ~GpuDeviceWorkspace();
     int acquire(GpuContext *ctx, int device, GpuPreparedSlotKind kind,
-                size_t bytes, size_t alignment, cudaStream_t stream);
+                size_t bytes, size_t alignment, cudaStream_t stream,
+                const GpuPreparedWorkspaceSlotIdentity *stream_identity = nullptr);
+    // Adopt an exact workspace-only lease for the native submit path. Without
+    // a resource identity the selected stream must be the claim's compute
+    // stream; a prepared submission-stream identity may authorize the exact
+    // dedicated stream and retains both leases until release.
+    int acquire_prepared(
+        GpuPreparedWorkspaceLease *lease, cudaStream_t stream,
+        const GpuPreparedWorkspaceSlotIdentity *stream_identity = nullptr);
     int release(cudaStream_t completed_stream = nullptr);
     cudaEvent_t completion_event() const;
     uint8_t *data;
@@ -343,10 +471,16 @@ struct GpuCudaResource {
     void detach_execution();
     // Attribute a prepared completion slot to its queued pinned retirement.
     void defer_to_pinned_release(void *pointer);
+    // Exact identity of a prepared submission-stream lease, when this resource
+    // was adopted from the active workspace claims.
+    bool prepared_stream_identity(GpuPreparedWorkspaceSlotIdentity *out) const;
     cudaEvent_t event;
     cudaStream_t stream;
 private:
     std::shared_ptr<GpuExecutionOwner> execution;
     int device;
     GpuPreparedResourceLease *lease;
+    GpuPreparedWorkspaceLease *workspace_lease;
+    GpuPreparedWorkspaceSlotIdentity workspace_identity{};
+    bool has_workspace_identity;
 };

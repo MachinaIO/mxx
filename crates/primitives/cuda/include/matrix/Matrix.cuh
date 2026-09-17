@@ -96,6 +96,21 @@ struct GpuMatrix
     // Non-owning native link. The Rust header retains a strong backing Arc.
     // Views never recycle the payload or destroy its events.
     GpuMatrix *prepared_view_owner = nullptr;
+    // The immutable stream assignment selected when this owner was created.
+    // Prepared planning consumes this value; it must not be reconstructed from
+    // the execution owner's mutable stream cursor after ordinary allocation.
+    struct PreparedOwnerPartition
+    {
+        int device = -1;
+        size_t pool_size = 0;
+        size_t local_limb_count = 0;
+        size_t shared_stream_slot = 0;
+        size_t limb_stream_slots[64]{};
+    };
+    uint64_t prepared_owner_execution_identity = 0;
+    int prepared_owner_execution_class = 0;
+    size_t prepared_owner_partition_count = 0;
+    PreparedOwnerPartition prepared_owner_partitions[64]{};
 };
 #endif
 

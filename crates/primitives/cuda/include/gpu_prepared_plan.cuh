@@ -45,6 +45,7 @@ typedef enum GpuPreparedStageRole
     GPU_PREPARED_STAGE_SCALAR_MATRIX_SELECT = 12,
     GPU_PREPARED_STAGE_THRESHOLD = 13,
     GPU_PREPARED_STAGE_SCALAR_PACK = 14,
+    GPU_PREPARED_STAGE_STORE = 15,
 } GpuPreparedStageRole;
 
 // Where a prepared plan's submission stream comes from.
@@ -70,6 +71,12 @@ typedef enum GpuPreparedStreamOrigin
 typedef struct GpuPreparedResourceKey
 {
     uint64_t execution_owner_identity;
+    // The concrete CRT context is part of the physical identity. Context
+    // pointers are not reconstructed by the host from a first parameter set.
+    uint64_t context_identity;
+    // Native descriptors are shared by instances; provisioning stamps the
+    // immutable instance on each Rust claim copy.
+    uint64_t instance;
     int partition;
     int device;
     uint32_t limb_x;
@@ -133,7 +140,6 @@ struct GpuPreparedOwnerPartitionLayout
 struct GpuPreparedOwnerLayout
 {
     uint64_t execution_owner_identity;
-    size_t stream_ordinal_base;
     int execution_class;
     size_t partition_count;
     GpuPreparedOwnerPartitionLayout partitions[GPU_PREPARED_OWNER_MAX_PARTITIONS];
@@ -147,6 +153,14 @@ struct GpuPreparedPlanDescriptor
     GpuPreparedStreamFootprint streams[GPU_PREPARED_PLAN_MAX_STREAMS];
     size_t launch_count;
     GpuPreparedLaunchLayout launches[GPU_PREPARED_PLAN_MAX_STREAMS];
+    // Exact coefficient-domain scratch owner for gadget decomposition.  This
+    // is value-only metadata carried through the descriptor; preparation must
+    // never reconstruct it from a stream ordinal or a partial stream match.
+    GpuPreparedOwnerLayout scratch_owner_layout;
+    // A schedule may merge genuinely separate stage owners. Preserve that
+    // fact explicitly so consumers cannot mistake one member's owner for the
+    // whole composite descriptor.
+    int scratch_owner_conflict;
 };
 
 // Validate descriptor bounds and immutable key/stream fields before any
@@ -194,15 +208,21 @@ extern "C" {
 // owns its storage, and an ordinary owner is returned unchanged.
 const GpuMatrix *gpu_prepared_base_owner(const GpuMatrix *matrix);
 
+// Returns the value-only stream assignment captured by an existing matrix
+// owner. This accessor only reads owner metadata; it allocates, synchronizes,
+// and advances no execution state.
+int gpu_matrix_prepared_owner_layout(
+    const GpuMatrix *matrix, GpuPreparedOwnerLayout *out);
+
 // Pure selection of the compute stream pool slot an owner limb receives. The
 // matrix allocator and every planner call this one rule.
 size_t gpu_prepared_stream_slot(size_t pool_size, size_t counter, size_t ordinal);
 
-// Pure owner stream assignment. `stream_ordinal_base` is a caller-owned
-// cursor position and is never read from GpuExecutionOwner::next_compute_stream.
+// Pure owner stream assignment. The returned layout is immutable metadata and
+// must be saved and consumed verbatim by every subsequent native operation.
 int gpu_prepared_owner_layout(
     const GpuContext *ctx, int level, size_t rows, size_t columns, int format,
-    size_t stream_ordinal_base, GpuPreparedOwnerLayout *out);
+    GpuPreparedOwnerLayout *out);
 int gpu_prepared_owner_layout_matches(
     const GpuContext *ctx, const GpuPreparedOwnerLayout *layout);
 
@@ -238,17 +258,10 @@ int gpu_prepared_ntt_launch_table(
 // Exact allocation layout and stream footprint of a prepared stage. These
 // entry points never allocate, never create a stream or event, and never
 // launch a kernel.
-int gpu_prepared_plan_const_coeff_readback(
-    const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
-    size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
-    GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_const_coeff_readback_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
     size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
     const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
-int gpu_prepared_plan_rns_upload(
-    const GpuContext *ctx, size_t rows, size_t columns, int level, int target_format,
-    int transform_to_eval, size_t bytes_per_poly, GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_rns_upload_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level, int target_format,
     int transform_to_eval, size_t bytes_per_poly, const GpuPreparedOwnerLayout *owner_layout,
@@ -264,17 +277,17 @@ int gpu_prepared_plan_compact_upload_with_owner(
 int gpu_prepared_plan_small_upload_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level, size_t payload_bytes,
     const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
-int gpu_prepared_plan_rns_reconstruction(
-    const GpuContext *ctx, size_t rows, size_t columns, int level,
-    size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
-    GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_rns_reconstruction_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level,
     size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
     const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
-int gpu_prepared_plan_ntt(
-    const GpuContext *ctx, size_t rows, size_t columns, int level,
-    const GpuMatrixRange *range, int forward, GpuPreparedPlanDescriptor *out);
+// A borrowed compact store uses the retained matrix itself.  It never claims
+// or allocates a matrix scratch owner: nonempty stores consume one native
+// submission stream followed by one transfer workspace on the owner's first
+// limb stream.  Empty owners have no native footprint.
+int gpu_prepared_plan_borrowed_compact_store_with_owner(
+    const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
+    const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_ntt_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level,
     const GpuMatrixRange *range, int forward, const GpuPreparedOwnerLayout *owner_layout,
@@ -306,12 +319,9 @@ int gpu_prepared_plan_threshold(
 int gpu_prepared_plan_threshold_with_owner(
     const GpuContext *ctx, size_t count, size_t plaintext_words,
     const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
-int gpu_prepared_plan_scalar_pack(
+int gpu_prepared_plan_scalar_pack_with_owner(
     const GpuContext *ctx, size_t count, size_t coefficient_bits, int level, int output_format,
-    GpuPreparedPlanDescriptor *out);
-int gpu_prepared_plan_small_rhs(
-    const GpuContext *ctx, int level, size_t inner, size_t columns,
-    size_t residency_budget_bytes, GpuPreparedPlanDescriptor *out);
+    const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_small_rhs_with_owner(
     const GpuContext *ctx, int level, size_t inner, size_t columns,
     size_t residency_budget_bytes, const GpuPreparedOwnerLayout *owner_layout,
@@ -334,7 +344,9 @@ int gpu_prepared_plan_centered_rebase_with_owner(
 int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
     const GpuContext *ctx, size_t source_rows, size_t source_columns,
     size_t output_rows, int level, int source_format, int format, uint32_t base_bits,
-    int small, size_t dropped_moduli, const GpuPreparedOwnerLayout *owner_layout,
+    int small, size_t dropped_moduli,
+    const GpuPreparedOwnerLayout *output_owner_layout,
+    const GpuPreparedOwnerLayout *source_owner_layout,
     GpuPreparedPlanDescriptor *out);
 int gpu_prepared_plan_modulus_conversion_with_owner(
     const GpuContext *ctx, size_t source_rows, size_t source_columns,

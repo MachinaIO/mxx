@@ -8,9 +8,8 @@ use crate::{
             GpuDCRTPolyMatrix, GpuMatrixRangeConstant, GpuMatrixSampleDist, GpuPreparedArithmetic,
             GpuPreparedArithmeticCommand, GpuPreparedArithmeticKind, GpuPreparedRange,
             GpuPreparedSampling, GpuPreparedSchedule, GpuPreparedSchedulePlan, GpuPreparedSlotKind,
-            GpuPreparedTransform, GpuPreparedTranspose, GpuPreparedView,
-            GpuPreparedWorkspaceLayout, GpuTracedClaim, PreparedOwnerLayout,
-            PreparedOwnerLayoutCursor, PreparedPlanLayout,
+            GpuPreparedTranspose, GpuPreparedView, GpuPreparedWorkspaceLayout, GpuTracedClaim,
+            PreparedOwnerLayout, PreparedPlanLayout,
         },
     },
     poly::{
@@ -18,10 +17,7 @@ use crate::{
         dcrt::gpu::{GPU_MATRIX_DIST_GAUSS, GpuDCRTPolyParams, GpuRngSeed},
     },
 };
-use std::{
-    cell::Cell,
-    sync::{Arc, Mutex},
-};
+use std::{cell::Cell, sync::Arc};
 
 /// Warmup-owned structural description of the prepared trapdoor sampler.
 /// The matrix claims preserve the fixed owner order while `sampler` is the
@@ -31,7 +27,7 @@ pub struct GpuPreparedTrapdoorLayout {
     pub sampler: PreparedPlanLayout,
     pub matrix_owners: Box<[PreparedOwnerLayout]>,
     pub stages: Box<[PreparedPlanLayout]>,
-    pub matrix_claims: [GpuTracedClaim; 13],
+    pub matrix_claims: [GpuTracedClaim; 10],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,7 +36,6 @@ pub enum GpuPreparedTrapdoorEntryKind {
     Sampler,
     Transpose,
     Arithmetic,
-    Transform,
 }
 
 /// The fixed order of all native substages in a prepared trapdoor bind.
@@ -55,12 +50,6 @@ pub enum TrapdoorStage {
     SamplerAbar,
     TransposeR,
     TransposeE,
-    GramA,
-    GramB,
-    GramD,
-    GramATransform,
-    GramBTransform,
-    GramDTransform,
     PublicProduct,
     PublicSum,
     PublicTail,
@@ -70,18 +59,12 @@ pub enum TrapdoorStage {
 }
 
 impl TrapdoorStage {
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 11] = [
         Self::SamplerR,
         Self::SamplerE,
         Self::SamplerAbar,
         Self::TransposeR,
         Self::TransposeE,
-        Self::GramA,
-        Self::GramB,
-        Self::GramD,
-        Self::GramATransform,
-        Self::GramBTransform,
-        Self::GramDTransform,
         Self::PublicProduct,
         Self::PublicSum,
         Self::PublicTail,
@@ -97,18 +80,12 @@ impl TrapdoorStage {
             Self::SamplerAbar => 2,
             Self::TransposeR => 3,
             Self::TransposeE => 4,
-            Self::GramA => 5,
-            Self::GramB => 6,
-            Self::GramD => 7,
-            Self::GramATransform => 8,
-            Self::GramBTransform => 9,
-            Self::GramDTransform => 10,
-            Self::PublicProduct => 11,
-            Self::PublicSum => 12,
-            Self::PublicTail => 13,
-            Self::PublicCopyAbar => 14,
-            Self::PublicCopyIdentity => 15,
-            Self::PublicCopyTail => 16,
+            Self::PublicProduct => 5,
+            Self::PublicSum => 6,
+            Self::PublicTail => 7,
+            Self::PublicCopyAbar => 8,
+            Self::PublicCopyIdentity => 9,
+            Self::PublicCopyTail => 10,
         }
     }
 
@@ -118,13 +95,7 @@ impl TrapdoorStage {
             Self::SamplerE => Some(Self::SamplerAbar),
             Self::SamplerAbar => Some(Self::TransposeR),
             Self::TransposeR => Some(Self::TransposeE),
-            Self::TransposeE => Some(Self::GramA),
-            Self::GramA => Some(Self::GramB),
-            Self::GramB => Some(Self::GramD),
-            Self::GramD => Some(Self::GramATransform),
-            Self::GramATransform => Some(Self::GramBTransform),
-            Self::GramBTransform => Some(Self::GramDTransform),
-            Self::GramDTransform => Some(Self::PublicProduct),
+            Self::TransposeE => Some(Self::PublicProduct),
             Self::PublicProduct => Some(Self::PublicSum),
             Self::PublicSum => Some(Self::PublicTail),
             Self::PublicTail => Some(Self::PublicCopyAbar),
@@ -140,12 +111,6 @@ impl TrapdoorStage {
                 GpuPreparedTrapdoorEntryKind::Sampler
             }
             Self::TransposeR | Self::TransposeE => GpuPreparedTrapdoorEntryKind::Transpose,
-            Self::GramATransform | Self::GramBTransform | Self::GramDTransform => {
-                GpuPreparedTrapdoorEntryKind::Transform
-            }
-            Self::GramA |
-            Self::GramB |
-            Self::GramD |
             Self::PublicProduct |
             Self::PublicSum |
             Self::PublicTail |
@@ -156,12 +121,11 @@ impl TrapdoorStage {
     }
 }
 
-pub const TRAPDOOR_ENTRY_KINDS: [GpuPreparedTrapdoorEntryKind; 5] = [
+pub const TRAPDOOR_ENTRY_KINDS: [GpuPreparedTrapdoorEntryKind; 4] = [
     GpuPreparedTrapdoorEntryKind::MatrixOwner,
     GpuPreparedTrapdoorEntryKind::Sampler,
     GpuPreparedTrapdoorEntryKind::Transpose,
     GpuPreparedTrapdoorEntryKind::Arithmetic,
-    GpuPreparedTrapdoorEntryKind::Transform,
 ];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,19 +135,13 @@ pub struct GpuPreparedTrapdoorBindEntry {
     pub stage: Option<TrapdoorStage>,
 }
 
-const fn trapdoor_stage_kinds() -> [GpuPreparedTrapdoorEntryKind; 17] {
+const fn trapdoor_stage_kinds() -> [GpuPreparedTrapdoorEntryKind; 11] {
     [
         TrapdoorStage::SamplerR.kind(),
         TrapdoorStage::SamplerE.kind(),
         TrapdoorStage::SamplerAbar.kind(),
         TrapdoorStage::TransposeR.kind(),
         TrapdoorStage::TransposeE.kind(),
-        TrapdoorStage::GramA.kind(),
-        TrapdoorStage::GramB.kind(),
-        TrapdoorStage::GramD.kind(),
-        TrapdoorStage::GramATransform.kind(),
-        TrapdoorStage::GramBTransform.kind(),
-        TrapdoorStage::GramDTransform.kind(),
         TrapdoorStage::PublicProduct.kind(),
         TrapdoorStage::PublicSum.kind(),
         TrapdoorStage::PublicTail.kind(),
@@ -193,15 +151,15 @@ const fn trapdoor_stage_kinds() -> [GpuPreparedTrapdoorEntryKind; 17] {
     ]
 }
 
-pub const TRAPDOOR_STAGE_KINDS: [GpuPreparedTrapdoorEntryKind; 17] = trapdoor_stage_kinds();
+pub const TRAPDOOR_STAGE_KINDS: [GpuPreparedTrapdoorEntryKind; 11] = trapdoor_stage_kinds();
 
 impl GpuPreparedTrapdoorLayout {
-    pub fn entry_kinds() -> &'static [GpuPreparedTrapdoorEntryKind; 5] {
+    pub fn entry_kinds() -> &'static [GpuPreparedTrapdoorEntryKind; 4] {
         &TRAPDOOR_ENTRY_KINDS
     }
 
     pub fn bind_entries() -> Vec<GpuPreparedTrapdoorBindEntry> {
-        let mut entries = (0..13)
+        let mut entries = (0..10)
             .map(|owner| GpuPreparedTrapdoorBindEntry {
                 kind: GpuPreparedTrapdoorEntryKind::MatrixOwner,
                 owner: Some(owner),
@@ -300,13 +258,42 @@ impl GpuPreparedTrapdoorLayout {
         }
         layouts
     }
+
+    /// Exact logical owner for every entry returned by [`Self::claims`].
+    pub fn claim_owner_layouts(&self) -> Result<Vec<PreparedOwnerLayout>, String> {
+        let mut owners = self.matrix_owners.to_vec();
+        for stage in TrapdoorStage::ALL {
+            for allocation in self.stage(stage).allocations() {
+                if allocation.kind == 100 {
+                    continue;
+                }
+                if allocation.kind == 0 ||
+                    allocation.allocation_kind().is_some_and(|kind| {
+                        !matches!(
+                            kind,
+                            crate::matrix::gpu_dcrt_poly::PreparedAllocationKind::Matrix |
+                                crate::matrix::gpu_dcrt_poly::PreparedAllocationKind::HostOnly
+                        )
+                    })
+                {
+                    owners.push(
+                        self.stage(stage).owner_layout().ok_or(
+                            "prepared trapdoor stage owner layout is missing or conflicting",
+                        )?,
+                    );
+                }
+            }
+        }
+        if owners.len() != self.claims().len() {
+            return Err("prepared trapdoor claim owner table length mismatch".into());
+        }
+        Ok(owners)
+    }
 }
 
 pub struct GpuPreparedTrapdoorSampler {
     samplers: [Arc<GpuPreparedSampling>; 3],
     transposes: [Arc<GpuPreparedTranspose>; 2],
-    grams: [GpuPreparedArithmeticCommand; 3],
-    gram_transforms: [(GpuPreparedTransform, Arc<GpuDCRTPolyMatrix>); 3],
     public_commands: Box<[GpuPreparedArithmeticCommand]>,
     trapdoor: Arc<GpuDCRTTrapdoor>,
     public: Arc<GpuDCRTPolyMatrix>,
@@ -318,7 +305,7 @@ impl GpuPreparedTrapdoorSampler {
         owners: &[PreparedOwnerLayout],
         rows: usize,
     ) -> Result<Box<[PreparedPlanLayout]>, String> {
-        if owners.len() != 13 {
+        if owners.len() != 10 {
             return Err("prepared trapdoor owner count mismatch".into());
         }
         let k = params.modulus_digits();
@@ -436,38 +423,16 @@ impl GpuPreparedTrapdoorSampler {
             )
         };
         push_stage!(
-            TrapdoorStage::GramA,
-            arith(4, rows, rows * k, rows * k, rows, rows, rows, &owners[5])?
-        );
-        push_stage!(
-            TrapdoorStage::GramB,
-            arith(4, rows, rows * k, rows * k, rows, rows, rows, &owners[6])?
-        );
-        push_stage!(
-            TrapdoorStage::GramD,
-            arith(4, rows, rows * k, rows * k, rows, rows, rows, &owners[7])?
-        );
-        for (stage, owner) in [
-            (TrapdoorStage::GramATransform, &owners[5]),
-            (TrapdoorStage::GramBTransform, &owners[6]),
-            (TrapdoorStage::GramDTransform, &owners[7]),
-        ] {
-            push_stage!(
-                stage,
-                PreparedPlanLayout::ntt_with_owner(params, rows, rows, level, None, false, owner,)?
-            );
-        }
-        push_stage!(
             TrapdoorStage::PublicProduct,
-            arith(4, rows, rows, rows, rows * k, rows, rows * k, &owners[8])?
+            arith(4, rows, rows, rows, rows * k, rows, rows * k, &owners[5])?
         );
         push_stage!(
             TrapdoorStage::PublicSum,
-            arith(1, rows, rows * k, rows, rows * k, rows, rows * k, &owners[9])?
+            arith(1, rows, rows * k, rows, rows * k, rows, rows * k, &owners[6])?
         );
         push_stage!(
             TrapdoorStage::PublicTail,
-            arith(5, rows, rows * k, rows, rows * k, rows, rows * k, &owners[10])?
+            arith(5, rows, rows * k, rows, rows * k, rows, rows * k, &owners[7])?
         );
         let public_owner = PreparedOwnerLayout::plan(
             params,
@@ -475,7 +440,6 @@ impl GpuPreparedTrapdoorSampler {
             rows * (2 + k),
             level,
             crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
-            0,
         )?;
         for ((source, start), stage) in [(rows, 0), (rows, rows), (rows, 2 * rows)]
             .into_iter()
@@ -515,11 +479,10 @@ impl GpuPreparedTrapdoorSampler {
         params: &GpuDCRTPolyParams,
         rows: usize,
     ) -> Result<Box<[PreparedOwnerLayout]>, String> {
-        let mut cursor = PreparedOwnerLayoutCursor::default();
         Self::allocation_claims(params, rows)
             .into_iter()
             .map(|claim| {
-                cursor.plan(
+                PreparedOwnerLayout::plan(
                     params,
                     claim.rows(),
                     claim.columns(),
@@ -563,7 +526,6 @@ impl GpuPreparedTrapdoorSampler {
             d * k,
             params.crt_depth() - 1,
             crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
-            0,
         )?;
         PreparedPlanLayout::sampling_with_owner(
             params,
@@ -626,7 +588,7 @@ impl GpuPreparedTrapdoorSampler {
         Self::bind_saved(params, public, sigma, layout)
     }
 
-    pub fn allocation_claims(params: &GpuDCRTPolyParams, d: usize) -> [GpuTracedClaim; 13] {
+    pub fn allocation_claims(params: &GpuDCRTPolyParams, d: usize) -> [GpuTracedClaim; 10] {
         let k = params.modulus_digits();
         [
             (d, d * k),
@@ -634,9 +596,6 @@ impl GpuPreparedTrapdoorSampler {
             (d, d),
             (d * k, d),
             (d * k, d),
-            (d, d),
-            (d, d),
-            (d, d),
             (d, d * k),
             (d, d * k),
             (d, d * k),
@@ -663,42 +622,29 @@ impl GpuPreparedTrapdoorSampler {
         {
             return Err("prepared trapdoor contract mismatch".into());
         }
-        if layout.matrix_owners.len() != 13 || layout.stages.len() != TrapdoorStage::ALL.len() {
+        if layout.matrix_owners.len() != 10 || layout.stages.len() != TrapdoorStage::ALL.len() {
             return Err("prepared trapdoor saved stage/owner count mismatch".into());
         }
-        let [
-            r,
-            e,
-            abar,
-            rt,
-            et,
-            gram_a,
-            gram_b,
-            gram_d,
-            product,
-            sum,
-            tail,
-            mut gadget,
-            mut identity,
-        ] = Self::allocation_claims(params, d)
-            .into_iter()
-            .zip(layout.matrix_owners.iter())
-            .map(|(claim, owner)| {
-                GpuDCRTPolyMatrix::new_empty_with_owner_layout(
-                    params,
-                    claim.rows(),
-                    claim.columns(),
-                    claim.level().expect("matrix layout level"),
-                    claim.is_evaluation().expect("matrix layout format"),
-                    None,
-                    owner,
-                )
-                .map(Arc::new)
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .and_then(|owners| {
-                owners.try_into().map_err(|_| "trapdoor owner count mismatch".into())
-            })?;
+        let [r, e, abar, rt, et, product, sum, tail, mut gadget, mut identity] =
+            Self::allocation_claims(params, d)
+                .into_iter()
+                .zip(layout.matrix_owners.iter())
+                .map(|(claim, owner)| {
+                    GpuDCRTPolyMatrix::new_empty_with_owner_layout(
+                        params,
+                        claim.rows(),
+                        claim.columns(),
+                        claim.level().expect("matrix layout level"),
+                        claim.is_evaluation().expect("matrix layout format"),
+                        None,
+                        owner,
+                    )
+                    .map(Arc::new)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .and_then(|owners| {
+                    owners.try_into().map_err(|_| "trapdoor owner count mismatch".into())
+                })?;
         Arc::get_mut(&mut gadget).expect("fresh gadget owner").fill_constant_columns(
             0..d,
             0..d * k,
@@ -803,73 +749,12 @@ impl GpuPreparedTrapdoorSampler {
                 consume_stage(TrapdoorStage::TransposeE)?.clone(),
             )?,
         ];
-        let gram_owners = [gram_a, gram_b, gram_d];
-        let grams = [
-            arithmetic(
-                TrapdoorStage::GramA,
-                GpuPreparedArithmeticKind::Multiply,
-                &r,
-                Some(&rt),
-                &gram_owners[0],
-            )?,
-            arithmetic(
-                TrapdoorStage::GramB,
-                GpuPreparedArithmeticKind::Multiply,
-                &r,
-                Some(&et),
-                &gram_owners[1],
-            )?,
-            arithmetic(
-                TrapdoorStage::GramD,
-                GpuPreparedArithmeticKind::Multiply,
-                &e,
-                Some(&et),
-                &gram_owners[2],
-            )?,
-        ];
-        let coefficients = [
-            header(&gram_owners[0], false)?,
-            header(&gram_owners[1], false)?,
-            header(&gram_owners[2], false)?,
-        ];
-        let gram_transforms = [
-            (
-                GpuPreparedTransform::new_with_layout(
-                    &coefficients[0],
-                    false,
-                    consume_stage(TrapdoorStage::GramATransform)?,
-                )?,
-                Arc::clone(&coefficients[0]),
-            ),
-            (
-                GpuPreparedTransform::new_with_layout(
-                    &coefficients[1],
-                    false,
-                    consume_stage(TrapdoorStage::GramBTransform)?,
-                )?,
-                Arc::clone(&coefficients[1]),
-            ),
-            (
-                GpuPreparedTransform::new_with_layout(
-                    &coefficients[2],
-                    false,
-                    consume_stage(TrapdoorStage::GramDTransform)?,
-                )?,
-                Arc::clone(&coefficients[2]),
-            ),
-        ];
         let own_header = |owner: &Arc<GpuDCRTPolyMatrix>, evaluation| {
             Arc::try_unwrap(header(owner, evaluation)?)
                 .map_err(|_| "fresh prepared trapdoor header is unexpectedly shared".to_owned())
         };
-        let trapdoor = Arc::new(GpuDCRTTrapdoor {
-            r: own_header(&r, true)?,
-            e: own_header(&e, true)?,
-            a_mat_coeff: own_header(&gram_owners[0], false)?,
-            b_mat_coeff: own_header(&gram_owners[1], false)?,
-            d_mat_coeff: own_header(&gram_owners[2], false)?,
-            p1_covariance_cache: Arc::new(Mutex::new(None)),
-        });
+        let trapdoor =
+            Arc::new(GpuDCRTTrapdoor { r: own_header(&r, true)?, e: own_header(&e, true)? });
         let mut public_commands = vec![
             arithmetic(
                 TrapdoorStage::PublicProduct,
@@ -921,8 +806,6 @@ impl GpuPreparedTrapdoorSampler {
         Ok(Self {
             samplers,
             transposes,
-            grams,
-            gram_transforms,
             public_commands: public_commands.into_boxed_slice(),
             trapdoor,
             public,
@@ -935,12 +818,6 @@ impl GpuPreparedTrapdoorSampler {
         }
         for command in &self.transposes {
             command.submit()?;
-        }
-        for command in &self.grams {
-            command.submit()?;
-        }
-        for (command, owner) in &self.gram_transforms {
-            command.submit_shared(owner)?;
         }
         for command in &self.public_commands {
             command.submit()?;
@@ -985,23 +862,11 @@ impl GpuPreparedTrapdoorSampler {
             *offset = end;
             Ok(&bytes[start..end])
         };
-        let payloads = [
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-        ];
+        let payloads = [next(&mut offset)?, next(&mut offset)?];
         if offset != bytes.len() {
             return Err("trapdoor payload has trailing bytes".into());
         }
-        for (payload, owner) in payloads.into_iter().zip([
-            &self.trapdoor().r,
-            &self.trapdoor().e,
-            &self.trapdoor().a_mat_coeff,
-            &self.trapdoor().b_mat_coeff,
-            &self.trapdoor().d_mat_coeff,
-        ]) {
+        for (payload, owner) in payloads.into_iter().zip([&self.trapdoor().r, &self.trapdoor().e]) {
             GpuDCRTPolyMatrix::validate_compact_bytes(
                 payload,
                 owner.row_size(),
@@ -1021,10 +886,6 @@ impl GpuPreparedTrapdoorSampler {
         let mut plans = Vec::new();
         plans.extend(self.samplers.iter().map(|plan| GpuPreparedSchedulePlan::Sampling(plan)));
         plans.extend(self.transposes.iter().map(|plan| GpuPreparedSchedulePlan::Transpose(plan)));
-        plans.extend(self.grams.iter().map(GpuPreparedSchedulePlan::Arithmetic));
-        for (transform, owner) in &self.gram_transforms {
-            plans.push(GpuPreparedSchedulePlan::Transform(transform, owner));
-        }
         plans.extend(self.public_commands.iter().map(GpuPreparedSchedulePlan::Arithmetic));
         GpuPreparedSchedule::new(&plans, &[])
     }

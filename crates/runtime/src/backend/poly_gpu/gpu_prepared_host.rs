@@ -21,6 +21,9 @@ pub(crate) struct PreparedHostCommandSpec {
     pub coefficient_count: usize,
     pub words_per_poly: usize,
     pub bytes_per_poly: usize,
+    /// Finalized polynomial domain for this host boundary. Readback accepts
+    /// either coefficient or evaluation layout; upload uses the same field as
+    /// its source format contract.
     pub format: i32,
     pub transform_to_eval: bool,
     pub plan: PreparedPlanLayout,
@@ -51,6 +54,14 @@ pub(crate) fn bind_reconstruction(
     spec: &PreparedHostCommandSpec,
 ) -> Result<PreparedHostCommand, String> {
     let source = Arc::clone(spec.source.as_ref().ok_or("reconstruction source owner is missing")?);
+    let expected_evaluation = match spec.format {
+        mxx_primitives::poly::dcrt::gpu::GPU_POLY_FORMAT_COEFF => false,
+        mxx_primitives::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL => true,
+        _ => return Err("prepared reconstruction format is invalid".into()),
+    };
+    if source.is_ntt() != expected_evaluation {
+        return Err("prepared reconstruction source format differs from its finalized domain".into());
+    }
     let command = GpuPreparedRnsReconstruction::bind(
         source,
         spec.coefficient_index,

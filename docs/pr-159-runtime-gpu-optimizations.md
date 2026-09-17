@@ -60,9 +60,11 @@ poisons its slot; poisoned slots are retired and never reused. Waiting for an
 exhausted pool observes existing terminal events and does not reserve the same
 execution twice.
 
-Runtime integer values are arbitrary-precision `BigInt`s. The warmup ledger
-reserves enough words for the declared capacity. A larger value fails at the
-input boundary; it does not trigger geometry growth or a second planning pass.
+Runtime integer values are arbitrary-precision `BigInt`s. Warmup derives a fixed
+projection for each scalar resource. Each execution claims its exact reusable
+slot and copies into preallocated device and pinned storage; a value exceeding
+the projection is rejected explicitly. Runtime execution never grows scalar
+storage or performs a second planning pass.
 
 ## Native operation and sampling rules
 
@@ -72,12 +74,24 @@ rebase, CRT, gadget, compact, serialization, small-RHS, trapdoor, and preimage
 operations. A convenience constructor is a low-level primitive only when it
 is called by a current standalone primitive API; prepared production code does
 not use it to rediscover a layout.
+`PreparedPlanLayout` is the sole native operation-layout authority. Prepared
+wrappers retain the planned descriptor and pass it to native binds; dimensions,
+live handles, and convenience constructors cannot establish a competing layout.
+Evaluation-domain `PolynomialValues` follows the direct source-owner path,
+without implicit coefficient staging and inverse-transform detours.
 
 Preimage sampling is compiled into fixed lanes and fixed resource claims.
 `Fresh` and `Record` receive fresh submit-time randomness. `Record` stores the
 actual payload accepted by the native sampler after completion. `Replay`
 validates the recorded payload against the prepared contract and uploads it to
 fixed staging; it never samples again.
+
+Persisted trapdoor state contains only `r` and `e`. Gram matrices, covariance
+data, coefficient workspaces, and transform metadata are derived once at the
+preimage operation boundary and retained only in that operation's workspace.
+The prepared transcript is two-part: a draw-site entry identifies the value and
+the recorded payload carries the complete public or secret bytes. It is not a
+five-part trapdoor metadata envelope.
 
 ## Estimator
 
@@ -98,6 +112,13 @@ The report keeps distinct:
 No missing class is silently replaced by a singleton estimate. Synthetic
 representatives describe the stated placement scenario and are not a physical
 VRAM guarantee.
+
+The WE GPU estimator uses `GpuNodeMeasurementBackend`: its production caller
+collects both validated graphs, warms and executes each prepared representative
+once, and then estimates from the frozen measurement table. The removed
+Diamond-specific direct primitive interpreter, pilot-calibration registry, and
+candidate-width fallback are not compatibility paths. Fleet grouping, prepared
+memory observation, and capped water-filling remain active.
 
 ## Validation and review requirements
 

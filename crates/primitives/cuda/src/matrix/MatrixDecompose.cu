@@ -1457,40 +1457,15 @@ static void destroy_prepared_gadget_decompose(GpuPreparedGadgetDecompose *plan)
     if (!plan) return;
     if (plan->inverse) gpu_matrix_destroy_ntt_plan(plan->inverse);
     if (plan->forward) gpu_matrix_destroy_ntt_plan(plan->forward);
+    // The correction workspace retains a non-owning pointer to the
+    // coefficient scratch matrix.  Retire it while that owner is still
+    // alive; otherwise its destructor dereferences the freed matrix during
+    // context stream retirement (notably when a dropped-moduli replay is
+    // destroyed after a failed/short submission).
+    if (plan->correction_workspace.has_owner())
+        (void)plan->correction_workspace.retire();
     if (plan->coefficient_source) gpu_matrix_destroy(plan->coefficient_source);
     delete plan;
-}
-
-static int gadget_scratch_owner_layout(
-    const GpuContext *ctx, int level, size_t rows, size_t columns,
-    const GpuPreparedPlanDescriptor *saved, size_t stream_index,
-    GpuPreparedOwnerLayout *out)
-{
-    if (!ctx || !saved || !out || stream_index >= saved->stream_count)
-        return set_error("prepared gadget scratch owner metadata is missing");
-    const auto &footprint = saved->streams[stream_index];
-    if (footprint.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
-        footprint.key.limb_x >= ctx->execution->compute_streams_by_partition.size())
-        return set_error("prepared gadget scratch owner stream is invalid");
-    const size_t pool_size = ctx->execution->compute_streams_by_partition[
-        footprint.key.limb_x].size();
-    for (size_t ordinal = 0; ordinal < pool_size * 2 + 1; ++ordinal)
-    {
-        GpuPreparedOwnerLayout candidate{};
-        if (gpu_prepared_owner_layout(ctx, level, rows, columns,
-                GPU_POLY_FORMAT_COEFF, ordinal, &candidate) != 0)
-            return -1;
-        const auto &partition = candidate.partitions[footprint.key.limb_x];
-        const size_t selected = candidate.execution_class == GPU_MATRIX_SHARED_STREAM
-            ? partition.shared_stream_slot
-            : partition.limb_stream_slots[footprint.key.limb_y];
-        if (selected == footprint.pool_slot)
-        {
-            *out = candidate;
-            return 0;
-        }
-    }
-    return set_error("prepared gadget scratch owner stream cannot be resolved");
 }
 
 static int prepare_gadget_decompose_impl(
@@ -1578,19 +1553,13 @@ static int prepare_gadget_decompose_impl(
 
     if (src->format == GPU_POLY_FORMAT_EVAL || dropped_moduli > 0) {
         if (saved) {
-            GpuPreparedOwnerLayout scratch_owner{};
-            size_t transform_stream_index = SIZE_MAX;
-            for (size_t index = 0; index < saved->stream_count; ++index)
-                if (saved->streams[index].key.role == GPU_PREPARED_STAGE_TRANSFORM)
-                {
-                    transform_stream_index = index;
-                    break;
-                }
-            status = gadget_scratch_owner_layout(src->ctx, level, src->rows, src->cols,
-                saved, transform_stream_index, &scratch_owner);
-            if (status == 0)
-                status = gpu_matrix_create_prepared(src->ctx, level, src->rows, src->cols,
-                    GPU_POLY_FORMAT_COEFF, &scratch_owner, &prepared->coefficient_source);
+            const GpuPreparedOwnerLayout *scratch_owner =
+                saved->scratch_owner_layout.execution_owner_identity != 0
+                    ? &saved->scratch_owner_layout : nullptr;
+            if (!scratch_owner)
+                return set_error("prepared gadget scratch owner metadata is missing");
+            status = gpu_matrix_create_prepared(src->ctx, level, src->rows, src->cols,
+                GPU_POLY_FORMAT_COEFF, scratch_owner, &prepared->coefficient_source);
         } else {
             status = gpu_matrix_create(src->ctx, level, src->rows, src->cols,
                 GPU_POLY_FORMAT_COEFF, &prepared->coefficient_source);

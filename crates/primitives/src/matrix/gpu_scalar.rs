@@ -1,52 +1,22 @@
 //! Prepared device scalar payloads and their GPU polynomial consumers.
 use super::*;
 use crate::poly::dcrt::gpu::{
-    GpuDCRTPolyParams, GpuPreparedScalarBufferOpaque, GpuPreparedScalarMatrixSelectOpaque,
-    GpuPreparedScalarOpOpaque, GpuPreparedScalarPackOpaque, GpuPreparedScalarRef,
-    GpuPreparedThresholdOpaque, GpuReleaseCompletion, gpu_matrix_defer_scalar_buffer_pinned_free,
+    GpuPreparedScalarBufferOpaque, GpuPreparedScalarMatrixSelectOpaque, GpuPreparedScalarOpOpaque,
+    GpuPreparedScalarPackOpaque, GpuPreparedScalarRef, GpuPreparedThresholdOpaque,
+    GpuReleaseCompletion, gpu_matrix_defer_scalar_buffer_pinned_free,
     gpu_matrix_destroy_scalar_buffer, gpu_matrix_destroy_scalar_matrix_select,
     gpu_matrix_destroy_scalar_op, gpu_matrix_destroy_scalar_pack, gpu_matrix_destroy_threshold,
-    gpu_matrix_finalize_scalar_buffer, gpu_matrix_prepare_scalar_buffer,
-    gpu_matrix_prepare_scalar_matrix_select, gpu_matrix_prepare_scalar_op,
-    gpu_matrix_prepare_scalar_pack, gpu_matrix_prepare_threshold,
-    gpu_matrix_query_scalar_buffer_completion, gpu_matrix_read_scalar_buffer,
-    gpu_matrix_resize_scalar_buffer, gpu_matrix_resize_scalar_op_workspace,
-    gpu_matrix_scalar_matrix_select_workspace_bytes, gpu_matrix_scalar_op_workspace_bytes,
-    gpu_matrix_scalar_pack_workspace_bytes, gpu_matrix_submit_scalar_matrix_select,
-    gpu_matrix_submit_scalar_op, gpu_matrix_submit_scalar_pack, gpu_matrix_submit_threshold,
+    gpu_matrix_finalize_scalar_buffer, gpu_matrix_finalize_scalar_op,
+    gpu_matrix_prepare_scalar_buffer, gpu_matrix_prepare_scalar_matrix_select,
+    gpu_matrix_prepare_scalar_op, gpu_matrix_prepare_scalar_pack, gpu_matrix_prepare_threshold,
+    gpu_matrix_read_scalar_buffer, gpu_matrix_scalar_matrix_select_workspace_bytes,
+    gpu_matrix_scalar_op_workspace_bytes, gpu_matrix_scalar_pack_workspace_bytes,
+    gpu_matrix_submit_scalar_matrix_select, gpu_matrix_submit_scalar_op,
+    gpu_matrix_submit_scalar_pack, gpu_matrix_submit_threshold,
     gpu_matrix_threshold_workspace_bytes, gpu_matrix_upload_scalar_buffer,
     gpu_matrix_validate_scalar_buffer, gpu_matrix_wait_scalar_buffer,
 };
-use std::sync::atomic::AtomicUsize;
-
-/// A runtime-owned charge for one dynamically grown scalar generation.
-///
-/// The primitive layer performs the native allocation, while the runtime owns
-/// the admission transaction. A generation is committed before its native
-/// pointer is published; committed generations are retired only with an event
-/// proof supplied by the native owner.
-pub trait GpuScalarCapacityLease: Send {
-    fn commit(&mut self) -> Result<(), String>;
-    /// Cancel a committed generation before its native owner was published.
-    /// This releases its admission charge without poisoning the ledger.
-    fn cancel(&mut self) -> Result<(), String>;
-    fn retire(&mut self, completion: GpuReleaseCompletion) -> Result<(), String>;
-    /// Permanently quarantine a generation whose native owner or completion
-    /// proof is unknown.  Implementations must keep its charge live and make
-    /// the failure observable to their admission owner.
-    fn quarantine(&mut self) -> Result<(), String>;
-}
-
-/// Runtime admission hook used at the explicit scalar input boundary.
-pub trait GpuScalarCapacityAllocator {
-    fn reserve(
-        &mut self,
-        params: &GpuDCRTPolyParams,
-        device: i32,
-        device_bytes: u64,
-        pinned_bytes: u64,
-    ) -> Result<Box<dyn GpuScalarCapacityLease>, String>;
-}
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[repr(i32)]
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +48,7 @@ pub struct GpuPreparedScalarOp {
     right: Option<Arc<GpuPreparedScalarBuffer>>,
     candidates: Box<[Arc<GpuPreparedScalarBuffer>]>,
     pub(super) output: Arc<GpuPreparedScalarBuffer>,
+    finalized: AtomicBool,
 }
 unsafe impl Send for GpuPreparedScalarOp {}
 unsafe impl Sync for GpuPreparedScalarOp {}
@@ -147,6 +118,7 @@ impl GpuPreparedScalarOp {
             right: right.map(|value| value.0),
             candidates: candidates.iter().map(|(owner, _)| Arc::clone(owner)).collect(),
             output: output.0,
+            finalized: AtomicBool::new(false),
         }))
     }
     pub fn submit(&self) -> Result<(), String> {
@@ -155,24 +127,21 @@ impl GpuPreparedScalarOp {
         }
         Ok(())
     }
-    pub fn ensure_workspace_capacity(&self, words: usize) -> Result<(), String> {
-        if unsafe { gpu_matrix_resize_scalar_op_workspace(self.raw.as_ptr(), words) } != 0 {
-            Err(last_error_string())
-        } else {
-            Ok(())
+    pub fn finalize(&self) -> Result<GpuReleaseCompletion, String> {
+        if self.finalized.swap(true, Ordering::AcqRel) {
+            return Err("scalar operation already finalized".into());
         }
-    }
-    pub fn workspace_bytes_for_words(&self, words: usize) -> usize {
-        Self::workspace_bytes(words, words, words, self.candidates.len())
+        let mut events = std::ptr::null_mut();
+        let status = unsafe { gpu_matrix_finalize_scalar_op(self.raw.as_ptr(), &mut events) };
+        if status != 0 {
+            return Err(last_error_string());
+        }
+        let events =
+            NonNull::new(events).ok_or("scalar operation finalization returned no completion")?;
+        Ok(GpuReleaseCompletion::from_event_set(self.output.anchor().params().clone(), events))
     }
     pub fn output(&self) -> &Arc<GpuPreparedScalarBuffer> {
         &self.output
-    }
-    /// Record the execution-owner completion after a workspace generation is
-    /// superseded or the operation is dropped. This is an event query at a
-    /// lifecycle boundary, never a device wait.
-    pub fn record_releases(&self) -> Result<GpuReleaseCompletion, String> {
-        self.output.release_completion()
     }
     pub fn inputs(&self) -> impl Iterator<Item = &Arc<GpuPreparedScalarBuffer>> {
         std::iter::once(&self.left).chain(self.right.iter()).chain(self.candidates.iter())
@@ -183,6 +152,17 @@ impl GpuPreparedScalarOp {
 }
 impl Drop for GpuPreparedScalarOp {
     fn drop(&mut self) {
+        if !self.finalized.swap(true, Ordering::AcqRel) {
+            let mut events = std::ptr::null_mut();
+            if unsafe { gpu_matrix_finalize_scalar_op(self.raw.as_ptr(), &mut events) } == 0 {
+                if let Some(events) = NonNull::new(events) {
+                    drop(GpuReleaseCompletion::from_event_set(
+                        self.output.anchor().params().clone(),
+                        events,
+                    ));
+                }
+            }
+        }
         unsafe { gpu_matrix_destroy_scalar_op(self.raw.as_ptr()) }
     }
 }
@@ -290,16 +270,13 @@ impl Drop for GpuPreparedScalarMatrixSelect {
     }
 }
 
-/// Execution-local scalar backing independent of command variants writing it.
-/// Integer words use two's complement and grow at the explicit input boundary.
+/// Fixed-capacity scalar backing independent of command variants writing it.
+/// Integer width is established during warmup and cannot grow during replay.
 pub struct GpuPreparedScalarBuffer {
     pub(super) raw: NonNull<GpuPreparedScalarBufferOpaque>,
     layout: super::super::PreparedPlanLayout,
     anchor: Arc<GpuDCRTPolyMatrix>,
     host: Mutex<Option<PinnedHostBuffer<u64>>>,
-    retired_host: Mutex<Vec<PinnedHostBuffer<u64>>>,
-    dynamic_lease: Mutex<Option<Box<dyn GpuScalarCapacityLease>>>,
-    retired_leases: Mutex<Vec<Box<dyn GpuScalarCapacityLease>>>,
     count: usize,
     words: AtomicUsize,
     upload_pending: AtomicBool,
@@ -354,9 +331,6 @@ impl GpuPreparedScalarBuffer {
             layout,
             anchor,
             host: Mutex::new(Some(host)),
-            retired_host: Mutex::new(Vec::new()),
-            dynamic_lease: Mutex::new(None),
-            retired_leases: Mutex::new(Vec::new()),
             count,
             words: AtomicUsize::new(words),
             upload_pending: AtomicBool::new(false),
@@ -372,112 +346,8 @@ impl GpuPreparedScalarBuffer {
         &self.anchor
     }
 
-    /// Completion proof for the native scalar owner's preclaimed event. The
-    /// weak owner avoids a reference cycle with a lease retained by the
-    /// admission ledger; if the owner has already gone away, completion is
-    /// deliberately unprovable and the ledger keeps the charge quarantined.
-    pub fn release_completion(self: &Arc<Self>) -> Result<GpuReleaseCompletion, String> {
-        let owner = Arc::downgrade(self);
-        let parameters = self.anchor.params().clone();
-        Ok(GpuReleaseCompletion::from_probe(parameters, move || {
-            let owner = owner.upgrade().ok_or_else(|| {
-                "scalar completion owner was dropped before release proof".to_string()
-            })?;
-            let mut ready = 0;
-            let status = unsafe {
-                gpu_matrix_query_scalar_buffer_completion(owner.raw.as_ptr(), &mut ready)
-            };
-            if status != 0 {
-                return Err(last_error_string());
-            }
-            Ok(ready != 0)
-        }))
-    }
     pub fn allocation_layout(&self) -> &super::super::PreparedPlanLayout {
         &self.layout
-    }
-    /// Grow the invocation-local backing at the explicit input boundary.
-    /// Native scalar plans refer to this stable object and refresh their views
-    /// at submit, so replacing the device generation does not require graph
-    /// replay or plan reconstruction. The previous pinned owner is retained
-    /// until the completion boundary observes all queued copies.
-    pub fn ensure_capacity(
-        self: &Arc<Self>,
-        required_words: usize,
-        allocator: &mut dyn GpuScalarCapacityAllocator,
-    ) -> Result<(), String> {
-        if required_words == 0 {
-            return Err("scalar capacity must be nonzero".into());
-        }
-        let current = self.words();
-        if required_words <= current {
-            return Ok(());
-        }
-        let capacity = required_words
-            .checked_add(1)
-            .and_then(|words| self.count.checked_mul(words))
-            .ok_or("scalar capacity overflow")?;
-        let device_bytes = u64::try_from(capacity)
-            .ok()
-            .and_then(|words| words.checked_mul(u64::try_from(std::mem::size_of::<u64>()).ok()?))
-            .ok_or("scalar device capacity overflow")?;
-        let pinned_bytes = device_bytes;
-        // Reserve the complete new generation before either native or pinned
-        // allocation.  An allocator failure leaves the current generation
-        // untouched and therefore reusable.
-        let mut next_lease = allocator.reserve(
-            self.anchor.params(),
-            self.anchor.params().device_ids()[0],
-            device_bytes,
-            pinned_bytes,
-        )?;
-        let mut next_host = PinnedHostBuffer::zeroed(self.anchor.params(), capacity);
-        let mut host = self.host.lock().map_err(|_| "scalar staging poisoned")?;
-        if host.is_none() {
-            return Err("scalar staging quarantined".into());
-        }
-        let mut retired_host =
-            self.retired_host.lock().map_err(|_| "scalar retirement poisoned")?;
-        // Acquire the publication lock before committing the lease or calling
-        // native resize.  No fallible mutex operation may occur after native
-        // has been given the new host pointer; otherwise a poisoned lock can
-        // drop the only Rust owner while CUDA still references it.
-        let mut current_lease = self.dynamic_lease.lock().map_err(|_| "scalar lease poisoned")?;
-        retired_host.try_reserve(1).map_err(|_| "scalar retirement capacity exhausted")?;
-        let pointer = next_host.as_mut_slice().as_mut_ptr();
-        // Commit ownership before publishing the pointer to native code. If
-        // publication fails, the old generation remains authoritative and the
-        // committed lease is discarded without poisoning the ledger.
-        if let Err(error) = next_lease.commit() {
-            let _ = next_lease.cancel();
-            return Err(error);
-        }
-        if unsafe { gpu_matrix_resize_scalar_buffer(self.raw.as_ptr(), required_words, pointer) } !=
-            0
-        {
-            let _ = next_lease.cancel();
-            return Err(last_error_string());
-        }
-        let old = host.replace(next_host).expect("scalar staging checked before publish");
-        retired_host.push(old);
-        let old_lease = current_lease.take();
-        *current_lease = Some(next_lease);
-        if let Some(mut old_lease) = old_lease {
-            match self.release_completion() {
-                Ok(completion) => {
-                    if let Err(error) = old_lease.retire(completion) {
-                        let _ = old_lease.quarantine();
-                        return Err(error);
-                    }
-                }
-                Err(error) => {
-                    let _ = old_lease.quarantine();
-                    return Err(error);
-                }
-            }
-        }
-        self.words.store(required_words, Ordering::Release);
-        Ok(())
     }
 
     /// Root staging only; the caller exclusively owns the invocation instance.
@@ -510,7 +380,6 @@ impl GpuPreparedScalarBuffer {
             return Err(last_error_string());
         }
         self.upload_pending.store(false, Ordering::Release);
-        self.retired_host.lock().map_err(|_| "scalar retirement poisoned")?.clear();
         Ok(())
     }
     pub fn with_words<T>(&self, read: impl FnOnce(&[u64], usize) -> T) -> Result<T, String> {
@@ -533,23 +402,17 @@ impl GpuPreparedScalarBuffer {
         if status & 2 != 0 {
             return Err("prepared scalar selection index is outside its fixed candidates".into());
         }
-        self.retired_host.lock().map_err(|_| "scalar retirement poisoned")?.clear();
         Ok(read(&host[..self.count * capacity], capacity))
     }
 }
 impl Drop for GpuPreparedScalarBuffer {
     fn drop(&mut self) {
-        let dynamic_lease = self.dynamic_lease.get_mut().ok().and_then(Option::take);
-        let mut completion = None;
-        if dynamic_lease.is_some() {
-            let mut events = std::ptr::null_mut();
-            let status =
-                unsafe { gpu_matrix_finalize_scalar_buffer(self.raw.as_ptr(), &mut events) };
-            if status == 0 {
-                completion = NonNull::new(events).map(|events| {
-                    GpuReleaseCompletion::from_event_set(self.anchor.params().clone(), events)
-                });
-            }
+        let mut events = std::ptr::null_mut();
+        let status = unsafe { gpu_matrix_finalize_scalar_buffer(self.raw.as_ptr(), &mut events) };
+        if status == 0 {
+            let _ = NonNull::new(events).map(|events| {
+                GpuReleaseCompletion::from_event_set(self.anchor.params().clone(), events)
+            });
         }
         let mut pending = Vec::<*mut std::ffi::c_void>::new();
         if self.upload_pending.load(Ordering::Acquire) {
@@ -561,13 +424,6 @@ impl Drop for GpuPreparedScalarBuffer {
                 pending.push(host.into_raw().cast());
             }
         }
-        let retired = match self.retired_host.get_mut() {
-            Ok(retired) => retired,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for host in retired.drain(..) {
-            pending.push(host.into_raw().cast());
-        }
         if !pending.is_empty() {
             let _ = unsafe {
                 gpu_matrix_defer_scalar_buffer_pinned_free(
@@ -578,19 +434,6 @@ impl Drop for GpuPreparedScalarBuffer {
             };
         }
         unsafe { gpu_matrix_destroy_scalar_buffer(self.raw.as_ptr()) }
-        if let Ok(retired) = self.retired_leases.get_mut() {
-            for mut lease in retired.drain(..) {
-                let _ = lease.quarantine();
-            }
-        }
-        if let Some(mut lease) = dynamic_lease {
-            let retired = completion.is_some_and(|completion| lease.retire(completion).is_ok());
-            if !retired && lease.quarantine().is_err() {
-                if let Ok(retired) = self.retired_leases.get_mut() {
-                    retired.push(lease);
-                }
-            }
-        }
     }
 }
 
@@ -719,12 +562,14 @@ impl GpuPreparedScalarPack {
         values: &[(Arc<GpuPreparedScalarBuffer>, usize)],
         coefficient_bits: usize,
     ) -> Result<Arc<Self>, String> {
-        let layout = super::super::PreparedPlanLayout::scalar_pack(
+        let owner = output.prepared_owner_layout()?;
+        let layout = super::super::PreparedPlanLayout::scalar_pack_with_owner(
             output.params(),
             values.len(),
             coefficient_bits,
             output.level(),
             crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
+            &owner,
         )?;
         Self::bind_with_layout(output, values, coefficient_bits, layout)
     }
@@ -804,74 +649,6 @@ mod tests {
         },
     };
     use rand::Rng;
-
-    struct TestCapacityLease;
-    impl GpuScalarCapacityLease for TestCapacityLease {
-        fn commit(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-        fn cancel(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-        fn retire(&mut self, _completion: GpuReleaseCompletion) -> Result<(), String> {
-            Ok(())
-        }
-        fn quarantine(&mut self) -> Result<(), String> {
-            Ok(())
-        }
-    }
-    struct TestCapacityAllocator {
-        requests: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
-    }
-    impl GpuScalarCapacityAllocator for TestCapacityAllocator {
-        fn reserve(
-            &mut self,
-            _params: &GpuDCRTPolyParams,
-            _device: i32,
-            device_bytes: u64,
-            pinned_bytes: u64,
-        ) -> Result<Box<dyn GpuScalarCapacityLease>, String> {
-            self.requests.lock().unwrap().push((device_bytes, pinned_bytes));
-            Ok(Box::new(TestCapacityLease))
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_prepared_scalar_rewarm_wide_charge_stability() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(32);
-        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
-        let params = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 4, None);
-        let anchor = Arc::new(GpuDCRTPolyMatrix::new_zero(&params, 1, 1));
-        let buffer = GpuPreparedScalarBuffer::bind(Arc::clone(&anchor), 1, 1).unwrap();
-        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut allocator = TestCapacityAllocator { requests: std::sync::Arc::clone(&requests) };
-        buffer.ensure_capacity(8, &mut allocator).unwrap();
-        let expected_bytes = (8 + 1) * std::mem::size_of::<u64>();
-        assert_eq!(requests.lock().unwrap()[0], (expected_bytes as u64, expected_bytes as u64));
-        assert_eq!(buffer.words(), 8);
-        buffer.ensure_capacity(2, &mut allocator).unwrap();
-        assert_eq!(buffer.words(), 8);
-        buffer.ensure_capacity(16, &mut allocator).unwrap();
-        assert_eq!(buffer.words(), 16);
-        // A rewarm at the established wide high-water mark must not reserve a
-        // third generation or increase the admission charge.
-        buffer.ensure_capacity(16, &mut allocator).unwrap();
-        assert_eq!(requests.lock().unwrap().len(), 2);
-        let value = BigInt::from(1u8) << 900usize;
-        buffer
-            .upload(|words, width| {
-                assert_eq!(width, 16);
-                for (word, digit) in words.iter_mut().zip(value.magnitude().iter_u64_digits()) {
-                    *word = digit;
-                }
-                Ok(())
-            })
-            .unwrap();
-        buffer.wait().unwrap();
-    }
 
     #[test]
     #[serial_test::serial(gpu_context)]

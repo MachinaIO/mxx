@@ -24,7 +24,6 @@ mod gpu_scalar;
 pub use gpu_scalar::{
     GpuPreparedScalarBuffer, GpuPreparedScalarMatrixSelect, GpuPreparedScalarOp,
     GpuPreparedScalarOpcode, GpuPreparedScalarPack, GpuPreparedThreshold,
-    GpuScalarCapacityAllocator, GpuScalarCapacityLease,
 };
 
 use crate::poly::dcrt::gpu::{
@@ -2529,7 +2528,6 @@ impl PartialEq for GpuPreparedAccumulateLayout {
             self.intermediate_owners.iter().zip(&other.intermediate_owners).all(
                 |(left, right)| {
                     left.execution_owner_identity() == right.execution_owner_identity() &&
-                        left.stream_ordinal_base() == right.stream_ordinal_base() &&
                         left.execution_class() == right.execution_class() &&
                         left.partition_count() == right.partition_count()
                 },
@@ -3084,12 +3082,14 @@ impl GpuPreparedSmallRhs {
         rhs: Arc<GpuSmallMatrix>,
         residency_budget_bytes: usize,
     ) -> Result<Arc<Self>, String> {
-        let layout = super::PreparedPlanLayout::small_rhs(
+        let owner = output.prepared_owner_layout()?;
+        let layout = super::PreparedPlanLayout::small_rhs_with_owner(
             output.params(),
             output.level(),
             source_template.col_size(),
             output.col_size(),
             residency_budget_bytes,
+            &owner,
         )?;
         Self::bind_with_layout(output, source_template, rhs, residency_budget_bytes, &layout)
     }
@@ -3568,6 +3568,34 @@ mod tests {
     #[test]
     fn test_gpu_prepared_submission_failures_record_the_terminal_generation() {
         let source = include_str!("../../cuda/src/matrix/MatrixSerde.cu");
+        assert!(
+            source.contains("coefficient_index, coefficient_count, {}, 1, {}"),
+            "prepared readback must start with a nonzero generation so pre-submit polling is not ready"
+        );
+        assert!(
+            source.contains("limb.completion_resource->quarantine()"),
+            "uncertain completion-event recording must quarantine its prepared slot"
+        );
+        assert!(
+            source.contains("consumer_tracked_generation"),
+            "readback failure cleanup must track each affected limb's readonly consumer"
+        );
+        let readback_submit = cuda_function_body(source, "gpu_matrix_submit_const_coeff_readback");
+        assert!(
+            readback_submit
+                .contains("plan->submission_generation == std::numeric_limits<uint64_t>::max()"),
+            "prepared readback must reject generation exhaustion before increment"
+        );
+        let exhaustion_guard = readback_submit
+            .find("plan->submission_generation == std::numeric_limits<uint64_t>::max()")
+            .expect("generation exhaustion guard");
+        let output_clear = readback_submit
+            .find("std::fill_n(plan->words, total_words, static_cast<uint64_t>(0))")
+            .expect("prepared readback output clear");
+        assert!(
+            exhaustion_guard < output_clear,
+            "generation exhaustion must be rejected before mutating readback output"
+        );
         for query in ["gpu_matrix_query_const_coeff_readback", "gpu_matrix_query_rns_upload"] {
             let body = cuda_function_body(source, query);
             assert!(
@@ -3699,10 +3727,17 @@ mod tests {
         let ntt = include_str!("../../cuda/src/matrix/MatrixNTT.cu");
         let arithmetic = include_str!("../../cuda/src/matrix/MatrixArith.cu");
         for (source, name, marker) in [
-            (ntt, "gpu_matrix_query_ntt_layout", "\nextern \"C\" int gpu_matrix_prepare_ntt_plan"),
+            // The NTT file has a legacy prepare helper between the pure query
+            // and the exported prepare entry point; stop at that helper so
+            // this check covers only the query definition.
+            (ntt, "gpu_matrix_query_ntt_layout", "\nstatic int prepare_ntt_plan_legacy_impl"),
             (arithmetic, "gpu_matrix_query_arithmetic_layout", "\n    struct PreparedMatmulLaunch"),
         ] {
-            let start = source.find(name).unwrap();
+            // Match the native definition, not an earlier call site.  The
+            // NTT prepare path queries this pure layout helper before the
+            // definition; slicing from that call would incorrectly include
+            // the prepare function's stream handle in this source contract.
+            let start = source.find(&format!("extern \"C\" int {name}")).unwrap();
             let end = source[start..].find(marker).map(|offset| start + offset).unwrap();
             let body = &source[start..end];
             for forbidden in

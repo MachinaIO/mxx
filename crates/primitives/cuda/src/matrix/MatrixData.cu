@@ -1,6 +1,7 @@
 #include "gpu_admission.cuh"
 #include "gpu_prepared_plan.cuh"
 
+
 GpuMatrix::GpuMatrix(GpuContext *context, size_t row_count, size_t column_count,
                      int active_level, GpuPolyFormat active_format)
     : ctx(context), rows(row_count), cols(column_count), level(active_level),
@@ -17,6 +18,11 @@ GpuMatrix::GpuMatrix(GpuMatrix &owner, size_t row_count, size_t column_count,
       host_observed_writer_ready(owner.host_observed_writer_ready),
       prepared_view_owner(owner.prepared_view_owner ? owner.prepared_view_owner : &owner)
 {
+    prepared_owner_execution_identity = owner.prepared_owner_execution_identity;
+    prepared_owner_execution_class = owner.prepared_owner_execution_class;
+    prepared_owner_partition_count = owner.prepared_owner_partition_count;
+    for (size_t partition = 0; partition < prepared_owner_partition_count; ++partition)
+        prepared_owner_partitions[partition] = owner.prepared_owner_partitions[partition];
     const size_t count = rows * cols;
     for (auto &buffer : shared_limb_buffers)
         buffer.bytes_total = count * buffer.bytes_per_poly;
@@ -574,11 +580,19 @@ static int gpu_matrix_create_impl(
     mat->shared_limb_buffers.resize(partition_count);
     mat->shared_aux_buffers.resize(partition_count);
     mat->exec_limb_states.resize(partition_count);
+    mat->prepared_owner_execution_identity = ctx->execution->identity;
+    mat->prepared_owner_execution_class = static_cast<int>(plan.totals.execution_class);
+    mat->prepared_owner_partition_count = partition_count;
 
     const size_t n = static_cast<size_t>(ctx->N);
     for (auto &partition : plan.partitions)
     {
         const size_t partition_idx = partition.partition;
+        auto &owner_meta = mat->prepared_owner_partitions[partition_idx];
+        owner_meta.device = ctx->gpu_ids[partition_idx];
+        owner_meta.pool_size = partition_idx < ctx->execution->compute_streams_by_partition.size()
+            ? ctx->execution->compute_streams_by_partition[partition_idx].size() : 0;
+        owner_meta.local_limb_count = partition.local_limb_count;
         if (partition.local_limb_count == 0 || plan.count == 0)
         {
             continue;
@@ -661,13 +675,41 @@ static int gpu_matrix_create_impl(
                 state.write_done_valid = true;
             }
         }
-
         cudaStream_t alloc_stream = exec_states[0].stream;
         if (!alloc_stream)
         {
             destroy_matrix_contents(mat);
             delete mat;
             return set_error("missing allocation stream in gpu_matrix_create");
+        }
+
+        if (shared_stream)
+        {
+            size_t slot = 0;
+            if (gpu_prepared_stream_slot_of(ctx, partition_idx, exec_states[0].stream, &slot) != 0)
+            {
+                destroy_matrix_contents(mat);
+                delete mat;
+                return set_error("failed to record prepared owner shared stream slot");
+            }
+            owner_meta.shared_stream_slot = slot;
+            for (size_t limb = 0; limb < partition.local_limb_count; ++limb)
+                owner_meta.limb_stream_slots[limb] = slot;
+        }
+        else
+        {
+            for (size_t limb = 0; limb < partition.local_limb_count; ++limb)
+            {
+                size_t slot = 0;
+                if (gpu_prepared_stream_slot_of(ctx, partition_idx,
+                        exec_states[limb].stream, &slot) != 0)
+                {
+                    destroy_matrix_contents(mat);
+                    delete mat;
+                    return set_error("failed to record prepared owner limb stream slot");
+                }
+                owner_meta.limb_stream_slots[limb] = slot;
+            }
         }
 
         uint8_t *base = nullptr;

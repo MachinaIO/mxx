@@ -12,7 +12,7 @@ mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
 mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-primitives
-mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
+mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime, mxx-bench-estimator
 mxx-func-enc/io          -> interface-only crates with no dependencies
 ```
 
@@ -76,11 +76,20 @@ representation, device/context, and owner layout. Families and trapdoors also
 carry their fixed shape and construction metadata. These checks happen before
 slot acquisition and never replace a fixed owner with a mismatched value.
 
+`PreparedPlanLayout` is the sole native operation-layout descriptor. Prepared
+wrappers retain the descriptor produced during planning and pass it to native
+binds; dimensions, live handles, and convenience constructors do not form a
+second layout authority. Evaluation-domain `PolynomialValues` also follows a
+direct source-owner path, without implicit coefficient staging and inverse
+transforms.
+
 Preimage resources use fixed lanes. Fresh and Record sampling use submit-time
 freshness; Record stores the actual accepted native payload and Replay validates
 and uploads the recorded payload without resampling. Runtime scalar values use
-an arbitrary-precision `BigInt` capacity ledger. A value beyond the prepared
-capacity is an input error, not a request to replan geometry.
+arbitrary-precision `BigInt` values projected to fixed widths during warmup. Each
+execution claims an exact reusable slot and copies into preallocated scalar
+storage. Values exceeding a fixed projection are rejected explicitly; runtime
+execution never grows scalar storage or replans geometry.
 
 Prepared slots advance through acquire, submit, publish, and terminal-event
 retirement. Reader and writer events—not host handle drop—control reuse.
@@ -99,6 +108,14 @@ It reports aggregate device work, cumulative prepared-wave time, dependency
 latency, workspace observations, and separately owned dataflow/materialization
 costs. It never executes the application graph to discover a class and never
 uses a missing measurement as a guessed singleton.
+
+For GPU estimation, `GpuNodeMeasurementBackend` collects canonical operation
+classes while walking each validated graph, warms and executes each prepared
+representative once through `measure_collected`, and then estimates from the
+frozen table. The removed Diamond-specific direct primitive interpreter,
+pilot-calibration registry, and candidate-width fallback are not estimator
+paths; fleet grouping, memory observation, and capped water-filling remain
+active.
 
 ### `mxx-gadgets` and `mxx-bgg`
 

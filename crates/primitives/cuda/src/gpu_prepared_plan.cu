@@ -17,8 +17,13 @@
 #include <cstring>
 #include <limits>
 
+static int validate_owner_layout_for_shape(
+    const GpuContext *ctx, int level, size_t rows, size_t columns, int format,
+    const GpuPreparedOwnerLayout *layout);
+
 namespace
 {
+
     bool plan_checked_mul_size(size_t left, size_t right, size_t *out)
     {
         if (!out)
@@ -105,6 +110,60 @@ namespace
         std::memcpy(out->launches + out->launch_count, part->launches,
             part->launch_count * sizeof(part->launches[0]));
         out->launch_count += part->launch_count;
+        if (part->scratch_owner_layout.execution_owner_identity != 0)
+        {
+            if (out->scratch_owner_conflict != 0)
+            {
+                // Keep the explicit conflict marker sticky.
+            }
+            else if (out->scratch_owner_layout.execution_owner_identity != 0 &&
+                std::memcmp(&out->scratch_owner_layout, &part->scratch_owner_layout,
+                    sizeof(out->scratch_owner_layout)) != 0)
+            {
+                out->scratch_owner_layout = GpuPreparedOwnerLayout{};
+                out->scratch_owner_conflict = 1;
+            }
+            else
+                out->scratch_owner_layout = part->scratch_owner_layout;
+        }
+        return 0;
+    }
+
+    int append_plan_descriptor_without_completion_events(
+        GpuPreparedPlanDescriptor *out, const GpuPreparedPlanDescriptor *part)
+    {
+        if (!out || !part || out->allocation_count > GPU_PREPARED_PLAN_MAX_ALLOCATIONS -
+                part->allocation_count || out->launch_count > GPU_PREPARED_PLAN_MAX_STREAMS -
+                part->launch_count)
+            return set_error("prepared composite descriptor capacity exceeded");
+        for (size_t index = 0; index < part->allocation_count; ++index)
+        {
+            const auto &allocation = part->allocations[index];
+            if (allocation.kind == GPU_PREPARED_COMPLETION_EVENT)
+                continue;
+            if (out->allocation_count >= GPU_PREPARED_PLAN_MAX_ALLOCATIONS)
+                return set_error("prepared plan allocation layout is full");
+            out->allocations[out->allocation_count++] = allocation;
+        }
+        std::memcpy(out->launches + out->launch_count, part->launches,
+            part->launch_count * sizeof(part->launches[0]));
+        out->launch_count += part->launch_count;
+        if (part->scratch_owner_layout.execution_owner_identity != 0)
+        {
+            if (out->scratch_owner_conflict != 0)
+            {
+                // Keep the explicit conflict marker sticky.
+            }
+            else if (out->scratch_owner_layout.execution_owner_identity != 0 &&
+                std::memcmp(&out->scratch_owner_layout, &part->scratch_owner_layout,
+                    sizeof(out->scratch_owner_layout)) != 0)
+            {
+                out->scratch_owner_layout = GpuPreparedOwnerLayout{};
+                out->scratch_owner_conflict = 1;
+            }
+            else
+                out->scratch_owner_layout = part->scratch_owner_layout;
+        }
         return 0;
     }
 
@@ -113,6 +172,8 @@ namespace
         // Host-side allocations have no physical device placement.
         GpuPreparedResourceKey key{};
         key.execution_owner_identity = 0;
+        key.context_identity = 0;
+        key.instance = 0;
         key.partition = -1;
         key.device = -1;
         key.limb_x = 0;
@@ -129,6 +190,8 @@ namespace
             return set_error("prepared plan partition is outside the execution context");
         }
         out->execution_owner_identity = ctx->execution->identity;
+        out->context_identity = reinterpret_cast<uint64_t>(ctx);
+        out->instance = 0;
         out->partition = static_cast<int>(partition);
         out->device = ctx->gpu_ids[partition];
         out->limb_x = limb_x;
@@ -252,10 +315,8 @@ namespace
         }
         if (owner_layout)
         {
-            GpuPreparedOwnerLayout expected{};
-            if (gpu_prepared_owner_layout(ctx, level, rows, columns, format,
-                    owner_layout->stream_ordinal_base, &expected) != 0 ||
-                std::memcmp(&expected, owner_layout, sizeof(expected)) != 0)
+            if (validate_owner_layout_for_shape(
+                    ctx, level, rows, columns, format, owner_layout) != 0)
                 return set_error("prepared readback owner layout does not match matrix");
         }
         if (format != GPU_POLY_FORMAT_COEFF)
@@ -338,6 +399,39 @@ const GpuMatrix *gpu_prepared_base_owner(const GpuMatrix *matrix)
     return owner;
 }
 
+int gpu_matrix_prepared_owner_layout(
+    const GpuMatrix *matrix, GpuPreparedOwnerLayout *out)
+{
+    if (!matrix || !out || !matrix->ctx || !matrix->ctx->execution ||
+        matrix->prepared_owner_partition_count > GPU_PREPARED_OWNER_MAX_PARTITIONS)
+        return set_error("missing prepared matrix owner layout");
+    *out = GpuPreparedOwnerLayout{};
+    out->execution_owner_identity = matrix->prepared_owner_execution_identity;
+    out->execution_class = matrix->prepared_owner_execution_class;
+    out->partition_count = matrix->prepared_owner_partition_count;
+    if (out->partition_count != matrix->ctx->gpu_ids.size())
+        return set_error("prepared matrix owner layout partition count is invalid");
+    for (size_t partition = 0; partition < out->partition_count; ++partition)
+    {
+        const auto &source = matrix->prepared_owner_partitions[partition];
+        auto &destination = out->partitions[partition];
+        destination.device = source.device;
+        destination.pool_size = source.pool_size;
+        destination.local_limb_count = source.local_limb_count;
+        destination.shared_stream_slot = source.shared_stream_slot;
+        std::memcpy(destination.limb_stream_slots, source.limb_stream_slots,
+            sizeof(destination.limb_stream_slots));
+        if (source.pool_size == 0 || source.device != matrix->ctx->gpu_ids[partition] ||
+            source.local_limb_count > GPU_RUNTIME_MAX_LIMBS ||
+            source.shared_stream_slot >= source.pool_size)
+            return set_error("prepared matrix owner layout metadata is invalid");
+        for (size_t limb = 0; limb < source.local_limb_count; ++limb)
+            if (source.limb_stream_slots[limb] >= source.pool_size)
+                return set_error("prepared matrix owner limb slot is invalid");
+    }
+    return 0;
+}
+
 size_t gpu_prepared_stream_slot(size_t pool_size, size_t counter, size_t ordinal)
 {
     if (pool_size == 0)
@@ -349,7 +443,7 @@ size_t gpu_prepared_stream_slot(size_t pool_size, size_t counter, size_t ordinal
 
 int gpu_prepared_owner_layout(
     const GpuContext *ctx, int level, size_t rows, size_t columns, int format,
-    size_t stream_ordinal_base, GpuPreparedOwnerLayout *out)
+    GpuPreparedOwnerLayout *out)
 {
     if (!ctx || !ctx->execution || !out || level < -1 || level > ctx->level ||
         (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL) ||
@@ -362,7 +456,6 @@ int gpu_prepared_owner_layout(
         return set_error("prepared owner layout matrix size overflow");
     *out = GpuPreparedOwnerLayout{};
     out->execution_owner_identity = ctx->execution->identity;
-    out->stream_ordinal_base = stream_ordinal_base;
     out->partition_count = ctx->gpu_ids.size();
     // Keep this classification identical to MatrixData's allocation rule;
     // these numeric values are the public MatrixData enum values, while this
@@ -373,7 +466,7 @@ int gpu_prepared_owner_layout(
     const size_t active_limbs = level < 0 ? 0 : static_cast<size_t>(level + 1);
     if (active_limbs > GPU_RUNTIME_MAX_LIMBS || ctx->limb_gpu_ids.size() < active_limbs)
         return set_error("incomplete prepared owner layout limb metadata");
-    size_t cursor = stream_ordinal_base;
+    size_t cursor = 0;
     for (size_t partition = 0; partition < out->partition_count; ++partition)
     {
         auto &entry = out->partitions[partition];
@@ -415,18 +508,117 @@ int gpu_prepared_owner_layout_matches(
         layout->partition_count != ctx->gpu_ids.size() ||
         layout->partition_count > GPU_PREPARED_OWNER_MAX_PARTITIONS)
         return set_error("prepared owner layout does not belong to this execution owner");
+    if (layout->execution_class != GPU_MATRIX_EMPTY &&
+        layout->execution_class != GPU_MATRIX_SHARED_STREAM &&
+        layout->execution_class != GPU_MATRIX_PER_LIMB_STREAMS)
+        return set_error("prepared owner layout has an invalid execution class");
+    if (ctx->limb_gpu_ids.size() > GPU_RUNTIME_MAX_LIMBS)
+        return set_error("prepared owner layout context has too many limbs");
     for (size_t partition = 0; partition < layout->partition_count; ++partition)
     {
         const auto &entry = layout->partitions[partition];
         if (entry.device != ctx->gpu_ids[partition] ||
             partition >= ctx->execution->compute_streams_by_partition.size() ||
-            entry.pool_size != ctx->execution->compute_streams_by_partition[partition].size())
+            entry.pool_size != ctx->execution->compute_streams_by_partition[partition].size() ||
+            entry.pool_size == 0 ||
+            entry.local_limb_count > GPU_RUNTIME_MAX_LIMBS)
             return set_error("prepared owner layout stream pool mismatch");
+        size_t available_limbs = 0;
+        for (const dim3 limb_id : ctx->limb_gpu_ids)
+            if (limb_id.x == partition)
+                available_limbs = std::max(available_limbs, static_cast<size_t>(limb_id.y) + 1);
+        if (entry.local_limb_count > available_limbs)
+            return set_error("prepared owner layout local limb count exceeds context limbs");
+        if (layout->execution_class == GPU_MATRIX_EMPTY && entry.local_limb_count != 0)
+            return set_error("empty prepared owner layout has active limbs");
         for (size_t limb = 0; limb < entry.local_limb_count; ++limb)
             if (entry.limb_stream_slots[limb] >= entry.pool_size)
                 return set_error("prepared owner layout stream slot is outside its pool");
-        if (entry.shared_stream_slot >= entry.pool_size && entry.local_limb_count != 0)
+        if (layout->execution_class == GPU_MATRIX_SHARED_STREAM &&
+            entry.local_limb_count != 0 && entry.shared_stream_slot >= entry.pool_size)
             return set_error("prepared owner layout shared stream slot is outside its pool");
+        if (layout->execution_class == GPU_MATRIX_SHARED_STREAM)
+        {
+            for (size_t limb = 0; limb < entry.local_limb_count; ++limb)
+                if (entry.limb_stream_slots[limb] != entry.shared_stream_slot)
+                    return set_error("shared prepared owner layout has split limb streams");
+        }
+        else if (layout->execution_class == GPU_MATRIX_PER_LIMB_STREAMS &&
+                 entry.shared_stream_slot != 0)
+            return set_error("per-limb prepared owner layout has a shared stream slot");
+        else if (layout->execution_class == GPU_MATRIX_EMPTY &&
+                 entry.shared_stream_slot != 0)
+            return set_error("empty prepared owner layout has a stream slot");
+    }
+    for (size_t partition = layout->partition_count;
+         partition < GPU_PREPARED_OWNER_MAX_PARTITIONS; ++partition)
+    {
+        const auto &entry = layout->partitions[partition];
+        // Native value-initialization leaves unused device fields at zero.
+        if (entry.device != 0 || entry.pool_size != 0 || entry.local_limb_count != 0 ||
+            entry.shared_stream_slot != 0)
+            return set_error("prepared owner layout has nonzero trailing partition metadata");
+        for (size_t limb = 0; limb < GPU_RUNTIME_MAX_LIMBS; ++limb)
+            if (entry.limb_stream_slots[limb] != 0)
+                return set_error("prepared owner layout has trailing limb metadata");
+    }
+    return 0;
+}
+
+static int validate_owner_layout_for_shape(
+    const GpuContext *ctx, int level, size_t rows, size_t columns, int format,
+    const GpuPreparedOwnerLayout *layout)
+{
+    if (!ctx || !ctx->execution || !layout || level < -1 || level > ctx->level ||
+        (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL) ||
+        layout->execution_owner_identity != ctx->execution->identity ||
+        layout->partition_count != ctx->gpu_ids.size() ||
+        layout->partition_count > GPU_PREPARED_OWNER_MAX_PARTITIONS)
+        return set_error("prepared owner layout context or shape mismatch");
+    if (gpu_prepared_owner_layout_matches(ctx, layout) != 0)
+        return -1;
+    size_t count = 0;
+    if (!plan_checked_mul_size(rows, columns, &count))
+        return set_error("prepared owner layout matrix size overflow");
+    const int expected_class = count == 0 ? 0 :
+        (rows <= 4 && columns <= 4 ? GPU_MATRIX_SHARED_STREAM : GPU_MATRIX_PER_LIMB_STREAMS);
+    if (layout->execution_class != expected_class)
+        return set_error("prepared owner layout execution class mismatch");
+    const size_t active_limbs = level < 0 ? 0 : static_cast<size_t>(level + 1);
+    if (active_limbs > GPU_RUNTIME_MAX_LIMBS || ctx->limb_gpu_ids.size() < active_limbs)
+        return set_error("prepared owner layout active limb count mismatch");
+    for (size_t partition = 0; partition < layout->partition_count; ++partition)
+    {
+        const auto &entry = layout->partitions[partition];
+        if (entry.device != ctx->gpu_ids[partition] ||
+            partition >= ctx->execution->compute_streams_by_partition.size() ||
+            entry.pool_size != ctx->execution->compute_streams_by_partition[partition].size() ||
+            entry.pool_size == 0)
+            return set_error("prepared owner layout partition metadata mismatch");
+        size_t local_limbs = 0;
+        for (size_t limb = 0; limb < active_limbs; ++limb)
+            if (ctx->limb_gpu_ids[limb].x == partition)
+                local_limbs = std::max(local_limbs,
+                    static_cast<size_t>(ctx->limb_gpu_ids[limb].y) + 1);
+        if (entry.local_limb_count != local_limbs)
+            return set_error("prepared owner layout local limb count mismatch");
+        if (local_limbs != 0 && entry.shared_stream_slot >= entry.pool_size)
+            return set_error("prepared owner layout shared stream slot is invalid");
+        for (size_t limb = 0; limb < local_limbs; ++limb)
+            if (entry.limb_stream_slots[limb] >= entry.pool_size)
+                return set_error("prepared owner layout limb stream slot is invalid");
+        if (layout->execution_class == GPU_MATRIX_SHARED_STREAM)
+        {
+            for (size_t limb = 0; limb < local_limbs; ++limb)
+                if (entry.limb_stream_slots[limb] != entry.shared_stream_slot)
+                    return set_error("shared prepared owner layout has split limb streams");
+        }
+        else if (layout->execution_class == GPU_MATRIX_PER_LIMB_STREAMS &&
+                 entry.shared_stream_slot != 0)
+            return set_error("per-limb prepared owner layout has a shared stream slot");
+        else if (layout->execution_class == GPU_MATRIX_EMPTY &&
+                 (entry.local_limb_count != 0 || entry.shared_stream_slot != 0))
+            return set_error("empty prepared owner layout has active stream metadata");
     }
     return 0;
 }
@@ -479,9 +671,15 @@ int gpu_prepared_require_allocation(
     {
         return set_error("prepared plan allocation descriptor is exhausted");
     }
+    if ((key->partition < 0) != (key->device < 0))
+    {
+        return set_error("prepared allocation has a mixed host sentinel resource key");
+    }
     const auto &entry = descriptor->allocations[index];
     if (entry.kind != kind || entry.bytes != bytes || entry.alignment != alignment ||
         entry.key.execution_owner_identity != key->execution_owner_identity ||
+        entry.key.context_identity != key->context_identity ||
+        entry.key.instance != key->instance ||
         entry.key.partition != key->partition || entry.key.device != key->device ||
         entry.key.limb_x != key->limb_x || entry.key.limb_y != key->limb_y ||
         entry.key.role != key->role)
@@ -630,15 +828,6 @@ int gpu_prepared_ntt_launch_table(
     return 0;
 }
 
-int gpu_prepared_plan_const_coeff_readback(
-    const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
-    size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
-    GpuPreparedPlanDescriptor *out)
-{
-    return plan_readback(ctx, rows, columns, level, format, words_per_poly, coefficient_index,
-        coefficient_count, GPU_PREPARED_STAGE_READBACK, out);
-}
-
 int gpu_prepared_plan_const_coeff_readback_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
     size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
@@ -646,17 +835,6 @@ int gpu_prepared_plan_const_coeff_readback_with_owner(
 {
     return plan_readback(ctx, rows, columns, level, format, words_per_poly, coefficient_index,
         coefficient_count, GPU_PREPARED_STAGE_READBACK, out, owner_layout);
-}
-
-int gpu_prepared_plan_rns_reconstruction(
-    const GpuContext *ctx, size_t rows, size_t columns, int level,
-    size_t words_per_poly, size_t coefficient_index, size_t coefficient_count,
-    GpuPreparedPlanDescriptor *out)
-{
-    // Host CRT reconstruction reuses the readback resources of the same source
-    // and adds no native allocation of its own.
-    return plan_readback(ctx, rows, columns, level, GPU_POLY_FORMAT_COEFF, words_per_poly,
-        coefficient_index, coefficient_count, GPU_PREPARED_STAGE_RECONSTRUCTION, out);
 }
 
 int gpu_prepared_plan_rns_reconstruction_with_owner(
@@ -672,131 +850,38 @@ int gpu_prepared_plan_rns_reconstruction_with_owner(
         owner_layout);
 }
 
-int gpu_prepared_plan_rns_upload(
-    const GpuContext *ctx, size_t rows, size_t columns, int level, int target_format,
-    int transform_to_eval, size_t bytes_per_poly, GpuPreparedPlanDescriptor *out)
+int gpu_prepared_plan_borrowed_compact_store_with_owner(
+    const GpuContext *ctx, size_t rows, size_t columns, int level, int format,
+    const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out)
 {
-    const int begin_status = plan_begin(ctx, out);
-    if (begin_status != 0)
-    {
-        return begin_status;
-    }
-    if (level < 0 || target_format != GPU_POLY_FORMAT_COEFF)
-    {
-        return set_error("invalid prepared RNS upload plan format");
-    }
-    size_t polynomial_count = 0;
-    if (!plan_checked_mul_size(rows, columns, &polynomial_count) || polynomial_count == 0)
-    {
-        return set_error("invalid prepared RNS upload plan matrix size");
-    }
-    const size_t limb_count = static_cast<size_t>(level) + 1;
-    if (limb_count > GPU_RUNTIME_MAX_LIMBS || ctx->limb_gpu_ids.size() < limb_count)
-    {
-        return set_error("incomplete prepared RNS upload plan limb metadata");
-    }
-    size_t expected_words = 0;
-    size_t expected_bytes = 0;
-    size_t host_bytes = 0;
-    if (!plan_checked_mul_size(limb_count, static_cast<size_t>(ctx->N), &expected_words) ||
-        !plan_checked_mul_size(expected_words, sizeof(uint64_t), &expected_bytes) ||
-        bytes_per_poly < expected_bytes ||
-        !plan_checked_mul_size(polynomial_count, bytes_per_poly, &host_bytes))
-    {
-        return set_error("prepared RNS upload plan byte span is too small");
-    }
-    size_t staging_bytes = 0;
-    if (!plan_checked_mul_size(polynomial_count, static_cast<size_t>(ctx->N), &staging_bytes) ||
-        !plan_checked_mul_size(staging_bytes, sizeof(uint64_t), &staging_bytes))
-    {
-        return set_error("prepared RNS upload plan staging overflow");
-    }
-
+    const int status = plan_begin(ctx, out);
+    if (status != 0) return status;
+    if (!owner_layout || validate_owner_layout_for_shape(
+            ctx, level, rows, columns, format, owner_layout) != 0)
+        return set_error("prepared borrowed compact store owner layout is missing or invalid");
+    if (level < 0 || (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL))
+        return set_error("prepared borrowed compact store format is invalid");
+    // The native store is a no-op for an empty owner.  Keeping the descriptor
+    // empty is important: there is no stream or transfer workspace to reserve.
+    if (rows == 0 || columns == 0) return 0;
+    if (ctx->limb_gpu_ids.empty())
+        return set_error("prepared borrowed compact store has no active limb");
+    dim3 first_limb{};
+    if (plan_limb(ctx, level, 0, &first_limb) != 0) return -1;
+    GpuPreparedResourceKey key{};
+    if (device_key(ctx, first_limb.x, first_limb.x, first_limb.y,
+            GPU_PREPARED_STAGE_STORE, &key) != 0)
+        return -1;
+    GpuPreparedWorkspaceLayout transfer{};
+    if (gpu_matrix_query_compact_workspace(
+            const_cast<GpuContext *>(ctx), level, rows, columns, 1, 0, 0, &transfer) != 0)
+        return -1;
     PlanDescriptorWriter writer{out};
-    int status = writer.allocation(
-        host_key(GPU_PREPARED_STAGE_UPLOAD), GPU_PREPARED_PINNED_HOST, 0, 0, host_bytes,
-        alignof(uint64_t), -1, -1);
-    if (status != 0)
-    {
-        return status;
-    }
-    for (size_t limb = 0; limb < limb_count; ++limb)
-    {
-        dim3 limb_id{};
-        status = plan_limb(ctx, level, limb, &limb_id);
-        if (status != 0)
-        {
-            return status;
-        }
-        GpuPreparedResourceKey key{};
-        status = device_key(
-            ctx, limb_id.x, limb_id.x, limb_id.y, GPU_PREPARED_STAGE_UPLOAD, &key);
-        if (status != 0)
-        {
-            return status;
-        }
-        // Per-limb unpack staging plus its terminal completion event, in the
-        // order the preparation acquires them.
-        status = writer.allocation(
-            key, GPU_PREPARED_TRANSFER_WORKSPACE, 0, 0, staging_bytes, alignof(uint64_t), -1, -1);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = writer.allocation(key, GPU_PREPARED_COMPLETION_EVENT, 0, 0, 0, 1, -1, -1);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_UPLOAD, limb);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-    if (transform_to_eval)
-    {
-        // The optional evaluation transform submits on the first limb's stream
-        // and owns a host geometry table.
-        dim3 limb_id{};
-        status = plan_limb(ctx, level, 0, &limb_id);
-        if (status != 0)
-        {
-            return status;
-        }
-        GpuPreparedResourceKey key{};
-        status = device_key(
-            ctx, limb_id.x, limb_id.x, limb_id.y, GPU_PREPARED_STAGE_NTT, &key);
-        if (status != 0)
-        {
-            return status;
-        }
-        size_t launch_count = 0;
-        const int table_status = gpu_prepared_ntt_launch_table(
-            static_cast<uint32_t>(ctx->N), limb_count, polynomial_count, 1, nullptr, 0,
-            &launch_count);
-        if (table_status != 0)
-        {
-            return table_status;
-        }
-        size_t geometry_bytes = 0;
-        if (!plan_checked_mul_size(launch_count, sizeof(GpuPreparedNttLaunchLayout),
-                &geometry_bytes))
-        {
-            return set_error("prepared RNS upload transform geometry overflow");
-        }
-        status = writer.allocation(
-            key, GPU_PREPARED_PLAN_HOST_ONLY, 0, 0, geometry_bytes, alignof(void *), -1, -1);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_NTT, 0, nullptr);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
+    if (writer.allocation(key, GPU_PREPARED_SUBMISSION_STREAM, 0, 0, 0, 1, -1, -1) != 0 ||
+        writer.allocation(key, transfer.kind, 0, 0, transfer.bytes,
+                transfer.alignment, -1, -1) != 0 ||
+        writer.stream(key, GPU_PREPARED_STREAM_ADDED_SUBMISSION, 0) != 0)
+        return -1;
     return 0;
 }
 
@@ -810,10 +895,8 @@ int gpu_prepared_plan_rns_upload_with_owner(
     // is applied by the saved owner descriptor.
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    GpuPreparedOwnerLayout expected_owner{};
-    if (!owner_layout || gpu_prepared_owner_layout(ctx, level, rows, columns,
-            target_format, owner_layout->stream_ordinal_base, &expected_owner) != 0 ||
-        std::memcmp(&expected_owner, owner_layout, sizeof(expected_owner)) != 0)
+    if (!owner_layout || validate_owner_layout_for_shape(
+            ctx, level, rows, columns, target_format, owner_layout) != 0)
         return set_error("prepared upload owner layout does not match matrix");
     if (level < 0 || (target_format != GPU_POLY_FORMAT_COEFF &&
             target_format != GPU_POLY_FORMAT_EVAL))
@@ -836,7 +919,7 @@ int gpu_prepared_plan_rns_upload_with_owner(
         return set_error("prepared RNS upload plan staging overflow");
     PlanDescriptorWriter writer{out};
     int status = writer.allocation(host_key(GPU_PREPARED_STAGE_UPLOAD), GPU_PREPARED_PINNED_HOST,
-        0, 0, host_bytes, alignof(uint64_t), -1, -1);
+        0, 0, host_bytes, alignof(uint8_t), -1, -1);
     if (status != 0) return status;
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
@@ -900,10 +983,12 @@ int gpu_prepared_plan_compact_upload_with_owner(
 {
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    if (!owner_layout || gpu_prepared_owner_layout_matches(ctx, owner_layout) != 0 ||
+    if (!owner_layout ||
         (target_format != GPU_POLY_FORMAT_COEFF && target_format != GPU_POLY_FORMAT_EVAL) ||
         level < 0 || rows == 0 || columns == 0 || payload_capacity == 0)
         return set_error("invalid prepared compact replay upload layout");
+    if (validate_owner_layout_for_shape(ctx, level, rows, columns, target_format, owner_layout) != 0)
+        return set_error("invalid prepared compact replay upload owner layout");
     const size_t limbs = static_cast<size_t>(level) + 1;
     if (limbs > GPU_RUNTIME_MAX_LIMBS || ctx->limb_gpu_ids.size() < limbs)
         return set_error("incomplete prepared compact replay upload limbs");
@@ -985,12 +1070,11 @@ int gpu_prepared_plan_small_upload_with_owner(
 {
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    (void)rows;
-    (void)columns;
-    (void)level;
-    if (!owner_layout || gpu_prepared_owner_layout_matches(ctx, owner_layout) != 0 ||
-        payload_bytes == 0 || ctx->gpu_ids.empty() || ctx->limb_gpu_ids.empty())
+    if (!owner_layout || payload_bytes == 0 || ctx->gpu_ids.empty() || ctx->limb_gpu_ids.empty())
         return set_error("invalid prepared compact canonical replay upload layout");
+    if (validate_owner_layout_for_shape(ctx, level, rows, columns,
+            GPU_POLY_FORMAT_COEFF, owner_layout) != 0)
+        return set_error("invalid prepared compact canonical replay upload owner layout");
     dim3 limb_id{};
     GpuPreparedResourceKey key{};
     int status = gpu_prepared_limb_key(ctx, 0, 0, GPU_PREPARED_STAGE_UPLOAD, &limb_id, &key);
@@ -1004,93 +1088,6 @@ int gpu_prepared_plan_small_upload_with_owner(
     return plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_UPLOAD, 0);
 }
 
-int gpu_prepared_plan_ntt(
-    const GpuContext *ctx, size_t rows, size_t columns, int level,
-    const GpuMatrixRange *range, int forward, GpuPreparedPlanDescriptor *out)
-{
-    const int begin_status = plan_begin(ctx, out);
-    if (begin_status != 0)
-    {
-        return begin_status;
-    }
-    if (ctx->N < 2 ||
-        (static_cast<uint32_t>(ctx->N) & (static_cast<uint32_t>(ctx->N) - 1)) != 0)
-    {
-        return set_error("invalid prepared NTT plan ring dimension");
-    }
-    const size_t limb_count = static_cast<size_t>(level) + 1;
-    if (level < 0 || limb_count > GPU_RUNTIME_MAX_LIMBS ||
-        ctx->limb_gpu_ids.size() < limb_count)
-    {
-        return set_error("incomplete prepared NTT plan limb metadata");
-    }
-    const GpuMatrixRange selected =
-        range ? *range : GpuMatrixRange{0, rows, 0, columns};
-    if (selected.row_start > selected.row_end || selected.row_end > rows ||
-        selected.column_start > selected.column_end || selected.column_end > columns ||
-        selected.row_end - selected.row_start == 0 ||
-        selected.column_end - selected.column_start == 0)
-    {
-        return set_error("invalid prepared NTT plan range");
-    }
-    size_t poly_count = 0;
-    if (!plan_checked_mul_size(
-            selected.row_end - selected.row_start, selected.column_end - selected.column_start,
-            &poly_count))
-    {
-        return set_error("prepared NTT plan polynomial count overflow");
-    }
-    size_t launch_count = 0;
-    const int table_status = gpu_prepared_ntt_launch_table(
-        static_cast<uint32_t>(ctx->N), limb_count, poly_count, forward, nullptr, 0,
-        &launch_count);
-    if (table_status != 0)
-    {
-        return table_status;
-    }
-    size_t geometry_bytes = 0;
-    if (!plan_checked_mul_size(launch_count, sizeof(GpuPreparedNttLaunchLayout), &geometry_bytes))
-    {
-        return set_error("prepared NTT plan geometry overflow");
-    }
-    dim3 limb_id{};
-    const int limb_status = plan_limb(ctx, level, 0, &limb_id);
-    if (limb_status != 0)
-    {
-        return limb_status;
-    }
-    GpuPreparedResourceKey key{};
-    const int key_status = device_key(
-        ctx, limb_id.x, limb_id.x, limb_id.y, GPU_PREPARED_STAGE_NTT, &key);
-    if (key_status != 0)
-    {
-        return key_status;
-    }
-    PlanDescriptorWriter writer{out};
-    // The prepared transform owns a host geometry table and no device or
-    // pinned allocation; every launch runs on the first limb's stream.
-    int status = writer.allocation(
-        key, GPU_PREPARED_PLAN_HOST_ONLY, 0, 0, geometry_bytes, alignof(void *), -1, -1);
-    if (status != 0)
-    {
-        return status;
-    }
-    std::vector<GpuPreparedNttLaunchLayout> launches(launch_count);
-    size_t launch_table_count = 0;
-    status = gpu_prepared_ntt_launch_table(
-        static_cast<uint32_t>(ctx->N), limb_count, poly_count, forward,
-        launches.data(), launches.size(), &launch_table_count);
-    if (status != 0 || launch_table_count != launch_count)
-        return status != 0 ? status : set_error("prepared NTT launch table count drift");
-    for (const auto &launch : launches)
-    {
-        status = writer.launch(launch.kind, launch.grid, launch.len, launch.poly_offset,
-            launch.limb_count, launch.forward != 0);
-        if (status != 0) return status;
-    }
-    return plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_NTT, 0);
-}
-
 int gpu_prepared_plan_ntt_with_owner(
     const GpuContext *ctx, size_t rows, size_t columns, int level,
     const GpuMatrixRange *range, int forward, const GpuPreparedOwnerLayout *owner_layout,
@@ -1100,10 +1097,8 @@ int gpu_prepared_plan_ntt_with_owner(
     // substitute the explicit owner stream assignment.
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    GpuPreparedOwnerLayout expected_owner{};
-    if (!owner_layout || gpu_prepared_owner_layout(ctx, level, rows, columns,
-            GPU_POLY_FORMAT_EVAL, owner_layout->stream_ordinal_base, &expected_owner) != 0 ||
-        std::memcmp(&expected_owner, owner_layout, sizeof(expected_owner)) != 0)
+    if (!owner_layout || validate_owner_layout_for_shape(
+            ctx, level, rows, columns, GPU_POLY_FORMAT_EVAL, owner_layout) != 0)
         return set_error("prepared NTT owner layout does not match matrix");
     if (ctx->N < 2 || (static_cast<uint32_t>(ctx->N) & (static_cast<uint32_t>(ctx->N) - 1)) != 0)
         return set_error("invalid prepared NTT plan ring dimension");
@@ -1147,7 +1142,10 @@ int gpu_prepared_plan_ntt_with_owner(
             launch.limb_count, launch.forward != 0);
         if (status != 0) return status;
     }
-    return plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_NTT, 0, owner_layout);
+    status = plan_reused_stream(writer, ctx, limb_id, GPU_PREPARED_STAGE_NTT, 0, owner_layout);
+    if (status != 0) return status;
+    out->scratch_owner_layout = *owner_layout;
+    return 0;
 }
 
 int gpu_prepared_plan_sampling_with_owner(
@@ -1157,14 +1155,15 @@ int gpu_prepared_plan_sampling_with_owner(
 {
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    if (!owner_layout || gpu_prepared_owner_layout_matches(ctx, owner_layout) != 0)
-        return set_error("prepared sampling owner layout is missing or invalid");
     if (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL)
         return set_error("prepared sampling format is invalid");
     if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
         return set_error("prepared sampling distribution is invalid");
     if (level < 0 || static_cast<size_t>(level) >= GPU_RUNTIME_MAX_LIMBS)
         return set_error("prepared sampling level is invalid");
+    if (!owner_layout || validate_owner_layout_for_shape(
+            ctx, level, rows, columns, format, owner_layout) != 0)
+        return set_error("prepared sampling owner layout is missing or invalid");
     GpuPreparedSamplingLayout structural{};
     const int query_status = gpu_matrix_query_sampling_layout(
         static_cast<size_t>(ctx->N), static_cast<size_t>(level) + 1, rows, columns,
@@ -1242,6 +1241,7 @@ int gpu_prepared_plan_sampling_with_owner(
             if (status != 0) return status;
         }
     }
+    out->scratch_owner_layout = *owner_layout;
     return 0;
 }
 
@@ -1295,6 +1295,7 @@ int gpu_prepared_plan_arithmetic_with_owner(
             writer, ctx, limb_id, GPU_PREPARED_STAGE_ARITHMETIC, limb, owner_layout);
         if (stream_status != 0) return stream_status;
     }
+    out->scratch_owner_layout = *owner_layout;
     return 0;
 }
 
@@ -1311,16 +1312,19 @@ int gpu_prepared_plan_schedule(
         return set_error("invalid prepared schedule plan list");
     }
     PlanDescriptorWriter writer{out};
-    // Preserve each member's ordered resources and launch substages.  The
-    // schedule adds bridge completions, but must not erase the immutable
-    // operation descriptors that a native bind consumes.
+    // Preserve each member's ordered non-event resources and launch
+    // substages. Completion events belong to the merged schedule, not to the
+    // member descriptors: retaining every member event would create several
+    // events for one shared physical stream.
     for (size_t plan_index = 0; plan_index < count; ++plan_index)
     {
-        if (!plans[plan_index] || append_plan_descriptor(out, plans[plan_index]) != 0)
+        if (!plans[plan_index] || append_plan_descriptor_without_completion_events(
+                out, plans[plan_index]) != 0)
             return set_error("invalid prepared schedule member descriptor");
     }
-    // One completion event per distinct submitted stream, matching the schedule
-    // that joins exactly those streams.
+    // Save one canonical schedule stream per distinct physical stream. Role is
+    // deliberately normalized to SCHEDULE; owner/context/partition/device/
+    // limbs plus origin/pool slot define the physical stream identity.
     for (size_t plan_index = 0; plan_index < count; ++plan_index)
     {
         const auto *plan = plans[plan_index];
@@ -1331,19 +1335,23 @@ int gpu_prepared_plan_schedule(
         for (size_t index = 0; index < plan->stream_count; ++index)
         {
             const auto &entry = plan->streams[index];
+            GpuPreparedResourceKey key = entry.key;
+            key.role = GPU_PREPARED_STAGE_SCHEDULE;
             bool known = false;
             for (size_t previous = 0; previous < writer.descriptor->stream_count; ++previous)
             {
                 const auto &existing = writer.descriptor->streams[previous];
-                // A context-reused stream is one physical stream per pool
-                // slot; an added submission stream belongs to the one plan
-                // that owns it, so different plans never share it.
-                const bool same_stream = entry.origin != GPU_PREPARED_STREAM_ADDED_SUBMISSION &&
-                    existing.origin == GPU_PREPARED_STREAM_CONTEXT_REUSED &&
-                    existing.pool_slot == entry.pool_slot;
-            if (existing.key.execution_owner_identity == entry.key.execution_owner_identity &&
-                existing.key.device == entry.key.device &&
-                existing.key.partition == entry.key.partition && same_stream)
+                const bool same_stream = existing.key.execution_owner_identity ==
+                        key.execution_owner_identity &&
+                    existing.key.context_identity == key.context_identity &&
+                    existing.key.instance == key.instance &&
+                    existing.key.partition == key.partition &&
+                    existing.key.device == key.device &&
+                    existing.key.limb_x == key.limb_x &&
+                    existing.key.limb_y == key.limb_y &&
+                    existing.key.role == key.role &&
+                    existing.origin == entry.origin && existing.pool_slot == entry.pool_slot;
+                if (same_stream)
                 {
                     known = true;
                     break;
@@ -1353,8 +1361,6 @@ int gpu_prepared_plan_schedule(
             {
                 continue;
             }
-            GpuPreparedResourceKey key = entry.key;
-            key.role = GPU_PREPARED_STAGE_SCHEDULE;
             const int status = writer.stream(key, entry.origin, entry.pool_slot);
             if (status != 0)
             {
@@ -1420,7 +1426,7 @@ int gpu_prepared_plan_scalar_op(
         return set_error("scalar operation plan workspace overflow");
     return plan_scalar_stage(ctx, GPU_PREPARED_STAGE_SCALAR_OP, 0,
         (largest + 1) * 3 * 8 + candidate_count * sizeof(PreparedScalarView),
-        0, GPU_POLY_FORMAT_COEFF, 0, out);
+        0, GPU_POLY_FORMAT_COEFF, 1, out);
 }
 
 int gpu_prepared_plan_scalar_matrix_select(
@@ -1472,9 +1478,9 @@ int gpu_prepared_plan_threshold_with_owner(
     return plan_threshold_impl(ctx, count, plaintext_words, owner_layout, out);
 }
 
-int gpu_prepared_plan_scalar_pack(
+static int gpu_prepared_plan_scalar_pack_impl(
     const GpuContext *ctx, size_t count, size_t coefficient_bits, int level, int output_format,
-    GpuPreparedPlanDescriptor *out)
+    const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out)
 {
     size_t view_bytes = 0, expected_count = 0;
     if (!ctx || count == 0 || level < 0 || static_cast<size_t>(level) >= ctx->moduli.size() ||
@@ -1484,7 +1490,7 @@ int gpu_prepared_plan_scalar_pack(
             &expected_count) || count != expected_count)
         return set_error("invalid scalar pack plan count");
     const int status = plan_scalar_stage(ctx, GPU_PREPARED_STAGE_SCALAR_PACK, 0,
-        view_bytes, level, output_format, 1, out);
+        view_bytes, level, output_format, 1, out, owner_layout);
     if (status != 0 || output_format != GPU_POLY_FORMAT_EVAL) return status;
     dim3 limb{};
     if (plan_limb(ctx, level, 0, &limb) != 0) return -1;
@@ -1514,7 +1520,16 @@ int gpu_prepared_plan_scalar_pack(
         if (writer.launch(launch.kind, launch.grid, launch.len, launch.poly_offset,
                 launch.limb_count, launch.forward != 0) != 0)
             return -1;
-    return plan_reused_stream(writer, ctx, limb, GPU_PREPARED_STAGE_NTT, 0);
+    return plan_reused_stream(writer, ctx, limb, GPU_PREPARED_STAGE_NTT, 0, owner_layout);
+}
+
+int gpu_prepared_plan_scalar_pack_with_owner(
+    const GpuContext *ctx, size_t count, size_t coefficient_bits, int level, int output_format,
+    const GpuPreparedOwnerLayout *owner_layout, GpuPreparedPlanDescriptor *out)
+{
+    if (!owner_layout) return set_error("missing scalar pack owner layout");
+    return gpu_prepared_plan_scalar_pack_impl(ctx, count, coefficient_bits, level, output_format,
+        owner_layout, out);
 }
 
 static int gpu_prepared_plan_small_rhs_impl(
@@ -1596,14 +1611,6 @@ static int gpu_prepared_plan_small_rhs_impl(
     return 0;
 }
 
-int gpu_prepared_plan_small_rhs(
-    const GpuContext *ctx, int level, size_t inner, size_t columns,
-    size_t residency_budget_bytes, GpuPreparedPlanDescriptor *out)
-{
-    return gpu_prepared_plan_small_rhs_impl(
-        ctx, level, inner, columns, residency_budget_bytes, nullptr, out);
-}
-
 int gpu_prepared_plan_small_rhs_with_owner(
     const GpuContext *ctx, int level, size_t inner, size_t columns,
     size_t residency_budget_bytes, const GpuPreparedOwnerLayout *owner_layout,
@@ -1622,10 +1629,8 @@ static int plan_matrix_completion_stage(
 {
     const int begin_status = plan_begin(ctx, out);
     if (begin_status != 0) return begin_status;
-    GpuPreparedOwnerLayout expected_owner{};
-    if (!owner_layout || gpu_prepared_owner_layout(ctx, level, rows, columns, format,
-            owner_layout->stream_ordinal_base, &expected_owner) != 0 ||
-        std::memcmp(&expected_owner, owner_layout, sizeof(expected_owner)) != 0)
+    if (!owner_layout || validate_owner_layout_for_shape(
+            ctx, level, rows, columns, format, owner_layout) != 0)
         return set_error("prepared matrix stage owner layout is missing or invalid");
     if (stage_role < GPU_PREPARED_STAGE_UPLOAD || stage_role > GPU_PREPARED_STAGE_SAMPLING)
         return set_error("prepared matrix stage role is invalid");
@@ -1672,7 +1677,10 @@ static int plan_matrix_completion_stage(
                 static_cast<uint32_t>(ctx->N), 0, static_cast<size_t>(level + 1), false) != 0)
             return -1;
     }
-    return plan_reused_stream(writer, ctx, limb, stage_role, 0, owner_layout);
+    status = plan_reused_stream(writer, ctx, limb, stage_role, 0, owner_layout);
+    if (status != 0) return status;
+    out->scratch_owner_layout = *owner_layout;
+    return 0;
 }
 
 extern "C" int gpu_prepared_plan_input_copy_with_owner(
@@ -1740,15 +1748,22 @@ extern "C" int gpu_prepared_plan_centered_rebase_with_owner(
 extern "C" int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
     const GpuContext *ctx, size_t source_rows, size_t source_columns,
     size_t output_rows, int level, int source_format, int format, uint32_t base_bits, int small,
-    size_t dropped_moduli, const GpuPreparedOwnerLayout *owner_layout,
+    size_t dropped_moduli, const GpuPreparedOwnerLayout *output_owner_layout,
+    const GpuPreparedOwnerLayout *source_owner_layout,
     GpuPreparedPlanDescriptor *out)
 {
     if (!ctx || level < 0 || (source_format != GPU_POLY_FORMAT_COEFF &&
             source_format != GPU_POLY_FORMAT_EVAL) ||
         (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL) ||
+        !output_owner_layout || !source_owner_layout ||
         base_bits == 0 || base_bits >= (small ? 64U : 63U) ||
         (small && dropped_moduli != 0) || dropped_moduli > static_cast<size_t>(level))
         return set_error("prepared gadget decomposition structural contract is invalid");
+    if (validate_owner_layout_for_shape(ctx, level, output_rows, source_columns,
+            format, output_owner_layout) != 0 ||
+        validate_owner_layout_for_shape(ctx, level, source_rows, source_columns,
+            source_format, source_owner_layout) != 0)
+        return set_error("prepared gadget decomposition owner layout does not match its shape");
     GpuMatrixDecomposeWorkspaceBytes requirements{};
     int status = gpu_matrix_query_decompose_workspace_bytes(
         ctx, level, source_rows, source_columns, format, base_bits, small,
@@ -1757,8 +1772,8 @@ extern "C" int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
     if (requirements.output_rows != output_rows)
         return set_error("prepared gadget decomposition output shape differs");
     GpuPreparedPlanDescriptor primary{};
-    status = plan_matrix_completion_stage(ctx, source_rows, source_columns, level, format,
-        GPU_PREPARED_STAGE_TRANSFORM, owner_layout, &primary,
+    status = plan_matrix_completion_stage(ctx, output_rows, source_columns, level, format,
+        GPU_PREPARED_STAGE_TRANSFORM, output_owner_layout, &primary,
         requirements.correction.workspace_bytes, requirements.correction.alignment,
         GPU_PREPARED_BATCH_WORKSPACE, false, false);
     if (status != 0) return status;
@@ -1770,13 +1785,13 @@ extern "C" int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
         GpuPreparedPlanDescriptor inverse{};
         if (source_format == GPU_POLY_FORMAT_EVAL) {
             status = gpu_prepared_plan_ntt_with_owner(ctx, source_rows, source_columns, level,
-                nullptr, 0, owner_layout, &inverse);
+                nullptr, 0, source_owner_layout, &inverse);
             if (status != 0) return status;
         }
         GpuPreparedPlanDescriptor forward{};
         if (format == GPU_POLY_FORMAT_EVAL) {
             status = gpu_prepared_plan_ntt_with_owner(ctx, output_rows, source_columns, level,
-                nullptr, 1, owner_layout, &forward);
+                nullptr, 1, output_owner_layout, &forward);
             if (status != 0) return status;
         }
         *out = GpuPreparedPlanDescriptor{};
@@ -1797,6 +1812,12 @@ extern "C" int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
             append_plan_descriptor(out, &primary) != 0 ||
             (format == GPU_POLY_FORMAT_EVAL && append_plan_descriptor(out, &forward) != 0))
             return -1;
+        // The descriptor now has an explicit owner for its one physical
+        // coefficient scratch phase.  The inverse and forward substages may
+        // legitimately belong to different matrix stores; their differing
+        // stage owners are not a scratch-owner conflict.
+        out->scratch_owner_layout = *source_owner_layout;
+        out->scratch_owner_conflict = 0;
         return 0;
     }
     if (format == GPU_POLY_FORMAT_COEFF && dropped_moduli == 0)
@@ -1818,6 +1839,11 @@ extern "C" int gpu_prepared_plan_gadget_decompose_with_source_format_owner(
     if (append_plan_descriptor(out, &scratch) != 0 ||
         append_plan_descriptor(out, &primary) != 0)
         return -1;
+    // The descriptor now has an explicit owner for its one physical
+    // coefficient scratch phase.  The output correction stage can have a
+    // different owner without changing that scratch provenance.
+    out->scratch_owner_layout = *source_owner_layout;
+    out->scratch_owner_conflict = 0;
     return 0;
 }
 
@@ -1838,7 +1864,7 @@ extern "C" int gpu_prepared_plan_modulus_conversion_with_owner(
     GpuMatrixTransformWorkspaceBytes requirements{};
     const int status = gpu_matrix_query_crt_workspace_bytes(
         ctx, target_level, target_rows, target_columns, operation,
-        static_cast<size_t>(source_level) + 1, static_cast<size_t>(target_level) + 1,
+        static_cast<size_t>(source_level) + 1, 1,
         false, &requirements);
     if (status != 0) return status;
     (void)digit_size;
@@ -1865,7 +1891,7 @@ extern "C" int gpu_prepared_plan_rns_conversion_with_owner(
     GpuMatrixTransformWorkspaceBytes requirements{};
     const int status = gpu_matrix_query_crt_workspace_bytes(
         ctx, target_level, target_rows, target_columns, GPU_MATRIX_CRT_RNS_CONVERSION,
-        static_cast<size_t>(source_level) + 1, static_cast<size_t>(target_level) + 1,
+        static_cast<size_t>(source_level) + 1, 1,
         false, &requirements);
     if (status != 0) return status;
     (void)plaintext_modulus;

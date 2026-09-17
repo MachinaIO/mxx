@@ -65,10 +65,6 @@ extern "C"
 {
 #endif
 
-    int gpu_matrix_sample_gadget_batch(
-        GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
-        const gpu_chacha::GpuRngSeed *seeds, size_t count, uint32_t base_bits, double c);
-
     int gpu_matrix_gauss_samp_gq_arb_base(
         GpuMatrix *src,
         uint32_t base_bits,
@@ -99,11 +95,6 @@ extern "C"
 
     void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cache);
 
-    int gpu_matrix_sample_p1_batch(
-        GpuMatrix *const *outputs, const GpuMatrix *const *inputs,
-        const GpuP1CovarianceCache *const *caches, const gpu_chacha::GpuRngSeed *seeds,
-        size_t count);
-
     int gpu_matrix_sample_p1_full_cached(
         const GpuP1CovarianceCache *cache,
         const GpuMatrix *tp2,
@@ -128,13 +119,6 @@ extern "C"
         const GpuMatrix *r,
         const GpuMatrix *e,
         const GpuMatrix *z);
-
-    int gpu_matrix_preimage_assemble_batch(
-        GpuMatrix *const *outputs, const GpuMatrix *const *tops,
-        const GpuMatrix *const *bottoms, size_t count);
-    int gpu_matrix_apply_trapdoor_batch(
-        GpuMatrix *const *outputs, const GpuMatrix *const *rs,
-        const GpuMatrix *const *es, const GpuMatrix *const *zs, size_t count, bool correction);
 
 #ifdef __cplusplus
 }

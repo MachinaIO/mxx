@@ -227,7 +227,6 @@ pub struct GpuPreparedOwnerPartitionLayout {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuPreparedOwnerLayout {
     pub execution_owner_identity: u64,
-    pub stream_ordinal_base: usize,
     pub execution_class: c_int,
     pub partition_count: usize,
     pub partitions: [GpuPreparedOwnerPartitionLayout; 64],
@@ -434,6 +433,10 @@ unsafe extern "C" {
         out_ctx: *mut *mut GpuContextOpaque,
     ) -> c_int;
     fn gpu_context_destroy(ctx: *mut GpuContextOpaque);
+    pub(crate) fn gpu_matrix_prepared_owner_layout(
+        matrix: *const GpuMatrixOpaque,
+        out: *mut GpuPreparedOwnerLayout,
+    ) -> c_int;
     fn gpu_context_execution_identity(ctx: *const GpuContextOpaque) -> u64;
     fn gpu_context_observe_allocation_epoch(
         ctx: *const GpuContextOpaque,
@@ -448,6 +451,7 @@ unsafe extern "C" {
         evidence: *const GpuAllocationEpochEvidence,
         out_current: *mut c_int,
     ) -> c_int;
+    fn gpu_prepared_setup_begin(ctx: *mut GpuContextOpaque) -> c_int;
     fn gpu_context_get_N(ctx: *const GpuContextOpaque, out_n: *mut c_int) -> c_int;
     fn gpu_context_get_vram_budget_bytes(
         ctx: *const GpuContextOpaque,
@@ -691,15 +695,6 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_upload_scalar_buffer(
         buffer: *const GpuPreparedScalarBufferOpaque,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_resize_scalar_buffer(
-        buffer: *mut GpuPreparedScalarBufferOpaque,
-        words: usize,
-        host: *mut u64,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_query_scalar_buffer_completion(
-        buffer: *const GpuPreparedScalarBufferOpaque,
-        out_ready: *mut c_int,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_wait_scalar_buffer(
         buffer: *const GpuPreparedScalarBufferOpaque,
     ) -> c_int;
@@ -734,9 +729,9 @@ unsafe extern "C" {
         out: *mut *mut GpuPreparedScalarOpOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_submit_scalar_op(plan: *mut GpuPreparedScalarOpOpaque) -> c_int;
-    pub(crate) fn gpu_matrix_resize_scalar_op_workspace(
+    pub(crate) fn gpu_matrix_finalize_scalar_op(
         plan: *mut GpuPreparedScalarOpOpaque,
-        words: usize,
+        out_completion: *mut *mut GpuEventSetOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy_scalar_op(plan: *mut GpuPreparedScalarOpOpaque);
     pub(crate) fn gpu_matrix_scalar_matrix_select_workspace_bytes(count: usize) -> usize;
@@ -785,6 +780,14 @@ unsafe extern "C" {
     pub(crate) fn gpu_matrix_submit_scalar_pack(plan: *const GpuPreparedScalarPackOpaque) -> c_int;
     pub(crate) fn gpu_matrix_destroy_scalar_pack(plan: *mut GpuPreparedScalarPackOpaque);
     pub(crate) fn gpu_matrix_store_compact_bytes(
+        mat: *mut GpuMatrixOpaque,
+        payload_out: *mut u8,
+        payload_capacity: usize,
+        out_max_coeff_bits: *mut u16,
+        out_bytes_per_coeff: *mut u16,
+        out_payload_len: *mut usize,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_store_compact_bytes_borrowed(
         mat: *mut GpuMatrixOpaque,
         payload_out: *mut u8,
         payload_capacity: usize,
@@ -1246,14 +1249,6 @@ unsafe extern "C" {
         plan: *const GpuPreparedGadgetDecomposeOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy_gadget_decompose(plan: *mut GpuPreparedGadgetDecomposeOpaque);
-    pub(crate) fn gpu_matrix_sample_gadget_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        inputs: *const *const GpuMatrixOpaque,
-        seeds: *const GpuRngSeed,
-        count: usize,
-        base_bits: u32,
-        c: f64,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_gauss_samp_gq_arb_base(
         src: *mut GpuMatrixOpaque,
         base_bits: u32,
@@ -1272,13 +1267,6 @@ unsafe extern "C" {
         out_cache: *mut *mut GpuP1CovarianceCacheOpaque,
     ) -> c_int;
     pub(crate) fn gpu_matrix_destroy_p1_covariance_cache(cache: *mut GpuP1CovarianceCacheOpaque);
-    pub(crate) fn gpu_matrix_sample_p1_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        inputs: *const *const GpuMatrixOpaque,
-        caches: *const *const GpuP1CovarianceCacheOpaque,
-        seeds: *const GpuRngSeed,
-        count: usize,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_sample_p1_full_cached(
         cache: *const GpuP1CovarianceCacheOpaque,
         tp2: *const GpuMatrixOpaque,
@@ -1298,31 +1286,11 @@ unsafe extern "C" {
         p1: *const GpuMatrixOpaque,
         p2: *const GpuMatrixOpaque,
     ) -> c_int;
-    pub(crate) fn gpu_matrix_preimage_assemble_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        tops: *const *const GpuMatrixOpaque,
-        bottoms: *const *const GpuMatrixOpaque,
-        count: usize,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_apply_trapdoor_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        rs: *const *const GpuMatrixOpaque,
-        es: *const *const GpuMatrixOpaque,
-        zs: *const *const GpuMatrixOpaque,
-        count: usize,
-        correction: bool,
-    ) -> c_int;
     pub(crate) fn gpu_matrix_preimage_add_correction(
         out: *mut GpuMatrixOpaque,
         r: *const GpuMatrixOpaque,
         e: *const GpuMatrixOpaque,
         z: *const GpuMatrixOpaque,
-    ) -> c_int;
-    pub(crate) fn gpu_matrix_sample_gaussian_batch(
-        outputs: *const *mut GpuMatrixOpaque,
-        seeds: *const GpuRngSeed,
-        count: usize,
-        sigma: f64,
     ) -> c_int;
     pub(crate) fn gpu_matrix_sample_distribution(
         out: *mut GpuMatrixOpaque,
@@ -1446,14 +1414,6 @@ unsafe extern "C" {
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_prepare_preimage_hard_cutoff(
         mat: *mut GpuSmallMatrixOpaque,
-    ) -> c_int;
-    pub(crate) fn gpu_small_matrix_pack_preimage_batch(
-        destinations: *const *mut GpuSmallMatrixOpaque,
-        sources: *const *const GpuMatrixOpaque,
-        dst_rows: *const usize,
-        dst_columns: *const usize,
-        count: usize,
-        accepted: *mut i32,
     ) -> c_int;
     pub(crate) fn gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         dst: *mut GpuSmallMatrixOpaque,
@@ -1687,8 +1647,8 @@ pub const GPU_POLY_FORMAT_COEFF: c_int = 0;
 pub const GPU_POLY_FORMAT_EVAL: c_int = 1;
 pub const GPU_MATRIX_DIST_UNIFORM: c_int = 0;
 pub const GPU_MATRIX_DIST_GAUSS: c_int = 1;
-pub(crate) const GPU_MATRIX_DIST_BIT: c_int = 2;
-pub(crate) const GPU_MATRIX_DIST_TERNARY: c_int = 3;
+pub const GPU_MATRIX_DIST_BIT: c_int = 2;
+pub const GPU_MATRIX_DIST_TERNARY: c_int = 3;
 
 pub(crate) fn last_error_string() -> String {
     unsafe {
@@ -1957,16 +1917,22 @@ pub fn detected_gpu_device_ids() -> Vec<i32> {
     available_gpu_ids()
 }
 
-fn pinned_alloc<T>(params: &GpuDCRTPolyParams, len: usize) -> NonNull<T> {
+fn try_pinned_alloc<T>(params: &GpuDCRTPolyParams, len: usize) -> Result<NonNull<T>, String> {
     if len == 0 {
-        return NonNull::dangling();
+        return Ok(NonNull::dangling());
     }
-    let bytes = len.checked_mul(mem::size_of::<T>()).expect("pinned buffer size overflow");
+    let bytes = len
+        .checked_mul(mem::size_of::<T>())
+        .ok_or_else(|| "pinned buffer size overflow".to_owned())?;
     let ptr = unsafe { gpu_pinned_alloc(params.ctx_raw(), bytes, mem::align_of::<T>()) } as *mut T;
     if ptr.is_null() {
-        panic!("gpu_pinned_alloc failed: {}", last_error_string());
+        return Err(format!("gpu_pinned_alloc failed: {}", last_error_string()));
     }
-    NonNull::new(ptr).expect("gpu_pinned_alloc returned null")
+    NonNull::new(ptr).ok_or_else(|| "gpu_pinned_alloc returned null".into())
+}
+
+fn pinned_alloc<T>(params: &GpuDCRTPolyParams, len: usize) -> NonNull<T> {
+    try_pinned_alloc(params, len).unwrap_or_else(|error| panic!("{error}"))
 }
 
 pub struct PinnedHostBuffer<T> {
@@ -2010,13 +1976,17 @@ impl<T> PinnedHostBuffer<T> {
 }
 
 impl<T: Copy + Send + Sync> PinnedHostBuffer<T> {
-    pub(crate) fn zeroed(params: &GpuDCRTPolyParams, len: usize) -> Self {
+    pub(crate) fn try_zeroed(params: &GpuDCRTPolyParams, len: usize) -> Result<Self, String> {
         if len == 0 {
-            return Self::new(params);
+            return Ok(Self::new(params));
         }
-        let ptr = pinned_alloc::<T>(params, len);
+        let ptr = try_pinned_alloc::<T>(params, len)?;
         unsafe { ptr::write_bytes(ptr.as_ptr(), 0, len) };
-        Self { params: params.clone(), ptr, len, cap: len }
+        Ok(Self { params: params.clone(), ptr, len, cap: len })
+    }
+
+    pub(crate) fn zeroed(params: &GpuDCRTPolyParams, len: usize) -> Self {
+        Self::try_zeroed(params, len).unwrap_or_else(|error| panic!("{error}"))
     }
 
     pub(crate) fn resize_for_overwrite(&mut self, len: usize) {
@@ -2409,6 +2379,14 @@ impl Drop for GpuDeviceTiming {
 }
 
 impl GpuDCRTPolyParams {
+    /// Seal the audited native allocation surface before first-generation
+    /// prepared backing is provisioned. Standalone contexts remain
+    /// uncertifiable until their complete inventory is finished.
+    pub fn begin_prepared_setup(&self) -> Result<(), String> {
+        let status = unsafe { gpu_prepared_setup_begin(self.ctx_raw()) };
+        if status == 0 { Ok(()) } else { Err(last_error_string()) }
+    }
+
     /// Observe an allocation epoch at an explicit dispatcher boundary.
     ///
     /// `external_pool_exclusive` asserts that unrelated, uninstrumented CUDA

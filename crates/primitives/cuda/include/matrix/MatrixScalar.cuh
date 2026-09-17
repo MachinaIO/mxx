@@ -17,8 +17,6 @@ int gpu_matrix_prepare_scalar_buffer(const GpuMatrix *anchor, size_t count, size
 int gpu_matrix_validate_scalar_buffer(const GpuMatrix *anchor, size_t count, size_t words,
     const GpuPreparedPlanDescriptor *plan);
 int gpu_matrix_upload_scalar_buffer(const GpuPreparedScalarBuffer *buffer);
-int gpu_matrix_resize_scalar_buffer(GpuPreparedScalarBuffer *buffer, size_t words, uint64_t *host);
-int gpu_matrix_query_scalar_buffer_completion(const GpuPreparedScalarBuffer *buffer, int *out_ready);
 int gpu_matrix_wait_scalar_buffer(const GpuPreparedScalarBuffer *buffer);
 int gpu_matrix_finalize_scalar_buffer(GpuPreparedScalarBuffer *buffer, GpuEventSet **out_completion);
 int gpu_matrix_defer_scalar_buffer_pinned_free(
@@ -30,7 +28,7 @@ int gpu_matrix_prepare_scalar_op(int opcode, GpuPreparedScalarRef left, GpuPrepa
     GpuPreparedScalarRef output, size_t bit, const GpuPreparedScalarRef *candidates, size_t candidate_count,
     const GpuPreparedPlanDescriptor *plan, GpuPreparedScalarOp **out);
 int gpu_matrix_submit_scalar_op(GpuPreparedScalarOp *plan);
-int gpu_matrix_resize_scalar_op_workspace(GpuPreparedScalarOp *plan, size_t words);
+int gpu_matrix_finalize_scalar_op(GpuPreparedScalarOp *plan, GpuEventSet **out_completion);
 void gpu_matrix_destroy_scalar_op(GpuPreparedScalarOp *plan);
 size_t gpu_matrix_scalar_matrix_select_workspace_bytes(size_t count);
 int gpu_matrix_prepare_scalar_matrix_select(GpuMatrix *output, GpuPreparedScalarRef selector,

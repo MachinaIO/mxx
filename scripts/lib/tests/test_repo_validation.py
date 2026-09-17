@@ -1,23 +1,52 @@
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from repo_validation import (
     DEFAULT_GPU_REPEAT_COUNT,
+    compile_gpu_test_binaries,
     edited_paths_from_git,
     gpu_repeat_validation_trigger_paths,
     gpu_single_run_validation_trigger_paths,
+    main,
     maybe_run_gpu_repeat_validation,
     parse_cargo_test_executables,
     run_gpu_repeat_suite,
+    run_gpu_binary,
 )
 
 
 class RepoValidationTests(unittest.TestCase):
+    def test_default_gpu_repeat_count_matches_sync_validation_policy(self) -> None:
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("repo_validation.maybe_run_gpu_repeat_validation", return_value=0) as validate,
+        ):
+            self.assertEqual(main(["maybe-run-gpu-repeat"]), 0)
+
+        validate.assert_called_once_with(Path.cwd(), DEFAULT_GPU_REPEAT_COUNT, ANY)
+        self.assertEqual(DEFAULT_GPU_REPEAT_COUNT, 300)
+
+    def test_gpu_repeat_count_environment_and_cli_overrides_are_preserved(self) -> None:
+        with (
+            patch.dict(os.environ, {"GPU_REPEAT_COUNT": "17"}, clear=True),
+            patch("repo_validation.maybe_run_gpu_repeat_validation", return_value=0) as validate,
+        ):
+            self.assertEqual(main(["maybe-run-gpu-repeat"]), 0)
+        validate.assert_called_once_with(Path.cwd(), 17, ANY)
+
+        with (
+            patch.dict(os.environ, {"GPU_REPEAT_COUNT": "17"}, clear=True),
+            patch("repo_validation.maybe_run_gpu_repeat_validation", return_value=0) as validate,
+        ):
+            self.assertEqual(main(["maybe-run-gpu-repeat", "--repeat-count", "5"]), 0)
+        validate.assert_called_once_with(Path.cwd(), 5, ANY)
+
     def test_gpu_validation_trigger_paths_split_repeat_and_single_run_modes(self) -> None:
         paths = [
             "crates/primitives/cuda/src/kernel.cu",
@@ -52,6 +81,51 @@ class RepoValidationTests(unittest.TestCase):
         self.assertEqual(
             parse_cargo_test_executables(stdout_text),
             [Path("/tmp/bin-a"), Path("/tmp/bin-b")],
+        )
+
+    def test_compile_gpu_test_binaries_builds_all_gpu_library_unit_tests(self) -> None:
+        command: tuple[str, ...] | None = None
+        stdout = '{"reason":"compiler-artifact","target":{"test":true},"executable":"/tmp/gpu-tests"}\n'
+
+        def runner(*args, **kwargs) -> subprocess.CompletedProcess[str]:
+            nonlocal command
+            command = args[0]
+            return subprocess.CompletedProcess(args=command, returncode=0, stdout=stdout, stderr="")
+
+        self.assertEqual(
+            compile_gpu_test_binaries(Path("/tmp/repo"), {"RUST_LOG": "debug"}, runner=runner),
+            [Path("/tmp/gpu-tests")],
+        )
+        self.assertEqual(
+            command,
+            (
+                "cargo",
+                "test",
+                "-r",
+                "--workspace",
+                "--lib",
+                "--features",
+                "gpu",
+                "--no-run",
+                "--no-fail-fast",
+                "--message-format=json",
+            ),
+        )
+
+    def test_run_gpu_binary_runs_complete_binary_without_a_name_filter(self) -> None:
+        binary = Path("/tmp/gpu-tests")
+        env = {"RUST_LOG": "debug"}
+        with patch(
+            "repo_validation.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=(str(binary),), returncode=0),
+        ) as run:
+            self.assertEqual(run_gpu_binary(binary, Path("/tmp/repo"), env), 0)
+
+        run.assert_called_once_with(
+            (str(binary),),
+            cwd=Path("/tmp/repo"),
+            env=env,
+            check=False,
         )
 
     def test_run_gpu_repeat_suite_counts_failed_iterations_and_keeps_running(self) -> None:

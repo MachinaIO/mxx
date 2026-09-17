@@ -1,7 +1,7 @@
 #![cfg(feature = "gpu")]
 
 use keccak_asm::Keccak256;
-use mxx_bench_estimator::harness::MeasurementHarnessConfig;
+use mxx_bench_estimator::{gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig};
 use mxx_gadgets::circuit::{
     BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
 };
@@ -16,10 +16,10 @@ use mxx_primitives::{
         trapdoor::GpuDCRTPolyTrapdoorSampler,
     },
 };
-use mxx_runtime::{ExecutionConfig, artifact::MemoryArtifactStore};
-use mxx_we::diamond::{
-    DiamondGpuMeasurementBackend, DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost,
+use mxx_runtime::{
+    ExecutionConfig, artifact::MemoryArtifactStore, backend::poly_gpu::gpu_backend_on,
 };
+use mxx_we::diamond::{DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost};
 use std::{env, num::NonZeroUsize, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -110,15 +110,22 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
     let measured_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS", 1);
     assert!(measured_iterations > 0, "MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS must be positive");
     let estimate_started = Instant::now();
-    let mut measurement_backend = DiamondGpuMeasurementBackend::new(
-        gpu_parameters.clone(),
-        &device_ids,
+    let mut measurement_backend = GpuNodeMeasurementBackend::new(
+        device_ids
+            .iter()
+            .copied()
+            .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
+            .collect(),
         MeasurementHarnessConfig {
             warm_up_iterations,
             measured_iterations,
             ..MeasurementHarnessConfig::default()
         },
     );
+    // First traverse both validated Diamond graphs to collect unique representative shapes.
+    estimate_diamond_cost(&selected.compiler, &mut measurement_backend)
+        .expect("GPU Diamond WE graph measurement collection");
+    measurement_backend.measure_collected().expect("GPU Diamond WE representative measurements");
     let estimate = estimate_diamond_cost(&selected.compiler, &mut measurement_backend)
         .expect("GPU Diamond WE graph cost estimation");
     info!(

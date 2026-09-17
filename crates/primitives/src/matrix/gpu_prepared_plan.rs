@@ -34,7 +34,6 @@ impl std::fmt::Debug for PreparedOwnerLayout {
         formatter
             .debug_struct("PreparedOwnerLayout")
             .field("execution_owner_identity", &self.native.execution_owner_identity)
-            .field("stream_ordinal_base", &self.native.stream_ordinal_base)
             .field("execution_class", &self.native.execution_class)
             .field("partition_count", &self.native.partition_count)
             .finish()
@@ -42,17 +41,19 @@ impl std::fmt::Debug for PreparedOwnerLayout {
 }
 
 impl PreparedOwnerLayout {
+    pub(crate) fn from_native(native: NativeOwnerLayout) -> Self {
+        Self { native }
+    }
+
     pub fn plan(
         params: &GpuDCRTPolyParams,
         rows: usize,
         columns: usize,
         level: usize,
         format: i32,
-        stream_ordinal_base: usize,
     ) -> Result<Self, String> {
         let mut native = NativeOwnerLayout {
             execution_owner_identity: 0,
-            stream_ordinal_base,
             execution_class: 0,
             partition_count: 0,
             partitions: [GpuPreparedOwnerPartitionLayout {
@@ -70,7 +71,6 @@ impl PreparedOwnerLayout {
                 rows,
                 columns,
                 format,
-                stream_ordinal_base,
                 &mut native,
             )
         };
@@ -82,9 +82,6 @@ impl PreparedOwnerLayout {
 
     pub fn execution_owner_identity(&self) -> u64 {
         self.native.execution_owner_identity
-    }
-    pub fn stream_ordinal_base(&self) -> usize {
-        self.native.stream_ordinal_base
     }
     pub fn execution_class(&self) -> i32 {
         self.native.execution_class
@@ -104,40 +101,36 @@ impl PreparedOwnerLayout {
             })
             .sum()
     }
+
+    /// Return the exact compute-stream pool slot for one physical owner limb.
+    /// Workspace-only claims carry this placement explicitly instead of
+    /// deriving it from a matrix anchor or a mutable stream cursor.
+    pub fn stream_slot(&self, partition: usize, limb: usize) -> Option<usize> {
+        let partition_layout = self.native.partitions.get(partition)?;
+        if limb >= partition_layout.local_limb_count {
+            return None;
+        }
+        Some(if self.native.execution_class == 1 {
+            partition_layout.shared_stream_slot
+        } else {
+            partition_layout.limb_stream_slots[limb]
+        })
+    }
+    /// Check the physical partition/limb component of a native resource key
+    /// against this exact owner layout. Host keys are intentionally excluded.
+    pub fn contains_resource_key(&self, key: &PreparedResourceKey) -> bool {
+        if key.partition < 0 || key.device < 0 {
+            return false;
+        }
+        let partition = key.partition as usize;
+        partition < self.native.partition_count &&
+            key.limb_x == partition as u32 &&
+            usize::try_from(key.limb_y)
+                .is_ok_and(|limb| limb < self.native.partitions[partition].local_limb_count) &&
+            key.device == self.native.partitions[partition].device
+    }
     pub(crate) fn native_ptr(&self) -> *const NativeOwnerLayout {
         &self.native
-    }
-}
-
-/// Preparation-owned cursor. It is local to one execution owner and is the
-/// only source of stream ordinals for prepared owner planning.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct PreparedOwnerLayoutCursor {
-    next_stream_ordinal: usize,
-}
-
-impl PreparedOwnerLayoutCursor {
-    pub fn plan(
-        &mut self,
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        columns: usize,
-        level: usize,
-        format: i32,
-    ) -> Result<PreparedOwnerLayout, String> {
-        let layout = PreparedOwnerLayout::plan(
-            params,
-            rows,
-            columns,
-            level,
-            format,
-            self.next_stream_ordinal,
-        )?;
-        self.next_stream_ordinal = self
-            .next_stream_ordinal
-            .checked_add(layout.stream_count())
-            .ok_or_else(|| "prepared owner stream cursor overflow".to_owned())?;
-        Ok(layout)
     }
 }
 
@@ -160,6 +153,7 @@ pub enum PreparedStageRole {
     ScalarMatrixSelect = 12,
     Threshold = 13,
     ScalarPack = 14,
+    Store = 15,
 }
 
 impl PreparedStageRole {
@@ -250,6 +244,11 @@ impl PreparedAllocationKind {
 pub struct PreparedResourceKey {
     /// Distinguishes execution owners that happen to use the same device.
     pub execution_owner_identity: u64,
+    /// Exact CRT context identity selected for this resource.
+    pub context_identity: u64,
+    /// Prepared execution instance. Native descriptors are shared and use
+    /// zero; provisioning stamps the instance on each immutable claim copy.
+    pub instance: u64,
     /// Execution context partition, or -1 for host-side resources.
     pub partition: i32,
     /// Physical CUDA device ordinal, or -1 for host-side resources.
@@ -332,7 +331,9 @@ pub const PREPARED_PLAN_MAX_ALLOCATIONS: usize = 256;
 pub const PREPARED_PLAN_MAX_STREAMS: usize = 512;
 
 /// Native descriptor layout, mirrored exactly. Instances are allocated as an
-/// aligned byte buffer instead of a stack value.
+/// aligned byte buffer instead of a stack value. The native descriptor is the
+/// only authority for allocation, stream, and launch metadata; Rust borrows
+/// bounded slices from it instead of maintaining shadow arrays.
 #[repr(C)]
 pub(crate) struct GpuPreparedPlanDescriptor {
     allocation_count: usize,
@@ -341,6 +342,8 @@ pub(crate) struct GpuPreparedPlanDescriptor {
     streams: [PreparedStreamFootprint; PREPARED_PLAN_MAX_STREAMS],
     launch_count: usize,
     launches: [PreparedLaunchLayout; PREPARED_PLAN_MAX_STREAMS],
+    scratch_owner_layout: NativeOwnerLayout,
+    scratch_owner_conflict: i32,
 }
 
 const DESCRIPTOR_WORDS: usize =
@@ -364,57 +367,50 @@ impl DescriptorBuffer {
     fn as_ptr(&self) -> *const GpuPreparedPlanDescriptor {
         self.words.as_ptr().cast()
     }
+}
 
-    /// Copy out the entries the native planner filled.
-    fn read(
-        &self,
-    ) -> (
-        Box<[PreparedAllocationLayout]>,
-        Box<[PreparedStreamFootprint]>,
-        Box<[PreparedLaunchLayout]>,
-    ) {
-        // The buffer is zero initialized and native writes all counts before
-        // publishing any entry, so an unplanned descriptor stays empty.
-        let descriptor = unsafe { &*self.as_ptr() };
-        let allocations = descriptor.allocations
-            [..descriptor.allocation_count.min(PREPARED_PLAN_MAX_ALLOCATIONS)]
-            .to_vec()
-            .into_boxed_slice();
-        let streams = descriptor.streams[..descriptor.stream_count.min(PREPARED_PLAN_MAX_STREAMS)]
-            .to_vec()
-            .into_boxed_slice();
-        let launches = descriptor.launches
-            [..descriptor.launch_count.min(PREPARED_PLAN_MAX_STREAMS)]
-            .to_vec()
-            .into_boxed_slice();
-        (allocations, streams, launches)
+impl GpuPreparedPlanDescriptor {
+    fn allocations(&self) -> &[PreparedAllocationLayout] {
+        &self.allocations[..self.allocation_count.min(PREPARED_PLAN_MAX_ALLOCATIONS)]
+    }
+
+    fn streams(&self) -> &[PreparedStreamFootprint] {
+        &self.streams[..self.stream_count.min(PREPARED_PLAN_MAX_STREAMS)]
+    }
+
+    fn launches(&self) -> &[PreparedLaunchLayout] {
+        &self.launches[..self.launch_count.min(PREPARED_PLAN_MAX_STREAMS)]
     }
 }
 
 /// Exact allocation layout and stream footprint of one prepared stage.
 pub struct PreparedPlanLayout {
     buffer: DescriptorBuffer,
-    allocations: Box<[PreparedAllocationLayout]>,
-    streams: Box<[PreparedStreamFootprint]>,
-    launches: Box<[PreparedLaunchLayout]>,
+    /// Accounting identity for this execution instance. Native descriptors
+    /// remain instance-agnostic because native bind validation uses the
+    /// structural zero-instance keys; provisioning stamps this value on its
+    /// claim copies at the accounting boundary.
+    instance: u64,
 }
 
 impl std::fmt::Debug for PreparedPlanLayout {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("PreparedPlanLayout")
-            .field("allocations", &self.allocations)
-            .field("streams", &self.streams)
-            .field("launches", &self.launches)
+            .field("instance", &self.instance)
+            .field("allocations", &self.descriptor().allocations())
+            .field("streams", &self.descriptor().streams())
+            .field("launches", &self.descriptor().launches())
             .finish()
     }
 }
 
 impl PartialEq for PreparedPlanLayout {
     fn eq(&self, other: &Self) -> bool {
-        self.allocations == other.allocations &&
-            self.streams == other.streams &&
-            self.launches == other.launches
+        self.instance == other.instance &&
+            self.descriptor().allocations() == other.descriptor().allocations() &&
+            self.descriptor().streams() == other.descriptor().streams() &&
+            self.descriptor().launches() == other.descriptor().launches()
     }
 }
 
@@ -432,46 +428,17 @@ impl Clone for PreparedPlanLayout {
                 DESCRIPTOR_WORDS,
             );
         }
-        let (allocations, streams, launches) = buffer.read();
-        Self { buffer, allocations, streams, launches }
+        Self { buffer, instance: self.instance }
     }
 }
 
 impl PreparedPlanLayout {
     fn from_buffer(buffer: DescriptorBuffer) -> Self {
-        let (allocations, streams, launches) = buffer.read();
-        Self { buffer, allocations, streams, launches }
+        Self { buffer, instance: 0 }
     }
 
-    /// Pinned coefficient readback of one coefficient span per active limb.
-    pub fn const_coeff_readback(
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        columns: usize,
-        level: usize,
-        format: i32,
-        words_per_poly: usize,
-        coefficient_index: usize,
-        coefficient_count: usize,
-    ) -> Result<Self, String> {
-        let mut buffer = DescriptorBuffer::new();
-        let status = unsafe {
-            gpu_prepared_plan_const_coeff_readback(
-                params.ctx_raw(),
-                rows,
-                columns,
-                i32::try_from(level).map_err(|_| "prepared readback level overflow")?,
-                format,
-                words_per_poly,
-                coefficient_index,
-                coefficient_count,
-                buffer.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        Ok(Self::from_buffer(buffer))
+    fn descriptor(&self) -> &GpuPreparedPlanDescriptor {
+        unsafe { &*self.buffer.as_ptr() }
     }
 
     pub fn const_coeff_readback_with_owner(
@@ -497,36 +464,6 @@ impl PreparedPlanLayout {
                 coefficient_index,
                 coefficient_count,
                 owner.native_ptr(),
-                buffer.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        Ok(Self::from_buffer(buffer))
-    }
-
-    /// Host RNS reconstruction: the readback resources of the same source plus
-    /// its host CRT containers.
-    pub fn rns_reconstruction(
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        columns: usize,
-        level: usize,
-        words_per_poly: usize,
-        coefficient_index: usize,
-        coefficient_count: usize,
-    ) -> Result<Self, String> {
-        let mut buffer = DescriptorBuffer::new();
-        let status = unsafe {
-            gpu_prepared_plan_rns_reconstruction(
-                params.ctx_raw(),
-                rows,
-                columns,
-                i32::try_from(level).map_err(|_| "prepared reconstruction level overflow")?,
-                words_per_poly,
-                coefficient_index,
-                coefficient_count,
                 buffer.as_mut_ptr(),
             )
         };
@@ -566,27 +503,27 @@ impl PreparedPlanLayout {
         Ok(Self::from_buffer(buffer))
     }
 
-    /// Pinned RNS upload staging, per-limb unpack workspaces, completion events
-    /// and the optional evaluation transform.
-    pub fn rns_upload(
+    /// Plan a borrowed compact store of the retained owner.  The native
+    /// descriptor is deliberately empty for an empty owner; otherwise its
+    /// allocation order is the store submission resource followed by the
+    /// transfer workspace used by the single-element codec.
+    pub fn borrowed_compact_store_with_owner(
         params: &GpuDCRTPolyParams,
         rows: usize,
         columns: usize,
         level: usize,
-        target_format: i32,
-        transform_to_eval: bool,
-        bytes_per_poly: usize,
+        format: i32,
+        owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
         let mut buffer = DescriptorBuffer::new();
         let status = unsafe {
-            gpu_prepared_plan_rns_upload(
+            gpu_prepared_plan_borrowed_compact_store_with_owner(
                 params.ctx_raw(),
                 rows,
                 columns,
-                i32::try_from(level).map_err(|_| "prepared upload level overflow")?,
-                target_format,
-                transform_to_eval,
-                bytes_per_poly,
+                i32::try_from(level).map_err(|_| "prepared store level overflow")?,
+                format,
+                owner.native_ptr(),
                 buffer.as_mut_ptr(),
             )
         };
@@ -675,34 +612,6 @@ impl PreparedPlanLayout {
                 i32::try_from(level).map_err(|_| "prepared small upload level overflow")?,
                 payload_bytes,
                 owner.native_ptr(),
-                buffer.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        Ok(Self::from_buffer(buffer))
-    }
-
-    /// Prepared NTT geometry table and the single limb stream it submits on.
-    pub fn ntt(
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        columns: usize,
-        level: usize,
-        range: Option<PreparedMatrixRange>,
-        forward: bool,
-    ) -> Result<Self, String> {
-        let mut buffer = DescriptorBuffer::new();
-        let native_range = range.map(PreparedMatrixRange::to_native);
-        let status = unsafe {
-            gpu_prepared_plan_ntt(
-                params.ctx_raw(),
-                rows,
-                columns,
-                i32::try_from(level).map_err(|_| "prepared NTT level overflow")?,
-                native_range.as_ref().map_or(std::ptr::null(), |range| std::ptr::from_ref(range)),
-                forward,
                 buffer.as_mut_ptr(),
             )
         };
@@ -808,7 +717,8 @@ impl PreparedPlanLayout {
         base_bits: u32,
         small: bool,
         dropped_moduli: usize,
-        owner: &PreparedOwnerLayout,
+        output_owner: &PreparedOwnerLayout,
+        source_owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
         let sampling = Self::sampling_with_owner(
             params,
@@ -819,7 +729,7 @@ impl PreparedPlanLayout {
             level,
             format,
             dist,
-            owner,
+            source_owner,
         )?;
         let decomposition = Self::compact_decompose_with_owner(
             params,
@@ -831,7 +741,8 @@ impl PreparedPlanLayout {
             base_bits,
             small,
             dropped_moduli,
-            owner,
+            output_owner,
+            source_owner,
         )?;
         Self::schedule(&[&sampling, &decomposition])
     }
@@ -850,9 +761,10 @@ impl PreparedPlanLayout {
         base_bits: u32,
         small: bool,
         dropped_moduli: usize,
-        owner: &PreparedOwnerLayout,
+        output_owner: &PreparedOwnerLayout,
+        source_owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
-        let decomposition = Self::gadget_decompose_with_owner(
+        let decomposition = Self::gadget_decompose_with_source_format_owner(
             params,
             source_rows,
             columns,
@@ -862,24 +774,34 @@ impl PreparedPlanLayout {
             // native decomposition stage is coefficient-domain.  Preserve
             // the source-domain inverse as the explicit ordered substage
             // below when the reusable source is evaluation-domain.
-            GPU_POLY_FORMAT_COEFF,
+            format,
+            format,
             base_bits,
             small,
             dropped_moduli,
-            owner,
+            output_owner,
+            source_owner,
         )?;
         if format == GPU_POLY_FORMAT_EVAL {
-            let inverse =
-                Self::ntt_with_owner(params, source_rows, columns, level, None, false, owner)?;
+            let inverse = Self::ntt_with_owner(
+                params,
+                source_rows,
+                columns,
+                level,
+                None,
+                false,
+                source_owner,
+            )?;
             Self::schedule(&[&decomposition, &inverse])
         } else {
             Ok(decomposition)
         }
     }
 
-    /// Composite host readback descriptor. Evaluation-domain exports consume
-    /// the readback claims followed by the fixed inverse-transform claims;
-    /// coefficient exports retain only the readback stage.
+    /// Host readback descriptor for the finalized polynomial domain. Both
+    /// domains use the same fixed RNS readback geometry; evaluation values are
+    /// reconstructed directly from the evaluation-domain residues, so this
+    /// descriptor never inserts an inverse transform behind the caller's back.
     pub fn host_rns_readback_with_owner(
         params: &GpuDCRTPolyParams,
         rows: usize,
@@ -888,9 +810,12 @@ impl PreparedPlanLayout {
         words_per_poly: usize,
         coefficient_index: usize,
         coefficient_count: usize,
-        evaluation: bool,
+        format: i32,
         owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
+        if format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL {
+            return Err("prepared host readback format is invalid".into());
+        }
         let readback = Self::rns_reconstruction_with_owner(
             params,
             rows,
@@ -901,11 +826,7 @@ impl PreparedPlanLayout {
             coefficient_count,
             owner,
         )?;
-        if !evaluation {
-            return Ok(readback);
-        }
-        let inverse = Self::ntt_with_owner(params, rows, columns, level, None, false, owner)?;
-        Self::schedule(&[&readback, &inverse])
+        Ok(readback)
     }
 
     /// Exact arithmetic descriptor. The arguments mirror the native prepare
@@ -1068,45 +989,23 @@ impl PreparedPlanLayout {
         Ok(Self::from_buffer(buffer))
     }
 
-    pub fn scalar_pack(
+    pub fn scalar_pack_with_owner(
         params: &GpuDCRTPolyParams,
         count: usize,
         coefficient_bits: usize,
         level: usize,
         output_format: i32,
+        owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
         let mut buffer = DescriptorBuffer::new();
         let status = unsafe {
-            gpu_prepared_plan_scalar_pack(
+            gpu_prepared_plan_scalar_pack_with_owner(
                 params.ctx_raw(),
                 count,
                 coefficient_bits,
                 i32::try_from(level).map_err(|_| "scalar pack level overflow")?,
                 output_format,
-                buffer.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(last_error_string());
-        }
-        Ok(Self::from_buffer(buffer))
-    }
-
-    pub fn small_rhs(
-        params: &GpuDCRTPolyParams,
-        level: usize,
-        inner: usize,
-        columns: usize,
-        residency_budget_bytes: usize,
-    ) -> Result<Self, String> {
-        let mut buffer = DescriptorBuffer::new();
-        let status = unsafe {
-            gpu_prepared_plan_small_rhs(
-                params.ctx_raw(),
-                i32::try_from(level).map_err(|_| "small RHS level overflow")?,
-                inner,
-                columns,
-                residency_budget_bytes,
+                owner.native_ptr(),
                 buffer.as_mut_ptr(),
             )
         };
@@ -1256,6 +1155,7 @@ impl PreparedPlanLayout {
             small,
             dropped_moduli,
             owner,
+            owner,
         )
     }
 
@@ -1270,7 +1170,8 @@ impl PreparedPlanLayout {
         base_bits: u32,
         small: bool,
         dropped_moduli: usize,
-        owner: &PreparedOwnerLayout,
+        output_owner: &PreparedOwnerLayout,
+        source_owner: &PreparedOwnerLayout,
     ) -> Result<Self, String> {
         let mut buffer = DescriptorBuffer::new();
         let status = unsafe {
@@ -1285,7 +1186,8 @@ impl PreparedPlanLayout {
                 base_bits,
                 small,
                 dropped_moduli,
-                owner.native_ptr(),
+                output_owner.native_ptr(),
+                source_owner.native_ptr(),
                 buffer.as_mut_ptr(),
             )
         };
@@ -1405,11 +1307,35 @@ impl PreparedPlanLayout {
     }
 
     pub fn allocations(&self) -> &[PreparedAllocationLayout] {
-        &self.allocations
+        self.descriptor().allocations()
     }
 
     pub fn streams(&self) -> &[PreparedStreamFootprint] {
-        &self.streams
+        self.descriptor().streams()
+    }
+
+    /// Exact logical owner consumed by the native planner for this stage.
+    /// The descriptor carries the complete value-only assignment, including
+    /// execution class and stream placement.
+    pub fn owner_layout(&self) -> Option<PreparedOwnerLayout> {
+        let descriptor = self.descriptor();
+        (descriptor.scratch_owner_conflict == 0 &&
+            descriptor.scratch_owner_layout.execution_owner_identity != 0)
+            .then(|| PreparedOwnerLayout::from_native(descriptor.scratch_owner_layout))
+    }
+
+    /// The immutable execution-instance identity carried alongside this
+    /// instance-agnostic native descriptor.
+    pub fn instance(&self) -> u64 {
+        self.instance
+    }
+
+    /// Attach an accounting identity without rebuilding or mutating the
+    /// structural native descriptor. Ownership is consumed so the instance
+    /// cannot be silently dropped by a reconstruction of the plan.
+    pub fn with_instance(mut self, instance: u64) -> Self {
+        self.instance = instance;
+        self
     }
 
     pub(crate) fn rectangular_layout(
@@ -1420,15 +1346,16 @@ impl PreparedPlanLayout {
         limb_count: usize,
         stage_role: u32,
     ) -> Result<super::PreparedRectLayout, String> {
-        let launch = self.launches.first().ok_or("prepared rectangular launch is missing")?;
-        if self.launches.len() != 1 ||
+        let launches = self.descriptor().launches();
+        let launch = launches.first().ok_or("prepared rectangular launch is missing")?;
+        if launches.len() != 1 ||
             launch.limb_count != limb_count ||
             launch.len as usize != ring_dimension
         {
             return Err("prepared rectangular launch metadata is invalid".into());
         }
         let device = self
-            .allocations
+            .allocations()
             .first()
             .and_then(|entry| entry.key.device())
             .ok_or("prepared rectangular device is missing")?;
@@ -1439,7 +1366,7 @@ impl PreparedPlanLayout {
             limb_count,
             workspace_bytes: 0,
             alignment: 1,
-            event_count: self.allocations.len(),
+            event_count: self.allocations().len(),
             grid: launch.grid,
             block: launch.block,
             stage_role,
@@ -1449,14 +1376,14 @@ impl PreparedPlanLayout {
 
     /// Distinguish plan-owned submission streams from context-reused ones.
     pub fn added_streams(&self) -> usize {
-        self.streams
+        self.streams()
             .iter()
             .filter(|entry| entry.origin == PreparedStreamOrigin::AddedSubmission as i32)
             .count()
     }
 
     pub fn reused_streams(&self) -> usize {
-        self.streams
+        self.streams()
             .iter()
             .filter(|entry| entry.origin == PreparedStreamOrigin::ContextReused as i32)
             .count()
@@ -1475,19 +1402,7 @@ unsafe extern "C" {
         rows: usize,
         columns: usize,
         format: i32,
-        stream_ordinal_base: usize,
         out: *mut NativeOwnerLayout,
-    ) -> i32;
-    fn gpu_prepared_plan_const_coeff_readback(
-        ctx: *mut GpuContextOpaque,
-        rows: usize,
-        columns: usize,
-        level: i32,
-        format: i32,
-        words_per_poly: usize,
-        coefficient_index: usize,
-        coefficient_count: usize,
-        out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
     fn gpu_prepared_plan_const_coeff_readback_with_owner(
         ctx: *mut GpuContextOpaque,
@@ -1501,16 +1416,6 @@ unsafe extern "C" {
         owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
-    fn gpu_prepared_plan_rns_reconstruction(
-        ctx: *mut GpuContextOpaque,
-        rows: usize,
-        columns: usize,
-        level: i32,
-        words_per_poly: usize,
-        coefficient_index: usize,
-        coefficient_count: usize,
-        out: *mut GpuPreparedPlanDescriptor,
-    ) -> i32;
     fn gpu_prepared_plan_rns_reconstruction_with_owner(
         ctx: *mut GpuContextOpaque,
         rows: usize,
@@ -1522,14 +1427,13 @@ unsafe extern "C" {
         owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
-    fn gpu_prepared_plan_rns_upload(
+    fn gpu_prepared_plan_borrowed_compact_store_with_owner(
         ctx: *mut GpuContextOpaque,
         rows: usize,
         columns: usize,
         level: i32,
-        target_format: i32,
-        transform_to_eval: bool,
-        bytes_per_poly: usize,
+        format: i32,
+        owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
     fn gpu_prepared_plan_rns_upload_with_owner(
@@ -1560,15 +1464,6 @@ unsafe extern "C" {
         level: i32,
         payload_bytes: usize,
         owner: *const NativeOwnerLayout,
-        out: *mut GpuPreparedPlanDescriptor,
-    ) -> i32;
-    fn gpu_prepared_plan_ntt(
-        ctx: *mut GpuContextOpaque,
-        rows: usize,
-        columns: usize,
-        level: i32,
-        range: *const crate::poly::dcrt::gpu::GpuMatrixRange,
-        forward: bool,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
     fn gpu_prepared_plan_ntt_with_owner(
@@ -1655,20 +1550,13 @@ unsafe extern "C" {
         owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
-    fn gpu_prepared_plan_scalar_pack(
+    fn gpu_prepared_plan_scalar_pack_with_owner(
         ctx: *mut GpuContextOpaque,
         count: usize,
         coefficient_bits: usize,
         level: i32,
         output_format: i32,
-        out: *mut GpuPreparedPlanDescriptor,
-    ) -> i32;
-    fn gpu_prepared_plan_small_rhs(
-        ctx: *mut GpuContextOpaque,
-        level: i32,
-        inner: usize,
-        columns: usize,
-        residency_budget_bytes: usize,
+        owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
     fn gpu_prepared_plan_small_rhs_with_owner(
@@ -1724,7 +1612,8 @@ unsafe extern "C" {
         base_bits: u32,
         small: bool,
         dropped_moduli: usize,
-        owner: *const NativeOwnerLayout,
+        output_owner: *const NativeOwnerLayout,
+        source_owner: *const NativeOwnerLayout,
         out: *mut GpuPreparedPlanDescriptor,
     ) -> i32;
     fn gpu_prepared_plan_modulus_conversion_with_owner(
@@ -1795,9 +1684,103 @@ impl PreparedMatrixRange {
 #[cfg(test)]
 mod tests {
     use super::{
-        PREPARED_PLAN_MAX_ALLOCATIONS, PREPARED_PLAN_MAX_STREAMS, PreparedOwnerLayoutCursor,
-        PreparedStageRole, PreparedStreamOrigin,
+        DescriptorBuffer, PREPARED_PLAN_MAX_ALLOCATIONS, PREPARED_PLAN_MAX_STREAMS,
+        PreparedAllocationLayout, PreparedPlanLayout, PreparedResourceKey, PreparedStageRole,
+        PreparedStreamFootprint, PreparedStreamOrigin,
     };
+
+    #[test]
+    fn test_prepared_plan_descriptor_slices_are_the_native_authority() {
+        let mut buffer = DescriptorBuffer::new();
+        let descriptor = unsafe { &mut *buffer.as_mut_ptr() };
+        descriptor.allocation_count = 1;
+        descriptor.allocations[0] = PreparedAllocationLayout {
+            key: PreparedResourceKey {
+                execution_owner_identity: 11,
+                context_identity: 12,
+                instance: 0,
+                partition: 0,
+                device: 3,
+                limb_x: 0,
+                limb_y: 0,
+                role: 4,
+            },
+            kind: 0,
+            rows: 2,
+            columns: 3,
+            bytes: 48,
+            alignment: 8,
+            level: 1,
+            format: 0,
+        };
+        descriptor.stream_count = 1;
+        descriptor.streams[0] = PreparedStreamFootprint {
+            key: descriptor.allocations[0].key,
+            origin: PreparedStreamOrigin::ContextReused as i32,
+            pool_slot: 5,
+        };
+        descriptor.launch_count = 1;
+        descriptor.launches[0].phase = 9;
+
+        let plan = PreparedPlanLayout::from_buffer(buffer);
+        assert_eq!(plan.allocations().len(), 1);
+        assert_eq!(plan.streams().len(), 1);
+        assert_eq!(plan.descriptor().launches().len(), 1);
+        assert_eq!(plan.allocations().as_ptr(), plan.descriptor().allocations().as_ptr());
+        assert_eq!(plan.streams().as_ptr(), plan.descriptor().streams().as_ptr());
+        assert_eq!(plan.allocations()[0].rows, 2);
+        assert_eq!(plan.descriptor().launches()[0].phase, 9);
+    }
+
+    #[test]
+    fn test_prepared_plan_instance_survives_clone_and_move() {
+        let plan = PreparedPlanLayout::from_buffer(DescriptorBuffer::new()).with_instance(17);
+        assert_eq!(plan.instance(), 17);
+        assert_eq!(plan.allocations().first().map(|entry| entry.key.instance), None);
+
+        let cloned = plan.clone();
+        assert_eq!(cloned.instance(), 17);
+        assert_eq!(cloned.allocations(), plan.allocations());
+
+        let moved = cloned.with_instance(23);
+        assert_eq!(moved.instance(), 23);
+        assert_eq!(moved.allocations(), plan.allocations());
+        assert_eq!(plan.instance(), 17);
+    }
+
+    #[test]
+    fn test_composite_owner_conflict_is_explicit_and_not_reinterpreted() {
+        let mut matching = DescriptorBuffer::new();
+        let matching_descriptor = unsafe { &mut *matching.as_mut_ptr() };
+        matching_descriptor.scratch_owner_layout.execution_owner_identity = 7;
+        assert!(PreparedPlanLayout::from_buffer(matching).owner_layout().is_some());
+
+        let mut conflicting = DescriptorBuffer::new();
+        let conflicting_descriptor = unsafe { &mut *conflicting.as_mut_ptr() };
+        conflicting_descriptor.scratch_owner_layout.execution_owner_identity = 7;
+        conflicting_descriptor.scratch_owner_conflict = 1;
+        assert!(PreparedPlanLayout::from_buffer(conflicting).owner_layout().is_none());
+    }
+
+    #[test]
+    fn test_removed_ownerless_plan_symbols_have_no_native_entry_points() {
+        let sources = [
+            include_str!("gpu_prepared_plan.rs"),
+            include_str!("../../cuda/include/gpu_prepared_plan.cuh"),
+            include_str!("../../cuda/src/gpu_prepared_plan.cu"),
+        ];
+        for suffix in [
+            "const_coeff_readback",
+            "rns_reconstruction",
+            "rns_upload",
+            "ntt",
+            "scalar_pack",
+            "small_rhs",
+        ] {
+            let symbol = format!("gpu_prepared_plan_{suffix}(");
+            assert!(sources.iter().all(|source| !source.contains(&symbol)), "{symbol} remains");
+        }
+    }
 
     /// Extracts one native definition so a source-level contract can be
     /// asserted without a device.
@@ -1843,10 +1826,10 @@ mod tests {
         }
         // Every declared planning entry point is declared by the shared header.
         for entry in [
-            "gpu_prepared_plan_const_coeff_readback",
-            "gpu_prepared_plan_rns_upload",
-            "gpu_prepared_plan_rns_reconstruction",
-            "gpu_prepared_plan_ntt",
+            "gpu_prepared_plan_const_coeff_readback_with_owner",
+            "gpu_prepared_plan_rns_upload_with_owner",
+            "gpu_prepared_plan_rns_reconstruction_with_owner",
+            "gpu_prepared_plan_ntt_with_owner",
             "gpu_prepared_plan_arithmetic_with_owner",
             "gpu_prepared_plan_schedule",
         ] {
@@ -1863,13 +1846,10 @@ mod tests {
         let plan = include_str!("../../cuda/src/gpu_prepared_plan.cu");
         let matrix = include_str!("../../cuda/src/matrix/MatrixData.cu");
         assert!(plan.contains("gpu_prepared_owner_layout"));
-        assert!(plan.contains("stream_ordinal_base"));
+        assert!(!plan.contains("stream_ordinal"));
         assert!(!plan.contains("next_compute_stream.load"));
         assert!(matrix.contains("gpu_matrix_create_prepared"));
         assert!(matrix.contains("owner_layout->partitions"));
-        // Keep the cursor API as a preparation-local state machine; no global
-        // execution counter is part of the Rust planner surface.
-        let _cursor = PreparedOwnerLayoutCursor::default();
         let rust = include_str!("gpu_prepared_plan.rs")
             .split("#[cfg(test)]")
             .next()
@@ -2062,7 +2042,7 @@ mod tests {
         assert!(ntt.contains("(n & (n - 1)) != 0"), "NTT geometry must require a power of two");
         let schedule = native_function_body(plan, "gpu_prepared_plan_schedule");
         assert!(
-            schedule.contains("existing.key.partition == entry.key.partition"),
+            schedule.contains("existing.key.partition == key.partition"),
             "schedule stream identity must include its partition"
         );
         assert!(
@@ -2073,6 +2053,38 @@ mod tests {
             include_str!("../../cuda/src/matrix/MatrixSampling.cu")
                 .contains("chunks > std::numeric_limits<size_t>::max() - 255"),
             "sampling chunk rounding must be checked"
+        );
+    }
+
+    #[test]
+    fn test_schedule_deduplicates_member_completion_events_by_physical_stream() {
+        let source = include_str!("../../cuda/src/gpu_prepared_plan.cu");
+        let schedule = native_function_body(source, "gpu_prepared_plan_schedule");
+        assert!(
+            schedule.contains("append_plan_descriptor_without_completion_events"),
+            "member completion allocations must not be copied into a merged schedule"
+        );
+        assert!(
+            schedule.contains("key.role = GPU_PREPARED_STAGE_SCHEDULE"),
+            "merged stream claims must use the schedule role"
+        );
+        for field in [
+            "existing.key.execution_owner_identity",
+            "existing.key.context_identity",
+            "existing.key.instance",
+            "existing.key.partition",
+            "existing.key.device",
+            "existing.key.limb_x",
+            "existing.key.limb_y",
+            "existing.key.role",
+            "existing.origin == entry.origin",
+            "existing.pool_slot == entry.pool_slot",
+        ] {
+            assert!(schedule.contains(field), "physical stream identity omits {field}");
+        }
+        assert!(
+            schedule.contains("for (size_t index = 0; index < writer.descriptor->stream_count"),
+            "merged schedules must emit one completion allocation per canonical stream"
         );
     }
 
@@ -2208,6 +2220,22 @@ mod tests {
             source.contains("pub fn allocation_layout(&self)"),
             "a bound plan must expose the layout it consumed"
         );
+    }
+
+    #[test]
+    fn test_borrowed_compact_store_plan_has_only_stream_and_transfer_claims() {
+        let header = include_str!("../../cuda/include/gpu_prepared_plan.cuh");
+        let native = include_str!("../../cuda/src/gpu_prepared_plan.cu");
+        let serde = include_str!("../../cuda/src/matrix/MatrixSerde.cu");
+        assert!(header.contains("gpu_prepared_plan_borrowed_compact_store_with_owner"));
+        let body =
+            native_function_body(native, "gpu_prepared_plan_borrowed_compact_store_with_owner");
+        assert!(body.contains("GPU_PREPARED_SUBMISSION_STREAM"));
+        assert!(body.contains("GPU_PREPARED_STREAM_ADDED_SUBMISSION"));
+        assert!(body.contains("gpu_matrix_query_compact_workspace"));
+        assert!(!body.contains("GPU_PREPARED_MATRIX"));
+        assert!(serde.contains("gpu_matrix_store_compact_bytes_borrowed"));
+        assert!(serde.contains("gpu_matrix_ntt_all(mat)"));
     }
 
     /// A preparation without a saved descriptor is rejected. The planner is a

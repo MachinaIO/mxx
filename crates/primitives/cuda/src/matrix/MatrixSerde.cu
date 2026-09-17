@@ -1248,6 +1248,7 @@ struct GpuPreparedConstCoeffReadbackLimb
     // mistaken for the current one.
     uint64_t armed_generation;
     uint64_t recorded_generation;
+    uint64_t consumer_tracked_generation;
 };
 
 struct GpuPreparedConstCoeffReadback
@@ -1278,8 +1279,9 @@ extern "C" int gpu_matrix_prepare_const_coeff_readback(
     if (!out_plan)
         return set_error("null prepared coefficient readback output");
     *out_plan = nullptr;
-    if (!mat || !mat->ctx || !mat->ctx->execution || mat->format != GPU_POLY_FORMAT_COEFF)
-        return set_error("invalid prepared coefficient readback matrix");
+    if (!mat || !mat->ctx || !mat->ctx->execution ||
+        (mat->format != GPU_POLY_FORMAT_COEFF && mat->format != GPU_POLY_FORMAT_EVAL))
+        return set_error("invalid prepared polynomial readback matrix");
     if (!plan || gpu_prepared_validate_descriptor(plan) != 0)
         return set_error("prepared coefficient readback requires a saved descriptor");
     if (mat->level < 0 || mat->ctx->N <= 0 || coefficient_count == 0 ||
@@ -1308,7 +1310,7 @@ extern "C" int gpu_matrix_prepare_const_coeff_readback(
         return set_error("prepared coefficient readback owner is invalid");
     if (plan->allocation_count != limb_count + 1 || plan->stream_count != limb_count)
         return set_error("prepared coefficient readback plan shape does not match its owner");
-    const GpuPreparedResourceKey host_key{0, -1, -1, 0, 0, GPU_PREPARED_STAGE_READBACK};
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_READBACK};
     if (gpu_prepared_require_allocation(
             plan, 0, GPU_PREPARED_PINNED_HOST, &host_key, total_bytes, alignof(uint64_t)) != 0)
         return set_error("prepared coefficient readback plan destination does not match its owner");
@@ -1316,7 +1318,7 @@ extern "C" int gpu_matrix_prepare_const_coeff_readback(
     GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
     auto *prepared = new GpuPreparedConstCoeffReadback{
         mat, words_out, polynomial_count, words_per_poly,
-        coefficient_index, coefficient_count, {}, 0, {}};
+        coefficient_index, coefficient_count, {}, 1, {}};
     try
     {
         prepared->limbs.reserve(limb_count);
@@ -1381,6 +1383,7 @@ extern "C" int gpu_matrix_prepare_const_coeff_readback(
                 std::move(completion),
                 0,
                 0,
+                0,
             });
         }
     }
@@ -1418,21 +1421,43 @@ extern "C" size_t gpu_matrix_test_reconstruction_prepared_acquisitions()
 
 namespace
 {
-    // Reports a failed submission while still recording the terminal completion
-    // of every limb that may already have queued work. The submission's own
-    // cause is the more specific report; when a terminal record is refused the
-    // generation stays unproven, so the pinned destination is retained instead
-    // of freed while a queued copy could still read it.
+    // Reports a failed submission while still recording and retaining every
+    // limb that may have queued work. A failed readonly registration falls
+    // back to stream retirement, which quarantines the execution if that
+    // retirement cannot be established before the source can be recycled.
     int fail_const_coeff_readback_submission(
         GpuPreparedConstCoeffReadback *plan, uint64_t generation, int status)
     {
         for (auto &limb : plan->limbs)
         {
-            if (limb.armed_generation != generation || limb.recorded_generation == generation)
+            if (limb.armed_generation != generation)
                 continue;
-            if (cudaSetDevice(limb.device) == cudaSuccess &&
-                cudaEventRecord(limb.completion, limb.stream) == cudaSuccess)
-                limb.recorded_generation = generation;
+            if (limb.recorded_generation != generation)
+            {
+                if (cudaSetDevice(limb.device) == cudaSuccess &&
+                    cudaEventRecord(limb.completion, limb.stream) == cudaSuccess)
+                    limb.recorded_generation = generation;
+                else
+                {
+                    // The completion event may have an uncertain record
+                    // status. Never return its prepared slot to the pool;
+                    // stream retirement protects the source when possible,
+                    // while quarantine preserves the event lease fail-closed.
+                    limb.completion_resource->quarantine();
+                    (void)gpu_context_retire_stream(plan->matrix->ctx, limb.device, limb.stream);
+                    continue;
+                }
+            }
+            if (limb.consumer_tracked_generation != generation)
+            {
+                const int tracked = matrix_track_limb_consumer_readonly(
+                    plan->matrix, limb.limb_id, limb.device, limb.stream,
+                    limb.completion, true);
+                if (tracked == 0)
+                    limb.consumer_tracked_generation = generation;
+                else
+                    (void)gpu_context_retire_stream(plan->matrix->ctx, limb.device, limb.stream);
+            }
         }
         return status;
     }
@@ -1448,6 +1473,8 @@ extern "C" int gpu_matrix_submit_const_coeff_readback(
     size_t total_words = 0;
     if (!serde_checked_mul_size(plan->polynomial_count, plan->words_per_poly, &total_words))
         return set_error("prepared coefficient readback output size overflow");
+    if (plan->submission_generation == std::numeric_limits<uint64_t>::max())
+        return set_error("prepared coefficient readback submission generation exhausted");
     std::fill_n(plan->words, total_words, static_cast<uint64_t>(0));
 
     const uint64_t generation = ++plan->submission_generation;
@@ -1460,22 +1487,78 @@ extern "C" int gpu_matrix_submit_const_coeff_readback(
             plan->matrix, limb.limb_id, limb.device, limb.stream, true, true);
         if (status != 0)
             return fail_const_coeff_readback_submission(plan, generation, status);
-        auto *destination = reinterpret_cast<uint8_t *>(plan->words) +
-            limb.ordinal * plan->coefficient_count * sizeof(uint64_t);
-        error = cudaMemcpy2DAsync(
-            destination,
-            plan->words_per_poly * sizeof(uint64_t),
-            limb.source,
-            limb.source_pitch,
-            static_cast<size_t>(limb.source_width) * plan->coefficient_count,
-            plan->polynomial_count,
-            cudaMemcpyDeviceToHost,
-            limb.stream);
-        if (error != cudaSuccess)
-            return fail_const_coeff_readback_submission(plan, generation, set_error(error));
-        // The copy is queued: this limb now owes a terminal record for this
-        // generation before the pinned destination may be released.
+        // Matrix storage is row-major: a device row contains `cols` complete
+        // polynomials, while the prepared host result is polynomial-major.
+        // Copy one matrix row at a time; the per-polynomial source pitch is
+        // already the matrix's bytes_per_poly stride and includes all limbs.
+        size_t destination_row_words = 0;
+        if (!serde_checked_mul_size(
+                plan->matrix->cols, plan->words_per_poly, &destination_row_words))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback destination pitch overflow"));
+        size_t source_row_pitch = 0;
+        if (!serde_checked_mul_size(
+                plan->matrix->cols, limb.source_pitch, &source_row_pitch))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback source row pitch overflow"));
+        size_t limb_offset_words = 0;
+        if (!serde_checked_mul_size(
+                limb.ordinal, plan->coefficient_count, &limb_offset_words))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback limb offset overflow"));
         limb.armed_generation = generation;
+        for (size_t row = 0; row < plan->matrix->rows; ++row)
+        {
+            size_t destination_words = 0;
+            if (!serde_checked_mul_size(row, destination_row_words, &destination_words) ||
+                destination_words > total_words ||
+                limb_offset_words > total_words - destination_words)
+                return fail_const_coeff_readback_submission(
+                    plan, generation, set_error("prepared coefficient readback destination offset overflow"));
+            destination_words += limb_offset_words;
+            auto *destination = reinterpret_cast<uint8_t *>(plan->words) +
+                destination_words * sizeof(uint64_t);
+            const auto *source = limb.source + row * source_row_pitch;
+            if (limb.source_width == sizeof(uint64_t))
+            {
+                error = cudaMemcpy2DAsync(
+                    destination,
+                    plan->words_per_poly * sizeof(uint64_t),
+                    source,
+                    limb.source_pitch,
+                    static_cast<size_t>(limb.source_width) * plan->coefficient_count,
+                    plan->matrix->cols,
+                    cudaMemcpyDeviceToHost,
+                    limb.stream);
+                if (error != cudaSuccess)
+                    return fail_const_coeff_readback_submission(plan, generation, set_error(error));
+            }
+            else
+            {
+                // Narrow limbs are packed on device, but the prepared API
+                // exposes one zero-extended u64 per residue. Copy each
+                // coefficient into its strided u64 destination so adjacent
+                // narrow residues do not get packed into one host word.
+                for (size_t coefficient = 0; coefficient < plan->coefficient_count;
+                     ++coefficient)
+                {
+                    error = cudaMemcpy2DAsync(
+                        destination + coefficient * sizeof(uint64_t),
+                        plan->words_per_poly * sizeof(uint64_t),
+                        source + coefficient * limb.source_width,
+                        limb.source_pitch,
+                        limb.source_width,
+                        plan->matrix->cols,
+                        cudaMemcpyDeviceToHost,
+                        limb.stream);
+                    if (error != cudaSuccess)
+                        return fail_const_coeff_readback_submission(
+                            plan, generation, set_error(error));
+                }
+            }
+        }
+        // The copies are queued: this limb now owes a terminal record for this
+        // generation before the pinned destination may be released.
         error = cudaEventRecord(limb.completion, limb.stream);
         if (error != cudaSuccess)
             return fail_const_coeff_readback_submission(plan, generation, set_error(error));
@@ -1484,6 +1567,7 @@ extern "C" int gpu_matrix_submit_const_coeff_readback(
             plan->matrix, limb.limb_id, limb.device, limb.stream, limb.completion, true);
         if (status != 0)
             return fail_const_coeff_readback_submission(plan, generation, status);
+        limb.consumer_tracked_generation = generation;
     }
     return 0;
 }
@@ -1519,7 +1603,11 @@ extern "C" int gpu_matrix_query_const_coeff_readback(
         // event and cannot speak for it, and an armed limb whose terminal event
         // was never recorded is unproven rather than complete. Either way the
         // answer is "not ready", never a completion claim.
-        if (limb.armed_generation != plan->submission_generation) continue;
+        if (limb.armed_generation != plan->submission_generation)
+        {
+            *out_ready = 0;
+            continue;
+        }
         if (limb.recorded_generation != plan->submission_generation)
         {
             *out_ready = 0;
@@ -1683,10 +1771,10 @@ extern "C" int gpu_matrix_prepare_rns_upload(
     const GpuMatrix *owner = gpu_prepared_base_owner(mat);
     if (!owner || owner->ctx != mat->ctx || owner->level != mat->level)
         return set_error("prepared RNS upload owner is invalid");
-    const GpuPreparedResourceKey host_key{0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
     if (plan->allocation_count != expected_allocations || plan->stream_count != expected_streams ||
         gpu_prepared_require_allocation(
-            plan, 0, GPU_PREPARED_PINNED_HOST, &host_key, host_bytes, alignof(uint64_t)) != 0)
+            plan, 0, GPU_PREPARED_PINNED_HOST, &host_key, host_bytes, alignof(uint8_t)) != 0)
         return set_error("prepared RNS upload plan shape does not match its owner");
 
     // Validate every physical claim and stream before constructing the first
@@ -2218,7 +2306,7 @@ extern "C" int gpu_poly_store_compact_bytes(
     GpuCudaResource private_stream;
     CompactWorkspace workspace;
     auto release = [&]() {
-        const int released = workspace.storage.release();
+        const int released = workspace.storage.release(work_stream);
         const int finished = serde_finish_private_stream(poly, common_device, private_stream, work_stream);
         return released != 0 ? released : finished;
     };
@@ -2230,7 +2318,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         return stream_status;
     }
     const int workspace_status = workspace.acquire(poly->ctx, common_device, level,
-        poly->rows, poly->cols, 1, 0, 0, work_stream);
+        poly->rows, poly->cols, 1, 0, 0, work_stream, &private_stream);
     if (workspace_status != 0) { release(); return workspace_status; }
 
     err = workspace.span(0, &d_modulus_words, words_per_coeff * sizeof(uint64_t));
@@ -2695,7 +2783,7 @@ extern "C" int gpu_poly_load_compact_bytes(
     GpuCudaResource private_stream;
     CompactWorkspace workspace;
     auto release = [&]() {
-        const int released = workspace.storage.release();
+        const int released = workspace.storage.release(work_stream);
         const int finished = serde_finish_private_stream(poly, common_device, private_stream, work_stream);
         return released != 0 ? released : finished;
     };
@@ -2707,7 +2795,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         return stream_status;
     }
     const int workspace_status = workspace.acquire(poly->ctx, common_device, level,
-        poly->rows, poly->cols, 1, 2, max_coeff_bits, work_stream);
+        poly->rows, poly->cols, 1, 2, max_coeff_bits, work_stream, &private_stream);
     if (workspace_status != 0) { release(); return workspace_status; }
 
     for (size_t limb = 0; limb < limb_count; ++limb)
@@ -2870,6 +2958,37 @@ extern "C" int gpu_matrix_store_compact_bytes(
         out_payload_len);
 }
 
+extern "C" int gpu_matrix_store_compact_bytes_borrowed(
+    GpuMatrix *mat,
+    uint8_t *payload_out,
+    size_t payload_capacity,
+    uint16_t *out_max_coeff_bits,
+    uint16_t *out_bytes_per_coeff,
+    size_t *out_payload_len)
+{
+    if (!mat || !mat->ctx)
+        return set_error("invalid borrowed compact store matrix");
+    const bool restore_ntt = mat->format == GPU_POLY_FORMAT_EVAL;
+    int status = gpu_poly_store_compact_bytes(
+        mat, payload_out, payload_capacity, out_max_coeff_bits,
+        out_bytes_per_coeff, out_payload_len);
+    // The production store changes an evaluation owner to coefficient form
+    // before encoding. Restore it even when encoding failed after INTT, so a
+    // retained prepared result never leaks a domain mutation to aliases.
+    if (restore_ntt && mat->format == GPU_POLY_FORMAT_COEFF) {
+        const int restored = gpu_matrix_ntt_all(mat);
+        if (restored != 0) {
+            if (mat->ctx->execution) {
+                mat->ctx->execution->unretired_work.store(true, std::memory_order_release);
+                mat->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+                gpu_execution_mark_allocation_unknown(mat->ctx->execution.get());
+            }
+            return set_error("borrowed compact store failed to restore evaluation format");
+        }
+    }
+    return status;
+}
+
 extern "C" int gpu_matrix_load_compact_bytes(
     GpuMatrix *mat,
     const uint8_t *payload,
@@ -2941,7 +3060,7 @@ extern "C" int gpu_matrix_prepare_compact_upload(
     const size_t expected_streams = mat->format == GPU_POLY_FORMAT_EVAL ? 2 : 1;
     if (plan->allocation_count != expected_allocations || plan->stream_count != expected_streams)
         return set_error("prepared compact upload descriptor counts mismatch");
-    const GpuPreparedResourceKey host_key{0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
     if (gpu_prepared_require_allocation(plan, 0, GPU_PREPARED_PINNED_HOST, &host_key,
             payload_capacity, 1) != 0)
         return set_error("prepared compact upload pinned staging claim differs from descriptor");

@@ -428,7 +428,7 @@ pub struct ExecutionResult<B: Backend> {
 /// Immutable artifact metadata captured when a prepared program is warmed.
 /// Production replay consumes this table directly and never revisits the
 /// validated graph's output declarations.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PreparedArtifactDescriptor {
     pub name: String,
     pub wire: WireId,
@@ -528,7 +528,7 @@ impl<S: SessionStore> PreparedTranscriptStore for S {
 /// A prepared backend owns one invocation lease and resolves all exports from
 /// its immutable warmup descriptor tree.  The executor deliberately does not
 /// retain one closure/map entry per output.
-pub(crate) trait PreparedOutputLease<B: Backend>: Send {
+pub(crate) trait PreparedOutputLease<B: Backend>: Send + Sync {
     fn output_count(&self) -> usize;
     fn output_name(&self, index: usize) -> Option<&str>;
     fn output_index(&self, name: &str) -> Option<usize>;

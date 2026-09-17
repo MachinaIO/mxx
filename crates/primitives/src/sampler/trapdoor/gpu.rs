@@ -19,11 +19,7 @@ use crate::{
 };
 use digest::Digest;
 use num_bigint::BigUint;
-use rayon::prelude::*;
-use std::{
-    sync::{Arc, Mutex},
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 const SPECTRAL_CONSTANT: f64 = 1.8;
 
@@ -76,101 +72,8 @@ fn preimage_smoothing_parameter(base: u32, sigma: f64, d: usize, n: usize, k: us
         (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7)
 }
 
-fn coeff_cached_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
+fn coefficient_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
     src.clone().into_coeff_domain()
-}
-
-/// One real candidate attempt in a homogeneous Preimage batch. The caller
-/// retains retry state and supplies only jobs that still need a candidate.
-/// Parameters, target shapes and sampler class are common to the batch;
-/// Trapdoors, public owners, offsets, attempt indices and seeds remain per job.
-pub struct GpuPreimageAttempt<'a> {
-    pub trapdoor: &'a GpuDCRTTrapdoor,
-    pub public: &'a GpuDCRTPolyMatrix,
-    pub target: &'a GpuDCRTPolyMatrix,
-    pub destination: &'a GpuSmallMatrix,
-    pub column_start: usize,
-    pub global_column_start: usize,
-    pub attempt: usize,
-    pub seed: [u8; 32],
-}
-
-/// Native ownership boundaries of the common candidate batch runner.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(usize)]
-pub enum GpuPreimageBatchPhase {
-    P2Output,
-    SampleP2,
-    ProductOutput,
-    Product,
-    ProductIntt,
-    P1Output,
-    SampleP1,
-    Residual,
-    AssembleOutput,
-    Assemble,
-    ResidualIntt,
-    GadgetOutput,
-    Gadget,
-    Correction,
-    Intt,
-    Cutoff,
-}
-
-/// Run the same phase under ordinary allocation, explicit warmup tracing, or
-/// prepared claims. The callback may return native owners to later phases;
-/// ending a claim boundary does not end those owners' lifetimes.
-pub trait GpuPreimageBatchResources {
-    fn run<T>(
-        &mut self,
-        phase: GpuPreimageBatchPhase,
-        jobs: usize,
-        operation: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String>;
-
-    /// Obtain an output owner for a fixed phase. Prepared callers override
-    /// this to take a warmup-provisioned owner; the default keeps standalone
-    /// sampling's existing allocation semantics and routes the allocation
-    /// through the same claim boundary used by tracing.
-    fn matrix_destination(
-        &mut self,
-        phase: GpuPreimageBatchPhase,
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        columns: usize,
-        level: usize,
-        is_ntt: bool,
-    ) -> Result<GpuDCRTPolyMatrix, String> {
-        self.run(phase, 1, || {
-            Ok(GpuDCRTPolyMatrix::new_empty_with_state(params, rows, columns, level, is_ntt, None))
-        })
-    }
-
-    /// Return an intermediate owner to a prepared pool after its reader
-    /// events have been retired. Standalone resources have no pool.
-    fn recycle_matrix(&mut self, matrix: GpuDCRTPolyMatrix) {
-        drop(matrix);
-    }
-
-    /// Return the warmup-owned native pointer tables, when this execution is
-    /// prepared. The pointer is valid only for the duration of the current
-    /// resource submission and is exclusively borrowed by that submission.
-    fn batch_scratch(
-        &mut self,
-    ) -> Option<*mut crate::matrix::gpu_dcrt_poly::GpuPreimageBatchScratch> {
-        None
-    }
-}
-
-impl GpuPreimageBatchResources for () {
-    fn run<T>(
-        &mut self,
-        _phase: GpuPreimageBatchPhase,
-        _jobs: usize,
-        operation: impl FnOnce() -> Result<T, String>,
-    ) -> Result<T, String> {
-        operation()
-    }
 }
 
 struct GpuPerturbationSamples {
@@ -179,59 +82,24 @@ struct GpuPerturbationSamples {
 }
 
 #[derive(Debug, Clone)]
-struct GpuP1CovarianceCacheEntry {
-    c: f64,
-    s: f64,
-    dgg_stddev: f64,
-    cache: Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>,
-}
-
-#[derive(Debug, Clone)]
 pub struct GpuDCRTTrapdoor {
     pub r: GpuDCRTPolyMatrix,
     pub e: GpuDCRTPolyMatrix,
-    a_mat_coeff: GpuDCRTPolyMatrix,
-    b_mat_coeff: GpuDCRTPolyMatrix,
-    d_mat_coeff: GpuDCRTPolyMatrix,
-    p1_covariance_cache: Arc<Mutex<Option<GpuP1CovarianceCacheEntry>>>,
 }
 
 impl PartialEq for GpuDCRTTrapdoor {
     fn eq(&self, other: &Self) -> bool {
-        self.r == other.r &&
-            self.e == other.e &&
-            self.a_mat_coeff == other.a_mat_coeff &&
-            self.b_mat_coeff == other.b_mat_coeff &&
-            self.d_mat_coeff == other.d_mat_coeff
+        self.r == other.r && self.e == other.e
     }
 }
 
 impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
-    /// Materialize the fixed trapdoor matrices once for fanout to other devices.
-    /// Cached Gram matrices are transferred, rather than recomputed per replica.
-    pub fn to_rns_snapshots(&self) -> [crate::matrix::gpu_dcrt_poly::GpuDCRTMatrixRnsSnapshot; 5] {
-        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
-            .map(GpuDCRTPolyMatrix::to_rns_snapshot)
-    }
-
-    /// Restore a trusted fixed-owner transfer in a destination parameter context.
-    pub fn from_rns_snapshots(
-        params: &GpuDCRTPolyParams,
-        snapshots: &[crate::matrix::gpu_dcrt_poly::GpuDCRTMatrixRnsSnapshot; 5],
-    ) -> Self {
-        let [r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff] = snapshots
-            .each_ref()
-            .map(|snapshot| GpuDCRTPolyMatrix::from_rns_snapshot(params, snapshot));
-        Self {
-            r,
-            e,
-            a_mat_coeff,
-            b_mat_coeff,
-            d_mat_coeff,
-            p1_covariance_cache: Arc::new(Mutex::new(None)),
-        }
+    /// Return every matrix whose shape, placement, and CRT context are part of
+    /// the prepared preimage-sampler contract.
+    pub fn prepared_matrices(&self) -> [&GpuDCRTPolyMatrix; 2] {
+        [&self.r, &self.e]
     }
 
     /// Waits for every matrix required to consume this trapdoor.
@@ -242,9 +110,7 @@ impl GpuDCRTTrapdoor {
     /// Wait for every matrix required to consume this trapdoor and preserve
     /// the first native failure for result-based fleet APIs.
     pub fn wait_until_ready_result(&self) -> Result<(), String> {
-        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
-            .into_iter()
-            .try_for_each(GpuDCRTPolyMatrix::wait_until_ready_result)
+        [&self.r, &self.e].into_iter().try_for_each(GpuDCRTPolyMatrix::wait_until_ready_result)
     }
 
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
@@ -258,15 +124,11 @@ impl GpuDCRTTrapdoor {
         let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist.clone());
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
-        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
-        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
-        let p1_covariance_cache = Arc::new(Mutex::new(None));
-        Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache }
+        Self { r, e }
     }
 
     pub fn to_compact_bytes(&self) -> Vec<u8> {
-        let mats = [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff];
+        let mats = [&self.r, &self.e];
         let mut parts = Vec::with_capacity(mats.len());
         let mut total_len = 0usize;
         for mat in mats {
@@ -280,6 +142,41 @@ impl GpuDCRTTrapdoor {
             out.extend_from_slice(&bytes);
         }
         out
+    }
+
+    /// Serialize the two authoritative trapdoor matrices into caller-owned
+    /// staging. The scratch and per-matrix buffers are provisioned during
+    /// prepared publication.
+    pub fn write_compact_bytes(
+        &self,
+        scratch: &mut Vec<u8>,
+        parts: &mut [Vec<u8>; 2],
+        output: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        let matrices = [&self.r, &self.e];
+        for (matrix, part) in matrices.into_iter().zip(parts.iter_mut()) {
+            matrix.write_compact_bytes(scratch, part)?;
+        }
+        let total_len = parts.iter().try_fold(0usize, |total, part| {
+            total
+                .checked_add(8)
+                .and_then(|value| value.checked_add(part.len()))
+                .ok_or_else(|| "trapdoor compact artifact size overflow".to_owned())
+        })?;
+        if output.capacity() < total_len {
+            return Err("trapdoor compact artifact staging capacity exhausted".into());
+        }
+        // SAFETY: capacity was checked and every write below stays within the
+        // exact serialized length.
+        unsafe { output.set_len(total_len) };
+        let mut offset = 0usize;
+        for part in parts.iter() {
+            output[offset..offset + 8].copy_from_slice(&(part.len() as u64).to_le_bytes());
+            offset += 8;
+            output[offset..offset + part.len()].copy_from_slice(part);
+            offset += part.len();
+        }
+        Ok(())
     }
 
     pub fn from_compact_bytes(params: &GpuDCRTPolyParams, bytes: &[u8]) -> Option<Self> {
@@ -301,20 +198,13 @@ impl GpuDCRTTrapdoor {
         };
         let r_bytes = next(bytes, &mut offset)?;
         let e_bytes = next(bytes, &mut offset)?;
-        let a_bytes = next(bytes, &mut offset)?;
-        let b_bytes = next(bytes, &mut offset)?;
-        let d_bytes = next(bytes, &mut offset)?;
         if offset != bytes.len() {
             return None;
         }
 
         let r = GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
         let e = GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
-        let a_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
-        let b_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
-        let d_mat_coeff = GpuDCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
-        let p1_covariance_cache = Arc::new(Mutex::new(None));
-        Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache })
+        Some(Self { r, e })
     }
 
     /// Validate and upload the complete trapdoor payload into these existing
@@ -339,23 +229,11 @@ impl GpuDCRTTrapdoor {
             *offset = end;
             Ok(&bytes[start..end])
         };
-        let payloads = [
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-            next(&mut offset)?,
-        ];
+        let payloads = [next(&mut offset)?, next(&mut offset)?];
         if offset != bytes.len() {
             return Err("trapdoor payload has trailing bytes".into());
         }
-        for (payload, owner) in payloads.into_iter().zip([
-            &self.r,
-            &self.e,
-            &self.a_mat_coeff,
-            &self.b_mat_coeff,
-            &self.d_mat_coeff,
-        ]) {
+        for (payload, owner) in payloads.into_iter().zip([&self.r, &self.e]) {
             GpuDCRTPolyMatrix::validate_compact_bytes(
                 payload,
                 owner.row_size(),
@@ -365,13 +243,7 @@ impl GpuDCRTTrapdoor {
                 owner.is_ntt(),
             )?;
         }
-        for (payload, owner) in payloads.into_iter().zip([
-            &self.r,
-            &self.e,
-            &self.a_mat_coeff,
-            &self.b_mat_coeff,
-            &self.d_mat_coeff,
-        ]) {
+        for (payload, owner) in payloads.into_iter().zip([&self.r, &self.e]) {
             owner.load_compact_bytes(payload)?;
         }
         Ok(())
@@ -391,30 +263,20 @@ fn p1_covariance_parameters(
     (c, s, dgg_stddev)
 }
 
-fn get_or_create_p1_covariance_cache(
+fn derive_p1_covariance_cache(
     trapdoor: &GpuDCRTTrapdoor,
     c: f64,
     s: f64,
     dgg_stddev: f64,
 ) -> Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache> {
-    let mut guard = trapdoor.p1_covariance_cache.lock().expect("p1 cache mutex poisoned");
-    if let Some(entry) = guard.as_ref() &&
-        entry.c == c &&
-        entry.s == s &&
-        entry.dgg_stddev == dgg_stddev
-    {
-        return entry.cache.clone();
-    }
-
-    let cache = Arc::new(GpuDCRTPolyMatrix::create_p1_covariance_cache(
-        &trapdoor.a_mat_coeff,
-        &trapdoor.b_mat_coeff,
-        &trapdoor.d_mat_coeff,
-        c,
-        s,
-        dgg_stddev,
+    // Gram matrices and the native covariance object are operation-owned
+    // workspace. They are derived once for this preimage boundary.
+    let gram_a = Arc::new(coefficient_matrix(&(&trapdoor.r * &trapdoor.r.transpose())));
+    let gram_b = Arc::new(coefficient_matrix(&(&trapdoor.r * &trapdoor.e.transpose())));
+    let gram_d = Arc::new(coefficient_matrix(&(&trapdoor.e * &trapdoor.e.transpose())));
+    let cache = Arc::new(GpuDCRTPolyMatrix::create_p1_covariance_cache_owned(
+        gram_a, gram_b, gram_d, c, s, dgg_stddev,
     ));
-    *guard = Some(GpuP1CovarianceCacheEntry { c, s, dgg_stddev, cache: cache.clone() });
     cache
 }
 
@@ -441,10 +303,45 @@ fn dcrt_matrix_bytes(
     rows: usize,
     columns: usize,
 ) -> Result<usize, SmallMatrixError> {
+    dcrt_matrix_bytes_format(params, rows, columns, true)
+}
+
+fn dcrt_matrix_bytes_format(
+    params: &GpuDCRTPolyParams,
+    rows: usize,
+    columns: usize,
+    is_ntt: bool,
+) -> Result<usize, SmallMatrixError> {
     params
-        .matrix_allocation_bytes(params.crt_depth().saturating_sub(1), rows, columns, true)
+        .matrix_allocation_bytes(params.crt_depth().saturating_sub(1), rows, columns, is_ntt)
         .map(|allocation| allocation.total_bytes)
         .map_err(|_| SmallMatrixError::DimensionOverflow)
+}
+
+fn covariance_cache_workspace_bytes(
+    params: &GpuDCRTPolyParams,
+    d: usize,
+) -> Result<usize, SmallMatrixError> {
+    let gram_bytes = dcrt_matrix_bytes_format(params, d, d, false)?
+        .checked_mul(3)
+        .ok_or(SmallMatrixError::DimensionOverflow)?;
+    let covariance_rows = d.checked_mul(2).ok_or(SmallMatrixError::DimensionOverflow)?;
+    let ring_dimension = params.ring_dimension() as usize;
+    let factor_elements =
+        ring_dimension.checked_mul(covariance_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+    let update_elements =
+        factor_elements.checked_mul(covariance_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+    let scalar_bytes = std::mem::size_of::<f64>();
+    let sqrt_bytes =
+        factor_elements.checked_mul(scalar_bytes).ok_or(SmallMatrixError::DimensionOverflow)?;
+    let update_bytes =
+        update_elements.checked_mul(scalar_bytes).ok_or(SmallMatrixError::DimensionOverflow)?;
+    let cov_bytes = update_bytes;
+    gram_bytes
+        .checked_add(sqrt_bytes)
+        .and_then(|bytes| bytes.checked_add(update_bytes))
+        .and_then(|bytes| bytes.checked_add(cov_bytes))
+        .ok_or(SmallMatrixError::DimensionOverflow)
 }
 
 enum RetryFailure {
@@ -470,467 +367,6 @@ where
 }
 
 impl GpuDCRTPolyTrapdoorSampler {
-    /// Allocate the compact preimage destination and its immutable hard-cutoff
-    /// plan. Runtime admission calls this once per retained output inside an
-    /// explicit claim boundary; the tile attempts below fill its columns.
-    pub fn preimage_destination(
-        params: &GpuDCRTPolyParams,
-        public_columns: usize,
-        columns: usize,
-        max_coefficient_bound: BigUint,
-    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
-        let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
-            .map_err(|_| SmallMatrixError::WidthOverflow)?
-            .max(1);
-        let destination = GpuSmallMatrix::new_empty_checked(
-            params,
-            public_columns,
-            columns,
-            max_coefficient_bound,
-            magnitude_bytes,
-            usize::MAX,
-            true,
-        )?;
-        destination.prepare_preimage_hard_cutoff();
-        Ok(destination)
-    }
-
-    /// Create the trapdoor's P1 covariance cache for this sampler's parameters
-    /// and `d` public rows, so later attempts find it prepared instead of
-    /// allocating during production sampling.
-    pub fn prepare_preimage_cache(
-        &self,
-        params: &GpuDCRTPolyParams,
-        trapdoor: &GpuDCRTTrapdoor,
-        d: usize,
-    ) {
-        let n = params.ring_dimension() as usize;
-        let k = params.modulus_digits();
-        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
-        let _ = get_or_create_p1_covariance_cache(trapdoor, self.c, s, self.sigma);
-    }
-
-    fn prepared_p1_covariance_cache(
-        &self,
-        trapdoor: &GpuDCRTTrapdoor,
-        s: f64,
-    ) -> Option<Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>> {
-        let guard = trapdoor.p1_covariance_cache.lock().ok()?;
-        let entry = guard.as_ref()?;
-        (entry.c == self.c && entry.s == s && entry.dgg_stddev == self.sigma)
-            .then(|| Arc::clone(&entry.cache))
-    }
-
-    /// One bounded candidate attempt for `target_tile` (already resident and
-    /// in evaluation format) into `destination` columns starting at
-    /// `column_start`, with the production seed derivation for the global
-    /// column and attempt index. Returns whether the tile was accepted. The
-    /// preimage equation and inclusive cutoff are unchanged; only the retry
-    /// loop moves to the caller so each attempt is a separate claim boundary.
-    pub fn preimage_attempt(
-        &self,
-        params: &GpuDCRTPolyParams,
-        trapdoor: &GpuDCRTTrapdoor,
-        public_matrix: &GpuDCRTPolyMatrix,
-        target_tile: &GpuDCRTPolyMatrix,
-        destination: &mut GpuSmallMatrix,
-        column_start: usize,
-        global_column_start: usize,
-        attempt: usize,
-        randomness_seed: [u8; 32],
-    ) -> Result<bool, SmallMatrixError> {
-        let d = public_matrix.row_size();
-        let k = public_matrix.col_size();
-        let columns = target_tile.col_size();
-        if target_tile.row_size() != d || k == 0 || columns == 0 || !target_tile.is_ntt() {
-            return Err(SmallMatrixError::ShapeMismatch);
-        }
-        if public_matrix.params != *params ||
-            trapdoor.r.params != *params ||
-            trapdoor.e.params != *params ||
-            target_tile.params != *params
-        {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
-        let candidate = expanded_preimage_candidate(
-            self,
-            params,
-            trapdoor,
-            public_matrix,
-            target_tile,
-            preimage_seed(randomness_seed, b"candidate", global_column_start, attempt),
-        )
-        .into_coeff_domain();
-        destination.try_pack_preimage_hard_cutoff_tile(&candidate, 0, column_start, k, columns)
-    }
-
-    /// Execute one candidate for each supplied job. The residual phase uses
-    /// one native batch, as do the perturbation product, correction and INTT.
-    /// Cutoff batches device checks and publication with one decision wait;
-    /// Gaussian stages preserve the scalar random streams while submitting
-    /// admitted siblings together. This does not retry accepted
-    /// jobs or perform calibration. Prepared callers must account for these phase lifetimes
-    /// and the residual batch workspace, rather than scalar attempt claims.
-    pub fn preimage_attempt_batch(
-        &self,
-        params: &GpuDCRTPolyParams,
-        jobs: Box<[GpuPreimageAttempt<'_>]>,
-        resources: &mut impl GpuPreimageBatchResources,
-    ) -> Result<Vec<bool>, String> {
-        let mut accepted = vec![false; jobs.len()];
-        self.preimage_attempt_batch_into(params, &jobs, resources, &mut accepted)?;
-        Ok(accepted)
-    }
-
-    pub fn preimage_attempt_batch_into(
-        &self,
-        params: &GpuDCRTPolyParams,
-        jobs: &[GpuPreimageAttempt<'_>],
-        resources: &mut impl GpuPreimageBatchResources,
-        accepted_out: &mut [bool],
-    ) -> Result<(), String> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        if accepted_out.len() < jobs.len() {
-            return Err("preimage acceptance output is smaller than the job batch".into());
-        }
-        let d = jobs[0].public.row_size();
-        let columns = jobs[0].target.col_size();
-        let s = preimage_smoothing_parameter(
-            self.base,
-            self.sigma,
-            d,
-            params.ring_dimension() as usize,
-            params.modulus_digits(),
-        );
-        let sigma_large = (s * s - self.c * self.c).sqrt();
-        let scratch_ptr = resources.batch_scratch();
-        let (mut owned_seeds, mut owned_p2_seeds, mut owned_p1_seeds, mut owned_gadget_seeds) =
-            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        if let Some(scratch) = scratch_ptr {
-            let scratch = unsafe { &mut *scratch };
-            if jobs.len() > scratch.capacity() {
-                return Err("preimage seed scratch capacity mismatch".into());
-            }
-            for (index, job) in jobs.iter().enumerate() {
-                let seed =
-                    preimage_seed(job.seed, b"candidate", job.global_column_start, job.attempt);
-                scratch.candidate_seeds[index] = seed;
-                let perturb = preimage_seed(seed.to_bytes(), b"perturb", 0, 0);
-                scratch.p2_seeds[index] = preimage_seed(perturb.to_bytes(), b"p2", 0, 0);
-                scratch.p1_seeds[index] = preimage_seed(perturb.to_bytes(), b"p1", 0, 0);
-                scratch.gadget_seeds[index] = preimage_seed(seed.to_bytes(), b"z", 0, 0);
-                scratch.trapdoor_r[index] = job.trapdoor.r.native_raw() as usize;
-                scratch.trapdoor_e[index] = job.trapdoor.e.native_raw() as usize;
-            }
-        } else {
-            owned_seeds = jobs
-                .par_iter()
-                .map(|job| {
-                    preimage_seed(job.seed, b"candidate", job.global_column_start, job.attempt)
-                })
-                .collect();
-            owned_p2_seeds = owned_seeds
-                .par_iter()
-                .map(|seed| {
-                    let perturb = preimage_seed(seed.to_bytes(), b"perturb", 0, 0);
-                    preimage_seed(perturb.to_bytes(), b"p2", 0, 0)
-                })
-                .collect();
-            owned_p1_seeds = owned_seeds
-                .par_iter()
-                .map(|seed| {
-                    let perturb = preimage_seed(seed.to_bytes(), b"perturb", 0, 0);
-                    preimage_seed(perturb.to_bytes(), b"p1", 0, 0)
-                })
-                .collect();
-            owned_gadget_seeds = owned_seeds
-                .par_iter()
-                .map(|seed| preimage_seed(seed.to_bytes(), b"z", 0, 0))
-                .collect();
-        }
-        let (seeds, p2_seeds, p1_seeds, gadget_seeds): (
-            &[GpuRngSeed],
-            &[GpuRngSeed],
-            &[GpuRngSeed],
-            &[GpuRngSeed],
-        ) = if let Some(scratch) = scratch_ptr {
-            let scratch = unsafe { &*scratch };
-            (
-                &scratch.candidate_seeds[..jobs.len()],
-                &scratch.p2_seeds[..jobs.len()],
-                &scratch.p1_seeds[..jobs.len()],
-                &scratch.gadget_seeds[..jobs.len()],
-            )
-        } else {
-            (&owned_seeds, &owned_p2_seeds, &owned_p1_seeds, &owned_gadget_seeds)
-        };
-        let mut p2 = seeds
-            .iter()
-            .map(|_| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::P2Output,
-                    params,
-                    jobs[0].trapdoor.r.col_size(),
-                    columns,
-                    params.crt_depth() - 1,
-                    false,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        resources.run(GpuPreimageBatchPhase::SampleP2, jobs.len(), || match scratch_ptr {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::sample_gaussian_batch_with_scratch(
-                    &mut p2,
-                    sigma_large,
-                    p2_seeds,
-                    &mut *scratch,
-                )
-            },
-            None => GpuDCRTPolyMatrix::sample_gaussian_batch(&mut p2, sigma_large, p2_seeds),
-        })?;
-        let mut products = jobs
-            .iter()
-            .map(|_| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::ProductOutput,
-                    params,
-                    2 * d,
-                    columns,
-                    params.crt_depth() - 1,
-                    true,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let scratch = resources.batch_scratch();
-        resources.run(GpuPreimageBatchPhase::Product, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::apply_trapdoor_batch_with_raw_scratch(
-                    &mut products,
-                    &p2,
-                    false,
-                    &mut *scratch,
-                )
-            },
-            None => {
-                let trapdoors =
-                    jobs.iter().map(|job| (&job.trapdoor.r, &job.trapdoor.e)).collect::<Vec<_>>();
-                GpuDCRTPolyMatrix::apply_trapdoor_batch(&mut products, &trapdoors, &p2, false)
-            }
-        })?;
-        let scratch = resources.batch_scratch();
-        resources.run(GpuPreimageBatchPhase::ProductIntt, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::intt_batch_in_place_with_scratch(&mut products, &mut *scratch)
-            },
-            None => GpuDCRTPolyMatrix::intt_batch_in_place(&mut products),
-        })?;
-        let mut p1 = jobs
-            .iter()
-            .map(|_| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::P1Output,
-                    params,
-                    2 * d,
-                    columns,
-                    params.crt_depth() - 1,
-                    false,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        resources.run(GpuPreimageBatchPhase::SampleP1, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                let scratch = &mut *scratch;
-                for (index, job) in jobs.iter().enumerate() {
-                    let cache = self
-                        .prepared_p1_covariance_cache(job.trapdoor, s)
-                        .ok_or("preimage P1 covariance cache was not prepared")?;
-                    scratch.caches[index] = cache.native_raw() as usize;
-                    scratch.cache_holders[index] = Some(cache);
-                }
-                GpuDCRTPolyMatrix::sample_p1_batch_with_raw_scratch(
-                    &mut p1, &products, p1_seeds, scratch,
-                )
-            },
-            None => {
-                let caches = jobs
-                    .iter()
-                    .map(|job| {
-                        get_or_create_p1_covariance_cache(job.trapdoor, self.c, s, self.sigma)
-                    })
-                    .collect::<Vec<_>>();
-                let caches = caches.iter().map(AsRef::as_ref).collect::<Vec<_>>();
-                GpuDCRTPolyMatrix::sample_p1_batch(&mut p1, &products, &caches, p1_seeds)
-            }
-        })?;
-        for product in products {
-            resources.recycle_matrix(product);
-        }
-        let perturbations = p1
-            .into_iter()
-            .zip(p2)
-            .map(|(p1, p2)| GpuPerturbationSamples { p1, p2 })
-            .collect::<Vec<_>>();
-        let mut residuals = jobs
-            .iter()
-            .map(|job| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::Residual,
-                    params,
-                    job.target.row_size(),
-                    job.target.col_size(),
-                    job.target.level(),
-                    true,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        resources.run(GpuPreimageBatchPhase::Residual, jobs.len(), || {
-            GpuDCRTPolyMatrix::preimage_residual_batch_into(
-                &mut residuals,
-                jobs.iter().zip(&perturbations).map(|(job, perturbation)| {
-                    (job.target, job.public, &perturbation.p1, &perturbation.p2)
-                }),
-            )
-        })?;
-        // Assemble every retained candidate before correction starts. This
-        // retires all p1/p2 owners (through their existing reader events) before
-        // any gadget/correction workspace overlaps the residual batch's peak.
-        let mut candidates = perturbations
-            .iter()
-            .map(|perturbation| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::AssembleOutput,
-                    params,
-                    perturbation.p1.row_size() + perturbation.p2.row_size(),
-                    columns,
-                    params.crt_depth() - 1,
-                    true,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        resources.run(GpuPreimageBatchPhase::Assemble, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                let scratch = &mut *scratch;
-                for (index, perturbation) in perturbations.iter().enumerate() {
-                    scratch.tops[index] = perturbation.p1.native_raw() as usize;
-                    scratch.bottoms[index] = perturbation.p2.native_raw() as usize;
-                }
-                GpuDCRTPolyMatrix::assemble_preimage_batch_with_raw_scratch(
-                    &mut candidates,
-                    scratch,
-                )
-            },
-            None => {
-                let sources = perturbations.iter().map(|p| (&p.p1, &p.p2)).collect::<Vec<_>>();
-                GpuDCRTPolyMatrix::assemble_preimage_batch(&mut candidates, &sources)
-            }
-        })?;
-        for perturbation in perturbations {
-            resources.recycle_matrix(perturbation.p1);
-            resources.recycle_matrix(perturbation.p2);
-        }
-        resources.run(GpuPreimageBatchPhase::ResidualIntt, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::intt_batch_in_place_with_scratch(&mut residuals, &mut *scratch)
-            },
-            None => GpuDCRTPolyMatrix::intt_batch_in_place(&mut residuals),
-        })?;
-        let mut corrections = jobs
-            .iter()
-            .map(|_| {
-                resources.matrix_destination(
-                    GpuPreimageBatchPhase::GadgetOutput,
-                    params,
-                    d * params.modulus_digits(),
-                    columns,
-                    params.crt_depth() - 1,
-                    false,
-                )
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        resources.run(GpuPreimageBatchPhase::Gadget, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::sample_gadget_batch_with_scratch(
-                    &mut corrections,
-                    &residuals,
-                    self.c,
-                    gadget_seeds,
-                    &mut *scratch,
-                )
-            },
-            None => GpuDCRTPolyMatrix::sample_gadget_batch(
-                &mut corrections,
-                &residuals,
-                self.c,
-                gadget_seeds,
-            ),
-        })?;
-        for residual in residuals {
-            resources.recycle_matrix(residual);
-        }
-        resources.run(GpuPreimageBatchPhase::Correction, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::apply_trapdoor_batch_with_raw_scratch(
-                    &mut candidates,
-                    &corrections,
-                    true,
-                    &mut *scratch,
-                )
-            },
-            None => {
-                let trapdoors =
-                    jobs.iter().map(|job| (&job.trapdoor.r, &job.trapdoor.e)).collect::<Vec<_>>();
-                GpuDCRTPolyMatrix::apply_trapdoor_batch(
-                    &mut candidates,
-                    &trapdoors,
-                    &corrections,
-                    true,
-                )
-            }
-        })?;
-        for correction in corrections {
-            resources.recycle_matrix(correction);
-        }
-        resources.run(GpuPreimageBatchPhase::Intt, jobs.len(), || match scratch {
-            Some(scratch) => unsafe {
-                GpuDCRTPolyMatrix::intt_batch_in_place_with_scratch(&mut candidates, &mut *scratch)
-            },
-            None => GpuDCRTPolyMatrix::intt_batch_in_place(&mut candidates),
-        })?;
-        let job_count = jobs.len();
-        if let Some(scratch) = scratch {
-            resources.run(GpuPreimageBatchPhase::Cutoff, job_count, || {
-                let packed = jobs
-                    .iter()
-                    .zip(&candidates)
-                    .map(|(job, candidate)| (job.destination, candidate, 0, job.column_start))
-                    .collect();
-                unsafe {
-                    GpuSmallMatrix::pack_preimage_batch_with_scratch_into(packed, &mut *scratch)
-                }
-            })?;
-            let scratch = unsafe { &*scratch };
-            for (output, flag) in accepted_out.iter_mut().zip(&scratch.accepted[..job_count]) {
-                *output = *flag != 0;
-            }
-        } else {
-            let accepted = resources.run(GpuPreimageBatchPhase::Cutoff, job_count, || {
-                let packed = jobs
-                    .into_iter()
-                    .zip(&candidates)
-                    .map(|(job, candidate)| (job.destination, candidate, 0, job.column_start))
-                    .collect();
-                GpuSmallMatrix::pack_preimage_batch(packed)
-            })?;
-            accepted_out[..job_count].copy_from_slice(&accepted);
-        }
-        for candidate in candidates {
-            resources.recycle_matrix(candidate);
-        }
-        Ok(())
-    }
-
     /// Produce the bounded preimage directly in compact GPU storage. Each
     /// retry expands only one complete K-by-C_s candidate tile.
     fn bounded_preimage(
@@ -972,26 +408,24 @@ impl GpuDCRTPolyTrapdoorSampler {
         let attempts = crate::env::gpu_preimage_max_tile_attempts()
             .map_err(|_| SmallMatrixError::InvalidConfig)?;
         let mut tile_columns = columns;
-        let persistent_bytes = [
-            public_matrix,
-            &trapdoor.r,
-            &trapdoor.e,
-            &trapdoor.a_mat_coeff,
-            &trapdoor.b_mat_coeff,
-            &trapdoor.d_mat_coeff,
-        ]
-        .into_iter()
-        .map(|matrix| dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size()))
-        .try_fold(0usize, |sum, bytes| {
-            let bytes = bytes?;
-            sum.checked_add(bytes).ok_or(SmallMatrixError::DimensionOverflow)
-        })?;
+        let persistent_bytes = [public_matrix, &trapdoor.r, &trapdoor.e]
+            .into_iter()
+            .map(|matrix| dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size()))
+            .try_fold(0usize, |sum, bytes| {
+                let bytes = bytes?;
+                sum.checked_add(bytes).ok_or(SmallMatrixError::DimensionOverflow)
+            })?;
         let resident_target_bytes = target.resident_matrix().map_or(Ok(0), |matrix| {
             dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size())
         })?;
         let persistent_bytes = persistent_bytes
             .checked_add(resident_target_bytes)
             .ok_or(SmallMatrixError::DimensionOverflow)?;
+        // The three coefficient Gram matrices are operation-owned P1
+        // workspace. Keep them in the same peak bucket as the perturbation
+        // outputs; the covariance cache retains these owners until sampling
+        // has retired its asynchronous readers.
+        let covariance_workspace_bytes = covariance_cache_workspace_bytes(params, d)?;
         let compact_bytes = k
             .checked_mul(columns)
             .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
@@ -1025,6 +459,7 @@ impl GpuDCRTPolyTrapdoorSampler {
             let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
             let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
                 .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
+                .and_then(|bytes| bytes.checked_add(covariance_workspace_bytes))
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
             let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
             let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
@@ -1071,6 +506,7 @@ impl GpuDCRTPolyTrapdoorSampler {
         let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
         let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
             .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
+            .and_then(|bytes| bytes.checked_add(covariance_workspace_bytes))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
         let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
         let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
@@ -1101,6 +537,12 @@ impl GpuDCRTPolyTrapdoorSampler {
                 budget_bytes: budget,
             });
         }
+        let covariance_cache = {
+            let n = params.ring_dimension() as usize;
+            let s =
+                preimage_smoothing_parameter(self.base, self.sigma, d, n, params.modulus_digits());
+            derive_p1_covariance_cache(trapdoor, self.c, s, self.sigma)
+        };
         tracing::debug!(
             persistent_bytes = report.persistent_bytes,
             compact_destination_bytes = report.compact_destination_bytes,
@@ -1130,12 +572,13 @@ impl GpuDCRTPolyTrapdoorSampler {
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
             let mut attempt = 0usize;
             let outcome = bounded_retry(attempts, || {
-                let candidate = expanded_preimage_candidate(
+                let candidate = expanded_preimage_candidate_with_cache(
                     self,
                     params,
                     trapdoor,
                     public_matrix,
                     &tile_target,
+                    &covariance_cache,
                     preimage_seed(randomness_seed, b"candidate", global_column, attempt),
                 )
                 .into_coeff_domain();
@@ -1284,6 +727,31 @@ fn expanded_preimage_candidate(
     target: &GpuDCRTPolyMatrix,
     randomness_seed: GpuRngSeed,
 ) -> GpuDCRTPolyMatrix {
+    let n = params.ring_dimension() as usize;
+    let d = public_matrix.row_size();
+    let s =
+        preimage_smoothing_parameter(sampler.base, sampler.sigma, d, n, params.modulus_digits());
+    let covariance_cache = derive_p1_covariance_cache(trapdoor, sampler.c, s, sampler.sigma);
+    expanded_preimage_candidate_with_cache(
+        sampler,
+        params,
+        trapdoor,
+        public_matrix,
+        target,
+        &covariance_cache,
+        randomness_seed,
+    )
+}
+
+fn expanded_preimage_candidate_with_cache(
+    sampler: &GpuDCRTPolyTrapdoorSampler,
+    params: &GpuDCRTPolyParams,
+    trapdoor: &GpuDCRTTrapdoor,
+    public_matrix: &GpuDCRTPolyMatrix,
+    target: &GpuDCRTPolyMatrix,
+    covariance_cache: &Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>,
+    randomness_seed: GpuRngSeed,
+) -> GpuDCRTPolyMatrix {
     let preimage_start = Instant::now();
     let d = public_matrix.row_size();
     let target_cols = target.col_size();
@@ -1310,7 +778,7 @@ fn expanded_preimage_candidate(
     );
 
     let p_hat_start = Instant::now();
-    let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts(
+    let GpuPerturbationSamples { p1, p2 } = sample_pert_square_mat_gpu_native_parts_with_cache(
         params,
         trapdoor,
         s,
@@ -1318,6 +786,7 @@ fn expanded_preimage_candidate(
         sampler.sigma,
         dgg_large_std,
         target_cols,
+        covariance_cache,
         preimage_seed(randomness_seed.to_bytes(), b"perturb", 0, 0),
     );
     tracing::debug!(
@@ -1366,6 +835,7 @@ fn expanded_preimage_candidate(
     out
 }
 
+#[cfg(test)]
 fn sample_pert_square_mat_gpu_native_parts(
     params: &GpuDCRTPolyParams,
     trapdoor: &GpuDCRTTrapdoor,
@@ -1374,6 +844,31 @@ fn sample_pert_square_mat_gpu_native_parts(
     dgg_stddev: f64,
     sigma_large: f64,
     total_ncol: usize,
+    randomness_seed: GpuRngSeed,
+) -> GpuPerturbationSamples {
+    let s_cache = derive_p1_covariance_cache(trapdoor, c, s, dgg_stddev);
+    sample_pert_square_mat_gpu_native_parts_with_cache(
+        params,
+        trapdoor,
+        s,
+        c,
+        dgg_stddev,
+        sigma_large,
+        total_ncol,
+        &s_cache,
+        randomness_seed,
+    )
+}
+
+fn sample_pert_square_mat_gpu_native_parts_with_cache(
+    params: &GpuDCRTPolyParams,
+    trapdoor: &GpuDCRTTrapdoor,
+    s: f64,
+    c: f64,
+    dgg_stddev: f64,
+    sigma_large: f64,
+    total_ncol: usize,
+    p1_covariance_cache: &Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>,
     randomness_seed: GpuRngSeed,
 ) -> GpuPerturbationSamples {
     let d = trapdoor.r.row_size();
@@ -1399,9 +894,8 @@ fn sample_pert_square_mat_gpu_native_parts(
     debug_assert_eq!(
         (c, s, dgg_stddev),
         p1_covariance_parameters(params, d, dgg_stddev),
-        "cached p1 covariance parameters must match the current preimage parameters",
+        "derived p1 covariance parameters must match the current preimage parameters",
     );
-    let p1_covariance_cache = get_or_create_p1_covariance_cache(trapdoor, c, s, dgg_stddev);
     let p1 = GpuDCRTPolyMatrix::sample_p1_full_cached(
         p1_covariance_cache.as_ref(),
         tp2,
@@ -1440,6 +934,21 @@ mod tests {
         DCRTPolyParams::new(128, 2, 16, 8, None, None)
     }
 
+    #[test]
+    #[sequential]
+    fn test_gpu_covariance_cache_workspace_accounting_matches_native_shapes() {
+        let params = gpu_params_from_cpu(&DCRTPolyParams::new(32, 2, 17, 4, None, None));
+        let d = 3usize;
+        let gram_bytes = dcrt_matrix_bytes_format(&params, d, d, false).unwrap();
+        let m = 2 * d;
+        let factor_elements = params.ring_dimension() as usize * m;
+        let update_elements = factor_elements * m;
+        let scalar_bytes = std::mem::size_of::<f64>();
+        let expected =
+            3 * gram_bytes + factor_elements * scalar_bytes + 2 * update_elements * scalar_bytes;
+        assert_eq!(covariance_cache_workspace_bytes(&params, d).unwrap(), expected);
+    }
+
     fn sample_pert_square_mat_gpu_native(
         params: &GpuDCRTPolyParams,
         trapdoor: &GpuDCRTTrapdoor,
@@ -1473,393 +982,6 @@ mod tests {
         p_hat.copy_block_from(&p2, p1.row_size(), 0, 0, 0, p2.row_size(), total_ncol);
         tracing::debug!("gpu preimage sample_pert: assembled p_hat without concat+slice");
         p_hat
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_gadget_batch_preserves_seeds_relation_and_metadata_free_tail() {
-        use crate::matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, trace_native_claims};
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().unwrap())
-            .unwrap_or(32);
-        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
-            .map(|value| value.parse::<usize>().unwrap())
-            .unwrap_or(2)
-            .max(1);
-        for (depth, base_bits) in [(1, 4), (3, 4), (1, 15), (3, 15)] {
-            let params =
-                gpu_params_from_cpu(&DCRTPolyParams::new(n, depth, 30, base_bits, None, None));
-            let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-            let originals = (0..65)
-                .map(|_| {
-                    GpuDCRTPolyUniformSampler::new().sample_uniform(
-                        &params,
-                        2,
-                        columns,
-                        DistType::FinRingDist,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let seeds = originals
-                .iter()
-                .map(|_| GpuRngSeed::from_bytes(rand::random()))
-                .collect::<Vec<_>>();
-            let expected = originals
-                .iter()
-                .zip(&seeds)
-                .map(|(value, seed)| value.clone().gauss_samp_gq_arb_base(sampler.c, SIGMA, *seed))
-                .collect::<Vec<_>>();
-            let mut sources = originals.clone();
-            GpuDCRTPolyMatrix::intt_batch_in_place(&mut sources).unwrap();
-            let mut outputs = sources
-                .iter()
-                .map(|_| {
-                    GpuDCRTPolyMatrix::new_empty_with_state(
-                        &params,
-                        2 * params.modulus_digits(),
-                        columns,
-                        params.crt_depth() - 1,
-                        false,
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let (result, claims) = trace_native_claims(|| {
-                GpuDCRTPolyMatrix::sample_gadget_batch(&mut outputs, &sources, sampler.c, &seeds)
-            })
-            .unwrap();
-            result.unwrap();
-            assert_eq!(
-                claims
-                    .iter()
-                    .filter(|claim| { claim.kind() == GpuPreparedSlotKind::SamplerWorkspace })
-                    .count(),
-                0,
-                "direct digit writes need no sampler workspace"
-            );
-            drop(sources);
-            assert_eq!(outputs, expected);
-            let gadget = GpuDCRTPolyMatrix::gadget_matrix(&params, 2, None);
-            for (output, original) in outputs.iter().zip(originals) {
-                assert_eq!(&gadget * output, original);
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_p1_batch_matches_scalar_small_large_and_distinct_cache_tail() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().unwrap())
-            .unwrap_or(32);
-        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
-            .map(|value| value.parse::<usize>().unwrap())
-            .unwrap_or(2)
-            .max(1);
-        let params = gpu_params_from_cpu(&DCRTPolyParams::new(n, 3, 30, 4, None, None));
-        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        // 2d=2 uses local sampling storage; 2d=10 uses the queried large
-        // workspace. Seventeen jobs cross the native descriptor block boundary.
-        for d in [1, 5] {
-            let trapdoors = (0..17).map(|_| sampler.trapdoor(&params, d).0).collect::<Vec<_>>();
-            let s = preimage_smoothing_parameter(
-                sampler.base,
-                SIGMA,
-                d,
-                n as usize,
-                params.modulus_digits(),
-            );
-            let caches = trapdoors
-                .iter()
-                .map(|trapdoor| get_or_create_p1_covariance_cache(trapdoor, sampler.c, s, SIGMA))
-                .collect::<Vec<_>>();
-            let mut products = trapdoors
-                .iter()
-                .map(|_| {
-                    GpuDCRTPolyUniformSampler::new().sample_uniform(
-                        &params,
-                        2 * d,
-                        columns,
-                        DistType::FinRingDist,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let seeds = trapdoors
-                .iter()
-                .map(|_| GpuRngSeed::from_bytes(rand::random()))
-                .collect::<Vec<_>>();
-            let expected = products
-                .iter()
-                .zip(&caches)
-                .zip(&seeds)
-                .map(|((product, cache), seed)| {
-                    GpuDCRTPolyMatrix::sample_p1_full_cached(cache.as_ref(), product.clone(), *seed)
-                })
-                .collect::<Vec<_>>();
-            GpuDCRTPolyMatrix::intt_batch_in_place(&mut products).unwrap();
-            let mut outputs = products
-                .iter()
-                .map(|_| {
-                    GpuDCRTPolyMatrix::new_empty_with_state(
-                        &params,
-                        2 * d,
-                        columns,
-                        params.crt_depth() - 1,
-                        false,
-                        None,
-                    )
-                })
-                .collect::<Vec<_>>();
-            GpuDCRTPolyMatrix::sample_p1_batch(
-                &mut outputs,
-                &products,
-                &caches.iter().map(AsRef::as_ref).collect::<Vec<_>>(),
-                &seeds,
-            )
-            .unwrap();
-            // Exercise cache/input retirement before any explicit output wait.
-            drop(products);
-            drop(caches);
-            drop(trapdoors);
-            outputs.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
-            expected.iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
-            assert_eq!(outputs, expected);
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_preimage_attempt_batch_preserves_seeds_and_relation() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|v| v.parse::<u32>().unwrap())
-            .unwrap_or(32);
-        let columns = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
-            .map(|v| v.parse::<usize>().unwrap())
-            .unwrap_or(2)
-            .max(1);
-        let params = gpu_params_from_cpu(&DCRTPolyParams::new(n, 3, 30, 4, None, None));
-        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let (trapdoor, public) = sampler.trapdoor(&params, 1);
-        sampler.prepare_preimage_cache(&params, &trapdoor, 1);
-        let targets = (0..3)
-            .map(|_| {
-                GpuDCRTPolyUniformSampler::new().sample_uniform(
-                    &params,
-                    1,
-                    columns,
-                    DistType::FinRingDist,
-                )
-            })
-            .collect::<Vec<_>>();
-        let seeds = (0..3).map(|_| rand::random::<[u8; 32]>()).collect::<Vec<_>>();
-        let make_outputs = || {
-            (0..3)
-                .map(|_| {
-                    GpuDCRTPolyTrapdoorSampler::preimage_destination(
-                        &params,
-                        public.col_size(),
-                        columns,
-                        permissive_preimage_bound(&params),
-                    )
-                    .unwrap()
-                })
-                .collect::<Vec<_>>()
-        };
-        let mut expected = make_outputs();
-        for (index, destination) in expected.iter_mut().enumerate() {
-            assert!(
-                sampler
-                    .preimage_attempt(
-                        &params,
-                        &trapdoor,
-                        &public,
-                        &targets[index],
-                        destination,
-                        0,
-                        7 + index * columns,
-                        index,
-                        seeds[index]
-                    )
-                    .unwrap()
-            );
-        }
-        let mut outputs = make_outputs();
-        let jobs = outputs
-            .iter_mut()
-            .enumerate()
-            .map(|(index, destination)| GpuPreimageAttempt {
-                trapdoor: &trapdoor,
-                public: &public,
-                target: &targets[index],
-                destination,
-                column_start: 0,
-                global_column_start: 7 + index * columns,
-                attempt: index,
-                seed: seeds[index],
-            })
-            .collect::<Box<[_]>>();
-        assert_eq!(sampler.preimage_attempt_batch(&params, jobs, &mut ()).unwrap(), vec![true; 3]);
-        for ((output, expected), target) in outputs.iter().zip(&expected).zip(&targets) {
-            assert_eq!(output, expected, "same per-job seed, column offset and attempt");
-            assert_eq!(public.multiply_small_rhs(output).unwrap(), *target);
-        }
-        // A nonzero target has no all-zero preimage. Its zero cutoff therefore
-        // rejects independently of the other job's permissive acceptance.
-        let rejecting_target = GpuDCRTPolyMatrix::unit_row_vector(&params, columns, 0);
-        let mut rejected = GpuDCRTPolyTrapdoorSampler::preimage_destination(
-            &params,
-            public.col_size(),
-            columns,
-            BigUint::from(0u8),
-        )
-        .unwrap();
-        let mut accepted = GpuDCRTPolyTrapdoorSampler::preimage_destination(
-            &params,
-            public.col_size(),
-            columns,
-            permissive_preimage_bound(&params),
-        )
-        .unwrap();
-        let accepted_flags = sampler
-            .preimage_attempt_batch(
-                &params,
-                vec![
-                    GpuPreimageAttempt {
-                        trapdoor: &trapdoor,
-                        public: &public,
-                        target: &rejecting_target,
-                        destination: &mut rejected,
-                        column_start: 0,
-                        global_column_start: 13,
-                        attempt: 0,
-                        seed: seeds[1],
-                    },
-                    GpuPreimageAttempt {
-                        trapdoor: &trapdoor,
-                        public: &public,
-                        target: &targets[0],
-                        destination: &mut accepted,
-                        column_start: 0,
-                        global_column_start: 7,
-                        attempt: 0,
-                        seed: seeds[0],
-                    },
-                ]
-                .into_boxed_slice(),
-                &mut (),
-            )
-            .unwrap();
-        assert_eq!(accepted_flags, vec![false, true]);
-        assert_eq!(accepted, expected[0]);
-        assert_eq!(
-            sampler
-                .preimage_attempt_batch(
-                    &params,
-                    vec![GpuPreimageAttempt {
-                        trapdoor: &trapdoor,
-                        public: &public,
-                        target: &rejecting_target,
-                        destination: &mut rejected,
-                        column_start: 0,
-                        global_column_start: 13,
-                        attempt: 1,
-                        seed: seeds[1],
-                    }]
-                    .into_boxed_slice(),
-                    &mut (),
-                )
-                .unwrap(),
-            vec![false]
-        );
-        assert_eq!(accepted, expected[0], "a retry must preserve the completed sibling");
-    }
-
-    #[test]
-    #[sequential]
-    fn test_gpu_preimage_attempt_claims_are_traceable_and_reproduce_bounded_preimage() {
-        use crate::matrix::gpu_dcrt_poly::{GpuPreparedSlotKind, trace_native_claims};
-        gpu_device_sync();
-        let cpu_params = DCRTPolyParams::new(32, 3, 30, 4, None, None);
-        let params = gpu_params_from_cpu(&cpu_params);
-        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
-        let ((trapdoor, public_matrix), trapdoor_claims) =
-            trace_native_claims(|| sampler.trapdoor(&params, 1)).unwrap();
-        assert!(trapdoor_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::Matrix));
-        let k = public_matrix.col_size();
-        let bound = default_preimage_cutoff(
-            params.ring_dimension(),
-            1,
-            params.modulus_digits(),
-            1 << params.base_bits(),
-            SIGMA,
-        )
-        .unwrap();
-        let uniform = GpuDCRTPolyUniformSampler::new();
-        let target = uniform.sample_uniform(&params, 1, 3, DistType::FinRingDist);
-        let (destination, destination_claims) = trace_native_claims(|| {
-            GpuDCRTPolyTrapdoorSampler::preimage_destination(&params, k, 3, bound.clone()).unwrap()
-        })
-        .unwrap();
-        assert!(destination_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::CompactPayload));
-        assert!(
-            destination_claims.iter().any(|c| c.kind() == GpuPreparedSlotKind::CompactWorkspace)
-        );
-        let mut destination = destination;
-        let seed: [u8; 32] = rand::random();
-        let tile = target.slice_columns(1, 3);
-        // Production admission prepares the covariance cache before tracing, so
-        // the traced attempt records only per-attempt claims.
-        sampler.prepare_preimage_cache(&params, &trapdoor, 1);
-        let (accepted, attempt_claims) = trace_native_claims(|| {
-            sampler
-                .preimage_attempt(
-                    &params,
-                    &trapdoor,
-                    &public_matrix,
-                    &tile,
-                    &mut destination,
-                    1,
-                    1,
-                    0,
-                    seed,
-                )
-                .unwrap()
-        })
-        .unwrap();
-        // The traced attempt claims the perturbation, residual, candidate and
-        // gadget sampler owners plus their workspaces, in claim order.
-        let kinds = attempt_claims.iter().map(|c| c.kind()).collect::<Vec<_>>();
-        assert!(
-            kinds.iter().filter(|k| **k == GpuPreparedSlotKind::Matrix).count() >= 4,
-            "{kinds:?}"
-        );
-        assert!(kinds.contains(&GpuPreparedSlotKind::SamplerWorkspace), "{kinds:?}");
-        assert!(kinds.contains(&GpuPreparedSlotKind::CompactWorkspace), "{kinds:?}");
-        assert!(
-            attempt_claims
-                .iter()
-                .filter(|c| c.kind() == GpuPreparedSlotKind::Matrix)
-                .all(|c| c.columns() == 2)
-        );
-        // A second attempt on the same shapes records the identical sequence.
-        let (_, again) = trace_native_claims(|| {
-            sampler
-                .preimage_attempt(
-                    &params,
-                    &trapdoor,
-                    &public_matrix,
-                    &tile,
-                    &mut destination,
-                    1,
-                    1,
-                    1,
-                    seed,
-                )
-                .unwrap()
-        })
-        .unwrap();
-        assert_eq!(again, attempt_claims);
-        let _ = accepted;
     }
 
     #[test]

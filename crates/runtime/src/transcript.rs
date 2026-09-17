@@ -3,7 +3,7 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, InstantiationFrame, NodeId, Port},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::{cmp::Ordering, collections::BTreeMap};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -61,15 +61,11 @@ pub enum TranscriptError {
 
 impl TranscriptRecorder {
     pub fn record(&mut self, site: DrawSite, value: RecordedValue) -> Result<(), TranscriptError> {
-        match self.entries.entry(site.clone()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(value);
-                Ok(())
-            }
-            std::collections::btree_map::Entry::Occupied(_) => {
-                Err(TranscriptError::Duplicate(site))
-            }
+        if self.entries.contains_key(&site) {
+            return Err(TranscriptError::Duplicate(site));
         }
+        self.entries.insert(site, value);
+        Ok(())
     }
 
     pub fn into_replayer(self) -> TranscriptReplayer {
@@ -85,9 +81,16 @@ impl TranscriptRecorder {
 
 impl TranscriptReplayer {
     #[cfg(feature = "gpu")]
-    pub(crate) fn from_entries(mut entries: Vec<(DrawSite, RecordedValue)>) -> Self {
+    pub(crate) fn from_entries(
+        mut entries: Vec<(DrawSite, RecordedValue)>,
+    ) -> Result<Self, TranscriptError> {
         entries.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-        Self { entries: entries.into_boxed_slice() }
+        for pair in entries.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                return Err(TranscriptError::Duplicate(pair[0].0.clone()));
+            }
+        }
+        Ok(Self { entries: entries.into_boxed_slice() })
     }
 
     pub fn get(&self, site: &DrawSite) -> Result<&RecordedValue, TranscriptError> {
@@ -97,9 +100,57 @@ impl TranscriptReplayer {
             .map_err(|_| TranscriptError::Missing(site.clone()))
     }
 
+    /// Lookup a per-invocation site without materializing the concatenated
+    /// instantiation path. Prepared replay keeps the suffix in warmup-owned
+    /// scratch; this comparison therefore performs no execute-time allocation.
+    pub fn get_with_path(
+        &self,
+        base: &DrawSite,
+        suffix: &[InstantiationFrame],
+    ) -> Result<&RecordedValue, TranscriptError> {
+        self.entries
+            .binary_search_by(|entry| compare_site_with_path(&entry.0, base, suffix))
+            .map(|index| &self.entries[index].1)
+            .map_err(|_| {
+                let mut site = base.clone();
+                site.instantiation_path.extend(suffix.iter().cloned());
+                TranscriptError::Missing(site)
+            })
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&DrawSite, &RecordedValue)> {
         self.entries.iter().map(|(site, value)| (site, value))
     }
+}
+
+fn compare_site_with_path(
+    actual: &DrawSite,
+    base: &DrawSite,
+    suffix: &[InstantiationFrame],
+) -> Ordering {
+    let mut expected = base.instantiation_path.iter().chain(suffix.iter());
+    let mut actual_path = actual.instantiation_path.iter();
+    loop {
+        match (actual_path.next(), expected.next()) {
+            (Some(actual), Some(expected)) => match actual.cmp(expected) {
+                Ordering::Equal => {}
+                ordering => return ordering,
+            },
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (None, None) => break,
+        }
+    }
+    actual.node.cmp(&base.node).then_with(|| actual.port.cmp(&base.port))
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn site_matches_path(
+    site: &DrawSite,
+    base: &DrawSite,
+    suffix: &[InstantiationFrame],
+) -> bool {
+    compare_site_with_path(site, base, suffix) == Ordering::Equal
 }
 
 pub enum SamplingMode<'a> {
@@ -179,5 +230,41 @@ mod tests {
         assert_eq!(replay.get(&nested), Ok(&value()));
         assert_eq!(replay.get(&parallel), Ok(&value()));
         assert_ne!(nested, parallel);
+    }
+
+    #[test]
+    fn replay_lookup_matches_an_invocation_path_without_rebuilding_the_site() {
+        let base = DrawSite {
+            instantiation_path: vec![InstantiationFrame { call: NodeId(1), loop_index: None }],
+            node: NodeId(2),
+            port: Port(0),
+        };
+        let suffix = [InstantiationFrame { call: NodeId(3), loop_index: Some(4) }];
+        let mut site = base.clone();
+        site.instantiation_path.extend(suffix.iter().cloned());
+        let mut recorder = TranscriptRecorder::default();
+        recorder.record(site, value()).expect("record invocation");
+        let replay = recorder.into_replayer();
+        assert_eq!(replay.get_with_path(&base, &suffix), Ok(&value()));
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn persisted_replayer_rejects_duplicate_public_and_secret_sites_after_sorting() {
+        let public = site(21);
+        let secret = site(22);
+        let public_result = TranscriptReplayer::from_entries(vec![
+            (secret.clone(), value()),
+            (public.clone(), value()),
+            (public.clone(), value()),
+        ]);
+        assert_eq!(public_result, Err(TranscriptError::Duplicate(public.clone())));
+
+        let secret_result = TranscriptReplayer::from_entries(vec![
+            (secret.clone(), value()),
+            (public, value()),
+            (secret.clone(), value()),
+        ]);
+        assert_eq!(secret_result, Err(TranscriptError::Duplicate(secret)));
     }
 }

@@ -12,10 +12,6 @@ extern "C"
 {
 #endif
 
-    int gpu_matrix_sample_gaussian_batch(
-        GpuMatrix *const *outputs, const gpu_chacha::GpuRngSeed *seeds,
-        size_t count, double sigma);
-
     int gpu_matrix_sample_distribution(
         GpuMatrix *out,
         int dist_type,

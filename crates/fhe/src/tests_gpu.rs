@@ -40,6 +40,16 @@ fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
     )
 }
 
+fn warm_up(
+    backend: &mut GpuDcrtBackend,
+    graph: &mxx_ir_core::ValidatedGraph,
+    inputs: &BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
+) {
+    backend
+        .warm_up_prepared_graph(graph, inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("GPU prepared graph warmup");
+}
+
 fn values(
     result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
@@ -93,17 +103,13 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     multiplier[1] = 1;
     let mut backend = backend(&common, None);
     let mut store = MemoryArtifactStore::default();
-    let mut result = execute(
-        &graph,
-        &mut backend,
-        BTreeMap::from([
-            ("message".into(), input(&message)),
-            ("multiplier".into(), input(&multiplier)),
-        ]),
-        &mut store,
-        SamplingMode::Fresh,
-    )
-    .unwrap();
+    let inputs = BTreeMap::from([
+        ("message".into(), input(&message)),
+        ("multiplier".into(), input(&multiplier)),
+    ]);
+    warm_up(&mut backend, &graph, &inputs);
+    let mut result =
+        execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
     assert_eq!(
         values(&mut result, "roundtrip", &mut backend, &mut store),
         message
@@ -179,14 +185,11 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let mut backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
     let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
-    let encrypted = execute(
-        &encryption,
-        &mut backend,
-        BTreeMap::from([("slots".into(), input(&message))]),
-        &mut store,
-        SamplingMode::Fresh,
-    )
-    .unwrap();
+    let encryption_inputs = BTreeMap::from([("slots".into(), input(&message))]);
+    warm_up(&mut backend, &encryption, &encryption_inputs);
+    let encrypted =
+        execute(&encryption, &mut backend, encryption_inputs, &mut store, SamplingMode::Fresh)
+            .unwrap();
     let encryption_id = encrypted.production_id.unwrap();
     let mut manifests =
         BTreeMap::from([(encryption_id.clone(), store.manifest(&encryption_id).unwrap().clone())]);
@@ -250,8 +253,10 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
+    let evaluator_inputs = BTreeMap::new();
+    warm_up(&mut backend, &evaluator, &evaluator_inputs);
     let evaluated =
-        execute(&evaluator, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+        execute(&evaluator, &mut backend, evaluator_inputs, &mut store, SamplingMode::Fresh)
             .unwrap();
     let evaluation_id = evaluated.production_id.unwrap();
     manifests.insert(evaluation_id.clone(), store.manifest(&evaluation_id).unwrap().clone());
@@ -284,8 +289,10 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
+    let decryption_inputs = BTreeMap::new();
+    warm_up(&mut backend, &decryption, &decryption_inputs);
     let mut result =
-        execute(&decryption, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+        execute(&decryption, &mut backend, decryption_inputs, &mut store, SamplingMode::Fresh)
             .unwrap();
     for (name, _) in outputs {
         let expected = (0..n)
@@ -341,17 +348,13 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let mut backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
     let partial_values = (0..n - 1).map(|i| i as i64 - t as i64 - 1).collect::<Vec<_>>();
-    let mut result = execute(
-        &graph,
-        &mut backend,
-        BTreeMap::from([
-            ("single".into(), input(&[-1])),
-            ("partial".into(), input(&partial_values)),
-        ]),
-        &mut store,
-        SamplingMode::Fresh,
-    )
-    .unwrap();
+    let inputs = BTreeMap::from([
+        ("single".into(), input(&[-1])),
+        ("partial".into(), input(&partial_values)),
+    ]);
+    warm_up(&mut backend, &graph, &inputs);
+    let mut result =
+        execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
     let mut expected = vec![BigInt::from(0); n];
     expected[0] = BigInt::from(t - 1);
     assert_eq!(values(&mut result, "single", &mut backend, &mut store), expected);
@@ -428,14 +431,10 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     let mut backend = backend(&common, Some(&bgv));
     let mut store = MemoryArtifactStore::default();
     let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
-    let mut result = execute(
-        &graph,
-        &mut backend,
-        BTreeMap::from([("slots".into(), input(&message))]),
-        &mut store,
-        SamplingMode::Fresh,
-    )
-    .unwrap();
+    let inputs = BTreeMap::from([("slots".into(), input(&message))]);
+    warm_up(&mut backend, &graph, &inputs);
+    let mut result =
+        execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
     let expected = message
         .iter()
         .map(|&m| {

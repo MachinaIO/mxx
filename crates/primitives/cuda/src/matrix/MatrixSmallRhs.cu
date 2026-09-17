@@ -1348,7 +1348,7 @@ extern "C" int gpu_matrix_prepare_small_upload(
     if (!plan || gpu_prepared_validate_descriptor(plan) != 0 ||
         plan->allocation_count != 2 || plan->stream_count != 1)
         return set_error("prepared small upload requires a saved descriptor");
-    const GpuPreparedResourceKey host_key{0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
     if (gpu_prepared_require_allocation(plan, 0, GPU_PREPARED_PINNED_HOST, &host_key,
             payload_len, 1) != 0 || plan->allocations[0].rows != 0 ||
         plan->allocations[0].columns != 0 || plan->allocations[0].level != -1 ||
@@ -3021,88 +3021,4 @@ extern "C" int gpu_preimage_cutoff_is_ready(const GpuPreparedPreimageCutoff *pla
 extern "C" void gpu_small_matrix_destroy_preimage_cutoff(GpuPreparedPreimageCutoff *plan)
 {
     delete plan;
-}
-
-// The caller owns every destination exclusively and supplies valid tile ranges.
-extern "C" int gpu_small_matrix_pack_preimage_batch(
-    GpuSmallMatrix *const *destinations, const GpuMatrix *const *sources,
-    const size_t *dst_rows, const size_t *dst_columns, size_t count, int32_t *accepted)
-{
-    if (count == 0) return 0;
-    auto *first = destinations[0];
-    GpuAllocationActivity activity(first->ctx->execution.get(), -1);
-    if (small_set_device(first) != 0) return 1;
-    const auto stream = first->stream;
-    const size_t rows = sources[0]->rows, columns = sources[0]->cols;
-    const size_t coefficients = rows * columns * first->n;
-    const size_t limbs = sources[0]->level + 1;
-    const size_t partition = first->ctx->limb_gpu_ids[0].x;
-    const auto &constants = first->ctx->ring_device_constants[partition];
-    // Acquire all staging owners before any reader event claims. This explicit
-    // phase order is also used when expanding the W=1 prepared trace.
-    std::vector<std::unique_ptr<GpuDeviceWorkspace>> staging;
-    staging.reserve(count);
-    for (size_t index = 0; index < count; ++index) {
-        staging.emplace_back(new GpuDeviceWorkspace());
-        const size_t bytes = coefficients * (1 + destinations[index]->magnitude_bytes);
-        if (staging.back()->acquire(first->ctx, first->device,
-                GPU_PREPARED_COMPACT_WORKSPACE, bytes, alignof(uint8_t), stream) != 0)
-            return 1;
-    }
-    for (size_t offset = 0; offset < count; offset += kCompactPreimageBatch) {
-        const size_t width = std::min(kCompactPreimageBatch, count - offset);
-        CompactPreimageBatch batch{};
-        size_t max_bytes = 0;
-        for (size_t local = 0; local < width; ++local) {
-            const size_t index = offset + local;
-            auto *dst = destinations[index];
-            const auto *src = sources[index];
-            if (small_wait(dst, stream) != 0) return 1;
-            for (size_t limb = 0; limb < limbs; ++limb)
-                if (matrix_wait_limb_stream(src, src->ctx->limb_gpu_ids[limb],
-                        first->device, stream, true, true) != 0) return 1;
-            batch.jobs[local] = {
-                src->shared_limb_buffers[partition].device_descriptors,
-                constants.moduli, dst->hard_cutoff_garner_inverses,
-                dst->hard_cutoff_modulus_words, dst->hard_cutoff_half_modulus_words,
-                dst->hard_cutoff_bound_words, dst->hard_cutoff_subset_indices,
-                static_cast<int>(src->ctx->moduli.size()), dst->hard_cutoff_subset_count,
-                static_cast<int>(limbs), dst->hard_cutoff_words_per_coeff,
-                dst->hard_cutoff_device_accepted, staging[index]->data, dst->payload,
-                dst->magnitude_bytes, dst->cols, dst_rows[index], dst_columns[index]
-            };
-            max_bytes = std::max(max_bytes, coefficients * (1 + dst->magnitude_bytes));
-        }
-        compact_preimage_initialize_batch_kernel<<<1, kCompactPreimageBatch, 0, stream>>>(batch, width);
-        cudaError_t error = cudaGetLastError();
-        if (error != cudaSuccess) return set_error(error);
-        const dim3 check((coefficients + kSmallThreads - 1) / kSmallThreads, width);
-        compact_preimage_check_batch_kernel<<<check, kSmallThreads, 0, stream>>>(batch, coefficients, first->n);
-        error = cudaGetLastError();
-        if (error != cudaSuccess) return set_error(error);
-        const dim3 commit((max_bytes + kSmallThreads - 1) / kSmallThreads, width);
-        compact_preimage_commit_batch_kernel<<<commit, kSmallThreads, 0, stream>>>(batch, first->n, rows, columns);
-        error = cudaGetLastError();
-        if (error != cudaSuccess) return set_error(error);
-        for (size_t local = 0; local < width; ++local) {
-            const size_t index = offset + local;
-            for (size_t limb = 0; limb < limbs; ++limb)
-                if (matrix_track_limb_consumer_readonly(sources[index],
-                        first->ctx->limb_gpu_ids[limb], first->device, stream) != 0) return 1;
-            if (small_record(destinations[index], stream) != 0) return 1;
-        }
-    }
-    for (size_t index = 0; index < count; ++index) {
-        auto *dst = destinations[index];
-        const auto error = cudaMemcpyAsync(dst->hard_cutoff_host_accepted,
-            dst->hard_cutoff_device_accepted, sizeof(int), cudaMemcpyDeviceToHost, stream);
-        if (error != cudaSuccess) return set_error(error);
-    }
-    // A single event covers every decision, including later argument chunks.
-    auto error = cudaEventRecord(first->hard_cutoff_decision_ready, stream);
-    if (error == cudaSuccess) error = cudaEventSynchronize(first->hard_cutoff_decision_ready);
-    if (error != cudaSuccess) return set_error(error);
-    for (size_t index = 0; index < count; ++index)
-        accepted[index] = *destinations[index]->hard_cutoff_host_accepted;
-    return 0;
 }

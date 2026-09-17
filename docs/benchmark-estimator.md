@@ -25,6 +25,14 @@ for comparing classes but are not a physical VRAM guarantee and do not certify
 an application's artifact representation or ownership. A missing class is an
 explicit estimator error.
 
+The GPU implementation is `GpuNodeMeasurementBackend`. Its production caller
+walks each validated graph while collecting canonical operation classes, then
+calls `measure_collected` to warm and execute prepared representative programs
+before report generation consults the frozen table. There is no Diamond-specific
+direct primitive interpreter, pilot-calibration registry, or candidate-width
+fallback. The measured path still groups fleet waves, observes prepared memory,
+and assigns columns with capped water-filling.
+
 ## Report quantities
 
 For class `k`, with multiplicity `n_k`, fleet wall time `L_k`, and device spans
@@ -71,10 +79,11 @@ descriptor. Synthetic measurement uses the same fixed-lane replay contract as
 production. Record/Replay payloads are actual accepted payloads, not inferred
 samples.
 
-Scalar classes use arbitrary-precision `BigInt` values. The prepared capacity
-ledger accounts for the words required by each declared range. Values beyond
-that ledger are reported as capacity errors; the estimator does not resize a
-prepared command or silently replan it.
+Scalar classes use arbitrary-precision `BigInt` values. Warmup derives fixed
+projections for each declared range, and estimator measurements do not model
+runtime scalar storage changes. Values beyond a prepared projection are rejected
+explicitly by execution. Report generation performs CPU-only lookup and does not
+invoke device allocation or resizing.
 
 ## Runtime agreement
 

@@ -132,6 +132,7 @@ struct MatrixTransformWorkspace
     int upload();
     int complete();
     int retire();
+    bool has_owner() const { return owner != nullptr; }
     uint8_t *base;
     uint8_t *pinned;
 

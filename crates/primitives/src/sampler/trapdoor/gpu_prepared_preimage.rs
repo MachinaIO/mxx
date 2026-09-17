@@ -11,8 +11,7 @@ use crate::{
             GpuPreparedRange, GpuPreparedSampling, GpuPreparedSchedule, GpuPreparedSchedulePlan,
             GpuPreparedSlotKind, GpuPreparedTransform, GpuPreparedTranspose, GpuPreparedView,
             GpuPreparedWorkspaceLayout, GpuSmallMatrix, GpuTracedClaim, PreparedAllocationKind,
-            PreparedAllocationLayout, PreparedOwnerLayout, PreparedOwnerLayoutCursor,
-            PreparedPlanLayout,
+            PreparedAllocationLayout, PreparedOwnerLayout, PreparedPlanLayout,
         },
     },
     poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
@@ -441,6 +440,81 @@ impl GpuPreparedPreimageLayout {
         layouts.extend(self.cutoff_workspaces.iter().map(|_| None));
         layouts
     }
+
+    /// Exact logical owner for every entry returned by [`Self::claims`].
+    /// Matrix/stage allocations use the exact owner embedded in their native
+    /// stage descriptor; phase workspaces run on the P1 descriptor owner and
+    /// cutoff workspaces run on the candidate-transform descriptor owner.
+    pub fn claim_owner_layouts(&self) -> Result<Vec<PreparedOwnerLayout>, String> {
+        let mut owners = self.matrix_owners.to_vec();
+        let should_append = |allocation: &PreparedAllocationLayout| {
+            allocation.kind != 100 &&
+                (allocation.kind == 0 ||
+                    allocation.allocation_kind().is_some_and(|kind| {
+                        !matches!(
+                            kind,
+                            PreparedAllocationKind::Matrix | PreparedAllocationKind::HostOnly
+                        )
+                    }))
+        };
+        for stage in self.stages.iter().take(PreimageStage::ResidualTransform.index() + 1) {
+            for allocation in stage.allocations() {
+                if should_append(allocation) {
+                    owners.push(
+                        stage.owner_layout().ok_or(
+                            "prepared preimage stage owner layout is missing or conflicting",
+                        )?,
+                    );
+                }
+            }
+        }
+        let phase_owner = self
+            .phases
+            .p1_ntt
+            .owner_layout()
+            .ok_or("prepared preimage phase owner layout is missing or conflicting")?;
+        let phase_claim_count = self
+            .phases
+            .workspaces
+            .iter()
+            .filter(|layout| {
+                layout.bytes != 0 || layout.kind == GpuPreparedSlotKind::CompletionEvent
+            })
+            .count();
+        owners.extend(std::iter::repeat_n(phase_owner, phase_claim_count));
+        for ntt in [&self.phases.p1_ntt, &self.phases.gadget_ntt] {
+            for allocation in ntt.allocations() {
+                if should_append(allocation) {
+                    owners.push(
+                        ntt.owner_layout().ok_or(
+                            "prepared preimage NTT owner layout is missing or conflicting",
+                        )?,
+                    );
+                }
+            }
+        }
+        for stage in self.stages.iter().skip(PreimageStage::CorrectionR.index()) {
+            for allocation in stage.allocations() {
+                if should_append(allocation) {
+                    owners.push(
+                        stage.owner_layout().ok_or(
+                            "prepared preimage stage owner layout is missing or conflicting",
+                        )?,
+                    );
+                }
+            }
+        }
+        owners.extend(std::iter::repeat_n(
+            self.stages[PreimageStage::CandidateTransform.index()]
+                .owner_layout()
+                .ok_or("prepared preimage cutoff owner layout is missing or conflicting")?,
+            self.cutoff_workspaces.len(),
+        ));
+        if owners.len() != self.claims().len() {
+            return Err("prepared preimage claim owner table length mismatch".into());
+        }
+        Ok(owners)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -607,39 +681,39 @@ impl GpuPreparedPreimageSampler {
             PreimageStage::ProductE,
             arith(4, rows, rows * k, rows * k, columns, rows, columns, &owners[8])?
         );
-        push_stage!(PreimageStage::ProductTransform, ntt(&owners[8], rows * columns, 1)?);
+        push_stage!(PreimageStage::ProductTransform, ntt(&owners[8], 2 * rows * columns, 1)?);
         push_stage!(
             PreimageStage::AssembleP1,
-            arith(0, 2 * rows, columns, 2 * rows, columns, 2 * rows, columns, &owners[9])?
+            arith(0, 2 * rows, columns, 2 * rows, columns, 2 * rows, columns, &owners[10])?
         );
         push_stage!(
             PreimageStage::AssembleP2,
-            arith(0, rows * k, columns, rows * k, columns, rows * k, columns, &owners[9])?
+            arith(0, rows * k, columns, rows * k, columns, rows * k, columns, &owners[10])?
         );
         push_stage!(
             PreimageStage::ResidualMultiply,
-            arith(4, rows * (2 + k), columns, 2 * rows, columns, rows, columns, &owners[10],)?
+            arith(4, rows * (2 + k), columns, 2 * rows, columns, rows, columns, &owners[11],)?
         );
         push_stage!(
             PreimageStage::ResidualSubtract,
-            arith(5, rows, columns, rows, columns, rows, columns, &owners[11])?
+            arith(5, rows, columns, rows, columns, rows, columns, &owners[12])?
         );
-        push_stage!(PreimageStage::ResidualTransform, ntt(&owners[11], rows * columns, 1)?);
+        push_stage!(PreimageStage::ResidualTransform, ntt(&owners[12], rows * columns, 1)?);
         push_stage!(
             PreimageStage::CorrectionR,
-            arith(4, rows, rows * k, rows * k, columns, rows, columns, &owners[12])?
+            arith(4, rows, rows * k, rows * k, columns, rows, columns, &owners[14])?
         );
         push_stage!(
             PreimageStage::CorrectionE,
-            arith(4, rows, rows * k, rows * k, columns, rows, columns, &owners[12])?
+            arith(4, rows, rows * k, rows * k, columns, rows, columns, &owners[14])?
         );
         push_stage!(
             PreimageStage::PublishP1,
-            arith(1, 2 * rows, columns, 2 * rows, columns, 2 * rows, columns, &owners[13],)?
+            arith(1, 2 * rows, columns, 2 * rows, columns, 2 * rows, columns, &owners[15],)?
         );
         push_stage!(
             PreimageStage::PublishP2,
-            arith(1, rows * k, columns, rows * k, columns, rows * k, columns, &owners[13],)?
+            arith(1, rows * k, columns, rows * k, columns, rows * k, columns, &owners[15],)?
         );
         push_stage!(PreimageStage::CandidateTransform, ntt(&owners[15], rows * (2 + k), columns)?);
         Ok(stages.into_boxed_slice())
@@ -651,11 +725,10 @@ impl GpuPreparedPreimageSampler {
         columns: usize,
     ) -> Result<Box<[PreparedOwnerLayout]>, String> {
         let claims = Self::matrix_layout(params, rows, columns);
-        let mut cursor = PreparedOwnerLayoutCursor::default();
         claims
             .into_iter()
             .map(|claim| {
-                cursor.plan(
+                PreparedOwnerLayout::plan(
                     params,
                     claim.rows(),
                     claim.columns(),
@@ -697,28 +770,6 @@ impl GpuPreparedPreimageSampler {
             (d * (2 + k), columns),
         ]
         .map(|(rows, columns)| GpuTracedClaim::matrix(rows, columns, params.crt_depth() - 1, true))
-    }
-
-    pub fn allocation_claims(
-        params: &GpuDCRTPolyParams,
-        rows: usize,
-        output: &GpuSmallMatrix,
-    ) -> Result<Vec<GpuTracedClaim>, String> {
-        let mut claims = Self::matrix_layout(params, rows, output.size().1).to_vec();
-        claims.extend(
-            GpuPreparedPreimagePhases::allocation_layout(params, rows, output.size().1)?
-                .into_iter()
-                .filter(|layout| {
-                    layout.bytes != 0 || layout.kind == GpuPreparedSlotKind::CompletionEvent
-                })
-                .map(GpuTracedClaim::workspace),
-        );
-        claims.extend(
-            GpuPreparedPreimageCutoff::allocation_layout(output, 1)?
-                .into_iter()
-                .map(GpuTracedClaim::workspace),
-        );
-        Ok(claims)
     }
 
     /// Plan the fixed Gaussian sampler stage.  This is metadata-only and is
@@ -767,7 +818,6 @@ impl GpuPreparedPreimageSampler {
             columns,
             params.crt_depth() - 1,
             crate::poly::dcrt::gpu::GPU_POLY_FORMAT_COEFF,
-            0,
         )?;
         PreparedPlanLayout::sampling_with_owner(
             params,
@@ -793,12 +843,33 @@ impl GpuPreparedPreimageSampler {
         sigma: f64,
         column_start: usize,
     ) -> Result<GpuPreparedPreimageLayout, String> {
-        let sampler = Self::plan_layout(params, public, target, output, sigma)?;
+        if !sigma.is_finite() || sigma <= 0.0 {
+            return Err("prepared preimage layout contract mismatch".into());
+        }
         let matrix_owners =
             Self::planned_matrix_owners(params, public.row_size(), target.col_size())?;
+        let sampler = PreparedPlanLayout::sampling_with_owner(
+            params,
+            public.row_size() * params.modulus_digits(),
+            target.col_size(),
+            target.col_size(),
+            0,
+            params.crt_depth() - 1,
+            crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
+            crate::poly::dcrt::gpu::GPU_MATRIX_DIST_GAUSS,
+            &matrix_owners[7],
+        )?;
         let mut stages =
             Self::plan_stages(params, &matrix_owners, public.row_size(), target.col_size())?;
         stages[PreimageStage::P2Sampler.index()] = sampler.clone();
+        let phases = GpuPreparedPreimagePhases::plan_layout(
+            params,
+            public.row_size(),
+            target.col_size(),
+            Self::gadget_digits(params),
+            &matrix_owners[9],
+            &matrix_owners[13],
+        )?;
         Ok(GpuPreparedPreimageLayout {
             stages,
             sampler: sampler.clone(),
@@ -806,12 +877,7 @@ impl GpuPreparedPreimageSampler {
             matrix_claims: Self::matrix_layout(params, public.row_size(), target.col_size())
                 .to_vec()
                 .into_boxed_slice(),
-            phases: GpuPreparedPreimagePhases::plan_layout(
-                params,
-                public.row_size(),
-                target.col_size(),
-                Self::gadget_digits(params),
-            )?,
+            phases,
             cutoff_workspaces: GpuPreparedPreimageCutoff::allocation_layout(output, 1)?
                 .into_boxed_slice(),
             attempts: crate::env::gpu_preimage_max_tile_attempts()?,
@@ -837,21 +903,34 @@ impl GpuPreparedPreimageSampler {
         if rows == 0 || columns == 0 || magnitude_bytes == 0 {
             return Err("prepared preimage layout shape is empty".into());
         }
-        let sampler = Self::plan_layout_for_shape(params, rows, columns)?;
         let matrix_owners = Self::planned_matrix_owners(params, rows, columns)?;
+        let sampler = PreparedPlanLayout::sampling_with_owner(
+            params,
+            rows * k,
+            columns,
+            columns,
+            0,
+            params.crt_depth() - 1,
+            crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
+            crate::poly::dcrt::gpu::GPU_MATRIX_DIST_GAUSS,
+            &matrix_owners[7],
+        )?;
         let mut stages = Self::plan_stages(params, &matrix_owners, rows, columns)?;
         stages[PreimageStage::P2Sampler.index()] = sampler.clone();
+        let phases = GpuPreparedPreimagePhases::plan_layout(
+            params,
+            rows,
+            columns,
+            Self::gadget_digits(params),
+            &matrix_owners[9],
+            &matrix_owners[13],
+        )?;
         Ok(GpuPreparedPreimageLayout {
             stages,
             sampler: sampler.clone(),
             matrix_owners,
             matrix_claims: Self::matrix_layout(params, rows, columns).to_vec().into_boxed_slice(),
-            phases: GpuPreparedPreimagePhases::plan_layout(
-                params,
-                rows,
-                columns,
-                Self::gadget_digits(params),
-            )?,
+            phases,
             cutoff_workspaces: GpuPreparedPreimageCutoff::allocation_layout_for_shape(
                 params,
                 rows * (2 + k),
@@ -1502,6 +1581,7 @@ mod tests {
             GpuSmallMatrix::new_empty(&params, d * (2 + params.modulus_digits()), 1, bound.clone())
                 .unwrap(),
         );
+        output.prepare_preimage_hard_cutoff();
         let layout = GpuPreparedPreimageSampler::plan_layout_bundle(
             &params, &public, &target, &output, sigma, 0,
         )
@@ -1548,16 +1628,8 @@ mod tests {
         );
 
         let (next_trapdoor, next_public) = sampler.trapdoor(&params, d);
-        let next_public = Arc::new(next_public.clone());
-        let owner_layout = PreparedOwnerLayout::plan(
-            &params,
-            next_public.row_size(),
-            next_public.col_size(),
-            next_public.level(),
-            crate::poly::dcrt::gpu::GPU_POLY_FORMAT_EVAL,
-            0,
-        )
-        .unwrap();
+        let next_public = Arc::new(next_public);
+        let owner_layout = public.prepared_owner_layout().unwrap();
         let copy_layout = PreparedPlanLayout::input_copy_with_owner(
             &params,
             next_public.row_size(),

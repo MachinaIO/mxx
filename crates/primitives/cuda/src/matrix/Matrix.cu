@@ -105,15 +105,11 @@ int gpu_matrix_prepare_kernels(GpuKernelPartition *partition)
         reinterpret_cast<const void *>(gadget_correct_residues_kernel),
         // MatrixSampling.cu
         reinterpret_cast<const void *>(matrix_sample_distribution_multi_limb_kernel),
-        reinterpret_cast<const void *>(matrix_sample_gaussian_batch_kernel),
         // MatrixTrapdoor.cu
         reinterpret_cast<const void *>(matrix_mul_vertical_pair_kernel),
         reinterpret_cast<const void *>(matrix_preimage_residual_kernel),
         reinterpret_cast<const void *>(matrix_preimage_add_correction_top_kernel),
         reinterpret_cast<const void *>(matrix_preimage_add_correction_bottom_kernel),
-        reinterpret_cast<const void *>(matrix_preimage_assemble_batch_kernel),
-        reinterpret_cast<const void *>(matrix_preimage_correction_top_batch_kernel),
-        reinterpret_cast<const void *>(matrix_preimage_correction_bottom_batch_kernel),
         reinterpret_cast<const void *>(matrix_precompute_p1_covariance_kernel),
         reinterpret_cast<const void *>(matrix_sample_p1_integer_cached_kernel_small),
         reinterpret_cast<const void *>(matrix_sample_p1_integer_cached_kernel_large),

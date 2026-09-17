@@ -2411,14 +2411,15 @@ mod tests {
                             );
                         }
                     }
-                    let scratch = GpuPreparedStorage::new(
-                        None,
-                        (0..copy_indices.len().max(1))
+                    let scratch = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+                        params: None,
+                        backing: (0..copy_indices.len().max(1))
                             .map(|_| GpuDCRTPolyMatrix::zero(&parameters, 2, 2))
                             .collect(),
-                        None,
-                        None,
-                    )
+                        uninitialized_matrices: None,
+                        workspaces: None,
+                        owner_layouts: None,
+                    })
                     .unwrap();
                     let transfer = parameters.rns_transfer_workspace(2, width + 4, 4).unwrap();
                     let mut readback_layouts = vec![
@@ -2437,14 +2438,15 @@ mod tests {
                         },
                         parameters.crt_depth() + 1,
                     ));
-                    let readback = GpuPreparedStorage::new(
-                        None,
-                        (0..2)
+                    let readback = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+                        params: None,
+                        backing: (0..2)
                             .map(|_| GpuDCRTPolyMatrix::zero(&parameters, width + 4, 4))
                             .collect(),
-                        None,
-                        Some(&readback_layouts),
-                    )
+                        uninitialized_matrices: None,
+                        workspaces: Some(&readback_layouts),
+                        owner_layouts: None,
+                    })
                     .unwrap();
                     GpuPreparedStorage::finish_setup(&[&scratch, &readback]).unwrap();
                     let claims = |columns| {
@@ -2630,12 +2632,13 @@ mod tests {
             let layouts =
                 parameters.small_rhs_workspaces(parameters.crt_depth() - 1, inner, 2).unwrap();
             assert_eq!(layouts.len(), if parameters.crt_depth() == 3 { 2 } else { 1 });
-            let scratch = GpuPreparedStorage::new(
-                None,
-                vec![GpuDCRTPolyMatrix::zero(&parameters, 1, 1)],
-                None,
-                Some(&layouts),
-            )
+            let scratch = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+                params: None,
+                backing: vec![GpuDCRTPolyMatrix::zero(&parameters, 1, 1)],
+                uninitialized_matrices: None,
+                workspaces: Some(&layouts),
+                owner_layouts: None,
+            })
             .unwrap();
             let mut readback_layouts = vec![
                 parameters
@@ -2650,12 +2653,15 @@ mod tests {
                 },
                 parameters.crt_depth(),
             ));
-            let readback = GpuPreparedStorage::new(
-                None,
-                (0..2).map(|_| GpuDCRTPolyMatrix::zero(&parameters, width + 4, 5)).collect(),
-                None,
-                Some(&readback_layouts),
-            )
+            let readback = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+                params: None,
+                backing: (0..2)
+                    .map(|_| GpuDCRTPolyMatrix::zero(&parameters, width + 4, 5))
+                    .collect(),
+                uninitialized_matrices: None,
+                workspaces: Some(&readback_layouts),
+                owner_layouts: None,
+            })
             .unwrap();
             GpuPreparedStorage::finish_setup(&[&scratch, &readback]).unwrap();
             let request = |columns| {
@@ -3611,12 +3617,13 @@ mod tests {
             },
             params.crt_depth(),
         ));
-        let storage = GpuPreparedStorage::new(
-            None,
-            vec![GpuDCRTPolyMatrix::zero(&params, 3, columns)],
-            None,
-            Some(&layouts),
-        )
+        let storage = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+            params: None,
+            backing: vec![GpuDCRTPolyMatrix::zero(&params, 3, columns)],
+            uninitialized_matrices: None,
+            workspaces: Some(&layouts),
+            owner_layouts: None,
+        })
         .unwrap();
         GpuPreparedStorage::finish_setup(&[&storage]).unwrap();
         for _ in 0..2 {
@@ -3821,12 +3828,13 @@ mod tests {
             },
             params.crt_depth(),
         ));
-        let storage = GpuPreparedStorage::new(
-            None,
-            vec![GpuDCRTPolyMatrix::zero(&params, columns, columns)],
-            None,
-            Some(&layouts),
-        )
+        let storage = GpuPreparedStorage::from_recipe(PreparedStorageRecipe::Matrix {
+            params: None,
+            backing: vec![GpuDCRTPolyMatrix::zero(&params, columns, columns)],
+            uninitialized_matrices: None,
+            workspaces: Some(&layouts),
+            owner_layouts: None,
+        })
         .unwrap();
         GpuPreparedStorage::finish_setup(&[&storage]).unwrap();
         for _ in 0..2 {

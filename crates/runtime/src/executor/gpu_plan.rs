@@ -11,6 +11,8 @@ use mxx_ir_core::{
     types::{NodeId, Port, WireRef},
 };
 use num_bigint::BigInt;
+#[cfg(test)]
+use num_bigint::BigUint;
 use num_traits::ToPrimitive;
 use std::collections::BTreeMap;
 
@@ -346,6 +348,7 @@ impl ImportProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mxx_ir_core::types::ConcreteMatrixType;
 
     #[cfg(feature = "gpu")]
     #[test]
@@ -521,17 +524,71 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
         use crate::{
-            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend_on, execute,
+            MemoryArtifactStore, RuntimeValue,
+            backend::{Backend, poly_gpu::gpu_backend_on},
+            execute,
             transcript::SamplingMode,
         };
         use mxx_primitives::{
-            matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
             poly::{
-                PolyParams,
-                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+                Poly, PolyParams,
+                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
             },
             sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
         };
+        use std::sync::Arc;
+        fn decode_prepared_compact(bytes: &[u8], parameters: &DCRTPolyParams) -> DCRTPolyMatrix {
+            let (
+                (
+                    version,
+                    _format,
+                    _level,
+                    rows,
+                    columns,
+                    max_coeff_bits,
+                    _bytes_per_coeff,
+                    payload,
+                ),
+                consumed,
+            ): ((u8, u8, u32, usize, usize, u16, u16, &[u8]), usize) =
+                bincode::borrow_decode_from_slice(bytes, bincode::config::standard())
+                    .expect("prepared GPU compact output header");
+            assert_eq!(version, 1);
+            let bit_width = usize::from(max_coeff_bits);
+            let magnitude_bits = bit_width.saturating_sub(1);
+            let ring_dimension = parameters.ring_dimension() as usize;
+            let modulus = parameters.modulus();
+            let mut polys = Vec::with_capacity(rows * columns);
+            for poly_index in 0..rows * columns {
+                let mut coefficients = Vec::with_capacity(ring_dimension);
+                for coefficient_index in 0..ring_dimension {
+                    let value = if bit_width == 0 {
+                        BigUint::ZERO
+                    } else {
+                        let base_bit =
+                            (poly_index * ring_dimension + coefficient_index) * bit_width;
+                        let magnitude = (0..magnitude_bits).fold(BigUint::ZERO, |value, bit| {
+                            let bit_index = base_bit + bit;
+                            let set = (payload[bit_index / 8] >> (bit_index % 8)) & 1 != 0;
+                            if set { value | (BigUint::from(1u8) << bit) } else { value }
+                        });
+                        let sign_bit = base_bit + magnitude_bits;
+                        let negative = (payload[sign_bit / 8] >> (sign_bit % 8)) & 1 != 0;
+                        if negative && magnitude != BigUint::ZERO {
+                            modulus.as_ref() - magnitude
+                        } else {
+                            magnitude
+                        }
+                    };
+                    coefficients.push(value);
+                }
+                polys.push(DCRTPoly::from_biguints(parameters, &coefficients));
+            }
+            assert_eq!(consumed, bytes.len());
+            let rows_vec = polys.chunks(columns).map(|row| row.to_vec()).collect();
+            DCRTPolyMatrix::from_poly_vec(parameters, rows_vec)
+        }
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|value| value.parse::<u32>().expect("ring dimension"))
             .unwrap_or(32);
@@ -565,19 +622,21 @@ mod tests {
                 sampler.sample_uniform(&parameters, 2, right_columns, DistType::FinRingDist);
             let expected = left.tensor(&right).sum_rows(&[vec![0], vec![1, 2], vec![3]]);
             // No GPU input owners survive execute, and no host wait precedes it.
+            let host_matrix = |matrix: &DCRTPolyMatrix| RuntimeValue::HostMatrix {
+                matrix_type: ConcreteMatrixType {
+                    modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+                    ring_dimension: parameters.ring_dimension() as usize,
+                    rows: matrix.row_size(),
+                    columns: matrix.col_size(),
+                },
+                bytes: Arc::new(GpuDCRTPolyMatrix::cpu_staging_bytes_from_cpu_matrix(
+                    &gpu_parameters,
+                    matrix,
+                )),
+            };
             let inputs = BTreeMap::from([
-                (
-                    "left".into(),
-                    RuntimeValue::matrix(
-                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &left).into(),
-                    ),
-                ),
-                (
-                    "right".into(),
-                    RuntimeValue::matrix(
-                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &right).into(),
-                    ),
-                ),
+                ("left".into(), host_matrix(&left)),
+                ("right".into(), host_matrix(&right)),
             ]);
             let mut store = MemoryArtifactStore::default();
             backend
@@ -595,9 +654,12 @@ mod tests {
                 panic!("matrix output")
             };
             assert_eq!(output.shards().len(), 1);
-            let transposed = output.shards()[0].value.transpose();
+            let output_bytes = backend.matrix_to_bytes(&output).unwrap();
             drop(result);
-            assert_eq!(transposed.to_cpu_matrix(), expected.transpose());
+            assert_eq!(
+                decode_prepared_compact(&output_bytes, &parameters).transpose(),
+                expected.transpose()
+            );
         }
     }
 

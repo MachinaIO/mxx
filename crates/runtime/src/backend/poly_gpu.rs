@@ -98,13 +98,12 @@ pub(crate) mod gpu_prepared_host;
 pub(crate) mod gpu_prepared_lowering;
 pub use fleet::{
     GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
-    GpuMatrixDescriptor, GpuMatrixFragmentDescriptor, GpuMatrixInputFragment, GpuMatrixInputLayout,
-    GpuMatrixInputRequest, GpuMatrixInputSource, GpuMatrixSlotContext, GpuMatrixSlotInventory,
+    GpuMatrixDescriptor, GpuMatrixFragmentDescriptor,
 };
 pub use gpu_prepared::{
-    PreparedGpuBusy, PreparedGpuFleetOutput, PreparedGpuOutput, PreparedGpuProgram,
-    PreparedGpuRunError, PreparedGpuWorkCounters, begin_prepared_gpu_work_gate,
-    end_prepared_gpu_work_gate, prepared_gpu_work_counters, reset_prepared_gpu_work_counters,
+    PreparedGpuBusy, PreparedGpuFleetOutput, PreparedGpuProgram, PreparedGpuRunError,
+    PreparedGpuWorkCounters, begin_prepared_gpu_work_gate, end_prepared_gpu_work_gate,
+    prepared_gpu_work_counters, reset_prepared_gpu_work_counters,
 };
 pub(crate) use gpu_prepared::{
     from_lowered_program, record_prepared_forbidden, record_provisioning_append,

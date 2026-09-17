@@ -18,6 +18,11 @@ native descriptors, and output lifetimes. One transaction commits all retained
 owners, workspaces, and reusable execution slots. It either publishes a
 `PreparedGpuProgram` or releases every partial reservation. Native binds
 consume saved descriptors from this recipe; they do not reconstruct layouts.
+`PreparedPlanLayout` is the sole native operation-layout authority: prepared
+wrappers retain the planned descriptor and pass it to native binds, with no
+competing dimension, live-handle, or convenience-constructor layout source.
+Evaluation-domain `PolynomialValues` uses the direct source-owner path rather
+than implicit coefficient staging and an inverse-transform detour.
 
 Execution accepts only the published program. It validates each runtime value,
 acquires one exact reusable slot, submits the fixed replay sequence, publishes
@@ -39,11 +44,11 @@ sigma, gadget base, digit count, mode, and preimage bound. Structural drift is
 rejected before a slot is acquired; it cannot overwrite a fixed matrix type or
 replace a mismatched owner.
 
-Scalar inputs use an arbitrary-precision `BigInt` capacity ledger. Warmup reserves
-the initial high-water widths; if a later value crosses that boundary, the runtime
-accounts and reserves a larger scalar device/pinned generation before the slot is
-acquired, then resizes the fixed scalar owner without changing command topology.
-Repeated values within the high-water capacity do not allocate. The limits
+Scalar inputs use arbitrary-precision `BigInt` values with fixed warmup-derived
+projections. Each execution claims one exact reusable slot and copies values into
+the preallocated scalar backing. A value that exceeds its fixed projection is
+rejected explicitly; runtime execution never grows device or pinned scalar
+storage, replans geometry, or fabricates a width. The limits
 `max_parallel_instances` and `max_live_gpu_executions` are accounted for
 independently.
 
@@ -62,6 +67,13 @@ Preimage sampling uses fixed prepared lanes and descriptors. `Fresh` and
 native payload and stores that actual payload in the transcript. `Replay`
 validates the recorded payload against the prepared shape, CRT parameters,
 lane, and schema, then uploads it to fixed staging; it never resamples.
+
+Persisted trapdoor state is only the two matrices `r` and `e`. Gram matrices,
+covariance data, coefficient workspaces, and transform metadata are derived once
+per preimage operation at its execution boundary and retained only for that
+operation. The prepared transcript has two parts: a draw-site entry identifies
+the value, and the recorded payload carries the complete public or secret bytes;
+it is not a five-part trapdoor metadata envelope.
 
 Artifacts and transcripts are complete payload contracts and must use matching
 codecs, schemas, parameters, and integrity metadata. Serialized data is not

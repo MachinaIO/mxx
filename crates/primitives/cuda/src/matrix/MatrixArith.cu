@@ -2802,7 +2802,8 @@ extern "C" int gpu_matrix_query_transpose_layout(
     {
         if (!layout || !out || !source || !out->ctx || source->level < 0 ||
             source->ctx != out->ctx ||
-            out->format != source->format)
+            (source->format != GPU_POLY_FORMAT_COEFF && source->format != GPU_POLY_FORMAT_EVAL) ||
+            (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL))
             return set_error("invalid saved input copy descriptor owners");
         if (layout->allocation_count != static_cast<size_t>(source->level + 1) ||
             layout->stream_count != 1 || layout->launch_count != 1)
@@ -2860,7 +2861,9 @@ extern "C" int gpu_matrix_query_transpose_layout(
                 &first, &stream_key) != 0 || std::memcmp(&stream_entry.key, &stream_key, sizeof(stream_key)) != 0 ||
             gpu_prepared_require_stream_slot(out->ctx, first.x, prepared.stream,
                 stream_entry.pool_slot) != 0)
+        {
             return set_error("saved input copy stream differs from descriptor");
+        }
         return 0;
     }
 
@@ -3328,6 +3331,7 @@ extern "C" int gpu_matrix_query_transpose_layout(
         geometry.block_x = 256;
         geometry.block_y = 1;
         geometry.block_z = 1;
+        geometry.grid_y = 1;
         geometry.grid_z = static_cast<unsigned int>(limbs);
         if (limbs > std::numeric_limits<unsigned int>::max())
             return set_error("saved arithmetic geometry limb count overflow");

@@ -96,10 +96,18 @@ struct CompactWorkspace {
     GpuDeviceWorkspace storage;
 
     int acquire(GpuContext *ctx, int device, int level, size_t rows, size_t columns,
-        size_t matrices, int kind, uint16_t bits, cudaStream_t stream) {
+        size_t matrices, int kind, uint16_t bits, cudaStream_t stream,
+        const GpuCudaResource *stream_owner = nullptr) {
         const int status = compact_workspace_layout(ctx, level, rows, columns, matrices, kind, bits, layout);
         if (status != 0) return status;
-        return storage.acquire(ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE, layout.bytes, 256, stream);
+        GpuPreparedWorkspaceSlotIdentity stream_identity{};
+        const auto *identity = stream_owner &&
+                stream_owner->prepared_stream_identity(&stream_identity)
+            ? &stream_identity : nullptr;
+        if (identity && stream_owner->stream != stream)
+            return set_error("prepared codec workspace stream differs from its submission resource");
+        return storage.acquire(ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE,
+            layout.bytes, 256, stream, identity);
     }
     template <class T> cudaError_t span(size_t index, T **pointer, size_t bytes) {
         if (index >= layout.offsets.size() || bytes > layout.capacities[index] || !storage.data)

@@ -122,22 +122,6 @@ pub(super) fn instantiate(
             PreparedOutputBinding { name: name.clone(), wire: *wire, kind }
         })
         .collect();
-    compiler.program.bindings = compiler
-        .program
-        .values
-        .iter()
-        .map(|(wire, location)| {
-            (
-                *wire,
-                PreparedBindingId {
-                    owner: location.owner,
-                    device: location.device,
-                    instance: 0,
-                    storage: None,
-                },
-            )
-        })
-        .collect();
     compiler.program.topology.edges = compiler
         .nodes
         .iter()
@@ -151,6 +135,36 @@ pub(super) fn instantiate(
         .collect();
     compiler.program.topology.nodes = compiler.nodes.into_boxed_slice();
     compiler.program.replay = compiler.replay.into_boxed_slice();
+    // Modulus reduction preserves the source domain by default. A centered
+    // rebase, however, consumes a coefficient-domain single-limb source; make
+    // that required boundary explicit in the immutable graph contract rather
+    // than relying on a runtime conversion or format guess.
+    let centered_rebase_inputs = compiler
+        .program
+        .node_sources
+        .iter()
+        .filter_map(|(id, source)| {
+            matches!(source.kind, NodeKind::CenteredRebase { .. }).then(|| {
+                compiler
+                    .program
+                    .node_bindings
+                    .get(id)
+                    .and_then(|(inputs, _)| inputs.first())
+                    .copied()
+            })
+        })
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    for wire in centered_rebase_inputs {
+        if matches!(
+            compiler.program.node_sources.get(&(wire.node.0 as u32)).map(PreparedNodeSource::kind),
+            Some(NodeKind::ModulusReduce { .. })
+        ) {
+            if let Some(location) = compiler.program.values.get_mut(&wire) {
+                location.format = PreparedFormat::Coefficient;
+            }
+        }
+    }
     color_storage(&mut compiler.program);
     Ok(compiler.program)
 }
@@ -191,19 +205,6 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
     for location in program.values.values() {
         ensure_owner(location.owner);
     }
-    for view in program.view_commands.values() {
-        match view {
-            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
-                ensure_owner(location.owner)
-            }
-            PreparedView::FixedCopies(copies) => {
-                for copy in copies {
-                    ensure_owner(copy.source.owner);
-                    ensure_owner(copy.destination.owner);
-                }
-            }
-        }
-    }
     for selection in program.selection_commands.values() {
         match selection {
             PreparedSelection::Static { location } => ensure_owner(location.owner),
@@ -240,17 +241,16 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
             parent.insert(left, right);
         }
     };
-    for (node_id, view) in &program.view_commands {
-        if !matches!(view, PreparedView::Alias(_) | PreparedView::TransposeAlias(_)) {
+    for node in &program.topology.nodes {
+        if node.command.operation != PreparedOperation::Alias {
             continue;
         }
-        let Some((_, outputs)) = program.node_bindings.get(node_id) else { continue };
-        let Some(output) = outputs.first().and_then(|wire| program.values.get(wire)) else {
-            continue
+        let Some((inputs, outputs)) = program.node_bindings.get(&node.id) else { continue };
+        let Some(source) = inputs.first().and_then(|wire| program.values.get(wire)) else {
+            continue;
         };
-        let source = match view {
-            PreparedView::Alias(source) | PreparedView::TransposeAlias(source) => source,
-            PreparedView::FixedCopies(_) => unreachable!(),
+        let Some(output) = outputs.first().and_then(|wire| program.values.get(wire)) else {
+            continue;
         };
         union(output.owner, source.owner);
     }
@@ -265,19 +265,6 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
     let canonical = |owner: u64, parent: &mut BTreeMap<u64, u64>| root(parent, owner);
     for location in program.values.values_mut() {
         location.owner = canonical(location.owner, &mut parent);
-    }
-    for view in program.view_commands.values_mut() {
-        match view {
-            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
-                location.owner = canonical(location.owner, &mut parent)
-            }
-            PreparedView::FixedCopies(copies) => {
-                for copy in copies {
-                    copy.source.owner = canonical(copy.source.owner, &mut parent);
-                    copy.destination.owner = canonical(copy.destination.owner, &mut parent);
-                }
-            }
-        }
     }
     for selection in program.selection_commands.values_mut() {
         match selection {
@@ -401,19 +388,6 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
     };
     for location in program.values.values() {
         register(location, &mut lifetimes);
-    }
-    for view in program.view_commands.values() {
-        match view {
-            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
-                register(location, &mut lifetimes)
-            }
-            PreparedView::FixedCopies(copies) => {
-                for copy in copies {
-                    register(&copy.source, &mut lifetimes);
-                    register(&copy.destination, &mut lifetimes);
-                }
-            }
-        }
     }
     for selection in program.selection_commands.values() {
         match selection {
@@ -582,19 +556,6 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
     for location in program.values.values_mut() {
         apply(location);
     }
-    for view in program.view_commands.values_mut() {
-        match view {
-            PreparedView::Alias(location) | PreparedView::TransposeAlias(location) => {
-                apply(location)
-            }
-            PreparedView::FixedCopies(copies) => {
-                for copy in copies {
-                    apply(&mut copy.source);
-                    apply(&mut copy.destination);
-                }
-            }
-        }
-    }
     for selection in program.selection_commands.values_mut() {
         match selection {
             PreparedSelection::Static { location } => apply(location),
@@ -619,11 +580,6 @@ pub(super) fn color_storage(program: &mut GpuPreparation) {
         .enumerate()
         .map(|(index, color)| (index as u64, (color.rows, color.columns)))
         .collect();
-    for (wire, binding) in &mut program.bindings {
-        if let Some(location) = program.values.get(wire) {
-            binding.owner = location.owner;
-        }
-    }
 }
 
 struct ScopeInstantiator<'a> {
@@ -888,36 +844,72 @@ impl ScopeInstantiator<'_> {
                                 );
                             }
                         }
+                        let mut variant_environments = Vec::<ParamEnv>::new();
+                        // A structural variant includes closed operation
+                        // parameters, not just storage geometry.  Loop-index
+                        // expressions can keep the same wire types while
+                        // changing constants in the body; those bodies must
+                        // get distinct fixed tapes.  Conversely, a uniform
+                        // body whose closed operations are identical still
+                        // uses one tape regardless of the loop count.
+                        let child_scope = self
+                            .graph
+                            .source
+                            .scope(&child)
+                            .ok_or(PreparedLoweringError::InvalidLoop)?;
+                        let mut variant_keys = Vec::<(Vec<ConcreteWireType>, Vec<NodeKind>)>::new();
+                        let mut variant_indices = Vec::with_capacity(environments.len());
                         for environment in &environments {
-                            for (port, output) in child_outputs.iter().enumerate() {
-                                let output_type = self
-                                    .graph
-                                    .concrete_wire_type(&child, *output, environment)
-                                    .map_err(|_| PreparedLoweringError::InvalidLoop)?;
-                                if output_type != self.program.wire_types[&arguments[port]] {
-                                    return Err(PreparedLoweringError::InvalidContract(
-                                        "prepared carried state changes its storage contract",
-                                    ));
-                                }
-                            }
+                            let output_key = child_outputs
+                                .iter()
+                                .map(|wire| {
+                                    self.graph
+                                        .concrete_wire_type(&child, *wire, environment)
+                                        .map_err(|_| PreparedLoweringError::InvalidLoop)
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let operation_key = child_scope
+                                .nodes()
+                                .iter()
+                                .map(|node| close_kind(node.kind().clone(), environment))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let key = (output_key, operation_key);
+                            let index = if let Some(index) =
+                                variant_keys.iter().position(|candidate| *candidate == key)
+                            {
+                                index
+                            } else {
+                                let index = variant_keys.len();
+                                variant_keys.push(key);
+                                variant_environments.push(environment.clone());
+                                index
+                            };
+                            variant_indices.push(index);
                         }
-                        let mut bank_a = Vec::new();
+                        // The carried output is one canonical owner. The
+                        // dependency tape orders each body after its prior
+                        // write, so a second region is introduced only by an
+                        // operation that explicitly requires a distinct
+                        // destination; loop parity never selects storage.
+                        let representative_environments = variant_environments;
+                        let mut carried = Vec::new();
                         for source in &arguments[..specification.carried_count] {
-                            bank_a.push(self.copy(*source, None, environment)?);
+                            carried.push(self.copy(*source, None, environment)?);
                         }
-                        let mut bodies = [Box::new([]) as Box<[PreparedReplayStep]>, Box::new([])];
-                        let mut bank_b = Vec::new();
+                        let mut bodies =
+                            Vec::with_capacity(representative_environments.len().max(1));
+                        // Keep every closed outer environment available while
+                        // lowering each representative body. Nested parallel
+                        // loops use this list to freeze their active-count
+                        // table; only the body tapes themselves are deduplicated
+                        // by structural variant.
                         let enclosing_variants =
                             std::mem::replace(&mut self.variant_environments, environments);
-                        for bank in 0..2 {
+                        for body_environment in &representative_environments {
                             let body_start = self.replay.len();
-                            let body_inputs = if bank == 0 { &bank_a } else { &bank_b };
-                            let mut bound_inputs = body_inputs.clone();
+                            let mut bound_inputs = carried.clone();
                             bound_inputs
                                 .extend_from_slice(&arguments[specification.carried_count..]);
-                            let body_environment = self.variant_environments
-                                [bank.min(self.variant_environments.len() - 1)]
-                            .clone();
                             let instantiated =
                                 self.scope(&child, &body_environment, &bound_inputs)?;
                             let results = child_outputs
@@ -925,25 +917,11 @@ impl ScopeInstantiator<'_> {
                                 .map(|wire| instantiated[wire])
                                 .collect::<Vec<_>>();
                             for (port, source) in results.into_iter().enumerate() {
-                                if bank == 0 {
-                                    bank_b.push(self.copy(source, None, &body_environment)?);
-                                } else {
-                                    self.copy(source, Some(bank_a[port]), &body_environment)?;
-                                }
+                                self.copy(source, Some(carried[port]), body_environment)?;
                             }
-                            bodies[bank] = self.replay.split_off(body_start).into_boxed_slice();
+                            bodies.push(self.replay.split_off(body_start).into_boxed_slice());
                         }
                         self.variant_environments = enclosing_variants;
-                        // A fixed canonical owner makes the enclosing binding independent
-                        // of the selected count's parity (including zero iterations).
-                        let tail_start = self.replay.len();
-                        for (source, destination) in bank_b.iter().zip(&bank_a) {
-                            self.copy(*source, Some(*destination), environment)?;
-                        }
-                        let tail = self.replay.split_off(tail_start).into_boxed_slice();
-                        // Both tapes repeat: a linear last use is not a lifetime end
-                        // until the back edge has retired. Keep every referenced owner
-                        // through the loop's canonical-output copy.
                         let variable = counts.iter().any(|value| *value != count);
                         self.replay.push(PreparedReplayStep::Sequential {
                             call: NodeId(id.0),
@@ -954,10 +932,10 @@ impl ScopeInstantiator<'_> {
                             } else {
                                 Box::new([])
                             },
-                            banks: bodies,
-                            tail,
+                            variants: bodies.into_boxed_slice(),
+                            variant_indices: variant_indices.into_boxed_slice(),
                         });
-                        bank_a
+                        carried
                     }
                 }
                 NodeKind::FamilyGetStatic { index } => {
@@ -1115,14 +1093,37 @@ impl ScopeInstantiator<'_> {
             .map(|(port, ty)| {
                 let wire = WireRef { node: NodeId(id as u64), port: Port(port as u32) };
                 self.program.wire_types.insert(wire, ty.clone());
-                let format = if matches!(
+                let format = if matches!(kind, NodeKind::ModulusReduce { .. }) {
+                    arguments
+                        .iter()
+                        .find_map(|argument| first_matrix_wire(&self.program, *argument))
+                        .and_then(|wire| self.program.values.get(&wire))
+                        .map(|location| location.format)
+                        .unwrap_or(PreparedFormat::Evaluation)
+                } else if matches!(kind, NodeKind::PolynomialFromValues { .. }) {
+                    // Host uploads are normalized into the retained evaluation
+                    // owner; `evaluation` describes the incoming bytes, not
+                    // the physical format of the prepared output.
+                    PreparedFormat::Evaluation
+                } else if matches!(
                     kind,
-                    NodeKind::RnsModUp { .. } |
-                        NodeKind::RnsModDown { .. } |
-                        NodeKind::ModulusSwitch { .. } |
-                        NodeKind::ModulusReduce { .. }
+                    NodeKind::MatrixBinary(_) |
+                        NodeKind::MatrixMulAccumulate { .. } |
+                        NodeKind::MatrixMulSmallRhs |
+                        NodeKind::MatrixNegate |
+                        NodeKind::MatrixScale { .. } |
+                        NodeKind::RingAutomorphism { .. } |
+                        NodeKind::Transpose |
+                        NodeKind::Slice { .. } |
+                        NodeKind::Tensor |
+                        NodeKind::Concat { .. }
                 ) {
-                    PreparedFormat::Coefficient
+                    arguments
+                        .iter()
+                        .find_map(|argument| first_matrix_wire(&self.program, *argument))
+                        .and_then(|wire| self.program.values.get(&wire))
+                        .map(|location| location.format)
+                        .unwrap_or(PreparedFormat::Evaluation)
                 } else {
                     PreparedFormat::Evaluation
                 };
@@ -1192,18 +1193,32 @@ impl ScopeInstantiator<'_> {
             _ => None,
         };
         if let Some(view) = view {
-            if matches!(view, PreparedView::FixedCopies(_)) &&
+            if matches!(view, PreparedViewShape::FixedCopies(_)) &&
                 matches!(kind, NodeKind::Slice { .. } | NodeKind::Concat { .. })
             {
                 operation = PreparedOperation::Gpu(PreparedGpuOperation::FixedCopies);
             }
-            self.program.view_commands.insert(id, view);
         }
         match &kind {
             NodeKind::FamilyPack { .. } => {
                 self.families.insert(outputs[0], arguments.clone().into_boxed_slice());
                 self.program.family_wires.insert(outputs[0], arguments.clone().into_boxed_slice());
                 self.program.family_members.insert(outputs[0], locations.into_boxed_slice());
+            }
+            NodeKind::PolynomialValues { .. } => {
+                let ConcreteWireType::IndexedFamily { element, count } = &types[0] else {
+                    return Err(PreparedLoweringError::InvalidContract(
+                        "prepared polynomial values output is not a family",
+                    ));
+                };
+                // PolynomialValues is one native host reconstruction producing
+                // a finite family.  Give its fixed members scalar identities
+                // here so FamilyGet/parallel-loop lowering can bind directly
+                // to prepared slots without synthesizing ExtractCoefficient
+                // nodes or rebuilding the family during replay.
+                let members = self.register_prepared_family(element, *count, outputs[0].node)?;
+                self.families.insert(outputs[0], members.clone());
+                self.program.family_wires.insert(outputs[0], members);
             }
             NodeKind::FamilyGetDynamic | NodeKind::Select { .. } => {
                 let (candidate_wires, selector) = if matches!(kind, NodeKind::FamilyGetDynamic) {
@@ -1241,6 +1256,7 @@ impl ScopeInstantiator<'_> {
                     lower_family(&kind, &PreparedFamily { members: candidates }, None)?
                         .with_selector(selector)
                 };
+                self.program.selection_candidate_wires.insert(id, candidate_wires.clone());
                 self.program.selection_commands.insert(id, selection);
             }
             _ => {}
@@ -1351,6 +1367,47 @@ impl ScopeInstantiator<'_> {
         Ok(members.into_boxed_slice())
     }
 
+    fn register_prepared_family(
+        &mut self,
+        element: &ConcreteWireType,
+        count: usize,
+        producer: mxx_ir_core::types::NodeId,
+    ) -> Result<Box<[WireRef]>, PreparedLoweringError> {
+        if !matches!(element, ConcreteWireType::Int) {
+            return Err(PreparedLoweringError::InvalidContract(
+                "prepared polynomial values family must contain integers",
+            ));
+        }
+        let mut members = Vec::with_capacity(count);
+        for index in 0..count {
+            let wire = WireRef {
+                // Keep a producer node identity on every scalar member so
+                // dependency construction orders its consumers after the one
+                // PolynomialValues reconstruction.  The output port is
+                // virtual; PolynomialValues itself owns port zero.
+                node: producer,
+                port: Port(
+                    index.checked_add(1).and_then(|index| u32::try_from(index).ok()).ok_or(
+                        PreparedLoweringError::InvalidContract(
+                            "prepared family member port overflow",
+                        ),
+                    )?,
+                ),
+            };
+            self.program.wire_types.insert(wire, element.clone());
+            let slot = self.program.scalar_slot_count;
+            self.program.scalar_slot_count += 1;
+            self.program.scalar_slots.insert(wire, slot);
+            members.push(wire);
+        }
+        if members.is_empty() {
+            return Err(PreparedLoweringError::InvalidContract(
+                "prepared polynomial values family has no members",
+            ));
+        }
+        Ok(members.into_boxed_slice())
+    }
+
     fn copy(
         &mut self,
         source: WireRef,
@@ -1372,13 +1429,6 @@ impl ScopeInstantiator<'_> {
                 target.owner = self.program.values[&destination].owner;
             }
             self.program.values.insert(output, target.clone());
-            self.program.view_commands.insert(
-                output.node.0 as u32,
-                PreparedView::FixedCopies(
-                    vec![FixedCopy { source: source_location, destination: target }]
-                        .into_boxed_slice(),
-                ),
-            );
             Ok(output)
         } else {
             let source_slot = *self.program.scalar_slots.get(&source).ok_or(
@@ -1575,11 +1625,14 @@ fn close_kind(
             .modulus
             .evaluate(environment)
             .map_err(|_| PreparedLoweringError::InvalidLoop)?;
-        if minimum != num_bigint::BigInt::from(0) ||
-            maximum != modulus - num_bigint::BigInt::from(1)
-        {
+        let full_residue = minimum == num_bigint::BigInt::from(0) &&
+            maximum == modulus - num_bigint::BigInt::from(1);
+        let ternary =
+            minimum == num_bigint::BigInt::from(-1) && maximum == num_bigint::BigInt::from(1);
+        let bit = minimum == num_bigint::BigInt::from(0) && maximum == num_bigint::BigInt::from(1);
+        if !full_residue && !ternary && !bit {
             return Err(PreparedLoweringError::InvalidContract(
-                "GPU prepared uniform interval requires the full residue range",
+                "GPU prepared uniform interval supports only full residue, ternary, or bit ranges",
             ));
         }
     }
@@ -1631,15 +1684,16 @@ mod tests {
     {
         fn plan_owner(
             &self,
+            _: &FinalizedMatrixIdTable,
             _: &PreparedOwnerKey,
             _: &PreparedStorePlan,
-            _: usize,
-        ) -> Result<(PreparedOwnerLayout, usize), String> {
+        ) -> Result<PreparedOwnerLayout, String> {
             unreachable!("scalar test graph has no matrix owners")
         }
 
         fn plan_stage(
             &self,
+            _: &FinalizedMatrixIdTable,
             _: &PreparedNativeRecipe,
             _: &[PreparedStorePlan],
             _: &[PreparedResolvedOwner],
@@ -1649,6 +1703,7 @@ mod tests {
 
         fn plan_replay_upload(
             &self,
+            _: &FinalizedMatrixIdTable,
             _: &PreparedNativeRecipe,
             _: &PreparedReplayUploadRecipe,
             _: &[PreparedStorePlan],
@@ -1659,6 +1714,7 @@ mod tests {
 
         fn plan_schedule(
             &self,
+            _: &FinalizedMatrixIdTable,
             _: &PreparedNativeRecipe,
             _: &[PreparedPlanLayout],
         ) -> Result<PreparedPlanLayout, String> {
@@ -1809,7 +1865,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_prepared_alias_chain_shares_base_owner_without_losing_offset() {
+    fn test_gpu_prepared_alias_chain_shares_base_owner() {
         let first = WireRef { node: NodeId(1), port: Port(0) };
         let second = WireRef { node: NodeId(2), port: Port(0) };
         let mut program = storage_program(
@@ -1832,24 +1888,8 @@ mod tests {
         program
             .node_bindings
             .insert(2, (vec![first].into_boxed_slice(), vec![second].into_boxed_slice()));
-        program.view_commands.insert(
-            2,
-            PreparedView::Alias(ValueLocation {
-                owner: 11,
-                rows: 1..3,
-                columns: 1..3,
-                level: 0,
-                format: PreparedFormat::Evaluation,
-                device: 0,
-            }),
-        );
         color_storage(&mut program);
         assert_eq!(program.values[&first].owner, program.values[&second].owner);
-        let PreparedView::Alias(view) = &program.view_commands[&2] else {
-            panic!("expected alias view")
-        };
-        assert_eq!(view.rows, 1..3);
-        assert_eq!(view.columns, 1..3);
     }
 
     #[test]
@@ -1888,7 +1928,7 @@ mod tests {
             assert!(program.trace_keys[wire].instantiation_path.is_empty());
         }
         let output_slot = program.scalar_slots[&program.outputs[0]];
-        let mut execution = PreparedGpuProgram::from_command_instances(
+        let mut execution = PreparedGpuProgram::from_unpublished_command_instances(
             vec![Box::new([])],
             Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
             0,
@@ -1907,7 +1947,7 @@ mod tests {
             ("rhs".to_owned(), crate::backend::RuntimeValue::Int(11.into())),
         ]);
         let mut sampling = SamplingMode::Fresh;
-        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling, None).unwrap();
+        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling).unwrap();
         assert_eq!(output.scalar_slot_values()[output_slot], ScalarValue::Int(18.into()));
     }
 
@@ -1932,7 +1972,7 @@ mod tests {
         let graph = freeze(node.output(0).unwrap());
         let program = instantiate(&graph, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
         let output_slot = program.scalar_slots[&program.outputs[0]];
-        let mut execution = PreparedGpuProgram::from_command_instances(
+        let mut execution = PreparedGpuProgram::from_unpublished_command_instances(
             vec![Box::new([])],
             Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
             0,
@@ -1951,12 +1991,12 @@ mod tests {
             ("increment".to_owned(), crate::backend::RuntimeValue::Int(5.into())),
         ]);
         let mut sampling = SamplingMode::Fresh;
-        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling, None).unwrap();
+        let output = execution.run_with_runtime_bindings(&inputs, &mut sampling).unwrap();
         assert_eq!(output.scalar_slot_values()[output_slot], ScalarValue::Int(13.into()));
     }
 
     #[test]
-    fn test_gpu_prepared_lowering_rejects_asymmetric_uniform_interval() {
+    fn test_gpu_prepared_lowering_rejects_unsupported_uniform_interval() {
         let matrix = MatrixType {
             modulus: IntExpr::constant(17),
             ring_dimension: IntExpr::constant(1),
@@ -1967,8 +2007,8 @@ mod tests {
             NodeKind::UniformIntervalSample {
                 matrix_type: matrix,
                 range: SampleRange {
-                    minimum: IntExpr::constant(-1),
-                    maximum: IntExpr::constant(1),
+                    minimum: IntExpr::constant(-2),
+                    maximum: IntExpr::constant(2),
                 },
             },
             vec![],
@@ -1979,17 +2019,27 @@ mod tests {
                 columns: IntExpr::constant(1),
             })],
         );
-        let error = instantiate(
-            &freeze(sample.output(0).unwrap()),
-            std::num::NonZeroUsize::new(1).unwrap(),
+        // The graph validator enforces the input contract before prepared
+        // lowering runs, so this malformed interval must never reach the
+        // prepared-specific error path.
+        let (graph, _) = Graph::freeze(
+            "prepared_scope",
+            vec![mxx_ir_core::graph::CompileParameter {
+                name: "iteration".into(),
+                kind: mxx_ir_core::graph::CompileParameterKind::Integer,
+            }],
+            BTreeMap::from([(
+                "result".into(),
+                GraphOutput { value: sample.output(0).unwrap(), confidentiality: None },
+            )]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
         )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            PreparedLoweringError::InvalidContract(
-                "GPU prepared uniform interval requires the full residue range"
-            )
-        );
+        .unwrap();
+        let mut bindings = ParamEnv::default();
+        bindings.integers.insert("iteration".into(), 0.into());
+        assert!(validate(&graph, &bindings).is_err());
     }
 
     #[test]
@@ -2024,6 +2074,67 @@ mod tests {
         assert_eq!(program.input_leaf_bindings.len(), 3);
         assert_eq!(program.input_leaf_bindings[&program.runtime_input_wires[1]].path.as_ref(), [1]);
         assert_eq!(program.scalar_slots.len(), 3);
+    }
+
+    #[test]
+    fn test_gpu_prepared_polynomial_values_feeds_loop_family_without_expansion() {
+        use mxx_dsl::{DslContext, Ring, parallel};
+
+        for evaluation in [false, true] {
+            let context = DslContext::new(if evaluation {
+                "prepared-polynomial-evaluations-family"
+            } else {
+                "prepared-polynomial-coefficients-family"
+            });
+            let ring = Ring::new(17, 4);
+            let input = ring.input("polynomial", (1, 1));
+            let values = if evaluation { input.evaluations() } else { input.coefficients() };
+            let output = parallel(4, |index| Ok(values.at(index))).unwrap();
+            let built = context.output("values", output).unwrap().build().unwrap();
+            let graph = built.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+
+            assert!(built.graph.root_scope().nodes().iter().any(|node| {
+                matches!(
+                    node.kind(),
+                    NodeKind::PolynomialValues { evaluation: actual } if *actual == evaluation
+                )
+            }));
+            assert!(
+                !built
+                    .graph
+                    .root_scope()
+                    .nodes()
+                    .iter()
+                    .any(|node| { matches!(node.kind(), NodeKind::ExtractCoefficient { .. }) })
+            );
+
+            let program = instantiate(&graph, std::num::NonZeroUsize::new(2).unwrap()).unwrap();
+            let polynomial_values_id = program
+                .node_sources
+                .iter()
+                .find_map(|(id, source)| {
+                    matches!(
+                        source.kind(),
+                        NodeKind::PolynomialValues { evaluation: actual } if *actual == evaluation
+                    )
+                    .then_some(*id)
+                })
+                .expect("prepared polynomial values node");
+            let polynomial_wire =
+                WireRef { node: NodeId(polynomial_values_id as u64), port: Port(0) };
+            let members = program
+                .family_wires
+                .get(&polynomial_wire)
+                .expect("prepared polynomial values family members");
+            assert_eq!(members.len(), 4);
+            assert!(members.iter().all(|member| program.scalar_slots.contains_key(member)));
+            assert!(
+                !program
+                    .node_sources
+                    .values()
+                    .any(|source| matches!(source.kind(), NodeKind::ExtractCoefficient { .. }))
+            );
+        }
     }
 
     #[test]
@@ -2087,17 +2198,17 @@ mod tests {
         let long = compile(300);
         assert_eq!(short.topology.nodes.len(), long.topology.nodes.len());
         assert_eq!(short.scalar_slot_count, long.scalar_slot_count);
-        let PreparedReplayStep::Sequential { count, banks, .. } = long.replay.last().unwrap()
+        let PreparedReplayStep::Sequential { count, variants, .. } = long.replay.last().unwrap()
         else {
             panic!("sequential scope must retain one loop instruction");
         };
         assert_eq!(*count, 300);
-        assert_eq!(banks[0].len(), banks[1].len());
+        assert_eq!(variants.len(), 1);
         assert!(long.node_sources.values().all(|source| source.variants.is_empty()));
     }
 
     #[test]
-    fn test_gpu_prepared_nested_counts_keep_prefix_offsets_and_canonical_tail() {
+    fn test_gpu_prepared_nested_counts_keep_prefix_offsets_and_final_variant() {
         let nested = with_new_construction_scope(|scope| {
             let carried = input("carried");
             let increment = input("increment");
@@ -2134,25 +2245,11 @@ mod tests {
         let program =
             instantiate(&freeze(outer.output(0).unwrap()), std::num::NonZeroUsize::new(2).unwrap())
                 .unwrap();
-        let PreparedReplayStep::Sequential { banks, tail, .. } = program.replay.last().unwrap()
-        else {
+        let PreparedReplayStep::Sequential { variants, .. } = program.replay.last().unwrap() else {
             panic!("outer loop")
         };
-        assert_eq!(tail.len(), 1);
-        for bank in banks {
-            let nested = bank
-                .iter()
-                .find_map(|step| match step {
-                    PreparedReplayStep::Sequential { counts, offsets, tail, .. } => {
-                        Some((counts, offsets, tail))
-                    }
-                    _ => None,
-                })
-                .unwrap();
-            assert_eq!(nested.0.as_ref(), &[0, 1, 2]);
-            assert_eq!(nested.1.as_ref(), &[0, 0, 1]);
-            assert_eq!(nested.2.len(), 1);
-        }
+        assert!(!variants.is_empty());
+        assert!(variants.iter().all(|variant| !variant.is_empty()));
     }
 
     #[test]
@@ -2196,7 +2293,7 @@ mod tests {
             instantiate(&freeze(node.output(0).unwrap()), std::num::NonZeroUsize::new(2).unwrap())
                 .unwrap();
         let output = program.scalar_slots[&program.outputs[0]];
-        let mut execution = PreparedGpuProgram::from_command_instances(
+        let mut execution = PreparedGpuProgram::from_unpublished_command_instances(
             vec![Box::new([])],
             Arc::new(crate::gpu_memory::GpuMemoryRegion::empty_for_test()),
             0,
@@ -2204,15 +2301,6 @@ mod tests {
         )
         .from_preparation(program)
         .unwrap();
-        let mut ledger = crate::gpu_memory::GpuMemoryLedger::synthetic_for_test(
-            &[crate::gpu_calibration::GpuDeviceMemory { total_bytes: 1 << 40, resident_bytes: 0 }],
-            &[0],
-            100,
-            Some(&[(0, 1)]),
-        )
-        .unwrap();
-        let mut allocator =
-            crate::backend::poly_gpu::gpu_prepared::LedgerScalarCapacityAllocator::new(&mut ledger);
         for start in 0..3 {
             execution.initialize_runtime_roots(&[PreparedRuntimeValue::Int(start.into())]).unwrap();
             let inputs = BTreeMap::from([(
@@ -2220,9 +2308,7 @@ mod tests {
                 crate::backend::RuntimeValue::Int(start.into()),
             )]);
             let mut sampling = SamplingMode::Fresh;
-            let result = execution
-                .run_with_runtime_bindings(&inputs, &mut sampling, Some(&mut allocator))
-                .unwrap();
+            let result = execution.run_with_runtime_bindings(&inputs, &mut sampling).unwrap();
             let expected = num_bigint::BigInt::from(start) +
                 (0..count).map(num_bigint::BigInt::from).sum::<num_bigint::BigInt>();
             assert_eq!(result.scalar_slot_values()[output], ScalarValue::Int(expected));
@@ -2277,11 +2363,11 @@ mod tests {
         let program =
             instantiate(&freeze(outer.output(0).unwrap()), std::num::NonZeroUsize::new(2).unwrap())
                 .unwrap();
-        let PreparedReplayStep::Sequential { banks, .. } = program.replay.last().unwrap() else {
+        let PreparedReplayStep::Sequential { variants, .. } = program.replay.last().unwrap() else {
             panic!("outer loop")
         };
-        for bank in banks {
-            let (counts, waves) = bank
+        for variant in variants.iter().take(2) {
+            let (counts, waves) = variant
                 .iter()
                 .find_map(|step| match step {
                     PreparedReplayStep::Parallel { counts, waves, .. } => Some((counts, waves)),
@@ -2503,7 +2589,7 @@ mod tests {
             .values()
             .filter(|source| matches!(source.kind, NodeKind::UniformResidueSample { .. }))
             .collect::<Vec<_>>();
-        assert_eq!(sampled.len(), 2);
+        assert_eq!(sampled.len(), 3);
         for source in sampled {
             assert_eq!(source.variants.len(), 3);
             assert_eq!(source.variant_indices.as_ref(), &[0, 1, 2]);
@@ -2819,5 +2905,288 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_matrix_record_persist_restore_replay_without_setup_work() {
+        use crate::{
+            Backend, MemoryArtifactStore, RuntimeValue,
+            executor::{ExecutionConfig, execute_with_config},
+            transcript::{
+                DrawSite, RecordedValue, SamplingMode, TranscriptRecorder, TranscriptReplayer,
+            },
+        };
+        use mxx_dsl::{DslContext, Ring};
+        use mxx_ir_core::{ParamEnv, types::ConcreteMatrixType};
+        use mxx_primitives::{
+            matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
+            poly::{
+                PolyParams,
+                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+            },
+            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
+        };
+
+        let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
+        else {
+            eprintln!("skipping prepared transcript replay: no CUDA device detected");
+            return;
+        };
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            vec![device],
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let sampled = ring.uniform_residue((1, 1));
+        let result_wire = sampled.clone() + ring.input("anchor", (1, 1));
+        let graph = DslContext::new("prepared-matrix-transcript")
+            // Keep the sampled wire observable so its fixed compact codec
+            // claims are part of the prepared output table; transcript
+            // capture must consume those claims rather than an adaptive
+            // readback allocation for this internal producer.
+            .output("sample", sampled)
+            .unwrap()
+            .output("result", result_wire)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+
+        let source =
+            DCRTPolyUniformSampler::new().sample_uniform(&cpu, 1, 1, DistType::FinRingDist);
+        let anchor = RuntimeValue::HostMatrix {
+            matrix_type: ConcreteMatrixType {
+                modulus: BigInt::from(cpu.modulus().as_ref().clone()),
+                ring_dimension: cpu.ring_dimension() as usize,
+                rows: 1,
+                columns: 1,
+            },
+            bytes: Arc::new(GpuDCRTPolyMatrix::cpu_staging_bytes_from_cpu_matrix(&params, &source)),
+        };
+        let inputs = BTreeMap::from([("anchor".to_owned(), anchor)]);
+        let mut backend = crate::backend::poly_gpu::gpu_backend_on([params], [device]);
+        backend.warm_up_prepared_graph(&graph, &inputs, &ExecutionConfig::default()).unwrap();
+
+        let mut store = MemoryArtifactStore::default();
+        let mut recorder = TranscriptRecorder::default();
+        let mut recorded = execute_with_config(
+            &graph,
+            &mut backend,
+            inputs.clone(),
+            &mut store,
+            SamplingMode::Record(&mut recorder),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let recorded_bytes =
+            match recorded.materialize_output("result", &mut backend, &mut store).unwrap() {
+                RuntimeValue::Matrix(value) => backend.matrix_to_bytes(&value).unwrap(),
+                _ => panic!("prepared matrix output has unexpected kind"),
+            };
+        recorded.cleanup_staged(&mut store).unwrap();
+        drop(recorded);
+
+        let persisted = recorder
+            .iter()
+            .map(|(site, value)| (site.clone(), value.clone()))
+            .collect::<Vec<(DrawSite, RecordedValue)>>();
+        assert!(!persisted.is_empty(), "the graph must record its uniform matrix draw");
+        let restored = serde_json::from_slice::<Vec<(DrawSite, RecordedValue)>>(
+            &serde_json::to_vec(&persisted).unwrap(),
+        )
+        .unwrap();
+        let replayer = TranscriptReplayer::from_entries(restored).unwrap();
+
+        crate::backend::poly_gpu::reset_prepared_gpu_work_counters();
+        crate::backend::poly_gpu::begin_prepared_gpu_work_gate();
+        let mut replayed = execute_with_config(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Replay(&replayer),
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let replayed_bytes =
+            match replayed.materialize_output("result", &mut backend, &mut store).unwrap() {
+                RuntimeValue::Matrix(value) => backend.matrix_to_bytes(&value).unwrap(),
+                _ => panic!("prepared matrix output has unexpected kind"),
+            };
+        crate::backend::poly_gpu::end_prepared_gpu_work_gate();
+        replayed.cleanup_staged(&mut store).unwrap();
+        assert_eq!(replayed_bytes, recorded_bytes);
+
+        #[cfg(feature = "gpu-instrumentation")]
+        {
+            let counters = crate::backend::poly_gpu::prepared_gpu_work_counters();
+            assert_eq!(counters.graph_traversals, 0);
+            assert_eq!(counters.graph_hashes, 0);
+            assert_eq!(counters.assignments, 0);
+            assert_eq!(counters.admissions, 0);
+            assert_eq!(counters.native_validations, 0);
+            assert_eq!(counters.reservations, 0);
+            assert_eq!(counters.leases, 0);
+            assert_eq!(counters.project_allocations, 0);
+            assert_eq!(counters.dynamic_events, 0);
+            assert_eq!(counters.dynamic_streams, 0);
+            assert_eq!(counters.measurement_launches, 0);
+            assert_eq!(counters.cuda_allocations, 0);
+            assert_eq!(counters.provisioning_begins, 0);
+            assert_eq!(counters.provisioning_permits, 0);
+            assert_eq!(counters.provisioning_appends, 0);
+            assert_eq!(counters.topology_scans, 0);
+            assert_eq!(counters.output_reconstructions, 0);
+            assert_eq!(counters.host_allocations, 0);
+            assert_eq!(counters.source_policy_checks, 1);
+            assert!(counters.production_kernels > 0, "replay must submit matrix work");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_prepared_multi_device_reports_detected_ids_and_uses_each_shard() {
+        use crate::{
+            MemoryArtifactStore, RuntimeValue,
+            backend::poly_gpu::{GpuColumnShard, GpuFleetMatrix},
+            executor::{ExecutionConfig, execute_with_config},
+            transcript::SamplingMode,
+        };
+        use mxx_dsl::{DslContext, Ring};
+        use mxx_ir_core::ParamEnv;
+        use mxx_primitives::{
+            matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+            poly::{
+                Poly, PolyParams,
+                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
+            },
+        };
+
+        let device_ids = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+        eprintln!("prepared multi-device test detected GPU IDs: {device_ids:?}");
+        if device_ids.len() < 2 {
+            eprintln!("skipping prepared multi-device test: fewer than two CUDA devices detected");
+            return;
+        }
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(32);
+        let columns = (device_ids.len() * 2).max(2);
+        let cpu = DCRTPolyParams::new(n, 2, 30, 4, None, None);
+        let params = GpuDCRTPolyParams::new_with_gpu(
+            n,
+            cpu.to_crt().0,
+            4,
+            device_ids.clone(),
+            Some(1),
+            None,
+            None,
+        );
+        let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
+        let graph = DslContext::new("prepared-multi-device-matrix")
+            .output("result", ring.input("left", (1, columns)) + ring.input("right", (1, columns)))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+
+        // Give every device a distinct, deterministic column range. Comparing
+        // every returned shard with its trusted CPU sum proves that all
+        // configured devices executed their own range; shard metadata alone is
+        // not sufficient because an output could otherwise be copied or empty.
+        let mut expected = BTreeMap::new();
+        let mut left_shards = Vec::new();
+        let mut right_shards = Vec::new();
+        for (index, device_id) in device_ids.iter().copied().enumerate() {
+            let start = columns * index / device_ids.len();
+            let end = columns * (index + 1) / device_ids.len();
+            let local_columns = end - start;
+            let left_cpu = DCRTPolyMatrix::from_poly_vec(
+                &cpu,
+                vec![
+                    (0..local_columns)
+                        .map(|column| {
+                            DCRTPoly::from_usize_to_constant(&cpu, 100 * (index + 1) + column)
+                        })
+                        .collect(),
+                ],
+            );
+            let right_cpu = DCRTPolyMatrix::from_poly_vec(
+                &cpu,
+                vec![
+                    (0..local_columns)
+                        .map(|column| {
+                            DCRTPoly::from_usize_to_constant(&cpu, 1_000 * (index + 1) + column)
+                        })
+                        .collect(),
+                ],
+            );
+            let expected_cpu = &left_cpu + &right_cpu;
+            expected.insert(device_id, (start, expected_cpu));
+            let local_params = params.params_for_device(device_id, None);
+            left_shards.push(GpuColumnShard {
+                device_id,
+                global_column_start: start,
+                value: GpuDCRTPolyMatrix::from_cpu_matrix(&local_params, &left_cpu),
+            });
+            right_shards.push(GpuColumnShard {
+                device_id,
+                global_column_start: start,
+                value: GpuDCRTPolyMatrix::from_cpu_matrix(&local_params, &right_cpu),
+            });
+        }
+        let inputs = BTreeMap::from([
+            ("left".to_owned(), RuntimeValue::matrix(GpuFleetMatrix::new(1, columns, left_shards))),
+            (
+                "right".to_owned(),
+                RuntimeValue::matrix(GpuFleetMatrix::new(1, columns, right_shards)),
+            ),
+        ]);
+        let mut backend =
+            crate::backend::poly_gpu::gpu_backend_on([params.clone()], device_ids.clone());
+        backend.warm_up_prepared_graph(&graph, &inputs, &ExecutionConfig::default()).unwrap();
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_with_config(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let RuntimeValue::Matrix(value) =
+            result.materialize_output("result", &mut backend, &mut store).unwrap()
+        else {
+            panic!("prepared multi-device output must be a matrix");
+        };
+        assert_eq!(value.size(), (1, columns));
+        let mut observed = value.shards().iter().map(|shard| shard.device_id).collect::<Vec<_>>();
+        let mut expected_ids = device_ids.clone();
+        observed.sort_unstable();
+        expected_ids.sort_unstable();
+        assert_eq!(observed, expected_ids, "prepared output must use every detected device");
+        for shard in value.shards() {
+            let (start, expected_cpu) = expected
+                .get(&shard.device_id)
+                .expect("prepared output shard has an unconfigured device");
+            assert_eq!(shard.global_column_start, *start);
+            assert_eq!(shard.value.to_cpu_matrix(), *expected_cpu);
+        }
+        result.cleanup_staged(&mut store).unwrap();
     }
 }

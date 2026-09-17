@@ -184,46 +184,84 @@ pub fn encode_small_matrix_artifact(
         let bytes = bound.to_bytes_le();
         if bytes.is_empty() { vec![0] } else { bytes }
     };
-    let mut bytes = Vec::with_capacity(49 + bound_bytes.len() + payload.len());
-    bytes.extend_from_slice(SMALL_MATRIX_MAGIC);
-    bytes.push(small_matrix_semantic_tag(semantic_kind));
-    bytes.extend_from_slice(
-        &u64::try_from(expected_schema.matrix.rows)
-            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(
-        &u64::try_from(expected_schema.matrix.columns)
-            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("column count overflows"))?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(
-        &u64::try_from(expected_schema.matrix.ring_dimension)
-            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows"))?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(
-        &u32::try_from(bound_bytes.len())
-            .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(&bound_bytes);
-    bytes.extend_from_slice(
-        &u32::try_from(magnitude_bytes)
-            .map_err(|_| {
-                PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows")
-            })?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(
-        &u64::try_from(coefficient_count)
-            .map_err(|_| {
-                PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows")
-            })?
-            .to_le_bytes(),
-    );
-    bytes.extend_from_slice(payload);
+    let mut bytes = Vec::with_capacity(45 + bound_bytes.len() + payload.len());
+    encode_small_matrix_artifact_into(
+        expected_schema,
+        &bound_bytes,
+        payload,
+        semantic_kind,
+        &mut bytes,
+    )?;
     Ok(bytes)
+}
+
+/// Encode a compact bounded-matrix artifact into publication-owned storage.
+/// `bound_bytes` is also publication-owned; accepting it explicitly avoids
+/// calling `BigUint::to_bytes_le` at the prepared execution boundary.
+#[cfg(feature = "gpu")]
+pub(crate) fn encode_small_matrix_artifact_into(
+    expected_schema: &ConcreteBoundedMatrixSchema,
+    bound_bytes: &[u8],
+    payload: &[u8],
+    semantic_kind: SmallMatrixSemanticKind,
+    output: &mut Vec<u8>,
+) -> Result<(), PolyBackendError> {
+    let (_, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
+    let encoded_width = 1usize
+        .checked_add(magnitude_bytes)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+    let expected_payload_len = coefficient_count
+        .checked_mul(encoded_width)
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("payload length overflows"))?;
+    if payload.len() != expected_payload_len {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("payload length does not match"));
+    }
+    if bound_bytes.len() != magnitude_bytes {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact("bound width does not match"));
+    }
+    let rows = u64::try_from(expected_schema.matrix.rows)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("row count overflows"))?;
+    let columns = u64::try_from(expected_schema.matrix.columns)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("column count overflows"))?;
+    let ring_dimension = u64::try_from(expected_schema.matrix.ring_dimension)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("ring dimension overflows"))?;
+    let bound_length = u32::try_from(bound_bytes.len())
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("bound width overflows"))?;
+    let magnitude = u32::try_from(magnitude_bytes)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
+    let count = u64::try_from(coefficient_count)
+        .map_err(|_| PolyBackendError::InvalidSmallMatrixArtifact("coefficient count overflows"))?;
+    let total_len = 45usize
+        .checked_add(bound_bytes.len())
+        .and_then(|length| length.checked_add(payload.len()))
+        .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("artifact length overflows"))?;
+    if output.capacity() < total_len {
+        return Err(PolyBackendError::InvalidSmallMatrixArtifact(
+            "artifact staging capacity exhausted",
+        ));
+    }
+    // SAFETY: capacity was checked and the fixed-width fields below exactly
+    // cover `total_len` bytes.
+    unsafe { output.set_len(total_len) };
+    let mut offset = 0usize;
+    output[offset..offset + SMALL_MATRIX_MAGIC.len()].copy_from_slice(SMALL_MATRIX_MAGIC);
+    offset += SMALL_MATRIX_MAGIC.len();
+    output[offset] = small_matrix_semantic_tag(semantic_kind);
+    offset += 1;
+    for value in [rows, columns, ring_dimension] {
+        output[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        offset += 8;
+    }
+    output[offset..offset + 4].copy_from_slice(&bound_length.to_le_bytes());
+    offset += 4;
+    output[offset..offset + bound_bytes.len()].copy_from_slice(bound_bytes);
+    offset += bound_bytes.len();
+    output[offset..offset + 4].copy_from_slice(&magnitude.to_le_bytes());
+    offset += 4;
+    output[offset..offset + 8].copy_from_slice(&count.to_le_bytes());
+    offset += 8;
+    output[offset..].copy_from_slice(payload);
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
@@ -1592,7 +1630,9 @@ where
     }
 
     fn matrix_to_bytes(&self, value: &M) -> Result<Vec<u8>, Self::Error> {
-        Ok(value.to_compact_bytes())
+        M::compact_bytes_batch(&[value]).into_iter().next().ok_or_else(|| {
+            PolyBackendError::GpuSubmission("matrix compact codec returned no output".into())
+        })
     }
 
     fn matrices_to_bytes(&self, values: &[&M]) -> Result<Vec<Vec<u8>>, Self::Error> {

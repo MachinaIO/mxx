@@ -14,7 +14,8 @@ use mxx_primitives::{
         PolyMatrix, SmallPolyMatrix,
         gpu_dcrt_poly::{
             GpuDCRTPolyMatrix, GpuMatrixReleaseObserver, GpuMatrixReservation, GpuPreparedRequest,
-            GpuPreparedReservationError, GpuPreparedStorage, GpuSmallMatrix,
+            GpuPreparedReservationError, GpuPreparedSlotKind, GpuPreparedStorage,
+            GpuPreparedWorkspaceRequest, GpuPreparedWorkspaceReservation, GpuSmallMatrix,
         },
     },
     poly::{
@@ -28,7 +29,7 @@ use rayon::prelude::*;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicU64, Ordering},
         mpsc,
     },
@@ -42,6 +43,12 @@ pub struct GpuAllocationId {
     allocation: u64,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct GpuChargeId {
+    ledger: u64,
+    charge: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuAllocationRequirement {
     pub device: usize,
@@ -53,6 +60,7 @@ pub struct GpuPreparedAllocationRequirement<'a> {
     pub device: usize,
     pub storage: &'a GpuPreparedStorage,
     pub requests: &'a [GpuPreparedRequest],
+    pub workspace_requests: &'a [GpuPreparedWorkspaceRequest],
 }
 
 pub struct GpuMemoryReservation {
@@ -66,13 +74,114 @@ pub struct GpuMemoryReservation {
 #[derive(Clone, Debug)]
 pub(crate) struct GpuWarmupCheckpoint {
     storage_ids: BTreeSet<u64>,
-    region_generations: BTreeSet<u64>,
-    provisioning_count: usize,
+    charge_ids: BTreeSet<GpuChargeId>,
+}
+
+/// Capacity reserved by one warmup transaction before a native owner exists.
+/// A reservation is consumed exactly once by either a known storage owner or
+/// an [`UnknownCharge`].  It is the only part of a provisioning charge that a
+/// failed transaction may refund directly.
+#[derive(Clone)]
+struct ConstructionReservation {
+    device: Vec<u64>,
+    pinned: Vec<u64>,
+}
+
+impl ConstructionReservation {
+    fn is_empty(&self) -> bool {
+        self.device.iter().all(|bytes| *bytes == 0) && self.pinned.iter().all(|bytes| *bytes == 0)
+    }
+
+    fn consume(
+        &mut self,
+        device: usize,
+        device_bytes: u64,
+        pinned_bytes: u64,
+    ) -> Result<(), GpuAdmissionError> {
+        let Some(available_device) = self.device.get_mut(device) else {
+            return Err(GpuAdmissionError::InvalidDevice(device));
+        };
+        let Some(available_pinned) = self.pinned.get_mut(device) else {
+            return Err(GpuAdmissionError::InvalidDevice(device));
+        };
+        if device_bytes > *available_device || pinned_bytes > *available_pinned {
+            return Err(GpuAdmissionError::AllocationExceedsReservation {
+                allocated_bytes: device_bytes.saturating_add(pinned_bytes),
+                reserved_bytes: available_device.saturating_add(*available_pinned),
+            });
+        }
+        *available_device -= device_bytes;
+        *available_pinned -= pinned_bytes;
+        Ok(())
+    }
+
+    fn take_unknown(&mut self, reason: &str) -> Vec<UnknownCharge> {
+        let mut unknown = Vec::new();
+        for (device, (&device_bytes, &pinned_bytes)) in
+            self.device.iter().zip(&self.pinned).enumerate()
+        {
+            if device_bytes == 0 && pinned_bytes == 0 {
+                continue;
+            }
+            unknown.push(UnknownCharge {
+                device,
+                device_bytes,
+                pinned_bytes,
+                reason: reason.to_owned(),
+                owner: None,
+            });
+        }
+        self.device.fill(0);
+        self.pinned.fill(0);
+        unknown
+    }
+}
+
+struct StorageCharge {
+    identity: u64,
+    storage: Arc<GpuPreparedStorage>,
+    device: usize,
+    device_bytes: u64,
+    pinned_bytes: u64,
+    state: StorageChargeState,
+}
+
+enum StorageChargeState {
+    Owned,
+    ReleasePending(GpuReleaseCompletion),
+}
+
+/// Capacity whose native owner or exact release proof is no longer known.
+/// Unknown charges are deliberately sticky: polling never refunds them.
+struct UnknownCharge {
+    device: usize,
+    device_bytes: u64,
+    pinned_bytes: u64,
+    reason: String,
+    // Keep an owner alive if native teardown itself failed.  The bytes remain
+    // sticky even if this owner later drops; no unproven release can refund it.
+    owner: Option<Arc<GpuPreparedStorage>>,
+}
+
+impl UnknownCharge {
+    fn is_well_formed(&self, device_count: usize) -> bool {
+        if self.device >= device_count ||
+            self.reason.is_empty() ||
+            self.device_bytes.checked_add(self.pinned_bytes).is_none()
+        {
+            return false;
+        }
+        self.owner.as_ref().map_or(true, |owner| {
+            owner.is_workspace_only() ||
+                (owner.device() >= 0 && owner.device() as usize == self.device)
+        })
+    }
 }
 
 struct ProvisioningCharge {
-    device: Vec<u64>,
-    pinned: Vec<u64>,
+    reservation: ConstructionReservation,
+    storages: Vec<StorageCharge>,
+    unknown: Vec<UnknownCharge>,
 }
 
 /// RAII transaction for warmup backing.  Charges are installed before native
@@ -82,21 +191,37 @@ struct ProvisioningCharge {
 /// unwinding and asynchronous native destruction.
 pub(crate) struct PendingProvisioning<'a> {
     ledger: &'a mut GpuMemoryLedger,
-    additional_device: Vec<u64>,
-    additional_pinned: Vec<u64>,
-    provisioning_index: usize,
+    charge_id: GpuChargeId,
     committed: bool,
 }
 
 impl PendingProvisioning<'_> {
+    /// Keep this charge permanently accounted when native construction failed
+    /// before it could return an owner/probe.  A conservative uncertain charge
+    /// is preferable to refunding bytes whose asynchronous native lifetime is
+    /// no longer observable by the transaction.
+    pub(crate) fn mark_uncertain(&mut self) {
+        if let Some(charge) = self.ledger.provisioning_charges.get_mut(&self.charge_id) {
+            charge.unknown.extend(
+                charge
+                    .reservation
+                    .take_unknown("native construction failed before an owner was returned"),
+            );
+        }
+    }
+
     pub(crate) fn append(
         &mut self,
         prepared: Vec<(usize, Arc<GpuPreparedStorage>)>,
     ) -> Result<(), GpuAdmissionError> {
-        self.ledger.append_prepared_storages(prepared)
+        self.ledger.append_prepared_storages(self.charge_id, prepared)
     }
 
     pub(crate) fn commit(mut self) {
+        // A complete production transaction consumes its reservation through
+        // `append`.  Keep any unconsumed reservation explicit until the
+        // generation checkpoint rolls it back; it is still proven unallocated
+        // capacity, not an unknown native owner.
         self.committed = true;
     }
 }
@@ -104,9 +229,7 @@ impl PendingProvisioning<'_> {
 impl Drop for PendingProvisioning<'_> {
     fn drop(&mut self) {
         if !self.committed {
-            self.ledger
-                .rollback_prepared_provisioning(&self.additional_device, &self.additional_pinned);
-            self.ledger.provisioning_charges.remove(self.provisioning_index);
+            self.ledger.rollback_prepared_provisioning(self.charge_id);
         }
     }
 }
@@ -126,7 +249,6 @@ enum AllocationNotice {
     /// A committed prepared generation whose native publication failed.
     /// Unlike quarantine, this is recoverable because no native owner was
     /// published and the reservation can be removed immediately.
-    Discarded,
     Submitted,
     Resident,
     Released(Result<GpuReleaseCompletion, String>),
@@ -141,10 +263,13 @@ fn validate_prepared_inventory(
     let Some((owner, accepted)) = inventory.get(&storage.identity()) else {
         return Err(GpuAdmissionError::UnknownPreparedStorage);
     };
-    if *owner != device ||
-        accepted.device() != storage.device() ||
-        accepted.execution_owner_id() != storage.execution_owner_id()
-    {
+    let same_execution = if storage.is_workspace_only() {
+        accepted.execution_owner_id() == storage.execution_owner_id()
+    } else {
+        accepted.device() == storage.device() &&
+            accepted.execution_owner_id() == storage.execution_owner_id()
+    };
+    if *owner != device || !same_execution {
         return Err(GpuAdmissionError::ExecutionMismatch);
     }
     Ok(())
@@ -170,60 +295,6 @@ impl GpuAllocationLease {
             .map_err(|_| GpuAdmissionError::Closed)?;
         self.submitted = true;
         Ok(())
-    }
-
-    /// Commit a prepared scalar backing whose native owner is managed by the
-    /// scalar buffer rather than by a matrix allocation observer.
-    pub(crate) fn commit_prepared_scalar(&mut self) -> Result<(), GpuAdmissionError> {
-        self.begin()?;
-        self.sender
-            .send((self.id, AllocationNotice::Resident))
-            .map_err(|_| GpuAdmissionError::Closed)?;
-        self.bound = true;
-        Ok(())
-    }
-
-    /// Attach the scalar buffer's event-ordered release to this lease. Keep
-    /// the lease bound until its owner is dropped so `Drop` cannot report a
-    /// second transition for the same allocation.
-    pub(crate) fn retire_prepared_scalar(
-        &mut self,
-        completion: GpuReleaseCompletion,
-    ) -> Result<(), GpuAdmissionError> {
-        if !self.bound {
-            return Err(GpuAdmissionError::InvalidTransition);
-        }
-        self.sender
-            .send((self.id, AllocationNotice::Released(Ok(completion))))
-            .map_err(|_| GpuAdmissionError::Closed)
-    }
-
-    pub(crate) fn cancel_prepared_scalar(&mut self) -> Result<(), GpuAdmissionError> {
-        if !self.submitted {
-            return Err(GpuAdmissionError::InvalidTransition);
-        }
-        self.sender
-            .send((self.id, AllocationNotice::Discarded))
-            .map_err(|_| GpuAdmissionError::Closed)?;
-        self.bound = true;
-        Ok(())
-    }
-
-    /// Mark a prepared scalar generation as permanently unknown. The charge
-    /// remains live and the dispatcher becomes sticky-failed; it must never be
-    /// reclaimed without native completion evidence.
-    pub(crate) fn quarantine_prepared_scalar(&mut self) -> Result<(), GpuAdmissionError> {
-        if !self.bound {
-            return Err(GpuAdmissionError::InvalidTransition);
-        }
-        self.sender
-            .send((
-                self.id,
-                AllocationNotice::Released(Err(
-                    "prepared scalar generation lost its native release owner".into(),
-                )),
-            ))
-            .map_err(|_| GpuAdmissionError::Closed)
     }
 
     fn validate_owner(
@@ -367,12 +438,16 @@ impl GpuDeviceAdmission {
 /// Transient containing the exact prepared storage selected for one wave.
 /// Dropping this owner restores the enclosing wave's inventory.
 pub struct GpuMemoryRegion {
-    inventory: BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>,
+    _inventory: BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>,
+    workspace_requests: std::sync::Mutex<BTreeMap<u64, Vec<GpuPreparedWorkspaceRequest>>>,
 }
 
 impl GpuMemoryRegion {
     pub(crate) fn empty() -> Self {
-        Self { inventory: BTreeMap::new() }
+        Self {
+            _inventory: BTreeMap::new(),
+            workspace_requests: std::sync::Mutex::new(BTreeMap::new()),
+        }
     }
 
     #[cfg(test)]
@@ -380,10 +455,32 @@ impl GpuMemoryRegion {
         Self::empty()
     }
 
-    pub(crate) fn prepared_inventory(
+    pub(crate) fn take_workspace_reservation_matching(
         &self,
-    ) -> impl Iterator<Item = (usize, Arc<GpuPreparedStorage>)> {
-        self.inventory.values().cloned().collect::<Vec<_>>().into_iter()
+        storage: u64,
+        request: GpuPreparedWorkspaceRequest,
+    ) -> Option<GpuPreparedWorkspaceReservation> {
+        // Workspace claims are immutable codec descriptors, not one-shot
+        // reservations.  Re-arm the exact slot from its owning storage for
+        // every serialization so retaining an output permits repeated reads.
+        let expected = {
+            let requests = self.workspace_requests.lock().ok()?;
+            requests.get(&storage)?.iter().find(|expected| **expected == request).copied()?
+        };
+        let (_, workspace) = self._inventory.get(&storage)?;
+        workspace.reserve_workspace(std::slice::from_ref(&expected)).ok()
+    }
+
+    pub(crate) fn reserve_matrix(
+        &self,
+        storage: u64,
+        requests: &[GpuPreparedRequest],
+    ) -> Result<GpuMatrixReservation, String> {
+        let (_, storage) = self
+            ._inventory
+            .get(&storage)
+            .ok_or_else(|| "prepared matrix storage is missing from the region".to_owned())?;
+        storage.reserve(requests)
     }
 }
 
@@ -393,11 +490,6 @@ pub struct GpuMemoryLedger {
     // Retain the actual backing accepted at setup. A later allocation on the
     // same execution owner is not implicitly part of the charged inventory.
     prepared_storages: BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>,
-    // The wave owns each inventory; the ledger only observes the innermost
-    // surviving region. Error unwinding restores its parent without a callback
-    // borrowing this mutable ledger, and without retaining completed waves.
-    region_inventories: Vec<(u64, Weak<GpuMemoryRegion>)>,
-    next_region_generation: u64,
     device_totals: Vec<u64>,
     next_allocation: u64,
     devices: Vec<GpuDeviceAdmission>,
@@ -408,7 +500,8 @@ pub struct GpuMemoryLedger {
     release_sender: mpsc::Sender<(GpuAllocationId, AllocationNotice)>,
     release_error: Option<String>,
     abandoned_submission: bool,
-    provisioning_charges: Vec<ProvisioningCharge>,
+    provisioning_charges: BTreeMap<GpuChargeId, ProvisioningCharge>,
+    next_charge: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -519,6 +612,8 @@ impl GpuMemoryLedger {
                 .checked_add(*pinned)
                 .ok_or(GpuAdmissionError::Overflow)?;
         }
+        let charge = self.next_charge;
+        let next_charge = charge.checked_add(1).ok_or(GpuAdmissionError::Overflow)?;
         crate::backend::poly_gpu::record_provisioning_begin();
         for ((device, requested_bytes), pinned) in
             self.devices.iter_mut().zip(additional_device).zip(additional_pinned)
@@ -526,65 +621,288 @@ impl GpuMemoryLedger {
             device.allocation_bytes += *requested_bytes;
             device.pinned_allocation_bytes += *pinned;
         }
-        let provisioning_index = self.provisioning_charges.len();
-        self.provisioning_charges.push(ProvisioningCharge {
-            device: additional_device.to_vec(),
-            pinned: additional_pinned.to_vec(),
-        });
-        Ok(PendingProvisioning {
-            ledger: self,
-            additional_device: additional_device.to_vec(),
-            additional_pinned: additional_pinned.to_vec(),
-            provisioning_index,
-            committed: false,
-        })
+        let charge_id = GpuChargeId { ledger: self.identity, charge };
+        self.provisioning_charges.insert(
+            charge_id,
+            ProvisioningCharge {
+                reservation: ConstructionReservation {
+                    device: additional_device.to_vec(),
+                    pinned: additional_pinned.to_vec(),
+                },
+                storages: Vec::new(),
+                unknown: Vec::new(),
+            },
+        );
+        self.next_charge = next_charge;
+        Ok(PendingProvisioning { ledger: self, charge_id, committed: false })
     }
 
     /// Undo a not-yet-published provisioning charge.  This is intentionally
     /// only used by the owning warmup transaction after native construction
     /// or detached-region acquisition fails.
-    pub(crate) fn rollback_prepared_provisioning(
-        &mut self,
-        additional_device: &[u64],
-        additional_pinned: &[u64],
-    ) {
-        debug_assert_eq!(additional_device.len(), self.devices.len());
-        debug_assert_eq!(additional_pinned.len(), self.devices.len());
-        for ((device, requested_bytes), pinned) in
-            self.devices.iter_mut().zip(additional_device).zip(additional_pinned)
+    fn rollback_prepared_provisioning(&mut self, charge_id: GpuChargeId) {
+        let Some(mut charge) = self.provisioning_charges.remove(&charge_id) else {
+            self.release_error = Some("prepared charge was already removed".into());
+            return;
+        };
+        for storage in &charge.storages {
+            self.prepared_storages.remove(&storage.identity);
+        }
+        if !charge.reservation.is_empty() {
+            let reservation = charge.reservation.clone();
+            match self.refund_construction_reservation(&reservation) {
+                Ok(()) => {
+                    charge.reservation.device.fill(0);
+                    charge.reservation.pinned.fill(0);
+                }
+                Err(error) => {
+                    self.release_error = Some(error.to_string());
+                }
+            }
+        }
+
+        let storages = std::mem::take(&mut charge.storages);
+        for mut storage in storages {
+            match storage.state {
+                StorageChargeState::Owned => match storage.storage.start_release() {
+                    Ok(probe) => {
+                        storage.state = StorageChargeState::ReleasePending(probe.into_completion());
+                        charge.storages.push(storage);
+                    }
+                    Err(error) => {
+                        self.release_error = Some(error.clone());
+                        charge.unknown.push(UnknownCharge {
+                            device: storage.device,
+                            device_bytes: storage.device_bytes,
+                            pinned_bytes: storage.pinned_bytes,
+                            reason: error,
+                            owner: Some(storage.storage),
+                        });
+                    }
+                },
+                StorageChargeState::ReleasePending(probe) => {
+                    storage.state = StorageChargeState::ReleasePending(probe);
+                    charge.storages.push(storage);
+                }
+            }
+        }
+        if !charge.storages.is_empty() ||
+            !charge.unknown.is_empty() ||
+            !charge.reservation.is_empty()
         {
-            debug_assert!(device.allocation_bytes >= *requested_bytes);
-            device.allocation_bytes -= *requested_bytes;
-            debug_assert!(device.pinned_allocation_bytes >= *pinned);
-            device.pinned_allocation_bytes -= *pinned;
+            self.provisioning_charges.insert(charge_id, charge);
         }
     }
 
-    /// Append newly provisioned prepared storage to this execution owner.
-    /// The ledger is never replaced after setup; all identities and the full
-    /// fleet budget are validated before any store becomes visible.
-    pub(crate) fn append_prepared_storages(
+    fn refund_construction_reservation(
         &mut self,
+        reservation: &ConstructionReservation,
+    ) -> Result<(), GpuAdmissionError> {
+        if reservation.device.len() != self.devices.len() ||
+            reservation.pinned.len() != self.devices.len()
+        {
+            return Err(GpuAdmissionError::InvalidTransition);
+        }
+        if self.devices.iter().zip(&reservation.device).zip(&reservation.pinned).any(
+            |((device, requested_bytes), pinned)| {
+                *requested_bytes > device.allocation_bytes ||
+                    *pinned > device.pinned_allocation_bytes
+            },
+        ) {
+            return Err(GpuAdmissionError::InvalidTransition);
+        }
+        for ((device, requested_bytes), pinned) in
+            self.devices.iter_mut().zip(&reservation.device).zip(&reservation.pinned)
+        {
+            device.allocation_bytes -= *requested_bytes;
+            device.pinned_allocation_bytes -= *pinned;
+        }
+        Ok(())
+    }
+
+    fn snapshot_storage_bytes(
+        storage: &GpuPreparedStorage,
+    ) -> Result<(u64, u64), GpuAdmissionError> {
+        if storage.is_workspace_only() {
+            let accounting =
+                storage.workspace_accounting().map_err(GpuAdmissionError::ReleaseFailure)?;
+            return Ok((
+                u64::try_from(accounting.device_bytes).map_err(|_| GpuAdmissionError::Overflow)?,
+                u64::try_from(accounting.pinned_bytes).map_err(|_| GpuAdmissionError::Overflow)?,
+            ));
+        }
+        let mut device_bytes = 0u64;
+        let mut pinned_bytes = 0u64;
+        for slot in storage.snapshot().map_err(GpuAdmissionError::ReleaseFailure)? {
+            let bytes = u64::try_from(slot.identity().requested_backing_bytes())
+                .map_err(|_| GpuAdmissionError::Overflow)?;
+            match slot.identity().kind() {
+                GpuPreparedSlotKind::PinnedHost => {
+                    pinned_bytes =
+                        pinned_bytes.checked_add(bytes).ok_or(GpuAdmissionError::Overflow)?;
+                }
+                GpuPreparedSlotKind::CompletionEvent | GpuPreparedSlotKind::SubmissionStream => {}
+                _ => {
+                    device_bytes =
+                        device_bytes.checked_add(bytes).ok_or(GpuAdmissionError::Overflow)?;
+                }
+            }
+        }
+        Ok((device_bytes, pinned_bytes))
+    }
+
+    /// Consume the remaining reservation conservatively after a fallible
+    /// append.  Every fresh owner is retained by an unknown record, while any
+    /// reservation that cannot be attributed to an exact owner remains a
+    /// per-device sticky unknown charge.
+    fn quarantine_append_failure(
+        &mut self,
+        charge_id: GpuChargeId,
+        prepared: &[(usize, Arc<GpuPreparedStorage>)],
+        reason: &str,
+    ) {
+        let Some(mut charge) = self.provisioning_charges.remove(&charge_id) else {
+            self.release_error = Some("prepared charge was already removed".into());
+            return;
+        };
+        let mut seen = BTreeSet::new();
+        for (device, storage) in prepared {
+            if *device >= self.devices.len() ||
+                self.prepared_storages.contains_key(&storage.identity()) ||
+                !seen.insert(storage.identity())
+            {
+                continue;
+            }
+            match Self::snapshot_storage_bytes(storage) {
+                Ok((device_bytes, pinned_bytes))
+                    if charge.reservation.consume(*device, device_bytes, pinned_bytes).is_ok() =>
+                {
+                    charge.unknown.push(UnknownCharge {
+                        device: *device,
+                        device_bytes,
+                        pinned_bytes,
+                        reason: reason.to_owned(),
+                        owner: Some(Arc::clone(storage)),
+                    });
+                }
+                _ => {
+                    // The exact owner demand could not be observed.  Keep the
+                    // owner alive and account the reservation remainder below.
+                    charge.unknown.push(UnknownCharge {
+                        device: *device,
+                        device_bytes: 0,
+                        pinned_bytes: 0,
+                        reason: reason.to_owned(),
+                        owner: Some(Arc::clone(storage)),
+                    });
+                }
+            }
+        }
+        charge.unknown.extend(charge.reservation.take_unknown(reason));
+        self.provisioning_charges.insert(charge_id, charge);
+    }
+
+    /// Append newly provisioned prepared storage to this execution owner.
+    /// Each owner consumes its exact reservation record; no aggregate charge
+    /// or fresh-charge polling exception is needed.
+
+    fn append_prepared_storages(
+        &mut self,
+        charge_id: GpuChargeId,
         prepared: Vec<(usize, Arc<GpuPreparedStorage>)>,
     ) -> Result<(), GpuAdmissionError> {
         if prepared.is_empty() {
             return Ok(());
         }
-        self.poll_releases()?;
+        if let Err(error) = self.poll_releases() {
+            self.quarantine_append_failure(
+                charge_id,
+                &prepared,
+                "release polling failed while appending prepared storage",
+            );
+            return Err(error);
+        }
         let mut identities = BTreeSet::new();
         for (device, storage) in &prepared {
-            let expected = self
-                .execution_identities
-                .as_ref()
-                .and_then(|identities| identities.get(*device))
-                .ok_or(GpuAdmissionError::InvalidDevice(*device))?;
-            if *expected != (storage.device(), storage.execution_owner_id()) ||
+            let Some(expected) =
+                self.execution_identities.as_ref().and_then(|ids| ids.get(*device))
+            else {
+                self.quarantine_append_failure(charge_id, &prepared, "invalid prepared device");
+                return Err(GpuAdmissionError::InvalidDevice(*device));
+            };
+            let execution_matches = if storage.is_workspace_only() {
+                storage.execution_owner_id() == expected.1 &&
+                    storage.workspace_claims().is_some_and(|claims| {
+                        claims.iter().all(|claim| claim.device == expected.0)
+                    })
+            } else {
+                *expected == (storage.device(), storage.execution_owner_id())
+            };
+            if !execution_matches ||
                 !identities.insert(storage.identity()) ||
                 self.prepared_storages.contains_key(&storage.identity())
             {
+                self.quarantine_append_failure(
+                    charge_id,
+                    &prepared,
+                    "prepared storage identity was duplicated or mismatched",
+                );
                 return Err(GpuAdmissionError::ExecutionMismatch);
             }
         }
+        let mut storage_charges = Vec::with_capacity(prepared.len());
+        for (device, storage) in &prepared {
+            let (device_bytes, pinned_bytes) = match Self::snapshot_storage_bytes(storage) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    self.quarantine_append_failure(
+                        charge_id,
+                        &prepared,
+                        "prepared storage snapshot failed during append",
+                    );
+                    return Err(error);
+                }
+            };
+            storage_charges.push(StorageCharge {
+                identity: storage.identity(),
+                storage: Arc::clone(storage),
+                device: *device,
+                device_bytes,
+                pinned_bytes,
+                state: StorageChargeState::Owned,
+            });
+        }
+        let reservation_error = {
+            let charge = self
+                .provisioning_charges
+                .get_mut(&charge_id)
+                .ok_or(GpuAdmissionError::UnknownAllocation)?;
+            let mut remaining_reservation = charge.reservation.clone();
+            let result = storage_charges.iter().try_for_each(|storage| {
+                remaining_reservation.consume(
+                    storage.device,
+                    storage.device_bytes,
+                    storage.pinned_bytes,
+                )
+            });
+            if result.is_ok() {
+                charge.reservation = remaining_reservation;
+            }
+            result
+        };
+        if let Err(error) = reservation_error {
+            self.quarantine_append_failure(
+                charge_id,
+                &prepared,
+                "prepared storage demand exceeded its construction reservation",
+            );
+            return Err(error);
+        }
+        let charge = self
+            .provisioning_charges
+            .get_mut(&charge_id)
+            .ok_or(GpuAdmissionError::UnknownAllocation)?;
+        charge.storages.extend(storage_charges);
         for (device, storage) in prepared {
             crate::backend::poly_gpu::record_provisioning_permit();
             self.prepared_storages.insert(storage.identity(), (device, storage));
@@ -596,12 +914,7 @@ impl GpuMemoryLedger {
     pub(crate) fn warmup_checkpoint(&self) -> GpuWarmupCheckpoint {
         GpuWarmupCheckpoint {
             storage_ids: self.prepared_storages.keys().copied().collect(),
-            region_generations: self
-                .region_inventories
-                .iter()
-                .map(|(generation, _)| *generation)
-                .collect(),
-            provisioning_count: self.provisioning_charges.len(),
+            charge_ids: self.provisioning_charges.keys().copied().collect(),
         }
     }
 
@@ -609,97 +922,126 @@ impl GpuMemoryLedger {
     /// Existing setup/program owners are left untouched; native storage owners
     /// are dropped after all failed reservations have unwound.
     pub(crate) fn rollback_warmup(&mut self, checkpoint: GpuWarmupCheckpoint) {
-        self.prepared_storages.retain(|identity, _| checkpoint.storage_ids.contains(identity));
-        self.region_inventories
-            .retain(|(generation, _)| checkpoint.region_generations.contains(generation));
-        if checkpoint.provisioning_count <= self.provisioning_charges.len() {
-            let charges = self.provisioning_charges.split_off(checkpoint.provisioning_count);
-            for charge in charges.into_iter().rev() {
-                for (device, bytes) in self.devices.iter_mut().zip(charge.device) {
-                    if let Some(value) = device.allocation_bytes.checked_sub(bytes) {
-                        device.allocation_bytes = value;
-                    } else {
-                        self.release_error = Some("warmup rollback device charge underflow".into());
-                    }
-                }
-                for (device, bytes) in self.devices.iter_mut().zip(charge.pinned) {
-                    if let Some(value) = device.pinned_allocation_bytes.checked_sub(bytes) {
-                        device.pinned_allocation_bytes = value;
-                    } else {
-                        self.release_error = Some("warmup rollback pinned charge underflow".into());
-                    }
+        let candidate_charges = self
+            .provisioning_charges
+            .keys()
+            .copied()
+            .filter(|id| !checkpoint.charge_ids.contains(id))
+            .collect::<Vec<_>>();
+        for charge_id in candidate_charges {
+            if let Some(charge) = self.provisioning_charges.get(&charge_id) {
+                for storage in &charge.storages {
+                    self.prepared_storages.remove(&storage.identity);
                 }
             }
-        } else {
-            self.release_error = Some("warmup rollback provisioning journal changed".into());
+            self.rollback_prepared_provisioning(charge_id);
         }
+        self.prepared_storages.retain(|identity, _| checkpoint.storage_ids.contains(identity));
     }
 
-    /// The complete accepted setup inventory. Unlike `prepared_inventory`,
-    /// this is not narrowed by a currently-live execution region and is the
-    /// only inventory suitable for resolving a replacement generation.
+    /// Roll back every speculative charge when the first generation never had
+    /// an accepted ledger checkpoint.  This must run before dropping the
+    /// ledger, so native owners remain reachable by their release probes.
+    pub(crate) fn rollback_all_warmup(&mut self) {
+        self.rollback_warmup(GpuWarmupCheckpoint {
+            storage_ids: BTreeSet::new(),
+            charge_ids: BTreeSet::new(),
+        });
+    }
+
+    /// The complete accepted base-owner inventory. This is the only inventory
+    /// suitable for resolving a replacement generation; regions are never
+    /// consulted as implicit parents.
     pub(crate) fn accepted_prepared_inventory(
         &self,
     ) -> impl Iterator<Item = (usize, Arc<GpuPreparedStorage>)> {
         self.prepared_storages.values().cloned().collect::<Vec<_>>().into_iter()
     }
 
-    pub(crate) fn prepared_inventory(
-        &self,
-    ) -> impl Iterator<Item = (usize, Arc<GpuPreparedStorage>)> {
-        let region = self.region_inventories.iter().rev().find_map(|(_, region)| region.upgrade());
-        region
-            .as_ref()
-            .map(|region| &region.inventory)
-            .unwrap_or(&self.prepared_storages)
-            .values()
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-    }
-
     /// Commit complete native region capacity, without taking operation leases.
     /// Matching/liveness chooses these exact slots first; this transaction only
     /// publishes an inventory after every storage owner has been acquired.
-    /// Dropping the returned owner restores the nearest surviving parent.
+    /// Dropping the returned owner releases only this independent native region.
     pub fn reserve_region(
         &mut self,
         requirements: &[GpuPreparedAllocationRequirement<'_>],
     ) -> Result<Arc<GpuMemoryRegion>, GpuAdmissionError> {
         crate::backend::poly_gpu::record_prepared_forbidden(5);
         let inventory = self
-            .prepared_inventory()
+            .accepted_prepared_inventory()
             .map(|(device, storage)| (storage.identity(), (device, storage)))
             .collect::<BTreeMap<_, _>>();
         let mut selected = BTreeMap::<u64, (usize, Vec<usize>)>::new();
+        let mut selected_workspace = BTreeMap::<
+            u64,
+            (usize, Arc<GpuPreparedStorage>, Vec<GpuPreparedWorkspaceRequest>),
+        >::new();
         for requirement in requirements {
             self.validate_prepared_storage(requirement.device, requirement.storage, &inventory)?;
-            let slots = &mut selected
-                .entry(requirement.storage.identity())
-                .or_insert_with(|| (requirement.device, Vec::new()))
-                .1;
-            slots.extend(requirement.requests.iter().map(|request| request.slot_key().2));
+            if !requirement.requests.is_empty() {
+                if requirement.storage.is_workspace_only() {
+                    return Err(GpuAdmissionError::NativeReservation(
+                        "workspace-only storage received a matrix reservation".into(),
+                    ));
+                }
+                let slots = &mut selected
+                    .entry(requirement.storage.identity())
+                    .or_insert_with(|| (requirement.device, Vec::new()))
+                    .1;
+                slots.extend(requirement.requests.iter().map(|request| request.slot_key().2));
+            }
+            if !requirement.workspace_requests.is_empty() {
+                if !requirement.storage.is_workspace_only() {
+                    return Err(GpuAdmissionError::NativeReservation(
+                        "matrix storage received a workspace reservation".into(),
+                    ));
+                }
+                let identity = requirement.storage.identity();
+                let entry = selected_workspace.entry(identity).or_insert_with(|| {
+                    (requirement.device, Arc::clone(&inventory[&identity].1), Vec::new())
+                });
+                entry.2.extend_from_slice(requirement.workspace_requests);
+            }
         }
-        let regions = selected
+        let mut regions = selected
             .into_par_iter()
             .map(|(identity, (device, slots))| {
                 let storage = &inventory[&identity].1;
                 let region = Arc::new(
                     storage
-                        .reserve_region(&slots, None)
+                        .reserve_region(&slots)
                         .map_err(GpuAdmissionError::NativeReservation)?
                         .ok_or(GpuAdmissionError::StaleRegion { device })?,
                 );
                 Ok((identity, (device, region.storage())))
             })
             .collect::<Result<BTreeMap<_, _>, GpuAdmissionError>>()?;
-        let regions = Arc::new(GpuMemoryRegion { inventory: regions });
-        self.region_inventories.retain(|(_, entry)| entry.strong_count() != 0);
-        let generation = self.next_region_generation;
-        self.next_region_generation =
-            self.next_region_generation.checked_add(1).ok_or(GpuAdmissionError::Overflow)?;
-        self.region_inventories.push((generation, Arc::downgrade(&regions)));
-        Ok(regions)
+        for (identity, (device, storage, _)) in &selected_workspace {
+            regions.insert(*identity, (*device, Arc::clone(storage)));
+        }
+        let workspace_requests = selected_workspace
+            .into_par_iter()
+            .map(|(identity, (device, storage, requests))| {
+                let _ = device;
+                let requests = requests
+                    .iter()
+                    .map(|request| {
+                        storage
+                            .reserve_workspace(std::slice::from_ref(request))
+                            .map(|reservation| {
+                                drop(reservation);
+                                *request
+                            })
+                            .map_err(GpuAdmissionError::NativeReservation)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((identity, requests))
+            })
+            .collect::<Result<BTreeMap<_, _>, GpuAdmissionError>>()?;
+        Ok(Arc::new(GpuMemoryRegion {
+            _inventory: regions,
+            workspace_requests: std::sync::Mutex::new(workspace_requests),
+        }))
     }
 
     pub(crate) fn execution_identities(&self) -> Option<&[(i32, u64)]> {
@@ -712,13 +1054,27 @@ impl GpuMemoryLedger {
         storage: &GpuPreparedStorage,
         inventory: &BTreeMap<u64, (usize, Arc<GpuPreparedStorage>)>,
     ) -> Result<(), GpuAdmissionError> {
+        if storage.is_region_authorized() {
+            return Err(GpuAdmissionError::AcquisitionConflict(
+                "prepared region construction cannot consume a region-authorized storage view"
+                    .into(),
+            ));
+        }
         self.devices.get(device).ok_or(GpuAdmissionError::InvalidDevice(device))?;
         let expected = self
             .execution_identities
             .as_ref()
             .and_then(|identities| identities.get(device))
             .ok_or(GpuAdmissionError::ExecutionMismatch)?;
-        if *expected != (storage.device(), storage.execution_owner_id()) {
+        let execution_matches = if storage.is_workspace_only() {
+            storage.execution_owner_id() == expected.1 &&
+                storage
+                    .workspace_claims()
+                    .is_some_and(|claims| claims.iter().all(|claim| claim.device == expected.0))
+        } else {
+            *expected == (storage.device(), storage.execution_owner_id())
+        };
+        if !execution_matches {
             return Err(GpuAdmissionError::ExecutionMismatch);
         }
         validate_prepared_inventory(device, storage, inventory)
@@ -742,6 +1098,18 @@ impl GpuMemoryLedger {
             Self::from_accounting_snapshot(&memory, &physical, percent, Some(&identities))?;
         let mut pinned_setup = vec![0u64; ledger.devices.len()];
         for (device, storage) in &prepared {
+            if storage.is_workspace_only() {
+                let bytes = u64::try_from(
+                    storage
+                        .workspace_accounting()
+                        .map_err(GpuAdmissionError::ReleaseFailure)?
+                        .pinned_bytes,
+                )
+                .map_err(|_| GpuAdmissionError::Overflow)?;
+                pinned_setup[*device] =
+                    pinned_setup[*device].checked_add(bytes).ok_or(GpuAdmissionError::Overflow)?;
+                continue;
+            }
             let bytes = storage
                 .snapshot()
                 .map_err(GpuAdmissionError::ReleaseFailure)?
@@ -776,7 +1144,15 @@ impl GpuMemoryLedger {
             crate::backend::poly_gpu::record_provisioning_permit();
             let identity =
                 identities.get(device).ok_or(GpuAdmissionError::InvalidDevice(device))?;
-            if *identity != (storage.device(), storage.execution_owner_id()) {
+            let execution_matches = if storage.is_workspace_only() {
+                storage.execution_owner_id() == identity.1 &&
+                    storage.workspace_claims().is_some_and(|claims| {
+                        claims.iter().all(|claim| claim.device == identity.0)
+                    })
+            } else {
+                *identity == (storage.device(), storage.execution_owner_id())
+            };
+            if !execution_matches {
                 return Err(GpuAdmissionError::ExecutionMismatch);
             }
             if ledger.prepared_storages.insert(storage.identity(), (device, storage)).is_some() {
@@ -891,8 +1267,6 @@ impl GpuMemoryLedger {
             identity,
             observation_epochs: Vec::new(),
             prepared_storages: BTreeMap::new(),
-            region_inventories: Vec::new(),
-            next_region_generation: 0,
             device_totals: memory.iter().map(|device| device.total_bytes).collect(),
             next_allocation: 0,
             devices,
@@ -903,7 +1277,8 @@ impl GpuMemoryLedger {
             releases,
             release_error: None,
             abandoned_submission: false,
-            provisioning_charges: Vec::new(),
+            provisioning_charges: BTreeMap::new(),
+            next_charge: 0,
         })
     }
 
@@ -987,7 +1362,7 @@ impl GpuMemoryLedger {
         // Validate the whole requested inventory before acquiring any logical
         // slots. Storage IDs are native and cannot be reused for later backing.
         let inventory = self
-            .prepared_inventory()
+            .accepted_prepared_inventory()
             .map(|(device, storage)| (storage.identity(), (device, storage)))
             .collect::<BTreeMap<_, _>>();
         for request in prepared {
@@ -1115,29 +1490,68 @@ impl GpuMemoryLedger {
     /// Called at admission boundaries, never in a per-column kernel loop.
     /// Incomplete or failed CUDA events keep their allocation charged.
     pub fn poll_releases(&mut self) -> Result<usize, GpuAdmissionError> {
+        let mut poll_error = self.release_error.clone();
+        let charge_ids = self.provisioning_charges.keys().copied().collect::<Vec<_>>();
+        for id in charge_ids {
+            let Some(charge) = self.provisioning_charges.get_mut(&id) else { continue };
+            if charge.unknown.iter().any(|unknown| !unknown.is_well_formed(self.devices.len())) {
+                let error = GpuAdmissionError::InvalidTransition;
+                self.release_error = Some(error.to_string());
+                return Err(error);
+            }
+            let mut completed = Vec::new();
+            for (index, storage) in charge.storages.iter().enumerate() {
+                let StorageChargeState::ReleasePending(release) = &storage.state else {
+                    continue;
+                };
+                match release.is_complete() {
+                    Ok(true) => completed.push(index),
+                    Ok(false) => {}
+                    Err(error) => {
+                        poll_error = Some(error.clone());
+                        self.release_error = Some(error);
+                    }
+                }
+            }
+            for index in completed.into_iter().rev() {
+                let storage = &charge.storages[index];
+                if storage.device >= self.devices.len() ||
+                    storage.device_bytes > self.devices[storage.device].allocation_bytes ||
+                    storage.pinned_bytes > self.devices[storage.device].pinned_allocation_bytes
+                {
+                    let error = GpuAdmissionError::InvalidTransition;
+                    poll_error = Some(error.to_string());
+                    self.release_error = Some(error.to_string());
+                    continue;
+                }
+                let storage = charge.storages.remove(index);
+                self.devices[storage.device].allocation_bytes -= storage.device_bytes;
+                self.devices[storage.device].pinned_allocation_bytes -= storage.pinned_bytes;
+            }
+        }
+
+        let completed = self
+            .provisioning_charges
+            .iter()
+            .filter_map(|(id, charge)| {
+                (charge.storages.is_empty() &&
+                    charge.reservation.is_empty() &&
+                    charge.unknown.is_empty())
+                .then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        for id in completed {
+            self.provisioning_charges.remove(&id);
+        }
+        if let Some(error) = poll_error {
+            return Err(GpuAdmissionError::ReleaseFailure(error));
+        }
         while let Ok((id, notice)) = self.releases.try_recv() {
             match notice {
                 AllocationNotice::Cancelled => {
                     let allocation =
                         self.allocations.get(&id).ok_or(GpuAdmissionError::UnknownAllocation)?;
                     if allocation.state != AllocationState::Leased {
-                        return Err(GpuAdmissionError::InvalidTransition);
-                    }
-                    let allocation = self.allocations.remove(&id).expect("validated allocation");
-                    self.devices[allocation.requirement.device].allocation_bytes -=
-                        allocation.requirement.bytes;
-                    self.devices[allocation.requirement.device].pinned_allocation_bytes -=
-                        allocation.requirement.pinned_bytes;
-                }
-                AllocationNotice::Discarded => {
-                    let allocation =
-                        self.allocations.get(&id).ok_or(GpuAdmissionError::UnknownAllocation)?;
-                    if !matches!(
-                        allocation.state,
-                        AllocationState::Leased |
-                            AllocationState::Submitted |
-                            AllocationState::Resident
-                    ) {
                         return Err(GpuAdmissionError::InvalidTransition);
                     }
                     let allocation = self.allocations.remove(&id).expect("validated allocation");
@@ -1345,6 +1759,44 @@ mod tests {
     }
 
     #[test]
+    fn construction_reservation_consumes_device_and_pinned_bytes_once() {
+        let mut reservation =
+            ConstructionReservation { device: vec![100, 200], pinned: vec![7, 11] };
+        reservation.consume(0, 40, 3).unwrap();
+        reservation.consume(1, 80, 5).unwrap();
+        assert_eq!(reservation.device, vec![60, 120]);
+        assert_eq!(reservation.pinned, vec![4, 6]);
+        assert!(matches!(
+            reservation.consume(0, 61, 0),
+            Err(GpuAdmissionError::AllocationExceedsReservation { .. })
+        ));
+        assert_eq!(reservation.device, vec![60, 120]);
+        assert_eq!(reservation.pinned, vec![4, 6]);
+    }
+
+    #[test]
+    fn construction_reservation_unknown_conversion_preserves_each_device_delta() {
+        let mut reservation =
+            ConstructionReservation { device: vec![60, 0, 9], pinned: vec![4, 6, 0] };
+        let unknown = reservation.take_unknown("native probe unavailable");
+        assert_eq!(unknown.len(), 3);
+        assert_eq!(
+            (unknown[0].device, unknown[0].device_bytes, unknown[0].pinned_bytes),
+            (0, 60, 4)
+        );
+        assert_eq!(
+            (unknown[1].device, unknown[1].device_bytes, unknown[1].pinned_bytes),
+            (1, 0, 6)
+        );
+        assert_eq!(
+            (unknown[2].device, unknown[2].device_bytes, unknown[2].pinned_bytes),
+            (2, 9, 0)
+        );
+        assert!(reservation.is_empty());
+        assert!(unknown.iter().all(|charge| charge.reason == "native probe unavailable"));
+    }
+
+    #[test]
     fn pending_provisioning_rolls_back_each_device_charge() {
         let mut ledger = ledger();
         let before =
@@ -1378,6 +1830,25 @@ mod tests {
     }
 
     #[test]
+    fn in_progress_and_unassigned_provisioning_survives_poll() {
+        let mut ledger = ledger();
+        let pending = ledger.begin_prepared_provisioning(&[123, 0], &[11, 0]).unwrap();
+        assert_eq!(pending.ledger.poll_releases().unwrap(), 0);
+        assert_eq!(pending.ledger.provisioning_charges.len(), 1);
+        pending.commit();
+        assert_eq!(ledger.poll_releases().unwrap(), 0);
+        assert_eq!(ledger.provisioning_charges.len(), 1);
+    }
+
+    #[test]
+    fn zero_byte_provisioning_can_complete_without_storage() {
+        let mut ledger = ledger();
+        ledger.begin_prepared_provisioning(&[0, 0], &[0, 0]).unwrap().commit();
+        assert_eq!(ledger.poll_releases().unwrap(), 0);
+        assert!(ledger.provisioning_charges.is_empty());
+    }
+
+    #[test]
     fn warmup_checkpoint_restores_device_and_pinned_charges() {
         let mut ledger = ledger();
         let checkpoint = ledger.warmup_checkpoint();
@@ -1406,22 +1877,6 @@ mod tests {
     }
 
     #[test]
-    fn warmup_checkpoint_uses_region_identity_after_weak_compaction() {
-        let mut ledger = ledger();
-        let old = Arc::new(GpuMemoryRegion::empty_for_test());
-        ledger.region_inventories.push((41, Arc::downgrade(&old)));
-        let checkpoint = ledger.warmup_checkpoint();
-        drop(old);
-
-        let newer = Arc::new(GpuMemoryRegion::empty_for_test());
-        ledger.region_inventories.push((42, Arc::downgrade(&newer)));
-        ledger.region_inventories.retain(|(_, entry)| entry.strong_count() != 0);
-        assert_eq!(ledger.region_inventories.len(), 1);
-        ledger.rollback_warmup(checkpoint);
-        assert!(ledger.region_inventories.is_empty());
-    }
-
-    #[test]
     fn reserve_accumulates_pinned_requirements_per_device() {
         let mut ledger = ledger();
         let error = match ledger.reserve(
@@ -1435,21 +1890,5 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(error, GpuAdmissionError::PinnedCapacity { requested_bytes: 1_100, .. }));
-    }
-
-    #[test]
-    fn committed_scalar_resize_failure_discards_without_poisoning_ledger() {
-        let mut ledger = ledger();
-        let reservation = ledger
-            .reserve(&[GpuAllocationRequirement { device: 0, bytes: 32, pinned_bytes: 16 }], &[])
-            .unwrap();
-        let mut leases = ledger.submit(&reservation.allocations).unwrap();
-        let mut lease = leases.pop().unwrap();
-        lease.commit_prepared_scalar().unwrap();
-        lease.cancel_prepared_scalar().unwrap();
-        assert_eq!(ledger.poll_releases().unwrap(), 0);
-        assert_eq!(ledger.devices()[0].allocation_bytes, 0);
-        assert_eq!(ledger.devices()[0].pinned_allocation_bytes, 0);
-        assert!(ledger.release_error.is_none());
     }
 }

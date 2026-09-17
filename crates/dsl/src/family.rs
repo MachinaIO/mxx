@@ -53,35 +53,6 @@ impl<T: GraphValue> Family<T> {
         let count = IntExpr::constant(elements.len());
 
         let flattened = elements.iter().map(GraphValue::flatten).collect::<Vec<_>>();
-        // Packing all ordered members of an existing family is a structural
-        // identity. Keep its producer instead of retaining one getter per
-        // member and then introducing a large pack node for each field.
-        let sources = flattened[0]
-            .iter()
-            .enumerate()
-            .map(|(port, first)| {
-                let [source] = first.node().arguments() else { return None };
-                let WireType::IndexedFamily { count: source_count, .. } = source.wire_type() else {
-                    return None;
-                };
-                if source_count != &count {
-                    return None;
-                }
-                flattened.iter().enumerate().all(|(index, member)| {
-                matches!(member[port].node().kind(), NodeKind::FamilyGetStatic { index: actual }
-                    if actual == &IntExpr::constant(index)) &&
-                    member[port].node().arguments() == std::slice::from_ref(source)
-            }).then(|| source.clone())
-            })
-            .collect::<Option<Vec<_>>>();
-        if let Some(values) = sources {
-            return Ok(Self {
-                shared: vec![false; types.len()],
-                values,
-                element_schema: schema,
-                count,
-            });
-        }
         let values = types
             .into_iter()
             .enumerate()
@@ -444,8 +415,6 @@ mod tests {
         let values =
             parallel(3, |_| Ok((ring.gaussian((1, 1), 1, 4), ring.uniform_residue((1, 1)))))
                 .unwrap();
-        let repacked = Family::pack((0..3).map(|index| values.at(index)).collect()).unwrap();
-        assert_eq!(repacked.flatten(), values.flatten());
         let reversed = Family::pack((0..3).rev().map(|index| values.at(index)).collect()).unwrap();
         assert_ne!(reversed.flatten(), values.flatten());
         let subset = Family::pack(vec![values.at(0), values.at(1)]).unwrap();

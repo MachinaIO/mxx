@@ -261,6 +261,9 @@ mod tests {
         };
         let actual = (0..3).map(|_| Arc::new(make_output())).collect::<Vec<_>>();
         let mut expected = (0..3).map(|_| make_output()).collect::<Vec<_>>();
+        for value in &actual {
+            value.prepare_preimage_hard_cutoff();
+        }
         for value in &expected {
             value.prepare_preimage_hard_cutoff();
         }

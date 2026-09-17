@@ -103,6 +103,16 @@ extern "C"
         uint16_t *out_bytes_per_coeff,
         size_t *out_payload_len);
 
+    // Store through the retained matrix owner. Evaluation owners are restored
+    // before return, including when the store itself fails.
+    int gpu_matrix_store_compact_bytes_borrowed(
+        GpuMatrix *mat,
+        uint8_t *payload_out,
+        size_t payload_capacity,
+        uint16_t *out_max_coeff_bits,
+        uint16_t *out_bytes_per_coeff,
+        size_t *out_payload_len);
+
     int gpu_matrix_store_compact_bytes_batch(
         GpuMatrix *const *matrices,
         size_t matrix_count,

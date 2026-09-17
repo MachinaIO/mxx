@@ -12,8 +12,9 @@ use mxx_ir_core::{
 };
 use mxx_primitives::{
     matrix::gpu_dcrt_poly::{
-        GpuPreparedAccumulateLayout, GpuPreparedRequest, PreparedAllocationLayout,
-        PreparedOwnerLayout, PreparedPlanLayout, PreparedStreamFootprint,
+        GpuPreparedAccumulateLayout, GpuPreparedRequest, GpuPreparedStorage,
+        PreparedAllocationLayout, PreparedOwnerLayout, PreparedPlanLayout, PreparedResourceKey,
+        PreparedStreamFootprint,
     },
     sampler::trapdoor::gpu::{GpuPreparedPreimageLayout, GpuPreparedTrapdoorLayout},
 };
@@ -22,6 +23,7 @@ use num_traits::ToPrimitive;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
+    sync::Arc,
 };
 
 #[path = "gpu_prepared_scope.rs"]
@@ -65,37 +67,290 @@ impl ValueLocation {
     }
 }
 
+/// The semantic site of a matrix value.  A site is deliberately tagged so
+/// that ordinary wires, finite variant outputs, and host readback staging can
+/// never be confused merely because their physical geometry happens to match.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum MatrixSite {
+    Ordinary { wire: WireRef, device: i32, instance: usize },
+    Variant { node: u32, variant: usize, port: usize, device: i32, instance: usize },
+    HostStaging { node: u32, instance: usize, device: i32 },
+}
+
+/// Stable identity for one finalized matrix site.  `location` is the physical
+/// owner/capacity view; the tagged `site` remains the semantic identity.  The
+/// two are kept separate so aliasing and storage colouring cannot silently
+/// turn one logical value into another.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct FinalizedMatrixId(pub u64);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct BasisId(pub u64);
+
+/// Fully resolved matrix view geometry.  The physical owner is not inferred
+/// from this layout; it is only the immutable semantic view consumed by
+/// descriptors and replay.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MatrixViewLayout {
+    pub rows: Range<usize>,
+    pub columns: Range<usize>,
+    pub row_stride: usize,
+    pub column_stride: usize,
+    pub ring_rows: usize,
+    pub ring_columns: usize,
+}
+
+/// Canonical physical owner/capacity record.  It is stored once by the
+/// finalized matrix table; resource plans refer to it through
+/// `FinalizedMatrixId` instead of deciding owner identity from a tuple.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedMatrixPhysical {
+    pub owner: u64,
+    pub device: i32,
+    pub level: usize,
+    pub format: PreparedFormat,
+    pub context_identity: usize,
+    pub capacity_rows: usize,
+    pub capacity_columns: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FinalizedMatrixIdentity {
+    pub site: MatrixSite,
+    pub physical: FinalizedMatrixPhysical,
+    pub basis: BasisId,
+    pub view: MatrixViewLayout,
+    pub execution_instance: usize,
+}
+
+pub(crate) fn finalized_matrix_location(identity: &FinalizedMatrixIdentity) -> ValueLocation {
+    ValueLocation {
+        owner: identity.physical.owner,
+        rows: identity.view.rows.clone(),
+        columns: identity.view.columns.clone(),
+        level: identity.physical.level,
+        format: identity.physical.format,
+        device: identity.physical.device,
+    }
+}
+
+/// The sole finalized matrix identity authority.  All native descriptors and
+/// stores are derived from this table; callers must not maintain parallel
+/// ordinary/variant/staging state maps.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct FinalizedMatrixIdTable {
+    pub by_site: BTreeMap<MatrixSite, FinalizedMatrixId>,
+    pub identities: BTreeMap<FinalizedMatrixId, FinalizedMatrixIdentity>,
+    next: u64,
+}
+
+pub fn store_owner_key(store: &PreparedStorePlan) -> PreparedOwnerKey {
+    PreparedOwnerKey { matrix_id: store.matrix_id, instance: store.instance }
+}
+
+impl FinalizedMatrixIdTable {
+    pub fn clear(&mut self) {
+        self.by_site.clear();
+        self.identities.clear();
+        self.next = 0;
+    }
+
+    pub fn insert(
+        &mut self,
+        site: MatrixSite,
+        location: ValueLocation,
+        context_identity: usize,
+        capacity_rows: usize,
+        capacity_columns: usize,
+    ) -> Result<FinalizedMatrixId, String> {
+        let view_location = location.clone();
+        let candidate = FinalizedMatrixIdentity {
+            site,
+            physical: FinalizedMatrixPhysical {
+                owner: location.owner,
+                device: location.device,
+                level: location.level,
+                format: location.format,
+                context_identity,
+                capacity_rows,
+                capacity_columns,
+            },
+            // Context identity selects the parameter set; include the
+            // finalized level/format so CRT basis content/order cannot alias
+            // across views that happen to share a context.
+            basis: BasisId(
+                (context_identity as u64)
+                    .wrapping_mul(1_000_003)
+                    .wrapping_add(view_location.level as u64)
+                    .wrapping_mul(31)
+                    .wrapping_add(match view_location.format {
+                        PreparedFormat::Coefficient => 0,
+                        PreparedFormat::Evaluation => 1,
+                    }),
+            ),
+            view: MatrixViewLayout {
+                rows: view_location.rows.clone(),
+                columns: view_location.columns.clone(),
+                row_stride: view_location.columns.end,
+                column_stride: 1,
+                ring_rows: view_location.rows.end,
+                ring_columns: view_location.columns.end,
+            },
+            execution_instance: match site {
+                MatrixSite::Ordinary { instance, .. } |
+                MatrixSite::Variant { instance, .. } |
+                MatrixSite::HostStaging { instance, .. } => instance,
+            },
+        };
+        if let Some(id) = self.by_site.get(&site).copied() {
+            let existing = self
+                .identities
+                .get(&id)
+                .ok_or_else(|| "finalized matrix site index is corrupt".to_owned())?;
+            return if existing == &candidate {
+                Ok(id)
+            } else {
+                Err(format!("conflicting finalized matrix identity for site {site:?}"))
+            };
+        }
+        let id = {
+            let id = FinalizedMatrixId(self.next);
+            self.next = self.next.checked_add(1).expect("finalized matrix id overflow");
+            id
+        };
+        self.by_site.insert(site, id);
+        self.identities.insert(id, candidate);
+        Ok(id)
+    }
+
+    pub fn id(&self, site: MatrixSite) -> Option<FinalizedMatrixId> {
+        self.by_site.get(&site).copied()
+    }
+
+    pub fn identity(&self, id: FinalizedMatrixId) -> Option<&FinalizedMatrixIdentity> {
+        self.identities.get(&id)
+    }
+
+    /// Resolve the same tagged semantic site for one concrete execution
+    /// instance. Instance expansion is part of identity, not stream order.
+    pub fn for_execution_instance(
+        &self,
+        id: FinalizedMatrixId,
+        instance: usize,
+    ) -> Option<FinalizedMatrixId> {
+        let site = self.identity(id)?.site;
+        let site = match site {
+            MatrixSite::Ordinary { wire, device, .. } => {
+                MatrixSite::Ordinary { wire, device, instance }
+            }
+            MatrixSite::Variant { node, variant, port, device, .. } => {
+                MatrixSite::Variant { node, variant, port, device, instance }
+            }
+            MatrixSite::HostStaging { node, device, .. } => {
+                MatrixSite::HostStaging { node, device, instance }
+            }
+        };
+        self.id(site)
+    }
+
+    pub fn ordinary_for_instance(
+        &self,
+        wire: WireRef,
+        device: i32,
+        instance: usize,
+    ) -> Option<&FinalizedMatrixIdentity> {
+        self.id(MatrixSite::Ordinary { wire, device, instance }).and_then(|id| self.identity(id))
+    }
+
+    pub fn variant(
+        &self,
+        node: u32,
+        variant: usize,
+        port: usize,
+        device: i32,
+    ) -> Option<&FinalizedMatrixIdentity> {
+        self.variant_for_instance(node, variant, port, device, 0)
+    }
+
+    pub fn variant_for_instance(
+        &self,
+        node: u32,
+        variant: usize,
+        port: usize,
+        device: i32,
+        instance: usize,
+    ) -> Option<&FinalizedMatrixIdentity> {
+        self.id(MatrixSite::Variant { node, variant, port, device, instance })
+            .and_then(|id| self.identity(id))
+    }
+
+    pub fn host_staging(
+        &self,
+        node: u32,
+        instance: usize,
+        device: i32,
+    ) -> Option<&FinalizedMatrixIdentity> {
+        self.id(MatrixSite::HostStaging { node, instance, device }).and_then(|id| self.identity(id))
+    }
+
+    pub fn iter_variants(&self) -> impl Iterator<Item = (MatrixSite, &FinalizedMatrixIdentity)> {
+        self.identities.iter().filter_map(|(_, identity)| {
+            matches!(identity.site, MatrixSite::Variant { .. }).then_some((identity.site, identity))
+        })
+    }
+
+    pub fn iter_host_staging(
+        &self,
+    ) -> impl Iterator<Item = (MatrixSite, &FinalizedMatrixIdentity)> {
+        self.identities.iter().filter_map(|(_, identity)| {
+            matches!(identity.site, MatrixSite::HostStaging { .. })
+                .then_some((identity.site, identity))
+        })
+    }
+}
+
+fn exact_common_instance_identity<'a>(
+    table: &'a FinalizedMatrixIdTable,
+    wire: WireRef,
+    device: i32,
+    instance_count: usize,
+) -> Option<&'a FinalizedMatrixIdentity> {
+    let mut identities =
+        (0..instance_count).map(|instance| table.ordinary_for_instance(wire, device, instance));
+    let first = identities.next()??;
+    identities
+        .all(|identity| {
+            identity.is_some_and(|candidate| {
+                candidate.physical == first.physical && candidate.view == first.view
+            })
+        })
+        .then_some(first)
+}
+
 /// Stable logical-to-physical binding identity. Storage is populated by the
 /// append-only provisioning transaction after lowering selects the topology.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PreparedBindingId {
-    pub owner: u64,
-    pub device: i32,
+    pub matrix_id: FinalizedMatrixId,
     pub instance: usize,
-    pub storage: Option<PreparedStorageBinding>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
-pub struct PreparedStorageBinding {
-    pub storage_id: u64,
-    pub slot_id: u64,
-    pub slot_index: usize,
-    pub context: usize,
-    /// CRT basis identity carried with the physical slot.  Context identity
-    /// alone is insufficient when one context owns several bases.
-    pub basis: usize,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreparedViewRange {
+    pub rows: Range<usize>,
+    pub columns: Range<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FixedCopy {
-    pub source: ValueLocation,
-    pub destination: ValueLocation,
+    pub source: PreparedViewRange,
+    pub destination: PreparedViewRange,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum PreparedView {
-    Alias(ValueLocation),
-    TransposeAlias(ValueLocation),
+pub enum PreparedViewShape {
+    Alias(PreparedViewRange),
+    TransposeAlias(PreparedViewRange),
     FixedCopies(Box<[FixedCopy]>),
 }
 
@@ -342,7 +597,7 @@ pub fn lower_slice(
     bindings: &ParamEnv,
     source: ValueLocation,
     destination: ValueLocation,
-) -> Result<PreparedView, PreparedLoweringError> {
+) -> Result<PreparedViewShape, PreparedLoweringError> {
     let NodeKind::Slice { rows, columns } = kind else {
         return Err(PreparedLoweringError::WrongNodeKind("Slice"));
     };
@@ -384,14 +639,20 @@ pub fn lower_slice(
     let selected_source =
         ValueLocation { rows: source_rows.clone(), columns: source_columns.clone(), ..source };
     if selected_source.same_owner(&destination) {
-        return Ok(PreparedView::Alias(ValueLocation {
+        return Ok(PreparedViewShape::Alias(PreparedViewRange {
             rows: source_rows,
             columns: source_columns,
-            ..destination
         }));
     }
-    Ok(PreparedView::FixedCopies(
-        vec![FixedCopy { source: selected_source, destination }].into_boxed_slice(),
+    Ok(PreparedViewShape::FixedCopies(
+        vec![FixedCopy {
+            source: PreparedViewRange {
+                rows: selected_source.rows,
+                columns: selected_source.columns,
+            },
+            destination: PreparedViewRange { rows: destination.rows, columns: destination.columns },
+        }]
+        .into_boxed_slice(),
     ))
 }
 
@@ -399,7 +660,7 @@ pub fn lower_transpose(
     kind: &NodeKind,
     source: ValueLocation,
     destination: ValueLocation,
-) -> Result<PreparedView, PreparedLoweringError> {
+) -> Result<PreparedViewShape, PreparedLoweringError> {
     require_node(kind, "Transpose")?;
     let (rows, columns) = source.shape();
     if destination.shape() != (columns, rows) {
@@ -407,14 +668,20 @@ pub fn lower_transpose(
     }
     let transposed_source = ValueLocation { rows: source.columns, columns: source.rows, ..source };
     if transposed_source.same_owner(&destination) {
-        return Ok(PreparedView::TransposeAlias(ValueLocation {
+        return Ok(PreparedViewShape::TransposeAlias(PreparedViewRange {
             rows: transposed_source.rows,
             columns: transposed_source.columns,
-            ..destination
         }));
     }
-    Ok(PreparedView::FixedCopies(
-        vec![FixedCopy { source: transposed_source, destination }].into_boxed_slice(),
+    Ok(PreparedViewShape::FixedCopies(
+        vec![FixedCopy {
+            source: PreparedViewRange {
+                rows: transposed_source.rows,
+                columns: transposed_source.columns,
+            },
+            destination: PreparedViewRange { rows: destination.rows, columns: destination.columns },
+        }]
+        .into_boxed_slice(),
     ))
 }
 
@@ -422,7 +689,7 @@ pub fn lower_concat(
     kind: &NodeKind,
     inputs: &[ValueLocation],
     destination: ValueLocation,
-) -> Result<PreparedView, PreparedLoweringError> {
+) -> Result<PreparedViewShape, PreparedLoweringError> {
     let NodeKind::Concat { axis } = kind else {
         return Err(PreparedLoweringError::WrongNodeKind("Concat"));
     };
@@ -438,7 +705,10 @@ pub fn lower_concat(
             }
         };
     if aliasable && *axis != ConcatAxis::Diagonal {
-        return Ok(PreparedView::Alias(destination));
+        return Ok(PreparedViewShape::Alias(PreparedViewRange {
+            rows: destination.rows,
+            columns: destination.columns,
+        }));
     }
     let mut row_offset = destination.rows.start;
     let mut column_offset = destination.columns.start;
@@ -467,20 +737,16 @@ pub fn lower_concat(
                 }
             };
             FixedCopy {
-                source: input.clone(),
-                destination: ValueLocation {
-                    owner: destination.owner,
-                    rows: target_rows,
-                    columns: target_columns,
-                    level: destination.level,
-                    format: destination.format,
-                    device: destination.device,
+                source: PreparedViewRange {
+                    rows: input.rows.clone(),
+                    columns: input.columns.clone(),
                 },
+                destination: PreparedViewRange { rows: target_rows, columns: target_columns },
             }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    Ok(PreparedView::FixedCopies(copies))
+    Ok(PreparedViewShape::FixedCopies(copies))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -668,6 +934,7 @@ pub struct PreparedInputLeaf {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparedDescriptorRef {
     pub wire: WireRef,
+    pub matrix_id: Option<FinalizedMatrixId>,
     pub instance: usize,
     pub store: Option<usize>,
     pub kind: PreparedDescriptorKind,
@@ -686,18 +953,94 @@ pub enum PreparedDescriptorKind {
 /// later provisioning concern.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreparedStorePlan {
+    pub matrix_id: FinalizedMatrixId,
     pub wire: WireRef,
     pub wire_type: Option<ConcreteWireType>,
-    pub location: ValueLocation,
     pub instance: usize,
-    pub capacity_rows: usize,
-    pub capacity_columns: usize,
     /// Logical command shape remains distinct from the colored owner's maximum
     /// capacity. Native stage planners consume this exact shape; allocation
     /// claims consume the capacity fields above.
     pub logical_rows: usize,
     pub logical_columns: usize,
-    pub alignment: usize,
+}
+
+/// Resolve the one matrix store a native recipe owns. A recipe with several
+/// outputs or several input-only stores is not safely bindable by ordinal;
+/// callers must reject it before provisioning rather than silently selecting
+/// the first entry.
+pub(crate) fn exact_recipe_store(
+    recipe: &PreparedNativeRecipe,
+    stores: &[PreparedStorePlan],
+) -> Result<Option<usize>, String> {
+    let unique = |indices: &[usize]| -> Result<Option<usize>, String> {
+        let mut candidates = indices.to_vec();
+        if candidates.iter().any(|index| stores.get(*index).is_none()) {
+            return Err(format!("prepared node {} has an invalid recipe store", recipe.node));
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [] => Ok(None),
+            [store] => Ok(Some(*store)),
+            _ => Err(format!("prepared node {} has ambiguous recipe stores", recipe.node)),
+        }
+    };
+    if let Some(store) = unique(&recipe.outputs)? {
+        return Ok(Some(store));
+    }
+    if let Some(store) = unique(&recipe.inputs)? {
+        return Ok(Some(store));
+    }
+    // Scalar-native recipes have no matrix descriptors, but their single
+    // explicit owner is still exact provenance for auxiliary workspaces.
+    // Resolve that owner only when it identifies one logical matrix store;
+    // multiple owners remain an intentional ambiguity and are rejected.
+    let owner_stores = recipe
+        .owners
+        .iter()
+        .flat_map(|owner| {
+            stores.iter().enumerate().filter_map(move |(index, store)| {
+                (store.matrix_id == owner.matrix_id && store.instance == owner.instance)
+                    .then_some(index)
+            })
+        })
+        .collect::<Vec<_>>();
+    unique(&owner_stores)
+}
+
+/// Resolve the physical store for one native allocation. Matrix plans can
+/// contain a source-shaped scratch allocation in addition to their output;
+/// the allocation geometry is authoritative for that claim, while auxiliary
+/// workspaces retain the recipe's exact output/input provenance.
+pub(crate) fn recipe_store_for_layout(
+    recipe: &PreparedNativeRecipe,
+    stores: &[PreparedStorePlan],
+    layout: &PreparedAllocationLayout,
+) -> Result<Option<usize>, String> {
+    if layout.kind != 0 {
+        return exact_recipe_store(recipe, stores);
+    }
+    if !matches!(layout.format, 0 | 1) {
+        return Err(format!("prepared node {} matrix layout has invalid format", recipe.node));
+    }
+    let mut candidates = recipe
+        .inputs
+        .iter()
+        .chain(recipe.outputs.iter())
+        .copied()
+        .filter(|index| {
+            stores.get(*index).is_some_and(|store| {
+                store.logical_rows == layout.rows && store.logical_columns == layout.columns
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [store] => Ok(Some(*store)),
+        [] => exact_recipe_store(recipe, stores),
+        _ => Err(format!("prepared node {} matrix allocation has ambiguous stores", recipe.node)),
+    }
 }
 
 /// Logical stage identity captured by lowering. The native schedule remains
@@ -729,10 +1072,7 @@ pub struct PreparedStreamKey {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PreparedPlacementKey {
     pub store: usize,
-    pub owner: u64,
-    pub device: i32,
-    pub level: usize,
-    pub format: PreparedFormat,
+    pub matrix_id: FinalizedMatrixId,
 }
 
 /// Closed native stage classification carried by the pure lowering plan. The
@@ -754,10 +1094,9 @@ pub enum PreparedNativeStage {
     Control,
 }
 
-/// Structural shape of a scalar native resource.  Widths here describe the
-/// initial prepared generation; arbitrary-width runtime integers may grow that
-/// generation at the explicit input boundary and are accounted for separately
-/// by the scalar capacity ledger.
+/// Structural shape of a scalar native resource. Widths are fixed by the
+/// operation-aware warmup projection; runtime values outside that projection
+/// are rejected at the input boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PreparedScalarResource {
     Buffer { count: usize, words: usize, pinned_host_bytes: usize },
@@ -791,11 +1130,8 @@ pub enum PreparedReplayUploadRecipe {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub struct PreparedOwnerKey {
-    pub owner: u64,
-    pub device: i32,
+    pub matrix_id: FinalizedMatrixId,
     pub instance: usize,
-    pub level: usize,
-    pub format: PreparedFormat,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -812,10 +1148,10 @@ pub struct PreparedNativeRecipe {
     pub outputs: Box<[usize]>,
     pub owners: Box<[PreparedOwnerKey]>,
     pub completion: Option<u32>,
-    /// Threshold decoding first copies its source into a fixed 1x1
-    /// coefficient-domain matrix.  The store and owner are planned here so
-    /// replay can consume the admitted matrix slot instead of constructing an
-    /// unplanned staging owner.
+    /// Threshold decoding first copies its source into a dedicated
+    /// coefficient-domain staging owner. The store and owner are planned here
+    /// so replay can consume the admitted matrix slot instead of constructing
+    /// an unplanned staging owner.
     pub matrix_staging: Option<PreparedOwnerKey>,
     /// Exact scalar sub-stage contract. Matrix stages leave this unset.
     pub scalar: Option<PreparedScalarResource>,
@@ -866,6 +1202,7 @@ pub struct PreparedResourcePlan {
     /// Number of independent physical execution instances represented by the
     /// store, command, and schedule entries below.
     pub instance_count: usize,
+    pub finalized_matrices: FinalizedMatrixIdTable,
     pub stores: Box<[PreparedStorePlan]>,
     pub scalar_buffers: Box<[PreparedScalarBufferPlan]>,
     pub commands: Box<[PreparedCommandPlan]>,
@@ -882,13 +1219,17 @@ pub struct PreparedResolvedOwner {
     /// must use this identity directly; it must not rediscover an owner by
     /// scanning the accepted inventory.
     pub slot: Option<PreparedSlotRef>,
+    /// Completion resources reserved for the one synthesized root-input copy
+    /// owned by this physical store.  Input copies are not IR commands, so
+    /// their native claims live beside the owner rather than being recovered
+    /// by scanning the inventory at bind time.
+    pub input_copy_slots: Vec<PreparedSlotRef>,
 }
 
 impl PartialEq for PreparedResolvedOwner {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key &&
             self.layout.execution_owner_identity() == other.layout.execution_owner_identity() &&
-            self.layout.stream_ordinal_base() == other.layout.stream_ordinal_base() &&
             self.layout.execution_class() == other.layout.execution_class() &&
             self.layout.partition_count() == other.layout.partition_count()
     }
@@ -899,10 +1240,58 @@ impl PartialEq for PreparedResolvedOwner {
 /// The request is copied from the accepted storage identity; replay must pass
 /// this value through the containing region and never rediscover a slot by
 /// scanning the global inventory.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone)]
 pub struct PreparedSlotRef {
+    /// Canonical native storage identity selected during warmup.  Binding
+    /// carries this owner directly; no region inventory rematching is needed.
+    pub storage: Arc<GpuPreparedStorage>,
     pub device: i32,
-    pub request: GpuPreparedRequest,
+    pub request: PreparedSlotRequest,
+}
+
+impl std::fmt::Debug for PreparedSlotRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedSlotRef")
+            .field("storage", &self.storage.identity())
+            .field("device", &self.device)
+            .field("request", &self.request)
+            .finish()
+    }
+}
+
+impl PartialEq for PreparedSlotRef {
+    fn eq(&self, other: &Self) -> bool {
+        self.storage.identity() == other.storage.identity() &&
+            self.device == other.device &&
+            self.request == other.request
+    }
+}
+
+impl Eq for PreparedSlotRef {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedSlotRequest {
+    Matrix(GpuPreparedRequest),
+    Workspace(mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedWorkspaceRequest),
+}
+
+impl PreparedSlotRef {
+    pub fn matrix_request(&self) -> Option<GpuPreparedRequest> {
+        match self.request {
+            PreparedSlotRequest::Matrix(request) => Some(request),
+            PreparedSlotRequest::Workspace(_) => None,
+        }
+    }
+
+    pub fn workspace_request(
+        &self,
+    ) -> Option<mxx_primitives::matrix::gpu_dcrt_poly::GpuPreparedWorkspaceRequest> {
+        match self.request {
+            PreparedSlotRequest::Matrix(_) => None,
+            PreparedSlotRequest::Workspace(request) => Some(request),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -911,6 +1300,10 @@ pub struct PreparedAllocationClaim {
     pub ordinal: usize,
     pub store: Option<usize>,
     pub layout: PreparedAllocationLayout,
+    /// Exact matrix owner layout resolved during warmup.  Workspace claims
+    /// leave this unset; matrix provisioning must never regenerate it from a
+    /// stream ordinal or a partial resource-key match.
+    pub owner_layout: Option<PreparedOwnerLayout>,
     pub slot: Option<PreparedSlotRef>,
 }
 
@@ -922,11 +1315,15 @@ pub struct PreparedCompositeClaim {
     pub command: u32,
     pub ordinal: usize,
     pub claim: mxx_primitives::matrix::gpu_dcrt_poly::GpuTracedClaim,
+    /// Exact logical store used when the native claim does not carry a
+    /// physical allocation layout (for example a matrix phase claim).
+    pub store: Option<usize>,
     /// The native descriptor which produced this claim, when it is a native
     /// allocation.  Keeping the key beside the traced claim lets admission
     /// match stream footprints by device/partition/limb/role instead of by a
     /// fragile ordinal among unrelated workspace claims.
     pub layout: Option<mxx_primitives::matrix::gpu_dcrt_poly::PreparedAllocationLayout>,
+    pub owner_layout: Option<PreparedOwnerLayout>,
     pub slot: Option<PreparedSlotRef>,
 }
 
@@ -995,6 +1392,10 @@ pub struct PreparedStreamClaim {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedResolvedCommand {
     pub command: PreparedCommandPlan,
+    /// Canonical prepared schedule resource selected during warmup. Runtime
+    /// provisioning must consume this identity directly; it must not
+    /// rediscover a schedule from node numbers or stream geometry.
+    pub schedule_id: Option<usize>,
     pub native: Option<PreparedPlanLayout>,
     /// Complete ordered descriptor bundle for a fused accumulate tape.
     /// `native` remains the command-level compatibility view for accounting;
@@ -1021,11 +1422,186 @@ pub struct PreparedResolvedReplayUpload {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum PreparedScheduleResource {
+    Allocation(PreparedAllocationClaim),
+    Stream(PreparedStreamClaim),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreparedResolvedSchedule {
     pub schedule: PreparedSchedulePlan,
-    pub native: PreparedPlanLayout,
-    pub allocations: Box<[PreparedAllocationClaim]>,
-    pub streams: Box<[PreparedStreamClaim]>,
+    pub resources: Box<[PreparedScheduleResource]>,
+}
+
+impl PreparedResolvedSchedule {
+    pub fn schedule_allocations_len(&self) -> usize {
+        self.resources
+            .iter()
+            .filter(|resource| matches!(resource, PreparedScheduleResource::Allocation(_)))
+            .count()
+    }
+
+    pub fn allocation(&self, index: usize) -> Option<&PreparedAllocationClaim> {
+        self.resources
+            .iter()
+            .filter_map(|resource| match resource {
+                PreparedScheduleResource::Allocation(allocation) => Some(allocation),
+                PreparedScheduleResource::Stream(_) => None,
+            })
+            .nth(index)
+    }
+
+    pub fn allocation_mut(&mut self, index: usize) -> Option<&mut PreparedAllocationClaim> {
+        self.resources
+            .iter_mut()
+            .filter_map(|resource| match resource {
+                PreparedScheduleResource::Allocation(allocation) => Some(allocation),
+                PreparedScheduleResource::Stream(_) => None,
+            })
+            .nth(index)
+    }
+
+    pub fn allocation_claims(&self) -> impl Iterator<Item = &PreparedAllocationClaim> {
+        self.resources.iter().filter_map(|resource| match resource {
+            PreparedScheduleResource::Allocation(allocation) => Some(allocation),
+            PreparedScheduleResource::Stream(_) => None,
+        })
+    }
+
+    pub fn stream_claims(&self) -> impl Iterator<Item = &PreparedStreamClaim> {
+        self.resources.iter().filter_map(|resource| match resource {
+            PreparedScheduleResource::Allocation(_) => None,
+            PreparedScheduleResource::Stream(stream) => Some(stream),
+        })
+    }
+
+    pub fn stream_claims_mut(&mut self) -> impl Iterator<Item = &mut PreparedStreamClaim> {
+        self.resources.iter_mut().filter_map(|resource| match resource {
+            PreparedScheduleResource::Allocation(_) => None,
+            PreparedScheduleResource::Stream(stream) => Some(stream),
+        })
+    }
+
+    pub fn stream_claim_mut(&mut self, index: usize) -> Option<&mut PreparedStreamClaim> {
+        self.resources
+            .iter_mut()
+            .filter_map(|resource| match resource {
+                PreparedScheduleResource::Allocation(_) => None,
+                PreparedScheduleResource::Stream(stream) => Some(stream),
+            })
+            .nth(index)
+    }
+}
+
+/// One native member stream together with the finalized store identity that
+/// owns it. Multiple member commands may expose the same physical stream when
+/// they are aliases of one store; candidates resolving to different stores
+/// must never be collapsed by stream geometry alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PreparedScheduleMemberCandidate {
+    pub(super) member: usize,
+    pub(super) stream: PreparedStreamFootprint,
+    pub(super) store: usize,
+    pub(super) owner: u64,
+    pub(super) context_identity: usize,
+    pub(super) device: i32,
+    pub(super) instance: usize,
+    pub(super) level: usize,
+    pub(super) format: PreparedFormat,
+}
+
+/// Compare a saved schedule stream by its complete physical identity.  Role,
+/// origin, and pool slot are part of the identity: matching only owner/device
+/// would conflate distinct stream completions.
+fn same_prepared_stream_physical(
+    left: &PreparedStreamFootprint,
+    right: &PreparedStreamFootprint,
+) -> bool {
+    left.key == right.key && left.origin == right.origin && left.pool_slot == right.pool_slot
+}
+
+pub(super) fn same_prepared_stream_placement(
+    left: &PreparedStreamFootprint,
+    right: &PreparedStreamFootprint,
+) -> bool {
+    left.key.execution_owner_identity == right.key.execution_owner_identity &&
+        left.key.context_identity == right.key.context_identity &&
+        left.key.instance == right.key.instance &&
+        left.key.partition == right.key.partition &&
+        left.key.device == right.key.device &&
+        left.key.limb_x == right.key.limb_x &&
+        left.key.limb_y == right.key.limb_y &&
+        left.origin == right.origin &&
+        left.pool_slot == right.pool_slot
+}
+
+fn validate_prepared_resource_key(
+    key: &mxx_primitives::matrix::gpu_dcrt_poly::PreparedResourceKey,
+    label: &str,
+) -> Result<(), String> {
+    let host_partition = key.partition < 0;
+    let host_device = key.device < 0;
+    if host_partition != host_device {
+        return Err(format!(
+            "{label} has a mixed host sentinel resource key (partition={}, device={})",
+            key.partition, key.device
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prepared_layout_keys(layout: &PreparedPlanLayout, label: &str) -> Result<(), String> {
+    for allocation in layout.allocations() {
+        validate_prepared_resource_key(&allocation.key, label)?;
+    }
+    for stream in layout.streams() {
+        validate_prepared_resource_key(&stream.key, label)?;
+    }
+    Ok(())
+}
+
+pub(super) fn unique_prepared_schedule_member(
+    candidates: &[PreparedScheduleMemberCandidate],
+    target: &PreparedStreamFootprint,
+) -> Result<usize, String> {
+    let matches = candidates
+        .iter()
+        .filter(|candidate| same_prepared_stream_placement(&candidate.stream, target))
+        .collect::<Vec<_>>();
+    let Some(first) = matches.first() else {
+        return Err("schedule stream has no exact member provenance".into());
+    };
+    let equivalent = matches.iter().all(|candidate| {
+        candidate.store == first.store &&
+            candidate.owner == first.owner &&
+            candidate.context_identity == first.context_identity &&
+            candidate.device == first.device &&
+            candidate.instance == first.instance &&
+            candidate.level == first.level &&
+            candidate.format == first.format &&
+            same_prepared_stream_placement(&candidate.stream, &first.stream)
+    });
+    if !equivalent {
+        return Err("schedule stream has ambiguous member provenance".into());
+    }
+    // Aliased member commands are valid, but choose their canonical member
+    // deterministically so allocation and completion provenance agree.
+    Ok(matches
+        .iter()
+        .min_by_key(|candidate| (candidate.store, candidate.member))
+        .expect("nonempty schedule member matches")
+        .member)
+}
+
+fn schedule_member_matches(
+    schedule: &PreparedSchedulePlan,
+    command: &PreparedCommandPlan,
+    node: u32,
+) -> bool {
+    command.node == node &&
+        command.instance == schedule.instance &&
+        command.stream.as_ref() == Some(&schedule.stream) &&
+        command.recipe.owners.iter().any(|owner| schedule.recipe.owners.contains(owner))
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1037,13 +1613,14 @@ pub struct PreparedResolvedScalarBuffer {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PreparedResolvedResources {
+    pub finalized_matrices: FinalizedMatrixIdTable,
     pub owners: Box<[PreparedResolvedOwner]>,
     pub scalar_buffers: Box<[PreparedResolvedScalarBuffer]>,
     pub commands: Box<[PreparedResolvedCommand]>,
     pub schedules: Box<[PreparedResolvedSchedule]>,
 }
 
-fn first_matrix_wire(program: &GpuPreparation, wire: WireRef) -> Option<WireRef> {
+pub(super) fn first_matrix_wire(program: &GpuPreparation, wire: WireRef) -> Option<WireRef> {
     if program.values.contains_key(&wire) {
         return Some(wire);
     }
@@ -1054,6 +1631,7 @@ fn first_matrix_wire(program: &GpuPreparation, wire: WireRef) -> Option<WireRef>
 }
 
 pub fn physical_command_matches(
+    finalized_matrices: &FinalizedMatrixIdTable,
     command: &PreparedCommandPlan,
     node: u32,
     instance: usize,
@@ -1061,7 +1639,11 @@ pub fn physical_command_matches(
 ) -> bool {
     command.node == node &&
         command.instance == instance &&
-        command.recipe.owners.iter().any(|owner| owner.device == device)
+        command.recipe.owners.iter().any(|owner| {
+            finalized_matrices
+                .identity(owner.matrix_id)
+                .is_some_and(|identity| identity.physical.device == device)
+        })
 }
 
 impl PreparedResolvedResources {
@@ -1073,7 +1655,11 @@ impl PreparedResolvedResources {
         let owners = self
             .owners
             .iter()
-            .filter(|owner| owner.key.device == device)
+            .filter(|owner| {
+                self.finalized_matrices
+                    .identity(owner.key.matrix_id)
+                    .is_some_and(|identity| identity.physical.device == device)
+            })
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1081,7 +1667,11 @@ impl PreparedResolvedResources {
             .commands
             .iter()
             .filter(|command| {
-                command.command.recipe.owners.iter().any(|owner| owner.device == device)
+                command.command.recipe.owners.iter().any(|owner| {
+                    self.finalized_matrices
+                        .identity(owner.matrix_id)
+                        .is_some_and(|identity| identity.physical.device == device)
+                })
             })
             .cloned()
             .collect::<Vec<_>>()
@@ -1090,7 +1680,11 @@ impl PreparedResolvedResources {
             .schedules
             .iter()
             .filter(|schedule| {
-                schedule.schedule.recipe.owners.iter().any(|owner| owner.device == device)
+                schedule.schedule.recipe.owners.iter().any(|owner| {
+                    self.finalized_matrices
+                        .identity(owner.matrix_id)
+                        .is_some_and(|identity| identity.physical.device == device)
+                })
             })
             .cloned()
             .collect::<Vec<_>>()
@@ -1098,11 +1692,21 @@ impl PreparedResolvedResources {
         let scalar_buffers = self
             .scalar_buffers
             .iter()
-            .filter(|buffer| buffer.plan.owner.device == device)
+            .filter(|buffer| {
+                self.finalized_matrices
+                    .identity(buffer.plan.owner.matrix_id)
+                    .is_some_and(|identity| identity.physical.device == device)
+            })
             .cloned()
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { owners, scalar_buffers, commands, schedules }
+        Self {
+            finalized_matrices: self.finalized_matrices.clone(),
+            owners,
+            scalar_buffers,
+            commands,
+            schedules,
+        }
     }
 }
 
@@ -1112,13 +1716,14 @@ impl PreparedResolvedResources {
 pub trait PreparedResourceBackend {
     fn plan_owner(
         &self,
+        finalized_matrices: &FinalizedMatrixIdTable,
         key: &PreparedOwnerKey,
         store: &PreparedStorePlan,
-        stream_ordinal_base: usize,
-    ) -> Result<(PreparedOwnerLayout, usize), String>;
+    ) -> Result<PreparedOwnerLayout, String>;
 
     fn plan_stage(
         &self,
+        finalized_matrices: &FinalizedMatrixIdTable,
         recipe: &PreparedNativeRecipe,
         stores: &[PreparedStorePlan],
         owners: &[PreparedResolvedOwner],
@@ -1130,6 +1735,7 @@ pub trait PreparedResourceBackend {
     /// for the native binder.
     fn plan_sampler_bundles(
         &self,
+        _finalized_matrices: &FinalizedMatrixIdTable,
         _recipe: &PreparedNativeRecipe,
         _stores: &[PreparedStorePlan],
         _owners: &[PreparedResolvedOwner],
@@ -1140,6 +1746,7 @@ pub trait PreparedResourceBackend {
 
     fn plan_accumulate(
         &self,
+        _finalized_matrices: &FinalizedMatrixIdTable,
         _recipe: &PreparedNativeRecipe,
         _stores: &[PreparedStorePlan],
         _owners: &[PreparedResolvedOwner],
@@ -1149,6 +1756,7 @@ pub trait PreparedResourceBackend {
 
     fn plan_replay_upload(
         &self,
+        finalized_matrices: &FinalizedMatrixIdTable,
         recipe: &PreparedNativeRecipe,
         replay: &PreparedReplayUploadRecipe,
         stores: &[PreparedStorePlan],
@@ -1157,6 +1765,7 @@ pub trait PreparedResourceBackend {
 
     fn plan_schedule(
         &self,
+        _finalized_matrices: &FinalizedMatrixIdTable,
         recipe: &PreparedNativeRecipe,
         members: &[PreparedPlanLayout],
     ) -> Result<PreparedPlanLayout, String>;
@@ -1189,8 +1798,8 @@ pub enum PreparedReplayStep {
         count: usize,
         counts: Box<[usize]>,
         offsets: Box<[usize]>,
-        banks: [Box<[PreparedReplayStep]>; 2],
-        tail: Box<[PreparedReplayStep]>,
+        variants: Box<[Box<[PreparedReplayStep]>]>,
+        variant_indices: Box<[usize]>,
     },
 }
 
@@ -1212,6 +1821,9 @@ pub struct GpuPreparation {
     pub instance_count: usize,
     pub topology: PreparedTopology,
     pub values: BTreeMap<WireRef, ValueLocation>,
+    /// One canonical table for every finalized matrix site.  Native stores,
+    /// descriptors, and replay bindings consume IDs from this table directly.
+    pub finalized_matrices: FinalizedMatrixIdTable,
     pub inputs: Box<[WireRef]>,
     pub outputs: Box<[WireRef]>,
     /// Matrix/scalar wires retained by the prepared trace descriptors. These
@@ -1222,9 +1834,6 @@ pub struct GpuPreparation {
     /// Prepared execution uses these keys directly for trace/transcript
     /// publication instead of exposing virtual topology node ids.
     pub trace_keys: BTreeMap<WireRef, mxx_ir_core::types::WireId>,
-    pub bindings: BTreeMap<WireRef, PreparedBindingId>,
-    pub instance_bindings: Box<[BTreeMap<WireRef, PreparedBindingId>]>,
-    pub instance_storage_bindings: Box<[BTreeMap<PreparedBindingId, PreparedStorageBinding>]>,
     pub node_bindings: BTreeMap<u32, (Box<[WireRef]>, Box<[WireRef]>)>,
     pub scalar_commands: BTreeMap<u32, PreparedScalar>,
     /// Stable scalar slots assigned by lowering.  Replay uses these bindings
@@ -1233,6 +1842,8 @@ pub struct GpuPreparation {
     pub scalar_slots: BTreeMap<WireRef, usize>,
     pub scalar_slot_count: usize,
     pub scalar_initializers: BTreeMap<usize, ScalarValue>,
+    /// Fixed operation-aware scalar widths computed from the warmup replay.
+    pub scalar_projections: BTreeMap<usize, usize>,
     /// Scalar wires produced on the device (or depending on one). They must
     /// never acquire a duplicate host bytecode command.
     pub device_scalar_wires: BTreeSet<WireRef>,
@@ -1247,8 +1858,9 @@ pub struct GpuPreparation {
     pub input_leaf_bindings: BTreeMap<WireRef, PreparedInputLeaf>,
     pub output_names: Box<[(String, WireRef)]>,
     pub output_bindings: Box<[PreparedOutputBinding]>,
-    pub view_commands: BTreeMap<u32, PreparedView>,
     pub selection_commands: BTreeMap<u32, PreparedSelection>,
+    /// Candidate-wire provenance for lowered family/selection descriptors.
+    pub selection_candidate_wires: BTreeMap<u32, Box<[WireRef]>>,
     /// The fixed members captured by each FamilyPack.  Family selection
     /// commands refer to this table by their family wire; replay never has to
     /// inspect the family node or rebuild its candidate list.
@@ -1266,6 +1878,73 @@ pub struct GpuPreparation {
 }
 
 impl PreparedResourcePlan {
+    /// Promote ownerless root-input warmup records to the synthetic upload
+    /// command used by host-staged runtime inputs.  Input nodes have no IR
+    /// operation of their own, but the materializer still needs the exact
+    /// upload layout and admission claims before it can bind the host bytes.
+    /// Keep this transformation in the immutable plan so upload binding does
+    /// not rediscover a resource by probing the accepted inventory.
+    pub fn mark_host_input_uploads(
+        &mut self,
+        host_wires: &BTreeSet<WireRef>,
+    ) -> Result<(), PreparedLoweringError> {
+        for wire in host_wires {
+            let mut matched = false;
+            for command in &mut self.commands {
+                if !matches!(command.operation, PreparedOperation::Warmup) ||
+                    !command.outputs.iter().any(|output| output.wire == *wire) ||
+                    !matches!(
+                        command.recipe.source.as_ref().map(PreparedNodeSource::kind),
+                        Some(NodeKind::Input { .. })
+                    )
+                {
+                    continue;
+                }
+                let stores = command
+                    .outputs
+                    .iter()
+                    .filter_map(|output| output.store)
+                    .collect::<BTreeSet<_>>();
+                let Some(store_index) = stores.iter().next().copied().filter(|_| stores.len() == 1)
+                else {
+                    return Err(PreparedLoweringError::InvalidContract(
+                        "host input has no unique physical output store",
+                    ));
+                };
+                let store =
+                    self.stores.get(store_index).ok_or(PreparedLoweringError::InvalidIndex)?;
+                let owner =
+                    PreparedOwnerKey { matrix_id: store.matrix_id, instance: command.instance };
+                command.operation = PreparedOperation::Gpu(PreparedGpuOperation::RnsUpload);
+                command.stream = Some(PreparedStreamKey {
+                    stage: PreparedStageRole::Transfer,
+                    instance: command.instance,
+                    stores: vec![store_index].into_boxed_slice(),
+                    placements: vec![PreparedPlacementKey {
+                        store: store_index,
+                        matrix_id: store.matrix_id,
+                    }]
+                    .into_boxed_slice(),
+                });
+                command.recipe.stage =
+                    PreparedNativeStage::Transfer(PreparedGpuOperation::RnsUpload);
+                command.recipe.inputs = Box::new([]);
+                command.recipe.outputs = vec![store_index].into_boxed_slice();
+                command.recipe.owners = vec![owner].into_boxed_slice();
+                command.recipe.matrix_staging = None;
+                command.recipe.scalar = None;
+                command.recipe.replay_upload = None;
+                matched = true;
+            }
+            if !matched {
+                return Err(PreparedLoweringError::InvalidContract(
+                    "host input has no ownerless input resource command",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Verify that every native command has a concrete structural descriptor
     /// before warmup publishes it. Non-GPU/control nodes intentionally have no
     /// stream footprint and therefore do not participate in this check.
@@ -1277,14 +1956,31 @@ impl PreparedResourcePlan {
                         PreparedNativeStage::ScalarMatrixSelect
                     }
                     Some(PreparedScalarResource::Op { .. }) => PreparedNativeStage::ScalarOp,
+                    None if command.recipe.owners.is_empty() => PreparedNativeStage::Control,
                     _ => PreparedNativeStage::Selection,
                 }
+            } else if matches!(command.operation, PreparedOperation::Scalar) &&
+                command.recipe.owners.is_empty()
+            {
+                // Host-only scalar nodes are replayed by the fixed control
+                // tape and intentionally have no native resource plan.
+                PreparedNativeStage::Control
             } else {
                 prepared_native_stage(&command.operation)
             };
             if command.recipe.stage != expected_stage {
                 return Err(PreparedLoweringError::InvalidContract(
                     "native recipe stage does not match command operation",
+                ));
+            }
+            if command.recipe.owners.iter().any(|key| {
+                !self
+                    .stores
+                    .iter()
+                    .any(|store| store.matrix_id == key.matrix_id && store.instance == key.instance)
+            }) {
+                return Err(PreparedLoweringError::InvalidContract(
+                    "native recipe owner has no exact matrix store",
                 ));
             }
             if matches!(command.operation, PreparedOperation::Gpu(_)) {
@@ -1323,12 +2019,10 @@ impl PreparedResourcePlan {
                         ));
                     };
                     if !command.recipe.owners.contains(&staging) ||
-                        !stream.placements.iter().any(|placement| {
-                            placement.owner == staging.owner &&
-                                placement.device == staging.device &&
-                                placement.level == staging.level &&
-                                placement.format == staging.format
-                        })
+                        !stream
+                            .placements
+                            .iter()
+                            .any(|placement| placement.matrix_id == staging.matrix_id)
                     {
                         return Err(PreparedLoweringError::InvalidContract(
                             "threshold staging owner is absent from its stream",
@@ -1337,12 +2031,14 @@ impl PreparedResourcePlan {
                 }
                 if stream.stores.iter().zip(&stream.placements).any(|(index, placement)| {
                     self.stores.get(*index).is_none_or(|store| {
+                        let Some(identity) = self.finalized_matrices.identity(store.matrix_id)
+                        else {
+                            return true;
+                        };
                         store.instance != stream.instance ||
                             placement.store != *index ||
-                            placement.owner != store.location.owner ||
-                            placement.device != store.location.device ||
-                            placement.level != store.location.level ||
-                            placement.format != store.location.format
+                            placement.matrix_id != store.matrix_id ||
+                            identity.execution_instance != stream.instance
                     })
                 }) {
                     return Err(PreparedLoweringError::InvalidContract(
@@ -1365,13 +2061,80 @@ impl PreparedResourcePlan {
     }
 
     pub fn from_preparation(program: &GpuPreparation) -> Result<Self, PreparedLoweringError> {
-        let mut seeds = Vec::<(WireRef, ValueLocation, usize, usize)>::new();
+        if program.instance_count == 0 {
+            return Err(PreparedLoweringError::InvalidContract(
+                "prepared program must declare at least one execution instance",
+            ));
+        }
+        let mut seeds = Vec::<(
+            FinalizedMatrixId,
+            WireRef,
+            Option<ConcreteWireType>,
+            ValueLocation,
+            usize,
+            usize,
+            usize,
+        )>::new();
         for (wire, location) in &program.values {
             let key = (location.owner, location.device, location.level, location.format);
-            if let Some((_, (_, _, existing_rows, existing_columns))) =
-                seeds.iter_mut().enumerate().find(|(_, (_, candidate, _, _))| {
-                    (candidate.owner, candidate.device, candidate.level, candidate.format) == key
-                })
+            let common_identity = exact_common_instance_identity(
+                &program.finalized_matrices,
+                *wire,
+                location.device,
+                program.instance_count,
+            )
+            .ok_or(PreparedLoweringError::InvalidContract("finalized CRT context is missing"))?;
+            let location_context = common_identity.physical.context_identity;
+            if let Some((_, (_, _, _, _existing_location, existing_rows, existing_columns, _))) =
+                seeds.iter_mut().enumerate().find(
+                    |(_, (_, _, _, candidate, _, _, candidate_context))| {
+                        (candidate.owner, candidate.device, candidate.level, candidate.format) ==
+                            key &&
+                            *candidate_context == location_context
+                    },
+                )
+            {
+                *existing_rows = (*existing_rows).max(location.rows.end);
+                *existing_columns = (*existing_columns).max(location.columns.end);
+            } else {
+                let matrix_id = program.finalized_matrices.id(common_identity.site).ok_or(
+                    PreparedLoweringError::InvalidContract(
+                        "ordinary matrix site has no finalized ID",
+                    ),
+                )?;
+                let (capacity_rows, capacity_columns) = program
+                    .storage_capacities
+                    .get(&location.owner)
+                    .copied()
+                    .unwrap_or((location.rows.end, location.columns.end));
+                seeds.push((
+                    matrix_id,
+                    *wire,
+                    program.wire_types.get(wire).cloned(),
+                    location.clone(),
+                    capacity_rows,
+                    capacity_columns,
+                    location_context,
+                ));
+            }
+        }
+        for (site, identity) in program.finalized_matrices.iter_variants() {
+            let MatrixSite::Variant { node, variant, port, .. } = site else { continue };
+            let location = finalized_matrix_location(identity);
+            let wire = WireRef { node: NodeId(u64::from(node)), port: Port(port as u32) };
+            let matrix_id = program.finalized_matrices.id(site).ok_or(
+                PreparedLoweringError::InvalidContract("variant matrix site has no finalized ID"),
+            )?;
+            let key = (location.owner, location.device, location.level, location.format);
+            let location_context = identity.physical.context_identity;
+            if let Some((_, (_, _, _, _existing_location, existing_rows, existing_columns, _))) =
+                seeds.iter_mut().enumerate().find(
+                    |(_, (_, _, _, candidate, _, _, candidate_context))| {
+                        (candidate.owner, candidate.device, candidate.level, candidate.format) ==
+                            key &&
+                            *candidate_context == location_context
+                    },
+                )
             {
                 *existing_rows = (*existing_rows).max(location.rows.end);
                 *existing_columns = (*existing_columns).max(location.columns.end);
@@ -1381,51 +2144,144 @@ impl PreparedResourcePlan {
                     .get(&location.owner)
                     .copied()
                     .unwrap_or((location.rows.end, location.columns.end));
-                seeds.push((*wire, location.clone(), capacity_rows, capacity_columns));
+                let wire_type = program
+                    .node_sources
+                    .get(&node)
+                    .and_then(|source| source.variant_output_types.get(variant))
+                    .and_then(|types| types.get(port))
+                    .cloned();
+                seeds.push((
+                    matrix_id,
+                    wire,
+                    wire_type,
+                    location.clone(),
+                    capacity_rows,
+                    capacity_columns,
+                    location_context,
+                ));
             }
         }
-        let instances = program.instance_count.max(1);
+        for (site, identity) in program.finalized_matrices.iter_host_staging() {
+            let MatrixSite::HostStaging { node, instance: _, device: _ } = site else { continue };
+            if !program.values.values().any(|location| location.device == identity.physical.device)
+            {
+                continue;
+            }
+            let location = finalized_matrix_location(identity);
+            let wire = WireRef { node: NodeId(u64::from(node)), port: Port(0) };
+            let matrix_id = program.finalized_matrices.id(site).ok_or(
+                PreparedLoweringError::InvalidContract("host staging site has no finalized ID"),
+            )?;
+            let key = (location.owner, location.device, location.level, location.format);
+            let location_context = identity.physical.context_identity;
+            if let Some((_, (_, _, _, _existing_location, existing_rows, existing_columns, _))) =
+                seeds.iter_mut().enumerate().find(
+                    |(_, (_, _, _, candidate, _, _, candidate_context))| {
+                        (candidate.owner, candidate.device, candidate.level, candidate.format) ==
+                            key &&
+                            *candidate_context == location_context
+                    },
+                )
+            {
+                *existing_rows = (*existing_rows).max(location.rows.end);
+                *existing_columns = (*existing_columns).max(location.columns.end);
+            } else {
+                let (capacity_rows, capacity_columns) = program
+                    .storage_capacities
+                    .get(&location.owner)
+                    .copied()
+                    .unwrap_or((location.rows.end, location.columns.end));
+                let wire_type = program
+                    .node_bindings
+                    .get(&node)
+                    .and_then(|(inputs, _)| inputs.first())
+                    .and_then(|wire| first_matrix_wire(program, *wire))
+                    .and_then(|wire| program.wire_types.get(&wire))
+                    .cloned();
+                seeds.push((
+                    matrix_id,
+                    wire,
+                    wire_type,
+                    location.clone(),
+                    capacity_rows,
+                    capacity_columns,
+                    location_context,
+                ));
+            }
+        }
+        if program.instance_count == 0 {
+            return Err(PreparedLoweringError::InvalidContract(
+                "prepared program must declare at least one execution instance",
+            ));
+        }
+        let instances = program.instance_count;
         let mut stores = Vec::with_capacity(seeds.len() * instances);
         // Resolve every wire through its canonical physical identity.  A view
         // or another alias of the same colored owner must point at the one
         // store entry; using the first wire as the key would leave later
         // aliases unresolved (and could tempt the binder to allocate again).
-        let mut store_index = BTreeMap::<(u64, i32, usize, PreparedFormat, usize), usize>::new();
+        let mut store_index = BTreeMap::<(FinalizedMatrixId, usize), usize>::new();
         for instance in 0..instances {
-            for (wire, location, capacity_rows, capacity_columns) in &seeds {
+            for (
+                matrix_id,
+                wire,
+                wire_type,
+                location,
+                _capacity_rows,
+                _capacity_columns,
+                _context_identity,
+            ) in &seeds
+            {
                 let index = stores.len();
-                let mut descriptor = location.clone();
-                descriptor.rows = 0..*capacity_rows;
-                descriptor.columns = 0..*capacity_columns;
+                let matrix_id = program
+                    .finalized_matrices
+                    .for_execution_instance(*matrix_id, instance)
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "matrix site has no exact execution-instance identity",
+                    ))?;
                 stores.push(PreparedStorePlan {
+                    matrix_id,
                     wire: *wire,
-                    wire_type: program.wire_types.get(wire).cloned(),
-                    location: descriptor,
+                    wire_type: wire_type.clone().or_else(|| program.wire_types.get(wire).cloned()),
                     instance,
-                    capacity_rows: *capacity_rows,
-                    capacity_columns: *capacity_columns,
                     logical_rows: location.rows.end,
                     logical_columns: location.columns.end,
-                    alignment: 8,
                 });
-                store_index.insert(
-                    (location.owner, location.device, location.level, location.format, instance),
-                    index,
-                );
+                store_index.insert((matrix_id, instance), index);
             }
         }
-        // Threshold replay uses a coefficient-domain 1x1 matrix as the input
-        // to the native scalar kernel. It is not an IR value, so reserve it as
-        // an explicit synthetic store before constructing command streams.
-        let mut next_staging_owner = program
-            .values
-            .values()
-            .map(|location| location.owner)
-            .chain(program.storage_capacities.keys().copied())
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(PreparedLoweringError::InvalidRange)?;
+        // Every semantic alias in the finalized table resolves to the one
+        // physical store selected by its canonical physical record. Aliases
+        // never allocate a second store or depend on which seed wire won the
+        // deduplication pass.
+        let canonical_store_keys = stores
+            .iter()
+            .map(|store| {
+                let identity = program.finalized_matrices.identity(store.matrix_id).ok_or(
+                    PreparedLoweringError::InvalidContract(
+                        "store has no canonical matrix identity",
+                    ),
+                )?;
+                Ok((store.instance, identity.physical.clone()))
+            })
+            .collect::<Result<Vec<_>, PreparedLoweringError>>()?;
+        for (matrix_id, identity) in &program.finalized_matrices.identities {
+            let instance = identity.execution_instance;
+            let candidates = canonical_store_keys
+                .iter()
+                .enumerate()
+                .filter(|(_, (store_instance, physical))| {
+                    *store_instance == instance && *physical == identity.physical
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            if let [index] = candidates.as_slice() {
+                store_index.insert((*matrix_id, instance), *index);
+            }
+        }
+        // Threshold replay uses a dedicated coefficient-domain staging owner
+        // as the input to the native scalar kernel. It is not an IR value, so
+        // reserve it explicitly before constructing command streams.
         let mut threshold_staging_stores = BTreeMap::<(u32, usize), usize>::new();
         for instance in 0..instances {
             for node in &program.topology.nodes {
@@ -1444,38 +2300,42 @@ impl PreparedResourcePlan {
                     .ok_or(PreparedLoweringError::InvalidRange)?;
                 let source =
                     program.values.get(&source_wire).ok_or(PreparedLoweringError::InvalidRange)?;
+                let source_id = program
+                    .finalized_matrices
+                    .id(MatrixSite::Ordinary { wire: source_wire, device: source.device, instance })
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "ordinary matrix site has no exact execution-instance ID",
+                    ))?;
+                let staging_id = program
+                    .finalized_matrices
+                    .id(MatrixSite::HostStaging { node: node.id, instance, device: source.device })
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "threshold staging matrix site has no exact execution-instance ID",
+                    ))?;
                 let source_store = *store_index
-                    .get(&(source.owner, source.device, source.level, source.format, instance))
+                    .get(&(source_id, instance))
                     .ok_or(PreparedLoweringError::InvalidRange)?;
-                let owner = next_staging_owner;
-                next_staging_owner =
-                    next_staging_owner.checked_add(1).ok_or(PreparedLoweringError::InvalidRange)?;
-                let location = ValueLocation {
-                    owner,
-                    rows: 0..1,
-                    columns: 0..1,
-                    level: source.level,
-                    format: PreparedFormat::Coefficient,
-                    device: source.device,
+                let index = if let Some(index) = store_index.get(&(staging_id, instance)).copied() {
+                    index
+                } else {
+                    let index = stores.len();
+                    stores.push(PreparedStorePlan {
+                        matrix_id: staging_id,
+                        wire: source_wire,
+                        wire_type: stores[source_store].wire_type.clone(),
+                        instance,
+                        logical_rows: 1,
+                        logical_columns: 1,
+                    });
+                    store_index.insert((staging_id, instance), index);
+                    index
                 };
-                let index = stores.len();
-                stores.push(PreparedStorePlan {
-                    wire: source_wire,
-                    wire_type: stores[source_store].wire_type.clone(),
-                    location,
-                    instance,
-                    capacity_rows: 1,
-                    capacity_columns: 1,
-                    logical_rows: 1,
-                    logical_columns: 1,
-                    alignment: 8,
-                });
                 threshold_staging_stores.insert((node.id, instance), index);
             }
         }
-        // Scalar backings are fixed warmup resources as well.  Keep one
-        // descriptor per scalar wire and execution instance; runtime BigInt
-        // growth is charged separately by the execution ledger.
+        // Scalar backings are fixed warmup resources as well. Keep one
+        // descriptor per scalar wire and execution instance; replay may only
+        // copy values that fit this immutable projection.
         let mut scalar_counts = BTreeMap::<WireRef, usize>::new();
         for node in &program.topology.nodes {
             let Some(source) = program.node_sources.get(&node.id) else { continue };
@@ -1490,32 +2350,242 @@ impl PreparedResourcePlan {
             }
             let count = length
                 .evaluate(&source.environment)
-                .ok()
-                .and_then(|value| value.to_usize())
-                .unwrap_or(1);
+                .map_err(|_| {
+                    PreparedLoweringError::InvalidContract(
+                        "threshold length cannot be evaluated during warmup",
+                    )
+                })?
+                .to_usize()
+                .ok_or(PreparedLoweringError::InvalidContract(
+                    "threshold length does not fit the fixed warmup projection",
+                ))?;
+            if count == 0 {
+                return Err(PreparedLoweringError::InvalidContract(
+                    "threshold length must be nonzero",
+                ));
+            }
             scalar_counts
                 .entry(*output)
                 .and_modify(|existing| *existing = (*existing).max(count))
                 .or_insert(count);
         }
-        let scalar_width = |wire: &WireRef| {
-            program
-                .scalar_slots
-                .get(wire)
-                .and_then(|slot| program.scalar_initializers.get(slot))
-                .map(|value| match value {
-                    ScalarValue::Int(value) => value.bits().div_ceil(64).saturating_add(1) as usize,
-                    _ => 1,
-                })
-                .unwrap_or(1)
+        let scalar_width = |wire: &WireRef| -> Result<usize, PreparedLoweringError> {
+            let slot = program.scalar_slots.get(wire).copied().ok_or(
+                PreparedLoweringError::InvalidContract("device scalar wire has no scalar slot"),
+            )?;
+            program.scalar_projections.get(&slot).copied().ok_or_else(|| {
+                PreparedLoweringError::InvalidContract("scalar wire has no fixed warmup projection")
+            })
         };
+        // Scalar buffers and scalar native commands are placed by the matrix
+        // value they depend on.  A graph can have several unrelated matrix
+        // owners (or no matrix owner at all), so a global first/unique output
+        // anchor is not a valid placement rule.  Build a small, immutable
+        // scalar-to-matrix provenance table from the lowered topology.
+        let mut scalar_placement_wires = BTreeMap::<WireRef, WireRef>::new();
+        let mut scalar_dependencies = BTreeMap::<WireRef, Vec<WireRef>>::new();
+        for node in &program.topology.nodes {
+            let Some((inputs, outputs)) = program.node_bindings.get(&node.id) else { continue };
+            let scalar_outputs = outputs
+                .iter()
+                .flat_map(|wire| std::iter::once(*wire).chain(family_leaf_wires(program, *wire)))
+                .filter(|wire| program.scalar_slots.contains_key(wire))
+                .collect::<Vec<_>>();
+            if scalar_outputs.is_empty() {
+                continue;
+            }
+            let scalar_inputs = inputs
+                .iter()
+                .flat_map(|wire| std::iter::once(*wire).chain(family_leaf_wires(program, *wire)))
+                .filter(|wire| program.scalar_slots.contains_key(wire))
+                .collect::<Vec<_>>();
+            for output in scalar_outputs {
+                scalar_dependencies.insert(output, scalar_inputs.clone());
+            }
+            // Threshold reads a matrix and writes a scalar; that matrix is
+            // the direct physical provenance of its result.
+            if matches!(
+                node.command.operation,
+                PreparedOperation::Gpu(PreparedGpuOperation::ThresholdDecode)
+            ) {
+                if let Some(matrix) =
+                    inputs.iter().copied().find_map(|wire| first_matrix_wire(program, wire))
+                {
+                    for output in outputs
+                        .iter()
+                        .copied()
+                        .filter(|wire| program.scalar_slots.contains_key(wire))
+                    {
+                        scalar_placement_wires.insert(output, matrix);
+                    }
+                }
+            }
+            // A scalar consumed by a matrix selection or scalar pack inherits
+            // the output matrix's owner. This covers scalar chains whose
+            // first matrix-dependent node is several operations downstream.
+            if let Some(matrix) = outputs.iter().copied().find(|wire| {
+                program.wire_types.get(wire).and_then(ConcreteWireType::matrix_type).is_some()
+            }) {
+                for input in scalar_inputs {
+                    scalar_placement_wires.insert(input, matrix);
+                }
+            }
+        }
+        // A scalar operation binds all of its scalar operands and results to
+        // one physical execution owner.  Resolve this relation to a fixed
+        // point from the threshold matrix seeds and matrix-producing pack
+        // nodes.  In particular, a host input such as an offset can become a
+        // device scalar when it is combined with a threshold result; leaving
+        // it unanchored would force the allocator to invent an owner.
+        loop {
+            let mut changed = false;
+            for node in &program.topology.nodes {
+                let Some((inputs, outputs)) = program.node_bindings.get(&node.id) else {
+                    continue;
+                };
+                let wires = inputs
+                    .iter()
+                    .chain(outputs.iter())
+                    .flat_map(|wire| {
+                        std::iter::once(*wire).chain(family_leaf_wires(program, *wire))
+                    })
+                    .filter(|wire| program.scalar_slots.contains_key(wire))
+                    .collect::<Vec<_>>();
+                let mut placements = wires
+                    .iter()
+                    .filter_map(|wire| scalar_placement_wires.get(wire).copied())
+                    .collect::<Vec<_>>();
+                placements.sort_unstable();
+                placements.dedup();
+                if placements.len() > 1 {
+                    return Err(PreparedLoweringError::InvalidContract(
+                        "scalar value has conflicting matrix placement provenance",
+                    ));
+                }
+                let Some(placement) = placements.first().copied() else { continue };
+                for wire in wires {
+                    if scalar_placement_wires.insert(wire, placement) != Some(placement) {
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        fn resolve_scalar_placement(
+            wire: WireRef,
+            direct: &BTreeMap<WireRef, WireRef>,
+            dependencies: &BTreeMap<WireRef, Vec<WireRef>>,
+            visiting: &mut BTreeSet<WireRef>,
+        ) -> Result<Option<WireRef>, PreparedLoweringError> {
+            if let Some(placement) = direct.get(&wire).copied() {
+                return Ok(Some(placement));
+            }
+            if !visiting.insert(wire) {
+                return Err(PreparedLoweringError::InvalidContract(
+                    "scalar placement provenance contains a cycle",
+                ));
+            }
+            let mut placements = Vec::new();
+            if let Some(inputs) = dependencies.get(&wire) {
+                for input in inputs {
+                    if let Some(placement) =
+                        resolve_scalar_placement(*input, direct, dependencies, visiting)?
+                    {
+                        placements.push(placement);
+                    }
+                }
+            }
+            visiting.remove(&wire);
+            placements.sort_unstable();
+            placements.dedup();
+            match placements.as_slice() {
+                [] => Ok(None),
+                [placement] => Ok(Some(*placement)),
+                _ => Err(PreparedLoweringError::InvalidContract(
+                    "scalar value has conflicting matrix placement provenance",
+                )),
+            }
+        }
+        let store_for_scalar =
+            |wire: WireRef,
+             instance: usize|
+             -> Result<Option<&PreparedStorePlan>, PreparedLoweringError> {
+                let Some(placement_wire) = resolve_scalar_placement(
+                    wire,
+                    &scalar_placement_wires,
+                    &scalar_dependencies,
+                    &mut BTreeSet::new(),
+                )?
+                else {
+                    return Ok(None)
+                };
+                let placement = program.values.get(&placement_wire).ok_or(
+                    PreparedLoweringError::InvalidContract(
+                        "scalar placement matrix wire is missing",
+                    ),
+                )?;
+                let context = program
+                    .finalized_matrices
+                    .ordinary_for_instance(placement_wire, placement.device, instance)
+                    .map(|identity| identity.physical.context_identity)
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "scalar placement matrix has no finalized CRT context",
+                    ))?;
+                let candidates = stores
+                    .iter()
+                    .filter(|store| {
+                        let Some(identity) = program.finalized_matrices.identity(store.matrix_id)
+                        else {
+                            return false;
+                        };
+                        store.instance == instance &&
+                            identity.physical.owner == placement.owner &&
+                            identity.physical.device == placement.device &&
+                            identity.physical.level == placement.level &&
+                            identity.physical.format == placement.format &&
+                            identity.physical.context_identity == context
+                    })
+                    .collect::<Vec<_>>();
+                match candidates.as_slice() {
+                    [store] => Ok(Some(*store)),
+                    [] => Err(PreparedLoweringError::InvalidContract(
+                        "scalar placement has no exact matrix store",
+                    )),
+                    _ => Err(PreparedLoweringError::InvalidContract(
+                        "scalar placement has ambiguous matrix stores",
+                    )),
+                }
+            };
+        let mut scalar_stores = BTreeMap::new();
         let mut scalar_buffers = Vec::new();
         for instance in 0..instances {
-            let Some(anchor) = stores.iter().find(|store| store.instance == instance) else {
-                continue;
-            };
-            for wire in program.scalar_slots.keys().copied() {
-                let words = scalar_width(&wire).max(1);
+            if program.scalar_slots.is_empty() {
+                break;
+            }
+            for wire in program
+                .scalar_slots
+                .keys()
+                .copied()
+                .filter(|wire| program.device_scalar_wires.contains(wire))
+            {
+                let placement = match store_for_scalar(wire, instance)? {
+                    Some(store) => store,
+                    None => {
+                        return Err(PreparedLoweringError::InvalidContract(
+                            "device scalar has no matrix placement provenance",
+                        ));
+                    }
+                };
+                let store_index_for_scalar = store_index
+                    .get(&(placement.matrix_id, instance))
+                    .copied()
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "device scalar placement store is not indexed",
+                    ))?;
+                scalar_stores.insert((wire, instance), store_index_for_scalar);
+                let words = scalar_width(&wire)?;
                 let count = scalar_counts.get(&wire).copied().unwrap_or(1).max(1);
                 let pinned_host_bytes = count
                     .checked_mul(words.checked_add(1).ok_or(PreparedLoweringError::InvalidRange)?)
@@ -1524,13 +2594,7 @@ impl PreparedResourcePlan {
                 scalar_buffers.push(PreparedScalarBufferPlan {
                     wire,
                     instance,
-                    owner: PreparedOwnerKey {
-                        owner: anchor.location.owner,
-                        device: anchor.location.device,
-                        instance,
-                        level: anchor.location.level,
-                        format: anchor.location.format,
-                    },
+                    owner: PreparedOwnerKey { matrix_id: placement.matrix_id, instance },
                     count,
                     words,
                     pinned_host_bytes,
@@ -1541,14 +2605,14 @@ impl PreparedResourcePlan {
             program: &GpuPreparation,
             wire: WireRef,
             instance: usize,
-            store_index: &BTreeMap<(u64, i32, usize, PreparedFormat, usize), usize>,
+            store_index: &BTreeMap<(FinalizedMatrixId, usize), usize>,
             out: &mut Vec<PreparedDescriptorRef>,
-        ) {
+        ) -> Result<(), PreparedLoweringError> {
             if let Some(members) = program.family_wires.get(&wire) {
                 for member in members {
-                    descriptors(program, *member, instance, store_index, out);
+                    descriptors(program, *member, instance, store_index, out)?;
                 }
-                return;
+                return Ok(());
             }
             let kind = if program.values.contains_key(&wire) {
                 PreparedDescriptorKind::Matrix
@@ -1562,55 +2626,95 @@ impl PreparedResourcePlan {
             } else {
                 PreparedDescriptorKind::Host
             };
-            let store = program.values.get(&wire).and_then(|location| {
-                store_index
-                    .get(&(
-                        location.owner,
-                        location.device,
-                        location.level,
-                        location.format,
-                        instance,
-                    ))
-                    .copied()
-            });
-            out.push(PreparedDescriptorRef { wire, instance, store, kind });
+            let store = if let Some(location) = program.values.get(&wire) {
+                let matrix_id = program
+                    .finalized_matrices
+                    .id(MatrixSite::Ordinary { wire, device: location.device, instance })
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "matrix descriptor has no exact execution-instance identity",
+                    ))?;
+                Some(*store_index.get(&(matrix_id, instance)).ok_or(
+                    PreparedLoweringError::InvalidContract(
+                        "matrix descriptor has no canonical physical store",
+                    ),
+                )?)
+            } else {
+                None
+            };
+            let matrix_id = if kind == PreparedDescriptorKind::Matrix {
+                let location =
+                    program.values.get(&wire).ok_or(PreparedLoweringError::InvalidContract(
+                        "matrix descriptor has no physical value location",
+                    ))?;
+                Some(
+                    program
+                        .finalized_matrices
+                        .id(MatrixSite::Ordinary { wire, device: location.device, instance })
+                        .ok_or(PreparedLoweringError::InvalidContract(
+                            "matrix descriptor has no exact execution-instance identity",
+                        ))?,
+                )
+            } else {
+                None
+            };
+            out.push(PreparedDescriptorRef { wire, matrix_id, instance, store, kind });
+            Ok(())
         }
         fn stream_key(
             node: &PreparedTopologyNode,
             inputs: &[PreparedDescriptorRef],
             outputs: &[PreparedDescriptorRef],
             stores: &[PreparedStorePlan],
+            finalized_matrices: &FinalizedMatrixIdTable,
+            scalar_stores: &BTreeMap<(WireRef, usize), usize>,
             instance: usize,
-        ) -> Option<PreparedStreamKey> {
-            if !matches!(node.command.operation, PreparedOperation::Gpu(_)) {
-                return None;
+        ) -> Result<Option<PreparedStreamKey>, PreparedLoweringError> {
+            if !matches!(
+                node.command.operation,
+                PreparedOperation::Gpu(_) |
+                    PreparedOperation::Scalar |
+                    PreparedOperation::Selection
+            ) {
+                return Ok(None);
             }
             let mut store_ids = inputs
                 .iter()
                 .chain(outputs.iter())
-                .filter_map(|descriptor| descriptor.store)
+                .filter_map(|descriptor| {
+                    descriptor.store.or_else(|| {
+                        (descriptor.kind == PreparedDescriptorKind::Scalar)
+                            .then(|| scalar_stores.get(&(descriptor.wire, instance)).copied())
+                            .flatten()
+                    })
+                })
                 .collect::<Vec<_>>();
             store_ids.sort_unstable();
             store_ids.dedup();
+            if store_ids.is_empty() {
+                return Ok(None);
+            }
             let placements = store_ids
                 .iter()
-                .filter_map(|index| {
-                    stores.get(*index).map(|store| PreparedPlacementKey {
-                        store: *index,
-                        owner: store.location.owner,
-                        device: store.location.device,
-                        level: store.location.level,
-                        format: store.location.format,
-                    })
+                .map(|index| {
+                    let store =
+                        stores.get(*index).ok_or(PreparedLoweringError::InvalidContract(
+                            "GPU stream references a missing store",
+                        ))?;
+                    finalized_matrices.identity(store.matrix_id).ok_or(
+                        PreparedLoweringError::InvalidContract(
+                            "GPU stream store has no canonical matrix identity",
+                        ),
+                    )?;
+                    Ok(PreparedPlacementKey { store: *index, matrix_id: store.matrix_id })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, PreparedLoweringError>>()?
                 .into_boxed_slice();
-            Some(PreparedStreamKey {
+            Ok(Some(PreparedStreamKey {
                 stage: prepared_stage_role(&node.command.operation),
                 instance,
                 stores: store_ids.into_boxed_slice(),
                 placements,
-            })
+            }))
         }
         let mut commands = Vec::with_capacity(program.topology.nodes.len() * instances);
         let mut schedules = Vec::<PreparedSchedulePlan>::new();
@@ -1621,12 +2725,31 @@ impl PreparedResourcePlan {
                 let mut inputs = Vec::new();
                 let mut outputs = Vec::new();
                 for wire in &input_wires {
-                    descriptors(program, *wire, instance, &store_index, &mut inputs);
+                    descriptors(program, *wire, instance, &store_index, &mut inputs)?;
                 }
                 for wire in &output_wires {
-                    descriptors(program, *wire, instance, &store_index, &mut outputs);
+                    descriptors(program, *wire, instance, &store_index, &mut outputs)?;
                 }
-                let stream = stream_key(node, &inputs, &outputs, &stores, instance);
+                // FamilyPack materializes only the host-side family table; it
+                // has no native selection stage. Do not give it a matrix
+                // stream (and therefore a schedule) merely because its
+                // members carry physical stores.
+                let stream = if matches!(
+                    program.node_sources.get(&node.id).map(PreparedNodeSource::kind),
+                    Some(NodeKind::FamilyPack { .. })
+                ) {
+                    None
+                } else {
+                    stream_key(
+                        node,
+                        &inputs,
+                        &outputs,
+                        &stores,
+                        &program.finalized_matrices,
+                        &scalar_stores,
+                        instance,
+                    )?
+                };
                 let stream = match stream {
                     Some(mut stream) => {
                         if let Some(&staging_store) =
@@ -1639,16 +2762,23 @@ impl PreparedResourcePlan {
                                 store_ids.dedup();
                                 let placements = store_ids
                                     .iter()
-                                    .filter_map(|index| {
-                                        stores.get(*index).map(|store| PreparedPlacementKey {
+                                    .map(|index| {
+                                        let store = stores.get(*index).ok_or(
+                                            PreparedLoweringError::InvalidContract(
+                                                "threshold stream references a missing store",
+                                            ),
+                                        )?;
+                                        program.finalized_matrices.identity(store.matrix_id).ok_or(
+                                            PreparedLoweringError::InvalidContract(
+                                                "threshold stream store has no canonical matrix identity",
+                                            ),
+                                        )?;
+                                        Ok(PreparedPlacementKey {
                                             store: *index,
-                                            owner: store.location.owner,
-                                            device: store.location.device,
-                                            level: store.location.level,
-                                            format: store.location.format,
+                                            matrix_id: store.matrix_id,
                                         })
                                     })
-                                    .collect::<Vec<_>>();
+                                    .collect::<Result<Vec<_>, PreparedLoweringError>>()?;
                                 stream.stores = store_ids.into_boxed_slice();
                                 stream.placements = placements.into_boxed_slice();
                             }
@@ -1689,11 +2819,8 @@ impl PreparedResourcePlan {
                                 .placements
                                 .iter()
                                 .map(|placement| PreparedOwnerKey {
-                                    owner: placement.owner,
-                                    device: placement.device,
+                                    matrix_id: stores[placement.store].matrix_id,
                                     instance,
-                                    level: placement.level,
-                                    format: placement.format,
                                 })
                                 .collect::<Vec<_>>()
                                 .into_boxed_slice(),
@@ -1719,75 +2846,93 @@ impl PreparedResourcePlan {
                     &inputs,
                     &outputs,
                     stream.as_ref(),
+                    &stores,
                     Some(node.completion),
                 );
                 if let Some(&staging_store) = threshold_staging_stores.get(&(node.id, instance)) {
                     let store =
                         stores.get(staging_store).ok_or(PreparedLoweringError::InvalidRange)?;
-                    recipe.matrix_staging = Some(PreparedOwnerKey {
-                        owner: store.location.owner,
-                        device: store.location.device,
-                        instance,
-                        level: store.location.level,
-                        format: store.location.format,
-                    });
+                    recipe.matrix_staging =
+                        Some(PreparedOwnerKey { matrix_id: store.matrix_id, instance });
                 }
                 if matches!(node.command.operation, PreparedOperation::Scalar) {
-                    let width = |wire: &WireRef| {
-                        program
-                            .scalar_slots
-                            .get(wire)
-                            .and_then(|slot| program.scalar_initializers.get(slot))
-                            .map(|value| match value {
-                                ScalarValue::Int(value) => {
-                                    value.bits().div_ceil(64).saturating_add(1) as usize
-                                }
-                                _ => 1,
-                            })
-                            .unwrap_or(1)
-                    };
-                    recipe.scalar = Some(PreparedScalarResource::Op {
-                        left_words: input_wires.first().map(width).unwrap_or(1),
-                        right_words: input_wires.get(1).map(width).unwrap_or(0),
-                        output_words: output_wires.first().map(width).unwrap_or(1),
-                        candidate_count: 0,
-                    });
-                }
-                // Scalar commands do not have matrix descriptor stores in
-                // their input/output list.  Still bind them to the canonical
-                // matrix owner for this instance so the native planner can
-                // resolve its context, device and stream deterministically.
-                if matches!(node.command.operation, PreparedOperation::Scalar) ||
-                    matches!(
-                        recipe.stage,
-                        PreparedNativeStage::ScalarPack | PreparedNativeStage::Threshold
-                    )
-                {
-                    if let Some(store) = stores.iter().find(|store| store.instance == instance) {
-                        let owner = recipe.matrix_staging.unwrap_or(PreparedOwnerKey {
-                            owner: store.location.owner,
-                            device: store.location.device,
-                            instance,
-                            level: store.location.level,
-                            format: store.location.format,
+                    let output_is_device_scalar =
+                        output_wires.iter().any(|wire| program.device_scalar_wires.contains(wire));
+                    if output_is_device_scalar {
+                        let width = |wire: &WireRef| -> Result<usize, PreparedLoweringError> {
+                            program
+                                .scalar_slots
+                                .get(wire)
+                                .and_then(|slot| program.scalar_projections.get(slot).copied())
+                                .ok_or(PreparedLoweringError::InvalidContract(
+                                    "scalar operation has no fixed warmup projection",
+                                ))
+                        };
+                        recipe.scalar = Some(PreparedScalarResource::Op {
+                            left_words: input_wires
+                                .first()
+                                .map(|wire| width(wire))
+                                .transpose()?
+                                .unwrap_or(1),
+                            right_words: input_wires
+                                .get(1)
+                                .map(|wire| width(wire))
+                                .transpose()?
+                                .unwrap_or(0),
+                            output_words: output_wires
+                                .first()
+                                .map(|wire| width(wire))
+                                .transpose()?
+                                .unwrap_or(1),
+                            candidate_count: 0,
                         });
-                        recipe.owners = vec![PreparedOwnerKey {
-                            owner: owner.owner,
-                            device: owner.device,
-                            instance,
-                            level: owner.level,
-                            format: owner.format,
-                        }]
-                        .into_boxed_slice();
+                        let output_wire =
+                            *output_wires.first().ok_or(PreparedLoweringError::InvalidContract(
+                                "device scalar operation has no output wire",
+                            ))?;
+                        let store = store_for_scalar(output_wire, instance)?.ok_or(
+                            PreparedLoweringError::InvalidContract(
+                                "device scalar operation has no placement provenance",
+                            ),
+                        )?;
+                        recipe.owners =
+                            vec![PreparedOwnerKey { matrix_id: store.matrix_id, instance }]
+                                .into_boxed_slice();
+                    } else {
+                        recipe.stage = PreparedNativeStage::Control;
+                        recipe.scalar = None;
+                        recipe.owners = Box::new([]);
                     }
                 }
                 if matches!(node.command.operation, PreparedOperation::Selection) {
-                    if let Some(
-                        PreparedSelection::ScalarStatic { .. } |
-                        PreparedSelection::ScalarDynamic { .. } |
-                        PreparedSelection::ScalarSelect { .. },
-                    ) = program.selection_commands.get(&node.id)
-                    {
+                    let scalar_selection_is_device_backed =
+                        program.node_bindings.get(&node.id).is_some_and(|(_, outputs)| {
+                            outputs.iter().any(|wire| program.device_scalar_wires.contains(wire))
+                        }) || program.selection_commands.get(&node.id).is_some_and(|selection| {
+                            matches!(
+                                selection,
+                                PreparedSelection::ScalarDynamic { selector, .. } |
+                                    PreparedSelection::ScalarSelect { selector, .. }
+                                    if program.device_scalar_wires.contains(selector)
+                            )
+                        });
+                    let scalar_selection = matches!(
+                        program.selection_commands.get(&node.id),
+                        Some(
+                            PreparedSelection::ScalarStatic { .. } |
+                                PreparedSelection::ScalarDynamic { .. } |
+                                PreparedSelection::ScalarSelect { .. },
+                        )
+                    );
+                    if scalar_selection && scalar_selection_is_device_backed {
+                        let Some(
+                            PreparedSelection::ScalarStatic { .. } |
+                            PreparedSelection::ScalarDynamic { .. } |
+                            PreparedSelection::ScalarSelect { .. },
+                        ) = program.selection_commands.get(&node.id)
+                        else {
+                            unreachable!("scalar selection matched above")
+                        };
                         recipe.stage = PreparedNativeStage::ScalarOp;
                         let candidate_count = match program.selection_commands.get(&node.id) {
                             Some(PreparedSelection::ScalarStatic { .. }) => 1,
@@ -1797,30 +2942,62 @@ impl PreparedResourcePlan {
                             }
                             _ => 0,
                         };
+                        let output_wire =
+                            *output_wires.first().ok_or(PreparedLoweringError::InvalidContract(
+                                "scalar selection has no output wire",
+                            ))?;
+                        let width = |slot: usize| {
+                            program.scalar_projections.get(&slot).copied().ok_or(
+                                PreparedLoweringError::InvalidContract(
+                                    "scalar selection has no fixed warmup projection",
+                                ),
+                            )
+                        };
+                        let left_words = match program.selection_commands.get(&node.id) {
+                            Some(PreparedSelection::ScalarStatic { slot }) => width(*slot)?,
+                            Some(
+                                PreparedSelection::ScalarDynamic { selector, .. } |
+                                PreparedSelection::ScalarSelect { selector, .. },
+                            ) => width(program.scalar_slots[selector])?,
+                            _ => unreachable!("scalar selection matched above"),
+                        };
+                        let output_words = width(program.scalar_slots[&output_wire])?;
                         recipe.scalar = Some(PreparedScalarResource::Op {
-                            left_words: 1,
+                            left_words,
                             right_words: 0,
-                            output_words: 1,
+                            output_words,
                             candidate_count,
                         });
-                        if let Some(store) = stores.iter().find(|store| store.instance == instance)
-                        {
-                            recipe.owners = vec![PreparedOwnerKey {
-                                owner: store.location.owner,
-                                device: store.location.device,
-                                instance,
-                                level: store.location.level,
-                                format: store.location.format,
-                            }]
-                            .into_boxed_slice();
-                        }
+                        let store = store_for_scalar(output_wire, instance)?.ok_or(
+                            PreparedLoweringError::InvalidContract(
+                                "scalar selection has no placement provenance",
+                            ),
+                        )?;
+                        recipe.owners =
+                            vec![PreparedOwnerKey { matrix_id: store.matrix_id, instance }]
+                                .into_boxed_slice();
+                    } else if matches!(
+                        program.selection_commands.get(&node.id),
+                        Some(
+                            PreparedSelection::ScalarStatic { .. } |
+                                PreparedSelection::ScalarDynamic { .. } |
+                                PreparedSelection::ScalarSelect { .. },
+                        )
+                    ) {
+                        // Host-only scalar selections are already represented
+                        // by ScalarAlias/ScalarSelection control commands.
+                        // They must not acquire a native scalar resource or
+                        // invent a matrix placement anchor.
+                        recipe.stage = PreparedNativeStage::Control;
+                        recipe.scalar = None;
+                        recipe.owners = Box::new([]);
                     }
                     if let Some(
                         PreparedSelection::Dynamic { candidates, selector } |
                         PreparedSelection::Select { candidates, selector },
                     ) = program.selection_commands.get(&node.id)
                     {
-                        if program.scalar_slots.contains_key(selector) {
+                        if program.device_scalar_wires.contains(selector) {
                             if let Some(output) =
                                 outputs.first().and_then(|wire| program.values.get(&wire.wire))
                             {
@@ -1831,20 +3008,25 @@ impl PreparedResourcePlan {
                                     level: output.level,
                                     count: candidates.len(),
                                 });
-                                if let Some(store) =
-                                    stores.iter().find(|store| store.instance == instance)
-                                {
-                                    recipe.owners = vec![PreparedOwnerKey {
-                                        owner: store.location.owner,
-                                        device: store.location.device,
-                                        instance,
-                                        level: store.location.level,
-                                        format: store.location.format,
-                                    }]
-                                    .into_boxed_slice();
-                                }
+                                let store_index = outputs
+                                    .first()
+                                    .and_then(|descriptor| descriptor.store)
+                                    .ok_or(PreparedLoweringError::InvalidContract(
+                                        "scalar matrix selection has no output store",
+                                    ))?;
+                                let store = stores
+                                    .get(store_index)
+                                    .ok_or(PreparedLoweringError::InvalidRange)?;
+                                recipe.owners =
+                                    vec![PreparedOwnerKey { matrix_id: store.matrix_id, instance }]
+                                        .into_boxed_slice();
                             }
                         }
+                    }
+                    if recipe.owners.is_empty() && recipe.scalar.is_none() {
+                        // Host-only family selections are replayed by the
+                        // control tape and have no native resource footprint.
+                        recipe.stage = PreparedNativeStage::Control;
                     }
                 }
                 if let Some(replay) =
@@ -1867,6 +3049,7 @@ impl PreparedResourcePlan {
         }
         let plan = Self {
             instance_count: instances,
+            finalized_matrices: program.finalized_matrices.clone(),
             stores: stores.into_boxed_slice(),
             scalar_buffers: scalar_buffers.into_boxed_slice(),
             commands: commands.into_boxed_slice(),
@@ -1896,26 +3079,199 @@ impl PreparedResourcePlan {
         let mut plans = Vec::with_capacity(devices.len());
         for device in devices.iter().copied() {
             let mut physical = program.clone();
-            for location in physical.values.values_mut() {
-                location.device = device;
+            let finalized_matrices = physical.finalized_matrices.clone();
+            for (wire, location) in physical.values.iter_mut() {
+                let identity = exact_common_instance_identity(
+                    &finalized_matrices,
+                    *wire,
+                    device,
+                    physical.instance_count,
+                )
+                .ok_or(PreparedLoweringError::InvalidContract(
+                    "ordinary matrix identity is missing for physical device",
+                ))?;
+                *location = finalized_matrix_location(identity);
             }
+            {
+                // Auxiliary descriptors do not carry their wire key.  The
+                // preparation pass records that key explicitly, so physical
+                // expansion must use the recorded (wire, device) state and
+                // never reverse-match by owner/shape geometry.  Equal aliases
+                // are valid because they resolve through the same wire state;
+                // conflicting finalized states are rejected by the direct
+                // table lookup below.
+                let remap_aux = |location: &mut ValueLocation, wire: WireRef| {
+                    let identity = exact_common_instance_identity(
+                        &finalized_matrices,
+                        wire,
+                        device,
+                        physical.instance_count,
+                    )
+                    .ok_or(PreparedLoweringError::InvalidContract(
+                        "auxiliary location has no finalized physical identity",
+                    ))?;
+                    let rows = location.rows.clone();
+                    let columns = location.columns.clone();
+                    *location =
+                        ValueLocation { rows, columns, ..finalized_matrix_location(identity) };
+                    Ok(())
+                };
+                for (family, members) in physical.family_members.iter_mut() {
+                    let member_wires = program
+                        .family_wires
+                        .get(family)
+                        .map(|wires| {
+                            wires
+                                .iter()
+                                .copied()
+                                .filter(|wire| program.values.contains_key(wire))
+                                .collect::<Vec<_>>()
+                        })
+                        .ok_or(PreparedLoweringError::InvalidContract(
+                            "family has no explicit member-wire provenance",
+                        ))?;
+                    if members.len() != member_wires.len() {
+                        return Err(PreparedLoweringError::InvalidContract(
+                            "family/member-wire provenance cardinality mismatch",
+                        ));
+                    }
+                    for (location, wire) in members.iter_mut().zip(member_wires.into_iter()) {
+                        remap_aux(location, wire)?;
+                    }
+                }
+                for (node, selection) in physical.selection_commands.iter_mut() {
+                    match selection {
+                        PreparedSelection::Static { location } => {
+                            let wires = program.selection_candidate_wires.get(node).ok_or(
+                                PreparedLoweringError::InvalidContract(
+                                    "selection has no explicit candidate-wire provenance",
+                                ),
+                            )?;
+                            let wire = wires.first().copied().ok_or(
+                                PreparedLoweringError::InvalidContract(
+                                    "static selection has no candidate-wire provenance",
+                                ),
+                            )?;
+                            remap_aux(location, wire)?
+                        }
+                        PreparedSelection::Dynamic { candidates, .. } |
+                        PreparedSelection::Select { candidates, .. } => {
+                            let wires = program.selection_candidate_wires.get(node).ok_or(
+                                PreparedLoweringError::InvalidContract(
+                                    "selection has no explicit candidate-wire provenance",
+                                ),
+                            )?;
+                            if candidates.len() != wires.len() {
+                                return Err(PreparedLoweringError::InvalidContract(
+                                    "selection/candidate-wire provenance cardinality mismatch",
+                                ));
+                            }
+                            for (location, wire) in candidates.iter_mut().zip(wires.iter()) {
+                                remap_aux(location, *wire)?;
+                            }
+                        }
+                        PreparedSelection::ScalarStatic { .. } |
+                        PreparedSelection::ScalarDynamic { .. } |
+                        PreparedSelection::ScalarSelect { .. } => {}
+                    }
+                }
+            }
+            physical.finalized_matrices.by_site.retain(|site, _| match site {
+                MatrixSite::Ordinary { device: source_device, .. } |
+                MatrixSite::Variant { device: source_device, .. } |
+                MatrixSite::HostStaging { device: source_device, .. } => *source_device == device,
+            });
+            physical.finalized_matrices.identities.retain(|_, identity| match identity.site {
+                MatrixSite::Ordinary { device: source_device, .. } |
+                MatrixSite::Variant { device: source_device, .. } |
+                MatrixSite::HostStaging { device: source_device, .. } => source_device == device,
+            });
             plans.push(Self::from_preparation(&physical)?);
         }
         Self::merge_physical_plans(plans)
     }
 
     fn merge_physical_plans(plans: Vec<Self>) -> Result<Self, PreparedLoweringError> {
-        let instance_count = plans.first().map(|plan| plan.instance_count).unwrap_or(0);
+        let instance_count = plans
+            .first()
+            .map(|plan| plan.instance_count)
+            .ok_or(PreparedLoweringError::InvalidContract("physical plan merge has no plans"))?;
+        if instance_count == 0 || plans.iter().any(|plan| plan.instance_count != instance_count) {
+            return Err(PreparedLoweringError::InvalidContract(
+                "physical plan merge requires one identical nonzero instance count",
+            ));
+        }
+        let mut finalized_matrices = FinalizedMatrixIdTable::default();
+        let mut id_maps = Vec::<BTreeMap<FinalizedMatrixId, FinalizedMatrixId>>::new();
+        for plan in &plans {
+            let mut id_map = BTreeMap::new();
+            for (old_id, identity) in &plan.finalized_matrices.identities {
+                let new_id = if let Some(site_id) = finalized_matrices.by_site.get(&identity.site) {
+                    let existing = finalized_matrices.identities.get(site_id).ok_or(
+                        PreparedLoweringError::InvalidContract(
+                            "physical plan merge has a dangling site identity",
+                        ),
+                    )?;
+                    if existing != identity {
+                        return Err(PreparedLoweringError::InvalidContract(
+                            "physical plan merge has conflicting site identities",
+                        ));
+                    }
+                    *site_id
+                } else if let Some(existing) = finalized_matrices.identities.get(old_id) {
+                    if existing == identity {
+                        finalized_matrices.by_site.insert(identity.site, *old_id);
+                        *old_id
+                    } else {
+                        let fresh = FinalizedMatrixId(finalized_matrices.next);
+                        finalized_matrices.next = finalized_matrices
+                            .next
+                            .checked_add(1)
+                            .ok_or(PreparedLoweringError::InvalidContract("matrix ID overflow"))?;
+                        finalized_matrices.by_site.insert(identity.site, fresh);
+                        finalized_matrices.identities.insert(fresh, identity.clone());
+                        fresh
+                    }
+                } else {
+                    finalized_matrices.next = finalized_matrices.next.max(old_id.0);
+                    finalized_matrices.by_site.insert(identity.site, *old_id);
+                    finalized_matrices.identities.insert(*old_id, identity.clone());
+                    finalized_matrices.next = finalized_matrices.next.max(old_id.0 + 1);
+                    *old_id
+                };
+                id_map.insert(*old_id, new_id);
+            }
+            id_maps.push(id_map);
+        }
+        for (plan, id_map) in plans.iter().zip(&id_maps) {
+            for (site, id) in &plan.finalized_matrices.by_site {
+                if id_map.get(id) != finalized_matrices.by_site.get(site) {
+                    return Err(PreparedLoweringError::InvalidContract(
+                        "physical plan merge produced an inconsistent site remap",
+                    ));
+                }
+            }
+        }
         let mut stores = Vec::new();
         let mut commands = Vec::new();
         let mut schedules = Vec::new();
         let mut scalar_buffers = Vec::new();
-        for plan in plans {
+        for (plan, id_map) in plans.into_iter().zip(id_maps) {
             let store_offset = stores.len();
-            stores.extend(plan.stores.iter().cloned());
+            stores.extend(plan.stores.iter().cloned().map(|mut store| {
+                store.matrix_id = *id_map.get(&store.matrix_id).expect("store ID was mapped");
+                store
+            }));
             let remap_store = |index: usize| index + store_offset;
+            let remap_owner = |mut owner: PreparedOwnerKey| {
+                owner.matrix_id = *id_map.get(&owner.matrix_id).expect("owner ID was mapped");
+                owner
+            };
             let remap_descriptor = |descriptor: PreparedDescriptorRef| PreparedDescriptorRef {
                 store: descriptor.store.map(remap_store),
+                matrix_id: descriptor
+                    .matrix_id
+                    .map(|id| *id_map.get(&id).expect("descriptor ID was mapped")),
                 ..descriptor
             };
             let remap_stream = |stream: &PreparedStreamKey| PreparedStreamKey {
@@ -1925,6 +3281,9 @@ impl PreparedResourcePlan {
                     .iter()
                     .map(|placement| PreparedPlacementKey {
                         store: remap_store(placement.store),
+                        matrix_id: *id_map
+                            .get(&placement.matrix_id)
+                            .expect("placement ID was mapped"),
                         ..*placement
                     })
                     .collect(),
@@ -1938,6 +3297,9 @@ impl PreparedResourcePlan {
                     command.recipe.inputs.iter().copied().map(remap_store).collect();
                 command.recipe.outputs =
                     command.recipe.outputs.iter().copied().map(remap_store).collect();
+                command.recipe.owners =
+                    command.recipe.owners.iter().copied().map(remap_owner).collect();
+                command.recipe.matrix_staging = command.recipe.matrix_staging.map(remap_owner);
                 commands.push(command);
             }
             for mut schedule in plan.schedules.iter().cloned() {
@@ -1946,14 +3308,45 @@ impl PreparedResourcePlan {
                     schedule.recipe.inputs.iter().copied().map(remap_store).collect();
                 schedule.recipe.outputs =
                     schedule.recipe.outputs.iter().copied().map(remap_store).collect();
+                schedule.recipe.owners =
+                    schedule.recipe.owners.iter().copied().map(remap_owner).collect();
+                schedule.recipe.matrix_staging = schedule.recipe.matrix_staging.map(remap_owner);
                 schedules.push(schedule);
             }
-            scalar_buffers.extend(plan.scalar_buffers.iter().cloned());
+            scalar_buffers.extend(plan.scalar_buffers.iter().cloned().map(|mut buffer| {
+                buffer.owner = remap_owner(buffer.owner);
+                buffer
+            }));
+        }
+        // Device expansion duplicates ownerless control records even though
+        // they have no physical resource identity. Keep one logical control
+        // command per `(instance,node)` and reject divergent records instead
+        // of selecting a device-dependent first match.
+        let mut canonical_controls = BTreeMap::<(usize, u32), PreparedCommandPlan>::new();
+        let mut deduplicated_commands = Vec::with_capacity(commands.len());
+        for command in commands {
+            if command.recipe.stage == PreparedNativeStage::Control &&
+                command.recipe.owners.is_empty() &&
+                command.stream.is_none()
+            {
+                let key = (command.instance, command.node);
+                if let Some(existing) = canonical_controls.get(&key) {
+                    if existing != &command {
+                        return Err(PreparedLoweringError::InvalidContract(
+                            "physical plan merge has conflicting control identities",
+                        ));
+                    }
+                    continue;
+                }
+                canonical_controls.insert(key, command.clone());
+            }
+            deduplicated_commands.push(command);
         }
         let merged = Self {
             instance_count,
+            finalized_matrices,
             stores: stores.into_boxed_slice(),
-            commands: commands.into_boxed_slice(),
+            commands: deduplicated_commands.into_boxed_slice(),
             schedules: schedules.into_boxed_slice(),
             scalar_buffers: scalar_buffers.into_boxed_slice(),
         };
@@ -1972,42 +3365,76 @@ impl PreparedResourcePlan {
     ) -> Result<PreparedResolvedResources, String> {
         self.validate_for_warmup()
             .map_err(|error| format!("invalid prepared resource plan: {error:?}"))?;
-        let mut owner_keys = self
-            .stores
-            .iter()
-            .map(|store| PreparedOwnerKey {
-                owner: store.location.owner,
-                device: store.location.device,
-                instance: store.instance,
-                level: store.location.level,
-                format: store.location.format,
-            })
-            .collect::<Vec<_>>();
+        let instance_key = |instance: usize| {
+            u64::try_from(instance)
+                .map_err(|_| "prepared execution instance overflows resource key".to_owned())
+        };
+        let stamp_allocation = |mut layout: PreparedAllocationLayout, instance: usize| {
+            layout.key.instance = instance_key(instance)?;
+            Ok::<_, String>(layout)
+        };
+        let stamp_stream = |mut layout: PreparedStreamFootprint, instance: usize| {
+            layout.key.instance = instance_key(instance)?;
+            Ok::<_, String>(layout)
+        };
+        let mut owner_keys = self.stores.iter().map(store_owner_key).collect::<Vec<_>>();
         for command in &self.commands {
             owner_keys.extend(command.recipe.owners.iter().copied());
         }
         owner_keys.extend(self.scalar_buffers.iter().map(|buffer| buffer.owner));
         owner_keys.sort_unstable();
         owner_keys.dedup();
-        let mut cursors = BTreeMap::<(u64, i32, usize), usize>::new();
         let mut owners = Vec::with_capacity(owner_keys.len());
         for key in owner_keys {
             let store = self
                 .stores
                 .iter()
-                .find(|store| {
-                    store.location.owner == key.owner &&
-                        store.location.device == key.device &&
-                        store.instance == key.instance &&
-                        store.location.level == key.level &&
-                        store.location.format == key.format
-                })
-                .ok_or_else(|| format!("prepared owner {} has no matrix store", key.owner))?;
-            let cursor = cursors.entry((key.owner, key.device, key.instance)).or_default();
-            let (layout, consumed) = backend.plan_owner(&key, store, *cursor)?;
-            *cursor = cursor.checked_add(consumed).ok_or("prepared owner cursor overflow")?;
-            owners.push(PreparedResolvedOwner { key, layout, slot: None });
+                .find(|store| store.matrix_id == key.matrix_id && store.instance == key.instance)
+                .ok_or_else(|| {
+                    format!("prepared matrix {:?} has no matrix store", key.matrix_id)
+                })?;
+            let layout = backend.plan_owner(&self.finalized_matrices, &key, store)?;
+            owners.push(PreparedResolvedOwner {
+                key,
+                layout,
+                slot: None,
+                input_copy_slots: Vec::new(),
+            });
         }
+        let owner_layout_for_key =
+            |key: &PreparedResourceKey| -> Result<PreparedOwnerLayout, String> {
+                let matches = owners
+                    .iter()
+                    .filter(|owner| {
+                        owner.layout.execution_owner_identity() == key.execution_owner_identity &&
+                            owner.layout.contains_resource_key(key)
+                    })
+                    .map(|owner| owner.layout)
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [layout] => Ok(*layout),
+                    [] => Err("prepared matrix claim has no exact owner layout".into()),
+                    _ => Err("prepared matrix claim has ambiguous owner layouts".into()),
+                }
+            };
+        let owner_layout_for_store = |store_index: usize| -> Result<PreparedOwnerLayout, String> {
+            let store = self
+                .stores
+                .get(store_index)
+                .ok_or("prepared matrix claim store provenance is invalid")?;
+            let matches = owners
+                .iter()
+                .filter(|owner| {
+                    owner.key.matrix_id == store.matrix_id && owner.key.instance == store.instance
+                })
+                .map(|owner| owner.layout)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [layout] => Ok(*layout),
+                [] => Err("prepared matrix claim store has no exact owner layout".into()),
+                _ => Err("prepared matrix claim store has ambiguous owner layouts".into()),
+            }
+        };
         let mut scalar_buffers = Vec::with_capacity(self.scalar_buffers.len());
         for buffer in &self.scalar_buffers {
             let recipe = PreparedNativeRecipe {
@@ -2027,8 +3454,10 @@ impl PreparedResourcePlan {
                 replay_upload: None,
             };
             let layout = backend
-                .plan_stage(&recipe, &self.stores, &owners)?
+                .plan_stage(&self.finalized_matrices, &recipe, &self.stores, &owners)?
                 .ok_or("scalar buffer native plan missing")?;
+            validate_prepared_layout_keys(&layout, "scalar buffer native layout")?;
+            let layout = layout.with_instance(instance_key(buffer.instance)?);
             let slots =
                 layout.allocations().iter().map(|_| None).collect::<Vec<_>>().into_boxed_slice();
             scalar_buffers.push(PreparedResolvedScalarBuffer {
@@ -2039,9 +3468,21 @@ impl PreparedResourcePlan {
         }
         let mut commands = Vec::with_capacity(self.commands.len());
         for command in &self.commands {
-            let native = backend.plan_stage(&command.recipe, &self.stores, &owners)?;
-            let (preimage, trapdoor) =
-                backend.plan_sampler_bundles(&command.recipe, &self.stores, &owners)?;
+            let native = backend.plan_stage(
+                &self.finalized_matrices,
+                &command.recipe,
+                &self.stores,
+                &owners,
+            )?;
+            if let Some(layout) = native.as_ref() {
+                validate_prepared_layout_keys(layout, "native command layout")?;
+            }
+            let (preimage, trapdoor) = backend.plan_sampler_bundles(
+                &self.finalized_matrices,
+                &command.recipe,
+                &self.stores,
+                &owners,
+            )?;
             let (composite_claims, composite_layouts) = preimage
                 .as_ref()
                 .map(|layout| (layout.claims(), layout.claim_layouts()))
@@ -2055,18 +3496,57 @@ impl PreparedResourcePlan {
                     command.node
                 ));
             }
+            let composite_store = if composite_claims.is_empty() {
+                None
+            } else {
+                exact_recipe_store(&command.recipe, &self.stores)?
+            };
+            if !composite_claims.is_empty() && composite_store.is_none() {
+                return Err(format!(
+                    "prepared node {} composite recipe has no exact store",
+                    command.node
+                ));
+            }
+            let composite_owner_layouts = if let Some(layout) = preimage.as_ref() {
+                layout.claim_owner_layouts()?
+            } else if let Some(layout) = trapdoor.as_ref() {
+                layout.claim_owner_layouts()?
+            } else {
+                Vec::new()
+            };
+            if composite_owner_layouts.len() != composite_claims.len() {
+                return Err(format!(
+                    "prepared node {} composite claim/owner table mismatch",
+                    command.node
+                ));
+            }
             let composite_allocations = composite_claims
                 .into_iter()
                 .zip(composite_layouts)
                 .enumerate()
-                .map(|(ordinal, (claim, layout))| PreparedCompositeClaim {
-                    command: command.node,
-                    ordinal,
-                    claim,
-                    layout,
-                    slot: None,
+                .map(|(ordinal, (claim, layout))| {
+                    if let Some(layout) = layout.as_ref() {
+                        validate_prepared_resource_key(&layout.key, "composite allocation layout")?;
+                    }
+                    let layout = layout
+                        .map(|layout| stamp_allocation(layout, command.instance))
+                        .transpose()?;
+                    // Every composite phase claim carries the exact
+                    // finalized logical owner saved by the primitive layout.
+                    // Workspace claims use this same provenance; no phase
+                    // ordinal or native-key inference is allowed.
+                    let owner_layout = Some(composite_owner_layouts[ordinal]);
+                    Ok(PreparedCompositeClaim {
+                        command: command.node,
+                        ordinal,
+                        claim,
+                        store: composite_store,
+                        layout,
+                        owner_layout,
+                        slot: None,
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .into_boxed_slice();
             let composite_streams = preimage
                 .as_ref()
@@ -2075,25 +3555,36 @@ impl PreparedResourcePlan {
                 .unwrap_or_default()
                 .into_iter()
                 .enumerate()
-                .map(|(ordinal, layout)| PreparedCompositeStream {
-                    command: command.node,
-                    ordinal,
-                    layout,
-                    slot: None,
+                .map(|(ordinal, layout)| {
+                    validate_prepared_resource_key(&layout.key, "composite stream layout")?;
+                    Ok(PreparedCompositeStream {
+                        command: command.node,
+                        ordinal,
+                        layout: stamp_stream(layout, command.instance)?,
+                        slot: None,
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .into_boxed_slice();
             if !composite_allocations.is_empty() {
                 validate_composite_stream_claims(&composite_allocations, &composite_streams)
                     .map_err(|error| format!("prepared node {}: {error}", command.node))?;
             }
-            let accumulate = backend.plan_accumulate(&command.recipe, &self.stores, &owners)?;
-            let store = command
-                .recipe
-                .outputs
-                .first()
-                .copied()
-                .or_else(|| command.recipe.inputs.first().copied());
+            let accumulate = backend.plan_accumulate(
+                &self.finalized_matrices,
+                &command.recipe,
+                &self.stores,
+                &owners,
+            )?;
+            // Control/view/selection commands carry source and destination
+            // stores for dependency metadata, but do not own an allocation.
+            // Resolve a recipe store only when the replay-upload binder will
+            // actually attach one of its native claims to this command.
+            let store = if command.recipe.replay_upload.is_some() {
+                exact_recipe_store(&command.recipe, &self.stores)?
+            } else {
+                None
+            };
             let composite = preimage.is_some() || trapdoor.is_some();
             let (allocations, streams) = if composite {
                 // Composite binders consume the flattened substage table below;
@@ -2106,32 +3597,83 @@ impl PreparedResourcePlan {
             } else {
                 match native.as_ref() {
                     Some(native) => {
+                        // A row/diagonal concat is represented by one
+                        // prepared input-copy descriptor per source.  The
+                        // native descriptor is reused for each copy. Retain
+                        // one exact claim copy per source so each independent
+                        // copy bind consumes its own completion resources.
+                        let allocation_repetitions = if matches!(
+                            command.operation,
+                            PreparedOperation::Gpu(
+                                PreparedGpuOperation::FixedCopies |
+                                    PreparedGpuOperation::ConcatRows
+                            )
+                        ) && matches!(
+                            command.recipe.source.as_ref().map(PreparedNodeSource::kind),
+                            Some(NodeKind::Concat { .. })
+                        ) {
+                            command.recipe.inputs.len().max(1)
+                        } else {
+                            1
+                        };
                         let allocations = native
                             .allocations()
                             .iter()
                             .copied()
+                            .cycle()
+                            .take(native.allocations().len() * allocation_repetitions)
                             .enumerate()
-                            .map(|(ordinal, layout)| PreparedAllocationClaim {
-                                command: command.node,
-                                ordinal,
-                                store,
-                                layout,
-                                slot: None,
+                            .map(|(ordinal, layout)| {
+                                let store = recipe_store_for_layout(
+                                    &command.recipe,
+                                    &self.stores,
+                                    &layout,
+                                )?;
+                                let owner_layout = if layout.kind == 0 &&
+                                    matches!(
+                                        command.operation,
+                                        PreparedOperation::Gpu(
+                                            PreparedGpuOperation::HashCompactDecompose
+                                        )
+                                    ) {
+                                    Some(native
+                                        .owner_layout()
+                                        .ok_or(
+                                            "prepared compact hash matrix scratch owner is missing or conflicting",
+                                        )?)
+                                } else if layout.kind != 100 {
+                                    Some(match store {
+                                        Some(store) => owner_layout_for_store(store)?,
+                                        None => owner_layout_for_key(&layout.key)?,
+                                    })
+                                } else {
+                                    None
+                                };
+                                Ok(PreparedAllocationClaim {
+                                    command: command.node,
+                                    ordinal,
+                                    store,
+                                    layout: stamp_allocation(layout, command.instance)?,
+                                    owner_layout,
+                                    slot: None,
+                                })
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, String>>()?
                             .into_boxed_slice();
                         let streams = native
                             .streams()
                             .iter()
                             .copied()
                             .enumerate()
-                            .map(|(ordinal, layout)| PreparedStreamClaim {
-                                command: command.node,
-                                ordinal,
-                                layout,
-                                slot: None,
+                            .map(|(ordinal, layout)| {
+                                Ok(PreparedStreamClaim {
+                                    command: command.node,
+                                    ordinal,
+                                    layout: stamp_stream(layout, command.instance)?,
+                                    slot: None,
+                                })
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>, String>>()?
                             .into_boxed_slice();
                         (allocations, streams)
                     }
@@ -2150,47 +3692,128 @@ impl PreparedResourcePlan {
                     None => return Err(format!("native plan missing for command {}", command.node)),
                 }
             };
+            let mut allocations = allocations.into_vec();
+            if matches!(
+                command.operation,
+                PreparedOperation::Gpu(PreparedGpuOperation::GadgetDecompose)
+            ) {
+                let output_store = match command.recipe.outputs.as_ref() {
+                    [store] => *store,
+                    _ => {
+                        return Err(format!(
+                            "prepared gadget command {} must have one exact output store",
+                            command.node
+                        ));
+                    }
+                };
+                let output = self.stores.get(output_store).ok_or_else(|| {
+                    format!("prepared gadget command {} output store is invalid", command.node)
+                })?;
+                let (matrix, bound) = match output.wire_type.as_ref() {
+                    Some(ConcreteWireType::Preimage { matrix, max_coefficient_bound }) |
+                    Some(ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound }) => {
+                        (matrix, max_coefficient_bound)
+                    }
+                    _ => {
+                        return Err(format!(
+                            "prepared gadget command {} output is not compact typed",
+                            command.node
+                        ));
+                    }
+                };
+                let magnitude_bytes = bound.to_bytes_le().1.len().max(1);
+                let payload_bytes = matrix
+                    .rows
+                    .checked_mul(matrix.columns)
+                    .and_then(|count| count.checked_mul(matrix.ring_dimension))
+                    .and_then(|count| count.checked_mul(1usize.checked_add(magnitude_bytes)?))
+                    .ok_or_else(|| {
+                        format!("prepared gadget command {} payload size overflow", command.node)
+                    })?;
+                let payload_template = allocations
+                    .iter()
+                    .find(|allocation| {
+                        allocation.layout.kind == 0 && allocation.store == Some(output_store)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "prepared gadget command {} has no exact output matrix allocation",
+                            command.node
+                        )
+                    })?;
+                let mut payload_layout = payload_template.layout;
+                payload_layout.kind = 4;
+                payload_layout.rows = 0;
+                payload_layout.columns = 0;
+                payload_layout.bytes = payload_bytes;
+                payload_layout.alignment = 256;
+                payload_layout.level = -1;
+                payload_layout.format = -1;
+                allocations.push(PreparedAllocationClaim {
+                    command: command.node,
+                    ordinal: allocations.len(),
+                    store: Some(output_store),
+                    layout: stamp_allocation(payload_layout, command.instance)?,
+                    owner_layout: Some(owner_layout_for_store(output_store)?),
+                    slot: None,
+                });
+            }
             let replay_upload = command
                 .recipe
                 .replay_upload
                 .as_ref()
                 .map(|replay| -> Result<PreparedResolvedReplayUpload, String> {
                     let layout = backend.plan_replay_upload(
+                        &self.finalized_matrices,
                         &command.recipe,
                         replay,
                         &self.stores,
                         &owners,
                     )?;
-                    let replay_allocations = layout
+                    validate_prepared_layout_keys(&layout, "replay upload layout")?;
+                    let replay_layout = layout.with_instance(instance_key(command.instance)?);
+                    let replay_allocations = replay_layout
                         .allocations()
                         .iter()
                         .copied()
                         .enumerate()
-                        .map(|(ordinal, layout)| PreparedAllocationClaim {
-                            command: command.node,
-                            ordinal,
-                            store,
-                            layout,
-                            slot: None,
+                        .map(|(ordinal, layout)| {
+                            Ok(PreparedAllocationClaim {
+                                command: command.node,
+                                ordinal,
+                                store,
+                                layout,
+                                owner_layout: if layout.kind != 100 {
+                                    Some(match store {
+                                        Some(store) => owner_layout_for_store(store)?,
+                                        None => owner_layout_for_key(&layout.key)?,
+                                    })
+                                } else {
+                                    None
+                                },
+                                slot: None,
+                            })
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>, String>>()?
                         .into_boxed_slice();
-                    let replay_streams = layout
+                    let replay_streams = replay_layout
                         .streams()
                         .iter()
                         .copied()
                         .enumerate()
-                        .map(|(ordinal, layout)| PreparedStreamClaim {
-                            command: command.node,
-                            ordinal,
-                            layout,
-                            slot: None,
+                        .map(|(ordinal, layout)| {
+                            Ok(PreparedStreamClaim {
+                                command: command.node,
+                                ordinal,
+                                layout,
+                                slot: None,
+                            })
                         })
-                        .collect::<Vec<_>>()
+                        .collect::<Result<Vec<_>, String>>()?
                         .into_boxed_slice();
                     Ok(PreparedResolvedReplayUpload {
                         recipe: replay.clone(),
-                        layout,
+                        layout: replay_layout,
                         allocations: replay_allocations,
                         streams: replay_streams,
                     })
@@ -2198,11 +3821,12 @@ impl PreparedResourcePlan {
                 .transpose()?;
             commands.push(PreparedResolvedCommand {
                 command: command.clone(),
+                schedule_id: None,
                 native,
                 accumulate,
                 preimage,
                 trapdoor,
-                allocations,
+                allocations: allocations.into_boxed_slice(),
                 composite_allocations,
                 composite_streams,
                 streams,
@@ -2211,58 +3835,218 @@ impl PreparedResourcePlan {
         }
         let mut schedules = Vec::with_capacity(self.schedules.len());
         for schedule in &self.schedules {
-            let members = schedule
+            // Resolve the schedule's member commands once, retaining the
+            // member identity alongside its native descriptor.  The native
+            // schedule planner emits member-preserving allocation/stream
+            // entries; resource binding below consumes this table directly.
+            let member_commands = schedule
                 .command_group
                 .iter()
-                .filter_map(|node| {
-                    commands.iter().find(|command| {
-                        command.command.node == *node &&
-                            command
-                                .command
-                                .recipe
-                                .owners
-                                .iter()
-                                .any(|owner| schedule.recipe.owners.contains(owner))
-                    })
+                .map(|node| {
+                    commands
+                        .iter()
+                        .find(|command| schedule_member_matches(schedule, &command.command, *node))
+                        .ok_or_else(|| {
+                            format!(
+                                "prepared schedule {} has no exact member command {node}",
+                                schedule.instance
+                            )
+                        })
                 })
+                .collect::<Result<Vec<_>, String>>()?;
+            let members = member_commands
+                .iter()
                 .filter_map(|command| command.native.clone())
                 .collect::<Vec<_>>();
-            let native = backend.plan_schedule(&schedule.recipe, &members)?;
+            let native =
+                backend.plan_schedule(&self.finalized_matrices, &schedule.recipe, &members)?;
+            validate_prepared_layout_keys(&native, "native schedule layout")?;
+            for (index, stream) in native.streams().iter().enumerate() {
+                if native.streams()[..index]
+                    .iter()
+                    .any(|previous| same_prepared_stream_physical(previous, stream))
+                {
+                    return Err(format!(
+                        "prepared schedule {} has ambiguous duplicate physical stream provenance",
+                        schedule.instance
+                    ));
+                }
+            }
+            let member_stream_matches =
+                |schedule_stream: &PreparedStreamFootprint| -> Result<(usize, usize), String> {
+                    let mut candidates = Vec::new();
+                    for (member, command) in member_commands.iter().enumerate() {
+                        let Some(member_layout) = command.native.as_ref() else { continue };
+                        let Some(store) =
+                            exact_recipe_store(&command.command.recipe, &self.stores)?
+                        else {
+                            continue;
+                        };
+                        let store_plan = self.stores.get(store).ok_or_else(|| {
+                            format!(
+                                "prepared schedule {} member stream has invalid store",
+                                schedule.instance
+                            )
+                        })?;
+                        let identity = self
+                            .finalized_matrices
+                            .identity(store_plan.matrix_id)
+                            .ok_or_else(|| {
+                                format!(
+                                    "prepared schedule {} member store has no canonical identity",
+                                    schedule.instance
+                                )
+                            })?;
+                        for member_stream in member_layout.streams() {
+                            // The schedule rewrites the role to SCHEDULE, but
+                            // every other physical stream identity remains
+                            // immutable. Include origin and pool slot: a
+                            // same-device stream with a different pool slot
+                            // is a distinct completion target.
+                            if same_prepared_stream_placement(member_stream, schedule_stream) {
+                                candidates.push(PreparedScheduleMemberCandidate {
+                                    member,
+                                    stream: *member_stream,
+                                    store,
+                                    owner: identity.physical.owner,
+                                    context_identity: identity.physical.context_identity,
+                                    device: identity.physical.device,
+                                    instance: store_plan.instance,
+                                    level: identity.physical.level,
+                                    format: identity.physical.format,
+                                });
+                            }
+                        }
+                    }
+                    let member = unique_prepared_schedule_member(&candidates, schedule_stream)
+                        .map_err(|error| {
+                            format!("prepared schedule {} {error}", schedule.instance)
+                        })?;
+                    let store =
+                        exact_recipe_store(&member_commands[member].command.recipe, &self.stores)?
+                            .ok_or_else(|| {
+                                format!(
+                                    "prepared schedule {} member stream has no exact store",
+                                    schedule.instance
+                                )
+                            })?;
+                    Ok((member, store))
+                };
             let streams = native
                 .streams()
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(ordinal, layout)| PreparedStreamClaim {
-                    command: schedule.command_group.first().copied().unwrap_or_default(),
-                    ordinal,
-                    layout,
-                    slot: None,
+                .map(|(ordinal, layout)| {
+                    Ok(PreparedStreamClaim {
+                        command: schedule.command_group.first().copied().unwrap_or_default(),
+                        ordinal,
+                        layout: stamp_stream(layout, schedule.instance)?,
+                        slot: None,
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, String>>()?
                 .into_boxed_slice();
+            let completion_count =
+                native.allocations().iter().filter(|layout| layout.kind == 8).count();
+            if completion_count != native.streams().len() {
+                return Err(format!(
+                    "prepared schedule {} has {} completion allocations for {} streams",
+                    schedule.instance,
+                    completion_count,
+                    native.streams().len()
+                ));
+            }
             let allocations = native
                 .allocations()
                 .iter()
                 .copied()
                 .enumerate()
-                .map(|(ordinal, layout)| PreparedAllocationClaim {
-                    command: schedule.command_group.first().copied().unwrap_or_default(),
-                    ordinal,
-                    store: schedule.recipe.inputs.first().copied(),
-                    layout,
-                    slot: None,
+                .filter(|(_, layout)| layout.kind == 8)
+                .map(|(ordinal, layout)| {
+                    let schedule_stream = native
+                        .streams()
+                        .iter()
+                        .find(|stream| stream.key == layout.key)
+                        .ok_or_else(|| {
+                            format!(
+                                "prepared schedule {} completion has no exact stream provenance",
+                                schedule.instance
+                            )
+                        })?;
+                    let (_member, store) = member_stream_matches(schedule_stream)?;
+                    let allocation = PreparedAllocationClaim {
+                        command: schedule.command_group.first().copied().unwrap_or_default(),
+                        ordinal,
+                        store: Some(store),
+                        layout: stamp_allocation(layout, schedule.instance)?,
+                        owner_layout: Some(owner_layout_for_store(store)?),
+                        slot: None,
+                    };
+                    Ok(allocation)
                 })
+                .collect::<Result<Vec<_>, String>>()?
+                .into_boxed_slice();
+            let resources = allocations
+                .into_iter()
+                .map(PreparedScheduleResource::Allocation)
+                .chain(streams.into_iter().map(PreparedScheduleResource::Stream))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            schedules.push(PreparedResolvedSchedule {
-                schedule: schedule.clone(),
-                native,
-                allocations,
-                streams,
-            });
+            schedules.push(PreparedResolvedSchedule { schedule: schedule.clone(), resources });
+        }
+        for command in &mut commands {
+            let schedule_matches = schedules
+                .iter()
+                .enumerate()
+                .filter(|(_, schedule)| {
+                    if schedule.schedule.instance != command.command.instance {
+                        return false;
+                    }
+                    if !schedule.schedule.command_group.contains(&command.command.node) {
+                        return false;
+                    }
+                    if command.command.stream.as_ref() == Some(&schedule.schedule.stream) {
+                        return true;
+                    }
+                    let Some(native) = command.native.as_ref() else { return false };
+                    let native_streams = native.streams();
+                    let schedule_streams = schedule.stream_claims().collect::<Vec<_>>();
+                    let native_stream_match = native_streams.len() == schedule_streams.len() &&
+                        native_streams.iter().all(|native_stream| {
+                            schedule_streams.iter().any(|schedule_stream| {
+                                same_prepared_stream_placement(
+                                    native_stream,
+                                    &schedule_stream.layout,
+                                )
+                            })
+                        });
+                    let staging_owner_match =
+                        command.command.recipe.matrix_staging.is_some_and(|staging| {
+                            schedule.schedule.recipe.owners.iter().copied().any(|candidate| {
+                                candidate.instance == staging.instance &&
+                                    self.finalized_matrices
+                                        .identity(candidate.matrix_id)
+                                        .zip(self.finalized_matrices.identity(staging.matrix_id))
+                                        .is_some_and(|(candidate, staging)| {
+                                            candidate.physical == staging.physical
+                                        })
+                            })
+                        });
+                    native_stream_match || staging_owner_match
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>();
+            command.schedule_id = match schedule_matches.as_slice() {
+                [] => None,
+                [schedule_id] => Some(*schedule_id),
+                _ => {
+                    return Err("prepared command has ambiguous canonical schedule identity".into())
+                }
+            };
         }
         Ok(PreparedResolvedResources {
+            finalized_matrices: self.finalized_matrices.clone(),
             owners: owners.into_boxed_slice(),
             scalar_buffers: scalar_buffers.into_boxed_slice(),
             commands: commands.into_boxed_slice(),
@@ -2446,13 +4230,29 @@ fn prepared_recipe(
     inputs: &[PreparedDescriptorRef],
     outputs: &[PreparedDescriptorRef],
     stream: Option<&PreparedStreamKey>,
+    stores: &[PreparedStorePlan],
     completion: Option<u32>,
 ) -> PreparedNativeRecipe {
     let mut input_stores =
         inputs.iter().filter_map(|descriptor| descriptor.store).collect::<Vec<_>>();
+    // TrapdoorSample has two IR output ports: public matrix and secret
+    // trapdoor metadata. The secret wire aliases the public owner for replay,
+    // but is not a second native sampler output/store. Preserve the port
+    // identity here instead of selecting an arbitrary store later.
+    let recipe_outputs =
+        if matches!(operation, PreparedOperation::Gpu(PreparedGpuOperation::TrapdoorSample)) {
+            outputs.iter().take(1).collect::<Vec<_>>()
+        } else {
+            outputs.iter().collect::<Vec<_>>()
+        };
     let mut output_stores =
-        outputs.iter().filter_map(|descriptor| descriptor.store).collect::<Vec<_>>();
-    if !matches!(operation, PreparedOperation::Gpu(PreparedGpuOperation::MatrixMulAccumulate)) {
+        recipe_outputs.iter().filter_map(|descriptor| descriptor.store).collect::<Vec<_>>();
+    if !matches!(
+        operation,
+        PreparedOperation::Gpu(
+            PreparedGpuOperation::MatrixMulAccumulate | PreparedGpuOperation::Tensor
+        )
+    ) {
         input_stores.sort_unstable();
         input_stores.dedup();
     }
@@ -2462,11 +4262,8 @@ fn prepared_recipe(
         .into_iter()
         .flat_map(|stream| stream.placements.iter())
         .map(|placement| PreparedOwnerKey {
-            owner: placement.owner,
-            device: placement.device,
+            matrix_id: stores[placement.store].matrix_id,
             instance: stream.map_or(0, |stream| stream.instance),
-            level: placement.level,
-            format: placement.format,
         })
         .collect::<Vec<_>>();
     owners.sort_unstable();
@@ -2707,16 +4504,21 @@ pub fn lower_graph(
             continue;
         }
         for wire in outputs {
-            if matches!(
-                program.wire_types.get(&wire),
-                Some(
-                    ConcreteWireType::Int |
-                        ConcreteWireType::Bool |
-                        ConcreteWireType::Real |
-                        ConcreteWireType::IndexedFamily { .. }
-                )
-            ) {
-                device_scalars.insert(wire);
+            for leaf in family_leaf_wires(&program, wire) {
+                if matches!(
+                    program.wire_types.get(&leaf),
+                    Some(
+                        ConcreteWireType::Int |
+                            ConcreteWireType::Bool |
+                            ConcreteWireType::Real |
+                            ConcreteWireType::ConstantInt |
+                            ConcreteWireType::ConstantBool |
+                            ConcreteWireType::ConstantReal
+                    )
+                ) && program.scalar_slots.contains_key(&leaf)
+                {
+                    device_scalars.insert(leaf);
+                }
             }
         }
     }
@@ -2757,10 +4559,17 @@ pub fn lower_graph(
             if arguments
                 .iter()
                 .chain(outputs.iter())
-                .any(|wire| program.device_scalar_wires.contains(wire))
+                .flat_map(|wire| family_leaf_wires(&program, *wire))
+                .any(|wire| program.device_scalar_wires.contains(&wire))
             {
-                for wire in arguments.iter().chain(outputs.iter()).filter(|wire| scalar(wire)) {
-                    program.device_scalar_wires.insert(*wire);
+                let propagated = arguments
+                    .iter()
+                    .chain(outputs.iter())
+                    .flat_map(|wire| family_leaf_wires(&program, *wire))
+                    .filter(|wire| scalar(wire) && program.scalar_slots.contains_key(wire))
+                    .collect::<Vec<_>>();
+                for wire in propagated {
+                    program.device_scalar_wires.insert(wire);
                 }
             }
         }
@@ -2768,8 +4577,6 @@ pub fn lower_graph(
             break;
         }
     }
-    program.resource_plan = PreparedResourcePlan::from_preparation(&program)?;
-    program.resource_plan.validate_for_warmup()?;
     Ok(program)
 }
 
@@ -2820,7 +4627,7 @@ mod tests {
         let output = WireRef { node: NodeId(61), port: Port(0) };
         let node_id = 62;
         let matrix = ConcreteMatrixType::scalar(BigInt::from(17), 8);
-        let mut program = GpuPreparation::default();
+        let mut program = GpuPreparation { instance_count: 1, ..GpuPreparation::default() };
         program.values.insert(
             source,
             ValueLocation {
@@ -2864,7 +4671,305 @@ mod tests {
             completion: 63,
         }]
         .into_boxed_slice();
+        finalize_fixture(&mut program, &[2, 3, 7]);
+        for device in [2, 3, 7] {
+            let context = program
+                .finalized_matrices
+                .ordinary_for_instance(source, device, 0)
+                .expect("threshold source identity")
+                .physical
+                .context_identity;
+            program
+                .finalized_matrices
+                .insert(
+                    MatrixSite::HostStaging { node: node_id, instance: 0, device },
+                    ValueLocation {
+                        owner: 71,
+                        rows: 0..1,
+                        columns: 0..1,
+                        level: 0,
+                        format: PreparedFormat::Coefficient,
+                        device,
+                    },
+                    context,
+                    1,
+                    1,
+                )
+                .unwrap();
+        }
         program
+    }
+
+    fn scalar_pack_program() -> GpuPreparation {
+        let unrelated = WireRef { node: NodeId(1), port: Port(0) };
+        let output = WireRef { node: NodeId(2), port: Port(0) };
+        let scalar = WireRef { node: NodeId(3), port: Port(0) };
+        let node_id = 4;
+        let matrix = ConcreteMatrixType::scalar(BigInt::from(17), 8);
+        let mut program = GpuPreparation { instance_count: 2, ..GpuPreparation::default() };
+        // Put a separate matrix owner first so the test catches code that
+        // replaces ScalarPack's output owner with the first canonical store.
+        for (wire, owner) in [(unrelated, 70), (output, 80)] {
+            program.values.insert(
+                wire,
+                ValueLocation {
+                    owner,
+                    rows: 0..1,
+                    columns: 0..1,
+                    level: 0,
+                    format: PreparedFormat::Evaluation,
+                    device: 0,
+                },
+            );
+            program.wire_types.insert(wire, ConcreteWireType::Matrix(matrix.clone()));
+        }
+        program.wire_types.insert(scalar, ConcreteWireType::Int);
+        program
+            .node_bindings
+            .insert(node_id, (vec![scalar].into_boxed_slice(), vec![output].into_boxed_slice()));
+        program.topology.nodes = vec![PreparedTopologyNode {
+            id: node_id,
+            command: PreparedCommandRequirement {
+                operation: PreparedOperation::Gpu(PreparedGpuOperation::PackPolynomialCoefficients),
+                inputs: 1,
+                outputs: 1,
+            },
+            stream: 0,
+            waits: Box::new([]),
+            completion: 5,
+        }]
+        .into_boxed_slice();
+        finalize_fixture(&mut program, &[0, 2, 7]);
+        program
+    }
+
+    /// Explicit finalized fixture used by structural resource-plan tests.
+    /// Production never derives a context or owner from a missing table.
+    fn finalize_fixture(program: &mut GpuPreparation, devices: &[i32]) {
+        if program.instance_count == 0 {
+            program.instance_count = 1;
+        }
+        let values = program.values.clone();
+        let mut capacities = BTreeMap::<u64, (usize, usize)>::new();
+        for (owner, capacity) in &program.storage_capacities {
+            capacities.insert(*owner, *capacity);
+        }
+        for location in values.values() {
+            capacities
+                .entry(location.owner)
+                .and_modify(|capacity| {
+                    capacity.0 = capacity.0.max(location.rows.end);
+                    capacity.1 = capacity.1.max(location.columns.end);
+                })
+                .or_insert((location.rows.end, location.columns.end));
+        }
+        for (wire, location) in values {
+            for device in devices {
+                let mut physical = location.clone();
+                physical.device = *device;
+                let (capacity_rows, capacity_columns) = capacities[&location.owner];
+                for instance in 0..program.instance_count {
+                    program
+                        .finalized_matrices
+                        .insert(
+                            MatrixSite::Ordinary { wire, device: *device, instance },
+                            physical.clone(),
+                            100 + location.level * 2 +
+                                usize::from(location.format == PreparedFormat::Evaluation),
+                            capacity_rows,
+                            capacity_columns,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_matrix_ids_tag_each_semantic_site() {
+        let wire = WireRef { node: NodeId(70), port: Port(0) };
+        let location = ValueLocation {
+            owner: 9,
+            rows: 0..1,
+            columns: 0..1,
+            level: 0,
+            format: PreparedFormat::Coefficient,
+            device: 2,
+        };
+        let mut table = FinalizedMatrixIdTable::default();
+        let ordinary = table
+            .insert(
+                MatrixSite::Ordinary { wire, device: 2, instance: 0 },
+                location.clone(),
+                11,
+                1,
+                1,
+            )
+            .unwrap();
+        let variant = table
+            .insert(
+                MatrixSite::Variant { node: 70, variant: 0, port: 0, device: 2, instance: 0 },
+                location.clone(),
+                11,
+                1,
+                1,
+            )
+            .unwrap();
+        let staging = table
+            .insert(
+                MatrixSite::HostStaging { node: 70, instance: 0, device: 2 },
+                location,
+                11,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_ne!(ordinary, variant);
+        assert_ne!(variant, staging);
+        assert_eq!(
+            table.ordinary_for_instance(wire, 2, 0).unwrap().site,
+            MatrixSite::Ordinary { wire, device: 2, instance: 0 }
+        );
+        assert_eq!(
+            table.variant(70, 0, 0, 2).unwrap().site,
+            MatrixSite::Variant { node: 70, variant: 0, port: 0, device: 2, instance: 0 }
+        );
+        assert_eq!(table.host_staging(70, 0, 2).unwrap().physical.context_identity, 11);
+    }
+
+    #[test]
+    fn finalized_matrix_id_rejects_conflicting_site_identity() {
+        let wire = WireRef { node: NodeId(71), port: Port(0) };
+        let site = MatrixSite::Ordinary { wire, device: 7, instance: 0 };
+        let mut table = FinalizedMatrixIdTable::default();
+        let first = table
+            .insert(
+                site,
+                ValueLocation {
+                    owner: 1,
+                    rows: 0..1,
+                    columns: 0..1,
+                    level: 0,
+                    format: PreparedFormat::Evaluation,
+                    device: 7,
+                },
+                31,
+                1,
+                1,
+            )
+            .unwrap();
+        let duplicate = table
+            .insert(
+                site,
+                ValueLocation {
+                    owner: 1,
+                    rows: 0..1,
+                    columns: 0..1,
+                    level: 0,
+                    format: PreparedFormat::Evaluation,
+                    device: 7,
+                },
+                31,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(duplicate, first);
+        let second = table.insert(
+            site,
+            ValueLocation {
+                owner: 2,
+                rows: 0..1,
+                columns: 0..1,
+                level: 1,
+                format: PreparedFormat::Coefficient,
+                device: 7,
+            },
+            32,
+            2,
+            2,
+        );
+        assert!(second.is_err());
+        let identity = table.identity(first).unwrap();
+        assert_eq!(identity.physical.owner, 1);
+        assert_eq!(identity.physical.context_identity, 31);
+    }
+
+    #[test]
+    fn physical_plan_merge_remaps_id_collisions_and_rejects_site_conflicts() {
+        let location = ValueLocation {
+            owner: 1,
+            rows: 0..1,
+            columns: 0..1,
+            level: 0,
+            format: PreparedFormat::Coefficient,
+            device: 0,
+        };
+        let mut first_table = FinalizedMatrixIdTable::default();
+        let first_wire = WireRef { node: NodeId(81), port: Port(0) };
+        first_table
+            .insert(
+                MatrixSite::Ordinary { wire: first_wire, device: 0, instance: 0 },
+                location.clone(),
+                7,
+                1,
+                1,
+            )
+            .unwrap();
+        let mut second_table = FinalizedMatrixIdTable::default();
+        let second_wire = WireRef { node: NodeId(82), port: Port(0) };
+        second_table
+            .insert(
+                MatrixSite::Ordinary { wire: second_wire, device: 0, instance: 0 },
+                ValueLocation { owner: 2, ..location.clone() },
+                8,
+                1,
+                1,
+            )
+            .unwrap();
+        let mut conflict_table = FinalizedMatrixIdTable::default();
+        conflict_table
+            .insert(
+                MatrixSite::Ordinary { wire: first_wire, device: 0, instance: 0 },
+                ValueLocation { owner: 9, ..location.clone() },
+                7,
+                1,
+                1,
+            )
+            .unwrap();
+        let empty = |finalized_matrices| PreparedResourcePlan {
+            instance_count: 1,
+            finalized_matrices,
+            stores: Box::new([]),
+            scalar_buffers: Box::new([]),
+            commands: Box::new([]),
+            schedules: Box::new([]),
+        };
+        let merged = PreparedResourcePlan::merge_physical_plans(vec![
+            empty(first_table),
+            empty(second_table),
+        ])
+        .unwrap();
+        assert_eq!(merged.finalized_matrices.identities.len(), 2);
+        assert_ne!(
+            merged.finalized_matrices.id(MatrixSite::Ordinary {
+                wire: first_wire,
+                device: 0,
+                instance: 0,
+            }),
+            merged.finalized_matrices.id(MatrixSite::Ordinary {
+                wire: second_wire,
+                device: 0,
+                instance: 0,
+            }),
+        );
+        assert!(
+            PreparedResourcePlan::merge_physical_plans(vec![
+                empty(merged.finalized_matrices.clone()),
+                empty(conflict_table),
+            ])
+            .is_err()
+        );
     }
 
     fn composite_stream_claim(
@@ -2876,6 +4981,8 @@ mod tests {
     ) -> (PreparedCompositeClaim, PreparedCompositeStream) {
         let key = PreparedResourceKey {
             execution_owner_identity: 99,
+            context_identity: 0,
+            instance: 0,
             partition,
             device,
             limb_x: ordinal as u32,
@@ -2901,7 +5008,9 @@ mod tests {
                     bytes: 0,
                     alignment: 1,
                 }),
+                store: None,
                 layout: Some(layout),
+                owner_layout: None,
                 slot: None,
             },
             PreparedCompositeStream {
@@ -2943,24 +5052,24 @@ mod tests {
         );
 
         let trapdoor = GpuPreparedTrapdoorLayout::bind_entries();
-        assert_eq!(trapdoor.len(), 30);
+        let trapdoor_owner_count = trapdoor.len() - TrapdoorStage::ALL.len();
         assert_eq!(
-            trapdoor[..13].iter().map(|entry| entry.owner).collect::<Vec<_>>(),
-            (0..13).map(Some).collect::<Vec<_>>()
+            trapdoor[..trapdoor_owner_count].iter().map(|entry| entry.owner).collect::<Vec<_>>(),
+            (0..trapdoor_owner_count).map(Some).collect::<Vec<_>>()
         );
         assert_eq!(
-            trapdoor[13..].iter().map(|entry| entry.stage).collect::<Vec<_>>(),
+            trapdoor[trapdoor_owner_count..].iter().map(|entry| entry.stage).collect::<Vec<_>>(),
             TrapdoorStage::ALL.into_iter().map(Some).collect::<Vec<_>>()
         );
         assert_eq!(
-            trapdoor[13..].iter().map(|entry| entry.kind).collect::<Vec<_>>(),
+            trapdoor[trapdoor_owner_count..].iter().map(|entry| entry.kind).collect::<Vec<_>>(),
             TrapdoorStage::ALL.into_iter().map(|stage| stage.kind()).collect::<Vec<_>>()
         );
         assert_eq!(
             mxx_primitives::sampler::trapdoor::gpu::TRAPDOOR_STAGE_KINDS.to_vec(),
             TrapdoorStage::ALL.into_iter().map(|stage| stage.kind()).collect::<Vec<_>>()
         );
-        let stage_entries = &trapdoor[13..];
+        let stage_entries = &trapdoor[trapdoor_owner_count..];
         assert_eq!(stage_entries.len(), TrapdoorStage::ALL.len());
         assert!(
             stage_entries.iter().map(|entry| entry.stage).collect::<BTreeSet<_>>().len() ==
@@ -2996,7 +5105,9 @@ mod tests {
                 command: 7,
                 ordinal: 0,
                 claim: GpuTracedClaim::matrix(1, 1, 0, true),
+                store: None,
                 layout: None,
+                owner_layout: None,
                 slot: None,
             },
             first_claim,
@@ -3008,7 +5119,9 @@ mod tests {
                     bytes: 0,
                     alignment: 1,
                 }),
+                store: None,
                 layout: None,
+                owner_layout: None,
                 slot: None,
             },
             second_claim,
@@ -3035,20 +5148,8 @@ mod tests {
             prepared_operation(&NodeKind::MatrixBinary(MatrixBinaryOp::Subtract)),
             PreparedOperation::Gpu(PreparedGpuOperation::MatrixBinary(MatrixBinaryOp::Subtract))
         );
-        let binding = PreparedBindingId {
-            owner: 7,
-            device: 3,
-            instance: 1,
-            storage: Some(PreparedStorageBinding {
-                storage_id: 11,
-                slot_id: 13,
-                slot_index: 2,
-                context: 17,
-                basis: 3,
-            }),
-        };
-        let storage = binding.storage.unwrap();
-        assert_eq!((storage.storage_id, storage.slot_id, storage.slot_index), (11, 13, 2));
+        let binding = PreparedBindingId { matrix_id: FinalizedMatrixId(0), instance: 1 };
+        assert_eq!(binding.instance, 1);
     }
 
     #[test]
@@ -3412,7 +5513,7 @@ mod tests {
         assert!(matches!(
             lower_slice(&slice, &ParamEnv::default(), source.clone(), location(1, 0..4, 0..4))
                 .unwrap(),
-            PreparedView::Alias(_)
+            PreparedViewShape::Alias(_)
         ));
         let sliced = NodeKind::Slice {
             rows: Some(mxx_ir_core::node::IndexRange {
@@ -3421,7 +5522,7 @@ mod tests {
             }),
             columns: None,
         };
-        let PreparedView::Alias(sliced) =
+        let PreparedViewShape::Alias(sliced) =
             lower_slice(&sliced, &ParamEnv::default(), source.clone(), location(1, 0..2, 0..4))
                 .unwrap()
         else {
@@ -3431,22 +5532,22 @@ mod tests {
         assert!(matches!(
             lower_slice(&slice, &ParamEnv::default(), source.clone(), location(9, 0..4, 0..4))
                 .unwrap(),
-            PreparedView::FixedCopies(copies) if copies.len() == 1
+            PreparedViewShape::FixedCopies(copies) if copies.len() == 1
         ));
         assert!(matches!(
             lower_transpose(&NodeKind::Transpose, source.clone(), location(1, 0..4, 0..4)).unwrap(),
-            PreparedView::TransposeAlias(_)
+            PreparedViewShape::TransposeAlias(_)
         ));
         assert!(matches!(
             lower_transpose(&NodeKind::Transpose, source.clone(), location(9, 0..4, 0..4))
                 .unwrap(),
-            PreparedView::FixedCopies(copies) if copies.len() == 1
+            PreparedViewShape::FixedCopies(copies) if copies.len() == 1
         ));
         let other = location(2, 0..4, 0..4);
         let concat = NodeKind::Concat { axis: ConcatAxis::Diagonal };
         assert!(matches!(
             lower_concat(&concat, &[source, other], location(3, 0..8, 0..8)).unwrap(),
-            PreparedView::FixedCopies(_)
+            PreparedViewShape::FixedCopies(_)
         ));
         let source = location(1, 0..4, 0..4);
         let same_owner = location(1, 0..4, 0..4);
@@ -3457,7 +5558,7 @@ mod tests {
                 location(1, 0..8, 0..4)
             )
             .unwrap(),
-            PreparedView::Alias(_)
+            PreparedViewShape::Alias(_)
         ));
         assert!(matches!(
             lower_concat(
@@ -3466,7 +5567,7 @@ mod tests {
                 location(9, 0..4, 0..8)
             )
             .unwrap(),
-            PreparedView::FixedCopies(copies) if copies.len() == 2
+            PreparedViewShape::FixedCopies(copies) if copies.len() == 2
         ));
     }
 
@@ -3512,6 +5613,147 @@ mod tests {
             .unwrap(),
             PreparedSelection::ScalarStatic { slot: 4 }
         ));
+    }
+
+    #[test]
+    fn host_only_scalar_selections_use_control_recipes_without_matrix_placement() {
+        let selector = WireRef { node: NodeId(1), port: Port(0) };
+        let output = WireRef { node: NodeId(2), port: Port(0) };
+        let static_output = WireRef { node: NodeId(3), port: Port(0) };
+        let select_output = WireRef { node: NodeId(4), port: Port(0) };
+        let mut program = GpuPreparation { instance_count: 1, ..GpuPreparation::default() };
+        for (wire, slot) in [(selector, 0), (output, 1), (static_output, 2), (select_output, 3)] {
+            program.scalar_slots.insert(wire, slot);
+            program.wire_types.insert(wire, ConcreteWireType::Int);
+        }
+        program
+            .node_bindings
+            .insert(2, (vec![selector].into_boxed_slice(), vec![output].into_boxed_slice()));
+        program.node_bindings.insert(3, (Box::new([]), vec![static_output].into_boxed_slice()));
+        program
+            .node_bindings
+            .insert(4, (vec![selector].into_boxed_slice(), vec![select_output].into_boxed_slice()));
+        program.selection_commands.insert(
+            2,
+            PreparedSelection::ScalarDynamic {
+                candidates: vec![1, 2].into_boxed_slice(),
+                selector,
+            },
+        );
+        program.selection_commands.insert(3, PreparedSelection::ScalarStatic { slot: 1 });
+        program.selection_commands.insert(
+            4,
+            PreparedSelection::ScalarSelect { candidates: vec![1, 2].into_boxed_slice(), selector },
+        );
+        program.topology.nodes = vec![2, 3, 4]
+            .into_iter()
+            .map(|id| PreparedTopologyNode {
+                id,
+                command: PreparedCommandRequirement {
+                    operation: PreparedOperation::Selection,
+                    inputs: 1,
+                    outputs: 1,
+                },
+                stream: 0,
+                waits: Box::new([]),
+                completion: id + 10,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
+        assert_eq!(plan.stores.len(), 0);
+        assert_eq!(plan.commands.len(), 3);
+        assert!(plan.commands.iter().all(|command| {
+            command.recipe.stage == PreparedNativeStage::Control &&
+                command.recipe.scalar.is_none() &&
+                command.recipe.owners.is_empty()
+        }));
+        plan.validate_for_warmup().unwrap();
+
+        let expanded = PreparedResourcePlan::from_preparation_for_devices(&program, &[2, 7])
+            .expect("ownerless controls merge across devices");
+        assert_eq!(expanded.commands.len(), 3);
+        assert!(expanded.commands.iter().all(|command| {
+            command.recipe.stage == PreparedNativeStage::Control && command.recipe.owners.is_empty()
+        }));
+    }
+
+    #[test]
+    fn schedule_stream_identity_rejects_role_origin_and_pool_collisions() {
+        let key = PreparedResourceKey {
+            execution_owner_identity: 7,
+            context_identity: 11,
+            instance: 0,
+            partition: 0,
+            device: 3,
+            limb_x: 0,
+            limb_y: 1,
+            role: PreparedStageRole::Matrix as i32,
+        };
+        let base = PreparedStreamFootprint { key, origin: 0, pool_slot: 4 };
+        let mut different_pool = base;
+        different_pool.pool_slot += 1;
+        let mut different_origin = base;
+        different_origin.origin = 1;
+        let mut different_role = base;
+        different_role.key.role = PreparedStageRole::Schedule as i32;
+        assert!(same_prepared_stream_physical(&base, &base));
+        assert!(!same_prepared_stream_physical(&base, &different_pool));
+        assert!(!same_prepared_stream_physical(&base, &different_origin));
+        assert!(!same_prepared_stream_physical(&base, &different_role));
+    }
+
+    #[test]
+    fn schedule_member_aliases_canonicalize_but_different_stores_reject() {
+        let key = PreparedResourceKey {
+            execution_owner_identity: 7,
+            context_identity: 11,
+            instance: 0,
+            partition: 0,
+            device: 3,
+            limb_x: 0,
+            limb_y: 1,
+            role: PreparedStageRole::Matrix as i32,
+        };
+        let stream = PreparedStreamFootprint { key, origin: 0, pool_slot: 4 };
+        let candidate = |member, store| PreparedScheduleMemberCandidate {
+            member,
+            stream,
+            store,
+            owner: 19,
+            context_identity: 11,
+            device: 3,
+            instance: 0,
+            level: 2,
+            format: PreparedFormat::Evaluation,
+        };
+        assert_eq!(
+            unique_prepared_schedule_member(&[candidate(4, 9), candidate(2, 9)], &stream).unwrap(),
+            2
+        );
+        assert!(
+            unique_prepared_schedule_member(&[candidate(2, 9), candidate(4, 10)], &stream).is_err()
+        );
+    }
+
+    #[test]
+    fn resource_keys_require_paired_host_sentinels() {
+        let mut key = PreparedResourceKey {
+            execution_owner_identity: 0,
+            context_identity: 0,
+            instance: 0,
+            partition: -1,
+            device: -1,
+            limb_x: 0,
+            limb_y: 0,
+            role: PreparedStageRole::Transfer as i32,
+        };
+        assert!(validate_prepared_resource_key(&key, "test").is_ok());
+        key.partition = 0;
+        assert!(validate_prepared_resource_key(&key, "test").is_err());
+        key.device = 0;
+        assert!(validate_prepared_resource_key(&key, "test").is_ok());
     }
 
     #[test]
@@ -3614,6 +5856,7 @@ mod tests {
         }]
         .into_boxed_slice();
 
+        finalize_fixture(&mut program, &[2]);
         let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
         assert_eq!(plan.stores.len(), 2);
         assert_eq!(plan.commands[0].inputs[0].store, Some(0));
@@ -3623,6 +5866,278 @@ mod tests {
         assert_eq!(plan.schedules[0].command_group.as_ref(), [9]);
         assert_eq!(plan.schedules[0].completions.as_ref(), [90]);
         plan.validate_for_warmup().unwrap();
+    }
+
+    #[test]
+    fn finalized_resource_plan_rejects_missing_crt_context_identity() {
+        let wire = WireRef { node: NodeId(41), port: Port(0) };
+        let mut program = GpuPreparation { instance_count: 1, ..GpuPreparation::default() };
+        program.values.insert(
+            wire,
+            ValueLocation {
+                owner: 7,
+                rows: 0..1,
+                columns: 0..1,
+                level: 0,
+                format: PreparedFormat::Coefficient,
+                device: 3,
+            },
+        );
+        assert!(matches!(
+            PreparedResourcePlan::from_preparation(&program),
+            Err(PreparedLoweringError::InvalidContract("finalized CRT context is missing"))
+        ));
+    }
+
+    #[test]
+    fn physical_expansion_accepts_aliases_with_shared_physical_identity() {
+        let first = WireRef { node: NodeId(43), port: Port(0) };
+        let second = WireRef { node: NodeId(44), port: Port(0) };
+        let location = ValueLocation {
+            owner: 7,
+            rows: 0..2,
+            columns: 0..2,
+            level: 0,
+            format: PreparedFormat::Coefficient,
+            device: 0,
+        };
+        let mut program = GpuPreparation { instance_count: 1, ..GpuPreparation::default() };
+        program.values.insert(first, location.clone());
+        program.values.insert(second, location.clone());
+        for wire in [first, second] {
+            program
+                .finalized_matrices
+                .insert(
+                    MatrixSite::Ordinary { wire, device: 2, instance: 0 },
+                    ValueLocation { owner: 17, device: 2, ..location.clone() },
+                    19,
+                    2,
+                    2,
+                )
+                .unwrap();
+        }
+        program.family_members.insert(first, vec![location.clone()].into_boxed_slice());
+        program.family_wires.insert(first, vec![first].into_boxed_slice());
+        program.selection_commands.insert(10, PreparedSelection::Static { location });
+        program.selection_candidate_wires.insert(10, vec![second].into_boxed_slice());
+
+        let plan = PreparedResourcePlan::from_preparation_for_devices(&program, &[2]).unwrap();
+        assert_eq!(plan.stores.len(), 1);
+        let physical =
+            &plan.finalized_matrices.identity(plan.stores[0].matrix_id).unwrap().physical;
+        assert_eq!(physical.owner, 17);
+        assert_eq!(physical.device, 2);
+    }
+
+    #[test]
+    fn resource_plan_keeps_same_owner_states_distinct_across_devices_and_instances() {
+        let evaluation = WireRef { node: NodeId(1), port: Port(0) };
+        let coefficient = WireRef { node: NodeId(2), port: Port(0) };
+        let output = WireRef { node: NodeId(3), port: Port(0) };
+        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType::scalar(BigInt::from(17), 8));
+        let mut program = GpuPreparation { instance_count: 2, ..GpuPreparation::default() };
+        for (wire, level, format) in [
+            (evaluation, 1, PreparedFormat::Evaluation),
+            (coefficient, 0, PreparedFormat::Coefficient),
+        ] {
+            program.values.insert(
+                wire,
+                ValueLocation { owner: 7, rows: 0..1, columns: 0..2, level, format, device: 0 },
+            );
+            program.wire_types.insert(wire, matrix.clone());
+            for device in [2, 7] {
+                for instance in 0..2 {
+                    program
+                        .finalized_matrices
+                        .insert(
+                            MatrixSite::Ordinary { wire, device, instance },
+                            ValueLocation {
+                                owner: 7,
+                                device,
+                                level,
+                                format,
+                                ..program.values[&wire].clone()
+                            },
+                            19 + level,
+                            3,
+                            4,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        program.values.insert(
+            output,
+            ValueLocation {
+                owner: 7,
+                rows: 0..1,
+                columns: 0..2,
+                level: 1,
+                format: PreparedFormat::Evaluation,
+                device: 0,
+            },
+        );
+        program.wire_types.insert(output, matrix);
+        for device in [2, 7] {
+            for instance in 0..2 {
+                program
+                    .finalized_matrices
+                    .insert(
+                        MatrixSite::Ordinary { wire: output, device, instance },
+                        ValueLocation {
+                            owner: 7,
+                            device,
+                            level: 1,
+                            format: PreparedFormat::Evaluation,
+                            ..program.values[&output].clone()
+                        },
+                        20,
+                        3,
+                        4,
+                    )
+                    .unwrap();
+            }
+        }
+        program.storage_capacities.insert(7, (3, 4));
+        program.node_bindings.insert(
+            4,
+            (vec![evaluation, coefficient].into_boxed_slice(), vec![output].into_boxed_slice()),
+        );
+        program.topology.nodes = vec![PreparedTopologyNode {
+            id: 4,
+            command: PreparedCommandRequirement {
+                operation: PreparedOperation::Gpu(PreparedGpuOperation::MatrixBinary(
+                    MatrixBinaryOp::Add,
+                )),
+                inputs: 2,
+                outputs: 1,
+            },
+            stream: 0,
+            waits: Box::new([]),
+            completion: 5,
+        }]
+        .into_boxed_slice();
+
+        let plan = PreparedResourcePlan::from_preparation_for_devices(&program, &[2, 7]).unwrap();
+        assert_eq!(plan.stores.len(), 2 * 2 * 2);
+        let states = plan
+            .stores
+            .iter()
+            .map(|store| {
+                let physical = &plan.finalized_matrices.identity(store.matrix_id).unwrap().physical;
+                (store.instance, physical.device, physical.level, physical.format)
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(states.len(), plan.stores.len());
+        assert_eq!(
+            states,
+            BTreeSet::from([
+                (0, 2, 0, PreparedFormat::Coefficient),
+                (0, 2, 1, PreparedFormat::Evaluation),
+                (1, 2, 0, PreparedFormat::Coefficient),
+                (1, 2, 1, PreparedFormat::Evaluation),
+                (0, 7, 0, PreparedFormat::Coefficient),
+                (0, 7, 1, PreparedFormat::Evaluation),
+                (1, 7, 0, PreparedFormat::Coefficient),
+                (1, 7, 1, PreparedFormat::Evaluation),
+            ])
+        );
+        assert_eq!(plan.commands.len(), 4);
+        assert!(plan.commands.iter().all(|command| {
+            command.stream.as_ref().is_some_and(|stream| stream.placements.len() == 2)
+        }));
+        plan.validate_for_warmup().unwrap();
+    }
+
+    #[test]
+    fn resource_plan_includes_finite_variant_output_context_stores() {
+        let output = WireRef { node: NodeId(10), port: Port(0) };
+        let matrix_a = ConcreteWireType::Matrix(ConcreteMatrixType::scalar(BigInt::from(17), 8));
+        let matrix_b = ConcreteWireType::Matrix(ConcreteMatrixType::scalar(BigInt::from(19), 8));
+        let mut program = GpuPreparation { instance_count: 1, ..GpuPreparation::default() };
+        program.values.insert(
+            output,
+            ValueLocation {
+                owner: 3,
+                rows: 0..1,
+                columns: 0..1,
+                level: 1,
+                format: PreparedFormat::Evaluation,
+                device: 0,
+            },
+        );
+        program.wire_types.insert(output, matrix_a.clone());
+        for device in [2, 7] {
+            program
+                .finalized_matrices
+                .insert(
+                    MatrixSite::Ordinary { wire: output, device, instance: 0 },
+                    ValueLocation {
+                        owner: 3,
+                        rows: 0..1,
+                        columns: 0..1,
+                        level: 1,
+                        format: PreparedFormat::Evaluation,
+                        device,
+                    },
+                    20,
+                    1,
+                    1,
+                )
+                .unwrap();
+        }
+        program.node_bindings.insert(10, (Box::new([]), vec![output].into_boxed_slice()));
+        program.node_sources.insert(
+            10,
+            PreparedNodeSource {
+                kind: NodeKind::MatrixNegate,
+                environment: ParamEnv::default(),
+                variants: Box::new([]),
+                variant_indices: Box::new([]),
+                variant_input_types: Box::new([]),
+                variant_output_types: vec![
+                    vec![matrix_a].into_boxed_slice(),
+                    vec![matrix_b].into_boxed_slice(),
+                ]
+                .into_boxed_slice(),
+            },
+        );
+        // Both variants use the same CRT level but distinct concrete moduli;
+        // finalization therefore gives them separate owners even though their
+        // logical output wire is shared.
+        for (variant, (owner, level)) in [(0, (3, 1)), (1, (4, 1))] {
+            for device in [2, 7] {
+                program
+                    .finalized_matrices
+                    .insert(
+                        MatrixSite::Variant { node: 10, variant, port: 0, device, instance: 0 },
+                        ValueLocation {
+                            owner,
+                            rows: 0..1,
+                            columns: 0..1,
+                            level,
+                            format: PreparedFormat::Evaluation,
+                            device,
+                        },
+                        19 + variant,
+                        1,
+                        1,
+                    )
+                    .unwrap();
+            }
+        }
+        let plan = PreparedResourcePlan::from_preparation_for_devices(&program, &[2, 7]).unwrap();
+        assert_eq!(plan.stores.len(), 6);
+        for device in [2, 7] {
+            assert!(plan.stores.iter().any(|store| {
+                let physical = &plan.finalized_matrices.identity(store.matrix_id).unwrap().physical;
+                physical.device == device && physical.owner == 3 && physical.level == 1
+            }));
+            assert!(plan.stores.iter().any(|store| {
+                let physical = &plan.finalized_matrices.identity(store.matrix_id).unwrap().physical;
+                physical.device == device && physical.owner == 4 && physical.level == 1
+            }));
+        }
     }
 
     #[test]
@@ -3661,6 +6176,7 @@ mod tests {
             completion: 12,
         }]
         .into_boxed_slice();
+        finalize_fixture(&mut program, &[3]);
         let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
         assert_eq!(plan.commands[0].inputs.len(), 2);
         assert!(plan.commands[0].inputs.iter().all(|descriptor| {
@@ -3699,12 +6215,14 @@ mod tests {
             completion: 5,
         }]
         .into_boxed_slice();
+        finalize_fixture(&mut program, &[4]);
         let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
         assert_eq!(plan.instance_count, 2);
         assert_eq!(plan.stores.len(), 2);
-        assert_eq!(plan.stores[0].capacity_rows, 9);
-        assert_eq!(plan.stores[0].capacity_columns, 11);
-        assert_eq!(plan.stores[0].location.rows, 0..9);
+        let physical =
+            &plan.finalized_matrices.identity(plan.stores[0].matrix_id).unwrap().physical;
+        assert_eq!(physical.capacity_rows, 9);
+        assert_eq!(physical.capacity_columns, 11);
         assert_eq!(plan.stores[1].instance, 1);
         assert_eq!(plan.commands.len(), 2);
         assert_eq!(plan.commands[0].stream.as_ref().unwrap().stores.as_ref(), [0]);
@@ -3718,16 +6236,18 @@ mod tests {
         let staging = plan
             .stores
             .iter()
-            .find(|store| store.location.owner != 70)
+            .find(|store| {
+                plan.finalized_matrices.identity(store.matrix_id).unwrap().physical.owner != 70
+            })
             .expect("threshold staging store");
-        assert_eq!(staging.location.rows, 0..1);
-        assert_eq!(staging.location.columns, 0..1);
-        assert_eq!(staging.location.format, PreparedFormat::Coefficient);
-        assert_eq!(staging.location.device, 3);
+        let staging_identity = plan.finalized_matrices.identity(staging.matrix_id).unwrap();
+        assert_eq!(staging.logical_rows, 1);
+        assert_eq!(staging.logical_columns, 1);
+        assert_eq!(staging_identity.physical.format, PreparedFormat::Coefficient);
+        assert_eq!(staging_identity.physical.device, 3);
         let command = &plan.commands[0];
         let staging_owner = command.recipe.matrix_staging.expect("threshold staging owner");
-        assert_eq!(staging_owner.owner, staging.location.owner);
-        assert_eq!(staging_owner.format, PreparedFormat::Coefficient);
+        assert_eq!(staging_owner.matrix_id, staging.matrix_id);
         assert!(command.recipe.owners.contains(&staging_owner));
         assert_eq!(command.stream.as_ref().unwrap().stores.len(), 2);
         plan.validate_for_warmup().unwrap();
@@ -3742,18 +6262,32 @@ mod tests {
             .stores
             .iter()
             .enumerate()
-            .filter(|(_, store)| store.location.format == PreparedFormat::Coefficient)
+            .filter(|(_, store)| {
+                plan.finalized_matrices.identity(store.matrix_id).unwrap().physical.format ==
+                    PreparedFormat::Coefficient
+            })
             .collect::<Vec<_>>();
         assert_eq!(staging_stores.len(), 2);
         assert_eq!(
-            staging_stores.iter().map(|(_, store)| store.location.device).collect::<Vec<_>>(),
+            staging_stores
+                .iter()
+                .map(|(_, store)| plan
+                    .finalized_matrices
+                    .identity(store.matrix_id)
+                    .unwrap()
+                    .physical
+                    .device)
+                .collect::<Vec<_>>(),
             [2, 7]
         );
 
         for device in [2, 7] {
             let [(staging_index, staging)] = staging_stores
                 .iter()
-                .filter(|(_, store)| store.location.device == device)
+                .filter(|(_, store)| {
+                    plan.finalized_matrices.identity(store.matrix_id).unwrap().physical.device ==
+                        device
+                })
                 .copied()
                 .collect::<Vec<_>>()[..]
             else {
@@ -3763,15 +6297,18 @@ mod tests {
                 .commands
                 .iter()
                 .filter(|command| {
-                    command.recipe.matrix_staging.is_some_and(|owner| owner.device == device)
+                    command.recipe.matrix_staging.is_some_and(|owner| {
+                        plan.finalized_matrices
+                            .identity(owner.matrix_id)
+                            .is_some_and(|identity| identity.physical.device == device)
+                    })
                 })
                 .collect::<Vec<_>>()[..]
             else {
                 panic!("expected exactly one threshold command on device {device}");
             };
             let staging_owner = command.recipe.matrix_staging.unwrap();
-            assert_eq!(staging_owner.owner, staging.location.owner);
-            assert_eq!(staging_owner.device, device);
+            assert_eq!(staging_owner.matrix_id, staging.matrix_id);
             assert_eq!(
                 command.recipe.owners.iter().filter(|owner| **owner == staging_owner).count(),
                 1
@@ -3784,13 +6321,7 @@ mod tests {
                     .iter()
                     .filter(|placement| placement.store == staging_index)
                     .collect::<Vec<_>>(),
-                [&PreparedPlacementKey {
-                    store: staging_index,
-                    owner: staging.location.owner,
-                    device,
-                    level: staging.location.level,
-                    format: PreparedFormat::Coefficient,
-                }]
+                [&PreparedPlacementKey { store: staging_index, matrix_id: staging.matrix_id }]
             );
         }
         plan.validate_for_warmup().unwrap();
@@ -3811,7 +6342,15 @@ mod tests {
             .stores
             .iter()
             .copied()
-            .find(|index| valid.stores[*index].location.format == PreparedFormat::Coefficient)
+            .find(|index| {
+                valid
+                    .finalized_matrices
+                    .identity(valid.stores[*index].matrix_id)
+                    .unwrap()
+                    .physical
+                    .format ==
+                    PreparedFormat::Coefficient
+            })
             .unwrap();
         let mut missing_placement = valid;
         let stream = missing_placement.commands[0].stream.as_mut().unwrap();
@@ -3824,6 +6363,53 @@ mod tests {
             .filter(|placement| placement.store != staging_index)
             .collect();
         assert!(missing_placement.validate_for_warmup().is_err());
+    }
+
+    #[test]
+    fn scalar_pack_keeps_its_output_stream_owner() {
+        let plan = PreparedResourcePlan::from_preparation(&scalar_pack_program()).unwrap();
+        let command = &plan.commands[0];
+        let output_store = &plan.stores[command.outputs[0].store.unwrap()];
+        assert_eq!(command.recipe.stage, PreparedNativeStage::ScalarPack);
+        assert_eq!(
+            command.recipe.owners.as_ref(),
+            [PreparedOwnerKey {
+                matrix_id: plan.stores[command.outputs[0].store.unwrap()].matrix_id,
+                instance: output_store.instance,
+            }]
+        );
+        assert_eq!(command.recipe.owners[0].matrix_id, output_store.matrix_id);
+        assert_eq!(
+            command.stream.as_ref().unwrap().placements[0].matrix_id,
+            output_store.matrix_id
+        );
+    }
+
+    #[test]
+    fn scalar_pack_schedule_groups_match_one_command_per_instance_and_device() {
+        let plan =
+            PreparedResourcePlan::from_preparation_for_devices(&scalar_pack_program(), &[2, 7])
+                .unwrap();
+        assert_eq!(plan.instance_count, 2);
+        assert_eq!(plan.schedules.len(), 4);
+        for schedule in &plan.schedules {
+            let members = schedule
+                .command_group
+                .iter()
+                .filter_map(|node| {
+                    plan.commands
+                        .iter()
+                        .find(|command| schedule_member_matches(schedule, command, *node))
+                })
+                .collect::<Vec<_>>();
+            assert!(!members.is_empty(), "schedule group has no matching command");
+            assert_eq!(members.len(), schedule.command_group.len());
+            assert_eq!(members[0].recipe.stage, PreparedNativeStage::ScalarPack);
+            assert_eq!(
+                members[0].recipe.owners[0].matrix_id,
+                schedule.stream.placements[0].matrix_id
+            );
+        }
     }
 
     #[test]
@@ -3856,23 +6442,55 @@ mod tests {
         }]
         .into_boxed_slice();
 
+        finalize_fixture(&mut program, &[2, 7]);
         let plan = PreparedResourcePlan::from_preparation_for_devices(&program, &[2, 7]).unwrap();
         assert_eq!(plan.stores.len(), 2);
         assert_eq!(plan.commands.len(), 2);
+        assert_eq!(plan.schedules.len(), 2);
         assert_eq!(
-            plan.stores.iter().map(|store| store.location.device).collect::<Vec<_>>(),
+            plan.stores
+                .iter()
+                .map(|store| plan
+                    .finalized_matrices
+                    .identity(store.matrix_id)
+                    .unwrap()
+                    .physical
+                    .device)
+                .collect::<Vec<_>>(),
             [2, 7]
         );
         assert_eq!(
             plan.commands
                 .iter()
-                .map(|command| command.stream.as_ref().unwrap().placements[0].device)
+                .map(|command| {
+                    plan.finalized_matrices
+                        .identity(command.stream.as_ref().unwrap().placements[0].matrix_id)
+                        .unwrap()
+                        .physical
+                        .device
+                })
                 .collect::<Vec<_>>(),
             [2, 7]
         );
         assert_ne!(
             plan.commands[0].stream.as_ref().unwrap().stores[0],
             plan.commands[1].stream.as_ref().unwrap().stores[0]
+        );
+        let schedule_devices = plan
+            .schedules
+            .iter()
+            .map(|schedule| {
+                plan.finalized_matrices
+                    .identity(schedule.stream.placements[0].matrix_id)
+                    .unwrap()
+                    .physical
+                    .device
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(schedule_devices, BTreeSet::from([2, 7]));
+        assert_ne!(
+            plan.schedules[0].stream.placements[0].matrix_id,
+            plan.schedules[1].stream.placements[0].matrix_id
         );
         assert!(PreparedResourcePlan::from_preparation_for_devices(&program, &[2, 2]).is_err());
     }
@@ -3895,11 +6513,8 @@ mod tests {
                 inputs: Box::new([]),
                 outputs: Box::new([]),
                 owners: vec![PreparedOwnerKey {
-                    owner: 80,
-                    device,
+                    matrix_id: FinalizedMatrixId(if device == 2 { 0 } else { 1 }),
                     instance,
-                    level: 0,
-                    format: PreparedFormat::Evaluation,
                 }]
                 .into_boxed_slice(),
                 completion: Some(51),
@@ -3909,12 +6524,36 @@ mod tests {
             },
         };
         let commands = [command(2, 0), command(7, 0), command(2, 1), command(7, 1)];
-        assert!(physical_command_matches(&commands[0], 50, 0, 2));
-        assert!(!physical_command_matches(&commands[0], 50, 0, 7));
-        assert!(physical_command_matches(&commands[1], 50, 0, 7));
-        assert!(!physical_command_matches(&commands[0], 50, 1, 2));
-        assert!(physical_command_matches(&commands[2], 50, 1, 2));
-        assert!(physical_command_matches(&commands[3], 50, 1, 7));
+        let mut finalized_matrices = FinalizedMatrixIdTable::default();
+        for (id, device) in [(0, 2), (1, 7)] {
+            finalized_matrices
+                .insert(
+                    MatrixSite::Ordinary {
+                        wire: WireRef { node: NodeId(50), port: Port(0) },
+                        device,
+                        instance: 0,
+                    },
+                    ValueLocation {
+                        owner: 80,
+                        rows: 0..1,
+                        columns: 0..1,
+                        level: 0,
+                        format: PreparedFormat::Evaluation,
+                        device,
+                    },
+                    1,
+                    1,
+                    1,
+                )
+                .unwrap();
+            assert_eq!(finalized_matrices.identities.get(&FinalizedMatrixId(id)).is_some(), true);
+        }
+        assert!(physical_command_matches(&finalized_matrices, &commands[0], 50, 0, 2));
+        assert!(!physical_command_matches(&finalized_matrices, &commands[0], 50, 0, 7));
+        assert!(physical_command_matches(&finalized_matrices, &commands[1], 50, 0, 7));
+        assert!(!physical_command_matches(&finalized_matrices, &commands[0], 50, 1, 2));
+        assert!(physical_command_matches(&finalized_matrices, &commands[2], 50, 1, 2));
+        assert!(physical_command_matches(&finalized_matrices, &commands[3], 50, 1, 7));
     }
 
     #[test]
@@ -3948,10 +6587,18 @@ mod tests {
             completion: 4,
         }]
         .into_boxed_slice();
+        finalize_fixture(&mut program, &[8]);
         let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
         let stream = plan.commands[0].stream.as_ref().unwrap();
         assert_eq!(stream.stores.len(), 1);
-        assert_eq!(stream.placements[0].device, 8);
+        assert_eq!(
+            plan.finalized_matrices
+                .identity(stream.placements[0].matrix_id)
+                .unwrap()
+                .physical
+                .device,
+            8
+        );
         assert_eq!(plan.schedules[0].waits.as_ref(), [3]);
         assert_eq!(plan.schedules[0].completions.as_ref(), [4]);
         plan.validate_for_warmup().unwrap();
@@ -3992,13 +6639,14 @@ mod tests {
             completion: 10,
         }]
         .into_boxed_slice();
+        finalize_fixture(&mut program, &[5]);
         let plan = PreparedResourcePlan::from_preparation(&program).unwrap();
         assert_eq!(plan.stores.len(), 1);
         assert_eq!(plan.commands[0].inputs[0].store, Some(0));
         assert_eq!(plan.commands[0].inputs[1].store, Some(0));
         assert_eq!(plan.commands[0].outputs[0].store, Some(0));
-        assert_eq!(plan.stores[0].location.rows, 0..2);
-        assert_eq!(plan.stores[0].location.columns, 0..3);
+        assert_eq!(plan.stores[0].logical_rows, 2);
+        assert_eq!(plan.stores[0].logical_columns, 3);
     }
 
     #[test]
@@ -4011,7 +6659,6 @@ mod tests {
         assert!(source.contains("pub struct PreparedNativeRecipe"));
         assert!(source.contains("pub trait PreparedResourceBackend"));
         assert!(source.contains("pub fn resolve_prepared_resources<B: PreparedResourceBackend"));
-        assert!(source.contains("stream_ordinal_base"));
         assert!(!source.contains("cudaStream_t"));
         assert!(!source.contains("cudaEvent_t"));
     }

@@ -12573,46 +12573,12 @@ fn select_prepared_compact(
                     .is_some_and(|identity| identity.physical.device == descriptor.device)
         })
         .ok_or("compact descriptor has no exact resolved command")?;
-    // Gadget decomposition's native matrix plan owns only its matrix scratch
-    // and completion resources. Its compact result is a separate, exact
-    // replay/readback resource plan attached to the same command. Prefer the
-    // native claims when they contain compact resources (sampler composites),
-    // otherwise consume the command's resolved compact upload claims.
-    let allocations = if command
-        .allocations
-        .iter()
-        .any(|allocation| allocation.layout.kind == GpuPreparedSlotKind::CompactPayload as i32)
-    {
-        command.allocations.as_ref()
-    } else {
-        command
-            .replay_upload
-            .as_ref()
-            .ok_or("compact descriptor has no exact compact resource plan")?
-            .allocations
-            .as_ref()
-    };
-    let has_compact_payload = allocations
-        .iter()
-        .any(|allocation| allocation.layout.kind == GpuPreparedSlotKind::CompactPayload as i32);
-    let kinds = if has_compact_payload {
-        vec![
-            (GpuPreparedSlotKind::CompactPayload, bytes, 256),
-            (GpuPreparedSlotKind::PinnedHost, bytes, 1),
-            (GpuPreparedSlotKind::CompletionEvent, 0, 1),
-        ]
-    } else {
-        // GpuSmallMatrix owns its device payload. The canonical small-upload
-        // plan therefore contributes only its pinned host staging buffer and
-        // completion event; requiring a nonexistent compact-payload claim
-        // would reject valid GadgetDecompose outputs.
-        vec![
-            (GpuPreparedSlotKind::PinnedHost, bytes, 1),
-            (GpuPreparedSlotKind::CompletionEvent, 0, 1),
-        ]
-    };
-    let mut resources = Vec::with_capacity(kinds.len());
-    for (kind, bytes, alignment) in kinds {
+    // GpuSmallMatrix creation consumes exactly one compact-payload claim. Its
+    // payload slot supplies the writer completion event; readback staging is
+    // owned by the matrix itself and must not be bound as a second claim.
+    let allocations = command.allocations.as_ref();
+    let mut resources = Vec::with_capacity(1);
+    for (kind, bytes, alignment) in [(GpuPreparedSlotKind::CompactPayload, bytes, 256)] {
         let matches = allocations
             .iter()
             .filter_map(|allocation| {
@@ -12638,12 +12604,7 @@ fn select_prepared_compact(
                     allocations
                         .iter()
                         .map(|allocation| (allocation.layout.kind, allocation.layout.bytes))
-                        .collect::<Vec<_>>(),
-                    command.replay_upload.as_ref().map(|replay| replay
-                        .allocations
-                        .iter()
-                        .map(|allocation| (allocation.layout.kind, allocation.layout.bytes))
-                        .collect::<Vec<_>>())
+                        .collect::<Vec<_>>()
                 ));
             }
             _ => {

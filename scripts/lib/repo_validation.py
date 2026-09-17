@@ -9,7 +9,9 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Sequence, TextIO
 
-DEFAULT_GPU_REPEAT_COUNT = 150
+# Synchronization and resource-lifetime regressions require 300 identical runs.
+# Keep this aligned with the CUDA validation policy in GPU.md/BUILDER.md.
+DEFAULT_GPU_REPEAT_COUNT = 300
 EDITED_DIFF_FILTER = "ACDMR"
 GPU_REPEAT_SOURCE_DIRS = frozenset({"element", "poly", "matrix", "sampler"})
 
@@ -119,7 +121,18 @@ def compile_gpu_test_binaries(
 ) -> list[Path]:
     runner = runner or subprocess.run
     completed = runner(
-        ("cargo", "test", "gpu", "-r", "--workspace", "--lib", "--features", "gpu", "--no-run", "--message-format=json"),
+        (
+            "cargo",
+            "test",
+            "-r",
+            "--workspace",
+            "--lib",
+            "--features",
+            "gpu",
+            "--no-run",
+            "--no-fail-fast",
+            "--message-format=json",
+        ),
         cwd=repo_root,
         env=env,
         check=False,
@@ -162,7 +175,7 @@ def run_gpu_repeat_suite(
 
 def run_gpu_binary(binary: Path, repo_root: Path, env: dict[str, str]) -> int:
     completed = subprocess.run(
-        (str(binary), "gpu"),
+        (str(binary),),
         cwd=repo_root,
         env=env,
         check=False,

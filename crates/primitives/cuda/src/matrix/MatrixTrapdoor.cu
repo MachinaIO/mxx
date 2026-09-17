@@ -1,3 +1,5 @@
+#include "gpu_admission.cuh"
+#include <array>
 constexpr size_t kSampleP1LocalMaxM = 8;
 
 using gpu_chacha::GpuRngSeed;
@@ -15,11 +17,13 @@ namespace
             {
                 return;
             }
+            GpuAllocationActivity activity(nullptr, device);
             cudaError_t err = cudaSetDevice(device);
             if (err == cudaSuccess)
             {
-                cudaEventDestroy(event);
+                err = cudaEventDestroy(event);
             }
+            if (err != cudaSuccess) gpu_device_mark_allocation_unknown(device);
             event = nullptr;
             device = -1;
         }
@@ -27,13 +31,19 @@ namespace
 
     thread_local ThreadLocalOwnerLinkEventState g_thread_local_owner_link_event;
 
-    int matrix_get_thread_local_owner_link_event(int device, cudaEvent_t *out_event)
+    int matrix_get_thread_local_owner_link_event(const GpuContext *ctx, int device, cudaEvent_t *out_event, GpuCudaResource &resource)
     {
         if (device < 0 || !out_event)
         {
             return set_error("invalid matrix_get_thread_local_owner_link_event arguments");
         }
 
+        if (ctx->execution->resource_admission_required.load(std::memory_order_acquire)) {
+            const int status = resource.acquire(ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status == 0) *out_event = resource.event;
+            return status;
+        }
+        gpu_claim_trace_record(GPU_PREPARED_COMPLETION_EVENT, 0, 0, -1, -1, 0, 1);
         auto &tls = g_thread_local_owner_link_event;
         if (tls.event && tls.device == device)
         {
@@ -41,16 +51,20 @@ namespace
             return 0;
         }
 
+        GpuAllocationActivity activity(nullptr, device);
         if (tls.event)
         {
+            GpuAllocationActivity previous_activity(nullptr, tls.device);
             cudaError_t err = cudaSetDevice(tls.device);
             if (err != cudaSuccess)
             {
+                gpu_device_mark_allocation_unknown(tls.device);
                 return set_error(err);
             }
             err = cudaEventDestroy(tls.event);
             if (err != cudaSuccess)
             {
+                gpu_device_mark_allocation_unknown(tls.device);
                 return set_error(err);
             }
             tls.event = nullptr;
@@ -78,6 +92,9 @@ namespace
 struct GpuP1CovarianceCache
 {
     GpuContext *ctx = nullptr;
+    // The cache can outlive the final matrix/parameter wrapper. Retain its
+    // execution resources directly; destruction must not dereference ctx.
+    std::shared_ptr<GpuExecutionOwner> execution;
     int level = -1;
     size_t d_rows = 0;
     size_t n = 0;
@@ -86,6 +103,11 @@ struct GpuP1CovarianceCache
     double sigma = 0.0;
     double s = 0.0;
     int device = -1;
+    // Claimable owners: under sealed admission the stream/bridge event and the
+    // two device spans come from prepared slots; open domains allocate them.
+    GpuCudaResource stream_resource;
+    GpuDeviceWorkspace sqrt_owner;
+    GpuDeviceWorkspace update_owner;
     cudaStream_t stream = nullptr;
     cudaEvent_t ready_event = nullptr;
     double *sqrt_var = nullptr;      // [coeff][row]
@@ -94,6 +116,21 @@ struct GpuP1CovarianceCache
 
 namespace
 {
+struct MatrixSamplerSubmission {
+        GpuExecutionOwner *owner;
+        bool pending = false;
+        ~MatrixSamplerSubmission() {
+            if (pending) {
+                // After launch, only CUDA submission/retirement can fail: all
+                // capacity is acquired above. Without complete reader edges,
+                // retain owners rather than freeing a still-read cache/input.
+                owner->memory_release_failed.store(true, std::memory_order_release);
+                owner->unretired_work.store(true, std::memory_order_release);
+                gpu_execution_mark_allocation_unknown(owner);
+            }
+        }
+};
+
     // These are CUDA block-shape constants, not a preimage chunk limit. Every
     // kernel below receives the runtime column count selected by
     // AUX_SAMPLING_CHUNK_WIDTH and covers any final partial tile.
@@ -358,7 +395,7 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_add_correction_top_kernel(
+    __device__ void matrix_preimage_add_correction_top_kernel_body(
         const uint8_t *r_base,
         const uint8_t *e_base,
         const uint8_t *z_base,
@@ -376,7 +413,7 @@ namespace
         uint8_t e_coeff_bytes,
         uint8_t z_coeff_bytes,
         uint8_t out_coeff_bytes,
-        uint64_t modulus)
+        uint64_t modulus, size_t coefficient_start, size_t coefficient_step, bool accumulate)
     {
         __shared__ uint64_t trapdoor_tile[kPreimageTileM][kPreimageTileK];
         __shared__ uint64_t z_tile[kPreimageTileK][kPreimageTileN];
@@ -389,12 +426,12 @@ namespace
         const int tid = static_cast<int>(threadIdx.y) * blockDim.x + threadIdx.x;
         const int thread_count = blockDim.x * blockDim.y;
 
-        for (size_t coeff_idx = static_cast<size_t>(blockIdx.z);
+        for (size_t coeff_idx = coefficient_start;
              coeff_idx < n;
-             coeff_idx += static_cast<size_t>(gridDim.z))
+             coeff_idx += coefficient_step)
         {
             uint64_t acc = 0;
-            if (row < top_rows && col < out_cols)
+            if (accumulate && row < top_rows && col < out_cols)
             {
                 acc = matrix_load_limb_u64(
                     out_base,
@@ -485,7 +522,30 @@ namespace
         }
     }
 
-    __global__ void matrix_preimage_add_correction_bottom_kernel(
+    __global__ void matrix_preimage_add_correction_top_kernel(
+        const uint8_t *r_base,
+        const uint8_t *e_base,
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t d,
+        size_t inner,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t r_stride_bytes,
+        size_t e_stride_bytes,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t r_coeff_bytes,
+        uint8_t e_coeff_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        matrix_preimage_add_correction_top_kernel_body(r_base, e_base, z_base, out_base, d, inner, z_cols, out_cols, n, r_stride_bytes, e_stride_bytes, z_stride_bytes, out_stride_bytes, r_coeff_bytes, e_coeff_bytes, z_coeff_bytes, out_coeff_bytes, modulus, blockIdx.z, gridDim.z, true);
+    }
+
+    __device__ void matrix_preimage_add_correction_bottom_kernel_body(
         const uint8_t *z_base,
         uint8_t *out_base,
         size_t top_rows,
@@ -529,6 +589,23 @@ namespace
             out_stride_bytes,
             out_coeff_bytes,
             add_mod_u64(base_value, z_value, modulus));
+    }
+
+    __global__ void matrix_preimage_add_correction_bottom_kernel(
+        const uint8_t *z_base,
+        uint8_t *out_base,
+        size_t top_rows,
+        size_t z_rows,
+        size_t z_cols,
+        size_t out_cols,
+        size_t n,
+        size_t z_stride_bytes,
+        size_t out_stride_bytes,
+        uint8_t z_coeff_bytes,
+        uint8_t out_coeff_bytes,
+        uint64_t modulus)
+    {
+        matrix_preimage_add_correction_bottom_kernel_body(z_base, out_base, top_rows, z_rows, z_cols, out_cols, n, z_stride_bytes, out_stride_bytes, z_coeff_bytes, out_coeff_bytes, modulus);
     }
 
     int preimage_const_limb_view(
@@ -691,7 +768,7 @@ __global__ void matrix_precompute_p1_covariance_kernel(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_small(
+__device__ void matrix_sample_p1_integer_cached_kernel_small_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -770,7 +847,25 @@ __global__ void matrix_sample_p1_integer_cached_kernel_small(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_large(
+__global__ void matrix_sample_p1_integer_cached_kernel_small(
+    const uint8_t *tp2_base,
+    size_t tp2_stride_bytes,
+    uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base,
+    const double *update_coeff_base,
+    size_t d,
+    size_t cols,
+    size_t n,
+    int64_t *sampled_out,
+    uint64_t modulus,
+    double c_scale,
+    GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_small_body(tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base, update_coeff_base, d, cols, n, sampled_out, modulus, c_scale, seed);
+}
+
+
+__device__ void matrix_sample_p1_integer_cached_kernel_large_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -852,6 +947,28 @@ __global__ void matrix_sample_p1_integer_cached_kernel_large(
         sampled_out[out_idx] = sampled[row];
     }
 }
+
+__global__ void matrix_sample_p1_integer_cached_kernel_large(
+    const uint8_t *tp2_base,
+    size_t tp2_stride_bytes,
+    uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base,
+    const double *update_coeff_base,
+    size_t d,
+    size_t cols,
+    size_t n,
+    size_t sample_start,
+    size_t sample_count,
+    double *mean_workspace,
+    int64_t *sampled_workspace,
+    int64_t *sampled_out,
+    uint64_t modulus,
+    double c_scale,
+    GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_large_body(tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base, update_coeff_base, d, cols, n, sample_start, sample_count, mean_workspace, sampled_workspace, sampled_out, modulus, c_scale, seed);
+}
+
 
 __global__ void matrix_sample_p1_integer_kernel_small(
     const uint8_t *a_base,
@@ -1165,7 +1282,7 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     }
 }
 
-__global__ void matrix_scatter_p1_integer_to_limb_kernel(
+__device__ void matrix_scatter_p1_integer_to_limb_kernel_body(
     const int64_t *sampled_in,
     uint8_t *out_base,
     size_t out_stride_bytes,
@@ -1192,9 +1309,93 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
         signed_mod_i64(sampled_in[idx], modulus));
 }
 
-__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+__global__ void matrix_scatter_p1_integer_to_limb_kernel(
+    const int64_t *sampled_in,
+    uint8_t *out_base,
+    size_t out_stride_bytes,
+    uint8_t out_coeff_bytes,
+    size_t entry_count,
+    size_t n,
+    uint64_t modulus)
+{
+    matrix_scatter_p1_integer_to_limb_kernel_body(sampled_in, out_base, out_stride_bytes, out_coeff_bytes, entry_count, n, modulus);
+}
+
+
+constexpr size_t kP1BatchMatrices = 16;
+struct P1BatchJob {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *input, *output;
+    const double *sqrt_var, *update;
+    int64_t *samples, *sample_workspace;
+    double *mean_workspace;
+    uint64_t modulus;
+    double c_scale;
+    GpuRngSeed seed;
+    const int32_t *completed = nullptr;
+};
+struct P1BatchDescriptors {
+    P1BatchJob jobs[kP1BatchMatrices];
+    uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+    uint64_t moduli[GPU_RUNTIME_MAX_LIMBS];
+};
+static_assert(sizeof(P1BatchDescriptors) + 128 < 4096, "bounded P1 sampling arguments");
+
+template<bool Large>
+__global__ void matrix_sample_p1_batch_kernel(
+    P1BatchDescriptors batch, size_t d, size_t columns, size_t n)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
+    const auto source = job.input[batch.indices[0]];
+    if constexpr (Large) {
+        matrix_sample_p1_integer_cached_kernel_large_body(
+            source.base, source.stride, source.width, job.sqrt_var, job.update,
+            d, columns, n, 0, columns * n, job.mean_workspace, job.sample_workspace,
+            job.samples, job.modulus, job.c_scale, job.seed);
+    } else {
+        matrix_sample_p1_integer_cached_kernel_small_body(
+            source.base, source.stride, source.width, job.sqrt_var, job.update,
+            d, columns, n, job.samples, job.modulus, job.c_scale, job.seed);
+    }
+}
+__global__ void matrix_scatter_p1_batch_kernel(
+    P1BatchDescriptors batch, size_t polynomials, size_t n)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
+    const auto output = job.output[batch.indices[blockIdx.z]];
+    matrix_scatter_p1_integer_to_limb_kernel_body(
+        job.samples, output.base, output.stride, output.width,
+        polynomials, n, batch.moduli[blockIdx.z]);
+}
+
+struct GadgetDigitBuffer {
+    int64_t *data;
+    size_t n;
+    uint32_t digits;
+    __device__ void write(size_t poly, size_t coefficient, uint32_t digit, int64_t value) const {
+        data[(poly * digits + digit) * n + coefficient] = value;
+    }
+};
+struct GadgetDigitOutput {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *output;
+    const uint64_t *moduli;
+    size_t limbs, n, columns;
+    uint32_t digits, tower;
+    __device__ void write(size_t poly, size_t coefficient, uint32_t digit, int64_t value) const {
+        const size_t row = ((poly / columns) * limbs + tower) * digits + digit;
+        const size_t destination = row * columns + poly % columns;
+        for (size_t limb = 0; limb < limbs; ++limb) {
+            const auto descriptor = output[limb];
+            matrix_store_limb_u64(descriptor.base, destination, coefficient,
+                descriptor.stride, descriptor.width, signed_mod_i64(value, moduli[limb]));
+        }
+    }
+};
+
+template<typename Store>
+__device__ void matrix_gauss_samp_gq_arb_base_sample_kernel_body(
     const uint8_t *src_base,
-    int64_t *sampled_digits,
     size_t poly_count,
     size_t n,
     size_t src_stride_bytes,
@@ -1204,7 +1405,7 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
     uint32_t digits_per_tower,
     double c,
     uint32_t tower_idx,
-    GpuRngSeed seed)
+    GpuRngSeed seed, Store store)
 {
     size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     size_t total = poly_count * n;
@@ -1320,9 +1521,52 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
             out_digit = m_digits[last] * z[last] - z[last - 1] + v_digits[last];
         }
 
+        store.write(poly_idx, coeff_idx, digit_idx, out_digit);
+    }
+}
+
+__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+    const uint8_t *src_base,
+    int64_t *sampled_digits,
+    size_t poly_count,
+    size_t n,
+    size_t src_stride_bytes,
+    uint8_t src_coeff_bytes,
+    uint64_t tower_modulus,
+    uint32_t base_bits,
+    uint32_t digits_per_tower,
+    double c,
+    uint32_t tower_idx,
+    GpuRngSeed seed)
+{
+    matrix_gauss_samp_gq_arb_base_sample_kernel_body(src_base, poly_count, n, src_stride_bytes, src_coeff_bytes, tower_modulus, base_bits, digits_per_tower, c, tower_idx, seed, GadgetDigitBuffer{sampled_digits, n, digits_per_tower});
+}
+
+
+__device__ void matrix_scatter_gadget_digits(
+    size_t idx, const int64_t *sampled_digits, uint8_t *dst_base,
+    size_t dst_stride, uint8_t dst_bytes, uint64_t out_modulus,
+    size_t n, size_t src_cols, size_t out_cols, size_t log_base_q,
+    size_t src_digit_offset, uint32_t digits_per_tower)
+{
+    const size_t poly_idx = idx / n;
+    const size_t coeff_idx = idx - poly_idx * n;
+    const size_t row = poly_idx / src_cols;
+    const size_t col = poly_idx - row * src_cols;
+    for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
+    {
         const size_t sample_idx =
             (poly_idx * static_cast<size_t>(digits_per_tower) + static_cast<size_t>(digit_idx)) * n + coeff_idx;
-        sampled_digits[sample_idx] = out_digit;
+        const int64_t out_digit = sampled_digits[sample_idx];
+        const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
+        const size_t out_poly_idx = out_row * out_cols + col;
+        matrix_store_limb_u64(
+            dst_base,
+            out_poly_idx,
+            coeff_idx,
+            dst_stride,
+            dst_bytes,
+            signed_mod_i64(out_digit, out_modulus));
     }
 }
 
@@ -1370,25 +1614,33 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
         return;
     }
 
-    const size_t poly_idx = idx / n;
-    const size_t coeff_idx = idx - poly_idx * n;
-    const size_t row = poly_idx / src_cols;
-    const size_t col = poly_idx - row * src_cols;
-    for (uint32_t digit_idx = 0; digit_idx < digits_per_tower; ++digit_idx)
-    {
-        const size_t sample_idx =
-            (poly_idx * static_cast<size_t>(digits_per_tower) + static_cast<size_t>(digit_idx)) * n + coeff_idx;
-        const int64_t out_digit = sampled_digits[sample_idx];
-        const size_t out_row = row * log_base_q + src_digit_offset + static_cast<size_t>(digit_idx);
-        const size_t out_poly_idx = out_row * out_cols + col;
-        matrix_store_limb_u64(
-            dst_base,
-            out_poly_idx,
-            coeff_idx,
-            dst_stride,
-            dst_bytes,
-            signed_mod_i64(out_digit, out_modulus));
-    }
+    matrix_scatter_gadget_digits(idx, sampled_digits, dst_base, dst_stride,
+        dst_bytes, out_modulus, n, src_cols, out_cols, log_base_q,
+        src_digit_offset, digits_per_tower);
+}
+
+constexpr size_t kGadgetBatchMatrices = 64;
+struct GadgetBatchJob {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *input, *output;
+    GpuRngSeed seed;
+    const int32_t *completed = nullptr;
+};
+struct GadgetBatchDescriptors { GadgetBatchJob jobs[kGadgetBatchMatrices]; };
+static_assert(sizeof(GadgetBatchDescriptors) + 128 < 4096, "bounded gadget sampler arguments");
+
+__global__ void matrix_sample_gadget_batch_kernel(
+    GadgetBatchDescriptors batch, const uint64_t *moduli,
+    size_t polynomials, size_t n, size_t columns, size_t limbs,
+    uint32_t base_bits, uint32_t digits, double c)
+{
+    const auto job = batch.jobs[blockIdx.y];
+    if (job.completed && *job.completed) return;
+    const uint32_t tower = blockIdx.z;
+    const auto input = job.input[tower];
+    matrix_gauss_samp_gq_arb_base_sample_kernel_body(
+        input.base, polynomials, n, input.stride, input.width,
+        moduli[tower], base_bits, digits, c, tower, job.seed,
+        GadgetDigitOutput{job.output, moduli, limbs, n, columns, digits, tower});
 }
 
 int launch_gauss_samp_gq_arb_base_sample_kernel(
@@ -1525,6 +1777,37 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
 }
 
 
+extern "C" int gpu_matrix_query_p1_workspaces(
+    const GpuContext *ctx, size_t rows, size_t columns, int cached,
+    GpuPreparedWorkspaceLayout *out)
+{
+    if (!ctx || !out || ctx->N <= 0 || (cached != 0 && cached != 1) || rows > SIZE_MAX / 2)
+        return set_error("invalid P1 workspace query");
+    const size_t m = 2 * rows;
+    size_t samples = columns;
+    if (samples > SIZE_MAX / static_cast<size_t>(ctx->N))
+        return set_error("P1 sample count overflow");
+    samples *= static_cast<size_t>(ctx->N);
+    if (m > SIZE_MAX / sizeof(int64_t) ||
+        (m != 0 && samples > SIZE_MAX / (m * sizeof(int64_t))))
+        return set_error("P1 sampled output overflow");
+    size_t workspace = 0;
+    if (m > kSampleP1LocalMaxM && samples != 0) {
+        if (m > SIZE_MAX / m) return set_error("P1 covariance dimension overflow");
+        const size_t covariance = cached ? 0 : m * m;
+        const size_t vectors = cached ? 2 : 3;
+        if (m > (SIZE_MAX - covariance) / vectors)
+            return set_error("P1 workspace dimension overflow");
+        const size_t entries = covariance + vectors * m;
+        if (entries > SIZE_MAX / sizeof(double) || samples > SIZE_MAX / (entries * sizeof(double)))
+            return set_error("P1 workspace byte overflow");
+        workspace = samples * entries * sizeof(double);
+    }
+    out[0] = {samples * m * sizeof(int64_t), alignof(int64_t), GPU_PREPARED_SAMPLER_WORKSPACE};
+    out[1] = {workspace, alignof(double), GPU_PREPARED_SAMPLER_WORKSPACE};
+    return 0;
+}
+
 int launch_sample_p1_integer_kernel(
     const uint8_t *a_base,
     const uint8_t *b_base,
@@ -1549,7 +1832,8 @@ int launch_sample_p1_integer_kernel(
     cudaStream_t stream,
     int device_id,
     int64_t **sampled_out_device,
-    cudaEvent_t sampled_ready_event)
+    cudaEvent_t sampled_ready_event,
+    GpuContext *ctx, GpuDeviceWorkspace &sampled_owner)
 {
     if (!sampled_out_device)
     {
@@ -1600,23 +1884,26 @@ int launch_sample_p1_integer_kernel(
         return 0;
     }
 
+    GpuPreparedWorkspaceLayout layouts[2]{};
+    const int layout_status = gpu_matrix_query_p1_workspaces(
+        ctx, d, cols, 0, layouts);
+    if (layout_status != 0) return layout_status;
     int64_t *d_sampled_out = nullptr;
 
     auto free_all = [&]()
     {
         if (d_sampled_out)
         {
-            cudaFreeAsync(d_sampled_out, stream);
+            if (sampled_owner.release() != 0)
+                gpu_device_mark_allocation_unknown(device_id);
             d_sampled_out = nullptr;
         }
     };
 
-    err = cudaMallocAsync(reinterpret_cast<void **>(&d_sampled_out), total_values * sizeof(int64_t), stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
+    const int allocation_status = sampled_owner.acquire(ctx, device_id, layouts[0].kind,
+        layouts[0].bytes, layouts[0].alignment, stream);
+    if (allocation_status != 0) return allocation_status;
+    d_sampled_out = reinterpret_cast<int64_t *>(sampled_owner.data);
 
     const int threads = 256;
     if (m <= kSampleP1LocalMaxM)
@@ -1692,6 +1979,7 @@ int launch_sample_p1_integer_kernel(
         bytes_per_sample_total += sampled_bytes_per_sample;
 
         void *workspace = nullptr;
+        GpuDeviceWorkspace workspace_owner;
         double *cov_workspace = nullptr;
         double *mean_workspace = nullptr;
         double *col_workspace = nullptr;
@@ -1700,7 +1988,8 @@ int launch_sample_p1_integer_kernel(
         {
             if (workspace)
             {
-                cudaFreeAsync(workspace, stream);
+                if (workspace_owner.release() != 0)
+                    gpu_device_mark_allocation_unknown(device_id);
                 workspace = nullptr;
             }
             cov_workspace = nullptr;
@@ -1727,12 +2016,10 @@ int launch_sample_p1_integer_kernel(
                 return false;
             }
             const size_t workspace_bytes = samples * bytes_per_sample_total;
-            cudaError_t local_err = cudaMallocAsync(&workspace, workspace_bytes, stream);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
+            if (workspace_bytes != layouts[1].bytes ||
+                workspace_owner.acquire(ctx, device_id, layouts[1].kind,
+                    layouts[1].bytes, layouts[1].alignment, stream) != 0) return false;
+            workspace = workspace_owner.data;
             auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
             const size_t cov_bytes = samples * cov_bytes_per_sample;
             const size_t mean_bytes = samples * vec_bytes_per_sample;
@@ -1745,15 +2032,12 @@ int launch_sample_p1_integer_kernel(
             return true;
         };
 
-        while (!alloc_workspace(chunk_samples))
-        {
-            if (chunk_samples <= 1)
-            {
-                free_workspace();
-                free_all();
-                return set_error("failed to allocate workspace in matrix_sample_p1_integer_kernel");
-            }
-            chunk_samples = (chunk_samples + 1) / 2;
+        // The submitted column range fixes the complete scratch demand. A
+        // failed claim does not silently shrink this operation's execution plan.
+        if (!alloc_workspace(chunk_samples)) {
+            free_workspace();
+            free_all();
+            return set_error("P1 workspace does not fit its frozen column range");
         }
 
         for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
@@ -1906,7 +2190,8 @@ int launch_sample_p1_integer_cached_kernel(
     GpuRngSeed seed,
     cudaStream_t stream,
     int device_id,
-    cudaEvent_t sampled_ready_event)
+    cudaEvent_t sampled_ready_event,
+    GpuContext *ctx, GpuDeviceWorkspace &sampled_owner)
 {
     if (!sampled_out_device)
     {
@@ -1944,7 +2229,6 @@ int launch_sample_p1_integer_cached_kernel(
     {
         return set_error("sample byte overflow in matrix_sample_p1_integer_cached_kernel");
     }
-    const size_t total_values = entry_count * cache->n;
     const size_t total_samples = cols * cache->n;
     const double denom = cache->s * cache->s - cache->sigma * cache->sigma;
     if (!(denom > 0.0))
@@ -1953,22 +2237,25 @@ int launch_sample_p1_integer_cached_kernel(
     }
     const double c_scale = -(cache->sigma * cache->sigma) / denom;
 
+    GpuPreparedWorkspaceLayout layouts[2]{};
+    const int layout_status = gpu_matrix_query_p1_workspaces(
+        ctx, cache->d_rows, cols, 1, layouts);
+    if (layout_status != 0) return layout_status;
     int64_t *d_sampled_out = nullptr;
     auto free_all = [&]()
     {
         if (d_sampled_out)
         {
-            cudaFreeAsync(d_sampled_out, stream);
+            if (sampled_owner.release() != 0)
+                gpu_device_mark_allocation_unknown(device_id);
             d_sampled_out = nullptr;
         }
     };
 
-    err = cudaMallocAsync(reinterpret_cast<void **>(&d_sampled_out), total_values * sizeof(int64_t), stream);
-    if (err != cudaSuccess)
-    {
-        free_all();
-        return set_error(err);
-    }
+    const int allocation_status = sampled_owner.acquire(ctx, device_id, layouts[0].kind,
+        layouts[0].bytes, layouts[0].alignment, stream);
+    if (allocation_status != 0) return allocation_status;
+    d_sampled_out = reinterpret_cast<int64_t *>(sampled_owner.data);
 
     const int threads = 256;
     if (m <= kSampleP1LocalMaxM)
@@ -2012,13 +2299,15 @@ int launch_sample_p1_integer_cached_kernel(
         }
         const size_t bytes_per_sample_total = mean_bytes_per_sample + sampled_bytes_per_sample;
         void *workspace = nullptr;
+        GpuDeviceWorkspace workspace_owner;
         double *mean_workspace = nullptr;
         int64_t *sampled_workspace = nullptr;
         auto free_workspace = [&]()
         {
             if (workspace)
             {
-                cudaFreeAsync(workspace, stream);
+                if (workspace_owner.release() != 0)
+                    gpu_device_mark_allocation_unknown(device_id);
                 workspace = nullptr;
             }
             mean_workspace = nullptr;
@@ -2033,12 +2322,10 @@ int launch_sample_p1_integer_cached_kernel(
                 return false;
             }
             const size_t workspace_bytes = samples * bytes_per_sample_total;
-            cudaError_t local_err = cudaMallocAsync(&workspace, workspace_bytes, stream);
-            if (local_err != cudaSuccess)
-            {
-                free_workspace();
-                return false;
-            }
+            if (workspace_bytes != layouts[1].bytes ||
+                workspace_owner.acquire(ctx, device_id, layouts[1].kind,
+                    layouts[1].bytes, layouts[1].alignment, stream) != 0) return false;
+            workspace = workspace_owner.data;
             auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
             const size_t mean_bytes = samples * mean_bytes_per_sample;
             mean_workspace = reinterpret_cast<double *>(workspace_base);
@@ -2046,15 +2333,12 @@ int launch_sample_p1_integer_cached_kernel(
             return true;
         };
 
-        while (!alloc_workspace(chunk_samples))
-        {
-            if (chunk_samples <= 1)
-            {
-                free_workspace();
-                free_all();
-                return set_error("failed to allocate workspace in matrix_sample_p1_integer_cached_kernel");
-            }
-            chunk_samples = (chunk_samples + 1) / 2;
+        // The submitted column range fixes the complete scratch demand. A
+        // failed claim does not silently shrink this operation's execution plan.
+        if (!alloc_workspace(chunk_samples)) {
+            free_workspace();
+            free_all();
+            return set_error("P1 workspace does not fit its frozen column range");
         }
 
         for (size_t sample_start = 0; sample_start < total_samples; sample_start += chunk_samples)
@@ -2169,6 +2453,10 @@ extern "C" int gpu_matrix_mul_vertical_pair(
     const GpuMatrix *bottom,
     const GpuMatrix *rhs)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_mul_vertical_pair");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !top || !bottom || !rhs)
     {
@@ -2362,6 +2650,10 @@ extern "C" int gpu_matrix_preimage_residual(
     const GpuMatrix *p1,
     const GpuMatrix *p2)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_preimage_residual");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !target || !public_matrix || !p1 || !p2)
     {
@@ -2520,6 +2812,10 @@ extern "C" int gpu_matrix_preimage_add_correction(
     const GpuMatrix *e,
     const GpuMatrix *z)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_preimage_add_correction");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     if (!out || !r || !e || !z)
     {
         return set_error("invalid gpu_matrix_preimage_add_correction arguments");
@@ -2694,6 +2990,34 @@ extern "C" int gpu_matrix_preimage_add_correction(
     return 0;
 }
 
+extern "C" int gpu_matrix_query_gaussian_gadget_workspaces(
+    const GpuContext *ctx, int level, size_t rows, size_t cols,
+    uint32_t base_bits, GpuPreparedWorkspaceLayout *out)
+{
+    if (!ctx || !out || level < 0 || static_cast<size_t>(level) >= ctx->moduli.size() ||
+        base_bits == 0 || base_bits >= 63 || ctx->N <= 0)
+        return set_error("invalid Gaussian gadget workspace query");
+    uint32_t crt_bits = 0;
+    for (const auto modulus : ctx->moduli)
+        crt_bits = std::max(crt_bits, bit_width_u64(modulus));
+    const size_t digits = (crt_bits + base_bits - 1) / base_bits;
+    if (digits == 0 || digits > kGaussMaxDigits)
+        return set_error("unsupported Gaussian gadget digit count");
+    size_t sampled = rows == 0 || cols == 0 ? 0 : 1;
+    for (const size_t factor : {rows, cols, static_cast<size_t>(ctx->N), digits, sizeof(int64_t)}) {
+        if (factor != 0 && sampled > SIZE_MAX / factor)
+            return set_error("Gaussian gadget workspace size overflow");
+        sampled *= factor;
+    }
+    const size_t limbs = sampled == 0 ? 0 : static_cast<size_t>(level) + 1;
+    out[0] = {sampled, alignof(int64_t), GPU_PREPARED_SAMPLER_WORKSPACE};
+    out[1] = {limbs * sizeof(uint8_t *), alignof(uint8_t *), GPU_PREPARED_SAMPLER_WORKSPACE};
+    out[2] = {limbs * sizeof(size_t), alignof(size_t), GPU_PREPARED_SAMPLER_WORKSPACE};
+    out[3] = {limbs * sizeof(uint8_t), alignof(uint8_t), GPU_PREPARED_SAMPLER_WORKSPACE};
+    out[4] = {limbs * sizeof(uint64_t), alignof(uint64_t), GPU_PREPARED_SAMPLER_WORKSPACE};
+    return 0;
+}
+
 extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     GpuMatrix *src,
     uint32_t base_bits,
@@ -2702,6 +3026,10 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     GpuRngSeed seed,
     GpuMatrix *out)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_gauss_samp_gq_arb_base");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     (void)dgg_stddev;
     if (!src || !out)
     {
@@ -2898,74 +3226,60 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         src_limb_coeff_bytes[src_idx] = src_coeff_bytes;
     }
 
-    size_t sampled_values = count;
-    if (static_cast<size_t>(src->ctx->N) != 0 &&
-        sampled_values > std::numeric_limits<size_t>::max() / static_cast<size_t>(src->ctx->N))
-    {
-        cleanup_tmp_inputs();
-        return set_error("sample size overflow in gpu_matrix_gauss_samp_gq_arb_base");
-    }
-    sampled_values *= static_cast<size_t>(src->ctx->N);
-    if (static_cast<size_t>(digits_per_tower) != 0 &&
-        sampled_values > std::numeric_limits<size_t>::max() / static_cast<size_t>(digits_per_tower))
-    {
-        cleanup_tmp_inputs();
-        return set_error("sample size overflow in gpu_matrix_gauss_samp_gq_arb_base");
-    }
-    sampled_values *= static_cast<size_t>(digits_per_tower);
-    if (sampled_values > std::numeric_limits<size_t>::max() / sizeof(int64_t))
-    {
-        cleanup_tmp_inputs();
-        return set_error("sample byte overflow in gpu_matrix_gauss_samp_gq_arb_base");
-    }
-    const size_t sampled_bytes = sampled_values * sizeof(int64_t);
-    if (crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint8_t *) ||
-        crt_depth > std::numeric_limits<size_t>::max() / sizeof(size_t) ||
-        crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint64_t) ||
-        crt_depth > std::numeric_limits<size_t>::max() / sizeof(uint8_t))
-    {
-        cleanup_tmp_inputs();
-        return set_error("limb metadata size overflow in gpu_matrix_gauss_samp_gq_arb_base");
-    }
-    const size_t out_ptr_bytes = crt_depth * sizeof(uint8_t *);
-    const size_t out_stride_bytes = crt_depth * sizeof(size_t);
-    const size_t out_coeff_bytes = crt_depth * sizeof(uint8_t);
-    const size_t out_moduli_bytes = crt_depth * sizeof(uint64_t);
+    GpuPreparedWorkspaceLayout sampler_layouts[5]{};
+    status = gpu_matrix_query_gaussian_gadget_workspaces(
+        src->ctx, level, rows, cols, base_bits, sampler_layouts);
+    if (status != 0) { cleanup_tmp_inputs(); return status; }
+    const size_t out_ptr_bytes = sampler_layouts[1].bytes;
+    const size_t out_stride_bytes = sampler_layouts[2].bytes;
+    const size_t out_coeff_bytes = sampler_layouts[3].bytes;
+    const size_t out_moduli_bytes = sampler_layouts[4].bytes;
 
     int64_t *sampled_digits_device = nullptr;
     uint8_t **out_limb_bases_device = nullptr;
     size_t *out_limb_strides_device = nullptr;
     uint8_t *out_limb_coeff_bytes_device = nullptr;
     uint64_t *out_limb_moduli_device = nullptr;
+    std::array<GpuDeviceWorkspace, 5> sampler_owners;
     auto cleanup = [&]()
     {
         if (dispatch_device >= 0)
         {
-            cudaSetDevice(dispatch_device);
+            if (cudaSetDevice(dispatch_device) != cudaSuccess)
+            {
+                out->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+                out->ctx->execution->unretired_work.store(true, std::memory_order_release);
+                return;
+            }
         }
         if (sampled_digits_device)
         {
-            cudaFreeAsync(sampled_digits_device, dispatch_stream);
+            if (sampler_owners[0].release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             sampled_digits_device = nullptr;
         }
         if (out_limb_bases_device)
         {
-            cudaFreeAsync(out_limb_bases_device, dispatch_stream);
+            if (sampler_owners[1].release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             out_limb_bases_device = nullptr;
         }
         if (out_limb_strides_device)
         {
-            cudaFreeAsync(out_limb_strides_device, dispatch_stream);
+            if (sampler_owners[2].release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             out_limb_strides_device = nullptr;
         }
         if (out_limb_coeff_bytes_device)
         {
-            cudaFreeAsync(out_limb_coeff_bytes_device, dispatch_stream);
+            if (sampler_owners[3].release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             out_limb_coeff_bytes_device = nullptr;
         }
         if (out_limb_moduli_device)
         {
-            cudaFreeAsync(out_limb_moduli_device, dispatch_stream);
+            if (sampler_owners[4].release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             out_limb_moduli_device = nullptr;
         }
         cleanup_tmp_inputs();
@@ -3009,39 +3323,26 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
     }
 
-    err = cudaMallocAsync(reinterpret_cast<void **>(&sampled_digits_device), sampled_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_bases_device), out_ptr_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_strides_device), out_stride_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&out_limb_coeff_bytes_device),
-        out_coeff_bytes,
-        dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&out_limb_moduli_device), out_moduli_bytes, dispatch_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
+    status = sampler_owners[0].acquire(out->ctx, dispatch_device,
+        sampler_layouts[0].kind, sampler_layouts[0].bytes, sampler_layouts[0].alignment, dispatch_stream);
+    if (status != 0) { cleanup(); return status; }
+    sampled_digits_device = reinterpret_cast<int64_t *>(sampler_owners[0].data);
+    status = sampler_owners[1].acquire(out->ctx, dispatch_device,
+        sampler_layouts[1].kind, sampler_layouts[1].bytes, sampler_layouts[1].alignment, dispatch_stream);
+    if (status != 0) { cleanup(); return status; }
+    out_limb_bases_device = reinterpret_cast<uint8_t * *>(sampler_owners[1].data);
+    status = sampler_owners[2].acquire(out->ctx, dispatch_device,
+        sampler_layouts[2].kind, sampler_layouts[2].bytes, sampler_layouts[2].alignment, dispatch_stream);
+    if (status != 0) { cleanup(); return status; }
+    out_limb_strides_device = reinterpret_cast<size_t *>(sampler_owners[2].data);
+    status = sampler_owners[3].acquire(out->ctx, dispatch_device,
+        sampler_layouts[3].kind, sampler_layouts[3].bytes, sampler_layouts[3].alignment, dispatch_stream);
+    if (status != 0) { cleanup(); return status; }
+    out_limb_coeff_bytes_device = reinterpret_cast<uint8_t *>(sampler_owners[3].data);
+    status = sampler_owners[4].acquire(out->ctx, dispatch_device,
+        sampler_layouts[4].kind, sampler_layouts[4].bytes, sampler_layouts[4].alignment, dispatch_stream);
+    if (status != 0) { cleanup(); return status; }
+    out_limb_moduli_device = reinterpret_cast<uint64_t *>(sampler_owners[4].data);
 
     err = cudaMemcpyAsync(
         out_limb_bases_device,
@@ -3190,6 +3491,10 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     double dgg_stddev,
     GpuP1CovarianceCache **out_cache)
 {
+    if (!a_mat || !a_mat->ctx || !a_mat->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_create_p1_covariance_cache");
+    GpuAllocationActivity activity(a_mat->ctx->execution.get(), -1);
+
     if (!out_cache)
     {
         return set_error("null output in gpu_matrix_create_p1_covariance_cache");
@@ -3227,6 +3532,7 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     {
         auto *empty_cache = new GpuP1CovarianceCache();
         empty_cache->ctx = a_mat->ctx;
+        empty_cache->execution = a_mat->ctx->execution;
         empty_cache->level = a_mat->level;
         *out_cache = empty_cache;
         return 0;
@@ -3317,6 +3623,7 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
 
     auto *cache = new GpuP1CovarianceCache();
     cache->ctx = a_mat->ctx;
+    cache->execution = a_mat->ctx->execution;
     cache->level = a_mat->level;
     cache->d_rows = d_rows;
     cache->n = n;
@@ -3325,11 +3632,37 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     cache->sigma = sigma;
     cache->s = s;
     cache->device = ref_device;
-    err = cudaStreamCreateWithFlags(&cache->stream, cudaStreamNonBlocking);
-    if (err != cudaSuccess)
     {
-        delete cache;
-        return set_error(err);
+        // One submission-stream slot provides the private stream and its
+        // bridge event, which doubles as the cache's ready event.
+        const int acquired = cache->stream_resource.acquire(
+            a_mat->ctx, ref_device, GPU_PREPARED_SUBMISSION_STREAM);
+        if (acquired != 0)
+        {
+            delete cache;
+            return acquired;
+        }
+        cache->stream = cache->stream_resource.stream;
+        cache->ready_event = cache->stream_resource.event;
+    }
+
+    cudaStream_t producer = nullptr;
+    status = matrix_limb_stream(a_mat, ref_limb_id, &producer);
+    cudaEvent_t started = nullptr;
+    GpuCudaResource started_resource;
+    if (status == 0) status = matrix_get_thread_local_owner_link_event(a_mat->ctx, ref_device, &started, started_resource);
+    if (status == 0)
+    {
+        // A prepared input's writer event may predate a measurement start.
+        // Join the current producer boundary before using this private stream.
+        err = cudaEventRecord(started, producer);
+        if (err == cudaSuccess) err = cudaStreamWaitEvent(cache->stream, started, 0);
+        if (err != cudaSuccess) status = set_error(err);
+    }
+    if (status != 0)
+    {
+        gpu_matrix_destroy_p1_covariance_cache(cache);
+        return status;
     }
 
     status = matrix_wait_limb_stream(a_mat, ref_limb_id, ref_device, cache->stream);
@@ -3352,46 +3685,46 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     }
 
     double *cov_workspace = nullptr;
+    GpuDeviceWorkspace cov_owner;
     auto cleanup = [&]()
     {
-        cudaSetDevice(ref_device);
+        if (cudaSetDevice(ref_device) != cudaSuccess)
+        {
+            cache->execution->memory_release_failed.store(true, std::memory_order_release);
+            cache->execution->unretired_work.store(true, std::memory_order_release);
+            return;
+        }
         if (cov_workspace)
         {
-            cudaFreeAsync(cov_workspace, cache->stream);
+            if (cov_owner.release(cache->stream) != 0)
+            {
+                cache->execution->memory_release_failed.store(true, std::memory_order_release);
+                cache->execution->unretired_work.store(true, std::memory_order_release);
+            }
             cov_workspace = nullptr;
         }
         if (cache)
         {
+            // A failed construction may have submitted input readers before
+            // publishing their ordinary per-matrix completion dependencies.
+            gpu_context_retire_stream(cache->ctx, cache->device, cache->stream);
             gpu_matrix_destroy_p1_covariance_cache(cache);
             cache = nullptr;
         }
     };
 
-    err = cudaMallocAsync(reinterpret_cast<void **>(&cache->sqrt_var), sqrt_bytes, cache->stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&cache->update_coeff), update_bytes, cache->stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&cov_workspace), cov_bytes, cache->stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaEventCreateWithFlags(&cache->ready_event, cudaEventDisableTiming);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-
+    status = cache->sqrt_owner.acquire(a_mat->ctx, ref_device, GPU_PREPARED_SAMPLER_WORKSPACE,
+        sqrt_bytes, alignof(double), cache->stream);
+    if (status != 0) { cleanup(); return status; }
+    cache->sqrt_var = reinterpret_cast<double *>(cache->sqrt_owner.data);
+    status = cache->update_owner.acquire(a_mat->ctx, ref_device, GPU_PREPARED_SAMPLER_WORKSPACE,
+        update_bytes, alignof(double), cache->stream);
+    if (status != 0) { cleanup(); return status; }
+    cache->update_coeff = reinterpret_cast<double *>(cache->update_owner.data);
+    status = cov_owner.acquire(a_mat->ctx, ref_device, GPU_PREPARED_SAMPLER_WORKSPACE,
+        cov_bytes, alignof(double), cache->stream);
+    if (status != 0) { cleanup(); return status; }
+    cov_workspace = reinterpret_cast<double *>(cov_owner.data);
     status = launch_precompute_p1_covariance_kernel(
         a_base,
         b_base,
@@ -3424,8 +3757,15 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
         cleanup();
         return set_error(err);
     }
-    cudaFreeAsync(cov_workspace, cache->stream);
+    status = cov_owner.release(cache->stream);
     cov_workspace = nullptr;
+    if (status != 0)
+    {
+        cache->execution->memory_release_failed.store(true, std::memory_order_release);
+        cache->execution->unretired_work.store(true, std::memory_order_release);
+        cleanup();
+        return status;
+    }
 
     status = matrix_track_limb_consumer(a_mat, ref_limb_id, ref_device, cache->stream);
     if (status != 0)
@@ -3453,49 +3793,68 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
 
 extern "C" void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cache)
 {
-    if (!cache)
+    if (!cache) return;
+    auto owner = cache->execution;
+    if (owner->unretired_work.load(std::memory_order_acquire)) return;
+    int current = 0;
+    const cudaError_t selected = cudaGetDevice(&current);
     {
-        return;
-    }
-    if (cache->device >= 0)
-    {
-        cudaSetDevice(cache->device);
-        if (cache->sqrt_var)
+        GpuAllocationActivity activity(owner.get(), -1);
+        const auto fail = [&](cudaError_t error) {
+            // Keep the cache's owner reference, private stream and uncertain frees
+            // alive. In particular, never retry a free whose completion is unknown.
+            owner->memory_release_failed.store(true, std::memory_order_release);
+            owner->unretired_work.store(true, std::memory_order_release);
+            if (selected == cudaSuccess) cudaSetDevice(current);
+            set_error(error);
+        };
+        if (selected != cudaSuccess) { fail(selected); return; }
+        if (!cache->stream && (cache->sqrt_var || cache->update_coeff || cache->ready_event))
         {
-            if (cache->stream)
-            {
-                cudaFreeAsync(cache->sqrt_var, cache->stream);
-            }
-            else
-            {
-                cudaFree(cache->sqrt_var);
-            }
-            cache->sqrt_var = nullptr;
+            fail(cudaErrorInvalidResourceHandle);
+            return;
         }
-        if (cache->update_coeff)
+        if (cache->device >= 0 && cache->stream)
         {
-            if (cache->stream)
+            const auto found = std::find(owner->gpu_ids.begin(), owner->gpu_ids.end(), cache->device);
+            if (found == owner->gpu_ids.end()) { fail(cudaErrorInvalidDevice); return; }
+            const size_t partition = static_cast<size_t>(found - owner->gpu_ids.begin());
+            if (partition >= owner->release_streams_by_partition.size() ||
+                !owner->release_streams_by_partition[partition])
             {
-                cudaFreeAsync(cache->update_coeff, cache->stream);
+                fail(cudaErrorInvalidResourceHandle);
+                return;
             }
-            else
+            cudaError_t error = cudaSetDevice(cache->device);
+            // The cache is no longer borrowed. All existing waits capture its
+            // earlier ready record; reuse that setup-created handle for frees.
+            cudaEvent_t released = cache->ready_event;
+            if (error == cudaSuccess && !released)
+                error = cudaErrorInvalidResourceHandle;
+            if (error == cudaSuccess && cache->sqrt_var)
             {
-                cudaFree(cache->update_coeff);
+                if (cache->sqrt_owner.release(cache->stream) != 0) error = cudaErrorUnknown;
+                cache->sqrt_var = nullptr;
             }
-            cache->update_coeff = nullptr;
-        }
-        if (cache->ready_event)
-        {
-            cudaEventDestroy(cache->ready_event);
+            if (error == cudaSuccess && cache->update_coeff)
+            {
+                if (cache->update_owner.release(cache->stream) != 0) error = cudaErrorUnknown;
+                cache->update_coeff = nullptr;
+            }
+            if (error == cudaSuccess) error = cudaEventRecord(released, cache->stream);
+            if (error == cudaSuccess)
+                error = cudaStreamWaitEvent(owner->release_streams_by_partition[partition], released, 0);
+            if (error == cudaSuccess && cache->stream_resource.release() != 0)
+                error = cudaErrorUnknown;
             cache->ready_event = nullptr;
-        }
-        if (cache->stream)
-        {
-            cudaStreamDestroy(cache->stream);
             cache->stream = nullptr;
+            if (error != cudaSuccess) { fail(error); return; }
         }
+        delete cache;
     }
-    delete cache;
+    owner.reset();
+    if (cudaSetDevice(current) != cudaSuccess)
+        gpu_device_mark_allocation_unknown(current);
 }
 
 extern "C" int gpu_matrix_sample_p1_full_cached(
@@ -3504,6 +3863,10 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
     GpuRngSeed seed,
     GpuMatrix *out)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_sample_p1_full_cached");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!cache || !tp2 || !out)
     {
@@ -3612,24 +3975,20 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
         int64_t *ptr;
         cudaStream_t owner_stream;
         cudaEvent_t ready_event;
-        std::vector<cudaEvent_t> consumer_done_events;
+        std::unique_ptr<GpuDeviceWorkspace> owner;
+        std::unique_ptr<GpuCudaResource> ready_resource;
     };
     std::vector<DeviceSampleBuffer> sampled_device_buffers;
+    auto reference_owner = std::make_unique<GpuDeviceWorkspace>();
     cudaEvent_t sampled_ready_event = nullptr;
-    int sampled_ready_device = -1;
+    auto sampled_ready_resource = std::make_unique<GpuCudaResource>();
     int64_t *sampled_ref_device = nullptr;
 
     auto cleanup = [&]()
     {
-        if (sampled_ready_event)
-        {
-            if (sampled_ready_device >= 0)
-            {
-                cudaSetDevice(sampled_ready_device);
-            }
-            cudaEventDestroy(sampled_ready_event);
-            sampled_ready_event = nullptr;
-        }
+        if (sampled_ready_resource && sampled_ready_resource->release() != 0)
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+        sampled_ready_event = nullptr;
         for (auto &entry : sampled_device_buffers)
         {
             if (entry.device < 0)
@@ -3637,43 +3996,41 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
                 entry.ptr = nullptr;
                 if (entry.ready_event)
                 {
-                    cudaEventDestroy(entry.ready_event);
+                    if (entry.ready_resource->release() != 0)
+                        gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                     entry.ready_event = nullptr;
                 }
-                for (cudaEvent_t event : entry.consumer_done_events)
-                {
-                    cudaEventDestroy(event);
-                }
-                entry.consumer_done_events.clear();
                 continue;
             }
-            cudaSetDevice(entry.device);
+            if (cudaSetDevice(entry.device) != cudaSuccess)
+            {
+                out->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+                out->ctx->execution->unretired_work.store(true, std::memory_order_release);
+                return;
+            }
             if (entry.ptr)
             {
-                cudaFreeAsync(entry.ptr, entry.owner_stream);
+                if (entry.owner->release() != 0)
+                    gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                 entry.ptr = nullptr;
             }
             if (entry.ready_event)
             {
-                cudaEventDestroy(entry.ready_event);
+                if (entry.ready_resource->release() != 0)
+                    gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                 entry.ready_event = nullptr;
             }
-            for (cudaEvent_t event : entry.consumer_done_events)
-            {
-                cudaEventDestroy(event);
-            }
-            entry.consumer_done_events.clear();
         }
         sampled_device_buffers.clear();
     };
 
-    err = cudaEventCreateWithFlags(&sampled_ready_event, cudaEventDisableTiming);
-    if (err != cudaSuccess)
+    status = sampled_ready_resource->acquire(out->ctx, ref_device, GPU_PREPARED_COMPLETION_EVENT);
+    if (status != 0)
     {
         cleanup();
-        return set_error(err);
+        return status;
     }
-    sampled_ready_device = ref_device;
+    sampled_ready_event = sampled_ready_resource->event;
 
     status = launch_sample_p1_integer_cached_kernel(
         ref_tp2_base,
@@ -3685,32 +4042,19 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
         seed,
         ref_stream,
         ref_device,
-        sampled_ready_event);
+        sampled_ready_event, out->ctx, *reference_owner);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = matrix_track_limb_consumer(tp2, ref_limb_id, ref_device, ref_stream);
+    status = matrix_track_limb_consumer_readonly(tp2, ref_limb_id, ref_device, ref_stream, sampled_ready_event);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    cudaEvent_t cache_consumer_done = nullptr;
-    status = matrix_get_thread_local_owner_link_event(cache->device, &cache_consumer_done);
-    if (status != 0)
-    {
-        cleanup();
-        return status;
-    }
-    err = cudaEventRecord(cache_consumer_done, ref_stream);
-    if (err != cudaSuccess)
-    {
-        cleanup();
-        return set_error(err);
-    }
-    err = cudaStreamWaitEvent(cache->stream, cache_consumer_done, 0);
+    err = cudaStreamWaitEvent(cache->stream, sampled_ready_event, 0);
     if (err != cudaSuccess)
     {
         cleanup();
@@ -3724,9 +4068,9 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
                 sampled_ref_device,
                 ref_stream,
                 sampled_ready_event,
-                {}});
+                std::move(reference_owner),
+                std::move(sampled_ready_resource)});
         sampled_ready_event = nullptr;
-        sampled_ready_device = -1;
     }
 
     const size_t sampled_entry_count = 2 * cache->d_rows * cols;
@@ -3737,56 +4081,6 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
         return set_error("sample byte overflow in gpu_matrix_sample_p1_full_cached");
     }
     const size_t sampled_bytes = sampled_entry_count * cache->n * sizeof(int64_t);
-
-    auto link_sample_buffer_consumer_done =
-        [&](int64_t *ptr, int device, cudaStream_t consumer_stream) -> int
-    {
-        if (!ptr)
-        {
-            return set_error("null sampled buffer in cached consumer link");
-        }
-        if (device < 0 || !consumer_stream)
-        {
-            return set_error("invalid device/stream in cached consumer link");
-        }
-        for (auto &entry : sampled_device_buffers)
-        {
-            if (entry.device != device || entry.ptr != ptr)
-            {
-                continue;
-            }
-            if (!entry.owner_stream || entry.owner_stream == consumer_stream)
-            {
-                return 0;
-            }
-            cudaError_t err = cudaSetDevice(device);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            cudaEvent_t consumer_done = nullptr;
-            err = cudaEventCreateWithFlags(&consumer_done, cudaEventDisableTiming);
-            if (err != cudaSuccess)
-            {
-                return set_error(err);
-            }
-            err = cudaEventRecord(consumer_done, consumer_stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(consumer_done);
-                return set_error(err);
-            }
-            err = cudaStreamWaitEvent(entry.owner_stream, consumer_done, 0);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(consumer_done);
-                return set_error(err);
-            }
-            entry.consumer_done_events.push_back(consumer_done);
-            return 0;
-        }
-        return set_error("missing sampled buffer owner for cached consumer link");
-    };
 
     auto ensure_sample_buffer_on_device = [&](int device, cudaStream_t stream, int64_t **out_ptr) -> int
     {
@@ -3834,32 +4128,45 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
             return set_error(err);
         }
         int64_t *device_copy = nullptr;
-        err = cudaMallocAsync(reinterpret_cast<void **>(&device_copy), sampled_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
+        auto copy_owner = std::make_unique<GpuDeviceWorkspace>();
+        const int allocated = copy_owner->acquire(out->ctx, device, GPU_PREPARED_SAMPLER_WORKSPACE,
+            sampled_bytes, alignof(int64_t), stream);
+        if (allocated != 0) return allocated;
+        device_copy = reinterpret_cast<int64_t *>(copy_owner->data);
+        auto copy_resource = std::make_unique<GpuCudaResource>();
+        const int resource_status = copy_resource->acquire(out->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+        if (resource_status != 0) return resource_status;
+        const cudaEvent_t copy_ready = copy_resource->event;
+        err = cudaStreamWaitEvent(stream, sampled_device_buffers.front().ready_event, 0);
+        if (err != cudaSuccess) return set_error(err);
         err = cudaMemcpyPeerAsync(device_copy, device, sampled_ref_device, ref_device, sampled_bytes, stream);
         if (err != cudaSuccess)
         {
-            cudaFreeAsync(device_copy, stream);
-            return set_error(err);
-        }
-        cudaEvent_t copy_ready = nullptr;
-        err = cudaEventCreateWithFlags(&copy_ready, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(device_copy, stream);
+            if (copy_owner->release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             return set_error(err);
         }
         err = cudaEventRecord(copy_ready, stream);
         if (err != cudaSuccess)
         {
-            cudaEventDestroy(copy_ready);
-            cudaFreeAsync(device_copy, stream);
+            // A submitted peer reader without a completion edge cannot retire.
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+            copy_resource->quarantine();
+            if (copy_owner->release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             return set_error(err);
         }
-        sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy, stream, copy_ready, {}});
+        err = cudaSetDevice(ref_device);
+        if (err == cudaSuccess) err = cudaStreamWaitEvent(ref_stream, copy_ready, 0);
+        if (err == cudaSuccess) err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+            copy_resource->quarantine();
+            return set_error(err);
+        }
+        sampled_device_buffers.push_back(DeviceSampleBuffer{
+            device, device_copy, stream, copy_ready, std::move(copy_owner), std::move(copy_resource)});
         *out_ptr = device_copy;
         return 0;
     };
@@ -3924,11 +4231,20 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
             cleanup();
             return status;
         }
-        status = link_sample_buffer_consumer_done(sampled_for_device, out_device, out_stream);
-        if (status != 0)
+        // Retire the scratch reader after the scatter, never before it.
+        // The output owns this event, and the wait captures this exact record.
+        const cudaEvent_t scattered = out->exec_limb_states[limb_id.x][limb_id.y].write_done;
+        for (auto &entry : sampled_device_buffers)
         {
-            cleanup();
-            return status;
+            if (entry.device != out_device || entry.ptr != sampled_for_device ||
+                entry.owner_stream == out_stream) continue;
+            err = cudaStreamWaitEvent(entry.owner_stream, scattered, 0);
+            if (err != cudaSuccess)
+            {
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+                cleanup();
+                return set_error(err);
+            }
         }
     }
 
@@ -3954,6 +4270,10 @@ extern "C" int gpu_matrix_sample_p1_full(
     GpuRngSeed seed,
     GpuMatrix *out)
 {
+    if (!out || !out->ctx || !out->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_sample_p1_full");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
+
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!a_mat || !b_mat || !d_mat || !tp2 || !out)
     {
@@ -4024,22 +4344,19 @@ extern "C" int gpu_matrix_sample_p1_full(
         int64_t *ptr;
         cudaStream_t owner_stream;
         cudaEvent_t ready_event;
+        std::unique_ptr<GpuDeviceWorkspace> owner;
+        std::unique_ptr<GpuCudaResource> ready_resource;
     };
     std::vector<DeviceSampleBuffer> sampled_device_buffers;
+    auto reference_owner = std::make_unique<GpuDeviceWorkspace>();
     cudaEvent_t sampled_ready_event = nullptr;
-    int sampled_ready_device = -1;
+    auto sampled_ready_resource = std::make_unique<GpuCudaResource>();
 
     auto cleanup = [&]()
     {
-        if (sampled_ready_event)
-        {
-            if (sampled_ready_device >= 0)
-            {
-                cudaSetDevice(sampled_ready_device);
-            }
-            cudaEventDestroy(sampled_ready_event);
-            sampled_ready_event = nullptr;
-        }
+        if (sampled_ready_resource && sampled_ready_resource->release() != 0)
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+        sampled_ready_event = nullptr;
         for (auto &entry : sampled_device_buffers)
         {
             if (entry.device < 0)
@@ -4047,20 +4364,28 @@ extern "C" int gpu_matrix_sample_p1_full(
                 entry.ptr = nullptr;
                 if (entry.ready_event)
                 {
-                    cudaEventDestroy(entry.ready_event);
+                    if (entry.ready_resource->release() != 0)
+                        gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                     entry.ready_event = nullptr;
                 }
                 continue;
             }
-            cudaSetDevice(entry.device);
+            if (cudaSetDevice(entry.device) != cudaSuccess)
+            {
+                out->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+                out->ctx->execution->unretired_work.store(true, std::memory_order_release);
+                return;
+            }
             if (entry.ptr)
             {
-                cudaFreeAsync(entry.ptr, entry.owner_stream);
+                if (entry.owner->release() != 0)
+                    gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                 entry.ptr = nullptr;
             }
             if (entry.ready_event)
             {
-                cudaEventDestroy(entry.ready_event);
+                if (entry.ready_resource->release() != 0)
+                    gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
                 entry.ready_event = nullptr;
             }
         }
@@ -4263,13 +4588,13 @@ extern "C" int gpu_matrix_sample_p1_full(
         cleanup();
         return set_error(err);
     }
-    err = cudaEventCreateWithFlags(&sampled_ready_event, cudaEventDisableTiming);
-    if (err != cudaSuccess)
+    status = sampled_ready_resource->acquire(out->ctx, ref_device, GPU_PREPARED_COMPLETION_EVENT);
+    if (status != 0)
     {
         cleanup();
-        return set_error(err);
+        return status;
     }
-    sampled_ready_device = ref_device;
+    sampled_ready_event = sampled_ready_resource->event;
 
     int64_t *sampled_ref_device = nullptr;
     status = launch_sample_p1_integer_kernel(
@@ -4296,31 +4621,31 @@ extern "C" int gpu_matrix_sample_p1_full(
         ref_stream,
         ref_device,
         &sampled_ref_device,
-        sampled_ready_event);
+        sampled_ready_event, out->ctx, *reference_owner);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = matrix_track_limb_consumer(a_input, ref_limb_id, ref_device, ref_stream);
+    status = matrix_track_limb_consumer_readonly(a_input, ref_limb_id, ref_device, ref_stream, sampled_ready_event);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = matrix_track_limb_consumer(b_input, ref_limb_id, ref_device, ref_stream);
+    status = matrix_track_limb_consumer_readonly(b_input, ref_limb_id, ref_device, ref_stream, sampled_ready_event);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = matrix_track_limb_consumer(d_input, ref_limb_id, ref_device, ref_stream);
+    status = matrix_track_limb_consumer_readonly(d_input, ref_limb_id, ref_device, ref_stream, sampled_ready_event);
     if (status != 0)
     {
         cleanup();
         return status;
     }
-    status = matrix_track_limb_consumer(tp2_input, ref_limb_id, ref_device, ref_stream);
+    status = matrix_track_limb_consumer_readonly(tp2_input, ref_limb_id, ref_device, ref_stream, sampled_ready_event);
     if (status != 0)
     {
         cleanup();
@@ -4329,9 +4654,8 @@ extern "C" int gpu_matrix_sample_p1_full(
     if (sampled_ref_device)
     {
         sampled_device_buffers.push_back(
-            DeviceSampleBuffer{ref_device, sampled_ref_device, ref_stream, sampled_ready_event});
+            DeviceSampleBuffer{ref_device, sampled_ref_device, ref_stream, sampled_ready_event, std::move(reference_owner), std::move(sampled_ready_resource)});
         sampled_ready_event = nullptr;
-        sampled_ready_device = -1;
     }
 
     size_t sampled_entry_count = 0;
@@ -4368,39 +4692,6 @@ extern "C" int gpu_matrix_sample_p1_full(
             return set_error("invalid device/stream in ensure_sample_buffer_on_device");
         }
         *out_ptr = nullptr;
-        auto link_consumer_to_owner =
-            [&](DeviceSampleBuffer &entry, cudaStream_t consumer_stream) -> int
-        {
-            if (!entry.owner_stream)
-            {
-                return 0;
-            }
-            if (!consumer_stream)
-            {
-                return set_error("invalid consumer stream in gpu_matrix_sample_p1_full");
-            }
-            if (consumer_stream == entry.owner_stream)
-            {
-                return 0;
-            }
-            cudaEvent_t consumer_done = nullptr;
-            int event_status = matrix_get_thread_local_owner_link_event(entry.device, &consumer_done);
-            if (event_status != 0)
-            {
-                return event_status;
-            }
-            cudaError_t link_err = cudaEventRecord(consumer_done, consumer_stream);
-            if (link_err != cudaSuccess)
-            {
-                return set_error(link_err);
-            }
-            link_err = cudaStreamWaitEvent(entry.owner_stream, consumer_done, 0);
-            if (link_err != cudaSuccess)
-            {
-                return set_error(link_err);
-            }
-            return 0;
-        };
         for (auto &entry : sampled_device_buffers)
         {
             if (entry.device == device && entry.ptr)
@@ -4417,11 +4708,6 @@ extern "C" int gpu_matrix_sample_p1_full(
                     {
                         return set_error(wait_err);
                     }
-                }
-                int link_status = link_consumer_to_owner(entry, stream);
-                if (link_status != 0)
-                {
-                    return link_status;
                 }
                 *out_ptr = entry.ptr;
                 return 0;
@@ -4441,11 +4727,17 @@ extern "C" int gpu_matrix_sample_p1_full(
             return set_error(err);
         }
         int64_t *device_copy = nullptr;
-        err = cudaMallocAsync(reinterpret_cast<void **>(&device_copy), sampled_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
+        auto copy_owner = std::make_unique<GpuDeviceWorkspace>();
+        const int allocated = copy_owner->acquire(out->ctx, device, GPU_PREPARED_SAMPLER_WORKSPACE,
+            sampled_bytes, alignof(int64_t), stream);
+        if (allocated != 0) return allocated;
+        device_copy = reinterpret_cast<int64_t *>(copy_owner->data);
+        auto copy_resource = std::make_unique<GpuCudaResource>();
+        const int resource_status = copy_resource->acquire(out->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+        if (resource_status != 0) return resource_status;
+        const cudaEvent_t copy_ready = copy_resource->event;
+        err = cudaStreamWaitEvent(stream, sampled_device_buffers.front().ready_event, 0);
+        if (err != cudaSuccess) return set_error(err);
         err = cudaMemcpyPeerAsync(
             device_copy,
             device,
@@ -4455,24 +4747,31 @@ extern "C" int gpu_matrix_sample_p1_full(
             stream);
         if (err != cudaSuccess)
         {
-            cudaFreeAsync(device_copy, stream);
-            return set_error(err);
-        }
-        cudaEvent_t copy_ready = nullptr;
-        err = cudaEventCreateWithFlags(&copy_ready, cudaEventDisableTiming);
-        if (err != cudaSuccess)
-        {
-            cudaFreeAsync(device_copy, stream);
+            if (copy_owner->release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             return set_error(err);
         }
         err = cudaEventRecord(copy_ready, stream);
         if (err != cudaSuccess)
         {
-            cudaEventDestroy(copy_ready);
-            cudaFreeAsync(device_copy, stream);
+            // A submitted peer reader without a completion edge cannot retire.
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+            copy_resource->quarantine();
+            if (copy_owner->release() != 0)
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
             return set_error(err);
         }
-        sampled_device_buffers.push_back(DeviceSampleBuffer{device, device_copy, stream, copy_ready});
+        err = cudaSetDevice(ref_device);
+        if (err == cudaSuccess) err = cudaStreamWaitEvent(ref_stream, copy_ready, 0);
+        if (err == cudaSuccess) err = cudaSetDevice(device);
+        if (err != cudaSuccess)
+        {
+            gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+            copy_resource->quarantine();
+            return set_error(err);
+        }
+        sampled_device_buffers.push_back(DeviceSampleBuffer{
+            device, device_copy, stream, copy_ready, std::move(copy_owner), std::move(copy_resource)});
         *out_ptr = device_copy;
         return 0;
     };
@@ -4537,6 +4836,21 @@ extern "C" int gpu_matrix_sample_p1_full(
             cleanup();
             return status;
         }
+        // Retire the scratch reader after the scatter, never before it.
+        // The output owns this event, and the wait captures this exact record.
+        const cudaEvent_t scattered = out->exec_limb_states[limb_id.x][limb_id.y].write_done;
+        for (auto &entry : sampled_device_buffers)
+        {
+            if (entry.device != out_device || entry.ptr != sampled_for_device ||
+                entry.owner_stream == out_stream) continue;
+            err = cudaStreamWaitEvent(entry.owner_stream, scattered, 0);
+            if (err != cudaSuccess)
+            {
+                gpu_execution_mark_allocation_unknown(out->ctx->execution.get());
+                cleanup();
+                return set_error(err);
+            }
+        }
     }
 
     status = gpu_matrix_ntt_all(out);
@@ -4550,3 +4864,8 @@ extern "C" int gpu_matrix_sample_p1_full(
     cleanup();
     return 0;
 }
+
+
+// Homogeneous evaluation-format owners. The Rust caller retains exclusive
+// output ownership and every source through submission. Immutable descriptors
+// travel as kernel arguments, with no per-batch GPU allocation or upload.

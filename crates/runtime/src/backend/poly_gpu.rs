@@ -1,5 +1,6 @@
 use super::poly::{CrtRecomposeMatrix, PolyBackend, PolyBackendError};
 use num_traits::ToPrimitive;
+use rayon::prelude::*;
 use std::{collections::BTreeMap, marker::PhantomData};
 
 impl<M, U, H, T> PolyBackend<M, U, H, T>
@@ -23,6 +24,21 @@ where
         }
         backend
     }
+
+    /// Fleet resharding must remain device-resident. Parameter equality alone
+    /// does not establish ownership: independent executions can use the same GPU.
+    pub(super) fn matrix_to_active_placement_peer_only(
+        &self,
+        value: &M,
+    ) -> Result<M, PolyBackendError> {
+        let target = self.parameters_for_matrix(value)?;
+        if value.params() == target &&
+            value.params().execution_owner_id() == target.execution_owner_id()
+        {
+            return Ok(value.clone());
+        }
+        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
+    }
 }
 
 impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
@@ -44,15 +60,15 @@ impl CrtRecomposeMatrix for GpuDCRTPolyMatrix {
             return Err(PolyBackendError::InvalidInteger);
         }
         let plaintext_moduli = plaintext_moduli
-            .iter()
+            .par_iter()
             .map(|modulus| modulus.to_u64().filter(|modulus| *modulus != 0))
             .collect::<Option<Vec<_>>>()
             .ok_or(PolyBackendError::InvalidInteger)?;
         let ring_moduli = destination.moduli();
         let reconstruction_residues = reconstruction_coefficients
-            .iter()
+            .par_iter()
             .flat_map(|coefficient| {
-                ring_moduli.iter().map(move |modulus| {
+                ring_moduli.par_iter().map(move |modulus| {
                     let modulus = num_bigint::BigInt::from(*modulus);
                     (((coefficient % &modulus) + &modulus) % &modulus).to_u64()
                 })
@@ -76,12 +92,26 @@ use mxx_primitives::{
 };
 
 mod fleet;
+mod gpu_prepared;
+pub mod gpu_prepared_control;
+pub(crate) mod gpu_prepared_host;
+pub(crate) mod gpu_prepared_lowering;
 pub use fleet::{
     GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
+    GpuMatrixDescriptor, GpuMatrixFragmentDescriptor,
+};
+pub use gpu_prepared::{
+    PreparedGpuBusy, PreparedGpuFleetOutput, PreparedGpuProgram, PreparedGpuRunError,
+    PreparedGpuWorkCounters, begin_prepared_gpu_work_gate, end_prepared_gpu_work_gate,
+    prepared_gpu_work_counters, reset_prepared_gpu_work_counters,
+};
+pub(crate) use gpu_prepared::{
+    from_lowered_program, record_prepared_forbidden, record_provisioning_append,
+    record_provisioning_begin, record_provisioning_permit,
 };
 
 #[cfg(test)]
-pub(super) fn wait_for_gpu_test_context_quiescence(device: i32) {
+pub(crate) fn wait_for_gpu_test_context_quiescence(device: i32) {
     use mxx_primitives::poly::dcrt::gpu::{gpu_device_memory_usage, gpu_device_sync};
     use std::time::{Duration, Instant};
 
@@ -120,7 +150,7 @@ pub fn gpu_backend_on(
     let device_ids = device_ids.into_iter().collect::<Vec<_>>();
     assert!(!device_ids.is_empty(), "mxx-runtime GPU backend requires at least one detected GPU");
     let placements = device_ids
-        .into_iter()
+        .into_par_iter()
         .map(|device_id| {
             let mut placement = Vec::new();
             for parameters in &parameters {
@@ -150,7 +180,7 @@ where
         requested_device_ids.to_vec()
     };
     let placements = device_ids
-        .into_iter()
+        .into_par_iter()
         .map(|device_id| {
             let mut placement = Vec::new();
             for parameters in &parameters {
@@ -305,143 +335,101 @@ mod tests {
     }
 
     #[test]
-    fn test_gpu_execute_preserves_events_across_calls_and_release_policies() {
-        use super::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_backend_on};
-        use crate::{
-            ExecutionConfig, MemoryArtifactStore, RuntimeValue, execute_with_config,
-            gpu_calibration::{
-                GpuColumnWidths, gpu_calibration_operation_identity,
-                gpu_operation_is_column_separable_for_types,
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_same_device_transport_changes_execution_owner_and_preserves_pending_reads() {
+        use super::{GpuDCRTPolyMatrix, GpuDCRTPolyParams, PolyBackend, detected_gpu_device_ids};
+        use mxx_primitives::{
+            matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix},
+            poly::PolyParams,
+            sampler::{
+                DistType, PolyUniformSampler,
+                gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
+                trapdoor::GpuDCRTPolyTrapdoorSampler,
             },
-            transcript::SamplingMode,
         };
-        use mxx_dsl::{DslContext, Ring};
-        use mxx_ir_core::ParamEnv;
-        use mxx_primitives::poly::PolyParams;
-        use std::{collections::BTreeMap, num::NonZeroUsize};
 
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let ring = Ring::new(parameters.modulus().as_ref().clone(), 32);
-        let generate = DslContext::new("async-release-input")
-            .output("matrix", ring.uniform_residue((2, 3)))
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let input = ring.input("matrix", (2, 3));
-        // Algebraic round trips exercise released temporaries without constructing
-        // a separate arithmetic oracle or retaining intermediate GPU owners.
-        let producer = DslContext::new("async-release-producer")
-            .output("matrix", (&input + &input) - &input)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let consumer = DslContext::new("async-release-consumer")
-            .output("matrix", -(-input))
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let mut backend = gpu_backend_on([parameters], [detected_gpu_device_ids()[0]]);
-        for graph in [&generate, &producer, &consumer] {
-            let scope = graph.source.root_scope();
-            let validated = graph.root_scope();
-            for node in &validated.execution_order {
-                let arguments = scope
-                    .arguments(node)
-                    .unwrap()
-                    .iter()
-                    .map(|wire| validated.wire_types[wire].clone())
-                    .collect::<Vec<_>>();
-                if !gpu_operation_is_column_separable_for_types(node.kind(), &arguments) {
-                    continue;
-                }
-                let outputs = (0..node.output_types().len())
-                    .map(|port| {
-                        let wire = scope.wire_ref(&node.output(port as u32).unwrap()).unwrap();
-                        validated.wire_types[&wire].clone()
-                    })
-                    .collect::<Vec<_>>();
-                let identity = gpu_calibration_operation_identity(
-                    node.kind(),
-                    &arguments,
-                    &outputs,
-                    &graph.bindings,
-                )
-                .unwrap();
-                backend.set_column_widths_for_operation(
-                    identity,
-                    GpuColumnWidths { gpu0: 3, nonzero: None },
-                );
+        type DeviceBackend = PolyBackend<
+            GpuDCRTPolyMatrix,
+            GpuDCRTPolyUniformSampler,
+            GpuDCRTPolyHashSampler<keccak_asm::Keccak256>,
+            GpuDCRTPolyTrapdoorSampler,
+        >;
+        let device = detected_gpu_device_ids()[0];
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().expect("ring dimension"))
+            .unwrap_or(32);
+        let moduli = [17, 54]
+            .into_iter()
+            .flat_map(|bits| DCRTPolyParams::new(n, 1, bits, 4, None, None).to_crt().0)
+            .collect::<Vec<_>>();
+        // Each iteration drops the source execution before observing the queued
+        // copies. Separate formats also exercise both 32-bit and 64-bit limbs.
+        for coefficient in [false, true] {
+            let source_parameters = GpuDCRTPolyParams::new_with_gpu(
+                n,
+                moduli.clone(),
+                4,
+                vec![device],
+                None,
+                None,
+                None,
+            );
+            let destination_parameters = GpuDCRTPolyParams::new_with_gpu(
+                n,
+                moduli.clone(),
+                4,
+                vec![device],
+                None,
+                None,
+                None,
+            );
+            assert_eq!(source_parameters, destination_parameters);
+            let destination_owner = destination_parameters.execution_owner_id();
+            assert_ne!(source_parameters.execution_owner_id(), destination_owner);
+            let mut backend = DeviceBackend::new([destination_parameters.clone()]);
+            let template = GpuDCRTPolyUniformSampler::new().sample_uniform(
+                &source_parameters,
+                2,
+                3,
+                DistType::TernaryDist,
+            );
+            let expected = if coefficient {
+                template.to_coefficient_rns_snapshot_for_test()
+            } else {
+                template.to_rns_snapshot()
+            };
+            // Compact placement predicates have the same owner distinction.
+            // Their existing canonical transport must also return the selected owner.
+            let compact = template.gadget_decompose(true, None).unwrap();
+            assert!(!backend.small_matrix_is_on_active_placement(&compact));
+            let compact_copy = backend.small_matrix_to_active_placement(&compact).unwrap();
+            assert_eq!(compact_copy.params().execution_owner_id(), destination_owner);
+            assert!(backend.small_matrix_is_on_active_placement(&compact_copy));
+            assert_eq!(
+                compact.to_canonical_coefficients().unwrap(),
+                compact_copy.to_canonical_coefficients().unwrap()
+            );
+            drop((compact, compact_copy));
+            let source = GpuDCRTPolyMatrix::from_rns_snapshot(&source_parameters, &expected);
+            assert!(!backend.matrix_is_on_active_placement(&source));
+            let source_reader = source.clone();
+            let peer = backend.matrix_to_active_placement_peer_only(&source_reader).unwrap();
+            let regular = backend.matrix_to_active_placement(&source).unwrap();
+            for copied in [&peer, &regular] {
+                assert_eq!(copied.params().execution_owner_id(), destination_owner);
+                assert!(backend.matrix_is_on_active_placement(copied));
+            }
+            let peer_reader = peer.clone();
+            let regular_reader = regular.clone();
+            drop((peer, regular, source_reader, source, backend));
+            drop((source_parameters, destination_parameters));
+            for reader in [peer_reader, regular_reader] {
+                let observed = reader.to_rns_snapshot();
+                assert_eq!(observed.level(), expected.level());
+                assert_eq!(observed.is_ntt(), expected.is_ntt());
+                assert_eq!(observed.bytes(), expected.bytes());
             }
         }
-        for release_fence_interval in [None, NonZeroUsize::new(1)] {
-            let config = ExecutionConfig { release_fence_interval, ..ExecutionConfig::default() };
-            for _ in 0..5 {
-                let mut store = MemoryArtifactStore::default();
-                let mut generated = execute_with_config(
-                    &generate,
-                    &mut backend,
-                    BTreeMap::new(),
-                    &mut store,
-                    SamplingMode::Fresh,
-                    config,
-                )
-                .unwrap();
-                let sample = generated.outputs.remove("matrix").unwrap();
-                let RuntimeValue::Matrix(matrix) = &sample else { panic!("resident matrix") };
-                let expected = backend.matrix_to_bytes(matrix);
-                drop(generated);
-                let mut produced = execute_with_config(
-                    &producer,
-                    &mut backend,
-                    BTreeMap::from([("matrix".into(), sample)]),
-                    &mut store,
-                    SamplingMode::Fresh,
-                    config,
-                )
-                .unwrap();
-                assert!(produced.artifact_handles.is_empty());
-                let intermediate = produced.outputs.remove("matrix").unwrap();
-                drop(produced);
-                // No wait between producer and consumer; the input map transfers
-                // the last intermediate owner into the next execute invocation.
-                let mut consumed = execute_with_config(
-                    &consumer,
-                    &mut backend,
-                    BTreeMap::from([("matrix".into(), intermediate)]),
-                    &mut store,
-                    SamplingMode::Fresh,
-                    config,
-                )
-                .unwrap();
-                let RuntimeValue::Matrix(output) = consumed.outputs.remove("matrix").unwrap()
-                else {
-                    panic!("resident output")
-                };
-                drop(consumed);
-                drop(store);
-                output.wait_until_ready();
-                assert_eq!(backend.matrix_to_bytes(&output), expected);
-            }
-        }
-        // Context teardown must also own pending releases when a caller discards
-        // a result without explicitly waiting for its completion.
-        let mut store = MemoryArtifactStore::default();
-        let discarded = execute_with_config(
-            &generate,
-            &mut backend,
-            BTreeMap::new(),
-            &mut store,
-            SamplingMode::Fresh,
-            ExecutionConfig::default(),
-        )
-        .unwrap();
-        drop(discarded);
-        drop(backend);
     }
 }
+pub(crate) use gpu_prepared::PreparedRuntimeValue;

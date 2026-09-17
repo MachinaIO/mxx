@@ -11,6 +11,7 @@ extern "C" {
 #endif
 
 typedef struct GpuMatrix GpuMatrix;
+typedef struct GpuPreparedMatrixLease GpuPreparedMatrixLease;
 
 typedef enum GpuPolyFormat
 {
@@ -33,6 +34,10 @@ typedef enum GpuMatrixSampleDist
 #ifdef __cplusplus
 struct GpuMatrix
 {
+    GpuMatrix(GpuContext *context, size_t row_count, size_t column_count,
+              int active_level, GpuPolyFormat active_format);
+    GpuMatrix(GpuMatrix &owner, size_t row_count, size_t column_count,
+              int active_level, GpuPolyFormat active_format);
     GpuContext *ctx;
     size_t rows;
     size_t cols;
@@ -67,6 +72,9 @@ struct GpuMatrix
         size_t n;
         std::vector<uint8_t> limb_coeff_bytes;
         std::vector<size_t> limb_offsets_bytes;
+        // Non-null only while this whole prepared allocation is leased to a
+        // dispatch result. Its backing owner outlives all leased readers.
+        GpuPreparedMatrixLease *prepared_lease = nullptr;
     };
     struct SharedAuxBuffer
     {
@@ -78,11 +86,31 @@ struct GpuMatrix
     };
     std::vector<SharedLimbBuffer> shared_limb_buffers;
     std::vector<SharedAuxBuffer> shared_aux_buffers;
-    std::vector<std::vector<LimbExecState>> exec_limb_states;
+    std::vector<std::vector<LimbExecState>> owned_exec_limb_states;
+    std::vector<std::vector<LimbExecState>> &exec_limb_states;
     // A deferred allocation stays private until its filling kernel is submitted.
     bool descriptors_initialized = true;
     // Actual writes invalidate this; reader lifetime joins remain independent.
-    mutable std::atomic<bool> host_observed_writer_ready{false};
+    std::atomic<bool> owned_host_observed_writer_ready{false};
+    std::atomic<bool> &host_observed_writer_ready;
+    // Non-owning native link. The Rust header retains a strong backing Arc.
+    // Views never recycle the payload or destroy its events.
+    GpuMatrix *prepared_view_owner = nullptr;
+    // The immutable stream assignment selected when this owner was created.
+    // Prepared planning consumes this value; it must not be reconstructed from
+    // the execution owner's mutable stream cursor after ordinary allocation.
+    struct PreparedOwnerPartition
+    {
+        int device = -1;
+        size_t pool_size = 0;
+        size_t local_limb_count = 0;
+        size_t shared_stream_slot = 0;
+        size_t limb_stream_slots[64]{};
+    };
+    uint64_t prepared_owner_execution_identity = 0;
+    int prepared_owner_execution_class = 0;
+    size_t prepared_owner_partition_count = 0;
+    PreparedOwnerPartition prepared_owner_partitions[64]{};
 };
 #endif
 

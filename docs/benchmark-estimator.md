@@ -1,39 +1,116 @@
-# Benchmark timing semantics
+# Benchmark estimator
 
-`mxx-bench-estimator` distinguishes full logical work, cumulative production wave time,
-and an ideal dependency schedule. `NodeMeasurement::work_seconds` includes every
-production wave. `cumulative_wave_seconds` sums their measured fleet wall times;
-`CostReport::total_time_seconds` additionally includes every nested invocation.
-Benchmark-role totals use the same cumulative accounting.
+`mxx-bench-estimator` estimates a validated graph from prepared mini-programs.
+It keeps device work, prepared-wave time, dependency latency, workspace, and
+dataflow costs separate. It does not execute the application graph to discover
+resources.
 
-For operations accepted by the existing type-aware GPU column-range capability,
-the backend measures a coordinated fleet wave and records the exact calibrated
-`independent_wave_count`. Logical work and cumulative time multiply by that count;
-dependency `latency_seconds` remains one measured fleet wave. A final partial wave
-retains the existing conservative full-wave cost. Fleet wall time includes coordinated
-enqueue/completion and is not replaced with the maximum device timer.
+## Measurement boundary
 
-All calibrated column-separable operations use this rule, including hash sampling,
-matrix arithmetic, and supported ranged trapdoor/preimage operations. Inner products,
-reductions, and trapdoor dependencies inside a measured wave retain their measured
-cost. Graph edges remain dependency barriers. Operations without a valid independent
-column range use the complete atomic measurement unchanged. Sequential loops multiply
-dependency latency; parallel loops preserve one iteration's latency. Neither rule
-changes production scheduling, matrix values, hash tags, or sampling parameters.
+The estimator first collects concrete operation classes from the validated IR.
+A class includes its operation semantics, concrete parameter and shape types,
+CRT level and format, input-owner sharing, device placement, and preparation
+metadata. Repeated graph nodes reuse a class and contribute multiplicity;
+different concrete contracts require different classes.
 
-Ideal simultaneous-wave parallelism and transient workspace scale by the wave count,
-with saturating resource arithmetic. These are hypothetical unlimited-resource values,
-not the measured GPU fleet's physical peak. Persistent inputs retain the graph's shared
-ownership model; replication and transfer of fixed operands to hypothetical additional
-fleets are not modeled. Consequently these resource figures are not a provisioning plan.
-`chunk_count` sums primitive waves within a scope and counts each structural node once;
-nested invocation counts are separate in `per_subgraph`.
+For each missing class, explicit setup builds a prepared mini-program using
+the same compile and warmup boundary as runtime. Warmup resolves exact native
+descriptors, fixed owners, output lifetimes, preimage lanes, and typed capacity
+claims in one transaction. Measurement then runs only the published prepared
+program. Report generation freezes the measurement table and performs CPU-only
+lookup; it cannot trigger a second warmup or substitute an unprepared class.
 
-`measured_wave_workspace_bytes` retains the largest measured bounded-wave scratch
-without multiplying it by wave count or loop iterations. It excludes resident
-inputs and is not a whole-graph physical peak. This field is reported separately
-from ideal simultaneous-wave workspace.
+Synthetic operands describe the declared placement scenario. They are useful
+for comparing classes but are not a physical VRAM guarantee and do not certify
+an application's artifact representation or ownership. A missing class is an
+explicit estimator error.
 
-The GPU log `measured independent GPU fleet waves` records measured fleet latency,
-wave count, complete work, cumulative wave time, and physical wave workspace explicitly.
-Benchmark results must be rerun when their measurement semantics change.
+The GPU implementation is `GpuNodeMeasurementBackend`. Its production caller
+walks each validated graph while collecting canonical operation classes, then
+calls `measure_collected` to warm and execute prepared representative programs
+before report generation consults the frozen table. There is no Diamond-specific
+direct primitive interpreter, pilot-calibration registry, or candidate-width
+fallback. The measured path still groups fleet waves, observes prepared memory,
+and assigns columns with capped water-filling.
+
+## Report quantities
+
+For class `k`, with multiplicity `n_k`, fleet wall time `L_k`, and device spans
+`D_ki`, the adapter reports:
+
+```text
+work_seconds = sum_k(n_k * sum_i(D_ki))
+cumulative_wave_seconds = sum_k(n_k * L_k)
+independent_wave_count = sum_k(n_k)
+latency_seconds = max_k(L_k)
+```
+
+`work_seconds` is aggregate device time from CUDA event spans. It is not host
+elapsed time and is never divided by the device count. `cumulative_wave_seconds`
+includes the prepared wave wall boundary, including coordinated submission and
+completion. For independent classes, their latency is the maximum class span;
+graph dependencies are added to form `CostReport::critical_path_seconds`. This
+is not a promise about a physically contended fleet.
+
+`CostReport::total_time_seconds` adds separately owned dataflow/materialization
+and executor-dispatch costs. GPU-resident edges have no extra host-transfer
+charge. `measured_wave_workspace_bytes` describes the prepared measurement's
+incremental allocation, including one wave's outputs when the representative
+allocates them; it is not a whole-graph physical peak or a provisioning
+certificate.
+
+## Dataflow and artifacts
+
+Artifact encoding, decoding, host staging, and reload are measured through the
+production codec/store boundary and reported as `TransferCost` with their
+ownership. Fixture construction is outside primitive timing. Compact and raw
+RNS representations retain their actual declared format; the estimator does
+not insert a level-conversion trial or a placeholder operation.
+
+The dataflow model follows graph liveness, captures, subgraphs, sequential
+loops, and bounded parallel loops. It applies multiplicity to prepared classes
+and retains dependency barriers. It may use CPU metadata analysis, but it does
+not allocate GPU owners or submit work while producing a report.
+
+## Sampling and integer capacity
+
+Preimage classes include fixed prepared lanes and the complete saved resource
+descriptor. Synthetic measurement uses the same fixed-lane replay contract as
+production. Record/Replay payloads are actual accepted payloads, not inferred
+samples.
+
+Scalar classes use arbitrary-precision `BigInt` values. Warmup derives fixed
+projections for each declared range, and estimator measurements do not model
+runtime scalar storage changes. Values beyond a prepared projection are rejected
+explicitly by execution. Report generation performs CPU-only lookup and does not
+invoke device allocation or resizing.
+
+## Runtime agreement
+
+The production GPU entry point is
+`PreparedGpuProgram::run_with_runtime_bindings`, after explicit warmup. An
+unprepared request returns `NotPrepared` before slot acquisition or GPU work.
+Estimator setup follows that same contract. It does not model a fallback
+executor, a dynamic resource decision, or a second reservation for an
+exhausted prepared slot.
+
+Native failures poison the affected prepared slot. Input, capacity, and pool
+exhaustion failures remain distinguishable and recoverable. Terminal reader and
+writer events, rather than host-handle lifetime, determine slot reuse.
+
+## Validation
+
+Use the following narrow checks for estimator or runtime changes:
+
+```text
+cargo +nightly fmt --all
+git diff --check
+cargo check -p mxx-bench-estimator --lib
+cargo test -p mxx-bench-estimator --lib --no-run
+cargo check -p mxx-runtime --features gpu --lib
+```
+
+Run GPU timing and multi-device tests on the applicable hardware. Integration
+tests require explicit approval. Source-policy tests should prove estimator
+production code constructs prepared mini-programs and does not call removed
+legacy constructors or alternate evaluators.

@@ -2,17 +2,29 @@
 
 #include "matrix/Matrix.cuh"
 
+struct GpuPreparedOwnerLayout;
+
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+    typedef enum GpuMatrixExecutionClass
+    {
+        GPU_MATRIX_EMPTY = 0,
+        GPU_MATRIX_SHARED_STREAM = 1,
+        GPU_MATRIX_PER_LIMB_STREAMS = 2,
+    } GpuMatrixExecutionClass;
+
     typedef struct GpuMatrixAllocationBytes
     {
         size_t data_bytes;
         size_t aux_bytes;
+        // Reusable portion of aux_bytes, excluding descriptors and padding.
+        size_t aux_workspace_bytes;
         size_t event_bytes;
         size_t total_bytes;
+        GpuMatrixExecutionClass execution_class;
     } GpuMatrixAllocationBytes;
 
     int gpu_matrix_query_allocation_bytes(
@@ -31,10 +43,24 @@ extern "C"
         int format,
         GpuMatrix **out,
         bool initialize_descriptors = true);
+    int gpu_matrix_create_prepared(
+        GpuContext *ctx,
+        int level,
+        size_t rows,
+        size_t cols,
+        int format,
+        const GpuPreparedOwnerLayout *owner_layout,
+        GpuMatrix **out,
+        bool initialize_descriptors = true);
     void gpu_matrix_destroy(GpuMatrix *mat);
+    int gpu_matrix_prepared_shape(GpuMatrix *owner, size_t rows, size_t cols,
+        int level, int format, GpuMatrix **out);
+    int gpu_matrix_zero(GpuMatrix *mat);
     int gpu_matrix_wait(const GpuMatrix *mat);
+    int gpu_matrix_is_ready(const GpuMatrix *mat, int *out_ready);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
-    int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied);
+    int gpu_matrix_copy_device(GpuMatrix *dst, const GpuMatrix *src, int *out_copied,
+        const GpuMatrixBatchView *view, int require_peer);
     int gpu_matrix_copy_block(
         GpuMatrix *out,
         const GpuMatrix *src,

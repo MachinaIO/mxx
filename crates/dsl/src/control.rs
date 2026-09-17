@@ -15,30 +15,58 @@ pub fn parallel<T: GraphValue>(
     });
     let (scope, output) = result?;
     let schema = output.schema();
-    let family_schema = FamilyType { element: schema, count: count.clone() };
-    if family_schema.wire_types().is_empty() {
-        return Err(DslError::Schema);
+    let outputs = output.flatten();
+    let shared = outputs
+        .iter()
+        .map(|value| {
+            let owner = value.construction_scope();
+            owner != scope && owner.is_ancestor_of(&scope)
+        })
+        .collect::<Vec<_>>();
+    let family_schema = FamilyType { element: schema, count: count.clone(), shared };
+    if family_schema.shared.iter().all(|shared| *shared) {
+        return Family::from_values(&family_schema, &outputs);
     }
     let sealed = SubgraphHandle::seal(
         "parallel-body",
         scope,
         vec![],
-        output.flatten(),
+        outputs
+            .iter()
+            .zip(&family_schema.shared)
+            .filter_map(|(value, shared)| (!shared).then(|| value.clone()))
+            .collect(),
         &[],
         CapturePolicy::Lexical { parallel_index: Some(index_slot) },
     )?;
 
     let arguments = sealed.captures.iter().map(|capture| capture.outer.clone()).collect();
     let modes = sealed.captures.iter().map(|capture| capture.mode.clone()).collect();
-    let types = family_schema.wire_types();
+    let types = family_schema
+        .wire_types()
+        .into_iter()
+        .zip(&family_schema.shared)
+        .filter_map(|(ty, shared)| (!shared).then_some(ty))
+        .collect::<Vec<_>>();
     let node = NodeHandle::parallel_loop(
         sealed.handle,
         arguments,
         types.clone(),
         ParallelLoop { count, minimum_count: 0, index_slot, bindings: vec![], input_modes: modes },
     );
-    let values = (0..types.len())
-        .map(|port| node.output(port as u32).expect("parallel output field"))
+    let mut port = 0u32;
+    let values = outputs
+        .into_iter()
+        .zip(&family_schema.shared)
+        .map(|(value, shared)| {
+            if *shared {
+                value
+            } else {
+                let value = node.output(port).expect("parallel output field");
+                port += 1;
+                value
+            }
+        })
         .collect::<Vec<_>>();
     Family::from_values(&family_schema, &values)
 }
@@ -146,6 +174,84 @@ pub(super) fn normalize<T: GraphValue>(value: T) -> Result<T, DslError> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
+
+    #[test]
+    fn parallel_cache_keeps_captured_fields_shared() {
+        let ring = Ring::new(17, 8);
+        let captured = ring.uniform_residue((1, 1));
+        let cache = parallel(3, |_| Ok((captured.clone(), ring.uniform_residue((1, 1))))).unwrap();
+        assert_eq!(cache.schema().shared, vec![true, false]);
+        assert_eq!(cache.at(0).0.flatten(), captured.flatten());
+        assert_eq!(cache.at(2).0.flatten(), captured.flatten());
+        let shared = cache.field(|value| value.0).unwrap();
+        assert_eq!(shared.flatten(), captured.flatten());
+        assert_eq!(shared.schema().shared, vec![true]);
+        let indexed = cache.field(|value| value.1).unwrap();
+        assert_eq!(indexed.schema().shared, vec![false]);
+        let schema: FamilyType<(MatType, MatType)> =
+            serde_json::from_slice(&serde_json::to_vec(&cache.schema()).unwrap()).unwrap();
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([1; 32]),
+            execution_nonce: [2; 32],
+        };
+        let imported =
+            schema.artifact_input(production, "cache", ArtifactConfidentiality::Public).unwrap();
+        assert_eq!(imported.schema(), cache.schema());
+        assert_eq!(imported.at(0).0.flatten(), imported.at(2).0.flatten());
+        assert!(matches!(imported.flatten()[0].wire_type(), WireType::Matrix(_)));
+        assert!(matches!(imported.flatten()[1].wire_type(), WireType::IndexedFamily { .. }));
+        let graph =
+            DslContext::new("shared-cache").public_output("cache", cache).unwrap().build().unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+        assert_eq!(
+            graph
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .filter(|node| matches!(node.kind(), NodeKind::UniformResidueSample { .. }))
+                .count(),
+            1
+        );
+        let loops = graph
+            .graph
+            .root_scope()
+            .nodes()
+            .iter()
+            .filter(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(loops.len(), 1);
+        assert_eq!(loops[0].output_types().len(), 1);
+    }
+
+    #[test]
+    fn parallel_all_captured_fields_need_no_loop() {
+        let ring = Ring::new(17, 8);
+        let captured = ring.input("captured", (1, 1));
+        let family = parallel(7, |_| Ok(captured.clone())).unwrap();
+        assert_eq!(family.count(), &IntExpr::constant(7));
+        assert_eq!(family.flatten(), captured.flatten());
+        let graph =
+            DslContext::new("shared-only").output("shared", family).unwrap().build().unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+        assert!(
+            !graph
+                .graph
+                .root_scope()
+                .nodes()
+                .iter()
+                .any(|node| matches!(node.kind(), NodeKind::ParallelLoop(_)))
+        );
+        // A leaked value from a sibling scope is not a lexical capture.
+        let escaped = RefCell::new(None);
+        parallel(1, |_| {
+            let value = ring.uniform_residue((1, 1));
+            *escaped.borrow_mut() = Some(value.clone());
+            Ok(value)
+        })
+        .unwrap();
+        assert!(parallel(1, |_| Ok(escaped.borrow().as_ref().unwrap().clone())).is_err());
+    }
 
     #[test]
     fn escaped_binder_cannot_be_rebound_through_bit_or_hash_metadata() {

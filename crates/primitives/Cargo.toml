@@ -8,6 +8,9 @@ description = "Polynomial, matrix, sampling, and GPU primitives for mxx"
 [features]
 default = []
 gpu = []
+# Test-only GPU work instrumentation. This must never be enabled for a
+# production build: it adds hooks around native CUDA resource creation.
+gpu-instrumentation = ["gpu"]
 # Internal feature enabled by workspace dev-dependencies to preserve test-only Drop synchronization.
 test-gpu-sync = []
 

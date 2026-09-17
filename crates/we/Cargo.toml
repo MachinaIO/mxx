@@ -7,7 +7,12 @@ description = "Witness encryption constructions for mxx"
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-gadgets/gpu", "mxx-runtime/gpu"]
+gpu = [
+    "mxx-primitives/gpu",
+    "mxx-gadgets/gpu",
+    "mxx-runtime/gpu",
+    "mxx-bench-estimator/gpu",
+]
 
 [dependencies]
 mxx-primitives.workspace = true

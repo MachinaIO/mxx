@@ -104,6 +104,11 @@ pub trait SessionStore: ArtifactStore {
         site: &DrawSite,
     ) -> Result<Option<RecordedValue>, Self::Error>;
 
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error>;
+
     fn record_transcript_batch(
         &mut self,
         production: &ProductionId,

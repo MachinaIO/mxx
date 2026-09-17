@@ -1,7 +1,7 @@
 # Workspace architecture
 
-This repository is a virtual Cargo workspace with no root facade crate. Consumers depend directly
-on the crate that owns an abstraction.
+This repository is a virtual Cargo workspace with no root facade crate.
+Consumers depend directly on the crate that owns an abstraction.
 
 ## Dependency layers
 
@@ -12,105 +12,141 @@ mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
 mxx-fhe                  -> mxx-dsl, mxx-ir-core, mxx-primitives
-mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime
+mxx-we                   -> mxx-bgg, mxx-ir-core, mxx-gadgets, mxx-runtime, mxx-bench-estimator
 mxx-func-enc/io          -> interface-only crates with no dependencies
 ```
 
-Application crates never depend on one another. Diamond WE is active in `mxx-we`; functional
-encryption and iO protocol implementations have been removed during the DSL migration.
+Application crates do not depend on one another. The authoritative crate list
+is the workspace member list in `Cargo.toml`; the dependency rules are also
+summarized in `docs/architecture.md`.
 
 ## Responsibilities
 
 ### `mxx-primitives`
 
-Owns polynomial and matrix representations, OpenFHE integration, concrete sampling, and native
-CUDA. CPU Gaussian sampling resamples individual coefficients outside the authoritative integer
-cutoff. CPU preimage sampling rejects a whole candidate outside its cutoff so `B * K = P` is
-preserved. GPU Gaussian sampling enforces the same cutoff per coefficient in CUDA. Batched GPU
-preimage sampling rejects a whole GPU-generated candidate after full-CRT centered-norm checking,
-preserving both the preimage equation and the authoritative cutoff.
+Owns polynomial and matrix representations, OpenFHE integration, concrete
+sampling, and native CUDA. CPU and GPU samplers enforce the authoritative
+integer and centered-norm cutoffs. GPU matrix operations expose low-level
+saved-layout bind primitives and native completion dependencies; they do not
+own graph scheduling or runtime binding checks.
 
 ### `mxx-ir-core`
 
-Owns the canonical executable graph, compile expressions, artifact metadata, parameter/type/shape
-validation, execution ordering, and liveness. `derive_param_constraints` is the shared source of
-decidable compile-parameter conditions consumed by concrete validation. Sampler
-nodes serialize required integer coefficient cutoffs. Subgraph and parallel-loop bodies are
-structural and stored once.
+Owns the canonical executable graph, compile expressions, artifact metadata,
+parameter/type/shape validation, execution ordering, and liveness.
+`derive_param_constraints` is the shared source of decidable compile-parameter
+conditions. Sampler nodes serialize their integer coefficient cutoffs.
+Subgraph and parallel-loop bodies are structural and stored once.
 
-`protocol` owns protocol declarations, input contracts, frozen graph annotations, sampler-free
-ideal/predicate specifications, and structural validation of linked workflows. These are core
-graph data and checks, independent of the DSL used to construct a graph. There is no separate
-correctness crate and no generic symbolic noise simulator.
-
-The Lean exporter owns primitive execution-relation generation and application-independent linked
-claim assembly. It receives explicit graph connections and endpoint semantics, not a WE protocol
-implementation, and does not infer noise bounds or expand structural families into individual lanes.
-`lean::protocol` converts a protocol declaration into exported roots and a linked claim;
-`lean::claim` renders the final proposition. Applications supply backend bindings and decoder
-semantics, while their mathematical bounds and proofs remain application-owned.
+The `protocol` modules own declarations, input contracts, frozen graph
+annotations, sampler-free ideal/predicate specifications, and structural
+validation of linked workflows. The Lean exporter generates primitive
+execution relations and linked claims from explicit graph endpoints; it does
+not infer noise bounds or expand structural families into lanes.
 
 ### `mxx-dsl`
 
-Creates immutable core nodes immediately. It has no symbolic reinterpretation layer.
-The constructed graphs feed core-owned `IdealSpec` and `PurePredicateSpec` validation.
-Indexed `Family<T>` values preserve composite element schemas. `parallel` and `iterate` create
-structural loops; lexical reads become explicit core dependencies with inferred member indexing.
+Creates immutable core nodes immediately and has no symbolic reinterpretation
+layer. `Family<T>` preserves composite element schemas. `parallel` and
+`iterate` create structural loops, and lexical reads become explicit core
+dependencies with inferred member indexing.
 
 ### `mxx-runtime`
 
-Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
-transcripts, sessions, artifacts, and bounded parallel waves.
+Executes validated schedules on CPU or on the prepared GPU primitive backend.
+CPU execution is independent of GPU preparation. GPU execution has exactly
+three boundaries:
+
+1. Compile validates the graph and lowers it to a fixed typed recipe.
+2. Warmup resolves saved native descriptors, exact owners and layouts, fixed
+   preimage lanes, output lifetimes, and reusable slot capacity.
+3. Execute validates runtime bindings and replays the published commands.
+
+Warmup uses one resolver transaction for retained owners, workspace, and all
+execution slots. A failed transaction releases its complete partial state.
+Execution can reach only `PreparedGpuProgram::run_with_runtime_bindings`; an
+unprepared or structurally mismatched request returns `NotPrepared` before
+slot acquisition and GPU submission. There is no dynamic graph walk, runtime
+resource decision, implicit warmup, dynamic scheduler, or fallback runner in
+the production GPU path.
+
+Native operation binds consume resolver-provided saved descriptors. Matrix
+contracts include rows, columns, ordered CRT basis and parameters, level,
+representation, device/context, and owner layout. Families and trapdoors also
+carry their fixed shape and construction metadata. These checks happen before
+slot acquisition and never replace a fixed owner with a mismatched value.
+
+`PreparedPlanLayout` is the sole native operation-layout descriptor. Prepared
+wrappers retain the descriptor produced during planning and pass it to native
+binds; dimensions, live handles, and convenience constructors do not form a
+second layout authority. Evaluation-domain `PolynomialValues` also follows a
+direct source-owner path, without implicit coefficient staging and inverse
+transforms.
+
+Preimage resources use fixed lanes. Fresh and Record sampling use submit-time
+freshness; Record stores the actual accepted native payload and Replay validates
+and uploads the recorded payload without resampling. Runtime scalar values use
+arbitrary-precision `BigInt` values projected to fixed widths during warmup. Each
+execution claims an exact reusable slot and copies into preallocated scalar
+storage. Values exceeding a fixed projection are rejected explicitly; runtime
+execution never grows scalar storage or replans geometry.
+
+Prepared slots advance through acquire, submit, publish, and terminal-event
+retirement. Reader and writer events—not host handle drop—control reuse.
+Input/capacity/exhaustion failures are recoverable. A native failure poisons
+the slot and removes it from reuse. `max_parallel_instances` and
+`max_live_gpu_executions` bound different resources and are accounted for
+separately. A pool exhaustion wait observes existing terminal events and does
+not make a second reservation.
+
+### `mxx-bench-estimator`
+
+The estimator builds prepared mini-programs for representative operation and
+wave classes. It measures each missing class during explicit setup, freezes
+the resulting table, and performs CPU-only lookup during report generation.
+It reports aggregate device work, cumulative prepared-wave time, dependency
+latency, workspace observations, and separately owned dataflow/materialization
+costs. It never executes the application graph to discover a class and never
+uses a missing measurement as a guessed singleton.
+
+For GPU estimation, `GpuNodeMeasurementBackend` collects canonical operation
+classes while walking each validated graph, warms and executes each prepared
+representative once through `measure_collected`, and then estimates from the
+frozen table. The removed Diamond-specific direct primitive interpreter,
+pilot-calibration registry, and candidate-width fallback are not estimator
+paths; fleet grouping, memory observation, and capped water-filling remain
+active.
 
 ### `mxx-gadgets` and `mxx-bgg`
 
-`mxx-gadgets` owns BGG-independent circuits and reusable circuit gadgets.
-`mxx-bgg` owns BGG+-specific keys, encodings, sampling, evaluation, lookup, decoding, artifacts,
-slot transfer, and refresh. Both build executable graphs through `mxx-dsl`.
+`mxx-gadgets` owns reusable circuit gadgets. `mxx-bgg` owns BGG+-specific keys,
+encodings, sampling, evaluation, lookup, decoding, artifacts, and refresh.
+Both construct executable graphs through `mxx-dsl`.
 
 ### Application crates
 
-`mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT modulus
-switching, hybrid RNS key switching over QP, relinearization, and rotations. BGV encrypt/decrypt exchange SIMD slots
-by default, with internal encoding and zero-padding of short inputs. Cryptographic arithmetic
-and sampling execute through the DSL runtime; runtime is a test-only dependency.
-It tracks coefficient noise bounds per ciphertext and reuses primitive ring parameters and DSL
-matrix handles. Bootstrapping is out of scope. CPU and GPU backends share the same
-FHE graphs. GPU centered basis conversion uses native unsigned CRT residues and
-stream-ordered INTT/lift/NTT operations without a host coefficient round trip.
-Hybrid RNS ModUp/ModDown use dedicated graph nodes with an explicit ordered
-source basis, checked by the runtime against registered parameters. CPU and CUDA
-primitives fuse CRT accumulation between one input INTT and one output NTT per
-digit, preserving the approximate centered-sum semantics and noise bounds.
-FHE artifacts stay in memory or enter the protocol as direct runtime inputs.
+`mxx-fhe` builds Ring Regev/Ring-GSW and leveled BGV graphs, including CRT
+modulus conversion and hybrid RNS key switching. CPU and prepared GPU backends
+execute the same FHE graphs; GPU centered basis conversion uses native CRT
+residues and stream-ordered transforms without a host coefficient round trip.
 
-`mxx-we` owns the implementation-independent witness-encryption declaration/runtime traits and the
-Diamond protocol. A Diamond protocol fixes a layered Boolean shape but accepts gate opcodes and
-previous-layer indices as public runtime families. Encryption and decryption consume the same
-circuit assignment; witness bits are decryption-only inputs. Parameter search uses deterministic
-worst-case bounds and accepts a candidate only after Lean checks the generated theorem for the
-same frozen workflow, backend layout, and concrete parameter environment. The selected candidate
-retains its checked artifact; numerical rejection and checker failures remain distinct.
-
-`mxx-func-enc` and `mxx-io` expose only their common interface traits. The disabled AKY24 FE,
-AKY24 iO, and Diamond iO modules and their exclusive BGG helpers have been removed. See the
-README for the `main` branch containing the latest iO implementations. Reusable implementations
-in `mxx-gadgets` remain available.
-
-Tall's old-simulator-dependent parameter search and noisy verification modes are explicitly
-unavailable pending a Tall-specific correctness implementation. The independent noiseless runtime
-round-trip remains available; it is not a substitute for a proved noisy bound.
+`mxx-we` owns the implementation-independent witness-encryption declarations
+and Diamond protocol. Parameter search retains the artifact checked by Lean.
+`mxx-func-enc` and `mxx-io` expose common interface traits only.
 
 ## Generated Lean artifacts
 
-Each crate keeps its handwritten Lean modules directly under `lean/`, without a nested package-name
-directory. Shared modules have crate-qualified filenames such as `PrimitivesBounds.lean` and
-`RuntimeMatrixOps.lean`, avoiding collisions when several packages share one Lean search path.
-Lake libraries list their module roots explicitly. The `MxxPrimitives.lean`, `MxxRuntime.lean`,
-`MxxIR.lean`, `MxxGadgets.lean`, and `MxxBgg.lean` entry modules collect reusable imports; mathematical
-namespaces and theorem names are independent of this file layout.
+Each crate keeps handwritten Lean modules directly under `lean/`, without a
+nested package-name directory. Shared modules use crate-qualified filenames.
+Lake libraries list module roots explicitly. Entry modules such as
+`MxxPrimitives.lean`, `MxxRuntime.lean`, and `MxxIR.lean` collect reusable
+imports. Generated files belong under ignored test-data or temporary artifact
+directories; no example executable is required.
 
-Diamond parameter search generates and checks Lean artifacts through the production library API;
-the GPU integration test uses that same search. No separate example executable is required.
-Crates do not contain example targets: reusable extraction fixtures live in ordinary unit-test
-modules, and generated files belong under ignored `test_data` or temporary artifact directories.
+## Validation requirements
+
+For runtime or GPU changes, run `cargo +nightly fmt --all`,
+`git diff --check`, the relevant crate library checks, and targeted `--no-run`
+tests for primitives and runtime. GPU behavior and multi-device claims require
+the applicable hardware tests. Integration tests are not part of the default
+validation and require explicit approval.

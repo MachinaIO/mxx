@@ -54,7 +54,6 @@ use mxx_runtime::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore, MemoryArtifactStore},
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
     execute_in_session_with_config, execute_with_config,
-    gpu_calibration::FrozenGpuCalibrationRegistry,
     transcript::SamplingMode,
 };
 use num_bigint::{BigInt, BigUint};
@@ -1281,7 +1280,7 @@ fn benchmark_estimation(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-) -> Result<(CostReport, CostReport, FrozenGpuCalibrationRegistry), String> {
+) -> Result<(CostReport, CostReport), String> {
     info!("stage 2/4: benchmark estimation");
     let bindings = ParamEnv::default();
     let manifests =
@@ -1335,8 +1334,7 @@ fn benchmark_estimation(
         estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
     info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
     log_cost_report("TallBggEncoding", &encoding_report);
-    let calibration_registry = backend.calibration_registry().freeze();
-    Ok((preprocessing_report, encoding_report, calibration_registry))
+    Ok((preprocessing_report, encoding_report))
 }
 
 fn execution_config(
@@ -1347,6 +1345,7 @@ fn execution_config(
     Ok(ExecutionConfig {
         max_parallel_instances: NonZeroUsize::new(max_parallel_instances)
             .ok_or_else(|| "maximum parallel instances must be positive".to_owned())?,
+        max_live_gpu_executions: ExecutionConfig::default().max_live_gpu_executions,
         preimage_progress: preprocessing_preimage_count.map(|total| PreimageProgressConfig {
             total,
             report_interval: NonZeroUsize::new(config.preimage_progress_interval)
@@ -1745,7 +1744,6 @@ fn end_to_end_processing(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-    calibration_registry: Option<&FrozenGpuCalibrationRegistry>,
 ) -> Result<EndToEndOutputs, String> {
     info!("stage 3/4: end-to-end processing");
     info!(
@@ -1793,9 +1791,16 @@ fn end_to_end_processing(
         let production = {
             let mut preprocessing_backend =
                 gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
-            if let Some(registry) = calibration_registry {
-                preprocessing_backend.set_calibration_registry(registry.clone());
-            }
+            preprocessing_backend
+                .warm_up_prepared_graph(
+                    &preprocessing,
+                    &BTreeMap::from([(
+                        HASH_KEY_INPUT.to_owned(),
+                        RuntimeValue::Bytes(hash_key.to_vec()),
+                    )]),
+                    &producer_execution_config,
+                )
+                .map_err(|error| error.to_string())?;
             let started = Instant::now();
             let preprocessing_result = execute_in_session_with_config(
                 &preprocessing,
@@ -1833,9 +1838,6 @@ fn end_to_end_processing(
     };
     let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
     let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
-    if let Some(registry) = calibration_registry {
-        backend.set_calibration_registry(registry.clone());
-    }
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
@@ -1873,6 +1875,9 @@ fn end_to_end_processing(
         .map_err(|error| error.to_string())?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph validation");
     let started = Instant::now();
+    backend
+        .warm_up_prepared_graph(&encoding_graph, &inputs, &runtime_execution_config)
+        .map_err(|error| error.to_string())?;
     let mut encoding_result = execute_with_config(
         &encoding_graph,
         &mut backend,
@@ -2336,7 +2341,7 @@ fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
         selected.parameters.base_bits(),
         None,
     );
-    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids, None)
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
         .expect("small noiseless Tall execution");
     let (maximum_residual, location) =
         measure_runtime_residual(&selected, &gpu_parameters, outputs)
@@ -2421,7 +2426,7 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         selected.parameters.base_bits(),
         None,
     );
-    let (_preprocessing_report, _encoding_report, calibration_registry) =
+    let (_preprocessing_report, _encoding_report) =
         benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
             .expect("benchmark estimation");
     if requested_mode == TallRunMode::BenchmarkSelected {
@@ -2431,14 +2436,8 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         );
         return;
     }
-    let outputs = end_to_end_processing(
-        &selected,
-        &config,
-        &gpu_parameters,
-        &device_ids,
-        Some(&calibration_registry),
-    )
-    .expect("end-to-end processing");
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
+        .expect("end-to-end processing");
     // Only ZeroNoise reaches execution. No noisy execution may bypass the retired
     // simulator's bound-conformance assertion: it requires a Tall-specific Lean certificate.
     assert_eq!(requested_mode, TallRunMode::ZeroNoise);

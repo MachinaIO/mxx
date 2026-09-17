@@ -25,6 +25,9 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 
+/// Reserved layout for execution-local scratch, never a durable export.
+pub(crate) const STAGED_FAMILY_LAYOUT: &str = "runtime/staged-family-v1";
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ArtifactKey {
     pub production: ProductionId,
@@ -164,6 +167,7 @@ pub struct FileArtifactStore {
     loads: BTreeMap<ArtifactKey, usize>,
     verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
     family_hash_verifications: usize,
+    staged_memory: BTreeMap<ArtifactKey, FileStoredArtifact>,
 }
 
 /// Descriptive alias for callers that prefer the storage medium in the name.
@@ -181,6 +185,11 @@ impl std::fmt::Debug for FileArtifactStore {
 
 impl Drop for FileArtifactStore {
     fn drop(&mut self) {
+        // Closing our descriptor alone can leave a flock held by a concurrent
+        // fork until its child execs. Release ownership explicitly first.
+        for lock in self.locks.values() {
+            let _ = unlock(lock);
+        }
         self.locks.clear();
     }
 }
@@ -197,6 +206,7 @@ impl FileArtifactStore {
             loads: BTreeMap::new(),
             verified_families: BTreeSet::new(),
             family_hash_verifications: 0,
+            staged_memory: BTreeMap::new(),
         })
     }
 
@@ -269,6 +279,9 @@ impl FileArtifactStore {
     }
 
     fn read_stored(&self, key: &ArtifactKey) -> Result<FileStoredArtifact, FileArtifactError> {
+        if let Some(stored) = self.staged_memory.get(key) {
+            return Ok(stored.clone());
+        }
         let path = self.artifact_path(key);
         if !path.exists() {
             return Err(FileArtifactError::Missing(key.clone()));
@@ -446,6 +459,13 @@ impl ArtifactStore for FileArtifactStore {
             layout: layout.map(str::to_owned),
             payload,
         };
+        if let Some(existing) = self.staged_memory.get(&key) {
+            return if existing == &stored {
+                Ok(())
+            } else {
+                Err(FileArtifactError::ArtifactConflict(key))
+            };
+        }
         let path = self.artifact_path(&key);
         if path.exists() {
             let existing = self.read_stored(&key)?;
@@ -454,6 +474,11 @@ impl ArtifactStore for FileArtifactStore {
             }
             return Err(FileArtifactError::ArtifactConflict(key));
         }
+        if layout == Some(STAGED_FAMILY_LAYOUT) {
+            self.staged_memory.insert(key, stored);
+            return Ok(());
+        }
+
         match write_stored_file(&path, &stored) {
             Ok(()) => {}
             Err(FileArtifactError::Io { ref source, .. })
@@ -484,6 +509,9 @@ impl ArtifactStore for FileArtifactStore {
     }
 
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        if self.staged_memory.remove(key).is_some() {
+            return Ok(());
+        }
         let path = self.artifact_path(key);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -596,6 +624,7 @@ impl SessionStore for FileArtifactStore {
             return Err(FileArtifactError::SessionBusy(production));
         }
         if let Err(error) = self.store_session(&session) {
+            unlock(&lock).map_err(|source| FileArtifactError::Io { path: lock_path, source })?;
             return Err(error);
         }
         self.locks.insert(production.clone(), lock);
@@ -607,6 +636,12 @@ impl SessionStore for FileArtifactStore {
         if !self.active_sessions.contains(production) {
             return Err(FileArtifactError::SessionNotOpen(production.clone()));
         }
+        let lock = self
+            .locks
+            .get(production)
+            .ok_or_else(|| FileArtifactError::SessionNotOpen(production.clone()))?;
+        unlock(lock)
+            .map_err(|source| FileArtifactError::Io { path: self.lock_path(production), source })?;
         self.locks.remove(production);
         self.active_sessions.remove(production);
         Ok(())
@@ -622,6 +657,13 @@ impl SessionStore for FileArtifactStore {
             .transcript
             .iter()
             .find_map(|(stored_site, value)| (stored_site == site).then_some(value.clone())))
+    }
+
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error> {
+        Ok(self.session(production)?.transcript)
     }
 
     fn record_transcript_batch(
@@ -951,8 +993,24 @@ fn try_lock(_file: &fs::File) -> io::Result<bool> {
     Ok(true)
 }
 
+#[cfg(unix)]
+fn unlock(file: &fs::File) -> io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn unlock(_file: &fs::File) -> io::Result<()> {
+    Ok(())
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct MemoryArtifactStore {
+    #[cfg(test)]
+    pub(crate) peak_entries: usize,
     entries: BTreeMap<
         ArtifactKey,
         (ArtifactType, ArtifactConfidentiality, Option<String>, ArtifactPayload),
@@ -1208,6 +1266,10 @@ impl ArtifactStore for MemoryArtifactStore {
                     layout.map(str::to_owned),
                     payload,
                 ));
+                #[cfg(test)]
+                {
+                    self.peak_entries = self.peak_entries.max(self.entries.len());
+                }
                 Ok(())
             }
             Entry::Occupied(entry)
@@ -1325,6 +1387,18 @@ impl SessionStore for MemoryArtifactStore {
     ) -> Result<Option<RecordedValue>, Self::Error> {
         let session = self.open_session_record(production)?;
         Ok(session.transcript.get(site).cloned())
+    }
+
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error> {
+        Ok(self
+            .open_session_record(production)?
+            .transcript
+            .iter()
+            .map(|(site, value)| (site.clone(), value.clone()))
+            .collect())
     }
 
     fn record_transcript_batch(
@@ -1524,6 +1598,80 @@ mod tests {
         }
         assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::Bytes(vec![])));
         assert!(!payload_matches(&ArtifactType::Int, &ArtifactPayload::TypedBlob(vec![0])));
+    }
+
+    #[test]
+    fn scratch_stays_in_ram_and_releases_without_losing_exports() {
+        let directory = tempdir().unwrap();
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        let ty = ArtifactType::Bytes { length: 4 };
+        let descriptor = ManifestArtifact {
+            artifact_type: ty.clone(),
+            family_count: None,
+            confidentiality: ArtifactConfidentiality::Private,
+            content_hash: None,
+            layout: Some(STAGED_FAMILY_LAYOUT.to_owned()),
+        };
+        let ram = key();
+        let mut spill = ram.clone();
+        spill.name = "spill".into();
+        let mut exported = ram.clone();
+        exported.name = "exported".into();
+        for item in [&ram, &spill] {
+            store
+                .store(
+                    item.clone(),
+                    &ty,
+                    descriptor.confidentiality,
+                    descriptor.layout.as_deref(),
+                    ArtifactPayload::Bytes(vec![7; 4]),
+                )
+                .unwrap();
+        }
+        assert!(!store.artifact_path(&ram).exists());
+        assert!(!store.artifact_path(&spill).exists());
+        assert_eq!(
+            store.load_staged(&ram, &descriptor).unwrap(),
+            store.load_staged(&spill, &descriptor).unwrap()
+        );
+        store.remove_staged(&ram).unwrap();
+        assert!(!store.staged_memory.contains_key(&ram));
+        store
+            .store(
+                ram.clone(),
+                &ty,
+                descriptor.confidentiality,
+                descriptor.layout.as_deref(),
+                ArtifactPayload::Bytes(vec![8; 4]),
+            )
+            .unwrap();
+        assert!(!store.artifact_path(&ram).exists());
+        store
+            .store(
+                exported.clone(),
+                &ty,
+                descriptor.confidentiality,
+                None,
+                ArtifactPayload::Bytes(vec![9; 4]),
+            )
+            .unwrap();
+        store.remove_staged(&ram).unwrap();
+        store.remove_staged(&spill).unwrap();
+        assert!(!store.artifact_path(&spill).exists());
+        let exported_descriptor = ManifestArtifact { layout: None, ..descriptor };
+        store
+            .store_manifest(Manifest {
+                ir_version: IR_VERSION,
+                production_id: exported.production.clone(),
+                artifacts: BTreeMap::from([(exported.name.clone(), exported_descriptor.clone())]),
+            })
+            .unwrap();
+        drop(store);
+        let mut reopened = FileArtifactStore::new(directory.path()).unwrap();
+        assert_eq!(
+            reopened.load(&exported, &exported_descriptor).unwrap(),
+            ArtifactPayload::Bytes(vec![9; 4])
+        );
     }
 
     #[test]
@@ -1742,6 +1890,40 @@ mod tests {
             store.load(&key, &descriptor).expect("load original payload"),
             ArtifactPayload::Bytes(vec![1])
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_file_session_owner_releases_locks_with_duplicated_descriptors() {
+        for explicit in [false, true] {
+            let directory = tempdir().unwrap();
+            let production = production(50);
+            let descriptor = SessionDescriptor::new(production.clone(), "graph", [10; 32]);
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            assert_eq!(store.open_session(&descriptor).unwrap(), SessionStatus::Running);
+            // dup shares the same open file description as a fork-inherited
+            // descriptor, so this exercises the lifetime without process races.
+            let inherited = store.locks[&production].try_clone().unwrap();
+            let mut contender = FileArtifactStore::new(directory.path()).unwrap();
+            assert!(matches!(
+                contender.open_session(&descriptor),
+                Err(FileArtifactError::SessionBusy(_))
+            ));
+            if explicit {
+                store.release_session(&production).unwrap();
+            } else {
+                drop(store);
+            }
+            assert_eq!(contender.open_session(&descriptor).unwrap(), SessionStatus::Running);
+            drop(inherited);
+            let mut third = FileArtifactStore::new(directory.path()).unwrap();
+            assert!(matches!(
+                third.open_session(&descriptor),
+                Err(FileArtifactError::SessionBusy(_))
+            ));
+            contender.release_session(&production).unwrap();
+            assert_eq!(third.open_session(&descriptor).unwrap(), SessionStatus::Running);
+        }
     }
 
     #[test]

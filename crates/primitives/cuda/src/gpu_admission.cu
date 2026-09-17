@@ -1,0 +1,3459 @@
+#include "gpu_admission.cuh"
+#include "matrix/Matrix.cuh"
+#include "matrix/MatrixData.cuh"
+
+#include <atomic>
+#include <string>
+#include <cstdio>
+#include <algorithm>
+#include <exception>
+#include <memory>
+#include <limits>
+#include <mutex>
+#include <numeric>
+#include <stdexcept>
+#include <set>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace {
+constexpr unsigned int available = 0;
+constexpr unsigned int reserved = 1;
+constexpr unsigned int leased = 2;
+constexpr unsigned int quarantined = 3;
+constexpr unsigned int inspecting = 4;
+constexpr size_t resetting = std::numeric_limits<size_t>::max();
+constexpr int acquisition_conflict = -2;
+
+int fail(const char *message) { return gpu_set_last_error(message); }
+int conflict(const char *message) {
+    gpu_set_last_error(message);
+    return acquisition_conflict;
+}
+int fail(cudaError_t error) { return fail(cudaGetErrorString(error)); }
+
+uint64_t next_identity() {
+    static std::atomic<uint64_t> next{1};
+    uint64_t value = next.load(std::memory_order_relaxed);
+    while (value != std::numeric_limits<uint64_t>::max()) {
+        if (next.compare_exchange_weak(value, value + 1, std::memory_order_relaxed))
+            return value;
+    }
+    throw std::runtime_error("prepared matrix identity space exhausted");
+}
+
+bool is_resource(GpuPreparedSlotKind kind) {
+    return kind == GPU_PREPARED_COMPLETION_EVENT || kind == GPU_PREPARED_SUBMISSION_STREAM;
+}
+
+struct ResourceOccupancy {
+    size_t capacity = 0;
+    std::atomic<size_t> reserved{0};
+    std::atomic<size_t> occupied{0};
+    std::atomic<size_t> high_water{0};
+};
+
+struct Slot {
+    GpuMatrix *matrix = nullptr;
+    void *workspace = nullptr;
+    cudaEvent_t resource_event = nullptr;
+    cudaStream_t resource_stream = nullptr;
+    int resource_device = -1;
+    GpuPreparedSlotIdentity identity{};
+    cudaEvent_t reusable = nullptr;
+    size_t auxiliary_capacity_bytes = 0;
+    std::atomic<unsigned int> state{available};
+    // Exclusive invocation ownership is separate from one wave's live lease.
+    // Recycle may make a slot idle without allowing another invocation to steal it.
+    std::atomic<uint64_t> reservation_owner{0};
+    // Capacity exclusion survives operation lease retirement. Only a child
+    // region or an operation authorized by this region may borrow the slot.
+    std::atomic<uint64_t> region_owner{0};
+    std::atomic<bool> pinned_deferred{false};
+    std::atomic<void *> deferred_resource_pointer{nullptr};
+    // Protected by exclusive reserved/leased/inspecting slot ownership. Recycle
+    // deliberately keeps this charge until completion or event-ordered reuse.
+    size_t occupied_units = 0;
+
+    ~Slot() {
+        if (resource_event || resource_stream) {
+            GpuAllocationActivity activity(nullptr, resource_device);
+            int previous = -1;
+            cudaError_t error = cudaGetDevice(&previous);
+            if (error == cudaSuccess) error = cudaSetDevice(resource_device);
+            if (error == cudaSuccess && resource_event) error = cudaEventDestroy(resource_event);
+            if (error == cudaSuccess && resource_stream) error = cudaStreamDestroy(resource_stream);
+            if (previous >= 0 && cudaSetDevice(previous) != cudaSuccess)
+                gpu_device_mark_allocation_unknown(previous);
+            if (error != cudaSuccess) gpu_device_mark_allocation_unknown(resource_device);
+        }
+        // Host DMA leases can outlive the matrix inventory. Their retirement
+        // must never destroy a context on its own pinned-reclaimer thread.
+        if (identity.kind == GPU_PREPARED_PINNED_HOST && workspace)
+            gpu_pinned_free(workspace);
+    }
+};
+
+struct PinnedOccupancy {
+    size_t capacity_bytes = 0;
+    std::atomic<size_t> reserved_bytes{0};
+    std::atomic<size_t> occupied_bytes{0};
+    std::atomic<size_t> high_water_bytes{0};
+};
+
+struct Storage;
+void quarantine(Storage &storage);
+
+struct Storage {
+    uint64_t identity = 0;
+    GpuContext *context = nullptr;
+    int device = -1;
+    std::vector<std::shared_ptr<Slot>> slots;
+    size_t requested_capacity_bytes = 0;
+    std::shared_ptr<PinnedOccupancy> pinned = std::make_shared<PinnedOccupancy>();
+    std::shared_ptr<ResourceOccupancy> resources = std::make_shared<ResourceOccupancy>();
+    std::atomic<size_t> reserved_bytes{0};
+    std::atomic<size_t> occupied_bytes{0};
+    std::atomic<size_t> occupied_high_water_bytes{0};
+    std::atomic<size_t> active_reservations{0};
+    bool registered = false;
+    void *owner = nullptr;
+    void (*release_owner)(void *) = nullptr;
+    cudaEvent_t release_probe = nullptr;
+    bool release_started = false;
+    bool release_complete = false;
+    bool release_quarantined = false;
+
+    ~Storage() {
+        auto execution = context ? context->execution : nullptr;
+        if (registered) {
+            execution->prepared_occupied_bytes.fetch_sub(
+                occupied_bytes.load(std::memory_order_acquire), std::memory_order_acq_rel);
+            execution->prepared_storage_count.fetch_sub(1, std::memory_order_acq_rel);
+        }
+        GpuAllocationActivity activity(execution.get(), device);
+        bool uncertain_release = release_started && (!release_complete || release_quarantined);
+        if (uncertain_release) quarantine(*this);
+        int previous = -1;
+        cudaError_t error = cudaGetDevice(&previous);
+        if (error == cudaSuccess && device >= 0) error = cudaSetDevice(device);
+        for (auto &slot : slots) {
+            if (uncertain_release) {
+                // The release event was never observed complete (or a
+                // retirement operation failed). Do not let Slot::~Slot or a
+                // retry free host memory whose DMA completion is uncertain.
+                if (slot->identity.kind == GPU_PREPARED_PINNED_HOST) slot->workspace = nullptr;
+                slot->reusable = nullptr;
+                slot->resource_event = nullptr;
+                slot->resource_stream = nullptr;
+                continue;
+            }
+            if (error == cudaSuccess && slot->workspace &&
+                slot->identity.kind == GPU_PREPARED_PINNED_HOST) {
+                int retained = 0;
+                if (gpu_pinned_free_uncached(slot->workspace, &retained) != 0) {
+                    error = cudaErrorUnknown;
+                    release_quarantined = true;
+                    uncertain_release = true;
+                    quarantine(*this);
+                    slot->workspace = nullptr;
+                }
+                // An active pinned lease owns the backing until its CPU owner
+                // or completion reclaimer releases it. Keep the slot alive
+                // through that lease instead of freeing the pointer while it
+                // is still exposed to the caller.
+                if (!retained) slot->workspace = nullptr;
+            }
+            if (!release_started && error == cudaSuccess && slot->workspace &&
+                slot->identity.kind != GPU_PREPARED_PINNED_HOST)
+                error = cudaFreeAsync(slot->workspace, execution->release_streams_by_partition[0]);
+            if (error == cudaSuccess && slot->reusable)
+                error = cudaEventDestroy(slot->reusable);
+        }
+        if (!uncertain_release && error == cudaSuccess && release_probe)
+            error = cudaEventDestroy(release_probe);
+        if (error != cudaSuccess && !uncertain_release) {
+            // Any teardown failure makes the remaining native ownership
+            // uncertain. Quarantine all handles before slots.clear() so their
+            // destructors cannot turn a partial failure into a host free.
+            release_quarantined = true;
+            uncertain_release = true;
+            quarantine(*this);
+            for (auto &slot : slots) {
+                if (slot->identity.kind == GPU_PREPARED_PINNED_HOST) slot->workspace = nullptr;
+                slot->reusable = nullptr;
+                slot->resource_event = nullptr;
+                slot->resource_stream = nullptr;
+            }
+        }
+        if (uncertain_release) release_probe = nullptr;
+        slots.clear();
+        // Every idle slot has already joined its readers on the release stream.
+        // The real owners retain their existing event-ordered allocation frees.
+        if (error == cudaSuccess && !release_started) {
+            if (release_owner) release_owner(owner);
+        } else if (error != cudaSuccess && execution) {
+            // The callback owns the real backing. Retain it if CUDA cannot
+            // safely retire the prepared resources.
+            execution->memory_release_failed.store(true, std::memory_order_release);
+            execution->unretired_work.store(true, std::memory_order_release);
+            gpu_execution_mark_allocation_unknown(execution.get());
+        }
+        if (previous >= 0 && previous != device && cudaSetDevice(previous) != cudaSuccess)
+            gpu_execution_mark_allocation_unknown(execution.get());
+    }
+};
+
+struct PreparedRelease {
+    std::shared_ptr<Storage> storage;
+};
+
+void quarantine(Storage &storage) {
+    if (!storage.context || !storage.context->execution) return;
+    storage.context->execution->memory_release_failed.store(true, std::memory_order_release);
+    storage.context->execution->unretired_work.store(true, std::memory_order_release);
+    gpu_execution_mark_allocation_unknown(storage.context->execution.get());
+}
+
+size_t reservation_units(const Slot &slot) {
+    return is_resource(slot.identity.kind) ? 1 : slot.identity.requested_backing_bytes;
+}
+
+std::atomic<size_t> &reserved_counter(Storage &storage, const Slot &slot) {
+    if (is_resource(slot.identity.kind)) return storage.resources->reserved;
+    return slot.identity.kind == GPU_PREPARED_PINNED_HOST
+        ? storage.pinned->reserved_bytes : storage.reserved_bytes;
+}
+
+void occupy(Storage &storage, Slot &slot, size_t requested_bytes) {
+    auto &occupied = is_resource(slot.identity.kind) ? storage.resources->occupied :
+        (slot.identity.kind == GPU_PREPARED_PINNED_HOST
+        ? storage.pinned->occupied_bytes : storage.occupied_bytes);
+    auto &high_water = is_resource(slot.identity.kind) ? storage.resources->high_water :
+        (slot.identity.kind == GPU_PREPARED_PINNED_HOST
+        ? storage.pinned->high_water_bytes : storage.occupied_high_water_bytes);
+    // Each layout uses nested prefixes of this group's data/auxiliary spans.
+    // Keep their largest unretired use, including preceding readers, once.
+    if (requested_bytes > slot.occupied_units) {
+        const size_t increase = requested_bytes - slot.occupied_units;
+        slot.occupied_units = requested_bytes;
+        const size_t bytes = occupied.fetch_add(
+            increase, std::memory_order_acq_rel) + increase;
+        size_t peak = high_water.load(std::memory_order_relaxed);
+        while (peak < bytes && !high_water.compare_exchange_weak(
+                   peak, bytes, std::memory_order_relaxed)) {}
+        if (!is_resource(slot.identity.kind) && slot.identity.kind != GPU_PREPARED_PINNED_HOST) {
+            auto &execution = *storage.context->execution;
+            const size_t joint = execution.prepared_occupied_bytes.fetch_add(
+                increase, std::memory_order_acq_rel) + increase;
+            size_t joint_peak = execution.prepared_high_water_bytes.load(std::memory_order_relaxed);
+            while (joint_peak < joint && !execution.prepared_high_water_bytes.compare_exchange_weak(
+                       joint_peak, joint, std::memory_order_relaxed)) {}
+        }
+    }
+    reserved_counter(storage, slot).fetch_sub(
+        reservation_units(slot), std::memory_order_acq_rel);
+}
+
+struct PreparedClaim {
+    GpuPreparedRequest request;
+    size_t data_bytes = 0;
+    size_t auxiliary_slots = 0;
+    size_t occupied_units = 0;
+};
+
+int prepare_claim_layout(GpuContext *context, const GpuPreparedSlotSnapshot &capacity,
+    const GpuPreparedRequest &request, PreparedClaim &claim, bool &fits)
+{
+    fits = false;
+    const auto &identity = capacity.identity;
+    if (request.kind != identity.kind) return 0;
+    if (request.kind == GPU_PREPARED_MATRIX) {
+        if (request.rows == 0 || request.columns == 0 || request.bytes != 0 ||
+            request.alignment != 0 ||
+            (request.format != GPU_POLY_FORMAT_COEFF && request.format != GPU_POLY_FORMAT_EVAL))
+            return fail("invalid prepared matrix request layout");
+        if (request.level != identity.level || request.rows > identity.rows ||
+            request.columns > identity.columns) return 0;
+        GpuMatrixAllocationBytes layout{};
+        const int status = gpu_matrix_query_allocation_bytes(
+            context, request.level, request.rows, request.columns, request.format,
+            &layout);
+        if (status != 0) return status;
+        if (layout.data_bytes > identity.payload_bytes ||
+            layout.aux_workspace_bytes > capacity.auxiliary_capacity_bytes ||
+            layout.aux_workspace_bytes % sizeof(void *) != 0 ||
+            layout.aux_bytes > SIZE_MAX - layout.data_bytes ||
+            layout.data_bytes + layout.aux_bytes > identity.requested_backing_bytes) return 0;
+        claim.data_bytes = layout.data_bytes;
+        claim.auxiliary_slots = layout.aux_workspace_bytes / sizeof(void *);
+        claim.occupied_units = layout.data_bytes + layout.aux_bytes;
+    } else if (is_resource(request.kind)) {
+        if (request.rows != 0 || request.columns != 0 || request.level != -1 ||
+            request.format != -1 || request.bytes != 0 || request.alignment != 1)
+            return fail("invalid prepared CUDA resource request");
+        claim.occupied_units = 1;
+    } else {
+        if ((request.kind != GPU_PREPARED_BATCH_WORKSPACE &&
+             request.kind != GPU_PREPARED_TRANSFORM_WORKSPACE &&
+             request.kind != GPU_PREPARED_PINNED_HOST &&
+             request.kind != GPU_PREPARED_COMPACT_PAYLOAD &&
+             request.kind != GPU_PREPARED_COMPACT_WORKSPACE &&
+             request.kind != GPU_PREPARED_SAMPLER_WORKSPACE &&
+             request.kind != GPU_PREPARED_TRANSFER_WORKSPACE) ||
+            request.rows != 0 || request.columns != 0 || request.level != -1 ||
+            request.format != -1 || request.bytes == 0 || request.alignment == 0 ||
+            (request.alignment & (request.alignment - 1)) != 0)
+            return fail("invalid prepared workspace request layout");
+        if (request.bytes > identity.requested_backing_bytes ||
+            request.alignment > identity.alignment) return 0;
+        claim.occupied_units = request.bytes;
+    }
+    fits = true;
+    return 0;
+}
+
+int prepare_claims(
+    const Storage &storage, const GpuPreparedRequest *requests, size_t count,
+    std::vector<PreparedClaim> &claims, bool &fits)
+{
+    fits = false;
+    if (count != 0 && !requests) return fail("missing prepared requests");
+    std::unordered_set<size_t> unique;
+    claims.reserve(count);
+    for (size_t index = 0; index < count; ++index) {
+        const auto &request = requests[index];
+        if (request.storage_id != storage.identity || request.slot_index >= storage.slots.size())
+            return fail("prepared request belongs to another storage");
+        const auto &slot = *storage.slots[request.slot_index];
+        const auto &identity = slot.identity;
+        if (request.slot_id != identity.slot_id || !unique.insert(request.slot_index).second)
+            return fail("stale or duplicate prepared slot request");
+        PreparedClaim claim{request};
+        const GpuPreparedSlotSnapshot capacity{identity, slot.auxiliary_capacity_bytes, 0};
+        bool layout_fits = false;
+        const int status = prepare_claim_layout(storage.context, capacity, request, claim, layout_fits);
+        if (status != 0 || !layout_fits) return status;
+        claims.push_back(claim);
+    }
+    fits = true;
+    return 0;
+}
+}
+
+namespace {
+struct Region {
+    std::shared_ptr<Storage> storage;
+    uint64_t identity = next_identity();
+    std::vector<size_t> slots;
+    size_t acquired = 0;
+
+    ~Region() {
+        for (size_t index = 0; index < acquired; ++index)
+            storage->slots[slots[index]]->region_owner.store(
+                0, std::memory_order_release);
+    }
+};
+}
+struct GpuPreparedRegion { std::shared_ptr<Region> value; };
+struct GpuPreparedStorage { std::shared_ptr<Storage> value; };
+
+// Workspace-only storage deliberately has a separate native owner.  Matrix
+// storage keeps its existing single-device/backing contract; this owner has
+// no GpuMatrix pointers and can cover all partitions of one execution owner.
+struct WorkspaceSlot {
+    GpuPreparedWorkspaceClaim claim{};
+    GpuPreparedWorkspaceSlotIdentity identity{};
+    void *pointer = nullptr;
+    cudaEvent_t resource_event = nullptr;
+    cudaStream_t resource_stream = nullptr;
+    std::atomic<uint64_t> reservation_owner{0};
+    std::atomic<bool> lease_active{false};
+    std::atomic<bool> release_event_recorded{false};
+    // One setup-created bridge event orders this exact compute stream before
+    // the partition release stream. It is control state, not workspace bytes.
+    cudaEvent_t release_event = nullptr;
+};
+
+struct WorkspaceStorage {
+    uint64_t identity = 0;
+    GpuContext *context = nullptr;
+    std::shared_ptr<GpuExecutionOwner> execution;
+    std::vector<std::shared_ptr<WorkspaceSlot>> slots;
+    size_t device_bytes = 0;
+    size_t pinned_bytes = 0;
+    size_t resource_slots = 0;
+    std::vector<GpuPreparedWorkspaceDeviceAccounting> device_accounting;
+    std::vector<void *> pinned_release_pointers;
+    mutable std::mutex lifecycle_mutex;
+    bool release_started = false;
+
+    ~WorkspaceStorage();
+
+    bool release_has_started() const
+    {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        return release_started;
+    }
+};
+
+struct GpuPreparedWorkspaceStorage { std::shared_ptr<WorkspaceStorage> value; };
+
+struct WorkspaceRelease {
+    std::shared_ptr<WorkspaceStorage> storage;
+};
+
+struct WorkspaceReservation {
+    std::shared_ptr<WorkspaceStorage> storage;
+    std::vector<size_t> slots;
+    std::vector<GpuPreparedWorkspaceRequest> requests;
+    uint64_t identity = next_identity();
+    std::vector<bool> leased;
+    size_t next = 0;
+
+    ~WorkspaceReservation()
+    {
+        std::lock_guard<std::mutex> lock(storage->lifecycle_mutex);
+        for (size_t index = 0; index < slots.size(); ++index) {
+            auto &slot = *storage->slots[slots[index]];
+            if (!leased[index])
+                slot.reservation_owner.compare_exchange_strong(
+                    identity, 0, std::memory_order_acq_rel);
+        }
+    }
+};
+
+struct GpuPreparedWorkspaceReservation {
+    std::shared_ptr<WorkspaceReservation> value;
+};
+
+struct GpuPreparedWorkspaceLease {
+    std::shared_ptr<Storage> storage;
+    size_t slot = 0;
+    std::shared_ptr<WorkspaceStorage> workspace_storage;
+    uint64_t reservation_identity = 0;
+    cudaStream_t completion_stream = nullptr;
+    bool workspace_released = false;
+};
+
+namespace {
+
+extern thread_local GpuPreparedProvisioningPermit *active_provisioning;
+int provisioning_consume(
+    GpuContext *context, GpuPreparedSlotKind kind, size_t rows, size_t columns,
+    int level, int format, size_t bytes, size_t alignment);
+
+bool valid_workspace_kind(GpuPreparedSlotKind kind)
+{
+    switch (kind) {
+        case GPU_PREPARED_BATCH_WORKSPACE:
+        case GPU_PREPARED_TRANSFORM_WORKSPACE:
+        case GPU_PREPARED_PINNED_HOST:
+        case GPU_PREPARED_COMPACT_PAYLOAD:
+        case GPU_PREPARED_COMPACT_WORKSPACE:
+        case GPU_PREPARED_SAMPLER_WORKSPACE:
+        case GPU_PREPARED_TRANSFER_WORKSPACE:
+        case GPU_PREPARED_COMPLETION_EVENT:
+        case GPU_PREPARED_SUBMISSION_STREAM:
+            return true;
+        case GPU_PREPARED_MATRIX:
+            return false;
+    }
+    return false;
+}
+
+cudaStream_t workspace_compute_stream(const WorkspaceStorage &storage, size_t partition,
+    size_t stream_slot)
+{
+    if (!storage.execution || partition >= storage.execution->compute_streams_by_partition.size())
+        return nullptr;
+    const auto &streams = storage.execution->compute_streams_by_partition[partition];
+    return stream_slot < streams.size() ? streams[stream_slot] : nullptr;
+}
+
+cudaStream_t workspace_release_stream(const WorkspaceStorage &storage, size_t partition)
+{
+    if (!storage.execution || partition >= storage.execution->release_streams_by_partition.size())
+        return nullptr;
+    return storage.execution->release_streams_by_partition[partition];
+}
+
+void mark_workspace_release_failure(const WorkspaceStorage &storage)
+{
+    if (storage.execution) {
+        storage.execution->memory_release_failed.store(true, std::memory_order_release);
+        storage.execution->unretired_work.store(true, std::memory_order_release);
+        gpu_execution_mark_allocation_unknown(storage.execution.get());
+    }
+}
+
+int queue_workspace_release(WorkspaceStorage &storage)
+{
+    {
+        std::lock_guard<std::mutex> lock(storage.lifecycle_mutex);
+        if (storage.release_started)
+            return fail("prepared workspace release already started");
+        for (const auto &slot_ptr : storage.slots) {
+            if (slot_ptr->reservation_owner.load(std::memory_order_acquire) != 0 ||
+                slot_ptr->lease_active.load(std::memory_order_acquire))
+                return fail("prepared workspace release has active reservations or leases");
+        }
+        storage.release_started = true;
+    }
+    GpuAllocationActivity activity(storage.execution.get(), -1);
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    for (auto &slot_ptr : storage.slots) {
+        auto &slot = *slot_ptr;
+        const size_t partition = slot.claim.partition;
+        const cudaStream_t compute = workspace_compute_stream(
+            storage, partition, slot.claim.stream_slot);
+        const cudaStream_t release = workspace_release_stream(storage, partition);
+        if (!compute || !release) {
+            error = cudaErrorInvalidResourceHandle;
+            break;
+        }
+        if (error == cudaSuccess) error = cudaSetDevice(slot.claim.device);
+        if (error == cudaSuccess && slot.release_event &&
+            !slot.release_event_recorded.load(std::memory_order_acquire))
+            error = cudaEventRecord(slot.release_event, compute);
+        if (error == cudaSuccess && slot.resource_stream && slot.resource_event)
+            error = cudaEventRecord(slot.resource_event, slot.resource_stream);
+        if (error == cudaSuccess && slot.release_event)
+            error = cudaStreamWaitEvent(release, slot.release_event, 0);
+        if (error == cudaSuccess && slot.resource_event)
+            error = cudaStreamWaitEvent(release, slot.resource_event, 0);
+        if (error != cudaSuccess) break;
+        if (slot.pointer && slot.claim.layout.kind == GPU_PREPARED_PINNED_HOST) {
+            void *pointer = slot.pointer;
+            error = gpu_defer_pinned_frees(storage.context, slot.claim.device, release, &pointer, 1) == 0
+                ? cudaSuccess : cudaErrorUnknown;
+            if (error == cudaSuccess) storage.pinned_release_pointers.push_back(pointer);
+        } else if (slot.pointer) {
+            error = cudaFreeAsync(slot.pointer, release);
+        }
+        if (error != cudaSuccess) break;
+        slot.pointer = nullptr;
+    }
+    if (previous >= 0) {
+        const cudaError_t restored = cudaSetDevice(previous);
+        if (error == cudaSuccess) error = restored;
+    }
+    if (error != cudaSuccess) {
+        mark_workspace_release_failure(storage);
+        return fail(error);
+    }
+    return 0;
+}
+
+} // namespace
+
+WorkspaceStorage::~WorkspaceStorage()
+{
+    if (!release_has_started()) {
+        if (queue_workspace_release(*this) != 0) return;
+    }
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    for (auto &slot_ptr : slots) {
+        auto &slot = *slot_ptr;
+        if (error == cudaSuccess) error = cudaSetDevice(slot.claim.device);
+        if (error == cudaSuccess && slot.resource_event)
+            error = cudaEventDestroy(slot.resource_event);
+        if (error == cudaSuccess && slot.resource_stream)
+            error = cudaStreamDestroy(slot.resource_stream);
+        if (error == cudaSuccess && slot.release_event)
+            error = cudaEventDestroy(slot.release_event);
+        slot.resource_event = nullptr;
+        slot.release_event = nullptr;
+    }
+    if (previous >= 0 && cudaSetDevice(previous) != cudaSuccess)
+        mark_workspace_release_failure(*this);
+    if (error != cudaSuccess) mark_workspace_release_failure(*this);
+}
+
+extern "C" int gpu_prepared_workspace_storage_create(
+    GpuContext *context, const GpuPreparedWorkspaceClaim *claims, size_t count,
+    GpuPreparedWorkspaceStorage **out)
+{
+    if (!out || !context || !context->execution || !claims || count == 0)
+        return fail("invalid prepared workspace-only storage arguments");
+    *out = nullptr;
+    auto execution = context->execution;
+    if (execution->unretired_work.load(std::memory_order_acquire) && !active_provisioning)
+        return fail("cannot prepare workspace-only storage with unretired work");
+    if (!active_provisioning && gpu_context_admission_is_required(context))
+        return fail("prepared workspace-only resources must be created before checked dispatch");
+    GpuAllocationActivity activity(execution.get(), -1);
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error != cudaSuccess) return fail(error);
+    std::shared_ptr<WorkspaceStorage> storage;
+    try {
+        storage = std::make_shared<WorkspaceStorage>();
+        storage->identity = next_identity();
+        storage->context = context;
+        storage->execution = execution;
+        storage->device_accounting.reserve(context->gpu_ids.size());
+        storage->pinned_release_pointers.reserve(count);
+        for (size_t partition = 0; partition < context->gpu_ids.size(); ++partition)
+            storage->device_accounting.push_back(
+                GpuPreparedWorkspaceDeviceAccounting{context->gpu_ids[partition], partition, 0, 0, 0});
+        storage->slots.reserve(count);
+        for (size_t index = 0; index < count; ++index) {
+            const auto &claim = claims[index];
+            const auto &layout = claim.layout;
+            if (!valid_workspace_kind(layout.kind) || claim.partition >= context->gpu_ids.size() ||
+                claim.device != context->gpu_ids[claim.partition] || layout.alignment == 0 ||
+                layout.alignment > 256 || (layout.alignment & (layout.alignment - 1)) != 0 ||
+                !workspace_compute_stream(*storage, claim.partition, claim.stream_slot) ||
+                !workspace_release_stream(*storage, claim.partition))
+                return fail("prepared workspace claim has an invalid context, partition, device or stream");
+            const bool resource = is_resource(layout.kind);
+            if ((resource && (layout.bytes != 0 || layout.alignment != 1)) ||
+                (!resource && layout.bytes == 0))
+                return fail("prepared workspace claim has invalid bytes or alignment");
+            if (active_provisioning) {
+                const int status = provisioning_consume(
+                    context, layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment);
+                if (status != 0) return status;
+            }
+        }
+        for (size_t index = 0; index < count; ++index) {
+            const auto &claim = claims[index];
+            const auto &layout = claim.layout;
+            auto slot = std::make_shared<WorkspaceSlot>();
+            slot->claim = claim;
+            slot->identity.storage_id = storage->identity;
+            slot->identity.execution_owner_identity = execution->identity;
+            slot->identity.context_identity = reinterpret_cast<uint64_t>(context);
+            slot->identity.slot_id = next_identity();
+            slot->identity.slot_index = index;
+            slot->identity.partition = claim.partition;
+            slot->identity.stream_slot = claim.stream_slot;
+            slot->identity.bytes = layout.bytes;
+            slot->identity.alignment = layout.alignment;
+            slot->identity.device = claim.device;
+            slot->identity.kind = layout.kind;
+            // Publish the slot before creating any native event or backing.
+            // If a later setup step fails, WorkspaceStorage's fail-closed
+            // destructor can then retire every resource created for this slot.
+            storage->slots.push_back(slot);
+            error = cudaSetDevice(claim.device);
+            if (error == cudaSuccess)
+                error = cudaEventCreateWithFlags(&slot->release_event, cudaEventDisableTiming);
+            if (error != cudaSuccess) return fail(error);
+            if (is_resource(layout.kind)) {
+                if (layout.kind == GPU_PREPARED_COMPLETION_EVENT) {
+                    error = cudaEventCreateWithFlags(&slot->resource_event, cudaEventDisableTiming);
+                } else {
+                    error = cudaStreamCreateWithFlags(
+                        &slot->resource_stream, cudaStreamNonBlocking);
+                    if (error == cudaSuccess)
+                        error = cudaEventCreateWithFlags(
+                            &slot->resource_event, cudaEventDisableTiming);
+                }
+                if (error != cudaSuccess) return fail(error);
+                ++storage->resource_slots;
+            } else if (layout.kind == GPU_PREPARED_PINNED_HOST) {
+                // Use the runtime pinned pool so teardown can hand this
+                // exact backing to its asynchronous reclaimer. A raw
+                // cudaHostAlloc would be foreign to gpu_defer_pinned_frees
+                // and would make rollback fail closed.
+                slot->pointer = gpu_pinned_alloc(context, layout.bytes, layout.alignment);
+                if (!slot->pointer) {
+                    return fail("failed to prepare pinned host workspace");
+                }
+                if (storage->pinned_bytes > SIZE_MAX - layout.bytes)
+                    return fail("prepared workspace pinned accounting overflow");
+                storage->pinned_bytes += layout.bytes;
+                auto &accounting = storage->device_accounting[claim.partition];
+                if (accounting.pinned_bytes > SIZE_MAX - layout.bytes)
+                    return fail("prepared workspace device accounting overflow");
+                accounting.pinned_bytes += layout.bytes;
+            } else {
+                gpu_test_record_cuda_allocation();
+                error = cudaMallocAsync(&slot->pointer, layout.bytes,
+                    workspace_compute_stream(*storage, claim.partition, claim.stream_slot));
+                if (error == cudaSuccess) {
+                    if (storage->device_bytes > SIZE_MAX - layout.bytes)
+                        return fail("prepared workspace device accounting overflow");
+                    storage->device_bytes += layout.bytes;
+                    auto &accounting = storage->device_accounting[claim.partition];
+                    if (accounting.device_bytes > SIZE_MAX - layout.bytes)
+                        return fail("prepared workspace device accounting overflow");
+                    accounting.device_bytes += layout.bytes;
+                }
+            }
+            if (is_resource(layout.kind))
+                ++storage->device_accounting[claim.partition].resource_slots;
+            if (error != cudaSuccess) return fail(error);
+        }
+        auto result = std::make_unique<GpuPreparedWorkspaceStorage>();
+        result->value = std::move(storage);
+        if (previous >= 0 && cudaSetDevice(previous) != cudaSuccess)
+            return fail(cudaErrorUnknown);
+        *out = result.release();
+        return 0;
+    } catch (const std::exception &exception) {
+        if (previous >= 0) cudaSetDevice(previous);
+        return fail(exception.what());
+    } catch (...) {
+        if (previous >= 0) cudaSetDevice(previous);
+        return fail("unknown prepared workspace-only storage error");
+    }
+}
+
+extern "C" void gpu_prepared_workspace_storage_destroy(GpuPreparedWorkspaceStorage *storage)
+{
+    delete storage;
+}
+
+extern "C" int gpu_prepared_workspace_storage_identity(
+    const GpuPreparedWorkspaceStorage *storage, uint64_t *out_storage_id,
+    uint64_t *out_execution_id, uint64_t *out_context_id)
+{
+    if (!storage || !storage->value || !out_storage_id || !out_execution_id || !out_context_id)
+        return fail("invalid prepared workspace-only storage identity arguments");
+    *out_storage_id = storage->value->identity;
+    *out_execution_id = storage->value->execution->identity;
+    *out_context_id = reinterpret_cast<uint64_t>(storage->value->context);
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_slot_identity(
+    const GpuPreparedWorkspaceStorage *storage, size_t slot,
+    GpuPreparedWorkspaceSlotIdentity *out)
+{
+    if (!storage || !storage->value || !out || slot >= storage->value->slots.size())
+        return fail("invalid prepared workspace-only slot identity arguments");
+    *out = storage->value->slots[slot]->identity;
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_storage_accounting(
+    const GpuPreparedWorkspaceStorage *storage, GpuPreparedWorkspaceAccounting *out)
+{
+    if (!storage || !storage->value || !out)
+        return fail("invalid prepared workspace-only accounting arguments");
+    *out = GpuPreparedWorkspaceAccounting{
+        storage->value->device_bytes, storage->value->pinned_bytes,
+        storage->value->resource_slots, storage->value->slots.size()};
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_device_accounting(
+    const GpuPreparedWorkspaceStorage *storage, size_t partition,
+    GpuPreparedWorkspaceDeviceAccounting *out)
+{
+    if (!storage || !storage->value || !out ||
+        partition >= storage->value->device_accounting.size())
+        return fail("invalid prepared workspace device accounting arguments");
+    *out = storage->value->device_accounting[partition];
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_storage_reserve(
+    GpuPreparedWorkspaceStorage *storage, const GpuPreparedWorkspaceRequest *requests,
+    size_t count, GpuPreparedWorkspaceReservation **out)
+{
+    if (!storage || !storage->value || !requests || count == 0 || !out)
+        return fail("invalid prepared workspace reservation arguments");
+    *out = nullptr;
+    auto backing = storage->value;
+    try {
+        auto reservation = std::make_shared<WorkspaceReservation>();
+        reservation->storage = std::move(backing);
+        std::lock_guard<std::mutex> lock(reservation->storage->lifecycle_mutex);
+        if (reservation->storage->release_started)
+            return fail("prepared workspace storage is releasing");
+        reservation->slots.reserve(count);
+        reservation->requests.reserve(count);
+        reservation->leased.assign(count, false);
+        std::unordered_set<size_t> unique;
+        for (size_t index = 0; index < count; ++index) {
+            const auto &request = requests[index];
+            if (request.storage_id != reservation->storage->identity ||
+                request.slot >= reservation->storage->slots.size() ||
+                !unique.insert(request.slot).second)
+                return fail("prepared workspace reservation repeats or exceeds a slot");
+            const auto &identity = reservation->storage->slots[request.slot]->identity;
+            if (identity.device != request.device || identity.partition != request.partition ||
+                identity.stream_slot != request.stream_slot || identity.bytes != request.bytes ||
+                identity.alignment != request.alignment || identity.kind != request.kind)
+                return fail("prepared workspace reservation differs from its exact slot");
+            uint64_t expected = 0;
+            if (!reservation->storage->slots[request.slot]->reservation_owner
+                     .compare_exchange_strong(expected, reservation->identity,
+                         std::memory_order_acq_rel))
+                return GPU_ADMISSION_ACQUISITION_CONFLICT;
+            reservation->slots.push_back(request.slot);
+            reservation->requests.push_back(request);
+        }
+        auto result = std::make_unique<GpuPreparedWorkspaceReservation>();
+        result->value = std::move(reservation);
+        *out = result.release();
+        return 0;
+    } catch (const std::exception &exception) {
+        return fail(exception.what());
+    } catch (...) {
+        return fail("unknown prepared workspace reservation error");
+    }
+}
+
+extern "C" void gpu_prepared_workspace_reservation_destroy(
+    GpuPreparedWorkspaceReservation *reservation)
+{
+    delete reservation;
+}
+
+extern "C" int gpu_prepared_workspace_reservation_lease(
+    GpuPreparedWorkspaceReservation *reservation, size_t request_index,
+    GpuPreparedWorkspaceLease **out)
+{
+    if (!reservation || !reservation->value || !out ||
+        request_index >= reservation->value->slots.size())
+        return fail("invalid prepared workspace lease request");
+    *out = nullptr;
+    auto &state = *reservation->value;
+    std::lock_guard<std::mutex> lock(state.storage->lifecycle_mutex);
+    if (state.storage->release_started)
+        return fail("prepared workspace storage is releasing");
+    if (state.leased[request_index]) return fail("prepared workspace slot already leased");
+    const size_t slot_index = state.slots[request_index];
+    auto &slot = *state.storage->slots[slot_index];
+    if (slot.reservation_owner.load(std::memory_order_acquire) != state.identity)
+        return GPU_ADMISSION_ACQUISITION_CONFLICT;
+    bool expected = false;
+    if (!slot.lease_active.compare_exchange_strong(expected, true, std::memory_order_acq_rel))
+        return GPU_ADMISSION_ACQUISITION_CONFLICT;
+    cudaError_t error = cudaSetDevice(slot.claim.device);
+    const cudaStream_t compute = workspace_compute_stream(
+        *state.storage, slot.claim.partition, slot.claim.stream_slot);
+    if (error == cudaSuccess && !compute)
+        error = cudaErrorInvalidResourceHandle;
+    if (error == cudaSuccess && slot.release_event)
+        error = cudaStreamWaitEvent(compute, slot.release_event, 0);
+    if (error != cudaSuccess) {
+        slot.lease_active.store(false, std::memory_order_release);
+        mark_workspace_release_failure(*state.storage);
+        return fail(error);
+    }
+    auto lease = std::make_unique<GpuPreparedWorkspaceLease>();
+    lease->workspace_storage = state.storage;
+    lease->slot = slot_index;
+    lease->reservation_identity = state.identity;
+    state.leased[request_index] = true;
+    *out = lease.release();
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_lease_info(
+    const GpuPreparedWorkspaceLease *lease, GpuPreparedWorkspaceLeaseInfo *out)
+{
+    if (!lease || !lease->workspace_storage || !out || lease->workspace_released ||
+        lease->slot >= lease->workspace_storage->slots.size())
+        return fail("invalid prepared workspace lease info request");
+    std::lock_guard<std::mutex> lock(lease->workspace_storage->lifecycle_mutex);
+    const auto &slot = *lease->workspace_storage->slots[lease->slot];
+    if (slot.reservation_owner.load(std::memory_order_acquire) != lease->reservation_identity ||
+        !slot.lease_active.load(std::memory_order_acquire))
+        return GPU_ADMISSION_ACQUISITION_CONFLICT;
+    out->data = slot.pointer;
+    out->resource_stream = slot.resource_stream;
+    out->completion_event = is_resource(slot.claim.layout.kind)
+        ? slot.resource_event : slot.release_event;
+    out->identity = slot.identity;
+    return 0;
+}
+
+extern "C" int gpu_prepared_workspace_lease_release(
+    GpuPreparedWorkspaceLease *lease, cudaStream_t completed_stream)
+{
+    if (!lease || !lease->workspace_storage || lease->workspace_released ||
+        lease->slot >= lease->workspace_storage->slots.size())
+        return fail("invalid prepared workspace lease release request");
+    auto &storage = *lease->workspace_storage;
+    std::lock_guard<std::mutex> lock(storage.lifecycle_mutex);
+    auto &slot = *storage.slots[lease->slot];
+    GpuAllocationActivity activity(storage.execution.get(), slot.claim.device);
+    if (slot.reservation_owner.load(std::memory_order_acquire) != lease->reservation_identity ||
+        !slot.lease_active.load(std::memory_order_acquire))
+        return GPU_ADMISSION_ACQUISITION_CONFLICT;
+    cudaError_t error = cudaSetDevice(slot.claim.device);
+    const cudaStream_t compute = workspace_compute_stream(
+        storage, slot.claim.partition, slot.claim.stream_slot);
+    if (error == cudaSuccess && !compute)
+        error = cudaErrorInvalidResourceHandle;
+    const cudaStream_t authorized = lease->completion_stream ? lease->completion_stream : compute;
+    const cudaStream_t release_stream = completed_stream ? completed_stream : authorized;
+    if (error == cudaSuccess && (!release_stream || release_stream != authorized))
+        error = cudaErrorInvalidResourceHandle;
+    // The bridge event follows the stream that actually consumed the workspace.
+    // Storage teardown waits on this event before pool defer/free, so pinned
+    // DMA and device workspace follow the exact producer ordering without
+    // trusting a mutable or unrelated caller stream.
+    if (error == cudaSuccess && slot.release_event)
+        error = cudaEventRecord(slot.release_event, release_stream);
+    if (error != cudaSuccess) {
+        mark_workspace_release_failure(storage);
+        return fail(error);
+    }
+    slot.lease_active.store(false, std::memory_order_release);
+    slot.release_event_recorded.store(true, std::memory_order_release);
+    slot.reservation_owner.store(0, std::memory_order_release);
+    lease->workspace_released = true;
+    return 0;
+}
+
+extern "C" void gpu_prepared_workspace_lease_destroy(GpuPreparedWorkspaceLease *lease)
+{
+    if (!lease) return;
+    if (lease->workspace_storage && !lease->workspace_released)
+        (void)gpu_prepared_workspace_lease_release(lease, nullptr);
+    delete lease;
+}
+
+extern "C" int gpu_prepared_workspace_storage_start_release(
+    GpuPreparedWorkspaceStorage *storage, void **out)
+{
+    if (!storage || !storage->value || !out)
+        return fail("invalid prepared workspace-only release arguments");
+    *out = nullptr;
+    auto backing = storage->value;
+    const int status = queue_workspace_release(*backing);
+    if (status != 0) return status;
+    try {
+        auto release = std::make_unique<WorkspaceRelease>();
+        release->storage = std::move(backing);
+        *out = release.release();
+        return 0;
+    } catch (const std::exception &exception) { return fail(exception.what()); }
+}
+
+extern "C" int gpu_prepared_workspace_release_complete(const void *release, int *out_complete)
+{
+    if (!release || !out_complete) return fail("invalid prepared workspace-only release probe");
+    const auto *probe = static_cast<const WorkspaceRelease *>(release);
+    if (!probe->storage || !probe->storage->release_has_started())
+        return fail("prepared workspace-only release was not started");
+    *out_complete = 1;
+    for (size_t partition = 0; partition < probe->storage->execution->gpu_ids.size(); ++partition) {
+        const int device = probe->storage->execution->gpu_ids[partition];
+        int previous = -1;
+        cudaError_t error = cudaGetDevice(&previous);
+        if (error == cudaSuccess) error = cudaSetDevice(device);
+        if (error == cudaSuccess) {
+            const cudaError_t query = cudaStreamQuery(
+                probe->storage->execution->release_streams_by_partition[partition]);
+            if (query == cudaErrorNotReady) *out_complete = 0;
+            else if (query != cudaSuccess) error = query;
+        }
+        if (previous >= 0 && cudaSetDevice(previous) != cudaSuccess) error = cudaErrorUnknown;
+        if (error != cudaSuccess) {
+            mark_workspace_release_failure(*probe->storage);
+            return fail(error);
+        }
+    }
+    for (void *pointer : probe->storage->pinned_release_pointers) {
+        int ready = 0;
+        if (gpu_query_pinned_release(probe->storage->context, pointer, &ready) != 0)
+            return fail("pinned-host reclamation failed");
+        if (!ready) *out_complete = 0;
+    }
+    return 0;
+}
+
+extern "C" void gpu_prepared_workspace_release_destroy(void *release)
+{
+    delete static_cast<WorkspaceRelease *>(release);
+}
+
+struct GpuPreparedMatrixLease {
+    std::shared_ptr<Storage> storage;
+    size_t slot;
+};
+struct GpuPreparedPinnedLease {
+    std::shared_ptr<Slot> slot;
+    std::shared_ptr<PinnedOccupancy> occupancy;
+    uint64_t execution_identity;
+    int device;
+    GpuPreparedWorkspaceLease *workspace_lease = nullptr;
+};
+struct GpuPreparedResourceLease {
+    std::shared_ptr<Slot> slot;
+    std::shared_ptr<ResourceOccupancy> occupancy;
+};
+struct GpuMatrixReservation {
+    // Reverse member destruction keeps tracking active through the storage's
+    // backing callback, then retains execution through the activity destructor.
+    std::shared_ptr<GpuExecutionOwner> execution;
+    GpuAllocationActivity activity;
+    std::shared_ptr<Storage> storage;
+    // Keep the authority that admitted these slots alive for the reservation.
+    // A validated claim handle may be dropped immediately after activation;
+    // slot ownership must still be checked against the same region until the
+    // reservation releases it.
+    std::shared_ptr<Region> region;
+    uint64_t identity = next_identity();
+    std::vector<size_t> slots;
+    std::vector<GpuPreparedRequest> bounds;
+    std::shared_ptr<const std::vector<PreparedClaim>> claims;
+    size_t next = 0;
+    size_t claimed = 0;
+
+    explicit GpuMatrixReservation(std::shared_ptr<Storage> prepared)
+        : execution(prepared->context->execution), activity(execution.get(), prepared->device),
+          storage(std::move(prepared)) {
+        size_t total = execution->prepared_active_reservations.load(std::memory_order_acquire);
+        for (;;) {
+            if (total >= resetting - 1)
+                throw std::runtime_error("joint prepared occupancy reset or reservation limit reached");
+            if (execution->prepared_active_reservations.compare_exchange_weak(
+                    total, total + 1, std::memory_order_acq_rel)) break;
+        }
+        size_t count = storage->active_reservations.load(std::memory_order_acquire);
+        for (;;) {
+            if (count >= resetting - 1) {
+                execution->prepared_active_reservations.fetch_sub(1, std::memory_order_acq_rel);
+                throw std::runtime_error("prepared occupancy reset or reservation limit reached");
+            }
+            if (storage->active_reservations.compare_exchange_weak(
+                    count, count + 1, std::memory_order_acq_rel)) break;
+        }
+    }
+
+    ~GpuMatrixReservation() {
+        // Only slots still owned by this reservation are returned. Published
+        // output leases retain their independent ownership and reader edges.
+        for (size_t index = next; index < claimed; ++index) {
+            reserved_counter(*storage, *storage->slots[slots[index]]).fetch_sub(
+                reservation_units(*storage->slots[slots[index]]),
+                std::memory_order_acq_rel);
+            storage->slots[slots[index]]->state.store(available, std::memory_order_release);
+        }
+        for (size_t index = 0; index < claimed; ++index)
+            storage->slots[slots[index]]->reservation_owner.store(0, std::memory_order_release);
+        storage->active_reservations.fetch_sub(1, std::memory_order_acq_rel);
+        execution->prepared_active_reservations.fetch_sub(1, std::memory_order_acq_rel);
+    }
+};
+
+// Layout validation is intentionally separated from slot activation.  The
+// handle retains the native execution owner, so a cache hit can activate the
+// already-validated request list under a fresh containing region without
+// re-running the expensive matrix layout queries.
+struct GpuPreparedClaimHandle {
+    std::shared_ptr<Storage> storage;
+    std::shared_ptr<const std::vector<PreparedClaim>> claims;
+};
+
+struct GpuMatrixDispatchPermit {
+    std::vector<std::unique_ptr<GpuMatrixReservation>> reservations;
+    std::vector<std::unique_ptr<GpuPreparedWorkspaceReservation>> workspace_reservations;
+    struct ExactWorkspaceClaim {
+        GpuPreparedWorkspaceReservation *reservation;
+        size_t request_index;
+    };
+    std::vector<ExactWorkspaceClaim> exact_workspace_claims;
+    size_t exact_workspace_next = 0;
+    size_t current = 0;
+    GpuPreparedWorkspaceSlotIdentity pending_submission_stream_identity{};
+    bool has_pending_submission_stream_identity = false;
+    // Reservations the permit was entered with; extensions append beyond it and
+    // must be retracted before the permit ends.
+    size_t entered = 0;
+
+    GpuMatrixReservation *next_reservation() {
+        while (current < reservations.size() &&
+               reservations[current]->next == reservations[current]->slots.size()) ++current;
+        return current < reservations.size() ? reservations[current].get() : nullptr;
+    }
+
+    bool has_workspace_reservations() const { return !workspace_reservations.empty(); }
+
+    bool next_exact_workspace_kind_is(GpuPreparedSlotKind kind) const
+    {
+        if (exact_workspace_next >= exact_workspace_claims.size()) return false;
+        const auto expected = exact_workspace_claims[exact_workspace_next];
+        if (!expected.reservation || !expected.reservation->value ||
+            expected.request_index >= expected.reservation->value->requests.size())
+            return false;
+        return expected.reservation->value->requests[expected.request_index].kind == kind;
+    }
+};
+
+struct GpuPreparedProvisioningPermit {
+    GpuContext *context = nullptr;
+    std::shared_ptr<GpuExecutionOwner> execution;
+    std::vector<GpuClaimTraceEntry> claims;
+    size_t next = 0;
+    bool entered = false;
+};
+
+namespace {
+thread_local GpuMatrixDispatchPermit *active_permit = nullptr;
+thread_local GpuPreparedProvisioningPermit *active_provisioning = nullptr;
+
+GpuPreparedWorkspaceLease *next_exact_workspace_lease(
+    GpuMatrixDispatchPermit &permit, GpuPreparedSlotKind kind, size_t bytes,
+    size_t alignment, int device, int *status);
+
+// Ordered record of the claims an operation would make. Recording happens only
+// on open domains (no permit, admission not required), on the calling thread.
+thread_local std::vector<GpuClaimTraceEntry> *active_claim_trace = nullptr;
+// Recent claims consumed by permits on this thread, for mismatch diagnostics.
+// Fixed ring: recording happens after a claim is committed, so it must not
+// allocate or throw.
+constexpr size_t consumed_capacity = 64;
+thread_local GpuClaimTraceEntry consumed_claims[consumed_capacity];
+thread_local size_t consumed_next = 0;
+thread_local size_t consumed_count = 0;
+void note_consumed(GpuPreparedSlotKind kind, size_t rows, size_t cols, int level, int format,
+    size_t bytes, size_t alignment) noexcept
+{
+    consumed_claims[consumed_next] =
+        GpuClaimTraceEntry{static_cast<int>(kind), rows, cols, level, format, bytes, alignment};
+    consumed_next = (consumed_next + 1) % consumed_capacity;
+    if (consumed_count < consumed_capacity) ++consumed_count;
+}
+std::string consumed_summary()
+{
+    std::string out;
+    const size_t first = (consumed_next + consumed_capacity - consumed_count) % consumed_capacity;
+    for (size_t offset = 0; offset < consumed_count; ++offset) {
+        const auto &entry = consumed_claims[(first + offset) % consumed_capacity];
+        out += "[" + std::to_string(entry.kind) + ":" + std::to_string(entry.rows) + "x" +
+            std::to_string(entry.columns) + "/" + std::to_string(entry.bytes) + "]";
+    }
+    return out;
+}
+void trace_claim(GpuPreparedSlotKind kind, size_t rows, size_t cols, int level, int format,
+    size_t bytes, size_t alignment)
+{
+    if (!active_claim_trace) return;
+    try {
+        active_claim_trace->push_back(GpuClaimTraceEntry{
+            static_cast<int>(kind), rows, cols, level, format, bytes, alignment});
+    } catch (...) {}
+}
+
+int validate_provisioning_claim(const GpuClaimTraceEntry &claim)
+{
+    const auto kind = static_cast<GpuPreparedSlotKind>(claim.kind);
+    if (kind == GPU_PREPARED_MATRIX) {
+        if (claim.rows == 0 || claim.columns == 0 || claim.bytes != 0 || claim.alignment != 0 ||
+            claim.level < 0 ||
+            (claim.format != GPU_POLY_FORMAT_COEFF && claim.format != GPU_POLY_FORMAT_EVAL))
+            return fail("invalid provisioning matrix request");
+        return 0;
+    }
+    if (is_resource(kind)) {
+        if (claim.rows != 0 || claim.columns != 0 || claim.level != -1 || claim.format != -1 ||
+            claim.bytes != 0 || claim.alignment != 1)
+            return fail("invalid provisioning CUDA resource request");
+        return 0;
+    }
+    if (kind != GPU_PREPARED_BATCH_WORKSPACE &&
+        kind != GPU_PREPARED_TRANSFORM_WORKSPACE &&
+        kind != GPU_PREPARED_PINNED_HOST && kind != GPU_PREPARED_COMPACT_PAYLOAD &&
+        kind != GPU_PREPARED_COMPACT_WORKSPACE && kind != GPU_PREPARED_SAMPLER_WORKSPACE &&
+        kind != GPU_PREPARED_TRANSFER_WORKSPACE)
+        return fail("invalid provisioning workspace kind");
+    if (claim.rows != 0 || claim.columns != 0 || claim.level != -1 || claim.format != -1 ||
+        claim.bytes == 0 || claim.alignment == 0 || claim.alignment > 256 ||
+        (claim.alignment & (claim.alignment - 1)) != 0)
+        return fail("invalid provisioning workspace request");
+    return 0;
+}
+
+int provisioning_consume(
+    GpuContext *context, GpuPreparedSlotKind kind, size_t rows, size_t columns,
+    int level, int format, size_t bytes, size_t alignment)
+{
+    if (!active_provisioning) return fail("no active provisioning permit");
+    auto &permit = *active_provisioning;
+    if (permit.context != context || permit.execution != context->execution)
+        return fail("provisioning request belongs to another context");
+    if (permit.next >= permit.claims.size())
+        return fail("provisioning request list is exhausted");
+    const auto &claim = permit.claims[permit.next];
+    if (claim.kind != static_cast<int>(kind) || claim.rows != rows || claim.columns != columns ||
+        claim.level != level || claim.format != format || claim.bytes != bytes ||
+        claim.alignment != alignment)
+        return fail("provisioning construction differs from its exact request");
+    ++permit.next;
+    return 0;
+}
+
+bool same_workspace_identity(
+    const GpuPreparedWorkspaceSlotIdentity &left,
+    const GpuPreparedWorkspaceSlotIdentity &right)
+{
+    return left.storage_id == right.storage_id &&
+        left.execution_owner_identity == right.execution_owner_identity &&
+        left.context_identity == right.context_identity && left.slot_id == right.slot_id &&
+        left.slot_index == right.slot_index && left.partition == right.partition &&
+        left.stream_slot == right.stream_slot && left.bytes == right.bytes &&
+        left.alignment == right.alignment && left.device == right.device &&
+        left.kind == right.kind;
+}
+}
+
+extern "C" int gpu_prepared_provision_begin(
+    GpuContext *context, const GpuClaimTraceEntry *claims, size_t count,
+    GpuPreparedProvisioningPermit **out)
+{
+    if (!out) return fail("null provisioning permit output");
+    *out = nullptr;
+    if (!context || !context->execution || !claims || count == 0 || active_permit ||
+        active_provisioning)
+        return fail("invalid or nested provisioning permit");
+    auto execution = context->execution;
+    // The explicit initial setup boundary opens allocation tracking before the
+    // first backing exists.  It is not sealed yet, but it is the only owner
+    // allowed to mint this setup permit; later replacement provisioning still
+    // requires the finished inventory's admission seal.
+    if (!execution->allocation_tracking_complete.load(std::memory_order_acquire))
+        return fail("provisioning requires a prepared setup boundary");
+    try {
+        auto permit = std::make_unique<GpuPreparedProvisioningPermit>();
+        permit->context = context;
+        permit->execution = std::move(execution);
+        permit->claims.assign(claims, claims + count);
+        for (const auto &claim : permit->claims) {
+            const int status = validate_provisioning_claim(claim);
+            if (status != 0) return status;
+        }
+        *out = permit.release();
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_prepared_provision_enter(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit || permit->entered || active_permit || active_provisioning)
+        return fail("invalid or nested provisioning activation");
+    if (!permit->context || permit->context->execution != permit->execution)
+        return fail("provisioning execution owner is no longer valid");
+    permit->entered = true;
+    active_provisioning = permit;
+    return 0;
+}
+
+extern "C" int gpu_prepared_provision_finish(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit || permit != active_provisioning || !permit->entered)
+        return fail("provisioning permit must finish on its submitting thread");
+    if (permit->next != permit->claims.size())
+        return fail("provisioning permit finished before consuming every request");
+    active_provisioning = nullptr;
+    delete permit;
+    return 0;
+}
+
+extern "C" void gpu_prepared_provision_cancel(GpuPreparedProvisioningPermit *permit)
+{
+    if (!permit) return;
+    if (active_provisioning == permit) active_provisioning = nullptr;
+    delete permit;
+}
+
+extern "C" int gpu_prepared_provisioning_active(const GpuContext *context)
+{
+    return active_provisioning && active_provisioning->context == context ? 1 : 0;
+}
+
+extern "C" int gpu_prepared_pinned_claim(
+    GpuContext *ctx, size_t bytes, size_t alignment, void **out, int *handled)
+{
+    if (!ctx || !ctx->execution || !out || !handled) return fail("invalid prepared pinned claim");
+    *out = nullptr;
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != ctx->execution)
+            return fail("pinned provisioning belongs to another context");
+        // Workspace-storage construction consumes every claim in its native
+        // admission pass before allocating backing. Re-consuming pinned
+        // claims here would exhaust the same permit a second time.
+        *handled = 0;
+        return 0;
+    }
+    if (active_permit && active_permit->has_workspace_reservations() &&
+        active_permit->next_exact_workspace_kind_is(GPU_PREPARED_PINNED_HOST)) {
+        *handled = 1;
+        const auto expected =
+            active_permit->exact_workspace_claims[active_permit->exact_workspace_next];
+        const auto &request = expected.reservation->value->requests[expected.request_index];
+        if (request.partition >= ctx->gpu_ids.size() ||
+            ctx->gpu_ids[request.partition] != request.device)
+            return fail("prepared pinned workspace claim has invalid device partition");
+        GpuAllocationActivity activity(ctx->execution.get(), request.device);
+        int status = 0;
+        auto *prepared = next_exact_workspace_lease(
+            *active_permit, GPU_PREPARED_PINNED_HOST, bytes, alignment, request.device, &status);
+        if (!prepared) return status;
+        GpuPreparedWorkspaceLeaseInfo info{};
+        status = gpu_prepared_workspace_lease_info(prepared, &info);
+        if (status != 0) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return status;
+        }
+        if (info.identity.context_identity != reinterpret_cast<uint64_t>(ctx) ||
+            info.identity.execution_owner_identity != ctx->execution->identity ||
+            info.identity.storage_id != request.storage_id ||
+            info.identity.slot_index != request.slot || info.identity.device != request.device ||
+            info.identity.partition != request.partition ||
+            info.identity.stream_slot != request.stream_slot ||
+            info.identity.kind != request.kind || info.identity.bytes != request.bytes ||
+            info.identity.alignment != request.alignment || !info.data) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return fail("prepared pinned workspace identity differs from its exact claim");
+        }
+        try {
+            auto lease = std::make_unique<GpuPreparedPinnedLease>();
+            lease->execution_identity = ctx->execution->identity;
+            lease->device = info.identity.device;
+            lease->workspace_lease = prepared;
+            status = gpu_pinned_bind_prepared(info.data, lease.get());
+            if (status != 0) {
+                lease->workspace_lease = nullptr;
+                gpu_prepared_workspace_lease_destroy(prepared);
+                return status;
+            }
+            ++active_permit->exact_workspace_next;
+            lease.release();
+            note_consumed(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
+            *out = info.data;
+            return 0;
+        } catch (const std::exception &error) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return fail(error.what());
+        }
+    }
+    if (active_permit && active_permit->has_workspace_reservations() &&
+        active_permit->reservations.empty()) {
+        *handled = 1;
+        return fail("prepared dispatch consumed workspace claims out of order");
+    }
+    // A sealed inventory constrains allocations made while a reservation is
+    // outstanding, and an active dispatch always consumes its exact next
+    // claim.  It must not constrain unrelated caller-owned pinned work after
+    // execute has returned: the inventory's admission flags describe the
+    // prepared path, not every allocation made by the context owner.
+    const bool reservation_pending =
+        ctx->execution->prepared_active_reservations.load(std::memory_order_acquire) != 0;
+    const bool graph_dispatch =
+        active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire);
+    const bool prepared_reservation =
+        ctx->execution->pinned_admission_required.load(std::memory_order_acquire) &&
+        reservation_pending;
+    *handled = (graph_dispatch || prepared_reservation) ? 1 : 0;
+    if (!*handled) {
+        trace_claim(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
+        return 0;
+    }
+    auto *reservation = active_permit ? active_permit->next_reservation() : nullptr;
+    if (!reservation || reservation->storage->context != ctx)
+        return fail("pinned allocation requires its next prepared dispatch claim");
+    auto &storage = *reservation->storage;
+    const auto &claim = (*reservation->claims)[reservation->next];
+    auto &slot = *storage.slots[reservation->slots[reservation->next]];
+    if (slot.identity.kind != GPU_PREPARED_PINNED_HOST || claim.request.bytes != bytes ||
+        claim.request.alignment != alignment || !slot.workspace) {
+        static thread_local char message[256];
+        std::snprintf(message, sizeof(message),
+            "pinned allocation differs from its prepared size or alignment (kind %d, reserved %zu/%zu, requested %zu/%zu)",
+            static_cast<int>(slot.identity.kind), claim.request.bytes, claim.request.alignment, bytes, alignment);
+        return fail(message);
+    }
+    GpuAllocationActivity activity(ctx->execution.get(), storage.device);
+    try {
+        auto lease = std::make_unique<GpuPreparedPinnedLease>(
+            GpuPreparedPinnedLease{storage.slots[claim.request.slot_index], storage.pinned,
+                storage.context->execution->identity, storage.device});
+        const int status = gpu_pinned_bind_prepared(slot.workspace, lease.get());
+        if (status != 0) return status;
+        occupy(storage, slot, bytes);
+        ++reservation->next;
+        slot.pinned_deferred.store(false, std::memory_order_relaxed);
+        slot.state.store(leased, std::memory_order_release);
+        lease.release();
+        note_consumed(GPU_PREPARED_PINNED_HOST, 0, 0, -1, -1, bytes, alignment);
+        *out = slot.workspace;
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_prepared_pinned_defer(GpuPreparedPinnedLease *lease, GpuContext *ctx)
+{
+    if (!lease || !ctx || !ctx->execution || lease->execution_identity != ctx->execution->identity)
+        return fail("prepared pinned buffer belongs to another execution owner");
+    if (lease->workspace_lease) return 0;
+    lease->slot->pinned_deferred.store(true, std::memory_order_release);
+    return 0;
+}
+
+extern "C" void gpu_prepared_pinned_recycle(GpuPreparedPinnedLease *lease)
+{
+    if (lease->workspace_lease) {
+        auto *workspace = lease->workspace_lease;
+        lease->workspace_lease = nullptr;
+        const int status = gpu_prepared_workspace_lease_release(workspace, nullptr);
+        if (status != 0) workspace->workspace_released = true;
+        gpu_prepared_workspace_lease_destroy(workspace);
+        delete lease;
+        return;
+    }
+    GpuAllocationActivity activity(nullptr, lease->device);
+    auto &slot = *lease->slot;
+    // Called only after CPU ownership ends or the reclaimer observes the DMA
+    // event. No device-event wait can make an earlier CPU write safe here.
+    lease->occupancy->occupied_bytes.fetch_sub(slot.occupied_units, std::memory_order_acq_rel);
+    slot.occupied_units = 0;
+    // Keep the deferred marker until the next acquisition. Clearing it before
+    // publishing available would make scheduler queries mistake retirement in
+    // progress for an unreleased CPU owner. The state publication ends all access.
+    slot.state.store(available, std::memory_order_release);
+    delete lease;
+}
+
+GpuCudaResource::GpuCudaResource()
+    : event(nullptr), stream(nullptr), execution(nullptr), device(-1), lease(nullptr),
+      workspace_lease(nullptr), workspace_identity{}, has_workspace_identity(false) {}
+
+int GpuCudaResource::acquire(const GpuContext *ctx, int selected_device, GpuPreparedSlotKind kind)
+{
+    if (execution || event || stream || !ctx || !ctx->execution || !is_resource(kind) ||
+        std::find(ctx->execution->gpu_ids.begin(), ctx->execution->gpu_ids.end(), selected_device) ==
+            ctx->execution->gpu_ids.end())
+        return fail("invalid CUDA resource request");
+    execution = ctx->execution;
+    device = selected_device;
+    // A refused request leaves the handle reusable.
+    const auto refuse = [this](const char *message) {
+        execution.reset();
+        device = -1;
+        return fail(message);
+    };
+    const auto refuse_status = [this](int status) {
+        execution.reset();
+        device = -1;
+        return status;
+    };
+    GpuAllocationActivity activity(execution.get(), device);
+    if (execution->unretired_work.load(std::memory_order_acquire) &&
+        !(active_provisioning && active_provisioning->execution == execution))
+        return refuse("CUDA resource request has unretired work");
+    if (active_permit && active_permit->has_workspace_reservations()) {
+        int status = 0;
+        auto *prepared = next_exact_workspace_lease(
+            *active_permit, kind, 0, 1, selected_device, &status);
+        if (!prepared) return refuse_status(status);
+        GpuPreparedWorkspaceLeaseInfo info{};
+        if (gpu_prepared_workspace_lease_info(prepared, &info) != 0) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return refuse("prepared resource lease metadata is unavailable");
+        }
+        event = info.completion_event;
+        stream = info.resource_stream;
+        workspace_identity = info.identity;
+        has_workspace_identity = true;
+        prepared->completion_stream = info.resource_stream;
+        if (kind == GPU_PREPARED_SUBMISSION_STREAM) {
+            active_permit->pending_submission_stream_identity = info.identity;
+            active_permit->has_pending_submission_stream_identity = true;
+        }
+        workspace_lease = prepared;
+        ++active_permit->exact_workspace_next;
+        return 0;
+    }
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != execution)
+            return refuse("CUDA resource provisioning belongs to another context");
+        const int status = provisioning_consume(
+            const_cast<GpuContext *>(ctx), kind, 0, 0, -1, -1, 0, 1);
+        if (status != 0) {
+            execution.reset();
+            device = -1;
+            return status;
+        }
+    } else if ((active_permit && execution->graph_admission_scoped.load(std::memory_order_acquire)) || execution->resource_admission_required.load(std::memory_order_acquire)) {
+        auto *reservation = active_permit ? active_permit->next_reservation() : nullptr;
+        if (!reservation || reservation->storage->context != ctx || reservation->storage->device != device) {
+            return refuse("CUDA resource requires a matching prepared dispatch permit");
+        }
+        auto &storage = *reservation->storage;
+        auto &slot = storage.slots[reservation->slots[reservation->next]];
+        const auto &claim = (*reservation->claims)[reservation->next];
+        if (claim.request.kind != kind || !is_resource(slot->identity.kind))
+            return refuse("CUDA resource differs from its prepared type");
+        auto pending = std::make_unique<GpuPreparedResourceLease>(
+            GpuPreparedResourceLease{slot, storage.resources});
+        occupy(storage, *slot, claim.occupied_units);
+        ++reservation->next;
+        slot->state.store(leased, std::memory_order_release);
+        event = slot->resource_event;
+        stream = slot->resource_stream;
+        has_workspace_identity = false;
+        lease = pending.release();
+        note_consumed(kind, 0, 0, -1, -1, 0, 1);
+        return 0;
+    }
+    if (!active_provisioning) trace_claim(kind, 0, 0, -1, -1, 0, 1);
+    cudaError_t error = cudaSetDevice(device);
+    if (error == cudaSuccess) {
+        if (kind == GPU_PREPARED_COMPLETION_EVENT)
+            error = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        else {
+            error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+            if (error == cudaSuccess) error = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        }
+    }
+    if (error != cudaSuccess) {
+        if (event) cudaEventDestroy(event);
+        if (stream) cudaStreamDestroy(stream);
+        event = nullptr;
+        stream = nullptr;
+        execution.reset();
+        device = -1;
+        return fail(error);
+    }
+    return 0;
+}
+
+int GpuCudaResource::release()
+{
+    if (!event && !stream) return 0;
+    GpuAllocationActivity activity(execution.get(), device);
+    if (execution && execution->unretired_work.load(std::memory_order_acquire)) {
+        quarantine();
+        return fail("cannot recycle CUDA resource with unretired work");
+    }
+    if (lease) {
+        auto *completed = lease;
+        lease = nullptr;
+        event = nullptr;
+        stream = nullptr;
+        // All host users have relinquished this handle. Already enqueued CUDA
+        // event waits capture the prior record and are unaffected by rerecording:
+        // https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html
+        completed->occupancy->occupied.fetch_sub(1, std::memory_order_acq_rel);
+        completed->slot->occupied_units = 0;
+        completed->slot->deferred_resource_pointer.store(nullptr, std::memory_order_release);
+        completed->slot->state.store(available, std::memory_order_release);
+        delete completed;
+        return 0;
+    }
+    if (workspace_lease) {
+        auto *completed = workspace_lease;
+        workspace_lease = nullptr;
+        event = nullptr;
+        stream = nullptr;
+        has_workspace_identity = false;
+        const int status = gpu_prepared_workspace_lease_release(completed, nullptr);
+        gpu_prepared_workspace_lease_destroy(completed);
+        return status;
+    }
+    cudaError_t error = cudaSetDevice(device);
+    if (error == cudaSuccess && event) error = cudaEventDestroy(event);
+    if (error == cudaSuccess && stream) error = cudaStreamDestroy(stream);
+    event = nullptr;
+    stream = nullptr;
+    has_workspace_identity = false;
+    if (error != cudaSuccess) {
+        gpu_execution_mark_allocation_unknown(execution.get());
+        gpu_device_mark_allocation_unknown(device);
+        if (execution) execution->memory_release_failed.store(true, std::memory_order_release);
+        return fail(error);
+    }
+    return 0;
+}
+
+void GpuCudaResource::quarantine()
+{
+    gpu_execution_mark_allocation_unknown(execution.get());
+    gpu_device_mark_allocation_unknown(device);
+    if (lease) lease->slot->state.store(quarantined, std::memory_order_release);
+    if (workspace_lease) {
+        // The native workspace lease owns the slot's release event. Preserve
+        // it fail-closed when the caller cannot prove completion.
+        workspace_lease->workspace_released = true;
+    }
+    // Preserve uncertain handles and their slot ownership indefinitely.
+    lease = nullptr;
+    workspace_lease = nullptr;
+    event = nullptr;
+    stream = nullptr;
+    has_workspace_identity = false;
+}
+
+void GpuCudaResource::defer_to_pinned_release(void *pointer)
+{
+    if (lease) lease->slot->deferred_resource_pointer.store(pointer, std::memory_order_release);
+}
+
+bool GpuCudaResource::prepared_stream_identity(GpuPreparedWorkspaceSlotIdentity *out) const
+{
+    if (!out || !has_workspace_identity) return false;
+    *out = workspace_identity;
+    return true;
+}
+
+void GpuCudaResource::detach_execution() { execution.reset(); }
+GpuCudaResource::~GpuCudaResource() { release(); }
+
+GpuDeviceWorkspace::GpuDeviceWorkspace()
+    : data(nullptr), execution(nullptr), device(-1), stream(nullptr), lease(nullptr) {}
+
+namespace {
+GpuPreparedWorkspaceLease *next_exact_workspace_lease(
+    GpuMatrixDispatchPermit &permit, GpuPreparedSlotKind kind, size_t bytes,
+    size_t alignment, int device, int *status)
+{
+    if (!status) return nullptr;
+    *status = 0;
+    if (permit.exact_workspace_next >= permit.exact_workspace_claims.size()) {
+        *status = fail("prepared dispatch has no remaining exact workspace claim");
+        return nullptr;
+    }
+    const auto expected = permit.exact_workspace_claims[permit.exact_workspace_next];
+    if (!expected.reservation || !expected.reservation->value ||
+        expected.request_index >= expected.reservation->value->requests.size()) {
+        *status = fail("prepared dispatch exact workspace claim is invalid");
+        return nullptr;
+    }
+    const auto &request = expected.reservation->value->requests[expected.request_index];
+    if (request.kind != kind || request.device != device || request.bytes != bytes ||
+        request.alignment != alignment) {
+        *status = fail("prepared dispatch consumed workspace claims out of order");
+        return nullptr;
+    }
+    GpuPreparedWorkspaceLease *lease = nullptr;
+    *status = gpu_prepared_workspace_reservation_lease(
+        expected.reservation, expected.request_index, &lease);
+    if (*status != 0 || !lease) {
+        if (*status == 0) *status = fail("prepared dispatch exact workspace lease is null");
+        return nullptr;
+    }
+    ++expected.reservation->value->next;
+    return lease;
+}
+}
+
+int GpuDeviceWorkspace::acquire(
+    GpuContext *ctx, int selected_device, GpuPreparedSlotKind kind,
+    size_t bytes, size_t alignment, cudaStream_t selected_stream,
+    const GpuPreparedWorkspaceSlotIdentity *stream_identity)
+{
+    if (execution || !ctx || !ctx->execution || selected_device < 0 || !selected_stream ||
+        alignment == 0 || alignment > 256 || (alignment & (alignment - 1)) != 0 ||
+        (kind != GPU_PREPARED_BATCH_WORKSPACE && kind != GPU_PREPARED_TRANSFORM_WORKSPACE &&
+         kind != GPU_PREPARED_COMPACT_PAYLOAD && kind != GPU_PREPARED_COMPACT_WORKSPACE &&
+         kind != GPU_PREPARED_SAMPLER_WORKSPACE && kind != GPU_PREPARED_TRANSFER_WORKSPACE))
+        return fail("invalid device workspace request");
+    if (bytes == 0) return 0;
+    if (ctx->execution->unretired_work.load(std::memory_order_acquire) &&
+        !(active_provisioning && active_provisioning->execution == ctx->execution))
+        return fail("device workspace request has unretired work");
+    if (active_permit && active_permit->has_workspace_reservations()) {
+        int lease_status = 0;
+        auto *prepared = next_exact_workspace_lease(
+            *active_permit, kind, bytes, alignment, selected_device, &lease_status);
+        if (!prepared) return lease_status;
+        if (stream_identity &&
+            (!active_permit->has_pending_submission_stream_identity ||
+             !same_workspace_identity(
+                 *stream_identity, active_permit->pending_submission_stream_identity))) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return fail("prepared codec workspace does not match its exact submission stream claim");
+        }
+        const int acquire_status = acquire_prepared(prepared, selected_stream, stream_identity);
+        if (acquire_status != 0) {
+            gpu_prepared_workspace_lease_destroy(prepared);
+            return acquire_status;
+        }
+        if (stream_identity)
+            active_permit->has_pending_submission_stream_identity = false;
+        ++active_permit->exact_workspace_next;
+        return 0;
+    }
+    execution = ctx->execution;
+    device = selected_device;
+    stream = selected_stream;
+    // A refused request leaves the owner reusable; only an uncertain reuse
+    // edge (quarantine below) retains it.
+    const auto refuse = [this](int status) {
+        execution.reset();
+        device = -1;
+        stream = nullptr;
+        return status;
+    };
+    GpuAllocationActivity activity(ctx->execution.get(), device);
+    const bool requires_permit = kind == GPU_PREPARED_TRANSFER_WORKSPACE
+        ? ((active_permit && ctx->execution->graph_admission_scoped.load(std::memory_order_acquire)) || ctx->execution->transfer_admission_required.load(std::memory_order_acquire))
+        : (active_permit || gpu_context_admission_is_required(ctx));
+    if (active_provisioning) {
+        if (active_provisioning->context != ctx || active_provisioning->execution != ctx->execution)
+            return refuse(fail("device workspace provisioning belongs to another context"));
+        const int status = provisioning_consume(
+            ctx, kind, 0, 0, -1, -1, bytes, alignment);
+        if (status != 0) return refuse(status);
+    } else if (requires_permit) {
+        auto *next = active_permit ? active_permit->next_reservation() : nullptr;
+        if (!next || next->storage->context != ctx || next->storage->device != device)
+            return refuse(fail("device workspace requires a matching prepared dispatch permit"));
+        auto &reservation = *next;
+        auto &storage = *reservation.storage;
+        const size_t index = reservation.slots[reservation.next];
+        auto &slot = *storage.slots[index];
+        const auto &claim = (*reservation.claims)[reservation.next];
+        if (slot.identity.kind != kind || !slot.workspace ||
+            bytes != claim.request.bytes || alignment != claim.request.alignment)
+            return refuse(fail("device workspace differs from its prepared type, capacity, or alignment"));
+        std::unique_ptr<GpuPreparedWorkspaceLease> pending;
+        try {
+            pending = std::make_unique<GpuPreparedWorkspaceLease>(
+                GpuPreparedWorkspaceLease{
+                    reservation.storage, index, nullptr, reservation.identity, nullptr, false});
+        } catch (const std::exception &error) { return refuse(fail(error.what())); }
+        cudaError_t error = cudaSetDevice(device);
+        if (error != cudaSuccess) return refuse(fail(error));
+        occupy(storage, slot, claim.occupied_units);
+        ++reservation.next;
+        error = cudaStreamWaitEvent(stream, slot.reusable, 0);
+        if (error != cudaSuccess) {
+            quarantine(storage);
+            slot.state.store(quarantined, std::memory_order_release);
+            // An uncertain reuse edge must retain the whole backing owner.
+            pending.release();
+            return fail(error);
+        }
+        data = static_cast<uint8_t *>(slot.workspace);
+        lease = pending.release();
+        slot.state.store(leased, std::memory_order_release);
+        note_consumed(kind, 0, 0, -1, -1, bytes, alignment);
+        return 0;
+    }
+    if (!active_provisioning) trace_claim(kind, 0, 0, -1, -1, bytes, alignment);
+    cudaError_t error = cudaSetDevice(device);
+    if (error == cudaSuccess) {
+        gpu_test_record_cuda_allocation();
+        error = cudaMallocAsync(reinterpret_cast<void **>(&data), bytes, stream);
+    }
+    if (error != cudaSuccess) {
+        data = nullptr;
+        return refuse(fail(error));
+    }
+    return 0;
+}
+
+int GpuDeviceWorkspace::acquire_prepared(
+    GpuPreparedWorkspaceLease *prepared, cudaStream_t selected_stream,
+    const GpuPreparedWorkspaceSlotIdentity *stream_identity)
+{
+    if (data || execution || lease || !prepared || !prepared->workspace_storage || !selected_stream ||
+        prepared->workspace_released || prepared->slot >= prepared->workspace_storage->slots.size())
+        return fail("invalid prepared workspace lease adoption");
+    GpuPreparedWorkspaceLeaseInfo info{};
+    if (gpu_prepared_workspace_lease_info(prepared, &info) != 0)
+        return fail("prepared workspace lease metadata is unavailable");
+    auto &storage = *prepared->workspace_storage;
+    std::lock_guard<std::mutex> lock(storage.lifecycle_mutex);
+    auto &slot = *storage.slots[prepared->slot];
+    if (is_resource(slot.claim.layout.kind))
+        return fail("resource leases must use their resource-specific owner");
+    if (info.identity.slot_index != prepared->slot ||
+        info.identity.slot_id != slot.identity.slot_id ||
+        info.identity.storage_id != storage.identity ||
+        info.identity.bytes != slot.claim.layout.bytes ||
+        info.identity.alignment != slot.claim.layout.alignment ||
+        info.identity.kind != slot.claim.layout.kind)
+        return fail("prepared workspace lease identity metadata mismatch");
+    const cudaStream_t compute = workspace_compute_stream(
+        storage, slot.claim.partition, slot.claim.stream_slot);
+    const bool resource_stream = stream_identity != nullptr;
+    if (resource_stream &&
+        (stream_identity->kind != GPU_PREPARED_SUBMISSION_STREAM ||
+         stream_identity->storage_id != info.identity.storage_id ||
+         stream_identity->execution_owner_identity != info.identity.execution_owner_identity ||
+         stream_identity->context_identity != info.identity.context_identity ||
+         stream_identity->device != info.identity.device ||
+         stream_identity->partition != info.identity.partition ||
+         stream_identity->stream_slot != info.identity.stream_slot))
+        return fail("prepared workspace lease stream identity mismatch");
+    if (!compute || (!resource_stream && selected_stream != compute) ||
+        slot.reservation_owner.load(std::memory_order_acquire) != prepared->reservation_identity ||
+        !slot.lease_active.load(std::memory_order_acquire))
+        return fail("prepared workspace lease stream or ownership mismatch");
+    execution = storage.execution;
+    device = slot.claim.device;
+    stream = selected_stream;
+    data = static_cast<uint8_t *>(slot.pointer);
+    prepared->completion_stream = selected_stream;
+    lease = prepared;
+    return 0;
+}
+
+extern "C" void gpu_claim_trace_record(
+    int kind, size_t rows, size_t cols, int level, int format, size_t bytes, size_t alignment)
+{
+    trace_claim(static_cast<GpuPreparedSlotKind>(kind), rows, cols, level, format, bytes, alignment);
+}
+
+// Depth of traced steps on this thread. Inside a traced step, consumer
+// tracking claims its event even on the same-stream fast path, so a recorded
+// plan does not depend on which streams the step's owners received.
+thread_local int deterministic_consumer_events = 0;
+
+extern "C" void gpu_claim_deterministic_events_push() { ++deterministic_consumer_events; }
+extern "C" void gpu_claim_deterministic_events_pop()
+{
+    if (deterministic_consumer_events > 0) --deterministic_consumer_events;
+}
+extern "C" int gpu_claim_deterministic_events_active()
+{
+    return deterministic_consumer_events > 0 ? 1 : 0;
+}
+
+extern "C" int gpu_claim_trace_begin()
+{
+    if (active_claim_trace) return fail("a native claim trace is already active on this thread");
+    try {
+        active_claim_trace = new std::vector<GpuClaimTraceEntry>();
+    } catch (const std::exception &error) { return fail(error.what()); }
+    return 0;
+}
+
+extern "C" int gpu_claim_trace_end(GpuClaimTraceEntry *out, size_t capacity, size_t *count)
+{
+    if (!count) return fail("missing claim trace count");
+    auto *trace = active_claim_trace;
+    if (!trace) return fail("no native claim trace is active on this thread");
+    *count = trace->size();
+    // A null output only reports the length and keeps recording; a buffer
+    // receives the entries and ends the trace.
+    if (!out) return 0;
+    const size_t copied = std::min(capacity, trace->size());
+    std::copy(trace->begin(), trace->begin() + copied, out);
+    active_claim_trace = nullptr;
+    delete trace;
+    return 0;
+}
+
+int GpuDeviceWorkspace::release(cudaStream_t completed_stream)
+{
+    if (!data) return 0;
+    if (lease && lease->workspace_storage) {
+        auto *prepared = lease;
+        lease = nullptr;
+        data = nullptr;
+        const int status = gpu_prepared_workspace_lease_release(prepared, completed_stream);
+        gpu_prepared_workspace_lease_destroy(prepared);
+        execution.reset();
+        device = -1;
+        stream = nullptr;
+        return status;
+    }
+    // A persistent owner joins all of its readers before passing the final
+    // release stream. Short-lived scratch defaults to its original stream.
+    if (completed_stream) stream = completed_stream;
+    auto execution = std::move(this->execution);
+    GpuAllocationActivity activity(execution.get(), device);
+    void *pointer = data;
+    data = nullptr;
+    auto *prepared = lease;
+    lease = nullptr;
+    if (execution->unretired_work.load(std::memory_order_acquire)) {
+        if (prepared)
+            prepared->storage->slots[prepared->slot]->state.store(
+                quarantined, std::memory_order_release);
+        return fail("cannot recycle device workspace with unretired work");
+    }
+    cudaError_t error = cudaSetDevice(device);
+    if (prepared) {
+        auto &storage = *prepared->storage;
+        auto &slot = *storage.slots[prepared->slot];
+        if (error == cudaSuccess) error = cudaEventRecord(slot.reusable, stream);
+        if (error == cudaSuccess)
+            error = cudaStreamWaitEvent(
+                execution->release_streams_by_partition[0], slot.reusable, 0);
+        if (error != cudaSuccess) {
+            quarantine(storage);
+            slot.state.store(quarantined, std::memory_order_release);
+            return fail(error);
+        }
+        slot.state.store(available, std::memory_order_release);
+        delete prepared;
+        return 0;
+    }
+    if (error == cudaSuccess) error = cudaFreeAsync(pointer, stream);
+    if (error != cudaSuccess) {
+        execution->memory_release_failed.store(true, std::memory_order_release);
+        gpu_execution_mark_allocation_unknown(execution.get());
+        return fail(error);
+    }
+    return 0;
+}
+
+cudaEvent_t GpuDeviceWorkspace::completion_event() const
+{
+    if (!lease) return nullptr;
+    if (lease->workspace_storage)
+        return lease->workspace_storage->slots[lease->slot]->release_event;
+    return lease->storage->slots[lease->slot]->reusable;
+}
+
+GpuDeviceWorkspace::~GpuDeviceWorkspace() { release(); }
+
+extern "C" int gpu_prepared_slots_plan(GpuContext *context,
+    const GpuClaimTraceEntry *claims, size_t count, GpuPreparedSlotSnapshot *out)
+{
+    if (!context || (count && (!claims || !out))) return fail("invalid prepared capacity plan");
+    try {
+        for (size_t index = 0; index < count; ++index) {
+            const auto &claim = claims[index];
+            auto &slot = out[index];
+            slot = {};
+            auto &identity = slot.identity;
+            identity.backing_id = identity.slot_id = index + 1;
+            identity.slot_index = index;
+            identity.kind = static_cast<GpuPreparedSlotKind>(claim.kind);
+            identity.level = claim.level;
+            identity.rows = claim.rows;
+            identity.columns = claim.columns;
+            slot.available = 1;
+            if (identity.kind == GPU_PREPARED_MATRIX) {
+                if (claim.rows == 0 || claim.columns == 0 || claim.bytes != 0 || claim.alignment != 0)
+                    return fail("invalid prepared matrix request layout");
+                GpuMatrixAllocationBytes allocation{};
+                const int status = gpu_matrix_query_allocation_bytes(context,
+                    claim.level, claim.rows, claim.columns, claim.format, &allocation);
+                if (status != 0) return status;
+                if (allocation.data_bytes > SIZE_MAX - allocation.aux_bytes)
+                    return fail("prepared matrix capacity overflow");
+                identity.payload_bytes = allocation.data_bytes;
+                identity.auxiliary_bytes = allocation.aux_bytes;
+                identity.requested_backing_bytes = allocation.data_bytes + allocation.aux_bytes;
+                identity.alignment = 256;
+                slot.auxiliary_capacity_bytes = allocation.aux_workspace_bytes;
+            } else {
+                identity.payload_bytes = identity.requested_backing_bytes = claim.bytes;
+                identity.alignment = claim.alignment;
+                if (claim.alignment > 256) return fail("invalid prepared device workspace layout");
+                const GpuPreparedRequest request{0, identity.slot_id, index,
+                    claim.rows, claim.columns, claim.bytes, claim.alignment,
+                    claim.level, claim.format, identity.kind};
+                PreparedClaim prepared{request};
+                bool fits = false;
+                const int status = prepare_claim_layout(context, slot, request, prepared, fits);
+                if (status != 0 || !fits) return status != 0 ? status : fail("invalid prepared slot layout");
+            }
+        }
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_prepared_storage_create(
+    GpuMatrix *const *matrices, size_t count,
+    const GpuPreparedWorkspaceLayout *workspaces, size_t workspace_count, void *owner,
+    void (*release_owner)(void *), GpuPreparedStorage **out)
+{
+    if (!out) return fail("null prepared matrix storage output");
+    *out = nullptr;
+    if (!matrices || count == 0 || !owner || !release_owner || !matrices[0] ||
+        !matrices[0]->ctx || !matrices[0]->ctx->execution ||
+        matrices[0]->ctx->gpu_ids.size() != 1 ||
+        (workspace_count != 0 && !workspaces) || workspace_count > SIZE_MAX - count)
+        return fail("invalid prepared matrix backing owners");
+    GpuContext *context = matrices[0]->ctx;
+    auto execution = context->execution;
+    GpuAllocationActivity activity(execution.get(), context->gpu_ids[0]);
+    if (active_provisioning) {
+        if (active_provisioning->context != context ||
+            active_provisioning->execution != execution)
+            return fail("prepared storage provisioning belongs to another context");
+    } else if (gpu_context_admission_is_required(context))
+        return fail("prepared matrix resources must be created before checked dispatch");
+    if (!active_provisioning && context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("cannot prepare matrix storage with unretired work");
+    std::shared_ptr<Storage> storage;
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error != cudaSuccess) return fail(error);
+    struct RestoreDevice {
+        int device;
+        GpuExecutionOwner *execution;
+        ~RestoreDevice() {
+            if (cudaSetDevice(device) != cudaSuccess)
+                gpu_execution_mark_allocation_unknown(execution);
+        }
+    } restore_device{previous, execution.get()};
+    try {
+        storage = std::make_shared<Storage>();
+        storage->identity = next_identity();
+        storage->context = context;
+        storage->device = context->gpu_ids[0];
+        std::unordered_set<GpuMatrix *> unique;
+        std::unordered_set<const void *> unique_backings;
+        for (size_t index = 0; index < count; ++index) {
+            GpuMatrix *matrix = matrices[index];
+            if (!matrix || matrix->ctx != context || matrix->rows == 0 || matrix->cols == 0 ||
+                matrix->shared_limb_buffers.size() != 1 ||
+                matrix->exec_limb_states.size() != 1 ||
+                !matrix->shared_limb_buffers[0].ptr ||
+                matrix->shared_limb_buffers[0].prepared_lease ||
+                !matrix->descriptors_initialized || !unique.insert(matrix).second ||
+                !unique_backings.insert(matrix->shared_limb_buffers[0].ptr).second)
+                return fail("prepared matrix slots require distinct initialized backing owners");
+        }
+        error = cudaSetDevice(storage->device);
+        if (error != cudaSuccess) return fail(error);
+        const cudaStream_t release = context->execution->release_streams_by_partition[0];
+        if (!release) return fail("missing prepared matrix release stream");
+        // This event is part of the storage owner, not a rollback-time
+        // allocation. It proves the queued backing frees and backing-owner
+        // destruction for a failed warmup generation.
+        error = cudaEventCreateWithFlags(&storage->release_probe, cudaEventDisableTiming);
+        if (error != cudaSuccess) return fail(error);
+        // Plan all capacities before constructing events or workspaces. The
+        // estimator and real allocation consume these same native dimensions.
+        std::vector<GpuClaimTraceEntry> requested;
+        requested.reserve(count + workspace_count);
+        for (size_t index = 0; index < count; ++index) {
+            const auto *matrix = matrices[index];
+            requested.push_back(GpuClaimTraceEntry{GPU_PREPARED_MATRIX,
+                matrix->rows, matrix->cols, matrix->level, static_cast<int>(matrix->format), 0, 0});
+        }
+        for (size_t index = 0; index < workspace_count; ++index) {
+            const auto &layout = workspaces[index];
+            requested.push_back(GpuClaimTraceEntry{layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment});
+        }
+        std::vector<GpuPreparedSlotSnapshot> capacities(requested.size());
+        const int capacity_status = gpu_prepared_slots_plan(context,
+            requested.data(), requested.size(), capacities.data());
+        if (capacity_status != 0) return capacity_status;
+        storage->slots.reserve(count + workspace_count);
+        for (size_t index = 0; index < count; ++index) {
+            auto slot = std::make_shared<Slot>();
+            slot->matrix = matrices[index];
+            slot->identity = capacities[index].identity;
+            slot->identity.storage_id = storage->identity;
+            slot->identity.backing_id = next_identity();
+            slot->identity.slot_id = next_identity();
+            if (slot->identity.requested_backing_bytes >
+                std::numeric_limits<size_t>::max() - storage->requested_capacity_bytes)
+                return fail("prepared matrix capacity overflow");
+            storage->requested_capacity_bytes += slot->identity.requested_backing_bytes;
+            slot->auxiliary_capacity_bytes = capacities[index].auxiliary_capacity_bytes;
+            storage->slots.push_back(std::move(slot));
+            auto &prepared = *storage->slots.back();
+            // Acquire all limb-owned events now; shared completions still retain
+            // their original completion_owner until a later writer detaches.
+            for (auto &state : prepared.matrix->exec_limb_states[0]) {
+                if (!state.write_done) {
+                    error = cudaEventCreateWithFlags(&state.write_done, cudaEventDisableTiming);
+                    if (error != cudaSuccess) break;
+                }
+            }
+            if (error == cudaSuccess)
+                error = cudaEventCreateWithFlags(&prepared.reusable, cudaEventDisableTiming);
+            if (error != cudaSuccess) break;
+            const int status = matrix_wait_all_limb_streams(
+                prepared.matrix, storage->device, release, true, true);
+            if (status != 0) {
+                cudaSetDevice(previous);
+                return status;
+            }
+            error = cudaEventRecord(prepared.reusable, release);
+            if (error != cudaSuccess) break;
+        }
+        for (size_t index = 0; error == cudaSuccess && index < workspace_count; ++index) {
+            const auto &layout = workspaces[index];
+            auto &capacity = layout.kind == GPU_PREPARED_PINNED_HOST
+                ? storage->pinned->capacity_bytes : storage->requested_capacity_bytes;
+            if (layout.bytes > SIZE_MAX - capacity)
+                return fail("prepared workspace capacity overflow");
+            auto slot = std::make_shared<Slot>();
+            slot->identity = capacities[count + index].identity;
+            slot->identity.storage_id = storage->identity;
+            slot->identity.backing_id = next_identity();
+            slot->identity.slot_id = next_identity();
+            capacity += layout.bytes;
+            storage->slots.push_back(std::move(slot));
+            auto &prepared = *storage->slots.back();
+            if (is_resource(layout.kind)) {
+                if (active_provisioning) {
+                    const int status = provisioning_consume(
+                        context, layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment);
+                    if (status != 0) return status;
+                }
+                if (storage->resources->capacity == SIZE_MAX)
+                    return fail("prepared resource capacity overflow");
+                ++storage->resources->capacity;
+                prepared.resource_device = storage->device;
+                if (layout.kind == GPU_PREPARED_COMPLETION_EVENT)
+                    error = cudaEventCreateWithFlags(&prepared.resource_event, cudaEventDisableTiming);
+                else {
+                    error = cudaStreamCreateWithFlags(&prepared.resource_stream, cudaStreamNonBlocking);
+                    if (error == cudaSuccess)
+                        error = cudaEventCreateWithFlags(&prepared.resource_event, cudaEventDisableTiming);
+                }
+            } else if (layout.kind == GPU_PREPARED_PINNED_HOST) {
+                prepared.workspace = gpu_pinned_alloc(context, layout.bytes, layout.alignment);
+                if (!prepared.workspace) return fail("failed to prepare pinned host storage");
+            } else {
+                if (active_provisioning) {
+                    const int status = provisioning_consume(
+                        context, layout.kind, 0, 0, -1, -1, layout.bytes, layout.alignment);
+                    if (status != 0) return status;
+                }
+                gpu_test_record_cuda_allocation();
+                error = cudaMallocAsync(&prepared.workspace, layout.bytes, release);
+                if (error == cudaSuccess)
+                    error = cudaEventCreateWithFlags(&prepared.reusable, cudaEventDisableTiming);
+                if (error == cudaSuccess) error = cudaEventRecord(prepared.reusable, release);
+            }
+        }
+        const cudaError_t restored = cudaSetDevice(previous);
+        if (error != cudaSuccess) return fail(error);
+        if (restored != cudaSuccess) return fail(restored);
+        auto result = std::make_unique<GpuPreparedStorage>();
+        result->value = storage;
+        storage->owner = owner;
+        storage->release_owner = release_owner;
+        execution->prepared_storage_count.fetch_add(1, std::memory_order_acq_rel);
+        storage->registered = true;
+        *out = result.release();
+        return 0;
+    } catch (const std::exception &error) {
+        cudaSetDevice(previous);
+        return fail(error.what());
+    }
+}
+
+extern "C" void gpu_prepared_storage_destroy(GpuPreparedStorage *storage)
+{
+    delete storage;
+}
+
+extern "C" int gpu_prepared_storage_start_release(
+    GpuPreparedStorage *storage, void **out)
+{
+    if (!out) return fail("null prepared release output");
+    *out = nullptr;
+    if (!storage || !storage->value) return fail("invalid prepared release storage");
+    auto backing = storage->value;
+    if (backing->release_started) return fail("prepared storage release already started");
+    auto execution = backing->context ? backing->context->execution : nullptr;
+    if (!execution || !backing->release_probe)
+        return fail("prepared storage has no release completion probe");
+    if (execution->unretired_work.load(std::memory_order_acquire) ||
+        execution->memory_release_failed.load(std::memory_order_acquire) ||
+        execution->allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("prepared storage execution owner is quarantined");
+    // Release is a sticky transition: teardown must not retry a potentially
+    // unsafe host free after setup or completion becomes uncertain.
+    backing->release_started = true;
+    GpuAllocationActivity activity(execution.get(), backing->device);
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error == cudaSuccess) error = cudaSetDevice(backing->device);
+    const cudaStream_t release = execution->release_streams_by_partition[0];
+    if (error == cudaSuccess && !release) error = cudaErrorInvalidResourceHandle;
+    if (error == cudaSuccess) {
+        for (auto &slot : backing->slots) {
+            if (slot->workspace && slot->identity.kind != GPU_PREPARED_PINNED_HOST) {
+                error = cudaFreeAsync(slot->workspace, release);
+                if (error != cudaSuccess) break;
+                slot->workspace = nullptr;
+            }
+        }
+        if (error == cudaSuccess && backing->release_owner) {
+            auto release_owner = backing->release_owner;
+            auto owner = backing->owner;
+            backing->release_owner = nullptr;
+            backing->owner = nullptr;
+            release_owner(owner);
+        }
+        if (error == cudaSuccess) error = cudaEventRecord(backing->release_probe, release);
+    }
+    if (previous >= 0) {
+        const cudaError_t restored = cudaSetDevice(previous);
+        if (error == cudaSuccess) error = restored;
+    }
+    if (error != cudaSuccess) {
+        backing->release_quarantined = true;
+        quarantine(*backing);
+        return fail(error);
+    }
+    try {
+        auto result = std::make_unique<PreparedRelease>();
+        result->storage = std::move(backing);
+        storage->value.reset();
+        *out = result.release();
+        return 0;
+    } catch (const std::exception &exception) {
+        backing->release_quarantined = true;
+        quarantine(*backing);
+        return fail(exception.what());
+    }
+}
+
+extern "C" int gpu_prepared_release_complete(
+    const void *release, int *out_complete)
+{
+    if (!release || !out_complete)
+        return fail("invalid prepared release probe");
+    *out_complete = 0;
+    const auto *probe = static_cast<const PreparedRelease *>(release);
+    if (!probe->storage) return fail("invalid prepared release probe");
+    auto &storage = *probe->storage;
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error == cudaSuccess) error = cudaSetDevice(storage.device);
+    if (error == cudaSuccess) {
+        error = cudaEventQuery(storage.release_probe);
+        if (error == cudaSuccess) {
+            storage.release_complete = true;
+            *out_complete = 1;
+        }
+        else if (error == cudaErrorNotReady) {
+            error = cudaSuccess;
+        }
+    }
+    if (previous >= 0) {
+        const cudaError_t restored = cudaSetDevice(previous);
+        if (error == cudaSuccess) error = restored;
+    }
+    if (error != cudaSuccess) {
+        storage.release_quarantined = true;
+        quarantine(storage);
+        return fail(error);
+    }
+    return 0;
+}
+
+extern "C" void gpu_prepared_release_destroy(void *release)
+{
+    delete static_cast<PreparedRelease *>(release);
+}
+
+extern "C" int gpu_prepared_storage_matches_context(
+    const GpuPreparedStorage *storage, const GpuContext *context)
+{
+    return storage && storage->value && context && storage->value->context == context;
+}
+
+extern "C" int gpu_prepared_storage_identity(
+    const GpuPreparedStorage *storage, uint64_t *out_storage_id,
+    uint64_t *out_execution_id, int *out_device)
+{
+    if (!storage || !storage->value || !out_storage_id || !out_execution_id || !out_device)
+        return fail("invalid prepared matrix storage identity arguments");
+    const auto &backing = *storage->value;
+    *out_storage_id = backing.identity;
+    *out_execution_id = backing.context->execution->identity;
+    *out_device = backing.device;
+    return 0;
+}
+
+extern "C" int gpu_prepared_slot_identity(
+    const GpuPreparedStorage *storage, size_t slot,
+    GpuPreparedSlotIdentity *out)
+{
+    if (!storage || !storage->value || !out || slot >= storage->value->slots.size())
+        return fail("invalid prepared matrix slot identity arguments");
+    *out = storage->value->slots[slot]->identity;
+    return 0;
+}
+
+extern "C" int gpu_prepared_storage_occupancy(
+    GpuPreparedStorage *storage, int reset_peak,
+    GpuPreparedOccupancy *out)
+{
+    if (!storage || !storage->value || !out)
+        return fail("invalid prepared matrix occupancy arguments");
+    auto &backing = *storage->value;
+    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared matrix occupancy has unretired work");
+    struct ResetBoundary {
+        Storage &backing;
+        bool owned = false;
+        ~ResetBoundary() {
+            if (owned) backing.active_reservations.store(0, std::memory_order_release);
+        }
+    } boundary{backing};
+    if (reset_peak == 1) {
+        size_t expected = 0;
+        if (!backing.active_reservations.compare_exchange_strong(
+                expected, resetting, std::memory_order_acq_rel))
+            return fail("prepared occupancy reset requires no reservations or dispatches");
+        boundary.owned = true;
+    }
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error != cudaSuccess) return fail(error);
+    error = cudaSetDevice(backing.device);
+    if (error != cudaSuccess) return fail(error);
+    bool pending = false;
+    size_t available_bytes = 0;
+    size_t pinned_available = 0;
+    size_t resource_available = 0;
+    for (auto &slot : backing.slots) {
+        unsigned int restore_state = available;
+        unsigned int expected = available;
+        if (!slot->state.compare_exchange_strong(
+                expected, inspecting, std::memory_order_acq_rel)) {
+            // Measurement parks reservation owners before entering here. A
+            // reserved slot can still carry its preceding, completed use; poll
+            // that event while preserving the reservation and its exact claims.
+            if (reset_peak == 2 && expected == reserved &&
+                slot->state.compare_exchange_strong(
+                    expected, inspecting, std::memory_order_acq_rel)) {
+                restore_state = reserved;
+            } else {
+                // Leased outputs remain the retained baseline. Failed slots or
+                // concurrent inspection cannot establish a measurement boundary.
+                pending |= expected != leased || slot->pinned_deferred.load(std::memory_order_acquire) ||
+                    slot->deferred_resource_pointer.load(std::memory_order_acquire) != nullptr;
+                continue;
+            }
+        }
+        if (slot->occupied_units != 0) {
+            error = cudaEventQuery(slot->reusable);
+            if (error == cudaSuccess) {
+                backing.occupied_bytes.fetch_sub(
+                    slot->occupied_units, std::memory_order_acq_rel);
+                backing.context->execution->prepared_occupied_bytes.fetch_sub(
+                    slot->occupied_units, std::memory_order_acq_rel);
+                slot->occupied_units = 0;
+            } else if (error == cudaErrorNotReady) {
+                pending = true;
+                error = cudaSuccess;
+            } else {
+                quarantine(backing);
+                slot->state.store(quarantined, std::memory_order_release);
+                break;
+            }
+        }
+        if (slot->reservation_owner.load(std::memory_order_acquire) == 0 &&
+            slot->region_owner.load(std::memory_order_acquire) == 0) {
+            if (is_resource(slot->identity.kind)) ++resource_available;
+            else if (slot->identity.kind == GPU_PREPARED_PINNED_HOST)
+                pinned_available += slot->identity.requested_backing_bytes;
+            else available_bytes += slot->identity.requested_backing_bytes;
+        }
+        slot->state.store(restore_state, std::memory_order_release);
+    }
+    const cudaError_t restored = cudaSetDevice(previous);
+    if (restored != cudaSuccess) quarantine(backing);
+    if (error != cudaSuccess) return fail(error);
+    if (restored != cudaSuccess) return fail(restored);
+    if (reset_peak && pending)
+        return fail("prepared occupancy reset has pending releases or slot inspection");
+    const size_t occupied = backing.occupied_bytes.load(std::memory_order_acquire);
+    if (reset_peak == 1)
+        backing.occupied_high_water_bytes.store(occupied, std::memory_order_release);
+    const size_t pinned_occupied = backing.pinned->occupied_bytes.load(std::memory_order_acquire);
+    if (reset_peak == 1) backing.pinned->high_water_bytes.store(pinned_occupied, std::memory_order_release);
+    const size_t resource_occupied = backing.resources->occupied.load(std::memory_order_acquire);
+    if (reset_peak == 1) backing.resources->high_water.store(resource_occupied, std::memory_order_release);
+    const size_t active = backing.active_reservations.load(std::memory_order_acquire);
+    *out = GpuPreparedOccupancy{
+        backing.requested_capacity_bytes,
+        backing.reserved_bytes.load(std::memory_order_acquire), occupied,
+        backing.occupied_high_water_bytes.load(std::memory_order_acquire),
+        active == resetting ? 0 : active, available_bytes,
+        backing.pinned->capacity_bytes, backing.pinned->reserved_bytes.load(std::memory_order_acquire),
+        pinned_occupied, backing.pinned->high_water_bytes.load(std::memory_order_acquire), pinned_available,
+        backing.resources->capacity, backing.resources->reserved.load(std::memory_order_acquire),
+        resource_occupied, backing.resources->high_water.load(std::memory_order_acquire), resource_available};
+    return 0;
+}
+
+extern "C" int gpu_prepared_storages_occupancy(
+    GpuPreparedStorage *const *storages, size_t count, int reset_peak,
+    size_t *out_occupied_bytes, size_t *out_high_water_bytes)
+{
+    if (!storages || count == 0 || !storages[0] || !storages[0]->value ||
+        !out_occupied_bytes || !out_high_water_bytes)
+        return fail("invalid joint prepared occupancy arguments");
+    auto execution = storages[0]->value->context->execution;
+    const int device = storages[0]->value->device;
+    if (execution->gpu_ids.size() != 1)
+        return fail("joint occupancy requires one physical device per execution owner");
+    try {
+        std::unordered_set<uint64_t> unique;
+        for (size_t index = 0; index < count; ++index) {
+            if (!storages[index] || !storages[index]->value)
+                return fail("missing joint prepared storage");
+            const auto &storage = *storages[index]->value;
+            if (storage.context->execution != execution || storage.device != device ||
+                !unique.insert(storage.identity).second)
+                return fail("joint occupancy requires distinct stores on the same execution owner");
+        }
+        struct ResetBoundary {
+            GpuExecutionOwner &execution;
+            bool owned = false;
+            ~ResetBoundary() {
+                if (owned) execution.prepared_active_reservations.store(0, std::memory_order_release);
+            }
+        } boundary{*execution};
+        if (reset_peak == 1) {
+            size_t expected = 0;
+            if (!execution->prepared_active_reservations.compare_exchange_strong(
+                    expected, resetting, std::memory_order_acq_rel))
+                return fail("joint occupancy reset requires no reservations or dispatches");
+            boundary.owned = true;
+        }
+        if (execution->prepared_storage_count.load(std::memory_order_acquire) != count)
+            return fail("joint occupancy requires the complete live prepared inventory");
+        for (size_t index = 0; index < count; ++index) {
+            GpuPreparedOccupancy local{};
+            const int status = gpu_prepared_storage_occupancy(storages[index], reset_peak, &local);
+            if (status != 0) return status;
+        }
+        const size_t occupied = execution->prepared_occupied_bytes.load(std::memory_order_acquire);
+        // Mode 2 is an explicit benchmark boundary. Its caller has completed
+        // preceding releases and parked all reservation/dispatch owners. It
+        // resets only this joint measurement, never calibration's slot peaks or
+        // admission state. Ordinary observation and calibration keep their
+        // original reservation exclusion rules.
+        if (reset_peak) execution->prepared_high_water_bytes.store(occupied, std::memory_order_release);
+        *out_occupied_bytes = occupied;
+        *out_high_water_bytes = execution->prepared_high_water_bytes.load(std::memory_order_acquire);
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_graph_admission_begin(GpuContext *ctx)
+{
+    if (!ctx || !ctx->execution) return fail("missing graph execution owner");
+    auto &owner = *ctx->execution;
+    if (owner.prepared_active_reservations.load(std::memory_order_acquire) ||
+        owner.active_allocation_calls.load(std::memory_order_seq_cst) ||
+        owner.unretired_work.load(std::memory_order_acquire))
+        return fail("graph setup has outstanding admission or uncertain work");
+    bool inactive = false;
+    if (!owner.graph_admission_active.compare_exchange_strong(inactive, true, std::memory_order_acq_rel))
+        return fail("graph execution owner is already active");
+    GpuAllocationActivity activity(&owner, -1);
+    owner.graph_admission_scoped.store(true, std::memory_order_release);
+    owner.admission_required.store(false, std::memory_order_release);
+    owner.pinned_admission_required.store(false, std::memory_order_release);
+    owner.transfer_admission_required.store(false, std::memory_order_release);
+    owner.resource_admission_required.store(false, std::memory_order_release);
+    return 0;
+}
+
+extern "C" void gpu_graph_admission_end(GpuContext *ctx)
+{
+    if (!ctx || !ctx->execution) return;
+    auto &owner = *ctx->execution;
+    GpuAllocationActivity activity(&owner, -1);
+    // Failed/pending invocations keep their seal. Never turn an unfinished
+    // native reservation into permission for an unclaimed allocation.
+    if (!owner.prepared_active_reservations.load(std::memory_order_acquire) &&
+        !owner.unretired_work.load(std::memory_order_acquire)) {
+        // A completed managed inventory is a long-lived sealed owner. An
+        // ordinary graph scope may temporarily open it, but ending that scope
+        // must restore the seal so later provisioning targets this same owner
+        // rather than requiring a replacement ledger or dropping live outputs.
+        const bool sealed = owner.allocation_tracking_complete.load(std::memory_order_acquire);
+        owner.admission_required.store(sealed, std::memory_order_release);
+        owner.pinned_admission_required.store(sealed, std::memory_order_release);
+        owner.transfer_admission_required.store(sealed, std::memory_order_release);
+        owner.resource_admission_required.store(sealed, std::memory_order_release);
+    }
+    owner.graph_admission_active.store(false, std::memory_order_release);
+}
+
+extern "C" int gpu_prepared_storages_finish_setup(
+    GpuPreparedStorage *const *storages, size_t count)
+{
+    if (!storages || count == 0 || !storages[0] || !storages[0]->value)
+        return fail("managed setup requires a nonempty prepared inventory");
+    const auto execution = storages[0]->value->context->execution;
+    if (execution->gpu_ids.size() != 1)
+        return fail("managed setup requires one device per execution owner");
+    if (execution->unretired_work.load(std::memory_order_acquire) ||
+        execution->memory_release_failed.load(std::memory_order_acquire) ||
+        execution->allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("managed setup has uncertain allocation or release activity");
+    if (execution->timing_active.load(std::memory_order_acquire) ||
+        execution->prepared_active_reservations.load(std::memory_order_acquire) != 0 ||
+        execution->active_allocation_calls.load(std::memory_order_seq_cst) != 0)
+        return fail("managed setup requires no outstanding host allocations or reservations");
+    try {
+        std::unordered_set<uint64_t> identities;
+        for (size_t index = 0; index < count; ++index) {
+            if (!storages[index] || !storages[index]->value)
+                return fail("managed setup contains missing storage");
+            const auto &storage = *storages[index]->value;
+            if (storage.context->execution != execution ||
+                storage.device != execution->gpu_ids[0] ||
+                !identities.insert(storage.identity).second)
+                return fail("managed setup requires distinct stores on the same execution owner");
+            for (const auto &slot : storage.slots) {
+                const auto state = slot->state.load(std::memory_order_acquire);
+                if (slot->reservation_owner.load(std::memory_order_acquire) != 0 ||
+                    slot->region_owner.load(std::memory_order_acquire) != 0 ||
+                    (state != available && !(state == leased &&
+                        execution->graph_admission_scoped.load(std::memory_order_acquire))))
+                    return fail("managed setup has a reserved, untracked leased or quarantined slot");
+            }
+        }
+        if (execution->prepared_storage_count.load(std::memory_order_acquire) != count)
+            return fail("managed setup requires the complete live prepared inventory");
+        // The audited managed allocation sites all require one of these domains.
+        // Close every domain before making coherent observation available. A
+        // concurrent older allocation remains visible to the epoch counters;
+        // no receipt is issued here and no physical upper bound is asserted.
+        execution->admission_required.store(true, std::memory_order_release);
+        execution->pinned_admission_required.store(true, std::memory_order_release);
+        execution->transfer_admission_required.store(true, std::memory_order_release);
+        execution->resource_admission_required.store(true, std::memory_order_release);
+        execution->allocation_tracking_complete.store(true, std::memory_order_release);
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_prepared_setup_begin(GpuContext *context)
+{
+    if (!context || !context->execution)
+        return fail("managed setup requires a GPU execution owner");
+    auto &execution = *context->execution;
+    if (execution.unretired_work.load(std::memory_order_acquire) ||
+        execution.memory_release_failed.load(std::memory_order_acquire) ||
+        execution.allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("managed setup has uncertain allocation or release activity");
+    if (execution.prepared_storage_count.load(std::memory_order_acquire) != 0)
+        return fail("managed setup begin requires an empty prepared inventory");
+    if (execution.active_allocation_calls.load(std::memory_order_seq_cst) != 0 ||
+        execution.prepared_active_reservations.load(std::memory_order_acquire) != 0)
+        return fail("managed setup begin has outstanding allocation activity");
+    // This is the explicit prepared-backend boundary. Every audited native
+    // allocation domain is closed before the first baseline observation, so
+    // the initial receipt covers both the existing context and the backing
+    // claims consumed by the provisioning permit that follows.
+    execution.admission_required.store(true, std::memory_order_release);
+    execution.pinned_admission_required.store(true, std::memory_order_release);
+    execution.transfer_admission_required.store(true, std::memory_order_release);
+    execution.resource_admission_required.store(true, std::memory_order_release);
+    execution.allocation_tracking_complete.store(true, std::memory_order_release);
+    return 0;
+}
+
+extern "C" int gpu_matrix_validate_claims(
+    GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
+    GpuPreparedClaimHandle **out)
+{
+    if (!out) return fail("null prepared claim handle output");
+    *out = nullptr;
+    if (!storage || !storage->value || (count && !requests))
+        return fail("invalid prepared claim handle");
+    if (storage->value->context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared claim validation has unretired work");
+    try {
+        auto handle = std::make_unique<GpuPreparedClaimHandle>();
+        handle->storage = storage->value;
+        auto claims = std::make_shared<std::vector<PreparedClaim>>();
+        bool fits = false;
+        const int status = prepare_claims(*storage->value, requests, count, *claims, fits);
+        if (status != 0) return status;
+        if (!fits) return fail("prepared request does not fit its backing layout");
+        handle->claims = std::move(claims);
+        *out = handle.release();
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" int gpu_matrix_activate_claims(
+    const GpuPreparedClaimHandle *claims, const GpuPreparedRegion *region,
+    GpuMatrixReservation **out)
+{
+    if (!out) return fail("null matrix reservation output");
+    *out = nullptr;
+    if (!claims || !claims->storage)
+        return fail("invalid prepared claim handle");
+    auto &backing = *claims->storage;
+    if (region && (!region->value || region->value->storage != claims->storage))
+        return fail("prepared region belongs to a different storage");
+    const uint64_t region_id = region ? region->value->identity : 0;
+    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared claim activation has unretired work");
+    try {
+        auto reservation = std::make_unique<GpuMatrixReservation>(claims->storage);
+        reservation->region = region ? region->value : nullptr;
+        reservation->claims = claims->claims;
+        reservation->slots.reserve(claims->claims->size());
+        reservation->bounds.reserve(claims->claims->size());
+        for (const auto &claim : *claims->claims) {
+            reservation->slots.push_back(claim.request.slot_index);
+            reservation->bounds.push_back(claim.request);
+        }
+        for (; reservation->claimed < reservation->claims->size(); ++reservation->claimed) {
+            unsigned int expected = available;
+            const size_t slot = reservation->slots[reservation->claimed];
+            uint64_t owner = 0;
+            if (!backing.slots[slot]->reservation_owner.compare_exchange_strong(
+                    owner, reservation->identity, std::memory_order_acq_rel))
+                return conflict("prepared slot belongs to another invocation");
+            if (backing.slots[slot]->region_owner.load(std::memory_order_acquire) != region_id) {
+                backing.slots[slot]->reservation_owner.store(0, std::memory_order_release);
+                return conflict("prepared slot belongs to another region");
+            }
+            if (!backing.slots[slot]->state.compare_exchange_strong(
+                    expected, reserved, std::memory_order_acq_rel)) {
+                backing.slots[slot]->reservation_owner.store(0, std::memory_order_release);
+                return conflict("prepared matrix slot is still owned by another reservation or output");
+            }
+            reserved_counter(backing, *backing.slots[slot]).fetch_add(
+                reservation_units(*backing.slots[slot]), std::memory_order_acq_rel);
+        }
+        if (!backing.context->execution->graph_admission_scoped.load(std::memory_order_acquire)) {
+            backing.context->execution->admission_required.store(true, std::memory_order_release);
+            for (const auto &claim : *reservation->claims) {
+                if (claim.request.kind == GPU_PREPARED_PINNED_HOST)
+                    backing.context->execution->pinned_admission_required.store(true, std::memory_order_release);
+                if (claim.request.kind == GPU_PREPARED_TRANSFER_WORKSPACE)
+                    backing.context->execution->transfer_admission_required.store(true, std::memory_order_release);
+                if (is_resource(claim.request.kind))
+                    backing.context->execution->resource_admission_required.store(true, std::memory_order_release);
+            }
+        }
+        *out = reservation.release();
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" void gpu_matrix_claim_handle_destroy(GpuPreparedClaimHandle *claims)
+{
+    delete claims;
+}
+
+extern "C" int gpu_matrix_reserve(
+    GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
+    const GpuPreparedRegion *region, GpuMatrixReservation **out)
+{
+    GpuPreparedClaimHandle *claims = nullptr;
+    const int status = gpu_matrix_validate_claims(storage, requests, count, &claims);
+    if (status != 0) return status;
+    const int activated = gpu_matrix_activate_claims(claims, region, out);
+    gpu_matrix_claim_handle_destroy(claims);
+    return activated;
+}
+
+extern "C" int gpu_prepared_region_create(
+    GpuPreparedStorage *storage, const size_t *slots, size_t count,
+    GpuPreparedRegion **out)
+{
+    if (!out) return fail("null region output");
+    *out = nullptr;
+    if (!storage || !storage->value || (count && !slots))
+        return fail("invalid prepared region");
+    if (storage->value->context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("region admission has unretired work");
+    try {
+        auto region = std::make_shared<Region>();
+        region->storage = storage->value;
+        if (count) region->slots.assign(slots, slots + count);
+        auto result = std::make_unique<GpuPreparedRegion>();
+        for (; region->acquired < count; ++region->acquired) {
+            const size_t index = region->slots[region->acquired];
+            if (index >= region->storage->slots.size()) return fail("region slot out of bounds");
+            auto &slot = *region->storage->slots[index];
+            uint64_t previous = 0;
+            if (!slot.region_owner.compare_exchange_strong(previous, region->identity,
+                    std::memory_order_acq_rel))
+                return 0; // Busy capacity: roll back, without classifying it as a CUDA error.
+            if (slot.reservation_owner.load(std::memory_order_acquire) != 0 ||
+                slot.state.load(std::memory_order_acquire) != available) {
+                slot.region_owner.store(0, std::memory_order_release);
+                return 0; // A competing operation won after the candidate was fitted.
+            }
+            unsigned int expected = available;
+            if (!slot.state.compare_exchange_strong(expected, inspecting,
+                    std::memory_order_acq_rel)) {
+                slot.region_owner.store(0, std::memory_order_release);
+                return 0;
+            }
+            cudaError_t error = cudaSuccess;
+            if (slot.occupied_units != 0) {
+                int previous_device = -1;
+                error = cudaGetDevice(&previous_device);
+                if (error == cudaSuccess) error = cudaSetDevice(region->storage->device);
+                if (error == cudaSuccess) error = cudaEventQuery(slot.reusable);
+                if (previous_device >= 0) {
+                    const cudaError_t restored = cudaSetDevice(previous_device);
+                    if (restored != cudaSuccess) error = restored;
+                }
+            }
+            if (error != cudaSuccess && error != cudaErrorNotReady) {
+                quarantine(*region->storage);
+                slot.state.store(quarantined, std::memory_order_release);
+                slot.region_owner.store(0, std::memory_order_release);
+                return fail(error);
+            }
+            slot.state.store(available, std::memory_order_release);
+            if (error == cudaErrorNotReady) {
+                slot.region_owner.store(0, std::memory_order_release);
+                return 0; // A release became pending after the snapshot.
+            }
+        }
+        result->value = std::move(region);
+        *out = result.release();
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" void gpu_prepared_region_destroy(GpuPreparedRegion *region) { delete region; }
+
+extern "C" int gpu_prepared_storage_releases(const GpuPreparedStorage *storage,
+    const GpuPreparedRegion *region, const size_t *wait_slots, size_t wait_count,
+    unsigned char *out_pending)
+{
+    if (!storage || !storage->value || (!out_pending && !storage->value->slots.empty()))
+        return fail("invalid prepared release observation");
+    auto &backing = *storage->value;
+    if (region && (!region->value || region->value->storage != storage->value))
+        return fail("prepared region belongs to a different storage");
+    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared release observation has unretired work");
+    std::fill_n(out_pending, backing.slots.size(), 0);
+    // Matrix readers inside a region are ordered by admission. Deferred host
+    // uploads still hold their pinned buffer/event leases and must be retired
+    // before these resources can be claimed again within that same region.
+    const uint64_t owner = region ? region->value->identity : 0;
+    int previous = -1;
+    cudaError_t error = cudaGetDevice(&previous);
+    if (error != cudaSuccess) return fail(error);
+    error = cudaSetDevice(backing.device);
+    if (error != cudaSuccess) return fail(error);
+    for (size_t index = 0; index < backing.slots.size(); ++index) {
+        auto &slot = *backing.slots[index];
+        if (slot.region_owner.load(std::memory_order_acquire) != owner) continue;
+        bool wait = false;
+        for (size_t selected = 0; selected < wait_count; ++selected)
+            wait |= wait_slots[selected] == index;
+        unsigned int expected = available;
+        if (!slot.state.compare_exchange_strong(expected, inspecting, std::memory_order_acq_rel)) {
+            void *retirement = slot.identity.kind == GPU_PREPARED_PINNED_HOST &&
+                slot.pinned_deferred.load(std::memory_order_acquire)
+                    ? slot.workspace : slot.deferred_resource_pointer.load(std::memory_order_acquire);
+            if (expected == leased && retirement &&
+                slot.region_owner.load(std::memory_order_acquire) == owner &&
+                slot.reservation_owner.load(std::memory_order_acquire) == 0) {
+                if (wait) {
+                    const int status = gpu_wait_pinned_release(backing.context, retirement);
+                    if (status != 0) {
+                        cudaSetDevice(previous);
+                        return status;
+                    }
+                }
+                out_pending[index] = slot.state.load(std::memory_order_acquire) != available;
+            }
+            continue;
+        }
+        if (!region && slot.region_owner.load(std::memory_order_acquire) == 0 &&
+            slot.reservation_owner.load(std::memory_order_acquire) == 0 &&
+            slot.occupied_units != 0) {
+            error = cudaEventQuery(slot.reusable);
+            if (error == cudaErrorNotReady) {
+                if (wait) error = cudaEventSynchronize(slot.reusable);
+                else {
+                    out_pending[index] = 1;
+                    error = cudaSuccess;
+                }
+            }
+        }
+        if (error != cudaSuccess) {
+            quarantine(backing);
+            slot.state.store(quarantined, std::memory_order_release);
+            break;
+        }
+        slot.state.store(available, std::memory_order_release);
+    }
+    const cudaError_t restored = cudaSetDevice(previous);
+    if (restored != cudaSuccess) quarantine(backing);
+    if (error != cudaSuccess) return fail(error);
+    return restored == cudaSuccess ? 0 : fail(restored);
+}
+
+extern "C" int gpu_prepared_storage_demand(
+    const GpuPreparedStorage *storage, const GpuPreparedRequest *requests,
+    size_t count, GpuPreparedDemand *out)
+{
+    if (!storage || !storage->value || !out)
+        return fail("invalid prepared demand arguments");
+    *out = {};
+    try {
+        std::vector<PreparedClaim> claims;
+        bool fits = false;
+        const int status = prepare_claims(*storage->value, requests, count, claims, fits);
+        if (status != 0) return status;
+        if (!fits) return fail("prepared demand exceeds its native layout");
+        GpuPreparedDemand demand{};
+        for (const auto &claim : claims) {
+            auto &total = is_resource(claim.request.kind) ? demand.resource_slots :
+                claim.request.kind == GPU_PREPARED_PINNED_HOST ? demand.pinned_bytes : demand.device_bytes;
+            if (claim.occupied_units > SIZE_MAX - total)
+                return fail("prepared demand overflow");
+            total += claim.occupied_units;
+        }
+        *out = demand;
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_matrix_reservation_require_all_resources(GpuMatrixReservation *reservation)
+{
+    if (!reservation || reservation->next != 0 ||
+        reservation->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("complete resource coverage requires an unsubmitted reservation");
+    auto &owner = *reservation->execution;
+    if (!owner.graph_admission_scoped.load(std::memory_order_acquire)) {
+        owner.admission_required.store(true, std::memory_order_release);
+        owner.pinned_admission_required.store(true, std::memory_order_release);
+        owner.transfer_admission_required.store(true, std::memory_order_release);
+        owner.resource_admission_required.store(true, std::memory_order_release);
+    }
+    return 0;
+}
+
+extern "C" int gpu_prepared_slot_layout_fits(GpuContext *context,
+    const GpuPreparedSlotSnapshot *slot, const GpuPreparedRequest *request, int *out_fits)
+{
+    if (!context || !slot || !request || !out_fits)
+        return fail("invalid prepared layout observation");
+    *out_fits = 0;
+    PreparedClaim claim{*request};
+    bool fits = false;
+    const int status = prepare_claim_layout(context, *slot, *request, claim, fits);
+    if (status == 0) *out_fits = fits;
+    return status;
+}
+
+extern "C" int gpu_prepared_storage_snapshot(const GpuPreparedStorage *storage,
+    const GpuPreparedRegion *region, GpuPreparedSlotSnapshot *out, size_t count)
+{
+    if (!storage || !storage->value || count != storage->value->slots.size() || (count && !out))
+        return fail("invalid prepared inventory snapshot");
+    const auto &backing = *storage->value;
+    if (region && (!region->value || region->value->storage != storage->value))
+        return fail("prepared region belongs to a different storage");
+    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared snapshot has unretired work");
+    const uint64_t owner = region ? region->value->identity : 0;
+    for (size_t index = 0; index < count; ++index) {
+        const auto &slot = *backing.slots[index];
+        out[index] = GpuPreparedSlotSnapshot{slot.identity, slot.auxiliary_capacity_bytes,
+            slot.region_owner.load(std::memory_order_acquire) == owner &&
+            slot.reservation_owner.load(std::memory_order_acquire) == 0 &&
+            slot.state.load(std::memory_order_acquire) == available};
+    }
+    return 0;
+}
+
+extern "C" int gpu_prepared_storage_fits(
+    const GpuPreparedStorage *storage, const GpuPreparedRequest *requests, size_t count,
+    const GpuPreparedRegion *region, int *out_fits)
+{
+    if (!storage || !storage->value || !out_fits)
+        return fail("invalid prepared fit arguments");
+    *out_fits = 0;
+    const auto &backing = *storage->value;
+    if (region && (!region->value || region->value->storage != storage->value))
+        return fail("prepared region belongs to a different storage");
+    const uint64_t region_id = region ? region->value->identity : 0;
+    if (backing.context->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("prepared fit has unretired work");
+    try {
+        std::vector<PreparedClaim> claims;
+        bool fits = false;
+        const int status = prepare_claims(backing, requests, count, claims, fits);
+        if (status != 0 || !fits) return status;
+        for (const auto &claim : claims)
+            if (backing.slots[claim.request.slot_index]->region_owner.load(std::memory_order_acquire) != region_id ||
+                backing.slots[claim.request.slot_index]->reservation_owner.load(std::memory_order_acquire) != 0 ||
+                backing.slots[claim.request.slot_index]->state.load(std::memory_order_acquire) != available)
+                return 0;
+        *out_fits = 1;
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" void gpu_matrix_reservation_destroy(GpuMatrixReservation *reservation)
+{
+    delete reservation;
+}
+
+extern "C" int gpu_matrix_reservation_matches_context(
+    const GpuMatrixReservation *reservation, const GpuContext *context)
+{
+    return reservation && context && reservation->storage->context == context;
+}
+
+extern "C" int gpu_matrix_reservation_rearm(
+    GpuMatrixReservation *reservation, const GpuPreparedRequest *requests, size_t count)
+{
+    if (!reservation || (reservation->next != 0 && reservation->next != reservation->claimed) ||
+        count != reservation->slots.size() || (count && !requests))
+        return fail("rearm requires an unsubmitted or complete dispatch and its original slot count");
+    if (reservation->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("reservation rearm has unretired work");
+    auto &storage = *reservation->storage;
+    try {
+        std::vector<PreparedClaim> claims;
+        bool fits = false;
+        const int status = prepare_claims(storage, requests, count, claims, fits);
+        if (status != 0) return status;
+        if (!fits) return fail("rearmed request does not fit its backing layout");
+        for (size_t index = 0; index < count; ++index) {
+            const auto &request = requests[index];
+            const auto &bound = reservation->bounds[index];
+            if (request.storage_id != bound.storage_id || request.slot_id != bound.slot_id ||
+                request.slot_index != bound.slot_index || request.kind != bound.kind ||
+                request.level != bound.level || request.format != bound.format ||
+                request.rows > bound.rows || request.columns > bound.columns ||
+                request.bytes > bound.bytes || request.alignment > bound.alignment)
+                return fail("rearmed request exceeds its original admitted envelope");
+        }
+        if (reservation->next == 0) {
+            // An armed request can only be refined before submission, not
+            // rearmed unchanged or widened. Completed waves use the original
+            // admitted envelope below and may grow again within that bound.
+            bool narrower = false;
+            for (size_t index = 0; index < count; ++index) {
+                const auto &previous = (*reservation->claims)[index].request;
+                const auto &request = requests[index];
+                if (request.rows > previous.rows || request.columns > previous.columns ||
+                    request.bytes > previous.bytes || request.alignment > previous.alignment)
+                    return fail("unsubmitted request specialization must narrow its current layout");
+                narrower |= request.rows < previous.rows || request.columns < previous.columns ||
+                    request.bytes < previous.bytes || request.alignment < previous.alignment;
+            }
+            if (!narrower) return fail("reservation is already armed with this request");
+            // The initial envelope is already reserved. Specializing it for a
+            // narrower first range changes no slot ownership or capacity charge.
+            // Bounds remain the original invocation envelope, not this request.
+            reservation->claims = std::make_shared<std::vector<PreparedClaim>>(std::move(claims));
+            return 0;
+        }
+        size_t acquired = 0;
+        for (; acquired < count; ++acquired) {
+            auto &slot = *storage.slots[reservation->slots[acquired]];
+            unsigned int expected = available;
+            if (!slot.state.compare_exchange_strong(expected, reserved, std::memory_order_acq_rel))
+                break;
+            reserved_counter(storage, slot).fetch_add(
+                reservation_units(slot), std::memory_order_acq_rel);
+        }
+        if (acquired != count) {
+            for (size_t index = 0; index < acquired; ++index) {
+                auto &slot = *storage.slots[reservation->slots[index]];
+                reserved_counter(storage, slot).fetch_sub(
+                    reservation_units(slot), std::memory_order_acq_rel);
+                slot.state.store(available, std::memory_order_release);
+            }
+            return fail("previous wave still owns a prepared slot or it is being inspected");
+        }
+        reservation->claims = std::make_shared<std::vector<PreparedClaim>>(std::move(claims));
+        reservation->next = 0;
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_matrix_reservation_cpu_ready(
+    const GpuMatrixReservation *reservation, int *out_ready)
+{
+    if (!reservation || !out_ready) return fail("invalid CPU staging readiness query");
+    *out_ready = 0;
+    const auto &execution = *reservation->execution;
+    if (execution.unretired_work.load(std::memory_order_acquire) ||
+        execution.memory_release_failed.load(std::memory_order_acquire) ||
+        execution.allocation_activity_unknown.load(std::memory_order_seq_cst))
+        return fail("CPU staging retirement has uncertain allocation or release activity");
+    bool ready = true;
+    for (size_t index : reservation->slots) {
+        const auto &slot = *reservation->storage->slots[index];
+        if (slot.identity.kind != GPU_PREPARED_PINNED_HOST) continue;
+        const auto state = slot.state.load(std::memory_order_acquire);
+        if (state == available || state == reserved) continue;
+        if (state == leased && slot.pinned_deferred.load(std::memory_order_acquire)) {
+            ready = false;
+            continue;
+        }
+        return fail("CPU staging is still owned by the caller or quarantined");
+    }
+    // The reclaimer releases the exact upload completion resource before
+    // publishing its pinned slots available. This does not drain unrelated jobs.
+    *out_ready = ready ? 1 : 0;
+    return 0;
+}
+
+extern "C" int gpu_matrix_reservation_partition(
+    GpuMatrixReservation *reservation, const size_t *counts, size_t child_count,
+    GpuMatrixReservation **out_children)
+{
+    if (!reservation || reservation->next != 0 ||
+        reservation->claimed != reservation->slots.size() ||
+        (child_count != 0 && (!counts || !out_children)))
+        return fail("invalid prepared reservation partition");
+    if (reservation->execution->unretired_work.load(std::memory_order_acquire))
+        return fail("reservation partition has unretired work");
+    size_t total = 0;
+    for (size_t index = 0; index < child_count; ++index) {
+        out_children[index] = nullptr;
+        if (counts[index] > SIZE_MAX - total)
+            return fail("prepared reservation partition overflow");
+        total += counts[index];
+    }
+    if (total != reservation->slots.size())
+        return fail("prepared child plans must cover the complete reservation");
+    try {
+        std::vector<std::unique_ptr<GpuMatrixReservation>> children;
+        children.reserve(child_count);
+        size_t offset = 0;
+        for (size_t index = 0; index < child_count; ++index) {
+            auto child = std::make_unique<GpuMatrixReservation>(reservation->storage);
+            child->region = reservation->region;
+            child->slots.assign(reservation->slots.begin() + offset,
+                                reservation->slots.begin() + offset + counts[index]);
+            child->claims = std::make_shared<std::vector<PreparedClaim>>(
+                reservation->claims->begin() + offset,
+                reservation->claims->begin() + offset + counts[index]);
+            child->bounds.assign(reservation->bounds.begin() + offset,
+                                 reservation->bounds.begin() + offset + counts[index]);
+            offset += counts[index];
+            children.push_back(std::move(child));
+        }
+        // Every fallible host allocation has completed. Until this transfer,
+        // only the parent owns the slot claims and the children roll back no
+        // slots. Neither reservation counters nor slot states change here.
+        for (auto &child : children) {
+            for (size_t slot : child->slots)
+                child->storage->slots[slot]->reservation_owner.store(
+                    child->identity, std::memory_order_release);
+            child->claimed = child->slots.size();
+        }
+        reservation->claimed = 0;
+        for (size_t index = 0; index < child_count; ++index)
+            out_children[index] = children[index].release();
+        delete reservation;
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" int gpu_matrix_dispatch_enter(
+    GpuMatrixReservation *const *reservations, size_t count, GpuMatrixDispatchPermit **out)
+{
+    if (!out) return fail("null matrix dispatch permit output");
+    *out = nullptr;
+    if (!reservations || count == 0 || active_permit || active_provisioning)
+        return fail("invalid or nested matrix dispatch activation");
+    try {
+        std::unordered_set<GpuMatrixReservation *> unique;
+        for (size_t index = 0; index < count; ++index) {
+            const auto *reservation = reservations[index];
+            if (!reservation || reservation->next != 0 || !unique.insert(reservations[index]).second)
+                return fail("invalid, consumed or duplicate matrix dispatch reservation");
+            if (reservation->execution->unretired_work.load(std::memory_order_acquire))
+                return fail("matrix dispatch has unretired work");
+            if (reservation->execution != reservations[0]->execution ||
+                reservation->storage->device != reservations[0]->storage->device)
+                return fail("composed dispatch requires one device and execution owner");
+        }
+        auto permit = std::make_unique<GpuMatrixDispatchPermit>();
+        permit->reservations.resize(count);
+        permit->entered = count;
+        // All fallible host preparation precedes ownership transfer. Every
+        // reservation keeps its slot identities and invocation holds unchanged.
+        for (size_t index = 0; index < count; ++index)
+            permit->reservations[index].reset(reservations[index]);
+        active_permit = permit.release();
+        *out = active_permit;
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" int gpu_matrix_dispatch_enter_with_workspaces(
+    GpuMatrixReservation *const *reservations, size_t count,
+    GpuPreparedWorkspaceReservation *const *workspace_reservations,
+    size_t workspace_count, GpuMatrixDispatchPermit **out)
+{
+    if (!out) return fail("null prepared dispatch permit output");
+    *out = nullptr;
+    if ((!reservations && count) || (!workspace_reservations && workspace_count) ||
+        (!count && !workspace_count) || active_permit || active_provisioning)
+        return fail("invalid or nested prepared dispatch activation");
+    try {
+        std::unordered_set<GpuMatrixReservation *> unique_matrix;
+        std::unordered_set<GpuPreparedWorkspaceReservation *> unique_workspace;
+        std::shared_ptr<GpuExecutionOwner> execution;
+        int physical_device = -1;
+        for (size_t index = 0; index < count; ++index) {
+            auto *reservation = reservations[index];
+            if (!reservation || reservation->next != 0 ||
+                !unique_matrix.insert(reservation).second)
+                return fail("invalid, consumed or duplicate matrix dispatch reservation");
+            if (reservation->execution->unretired_work.load(std::memory_order_acquire))
+                return fail("prepared dispatch has unretired work");
+            if (!execution) {
+                execution = reservation->execution;
+                physical_device = reservation->storage->device;
+            } else if (execution != reservation->execution ||
+                       physical_device != reservation->storage->device) {
+                return fail("prepared dispatch requires one device and execution owner");
+            }
+        }
+        for (size_t index = 0; index < workspace_count; ++index) {
+            auto *reservation = workspace_reservations[index];
+            if (!reservation || !reservation->value || reservation->value->next != 0 ||
+                !unique_workspace.insert(reservation).second)
+                return fail("invalid, consumed or duplicate workspace dispatch reservation");
+            auto candidate = reservation->value->storage->execution;
+            if (candidate->unretired_work.load(std::memory_order_acquire))
+                return fail("prepared workspace dispatch has unretired work");
+            if (!execution) execution = candidate;
+            else if (execution != candidate)
+                return fail("prepared dispatch requires one execution owner");
+        }
+        auto permit = std::make_unique<GpuMatrixDispatchPermit>();
+        permit->reservations.reserve(count);
+        permit->entered = count;
+        for (size_t index = 0; index < count; ++index)
+            permit->reservations.emplace_back(reservations[index]);
+        permit->workspace_reservations.reserve(workspace_count);
+        for (size_t index = 0; index < workspace_count; ++index)
+            permit->workspace_reservations.emplace_back(workspace_reservations[index]);
+        active_permit = permit.release();
+        *out = active_permit;
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+extern "C" int gpu_matrix_dispatch_set_workspace_claims(
+    const GpuPreparedWorkspaceRequest *requests, size_t count)
+{
+    if (!active_permit || (!requests && count))
+        return fail("exact workspace claims require an active dispatch");
+    try {
+        std::vector<GpuMatrixDispatchPermit::ExactWorkspaceClaim> exact;
+        exact.reserve(count);
+        std::set<std::pair<uint64_t, size_t>> seen;
+        for (size_t index = 0; index < count; ++index) {
+            const auto &request = requests[index];
+            GpuPreparedWorkspaceReservation *found = nullptr;
+            size_t request_index = 0;
+            for (auto &owned : active_permit->workspace_reservations) {
+                auto &reservation = *owned->value;
+                for (size_t candidate = 0; candidate < reservation.requests.size(); ++candidate) {
+                    const auto &available = reservation.requests[candidate];
+                    if (available.storage_id == request.storage_id &&
+                        available.slot == request.slot) {
+                        if (found || available.device != request.device ||
+                            available.partition != request.partition ||
+                            available.stream_slot != request.stream_slot ||
+                            available.bytes != request.bytes ||
+                            available.alignment != request.alignment ||
+                            available.kind != request.kind)
+                            return fail("exact workspace claim identity is duplicated or differs");
+                        found = owned.get();
+                        request_index = candidate;
+                    }
+                }
+            }
+            if (!found) return fail("exact workspace claim is not owned by this dispatch");
+            if (!seen.insert({request.storage_id, request.slot}).second)
+                return fail("exact workspace claim is repeated");
+            exact.push_back({found, request_index});
+        }
+        size_t available = 0;
+        for (const auto &owned : active_permit->workspace_reservations)
+            available += owned->value->requests.size();
+        if (count != available)
+            return fail("exact workspace claims do not cover the dispatch reservation");
+        active_permit->exact_workspace_claims = std::move(exact);
+        active_permit->exact_workspace_next = 0;
+        return 0;
+    } catch (const std::exception &error) { return fail(error.what()); }
+}
+
+extern "C" int gpu_matrix_dispatch_active()
+{
+    return active_permit ? 1 : 0;
+}
+
+// Append ordered reservations to the active permit after all of its earlier
+// claims are consumed. Host-driven steps of an admitted job hold their exact
+// extra claims this way without nesting a second permit.
+extern "C" int gpu_matrix_dispatch_extend(
+    GpuMatrixReservation *const *reservations, size_t count, size_t *out_base)
+{
+    if (!out_base) return fail("null matrix dispatch extension output");
+    *out_base = 0;
+    if (!reservations || count == 0 || !active_permit)
+        return fail("matrix dispatch extension requires an active permit");
+    if (active_permit->next_reservation() != nullptr)
+        return fail("matrix dispatch extension requires the earlier claims to be consumed");
+    try {
+        std::unordered_set<GpuMatrixReservation *> unique;
+        const auto *anchor = active_permit->reservations.front().get();
+        for (size_t index = 0; index < count; ++index) {
+            const auto *reservation = reservations[index];
+            if (!reservation || reservation->next != 0 || !unique.insert(reservations[index]).second)
+                return fail("invalid, consumed or duplicate matrix dispatch reservation");
+            if (reservation->execution->unretired_work.load(std::memory_order_acquire))
+                return fail("matrix dispatch has unretired work");
+            if (reservation->execution != anchor->execution ||
+                reservation->storage->device != anchor->storage->device)
+                return fail("dispatch extension requires the permit's device and execution owner");
+        }
+        *out_base = active_permit->reservations.size();
+        active_permit->reservations.reserve(*out_base + count);
+        for (size_t index = 0; index < count; ++index)
+            active_permit->reservations.emplace_back(reservations[index]);
+        return 0;
+    } catch (const std::exception &error) {
+        return fail(error.what());
+    }
+}
+
+// Remove the most recent extension. On success every extension claim must be
+// consumed; retained reservations return to the caller like a completed dispatch.
+extern "C" int gpu_matrix_dispatch_retract(
+    size_t base, size_t count, int successful, GpuMatrixReservation **out)
+{
+    if (!active_permit || active_permit->reservations.size() != base + count || count == 0)
+        return fail("matrix dispatch retraction does not match the active extension");
+    bool complete = true;
+    for (size_t index = base; index < base + count; ++index) {
+        auto &reservation = active_permit->reservations[index];
+        if (reservation->next != reservation->slots.size()) complete = false;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        auto &reservation = active_permit->reservations[base + index];
+        if (out) out[index] = successful && complete ? reservation.release() : nullptr;
+        reservation.reset();
+    }
+    active_permit->reservations.resize(base);
+    if (active_permit->current > base) active_permit->current = base;
+    return successful && !complete
+        ? fail("matrix dispatch extension did not consume its prepared slots") : 0;
+}
+
+extern "C" int gpu_matrix_dispatch_end(
+    GpuMatrixDispatchPermit *permit, int successful, GpuMatrixReservation **out)
+{
+    if (!permit || permit != active_permit)
+        return fail("matrix dispatch permit must end on its submitting thread");
+    if (permit->reservations.size() != permit->entered)
+        return fail("matrix dispatch permit ended with a live extension");
+    const bool matrix_complete = permit->next_reservation() == nullptr;
+    const bool workspace_complete = std::all_of(
+        permit->workspace_reservations.begin(), permit->workspace_reservations.end(),
+        [](const auto &reservation) {
+            return reservation && reservation->value &&
+                reservation->value->next == reservation->value->slots.size();
+        });
+    const bool exact_workspace_complete = permit->workspace_reservations.empty() ||
+        (permit->exact_workspace_next == permit->exact_workspace_claims.size() &&
+         permit->exact_workspace_claims.size() ==
+             std::accumulate(
+                 permit->workspace_reservations.begin(), permit->workspace_reservations.end(),
+                 size_t{0}, [](size_t count, const auto &reservation) {
+                     return count + reservation->value->requests.size();
+                 }));
+    const bool complete = matrix_complete && workspace_complete && exact_workspace_complete;
+    static thread_local char incomplete_message[512];
+    incomplete_message[0] = '\0';
+    if (successful && !complete) {
+        const size_t remaining = permit->exact_workspace_claims.size() -
+            std::min(permit->exact_workspace_next, permit->exact_workspace_claims.size());
+        if (!exact_workspace_complete && permit->exact_workspace_next < permit->exact_workspace_claims.size()) {
+            const auto expected = permit->exact_workspace_claims[permit->exact_workspace_next];
+            if (expected.reservation && expected.reservation->value &&
+                expected.request_index < expected.reservation->value->requests.size()) {
+                const auto &request = expected.reservation->value->requests[expected.request_index];
+                std::snprintf(
+                    incomplete_message, sizeof(incomplete_message),
+                    "matrix dispatch did not consume prepared workspace claim: remaining=%zu "
+                    "storage=%llu slot=%zu device=%d partition=%zu stream_slot=%zu kind=%d "
+                    "bytes=%zu alignment=%zu",
+                    remaining, static_cast<unsigned long long>(request.storage_id), request.slot,
+                    request.device, request.partition, request.stream_slot,
+                    static_cast<int>(request.kind), request.bytes, request.alignment);
+            }
+        }
+        if (!incomplete_message[0]) {
+            std::snprintf(
+                incomplete_message, sizeof(incomplete_message),
+                "matrix dispatch did not consume prepared slots: matrix_complete=%d "
+                "workspace_complete=%d exact_complete=%d matrix_reservations=%zu matrix_current=%zu "
+                "workspace_reservations=%zu exact_next=%zu exact_total=%zu exact_remaining=%zu",
+                matrix_complete ? 1 : 0, workspace_complete ? 1 : 0,
+                exact_workspace_complete ? 1 : 0, permit->reservations.size(), permit->current,
+                permit->workspace_reservations.size(), permit->exact_workspace_next,
+                permit->exact_workspace_claims.size(), remaining);
+        }
+    }
+    active_permit = nullptr;
+    if (out) {
+        for (size_t index = 0; index < permit->reservations.size(); ++index)
+            out[index] = successful && complete ? permit->reservations[index].release() : nullptr;
+    }
+    delete permit;
+    if (successful && !complete)
+        return fail(incomplete_message[0] ? incomplete_message
+                                          : "matrix dispatch did not consume its prepared slots");
+    return 0;
+}
+
+extern "C" int gpu_prepared_matrix_claim(
+    GpuContext *ctx, int level, size_t rows, size_t cols, int format,
+    GpuMatrix **out, int *handled)
+{
+    if (!ctx || !out || !handled) return fail("invalid prepared matrix allocation");
+    *handled = 0;
+    if (active_provisioning) {
+        const int status = provisioning_consume(
+            ctx, GPU_PREPARED_MATRIX, rows, cols, level, format, 0, 0);
+        if (status != 0) return status;
+        // The provisioning permit authorizes the ordinary constructor below;
+        // it never supplies a persistent slot or weakens the admission seal.
+        return 0;
+    }
+    if (!active_permit && !gpu_context_admission_is_required(ctx)) {
+        if (rows != 0 && cols != 0) trace_claim(GPU_PREPARED_MATRIX, rows, cols, level, format, 0, 0);
+        return 0;
+    }
+    *handled = 1;
+    if (!active_permit)
+        return fail("ordinary matrix allocation requires a matching prepared dispatch permit");
+    // Empty native matrices own only host metadata and consume no device slot.
+    if (rows == 0 || cols == 0) {
+        for (const auto &reservation : active_permit->reservations) {
+            if (reservation->storage->context == ctx) {
+                *handled = 0;
+                return 0;
+            }
+        }
+        return fail("empty matrix context is absent from the prepared dispatch");
+    }
+    auto *next = active_permit->next_reservation();
+    if (!next)
+        return fail("ordinary matrix allocation exceeds its prepared dispatch slots");
+    if (next->storage->context != ctx)
+        return fail("ordinary matrix allocation differs from its next reserved context");
+    auto &reservation = *next;
+    auto &storage = *reservation.storage;
+    const size_t slot_index = reservation.slots[reservation.next];
+    auto &slot = *storage.slots[slot_index];
+    const auto &claim = (*reservation.claims)[reservation.next];
+    GpuMatrix *matrix = slot.matrix;
+    if (slot.identity.kind != GPU_PREPARED_MATRIX || !matrix ||
+        claim.request.rows != rows || claim.request.columns != cols ||
+        claim.request.level != level || claim.request.format != format) {
+        static thread_local std::string message;
+        char head[256];
+        std::snprintf(head, sizeof(head),
+            "ordinary matrix allocation differs from its reserved shape or format (reserved kind %d %zux%zu level %d format %d; requested %zux%zu level %d format %d); consumed so far: ",
+            static_cast<int>(slot.identity.kind), claim.request.rows, claim.request.columns,
+            claim.request.level, claim.request.format, rows, cols, level, format);
+        try {
+            message = std::string(head) + consumed_summary();
+        } catch (const std::exception &) {
+            return fail(head);
+        }
+        return fail(message.c_str());
+    }
+    std::unique_ptr<GpuPreparedMatrixLease> lease;
+    try {
+        lease = std::make_unique<GpuPreparedMatrixLease>(
+            GpuPreparedMatrixLease{reservation.storage, slot_index});
+    } catch (const std::exception &error) { return fail(error.what()); }
+    cudaError_t error = cudaSetDevice(storage.device);
+    if (error != cudaSuccess) return fail(error);
+    // Charge before the first device submission. A prior reader may still be
+    // using this same physical backing; the following stream waits transfer its
+    // ownership without counting that backing twice.
+    occupy(storage, slot, claim.occupied_units);
+    auto &states = matrix->exec_limb_states[0];
+    for (size_t limb = 0; limb < states.size(); ++limb) {
+        auto &state = states[limb];
+        if (!state.write_done || !state.stream) {
+            error = cudaErrorInvalidResourceHandle;
+            break;
+        }
+        error = cudaStreamWaitEvent(state.stream, slot.reusable, 0);
+        if (error == cudaSuccess) error = cudaEventRecord(state.write_done, state.stream);
+        if (error != cudaSuccess) break;
+        state.completion_owner = static_cast<uint32_t>(limb);
+        state.last_write_stream = state.stream;
+        state.write_done_valid = true;
+    }
+    if (error != cudaSuccess) {
+        quarantine(storage);
+        slot.state.store(quarantined, std::memory_order_release);
+        // Retain the backing even when CUDA cannot establish reuse ordering.
+        matrix->shared_limb_buffers[0].prepared_lease = lease.release();
+        ++reservation.next;
+        return fail(error);
+    }
+    // Only the shape-visible prefixes change. Per-polynomial descriptors,
+    // physical backing, auxiliary/descriptor pointers and original streams stay
+    // fixed, so queued readers keep their original addresses and strides.
+    matrix->rows = rows;
+    matrix->cols = cols;
+    matrix->shared_limb_buffers[0].bytes_total = claim.data_bytes;
+    matrix->shared_aux_buffers[0].slots_total = claim.auxiliary_slots;
+    matrix->format = static_cast<GpuPolyFormat>(format);
+    matrix->host_observed_writer_ready.store(false, std::memory_order_release);
+    matrix->shared_limb_buffers[0].prepared_lease = lease.release();
+    slot.state.store(leased, std::memory_order_release);
+    ++reservation.next;
+    note_consumed(GPU_PREPARED_MATRIX, rows, cols, level, format, 0, 0);
+    *out = matrix;
+    return 0;
+}
+
+extern "C" void gpu_prepared_matrix_recycle(GpuMatrix *matrix)
+{
+    auto *lease = matrix->shared_limb_buffers[0].prepared_lease;
+    if (!lease) return;
+    auto &storage = *lease->storage;
+    auto &slot = *storage.slots[lease->slot];
+    // Deleting the last lease can run the Rust backing callback and destroy its
+    // contexts. Keep both the outer activity and execution alive across it.
+    auto execution = storage.context->execution;
+    GpuAllocationActivity activity(execution.get(), storage.device);
+    if (storage.context->execution->unretired_work.load(std::memory_order_acquire)) return;
+    const cudaStream_t release = storage.context->execution->release_streams_by_partition[0];
+    cudaError_t error = cudaSetDevice(storage.device);
+    int status = error == cudaSuccess
+        ? matrix_wait_all_limb_streams(matrix, storage.device, release, true, true) : fail(error);
+    if (status == 0) {
+        error = cudaEventRecord(slot.reusable, release);
+        if (error != cudaSuccess) status = fail(error);
+    }
+    if (status != 0) {
+        quarantine(storage);
+        slot.state.store(quarantined, std::memory_order_release);
+        return;
+    }
+    matrix->shared_limb_buffers[0].prepared_lease = nullptr;
+    slot.state.store(available, std::memory_order_release);
+    delete lease;
+}

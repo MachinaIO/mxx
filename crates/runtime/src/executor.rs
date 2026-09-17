@@ -25,6 +25,7 @@ use mxx_ir_core::{
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{One, Signed, ToPrimitive, Zero};
+use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,7 +37,7 @@ use thiserror::Error;
 use tracing::info;
 
 #[cfg(feature = "gpu")]
-mod gpu_plan;
+pub mod gpu_plan;
 mod plan_cache;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +48,9 @@ pub struct ExecutionConfig {
     /// size. Artifact-compatible family outputs are streamed through the
     /// artifact store; scalar-only families are accumulated in memory.
     pub max_parallel_instances: NonZeroUsize,
+    /// Maximum number of prepared GPU executions that may be in flight.
+    /// This is independent of the sibling loop wave width above.
+    pub max_live_gpu_executions: NonZeroUsize,
     /// Optional progress reporting for actual preimage sampler invocations.
     pub preimage_progress: Option<PreimageProgressConfig>,
     /// Optionally fence backend release streams after this many executed nodes.
@@ -60,6 +64,7 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
+            max_live_gpu_executions: NonZeroUsize::new(1).expect("1 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
         }
@@ -76,11 +81,465 @@ pub struct PreimageProgressConfig {
     pub report_interval: NonZeroUsize,
 }
 
+/// Shared execution/estimation contract for intermediate matrix Family outputs.
+/// Durable exports use the artifact path regardless of this RAM-staging decision.
+/// The single staging rule for a parallel-loop output family: whether the
+/// admitted wave must cross the host boundary instead of keeping device owners.
+/// `total_count` is the loop's whole body count, never the number of bodies in
+/// the current wave, so the action admitted for one wave cannot be rewritten by
+/// a shorter tail wave.
+pub fn stage_matrix_family_output(
+    scope: &FrozenGraphScopeId,
+    total_count: usize,
+    wave_size: usize,
+    retained: bool,
+) -> bool {
+    matches!(scope, FrozenGraphScopeId::Root) ||
+        total_count > wave_size ||
+        (matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) && retained)
+}
+
+/// The single retention rule of a parallel loop's output families: a port is
+/// retained when its owning scope exports that port. Root loops stage every
+/// port. The rule is per output port, never per loop node, because a body can
+/// export some of its ports and consume others locally.
+pub fn retained_loop_output_ports(
+    validated: &ValidatedGraph,
+    scope: &FrozenGraphScopeId,
+    loop_node: NodeId,
+    child_outputs: &[WireRef],
+) -> Vec<bool> {
+    let owning = validated.source.scope(scope);
+    child_outputs
+        .iter()
+        .enumerate()
+        .map(|(port, _)| {
+            matches!(scope, FrozenGraphScopeId::SequentialBody { .. }) &&
+                owning.is_some_and(|owning| {
+                    owning.outputs().contains(&WireRef { node: loop_node, port: Port(port as u32) })
+                })
+        })
+        .collect()
+}
+
+/// Per-output-port staging actions of one bounded wave.
+///
+/// `retained` is [`retained_loop_output_ports`] of the same loop; `total_count`
+/// is the loop's whole body count, never the number of bodies in this wave.
+pub fn staged_loop_outputs(
+    scope: &FrozenGraphScopeId,
+    total_count: usize,
+    wave_size: usize,
+    retained: &[bool],
+) -> Vec<bool> {
+    retained
+        .iter()
+        .map(|retained| stage_matrix_family_output(scope, total_count, wave_size, *retained))
+        .collect()
+}
+
+/// Metadata-only description of one bounded parallel-loop wave.
+///
+/// It borrows the validated child scope, the owning scope's actual values (lazy
+/// descriptors and existing owners, never clones of payload owners) and the
+/// parent parameters, so a backend can choose a capacity-correct wave size
+/// without executing a body, importing a candidate, or allocating a GPU value.
+pub struct WaveAdmissionRequest<'a, B: Backend> {
+    /// Scope that owns the parallel loop.
+    scope: &'a FrozenGraphScopeId,
+    loop_node: NodeId,
+    /// Validated graph that owns the child scope.
+    validated: &'a ValidatedGraph,
+    /// Validated body scope whose bodies this wave instantiates.
+    child_id: &'a FrozenGraphScopeId,
+    /// Validated body-scope input wires, one per instance argument.
+    child_inputs: &'a [WireRef],
+    /// Validated body-scope output wires, one per result port.
+    child_outputs: &'a [WireRef],
+    /// The loop's argument wires, one per body input in `input_modes` order.
+    arguments: &'a [WireRef],
+    /// Parameters of the owning scope. A candidate body index adds that
+    /// instance's `bindings` evaluation to this environment.
+    parent_env: &'a ParamEnv,
+    /// The owning scope's live values as the executor holds them: lazy
+    /// descriptors, host-staged values and existing owners. Admission may read
+    /// their identity and shapes but must not materialize or clone them.
+    values: &'a BTreeMap<WireRef, RuntimeValue<B>>,
+    /// Broadcast owners retained from earlier waves, indexed by placement and
+    /// argument. Absent before the first admission; no payload is loaded here.
+    broadcast_inputs: Option<&'a [Vec<Option<RuntimeValue<B>>>]>,
+    capture_trace: bool,
+    /// Total body count of the loop; waves never rewrite this value.
+    total_count: usize,
+    /// Index of the first body of this wave.
+    next_index: usize,
+    /// Bodies left from `next_index`, i.e. `total_count - next_index`.
+    remaining: usize,
+    /// Caller's per-wave cap (`ExecutionConfig::max_parallel_instances`).
+    caller_cap: usize,
+    /// Per output port, whether that family must stay retained for its owning
+    /// scope. Length equals `child_outputs.len()`.
+    retained_output_ports: Vec<bool>,
+}
+
+/// A borrowed body input before materialization. Eager selections point at the
+/// exact member, preserving alias identity. Lazy family selections retain the
+/// family descriptor and member index without cloning or loading its payload.
+pub struct WaveInput<'a, B: Backend> {
+    pub wire: WireRef,
+    pub value: &'a RuntimeValue<B>,
+    pub member: Option<usize>,
+}
+
+impl<'a, B: Backend> WaveAdmissionRequest<'a, B> {
+    /// Build the request for the wave starting at `next_index`. Retention of
+    /// each output port is derived here, so the executor and the planner cannot
+    /// disagree about which ports cross the host boundary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        validated: &'a ValidatedGraph,
+        scope: &'a FrozenGraphScopeId,
+        loop_node: NodeId,
+        child_id: &'a FrozenGraphScopeId,
+        child_inputs: &'a [WireRef],
+        child_outputs: &'a [WireRef],
+        arguments: &'a [WireRef],
+        parent_env: &'a ParamEnv,
+        values: &'a BTreeMap<WireRef, RuntimeValue<B>>,
+        broadcast_inputs: Option<&'a [Vec<Option<RuntimeValue<B>>>]>,
+        capture_trace: bool,
+        total_count: usize,
+        next_index: usize,
+        caller_cap: usize,
+    ) -> Self {
+        let retained_output_ports =
+            retained_loop_output_ports(validated, scope, loop_node, child_outputs);
+        Self {
+            scope,
+            loop_node,
+            validated,
+            child_id,
+            child_inputs,
+            child_outputs,
+            arguments,
+            parent_env,
+            values,
+            broadcast_inputs,
+            capture_trace,
+            total_count,
+            next_index,
+            remaining: total_count.saturating_sub(next_index),
+            caller_cap,
+            retained_output_ports,
+        }
+    }
+
+    pub fn scope(&self) -> &FrozenGraphScopeId {
+        self.scope
+    }
+
+    /// Validated graph that owns [`Self::child`].
+    pub fn validated(&self) -> &ValidatedGraph {
+        self.validated
+    }
+
+    /// Validated body scope this wave instantiates. Its execution order, wire
+    /// types and liveness are the planning contract for the candidate bodies.
+    pub fn child(&self) -> &GraphScope {
+        self.validated.source.scope(self.child_id).expect("validated child scope")
+    }
+
+    pub fn child_id(&self) -> &FrozenGraphScopeId {
+        self.child_id
+    }
+
+    pub fn child_inputs(&self) -> &[WireRef] {
+        self.child_inputs
+    }
+
+    pub fn child_outputs(&self) -> &[WireRef] {
+        self.child_outputs
+    }
+
+    /// The loop's argument wires, one per body input in `input_modes` order.
+    pub fn arguments(&self) -> &[WireRef] {
+        self.arguments
+    }
+
+    /// Parameters of the owning scope, before the per-index bindings.
+    pub fn parent_env(&self) -> &ParamEnv {
+        self.parent_env
+    }
+
+    /// Live values of the owning scope. Borrowed, never materialized here.
+    pub fn values(&self) -> &BTreeMap<WireRef, RuntimeValue<B>> {
+        self.values
+    }
+
+    /// All retained placement replicas, including those not selected by the
+    /// candidate's first body. Admission must account for their live owners.
+    pub fn broadcast_inputs(&self) -> Option<&[Vec<Option<RuntimeValue<B>>>]> {
+        self.broadcast_inputs
+    }
+
+    pub fn selected_inputs(&self, index: usize) -> Result<Vec<WaveInput<'_, B>>, ExecutionError> {
+        self.arguments
+            .iter()
+            .zip(self.child_inputs)
+            .zip(self.input_modes())
+            .enumerate()
+            .map(|(argument, ((source, wire), mode))| {
+                let value = self.values.get(source).ok_or(ExecutionError::MissingWire(*source))?;
+                let offset = match mode {
+                    LoopInputMode::Broadcast => {
+                        let value = self.broadcast_inputs.map_or(value, |placements| {
+                            placements[index % placements.len()][argument]
+                                .as_ref()
+                                .expect("retained broadcast owner")
+                        });
+                        return Ok(WaveInput { wire: *wire, value, member: None })
+                    }
+                    LoopInputMode::Zip => 0,
+                    LoopInputMode::ZipOffset { offset } => *offset,
+                };
+                let count = match value {
+                    RuntimeValue::IndexedFamily(values) => values.len(),
+                    RuntimeValue::LazyArtifactFamily { descriptor, .. } |
+                    RuntimeValue::StagedArtifactFamily { descriptor, .. } => {
+                        descriptor.family_count.unwrap_or(0)
+                    }
+                    _ => return Err(ExecutionError::ValueKind(*source)),
+                };
+                let member = index
+                    .checked_add(offset)
+                    .filter(|member| *member < count)
+                    .ok_or_else(|| ExecutionError::SelectIndexOutOfRange {
+                        node: self.loop_node,
+                        index: BigInt::from(index) + BigInt::from(offset),
+                        count,
+                    })?;
+                Ok(match value {
+                    RuntimeValue::IndexedFamily(values) => {
+                        WaveInput { wire: *wire, value: &values[member], member: None }
+                    }
+                    _ => WaveInput { wire: *wire, value, member: Some(member) },
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve a candidate's actual loop bindings without reading artifact
+    /// payloads or constructing runtime values. Execution uses this same method.
+    pub fn body_bindings(&self, index: usize) -> Result<ParamEnv, ExecutionError> {
+        let node = self
+            .validated
+            .source
+            .scope(self.scope)
+            .expect("validated parent scope")
+            .node(self.loop_node)
+            .expect("validated loop node");
+        let NodeKind::ParallelLoop(body) = node.kind() else {
+            unreachable!("parallel wave request")
+        };
+        self.parent_env.child(&body.bindings, Some((body.index_slot, index))).map_err(|error| {
+            ExecutionError::Expression { node: self.loop_node, message: error.to_string() }
+        })
+    }
+
+    pub fn input_modes(&self) -> &[LoopInputMode] {
+        let node = self
+            .validated
+            .source
+            .scope(self.scope)
+            .expect("validated parent scope")
+            .node(self.loop_node)
+            .expect("validated loop node");
+        let NodeKind::ParallelLoop(body) = node.kind() else {
+            unreachable!("parallel wave request")
+        };
+        &body.input_modes
+    }
+
+    pub fn capture_trace(&self) -> bool {
+        self.capture_trace
+    }
+
+    pub fn total_count(&self) -> usize {
+        self.total_count
+    }
+
+    pub fn next_index(&self) -> usize {
+        self.next_index
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+
+    pub fn caller_cap(&self) -> usize {
+        self.caller_cap
+    }
+
+    pub fn retained_output_ports(&self) -> &[bool] {
+        &self.retained_output_ports
+    }
+
+    /// Staging action of every output port for an accepted wave size. This is
+    /// the single staging rule, and it is evaluated from the loop's total
+    /// count, so a later (shorter) wave cannot silently choose an action other
+    /// than the one admitted for the earlier waves.
+    pub fn staged_outputs(&self, wave_size: usize) -> Vec<bool> {
+        staged_loop_outputs(self.scope, self.total_count, wave_size, &self.retained_output_ports)
+    }
+
+    /// Freeze an accepted wave size, clamped to the caller cap and to the
+    /// bodies that actually remain, together with its staging actions.
+    pub fn admission_of_size(&self, wave_size: usize) -> WaveAdmission {
+        let wave_size = wave_size.min(self.caller_cap).min(self.remaining).max(1);
+        WaveAdmission { wave_size, staged_outputs: self.staged_outputs(wave_size) }
+    }
+
+    /// Backend-neutral admission: the whole remaining prefix the caller
+    /// allows, without reservation or discovery.
+    pub fn default_admission(&self) -> WaveAdmission {
+        self.admission_of_size(self.caller_cap.min(self.remaining))
+    }
+}
+
+/// An accepted bounded wave: its frozen instance count and the staging action
+/// of every output port for that wave.
+///
+/// This is an internal input contract, not a validated user input: the
+/// executor consumes it verbatim. The CPU interpreted scheduler derives the
+/// bounded size and staging action for every output port before dispatch.
+pub struct WaveAdmission {
+    pub wave_size: usize,
+    pub staged_outputs: Vec<bool>,
+}
+
 pub struct ExecutionResult<B: Backend> {
     pub outputs: BTreeMap<String, RuntimeValue<B>>,
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
     pub staged_family_leases: Vec<StagedFamilyLease>,
+    pub(crate) prepared_outputs: Option<std::sync::Arc<dyn PreparedOutputLease<B>>>,
+}
+
+/// Immutable artifact metadata captured when a prepared program is warmed.
+/// Production replay consumes this table directly and never revisits the
+/// validated graph's output declarations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedArtifactDescriptor {
+    pub name: String,
+    pub wire: WireId,
+    pub artifact_type: ArtifactType,
+    pub family_count: Option<usize>,
+    pub confidentiality: ArtifactConfidentiality,
+}
+
+#[cfg(feature = "gpu")]
+pub(crate) fn prepared_artifact_descriptors(
+    validated: &ValidatedGraph,
+) -> Result<Vec<PreparedArtifactDescriptor>, ExecutionError> {
+    let root = validated.root_scope();
+    let mut descriptors = Vec::new();
+    for (name, output) in validated.source.outputs() {
+        let Some(confidentiality) = output.confidentiality else { continue };
+        let wire = WireId { instantiation_path: Vec::new(), wire: output.value };
+        let concrete_type = root.wire_types.get(&output.value).ok_or_else(|| {
+            ExecutionError::Manifest(format!("output {name} has no fixed wire metadata"))
+        })?;
+        let (element_type, family_count) = match concrete_type {
+            ConcreteWireType::IndexedFamily { element, count } => (element.as_ref(), Some(*count)),
+            scalar => (scalar, None),
+        };
+        let artifact_type = ArtifactType::from_wire_type(element_type).ok_or_else(|| {
+            ExecutionError::Manifest(format!("output {name} is not artifact-compatible"))
+        })?;
+        descriptors.push(PreparedArtifactDescriptor {
+            name: name.clone(),
+            wire,
+            artifact_type,
+            family_count,
+            confidentiality,
+        });
+    }
+    Ok(descriptors)
+}
+
+/// Fixed execution-side context handed to a prepared backend after warmup.
+/// The backend consumes sampling through this boundary; it must not rediscover
+/// graph nodes or construct an alternate executor for Record/Replay/trace.
+pub struct PreparedExecutionContext<'a, B: Backend> {
+    pub sampling_mode: SamplingMode<'a>,
+    pub capture_trace: bool,
+    pub session: Option<ProductionId>,
+    pub trace: Option<&'a mut ExecutionTrace<B>>,
+    pub transcript_store: Option<&'a mut dyn PreparedTranscriptStore>,
+}
+
+/// Object-safe session transcript boundary for prepared backends.  The
+/// executor keeps the concrete store (and its error type) out of the prepared
+/// program so the latter can select Record/Replay without rebuilding an
+/// ordinary executor.
+pub trait PreparedTranscriptStore {
+    fn transcript_entry(
+        &mut self,
+        production: &ProductionId,
+        site: &DrawSite,
+    ) -> Result<Option<RecordedValue>, String>;
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, String>;
+    fn record_transcript_batch(
+        &mut self,
+        production: &ProductionId,
+        entries: &[(DrawSite, RecordedValue)],
+    ) -> Result<(), String>;
+}
+
+impl<S: SessionStore> PreparedTranscriptStore for S {
+    fn transcript_entry(
+        &mut self,
+        production: &ProductionId,
+        site: &DrawSite,
+    ) -> Result<Option<RecordedValue>, String> {
+        SessionStore::transcript_entry(self, production, site).map_err(|error| error.to_string())
+    }
+
+    fn record_transcript_batch(
+        &mut self,
+        production: &ProductionId,
+        entries: &[(DrawSite, RecordedValue)],
+    ) -> Result<(), String> {
+        SessionStore::record_transcript_batch(self, production, entries)
+            .map_err(|error| error.to_string())
+    }
+
+    fn transcript_entries(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Vec<(DrawSite, RecordedValue)>, String> {
+        SessionStore::transcript_entries(self, production).map_err(|error| error.to_string())
+    }
+}
+
+/// A prepared backend owns one invocation lease and resolves all exports from
+/// its immutable warmup descriptor tree.  The executor deliberately does not
+/// retain one closure/map entry per output.
+pub(crate) trait PreparedOutputLease<B: Backend>: Send + Sync {
+    fn output_count(&self) -> usize;
+    fn output_name(&self, index: usize) -> Option<&str>;
+    fn output_index(&self, name: &str) -> Option<usize>;
+    fn artifact_descriptors(&self) -> &[PreparedArtifactDescriptor] {
+        &[]
+    }
+    fn materialize_at(
+        &self,
+        index: usize,
+        backend: &mut B,
+    ) -> Result<RuntimeValue<B>, ExecutionError>;
 }
 
 /// A dispatch-only optimization: the original graph, validation and producer
@@ -628,8 +1087,26 @@ pub struct StagedFamilyLease {
 }
 
 impl<B: Backend> ExecutionResult<B> {
-    /// Materializes a named output that the executor returned as a lazy or streamed artifact.
-    ///
+    /// Returns every exported name, including outputs whose payload is still
+    /// owned by a prepared backend lease.  Deferred outputs intentionally do
+    /// not fabricate a `RuntimeValue` merely to make enumeration complete.
+    pub fn output_names(&self) -> impl Iterator<Item = &str> {
+        let resident = &self.outputs;
+        self.outputs.keys().map(String::as_str).chain(
+            self.prepared_outputs.as_deref().into_iter().flat_map(move |lease| {
+                (0..lease.output_count()).filter_map(move |index| {
+                    let name = lease.output_name(index)?;
+                    if resident.contains_key(name) ||
+                        (0..index).any(|previous| lease.output_name(previous) == Some(name))
+                    {
+                        None
+                    } else {
+                        Some(name)
+                    }
+                })
+            }),
+        )
+    }
     /// Parallel-loop families may be streamed through the artifact store so their live backend
     /// memory stays bounded by the configured wave size. Callers that need the complete output
     /// value can explicitly load it after execution. The staged payloads remain owned by this
@@ -637,9 +1114,20 @@ impl<B: Backend> ExecutionResult<B> {
     pub fn materialize_output<S: ArtifactStore>(
         &mut self,
         name: &str,
-        backend: &B,
+        backend: &mut B,
         store: &mut S,
     ) -> Result<&RuntimeValue<B>, ExecutionError> {
+        if !self.outputs.contains_key(name) {
+            let lease = self
+                .prepared_outputs
+                .as_ref()
+                .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
+            let index = lease
+                .output_index(name)
+                .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
+            let value = lease.materialize_at(index, backend)?;
+            self.outputs.insert(name.to_owned(), value);
+        }
         let value = self
             .outputs
             .get_mut(name)
@@ -652,11 +1140,33 @@ impl<B: Backend> ExecutionResult<B> {
         Ok(value)
     }
 
+    fn materialize_prepared_output_at<S: ArtifactStore>(
+        &mut self,
+        index: usize,
+        backend: &mut B,
+        store: &mut S,
+    ) -> Result<(), ExecutionError> {
+        let lease = self
+            .prepared_outputs
+            .as_ref()
+            .ok_or_else(|| ExecutionError::Backend("prepared output lease is missing".into()))?;
+        let name = lease
+            .output_name(index)
+            .ok_or_else(|| ExecutionError::MissingOutput(index.to_string()))?
+            .to_owned();
+        let value = lease.materialize_at(index, backend)?;
+        self.outputs.insert(name.clone(), value);
+        let value = self.outputs.get_mut(&name).expect("prepared output inserted");
+        if !matches!(value, RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_)) {
+            *value = materialize_runtime_value(value.clone(), backend, store)?;
+        }
+        Ok(())
+    }
+
     /// Deletes ephemeral streamed families returned by this execution.
     ///
     /// A returned staged family remains readable until this method is called.
-    /// Persisted families are replaced with final lazy artifact handles and do
-    /// not require this cleanup.
+    /// Persisted families refer to final artifact storage and do not require this cleanup.
     pub fn cleanup_staged<S: ArtifactStore>(
         &mut self,
         store: &mut S,
@@ -704,8 +1214,16 @@ struct ExecutableNode<'a> {
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
+    #[error("NotPrepared: prepared GPU graph is unavailable; call explicit warmup")]
+    NotPrepared,
+    #[error("prepared graph contract differs from the requested graph")]
+    PreparedContractMismatch,
     #[error("backend operation failed: {0}")]
     Backend(String),
+    #[error(
+        "prepared preimage sampling exhausted at columns {column_start}..{column_end} after {attempts} attempts"
+    )]
+    SamplingExhausted { column_start: usize, column_end: usize, attempts: usize },
     #[error("preimage progress expected {expected} generated preimages but observed {actual}")]
     PreimageProgressMismatch { expected: usize, actual: usize },
     #[error("artifact operation failed: {0}")]
@@ -849,8 +1367,19 @@ where
     B: Backend,
     S: SessionStore,
 {
-    let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
-        .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+    // Session identity is an explicit public-boundary operation: it must be
+    // derived from the caller's validated graph even when a backend has a
+    // stale prepared program for another graph.
+    let spec_hash = validated.spec_hash();
+    if matches!(B::EXECUTION_STRATEGY, crate::backend::ExecutionStrategy::Prepared) {
+        match backend.prepared_spec_hash() {
+            None => return Err(ExecutionError::NotPrepared),
+            Some(hash) if hash != spec_hash.0 => {
+                return Err(ExecutionError::PreparedContractMismatch);
+            }
+            Some(_) => {}
+        }
+    }
     let production = mxx_ir_core::artifact::production_id(spec_hash, execution_nonce);
     let input_digest = runtime_inputs_digest(validated, backend, &inputs)?;
     let descriptor = SessionDescriptor::new(
@@ -919,11 +1448,85 @@ where
     B: Backend,
     S: SessionStore,
 {
-    let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
-        .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+    // Select the fixed backend strategy before deriving identities or creating
+    // any ordinary-executor state.  Prepared backends use the O(1) identity
+    // published during warmup; an absent program is a typed NotPrepared error.
+    let (spec_hash, spec_hash_bytes, prepared) = match B::EXECUTION_STRATEGY {
+        crate::backend::ExecutionStrategy::Prepared => {
+            let bytes = backend.prepared_spec_hash().ok_or(ExecutionError::NotPrepared)?;
+            if bytes != validated.spec_hash.0 {
+                return Err(ExecutionError::PreparedContractMismatch);
+            }
+            (mxx_ir_core::artifact::SpecHash(bytes), bytes, true)
+        }
+        crate::backend::ExecutionStrategy::Interpreted => {
+            let spec_hash =
+                mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                    .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
+            let bytes = spec_hash.0;
+            (mxx_ir_core::artifact::SpecHash(bytes), bytes, false)
+        }
+    };
     let production = session
         .clone()
         .unwrap_or_else(|| mxx_ir_core::artifact::production_id(spec_hash, rand::random()));
+    if prepared {
+        // Prepared execution is selected only after warmup has published the
+        // immutable program. Sampling and trace state cross the same fixed
+        // boundary as inputs and outputs; there is no ordinary-executor
+        // fallback once this backend has selected the prepared program.
+        let mut trace = capture_trace.then(BTreeMap::new);
+        let context = PreparedExecutionContext {
+            sampling_mode,
+            capture_trace,
+            session: session.clone(),
+            trace: trace.as_mut(),
+            transcript_store: session
+                .is_some()
+                .then_some(artifact_store as &mut dyn PreparedTranscriptStore),
+        };
+        let mut result = backend
+            .execute_prepared_graph(spec_hash_bytes, validated, &inputs, context)
+            .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+        // Prepared replay returns an output lease. Keep ordinary outputs in
+        // that fixed descriptor table; only confidential exports needed for
+        // persistence cross into the caller-facing map.
+        let prepared_outputs = result.prepared_outputs.clone();
+        let artifact_descriptors =
+            prepared_outputs.as_ref().map(|lease| lease.artifact_descriptors()).unwrap_or(&[]);
+        let prepared_result = (|| {
+            if let Some(lease) = prepared_outputs.as_deref() {
+                for descriptor in artifact_descriptors {
+                    let index = lease
+                        .output_index(&descriptor.name)
+                        .ok_or_else(|| ExecutionError::MissingOutput(descriptor.name.clone()))?;
+                    result.materialize_prepared_output_at(index, backend, artifact_store)?;
+                }
+            }
+            result.artifact_handles = persist_prepared_outputs(
+                backend,
+                artifact_store,
+                &result.outputs,
+                &production,
+                session.is_some(),
+                artifact_descriptors,
+            )?;
+            // Match ordinary execution: a non-session public-only result has
+            // no durable production identity because no manifest was written.
+            result.production_id = (session.is_some() || !result.artifact_handles.is_empty())
+                .then_some(production.clone());
+            if session.is_some() {
+                artifact_store
+                    .release_session(&production)
+                    .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            }
+            Ok::<_, ExecutionError>(())
+        })();
+        if let Err(error) = prepared_result {
+            return Err(error);
+        }
+        return Ok((result, trace.unwrap_or_default()));
+    }
     let mut executor = Executor {
         validated,
         backend,
@@ -935,6 +1538,62 @@ where
         production,
         scratch_production: None,
         staged_families: BTreeMap::new(),
+        root_exports: {
+            let mut exports = BTreeMap::<_, Vec<_>>::new();
+            for (name, output) in validated.source.outputs() {
+                if let Some(confidentiality) = output.confidentiality {
+                    exports.entry(output.value).or_default().push((name.clone(), confidentiality));
+                }
+            }
+            exports
+        },
+        member_exports: {
+            let mut exports = BTreeMap::<WireId, BTreeMap<usize, Vec<_>>>::new();
+            for (name, output) in validated.source.outputs() {
+                let Some(confidentiality) = output.confidentiality else { continue };
+                let mut scope = validated.source.root_scope();
+                let mut wire = output.value;
+                let mut path = Vec::new();
+                let mut member = None;
+                loop {
+                    let Some(node) = scope.node(wire.node) else { break };
+                    match node.kind() {
+                        NodeKind::FamilyGetStatic { index } if member.is_none() => {
+                            member = index
+                                .evaluate(&validated.bindings)
+                                .ok()
+                                .and_then(|value| usize::try_from(value).ok());
+                            let Some(source) = scope.wire_ref(&node.arguments()[0]) else { break };
+                            wire = source;
+                        }
+                        NodeKind::SubgraphCall(_) => {
+                            let Some(child) =
+                                validated.source.child_scope_id(scope.id(), wire.node)
+                            else {
+                                break
+                            };
+                            path.push(InstantiationFrame { call: wire.node, loop_index: None });
+                            scope = validated.source.scope(&child).expect("validated child");
+                            wire = scope.outputs()[wire.port.0 as usize];
+                        }
+                        NodeKind::ParallelLoop(_) => {
+                            if let Some(index) = member {
+                                exports
+                                    .entry(WireId { instantiation_path: path, wire })
+                                    .or_default()
+                                    .entry(index)
+                                    .or_default()
+                                    .push((name.clone(), confidentiality));
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            exports
+        },
+        streamed_exports: BTreeMap::new(),
         preimage_progress: config.preimage_progress.map(PreimageProgress::new),
         executed_node_count: 0,
         last_release_fence_node_count: 0,
@@ -955,14 +1614,14 @@ where
     ) {
         Ok(instance) => instance,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
         }
     };
     if let Err(error) = executor.finish_preimage_progress() {
-        return match executor.cleanup_all_staged_families() {
+        return match executor.cleanup_failed_execution() {
             Ok(()) => Err(error),
             Err(cleanup_error) => Err(cleanup_error),
         };
@@ -977,7 +1636,7 @@ where
     let (production_id, artifact_handles) = match executor.persist_outputs(&mut named_outputs) {
         Ok(persisted) => persisted,
         Err(error) => {
-            return match executor.cleanup_all_staged_families() {
+            return match executor.cleanup_failed_execution() {
                 Ok(()) => Err(error),
                 Err(cleanup_error) => Err(cleanup_error),
             };
@@ -1007,8 +1666,121 @@ where
         production_id,
         artifact_handles,
         staged_family_leases,
+        prepared_outputs: None,
     };
     Ok((result, executor.trace.take().unwrap_or_default()))
+}
+
+/// Publish prepared outputs at the same artifact boundary as ordinary
+/// execution. Prepared replay has no [`Executor`] liveness state, so this
+/// compact path handles only the already-materialized exports and never
+/// reconstructs a graph-sized staging map.
+fn persist_prepared_outputs<B, S>(
+    backend: &mut B,
+    store: &mut S,
+    outputs: &BTreeMap<String, RuntimeValue<B>>,
+    production: &ProductionId,
+    in_session: bool,
+    descriptors: &[PreparedArtifactDescriptor],
+) -> Result<BTreeMap<String, Vec<ArtifactHandle>>, ExecutionError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let mut artifacts = BTreeMap::new();
+    let mut handles = BTreeMap::new();
+    for descriptor in descriptors {
+        let name = &descriptor.name;
+        let wire = descriptor.wire.clone();
+        let artifact_type = descriptor.artifact_type.clone();
+        let family_count = descriptor.family_count;
+        let confidentiality = descriptor.confidentiality;
+        let output =
+            outputs.get(name).ok_or_else(|| ExecutionError::MissingOutput(name.clone()))?;
+        let mut output_handles = Vec::new();
+        let content_hash = if let RuntimeValue::IndexedFamily(members) = output {
+            if family_count != Some(members.len()) {
+                return Err(ExecutionError::Manifest(format!(
+                    "output {name} family count does not match validated metadata"
+                )));
+            }
+            let mut hasher = Sha256::new();
+            for (index, member) in members.iter().enumerate() {
+                let (payload, bytes) = encode_artifact(backend, member, &artifact_type)?;
+                hasher.update((index as u64).to_le_bytes());
+                hasher.update((bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+                let handle = ArtifactHandle {
+                    key: ArtifactKey {
+                        production: production.clone(),
+                        name: name.clone(),
+                        index: Some(index),
+                    },
+                    artifact_type: artifact_type.clone(),
+                    confidentiality,
+                    layout: None,
+                };
+                store
+                    .store(handle.key.clone(), &artifact_type, confidentiality, None, payload)
+                    .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+                if in_session {
+                    store
+                        .commit_artifact(&handle)
+                        .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+                }
+                output_handles.push(handle);
+            }
+            Some(hasher.finalize().into())
+        } else {
+            let (payload, bytes) = encode_artifact(backend, output, &artifact_type)?;
+            let handle = ArtifactHandle {
+                key: ArtifactKey {
+                    production: production.clone(),
+                    name: name.clone(),
+                    index: None,
+                },
+                artifact_type: artifact_type.clone(),
+                confidentiality,
+                layout: None,
+            };
+            store
+                .store(handle.key.clone(), &artifact_type, confidentiality, None, payload)
+                .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            if in_session {
+                store
+                    .commit_artifact(&handle)
+                    .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+            }
+            output_handles.push(handle);
+            Some(Sha256::digest(bytes).into())
+        };
+        handles.insert(name.clone(), output_handles);
+        artifacts.insert(
+            name.clone(),
+            mxx_ir_core::artifact::ExportArtifact {
+                wire,
+                artifact_type,
+                family_count,
+                confidentiality,
+                content_hash,
+                layout: None,
+            },
+        );
+    }
+    if artifacts.is_empty() && !in_session {
+        return Ok(handles);
+    }
+    let manifest = mxx_ir_core::artifact::export_manifest(production.clone(), &artifacts);
+    if in_session {
+        store
+            .finalize_session(manifest)
+            .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+    } else {
+        store
+            .store_manifest(manifest)
+            .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
+    }
+    Ok(handles)
 }
 
 struct Executor<'a, B: Backend, S: SessionStore> {
@@ -1021,7 +1793,10 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     config: ExecutionConfig,
     production: ProductionId,
     scratch_production: Option<ProductionId>,
-    staged_families: BTreeMap<(ProductionId, String), ManifestArtifact>,
+    staged_families: BTreeMap<(ProductionId, String), (ManifestArtifact, Arc<()>)>,
+    root_exports: BTreeMap<WireRef, Vec<(String, ArtifactConfidentiality)>>,
+    member_exports: BTreeMap<WireId, BTreeMap<usize, Vec<(String, ArtifactConfidentiality)>>>,
+    streamed_exports: BTreeMap<String, (ArtifactHandle, ManifestArtifact)>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
     last_release_fence_node_count: usize,
@@ -1149,14 +1924,6 @@ where
                     })
                     .collect::<Option<Vec<_>>>();
                 if let Some(matrices) = matrices {
-                    #[cfg(feature = "gpu")]
-                    if let Some(operation) =
-                        block_aliases.calibration[node].clone().map_err(ExecutionError::Backend)?
-                    {
-                        self.backend
-                            .select_gpu_operation(operation)
-                            .map_err(Self::backend_error)?;
-                    }
                     self.set_placement(placements[0])?;
                     let row_sum = &block_aliases.row_sums[node];
                     let output = if let [left, right] = matrices.as_slice() {
@@ -1377,16 +2144,13 @@ where
             let calibration_groups: Vec<(Option<[u8; 32]>, Vec<usize>)> =
                 if aliased { Vec::new() } else { all_instances(None) };
 
-            for (operation, indices) in
+            for (_, indices) in
                 singleton_operation.iter().map(|operation| (*operation, &[0usize][..])).chain(
                     calibration_groups
                         .iter()
                         .map(|(operation, indices)| (*operation, indices.as_slice())),
                 )
             {
-                if let Some(operation) = operation {
-                    self.backend.select_gpu_operation(operation).map_err(Self::backend_error)?;
-                }
                 if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
                     for &index in indices {
                         self.set_placement(placements[index])?;
@@ -1485,6 +2249,7 @@ where
                     )?;
                 } else if indices.len() > 1 &&
                     self.execute_parallel_matrix_node_by_placement(
+                        scope_id,
                         placements,
                         envs,
                         &node,
@@ -1492,6 +2257,46 @@ where
                         indices,
                     )?
                 {
+                } else if let NodeKind::SubgraphCall(call) = node.kind {
+                    // Preserve the parent's bounded wave across a function
+                    // call, rather than serializing each independent member.
+                    let child_id = self
+                        .validated
+                        .source
+                        .child_scope_id(scope_id, node.id)
+                        .expect("validated subgraph call");
+                    let child = self.validated.source.scope(&child_id).expect("child scope");
+                    let child_envs = indices
+                        .iter()
+                        .map(|index| self.child_env(&envs[*index], &call.bindings, None, node.id))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let child_inputs = indices
+                        .iter()
+                        .map(|index| self.child_inputs(child, &node, &mut values[*index]))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let child_paths = indices
+                        .iter()
+                        .map(|index| {
+                            let mut path = paths[*index].clone();
+                            path.push(InstantiationFrame { call: node.id, loop_index: None });
+                            path
+                        })
+                        .collect::<Vec<_>>();
+                    let child_placements =
+                        indices.iter().map(|index| placements[*index]).collect::<Vec<_>>();
+                    let results = self.execute_instances_batch(
+                        &child_id,
+                        &child_envs,
+                        &child_paths,
+                        &child_inputs,
+                        &child_placements,
+                    )?;
+                    drop(child_inputs);
+                    for (&index, result) in indices.iter().zip(results) {
+                        for (port, value) in result.outputs.into_iter().enumerate() {
+                            self.put(&mut values[index], node.id, port as u32, value);
+                        }
+                    }
                 } else if matches!(node.kind, NodeKind::Select { .. }) {
                     for &index in indices {
                         self.set_placement(placements[index])?;
@@ -1519,13 +2324,49 @@ where
             }
             for index in 0..envs.len() {
                 if let Some(trace) = &mut self.trace {
-                    for (wire, value) in
-                        values[index].iter().filter(|(wire, _)| wire.node == node.id)
-                    {
+                    for (wire, value) in values[index].range(
+                        WireRef { node: node.id, port: Port(0) }..=WireRef {
+                            node: node.id,
+                            port: Port(u32::MAX),
+                        },
+                    ) {
                         trace.insert(
                             WireId { instantiation_path: paths[index].clone(), wire: *wire },
                             value.clone(),
                         );
+                    }
+                }
+                if paths[index].is_empty() {
+                    let wires = values[index]
+                        .range(
+                            WireRef { node: node.id, port: Port(0) }..=WireRef {
+                                node: node.id,
+                                port: Port(u32::MAX),
+                            },
+                        )
+                        .filter_map(|(wire, _)| {
+                            self.root_exports.contains_key(wire).then_some(*wire)
+                        })
+                        .collect::<Vec<_>>();
+                    for wire in wires {
+                        self.stream_scalar_export(&mut values[index], wire)?;
+                    }
+                }
+                let unused = values[index]
+                    .range(
+                        WireRef { node: node.id, port: Port(0) }..=WireRef {
+                            node: node.id,
+                            port: Port(u32::MAX),
+                        },
+                    )
+                    .filter_map(|(wire, _)| {
+                        (!schedule.last_use.contains_key(wire) && !schedule.retained.contains(wire))
+                            .then_some(*wire)
+                    })
+                    .collect::<Vec<_>>();
+                for wire in unused {
+                    if let Some(value) = values[index].remove(&wire) {
+                        self.retire_value(value)?;
                     }
                 }
                 for argument in node.args {
@@ -1533,7 +2374,7 @@ where
                         !schedule.retained.contains(argument)
                     {
                         if let Some(value) = values[index].remove(argument) {
-                            self.has_pending_releases |= value.releases_backend_resources_on_drop();
+                            self.retire_value(value)?;
                         }
                     }
                 }
@@ -1563,8 +2404,20 @@ where
             let outputs = scope
                 .outputs()
                 .iter()
-                .map(|wire| self.materialize(&mut instance_values, *wire))
+                .map(|wire| {
+                    // Structural returns preserve host/lazy handles until a
+                    // consuming operation needs them. The public root result
+                    // retains its existing eager scalar contract.
+                    if paths[index].is_empty() && !self.root_exports.contains_key(wire) {
+                        self.materialize(&mut instance_values, *wire)
+                    } else {
+                        self.value(&instance_values, *wire)
+                    }
+                })
                 .collect::<Result<Vec<_>, _>>()?;
+            for value in instance_values.into_values() {
+                self.retire_value(value)?;
+            }
             instances.push(InstanceResult { outputs });
         }
         Ok(instances)
@@ -1572,6 +2425,7 @@ where
 
     fn execute_parallel_matrix_node_by_placement(
         &mut self,
+        scope_id: &FrozenGraphScopeId,
         placements: &[usize],
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
@@ -1583,7 +2437,8 @@ where
             NodeKind::MatrixBinary(_) |
                 NodeKind::MatrixMulAccumulate { .. } |
                 NodeKind::MatrixNegate |
-                NodeKind::MatrixScale { .. }
+                NodeKind::MatrixScale { .. } |
+                NodeKind::RingAutomorphism { .. }
         ) {
             return Ok(false);
         }
@@ -1594,7 +2449,9 @@ where
                 .filter(|index| placements[*index] == placement)
                 .collect::<Vec<_>>();
             if !indices.is_empty() {
-                self.execute_parallel_matrix_node(placement, envs, node, values, &indices)?;
+                self.execute_parallel_matrix_node(
+                    scope_id, placement, envs, node, values, &indices,
+                )?;
             }
         }
         Ok(true)
@@ -1602,12 +2459,15 @@ where
 
     fn execute_parallel_matrix_node(
         &mut self,
+        _scope_id: &FrozenGraphScopeId,
         placement: usize,
         envs: &[ParamEnv],
         node: &ExecutableNode<'_>,
         values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
         indices: &[usize],
     ) -> Result<(), ExecutionError> {
+        // The validated-IR metadata thread exists only in GPU builds; the CPU
+        // path keeps the identical dispatch order without it.
         self.set_placement(placement)?;
         let outputs = match node.kind {
             NodeKind::MatrixBinary(operation) => {
@@ -1670,6 +2530,14 @@ where
                 }
                 self.backend.scale_integer_batch(inputs).map_err(Self::backend_error)?
             }
+            NodeKind::RingAutomorphism { index: expression } => {
+                let mut inputs = Vec::with_capacity(indices.len());
+                for &instance in indices {
+                    let index = self.eval_usize(node.id, expression, &envs[instance])?;
+                    inputs.push((self.matrix(&mut values[instance], node.args[0])?, index));
+                }
+                self.backend.ring_automorphism_batch(inputs).map_err(Self::backend_error)?
+            }
             _ => unreachable!("matrix batch kind checked by caller"),
         };
         if outputs.len() != indices.len() {
@@ -1679,6 +2547,92 @@ where
             self.put(&mut values[*index], node.id, 0, RuntimeValue::matrix(output));
         }
         Ok(())
+    }
+
+    fn stream_scalar_export(
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+        wire: WireRef,
+    ) -> Result<(), ExecutionError> {
+        let Some(artifact_type) = self
+            .validated
+            .root_scope()
+            .wire_types
+            .get(&wire)
+            .filter(|ty| !matches!(ty, ConcreteWireType::IndexedFamily { .. }))
+            .and_then(ArtifactType::from_wire_type)
+        else {
+            return Ok(())
+        };
+        let declarations = self.root_exports[&wire].clone();
+        if declarations.iter().all(|(name, _)| self.streamed_exports.contains_key(name)) {
+            return Ok(())
+        }
+        let value = self.materialize(values, wire)?;
+        let replacement = self.store_scalar_exports(&value, &artifact_type, declarations)?;
+        if let Some(previous) = values.insert(wire, replacement) {
+            self.retire_value(previous)?;
+        }
+        Ok(())
+    }
+
+    fn store_scalar_exports(
+        &mut self,
+        value: &RuntimeValue<B>,
+        artifact_type: &ArtifactType,
+        declarations: Vec<(String, ArtifactConfidentiality)>,
+    ) -> Result<RuntimeValue<B>, ExecutionError> {
+        let (payload, bytes) = encode_artifact(self.backend, value, artifact_type)?;
+        let hash = Sha256::digest(&bytes).into();
+        let mut replacement = None;
+        let count = declarations.len();
+        let mut payload = Some(payload);
+        for (index, (name, confidentiality)) in declarations.into_iter().enumerate() {
+            let handle = ArtifactHandle {
+                key: ArtifactKey {
+                    production: self.production.clone(),
+                    name: name.clone(),
+                    index: None,
+                },
+                artifact_type: artifact_type.clone(),
+                confidentiality,
+                layout: None,
+            };
+            self.artifact_store
+                .store(
+                    handle.key.clone(),
+                    artifact_type,
+                    confidentiality,
+                    None,
+                    if index + 1 == count {
+                        payload.take().expect("last payload owner")
+                    } else {
+                        payload.as_ref().expect("payload owner").clone()
+                    },
+                )
+                .map_err(Self::artifact_error)?;
+            let descriptor = ManifestArtifact {
+                artifact_type: artifact_type.clone(),
+                confidentiality,
+                family_count: None,
+                layout: None,
+                content_hash: (confidentiality == ArtifactConfidentiality::Public).then_some(hash),
+            };
+            replacement.get_or_insert_with(|| RuntimeValue::LazyArtifact {
+                production: self.production.clone(),
+                name: name.clone(),
+                index: None,
+                descriptor: descriptor.clone(),
+            });
+            self.streamed_exports.insert(name, (handle, descriptor));
+        }
+        // Integer exports retain the scalar result contract. Their small resident
+        // values can also feed later arithmetic after the artifact is written.
+        if matches!(value, RuntimeValue::Int(_)) {
+            Ok(value.clone())
+        } else {
+            Ok(replacement.expect("declared export"))
+        }
     }
 
     fn persist_outputs(
@@ -1693,6 +2647,24 @@ where
             let Some(confidentiality) = output_root.confidentiality else {
                 continue;
             };
+            if let Some((handle, descriptor)) = self.streamed_exports.get(name) {
+                if self.session.is_some() {
+                    self.artifact_store.commit_artifact(handle).map_err(Self::artifact_error)?;
+                }
+                handles.entry(name.clone()).or_default().push(handle.clone());
+                artifacts.insert(
+                    name.clone(),
+                    mxx_ir_core::artifact::ExportArtifact {
+                        wire: WireId { instantiation_path: Vec::new(), wire: output_root.value },
+                        artifact_type: descriptor.artifact_type.clone(),
+                        family_count: None,
+                        confidentiality,
+                        content_hash: descriptor.content_hash,
+                        layout: None,
+                    },
+                );
+                continue;
+            }
             let Some(output) = outputs.get(name) else {
                 continue;
             };
@@ -1716,6 +2688,7 @@ where
                 production: staged_production,
                 name: staged_name,
                 descriptor,
+                ..
             } = output
             {
                 let Some(count) = family_count else {
@@ -1729,6 +2702,38 @@ where
                     return Err(ExecutionError::Manifest(format!(
                         "output {name} staged descriptor does not match validated metadata"
                     )));
+                }
+                if staged_production == &production && staged_name == name {
+                    for index in 0..count {
+                        let handle = ArtifactHandle {
+                            key: ArtifactKey {
+                                production: production.clone(),
+                                name: name.clone(),
+                                index: Some(index),
+                            },
+                            artifact_type: artifact_type.clone(),
+                            confidentiality,
+                            layout: None,
+                        };
+                        if self.session.is_some() {
+                            self.artifact_store
+                                .commit_artifact(&handle)
+                                .map_err(Self::artifact_error)?;
+                        }
+                        handles.entry(name.clone()).or_default().push(handle);
+                    }
+                    artifacts.insert(
+                        name.clone(),
+                        mxx_ir_core::artifact::ExportArtifact {
+                            wire,
+                            artifact_type,
+                            family_count,
+                            confidentiality,
+                            content_hash: descriptor.content_hash,
+                            layout: None,
+                        },
+                    );
+                    continue;
                 }
                 let mut family_hasher = Sha256::new();
                 for index in 0..count {
@@ -1782,12 +2787,15 @@ where
                         layout: None,
                     },
                 );
-                staged_replacements.push((
-                    name.clone(),
-                    staged_production.clone(),
-                    staged_name.clone(),
-                    count,
-                ));
+                if staged_production != &production {
+                    staged_replacements.push((
+                        name.clone(),
+                        staged_production.clone(),
+                        staged_name.clone(),
+                        count,
+                    ));
+                }
+
                 continue;
             }
             if let RuntimeValue::IndexedFamily(members) = output {
@@ -1798,7 +2806,8 @@ where
                 }
                 let mut family_hasher = Sha256::new();
                 for (index, member) in members.iter().enumerate() {
-                    let (payload, bytes) = self.encode_artifact(member, &artifact_type)?;
+                    let member = self.materialize_value(member.clone())?;
+                    let (payload, bytes) = encode_artifact(self.backend, &member, &artifact_type)?;
                     family_hasher.update((index as u64).to_le_bytes());
                     family_hasher.update((bytes.len() as u64).to_le_bytes());
                     family_hasher.update(&bytes);
@@ -1841,7 +2850,7 @@ where
                 );
                 continue;
             }
-            let (payload, bytes) = self.encode_artifact(output, &artifact_type)?;
+            let (payload, bytes) = encode_artifact(self.backend, output, &artifact_type)?;
             let content_hash = Sha256::digest(&bytes).into();
             let handle = ArtifactHandle {
                 key: ArtifactKey {
@@ -1943,6 +2952,34 @@ where
         let Some(artifact_type) = ArtifactType::from_wire_type(element) else {
             return Ok(None);
         };
+        // Root families declared as exports are written directly under their
+        // final artifact identity. The manifest is published only after execution.
+        if path.is_empty() {
+            if let Some((name, output)) =
+                self.validated.source.outputs().iter().find(|(_, output)| {
+                    output.value == wire_id.wire && output.confidentiality.is_some()
+                })
+            {
+                return Ok(Some((
+                    name.clone(),
+                    ManifestArtifact {
+                        artifact_type,
+                        family_count: Some(count),
+                        confidentiality: output.confidentiality.expect("export confidentiality"),
+                        content_hash: None,
+                        layout: None,
+                    },
+                )));
+            }
+        }
+        if self.member_exports.get(&wire_id).is_some_and(|members| members.len() == count) {
+            return Ok(None);
+        }
+        // Intermediate matrices use the existing raw-RNS HostMatrix representation.
+        // Only durable exports need compact coefficient serialization.
+        if matches!(artifact_type, ArtifactType::Matrix(_)) {
+            return Ok(None);
+        }
         let encoded = mxx_ir_core::encoding::canonical_json(&wire_id)
             .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
         let digest = Sha256::digest(encoded);
@@ -1952,7 +2989,7 @@ where
             family_count: Some(count),
             confidentiality: ArtifactConfidentiality::Private,
             content_hash: None,
-            layout: Some("runtime/staged-family-v1".to_owned()),
+            layout: Some(crate::artifact::STAGED_FAMILY_LAYOUT.to_owned()),
         };
         // Scratch identity is private to streamed families. Ordinary resident
         // executions need neither its random nonce nor its domain-separated hash.
@@ -1962,8 +2999,38 @@ where
         let scratch = self
             .scratch_production
             .get_or_insert_with(|| scratch_production_id(production, rand::random()));
-        self.staged_families.insert((scratch.clone(), name.clone()), descriptor.clone());
+        self.staged_families
+            .insert((scratch.clone(), name.clone()), (descriptor.clone(), Arc::new(())));
         Ok(Some((name, descriptor)))
+    }
+
+    /// Liveness retires a wire, while shared ownership protects captures,
+    /// aliases and individual members until their own final use.
+    fn retire_value(&mut self, value: RuntimeValue<B>) -> Result<(), ExecutionError> {
+        let mut families = BTreeMap::new();
+        collect_staged_families(&value, &mut families);
+        self.has_pending_releases |= value.releases_backend_resources_on_drop();
+        drop(value);
+        for ((production, name), count) in families {
+            let key = (production.clone(), name.clone());
+            if self
+                .staged_families
+                .get(&key)
+                .is_some_and(|(_, lifetime)| Arc::strong_count(lifetime) == 1)
+            {
+                for index in 0..count {
+                    self.artifact_store
+                        .remove_staged(&ArtifactKey {
+                            production: production.clone(),
+                            name: name.clone(),
+                            index: Some(index),
+                        })
+                        .map_err(|error| self.staged_cleanup_error(error))?;
+                }
+                self.staged_families.remove(&key);
+            }
+        }
+        Ok(())
     }
 
     fn cleanup_unreturned_staged_families(
@@ -1976,7 +3043,7 @@ where
         }
         let staged = self.staged_families.clone();
         let mut leases = Vec::new();
-        for ((production, name), descriptor) in staged {
+        for ((production, name), (descriptor, _)) in staged {
             if retained.contains_key(&(production.clone(), name.clone())) {
                 leases.push(StagedFamilyLease { production, name, descriptor });
                 continue;
@@ -1999,9 +3066,17 @@ where
         Ok(leases)
     }
 
-    fn cleanup_all_staged_families(&mut self) -> Result<(), ExecutionError> {
+    fn cleanup_failed_execution(&mut self) -> Result<(), ExecutionError> {
+        // Session identities are durable and may be resumed. Ordinary failed
+        // executions return no handles, so their eager exports are unreachable.
+        if self.session.is_none() {
+            for (handle, _) in self.streamed_exports.values() {
+                self.artifact_store.remove_staged(&handle.key).map_err(Self::artifact_error)?;
+            }
+            self.streamed_exports.clear();
+        }
         let staged = self.staged_families.clone();
-        for ((production, name), descriptor) in staged {
+        for ((production, name), (descriptor, _)) in staged {
             let Some(count) = descriptor.family_count else {
                 return Err(self.staged_cleanup_error("staged family descriptor has no cardinality"));
             };
@@ -2024,67 +3099,13 @@ where
         let leases = self
             .staged_families
             .iter()
-            .map(|((production, name), descriptor)| StagedFamilyLease {
+            .map(|((production, name), (descriptor, _))| StagedFamilyLease {
                 production: production.clone(),
                 name: name.clone(),
                 descriptor: descriptor.clone(),
             })
             .collect();
         ExecutionError::StagedCleanup { message: error.to_string(), leases }
-    }
-
-    fn encode_artifact(
-        &self,
-        value: &RuntimeValue<B>,
-        artifact_type: &ArtifactType,
-    ) -> Result<(ArtifactPayload, Vec<u8>), ExecutionError> {
-        match (value, artifact_type) {
-            (RuntimeValue::Int(value), ArtifactType::Int) => {
-                let bytes = value.to_signed_bytes_le();
-                Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
-            }
-            (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
-                let bytes = self.backend.matrix_to_bytes(matrix);
-                Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
-            }
-            (RuntimeValue::SmallMatrix(matrix), artifact_type)
-                if artifact_type.bounded_matrix_schema().is_some() =>
-            {
-                let (schema, semantic_kind) =
-                    artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
-                let bytes = self
-                    .backend
-                    .small_matrix_to_bytes(matrix, &schema, semantic_kind)
-                    .map_err(Self::backend_error)?;
-                Ok((ArtifactPayload::SmallMatrix(bytes.clone()), bytes))
-            }
-            (RuntimeValue::Bytes(bytes), ArtifactType::Bytes { length })
-                if bytes.len() == *length =>
-            {
-                Ok((ArtifactPayload::Bytes(bytes.clone()), bytes.clone()))
-            }
-            (RuntimeValue::TypedBlob(bytes), ArtifactType::TypedBlob { .. }) => {
-                Ok((ArtifactPayload::TypedBlob(bytes.clone()), bytes.clone()))
-            }
-            (
-                RuntimeValue::Trapdoor { secret: Some(secret), public, .. },
-                ArtifactType::Trapdoor { .. },
-            ) => {
-                let public_bytes = self.backend.matrix_to_bytes(public);
-                let secret_bytes = self.backend.trapdoor_to_bytes(secret);
-                let mut canonical = Vec::with_capacity(
-                    16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
-                );
-                canonical.extend_from_slice(&(public_bytes.len() as u64).to_le_bytes());
-                canonical.extend_from_slice(&public_bytes);
-                canonical.extend_from_slice(&(secret_bytes.len() as u64).to_le_bytes());
-                canonical.extend_from_slice(&secret_bytes);
-                Ok((ArtifactPayload::Trapdoor { public_bytes, secret_bytes }, canonical))
-            }
-            _ => Err(ExecutionError::Manifest(
-                "runtime value does not match declared artifact type".to_owned(),
-            )),
-        }
     }
 
     fn execute_node(
@@ -2098,7 +3119,16 @@ where
     ) -> Result<(), ExecutionError> {
         match &node.kind {
             NodeKind::Input { name, wire_type: _, artifact } => {
-                if let Some(artifact) = artifact {
+                // Only the owning scope loads an artifact input from the
+                // artifact store. Every other scope is caller-bound: its input
+                // is supplied by the parent call that instantiated it (a loop
+                // broadcast owner, a loop family member, or a subgraph-call
+                // argument), and the descriptor copied into the child node only
+                // records which outer value the capture came from. Re-deriving
+                // that descriptor here would load the artifact once per body
+                // and discard the owner the caller already materialized.
+                let stored = artifact.as_ref().filter(|_| *scope_id == FrozenGraphScopeId::Root);
+                if let Some(artifact) = stored {
                     let wire = WireRef { node: node.id, port: Port(0) };
                     let wire_id = WireId { instantiation_path: path.to_vec(), wire };
                     let concrete = self
@@ -2163,6 +3193,11 @@ where
                         },
                     );
                 } else {
+                    // Caller-bound input: the owning scope's declared input, or
+                    // a child scope's capture of an outer artifact value. The
+                    // supplied value may still be a lazy descriptor when its
+                    // parent has not materialized it, exactly like any other
+                    // lazy input.
                     let value = inputs
                         .get(name)
                         .cloned()
@@ -2210,20 +3245,15 @@ where
                 let sigma = self.trapdoor_sigma(scope_id, path, trapdoor_wire)?;
                 let (gadget_base, digit_count) =
                     self.trapdoor_layout(scope_id, path, trapdoor_wire)?;
-                let public = self
-                    .backend
-                    .constant_matrix(
-                        &ty,
-                        &mxx_ir_core::node::ConstantMatrix::Gadget {
-                            base: match &node.kind {
-                                NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
-                                _ => unreachable!(),
-                            },
-                            small: false,
-                        },
-                        env,
-                    )
-                    .map_err(Self::backend_error)?;
+                let gadget = mxx_ir_core::node::ConstantMatrix::Gadget {
+                    base: match &node.kind {
+                        NodeKind::GadgetTrapdoor { base, .. } => base.clone(),
+                        _ => unreachable!(),
+                    },
+                    small: false,
+                };
+                let public =
+                    self.backend.constant_matrix(&ty, &gadget, env).map_err(Self::backend_error)?;
                 self.put(
                     values,
                     node.id,
@@ -2392,10 +3422,9 @@ where
                 } else {
                     None
                 };
-                let output = self
-                    .backend
-                    .matrix_mul_accumulate(MatrixMulAccumulateRequest { products, bias })
-                    .map_err(Self::backend_error)?;
+                let request = MatrixMulAccumulateRequest { products, bias };
+                let output =
+                    self.backend.matrix_mul_accumulate(request).map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::MatrixNegate => {
@@ -2799,6 +3828,30 @@ where
                     .map_err(Self::backend_error)?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
+            NodeKind::CenteredExtend { .. }
+                if matches!(self.value(values, node.args[0])?, RuntimeValue::SmallMatrix(_)) =>
+            {
+                let input = self.small_matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output =
+                    self.backend.centered_extend_small(&input, &ty).map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
+            }
+            NodeKind::CenteredExtend { .. } | NodeKind::BlockModSwitch { .. } => {
+                let input = self.matrix(values, node.args[0])?;
+                let ty =
+                    self.matrix_type(scope_id, path, WireRef { node: node.id, port: Port(0) })?;
+                let output = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = &node.kind
+                {
+                    let t = self.eval_usize(node.id, plaintext_modulus, env)? as u64;
+                    self.backend.block_mod_switch(&input, &ty, t)
+                } else {
+                    self.backend.centered_extend(&input, &ty)
+                }
+                .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
+            }
             NodeKind::RingAutomorphism { index } => {
                 let input = self.matrix(values, node.args[0])?;
                 let index = self.eval_usize(node.id, index, env)?;
@@ -2944,11 +3997,37 @@ where
                     }
                 })?;
                 let count = self.eval_usize(node.id, &loop_node.count, env)?;
+                // A bounded family inside a body is consumed on the
+                // device. Only the carried outputs cross the host-RAM boundary;
+                // staging every reduction level would transfer the same data
+                // repeatedly. Large families still stream to host memory.
+                // Whether an output family is staged, per output port, is
+                // decided by wave admission below from the loop's retention
+                // requirements.
                 let staged = (0..child.outputs().len())
                     .map(|port| {
                         self.staged_family_descriptor(scope_id, path, node.id, port as u32, count)
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let member_exports = (0..child.outputs().len())
+                    .map(|port| {
+                        self.member_exports
+                            .get(&WireId {
+                                instantiation_path: path.to_vec(),
+                                wire: WireRef { node: node.id, port: Port(port as u32) },
+                            })
+                            .cloned()
+                    })
+                    .collect::<Vec<_>>();
+                let mut export_hashers = staged
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .as_ref()
+                            .filter(|(_, descriptor)| descriptor.layout.is_none())
+                            .map(|_| Sha256::new())
+                    })
+                    .collect::<Vec<_>>();
                 let mut families =
                     staged
                         .iter()
@@ -2966,36 +4045,83 @@ where
                 }
                 let parent_placement = self.backend.active_placement();
                 let loop_result = (|| {
-                    let mut broadcast_inputs = (0..placement_count)
-                        .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
-                        .collect::<Vec<_>>();
-                    for (argument, (wire, mode)) in
-                        node.args.iter().zip(&loop_node.input_modes).enumerate()
-                    {
-                        if matches!(mode, LoopInputMode::Broadcast) {
-                            let placed = self.values_for_placements(self.value(values, *wire)?)?;
-                            for (placement, value) in placed.into_iter().enumerate() {
-                                broadcast_inputs[placement][argument] = Some(value);
+                    // Broadcast inputs are loop invariants, but a lazy artifact
+                    // stays a descriptor until the first wave has been admitted:
+                    // the admitted size must never be decided after that load.
+                    // The per-placement owners are built once for this loop and
+                    // reused by every later wave of it. Each body's capture
+                    // input is bound to that owner, so the loop-level
+                    // materialization is the only load of a broadcast artifact.
+                    let mut broadcast_inputs: Option<Arc<Vec<Vec<Option<RuntimeValue<B>>>>>> = None;
+                    let mut wave_start = 0;
+                    while wave_start < count {
+                        // Admit before materializing this wave's lazy inputs;
+                        // the accepted size and its staging actions stay frozen
+                        // for the whole wave.
+                        // Retain only the cache container while the first wave
+                        // initializes it; payload owners are never cloned for admission.
+                        let retained_broadcasts = broadcast_inputs.clone();
+                        let request = WaveAdmissionRequest::new(
+                            self.validated,
+                            scope_id,
+                            node.id,
+                            &child_id,
+                            child.inputs(),
+                            child.outputs(),
+                            &node.args,
+                            env,
+                            values,
+                            retained_broadcasts.as_deref().map(Vec::as_slice),
+                            self.trace.is_some(),
+                            count,
+                            wave_start,
+                            self.config.max_parallel_instances.get(),
+                        );
+                        // Wave sizing is an interpreted-executor concern. GPU
+                        // submissions never enter this path; they replay the
+                        // fixed prepared wave directly.
+                        let admission = request.default_admission();
+                        let wave_size = admission.wave_size;
+                        let child_envs = (wave_start..wave_start + wave_size)
+                            .into_par_iter()
+                            .map(|index| request.body_bindings(index))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if broadcast_inputs.is_none() {
+                            let mut placed = (0..placement_count)
+                                .map(|_| (0..node.args.len()).map(|_| None).collect::<Vec<_>>())
+                                .collect::<Vec<_>>();
+                            let mut broadcast_arguments = BTreeMap::<WireRef, usize>::new();
+                            for (argument, (wire, mode)) in
+                                node.args.iter().zip(&loop_node.input_modes).enumerate()
+                            {
+                                if matches!(mode, LoopInputMode::Broadcast) {
+                                    if let Some(&previous) = broadcast_arguments.get(wire) {
+                                        for values in &mut placed {
+                                            values[argument] = values[previous].clone();
+                                        }
+                                        continue;
+                                    }
+                                    broadcast_arguments.insert(*wire, argument);
+                                    let placed_values =
+                                        self.values_for_placements(self.value(values, *wire)?)?;
+                                    for (placement, value) in placed_values.into_iter().enumerate()
+                                    {
+                                        placed[placement][argument] = Some(value);
+                                    }
+                                }
                             }
+                            self.set_placement(parent_placement)?;
+                            broadcast_inputs = Some(Arc::new(placed));
                         }
-                    }
-                    self.set_placement(parent_placement)?;
-                    let wave_size = self.config.max_parallel_instances.get();
-                    for wave_start in (0..count).step_by(wave_size) {
+                        let broadcast_inputs =
+                            broadcast_inputs.as_ref().expect("broadcast inputs prepared");
                         let wave_end = count.min(wave_start.saturating_add(wave_size));
                         let wave_len = wave_end - wave_start;
-                        let mut child_envs = Vec::with_capacity(wave_len);
                         let mut child_paths = Vec::with_capacity(wave_len);
                         let mut child_inputs = Vec::with_capacity(wave_len);
                         let mut child_placements = Vec::with_capacity(wave_len);
                         for index in wave_start..wave_end {
                             let placement = index % placement_count;
-                            child_envs.push(self.child_env(
-                                env,
-                                &loop_node.bindings,
-                                Some((loop_node.index_slot, index)),
-                                node.id,
-                            )?);
                             let mut child_path = path.to_vec();
                             child_path.push(InstantiationFrame {
                                 call: node.id,
@@ -3007,10 +4133,9 @@ where
                                 child,
                                 node,
                                 &loop_node.input_modes,
-                                index,
+                                &request.selected_inputs(index)?,
                                 placement,
                                 &broadcast_inputs[placement],
-                                values,
                             )?);
                         }
                         let instances = self.execute_instances_batch(
@@ -3027,12 +4152,35 @@ where
                             self.set_placement(child_placements[offset])?;
                             for (port, value) in instance.outputs.into_iter().enumerate() {
                                 if let Some((name, descriptor)) = &staged[port] {
-                                    let (payload, _) =
-                                        self.encode_artifact(&value, &descriptor.artifact_type)?;
+                                    // A nested loop may return a selected staged
+                                    // member. Resolve only this published value,
+                                    // while the containing wave still owns its
+                                    // import and serialization capacity.
+                                    let value = self.materialize_value(value)?;
+                                    let (payload, bytes) = encode_artifact(
+                                        self.backend,
+                                        &value,
+                                        &descriptor.artifact_type,
+                                    )?;
+                                    if let Some(hasher) = &mut export_hashers[port] {
+                                        hasher.update(((wave_start + offset) as u64).to_le_bytes());
+                                        hasher.update((bytes.len() as u64).to_le_bytes());
+                                        hasher.update(&bytes);
+                                    }
+                                    let production = if descriptor.layout.is_none() {
+                                        self.production.clone()
+                                    } else {
+                                        self.scratch_production
+                                            .as_ref()
+                                            .expect(
+                                                "staged descriptor initializes scratch identity",
+                                            )
+                                            .clone()
+                                    };
                                     self.artifact_store
                                         .store(
                                             ArtifactKey {
-                                                production: self.scratch_production.as_ref().expect("staged descriptor initializes scratch identity").clone(),
+                                                production,
                                                 name: name.clone(),
                                                 index: Some(wave_start + offset),
                                             },
@@ -3043,22 +4191,89 @@ where
                                         )
                                         .map_err(Self::artifact_error)?;
                                 } else {
+                                    let value = if let Some(declarations) = member_exports[port]
+                                        .as_ref()
+                                        .and_then(|members| members.get(&(wave_start + offset)))
+                                    {
+                                        let wire =
+                                            WireRef { node: node.id, port: Port(port as u32) };
+                                        let Some(ConcreteWireType::IndexedFamily {
+                                            element, ..
+                                        }) = self.validated_wire_type(scope_id, wire)
+                                        else {
+                                            return Err(ExecutionError::ValueKind(wire));
+                                        };
+                                        let ty = ArtifactType::from_wire_type(element)
+                                            .expect("export element");
+                                        self.store_scalar_exports(
+                                            &value,
+                                            &ty,
+                                            declarations.clone(),
+                                        )?
+                                    } else if !admission.staged_outputs[port] {
+                                        value
+                                    } else if let RuntimeValue::Matrix(matrix) = value {
+                                        let wire =
+                                            WireRef { node: node.id, port: Port(port as u32) };
+                                        let Some(ConcreteWireType::IndexedFamily {
+                                            element, ..
+                                        }) = self.validated_wire_type(scope_id, wire)
+                                        else {
+                                            return Err(ExecutionError::ValueKind(wire));
+                                        };
+                                        let ConcreteWireType::Matrix(matrix_type) =
+                                            element.as_ref()
+                                        else {
+                                            return Err(ExecutionError::ValueKind(wire));
+                                        };
+                                        let matrix_type = matrix_type.clone();
+                                        // Reuse the raw-RNS host snapshot also used for preimage
+                                        // targets. The column-source view is not needed here.
+                                        let (_, bytes) = self
+                                            .backend
+                                            .preimage_target(matrix)
+                                            .map_err(Self::backend_error)?;
+                                        RuntimeValue::HostMatrix { matrix_type, bytes }
+                                    } else {
+                                        value
+                                    };
                                     families[port].push(value);
                                 }
                             }
                         }
+                        wave_start = wave_end;
                     }
                     for (port, family) in families.into_iter().enumerate() {
                         let value = match &staged[port] {
-                            Some((name, descriptor)) => RuntimeValue::StagedArtifactFamily {
-                                production: self
-                                    .scratch_production
-                                    .as_ref()
-                                    .expect("staged descriptor initializes scratch identity")
-                                    .clone(),
-                                name: name.clone(),
-                                descriptor: descriptor.clone(),
-                            },
+                            Some((name, descriptor)) => {
+                                let mut descriptor = descriptor.clone();
+                                let direct = descriptor.layout.is_none();
+                                if let Some(hasher) = export_hashers[port].take() {
+                                    descriptor.content_hash = Some(hasher.finalize().into());
+                                }
+                                RuntimeValue::StagedArtifactFamily {
+                                    lifetime: if direct {
+                                        Arc::new(())
+                                    } else {
+                                        self.staged_families
+                                            [&(self.scratch_production.as_ref().expect("staged descriptor initializes scratch identity").clone(), name.clone())]
+                                            .1
+                                            .clone()
+                                    },
+                                    production: if direct {
+                                        self.production.clone()
+                                    } else {
+                                        self.scratch_production
+                                            .as_ref()
+                                            .expect(
+                                                "staged descriptor initializes scratch identity",
+                                            )
+                                            .clone()
+                                    },
+                                    name: name.clone(),
+                                    descriptor,
+                                }
+                            }
                             None => RuntimeValue::IndexedFamily(family),
                         };
                         self.put(values, node.id, port as u32, value);
@@ -3152,7 +4367,7 @@ where
             }
             NodeKind::FamilyGetStatic { index } => {
                 let index = self.eval_usize(node.id, index, env)?;
-                let selected = self.family_member(values, node.args[0], index, node.id)?;
+                let selected = self.family_member_value(values, node.args[0], index)?;
                 self.put(values, node.id, 0, selected);
             }
             NodeKind::FamilyGetDynamic => {
@@ -3237,10 +4452,11 @@ where
                     descriptor: descriptor.clone(),
                 })
             }
-            RuntimeValue::StagedArtifactFamily { production, name, descriptor }
+            RuntimeValue::StagedArtifactFamily { production, name, descriptor, lifetime }
                 if descriptor.family_count.is_some_and(|count| index < count) =>
             {
                 Ok(RuntimeValue::StagedArtifact {
+                    lifetime: lifetime.clone(),
                     production: production.clone(),
                     name: name.clone(),
                     index,
@@ -3412,13 +4628,14 @@ where
                     {
                         self.set_placement(request.placement)?;
                         outputs[index] = Some(
-                            self.backend
-                                .small_matrix_from_bytes(
+                            {
+                                self.backend.small_matrix_from_bytes(
                                     &request.schema,
                                     &bytes,
                                     SmallMatrixSemanticKind::Preimage,
                                 )
-                                .map_err(Self::backend_error)?,
+                            }
+                            .map_err(Self::backend_error)?,
                         );
                     }
                     Some(
@@ -3538,13 +4755,14 @@ where
                         {
                             self.set_placement(request.placement)?;
                             outputs.push(
-                                self.backend
-                                    .small_matrix_from_bytes(
+                                {
+                                    self.backend.small_matrix_from_bytes(
                                         &request.schema,
                                         &bytes,
                                         SmallMatrixSemanticKind::Preimage,
                                     )
-                                    .map_err(Self::backend_error)?,
+                                }
+                                .map_err(Self::backend_error)?,
                             );
                         }
                         RecordedValue::Matrix { .. } |
@@ -3699,11 +4917,11 @@ where
                 .map_err(Self::artifact_error)?
             {
                 return match recorded {
-                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => self
-                        .backend
-                        .matrix_from_bytes(ty, &bytes)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    RecordedValue::Matrix { matrix_type, bytes } if matrix_type == *ty => {
+                        { self.backend.matrix_from_bytes(ty, &bytes) }
+                            .map(|value| (value, false))
+                            .map_err(Self::backend_error)
+                    }
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -3719,7 +4937,10 @@ where
                         site,
                         RecordedValue::Matrix {
                             matrix_type: ty.clone(),
-                            bytes: self.backend.matrix_to_bytes(&value),
+                            bytes: self
+                                .backend
+                                .matrix_to_bytes(&value)
+                                .map_err(Self::backend_error)?,
                         },
                     )],
                 )
@@ -3736,17 +4957,17 @@ where
                     site,
                     RecordedValue::Matrix {
                         matrix_type: ty.clone(),
-                        bytes: self.backend.matrix_to_bytes(&value),
+                        bytes: self.backend.matrix_to_bytes(&value).map_err(Self::backend_error)?,
                     },
                 )?;
                 Ok((value, true))
             }
             SamplingMode::Replay(replayer) => match replayer.get(&site)? {
-                RecordedValue::Matrix { bytes, .. } => self
-                    .backend
-                    .matrix_from_bytes(ty, bytes)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                RecordedValue::Matrix { bytes, .. } => {
+                    { self.backend.matrix_from_bytes(ty, bytes) }
+                        .map(|value| (value, false))
+                        .map_err(Self::backend_error)
+                }
                 RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                     Err(TranscriptError::KindMismatch(site).into())
                 }
@@ -3792,11 +5013,11 @@ where
                         schema: recorded_schema,
                         semantic_kind: recorded_kind,
                         bytes,
-                    } if recorded_schema == *schema && recorded_kind == semantic_kind => self
-                        .backend
-                        .small_matrix_from_bytes(schema, &bytes, semantic_kind)
-                        .map(|value| (value, false))
-                        .map_err(Self::backend_error),
+                    } if recorded_schema == *schema && recorded_kind == semantic_kind => {
+                        { self.backend.small_matrix_from_bytes(schema, &bytes, semantic_kind) }
+                            .map(|value| (value, false))
+                            .map_err(Self::backend_error)
+                    }
                     RecordedValue::Matrix { .. } |
                     RecordedValue::SmallMatrix { .. } |
                     RecordedValue::Trapdoor { .. } => {
@@ -3841,11 +5062,11 @@ where
                     schema: recorded_schema,
                     semantic_kind: recorded_kind,
                     bytes,
-                } if recorded_schema == schema && *recorded_kind == semantic_kind => self
-                    .backend
-                    .small_matrix_from_bytes(schema, bytes, semantic_kind)
-                    .map(|value| (value, false))
-                    .map_err(Self::backend_error),
+                } if recorded_schema == schema && *recorded_kind == semantic_kind => {
+                    { self.backend.small_matrix_from_bytes(schema, bytes, semantic_kind) }
+                        .map(|value| (value, false))
+                        .map_err(Self::backend_error)
+                }
                 RecordedValue::Matrix { .. } |
                 RecordedValue::SmallMatrix { .. } |
                 RecordedValue::Trapdoor { .. } => Err(TranscriptError::KindMismatch(site).into()),
@@ -3901,20 +5122,18 @@ where
                         trapdoor_bytes,
                     }),
                 ) if matrix_type == *ty && secret_type == *ty && bytes == public_bytes => {
-                    let public =
-                        self.backend.matrix_from_bytes(ty, &bytes).map_err(Self::backend_error)?;
-                    let secret = self
-                        .backend
-                        .trapdoor_from_bytes(ty, &trapdoor_bytes)
+                    let public = { self.backend.matrix_from_bytes(ty, &bytes) }
+                        .map_err(Self::backend_error)?;
+                    let secret = { self.backend.trapdoor_from_bytes(ty, &trapdoor_bytes) }
                         .map_err(Self::backend_error)?;
                     Ok((public, secret))
                 }
                 (None, None) => {
-                    let (public, secret) = self
-                        .backend
-                        .sample_trapdoor(ty, sigma, gadget_base, digit_count)
-                        .map_err(Self::backend_error)?;
-                    let public_bytes = self.backend.matrix_to_bytes(&public);
+                    let (public, secret) =
+                        { self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count) }
+                            .map_err(Self::backend_error)?;
+                    let public_bytes =
+                        self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                     self.artifact_store
                         .record_transcript_batch(
                             &production,
@@ -3945,16 +5164,16 @@ where
             };
         }
         match &mut self.sampling_mode {
-            SamplingMode::Fresh => self
-                .backend
-                .sample_trapdoor(ty, sigma, gadget_base, digit_count)
-                .map_err(Self::backend_error),
+            SamplingMode::Fresh => {
+                { self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count) }
+                    .map_err(Self::backend_error)
+            }
             SamplingMode::Record(recorder) => {
-                let (public, secret) = self
-                    .backend
-                    .sample_trapdoor(ty, sigma, gadget_base, digit_count)
-                    .map_err(Self::backend_error)?;
-                let public_bytes = self.backend.matrix_to_bytes(&public);
+                let (public, secret) =
+                    { self.backend.sample_trapdoor(ty, sigma, gadget_base, digit_count) }
+                        .map_err(Self::backend_error)?;
+                let public_bytes =
+                    self.backend.matrix_to_bytes(&public).map_err(Self::backend_error)?;
                 recorder.record(
                     matrix_site,
                     RecordedValue::Matrix { matrix_type: ty.clone(), bytes: public_bytes.clone() },
@@ -3972,17 +5191,18 @@ where
             SamplingMode::Replay(replayer) => {
                 let public = match replayer.get(&matrix_site)? {
                     RecordedValue::Matrix { bytes, .. } => {
-                        self.backend.matrix_from_bytes(ty, bytes).map_err(Self::backend_error)?
+                        { self.backend.matrix_from_bytes(ty, bytes) }
+                            .map_err(Self::backend_error)?
                     }
                     RecordedValue::SmallMatrix { .. } | RecordedValue::Trapdoor { .. } => {
                         return Err(TranscriptError::KindMismatch(matrix_site).into());
                     }
                 };
                 let secret = match replayer.get(&trapdoor_site)? {
-                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => self
-                        .backend
-                        .trapdoor_from_bytes(ty, trapdoor_bytes)
-                        .map_err(Self::backend_error)?,
+                    RecordedValue::Trapdoor { trapdoor_bytes, .. } => {
+                        { self.backend.trapdoor_from_bytes(ty, trapdoor_bytes) }
+                            .map_err(Self::backend_error)?
+                    }
                     RecordedValue::Matrix { .. } | RecordedValue::SmallMatrix { .. } => {
                         return Err(TranscriptError::KindMismatch(trapdoor_site).into());
                     }
@@ -4000,11 +5220,15 @@ where
         let value = values.get(&wire).cloned().ok_or(ExecutionError::MissingWire(wire))?;
         let was_lazy = matches!(
             value,
-            RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. }
+            RuntimeValue::LazyArtifact { .. } |
+                RuntimeValue::StagedArtifact { .. } |
+                RuntimeValue::HostMatrix { .. }
         );
         let value = self.materialize_value(value)?;
         if was_lazy {
-            values.insert(wire, value.clone());
+            if let Some(previous) = values.insert(wire, value.clone()) {
+                self.retire_value(previous)?;
+            }
         }
         Ok(value)
     }
@@ -4014,18 +5238,22 @@ where
         value: RuntimeValue<B>,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
         if let RuntimeValue::HostMatrix { matrix_type, bytes } = value {
-            let matrix = self
-                .backend
-                .matrix_from_cpu_staging_bytes(&matrix_type, &bytes)
+            let matrix = { self.backend.matrix_from_cpu_staging_bytes(&matrix_type, &bytes) }
                 .map_err(Self::backend_error)?;
             Ok(RuntimeValue::matrix(matrix))
         } else if let RuntimeValue::LazyArtifact { production, name, index, descriptor } = value {
             let key = ArtifactKey { production, name, index };
             let artifact_type = descriptor.artifact_type.clone();
-            let payload =
-                self.artifact_store.load(&key, &descriptor).map_err(Self::artifact_error)?;
+            let payload = if key.production == self.production {
+                self.artifact_store.load_staged(&key, &descriptor)
+            } else {
+                self.artifact_store.load(&key, &descriptor)
+            }
+            .map_err(Self::artifact_error)?;
             self.decode_artifact(artifact_type, payload)
-        } else if let RuntimeValue::StagedArtifact { production, name, index, descriptor } = value {
+        } else if let RuntimeValue::StagedArtifact { production, name, index, descriptor, .. } =
+            value
+        {
             let key = ArtifactKey { production, name, index: Some(index) };
             let artifact_type = descriptor.artifact_type.clone();
             let payload =
@@ -4037,7 +5265,7 @@ where
     }
 
     fn decode_artifact(
-        &self,
+        &mut self,
         artifact_type: ArtifactType,
         payload: ArtifactPayload,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
@@ -4084,11 +5312,11 @@ where
     }
 
     fn int(
-        &self,
-        values: &BTreeMap<WireRef, RuntimeValue<B>>,
+        &mut self,
+        values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
         wire: WireRef,
     ) -> Result<BigInt, ExecutionError> {
-        match self.value(values, wire)? {
+        match self.materialize(values, wire)? {
             RuntimeValue::Int(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
@@ -4457,10 +5685,9 @@ where
         child: &GraphScope,
         node: &ExecutableNode<'_>,
         modes: &[LoopInputMode],
-        index: usize,
+        selected: &[WaveInput<'_, B>],
         placement: usize,
         broadcast_inputs: &[Option<RuntimeValue<B>>],
-        values: &BTreeMap<WireRef, RuntimeValue<B>>,
     ) -> Result<BTreeMap<String, RuntimeValue<B>>, ExecutionError> {
         let names = child.inputs().iter().map(|wire| {
             let input = child.node(wire.node).expect("validated child input node");
@@ -4473,10 +5700,10 @@ where
             return Err(ExecutionError::ValueKind(WireRef { node: node.id, port: Port(0) }));
         }
         names
-            .zip(node.args)
             .zip(modes)
             .zip(broadcast_inputs)
-            .map(|(((name, wire), mode), broadcast)| {
+            .zip(selected)
+            .map(|(((name, mode), broadcast), selected)| {
                 let value = match mode {
                     LoopInputMode::Broadcast => {
                         broadcast.clone().ok_or(ExecutionError::ValueKind(WireRef {
@@ -4485,22 +5712,36 @@ where
                         }))?
                     }
                     LoopInputMode::Zip | LoopInputMode::ZipOffset { .. } => {
-                        let offset = match mode {
-                            LoopInputMode::Zip => 0,
-                            LoopInputMode::ZipOffset { offset } => *offset,
-                            LoopInputMode::Broadcast => unreachable!(),
+                        let value = if let Some(member) = selected.member {
+                            match selected.value {
+                                RuntimeValue::LazyArtifactFamily {
+                                    production,
+                                    name,
+                                    descriptor,
+                                } => RuntimeValue::LazyArtifact {
+                                    production: production.clone(),
+                                    name: name.clone(),
+                                    index: Some(member),
+                                    descriptor: descriptor.clone(),
+                                },
+                                RuntimeValue::StagedArtifactFamily {
+                                    production,
+                                    name,
+                                    descriptor,
+                                    lifetime,
+                                } => RuntimeValue::StagedArtifact {
+                                    production: production.clone(),
+                                    name: name.clone(),
+                                    index: member,
+                                    descriptor: descriptor.clone(),
+                                    lifetime: lifetime.clone(),
+                                },
+                                _ => unreachable!("selected lazy family input"),
+                            }
+                        } else {
+                            selected.value.clone()
                         };
-                        let index = index.checked_add(offset).ok_or(
-                            ExecutionError::SelectIndexOutOfRange {
-                                node: node.id,
-                                index: BigInt::from(index),
-                                count: self.family_count(values, *wire)?,
-                            },
-                        )?;
-                        self.value_for_placement(
-                            self.family_member_value(values, *wire, index)?,
-                            placement,
-                        )?
+                        self.value_for_placement(value, placement)?
                     }
                 };
                 Ok((name.clone(), value))
@@ -4515,18 +5756,7 @@ where
         loop_index: Option<(u32, usize)>,
         node: NodeId,
     ) -> Result<ParamEnv, ExecutionError> {
-        let mut env = parent.clone();
-        if let Some((slot, index)) = loop_index {
-            env.loop_indices.insert(slot, BigInt::from(index));
-        }
-        let expression_env = env.clone();
-        for (name, expression) in bindings {
-            let value = expression
-                .evaluate(&expression_env)
-                .map_err(|error| self.expression_error(node, error))?;
-            env.integers.insert(name.clone(), value);
-        }
-        Ok(env)
+        parent.child(bindings, loop_index).map_err(|error| self.expression_error(node, error))
     }
 
     fn eval_usize(
@@ -4594,7 +5824,7 @@ fn preimage_request_seed(
 
 fn runtime_inputs_digest<B: Backend>(
     validated: &ValidatedGraph,
-    backend: &B,
+    backend: &mut B,
     inputs: &BTreeMap<String, RuntimeValue<B>>,
 ) -> Result<[u8; 32], ExecutionError> {
     let root = validated.source.root_scope();
@@ -4633,7 +5863,7 @@ fn runtime_inputs_digest<B: Backend>(
 }
 
 fn hash_runtime_value<B: Backend>(
-    backend: &B,
+    backend: &mut B,
     value: &RuntimeValue<B>,
     concrete: &ConcreteWireType,
     hasher: &mut Sha256,
@@ -4663,11 +5893,21 @@ fn hash_runtime_value<B: Backend>(
                 .matrix_from_cpu_staging_bytes(matrix_type, bytes)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(&matrix));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(&matrix)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
-            hash_sized(hasher, &backend.matrix_to_bytes(value));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(value)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
         }
         RuntimeValue::SmallMatrix(value) => {
             let artifact_type = ArtifactType::from_wire_type(concrete).ok_or_else(|| {
@@ -4706,7 +5946,12 @@ fn hash_runtime_value<B: Backend>(
             hash_sized(hasher, gadget_base.to_string().as_bytes());
             hasher.update(digit_count.to_le_bytes());
             hasher.update([gadget_small.map_or(0, |small| if small { 2 } else { 1 })]);
-            hash_sized(hasher, &backend.matrix_to_bytes(public));
+            hash_sized(
+                hasher,
+                &backend
+                    .matrix_to_bytes(public)
+                    .map_err(|error| ExecutionError::Backend(error.to_string()))?,
+            );
             match secret {
                 Some(secret) => {
                     hasher.update([1]);
@@ -4738,7 +5983,7 @@ fn hash_runtime_value<B: Backend>(
                     .map_err(|error| ExecutionError::Manifest(error.to_string()))?,
             );
         }
-        RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
+        RuntimeValue::StagedArtifact { production, name, index, descriptor, .. } => {
             hasher.update([9]);
             hasher.update(production.spec_hash.0);
             hasher.update(production.execution_nonce);
@@ -4750,7 +5995,7 @@ fn hash_runtime_value<B: Backend>(
                     .map_err(|error| ExecutionError::Manifest(error.to_string()))?,
             );
         }
-        RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
+        RuntimeValue::StagedArtifactFamily { production, name, descriptor, .. } => {
             hasher.update([10]);
             hasher.update(production.spec_hash.0);
             hasher.update(production.execution_nonce);
@@ -4787,6 +6032,11 @@ fn runtime_value_matches_wire_type<B: Backend>(
     concrete: &ConcreteWireType,
 ) -> bool {
     match (value, concrete) {
+        (
+            RuntimeValue::LazyArtifact { descriptor, .. } |
+            RuntimeValue::StagedArtifact { descriptor, .. },
+            concrete,
+        ) => ArtifactType::from_wire_type(concrete).as_ref() == Some(&descriptor.artifact_type),
         (RuntimeValue::Int(_), ConcreteWireType::ConstantInt | ConcreteWireType::Int) |
         (RuntimeValue::Real(_), ConcreteWireType::ConstantReal | ConcreteWireType::Real) |
         (RuntimeValue::Bool(_), ConcreteWireType::ConstantBool | ConcreteWireType::Bool) |
@@ -4844,7 +6094,8 @@ fn collect_staged_families<B: Backend>(
     families: &mut BTreeMap<(ProductionId, String), usize>,
 ) {
     match value {
-        RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
+        RuntimeValue::StagedArtifactFamily { production, name, descriptor, .. } |
+        RuntimeValue::StagedArtifact { production, name, descriptor, .. } => {
             if let Some(count) = descriptor.family_count {
                 families.insert((production.clone(), name.clone()), count);
             }
@@ -4860,7 +6111,7 @@ fn collect_staged_families<B: Backend>(
 
 fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     value: RuntimeValue<B>,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     match value {
@@ -4877,7 +6128,7 @@ fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
                 .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
             decode_artifact(backend, artifact_type, payload)
         }
-        RuntimeValue::StagedArtifact { production, name, index, descriptor } => {
+        RuntimeValue::StagedArtifact { production, name, index, descriptor, .. } => {
             let artifact_type = descriptor.artifact_type.clone();
             let payload = store
                 .load_staged(&ArtifactKey { production, name, index: Some(index) }, &descriptor)
@@ -4887,7 +6138,7 @@ fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
         RuntimeValue::LazyArtifactFamily { production, name, descriptor } => {
             materialize_artifact_family(production, name, descriptor, false, backend, store)
         }
-        RuntimeValue::StagedArtifactFamily { production, name, descriptor } => {
+        RuntimeValue::StagedArtifactFamily { production, name, descriptor, .. } => {
             materialize_artifact_family(production, name, descriptor, true, backend, store)
         }
         RuntimeValue::IndexedFamily(values) => values
@@ -4904,7 +6155,7 @@ fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
     name: String,
     descriptor: ManifestArtifact,
     staged: bool,
-    backend: &B,
+    backend: &mut B,
     store: &mut S,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
     let count = descriptor
@@ -4926,8 +6177,63 @@ fn materialize_artifact_family<B: Backend, S: ArtifactStore>(
     Ok(RuntimeValue::IndexedFamily(values))
 }
 
-fn decode_artifact<B: Backend>(
+pub fn encode_artifact<B: Backend>(
     backend: &B,
+    value: &RuntimeValue<B>,
+    artifact_type: &ArtifactType,
+) -> Result<(ArtifactPayload, Vec<u8>), ExecutionError> {
+    match (value, artifact_type) {
+        (RuntimeValue::Int(value), ArtifactType::Int) => {
+            let bytes = value.to_signed_bytes_le();
+            Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
+        }
+        (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
+            let bytes = backend
+                .matrix_to_bytes(matrix)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
+        }
+        (RuntimeValue::SmallMatrix(matrix), artifact_type)
+            if artifact_type.bounded_matrix_schema().is_some() =>
+        {
+            let (schema, semantic_kind) =
+                artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
+            let bytes = backend
+                .small_matrix_to_bytes(matrix, &schema, semantic_kind)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok((ArtifactPayload::SmallMatrix(bytes.clone()), bytes))
+        }
+        (RuntimeValue::Bytes(bytes), ArtifactType::Bytes { length }) if bytes.len() == *length => {
+            Ok((ArtifactPayload::Bytes(bytes.clone()), bytes.clone()))
+        }
+        (RuntimeValue::TypedBlob(bytes), ArtifactType::TypedBlob { .. }) => {
+            Ok((ArtifactPayload::TypedBlob(bytes.clone()), bytes.clone()))
+        }
+        (
+            RuntimeValue::Trapdoor { secret: Some(secret), public, .. },
+            ArtifactType::Trapdoor { .. },
+        ) => {
+            let public_bytes = backend
+                .matrix_to_bytes(public)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            let secret_bytes = backend.trapdoor_to_bytes(secret);
+            let mut canonical = Vec::with_capacity(
+                16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
+            );
+            canonical.extend_from_slice(&(public_bytes.len() as u64).to_le_bytes());
+            canonical.extend_from_slice(&public_bytes);
+            canonical.extend_from_slice(&(secret_bytes.len() as u64).to_le_bytes());
+            canonical.extend_from_slice(&secret_bytes);
+            Ok((ArtifactPayload::Trapdoor { public_bytes, secret_bytes }, canonical))
+        }
+        _ => Err(ExecutionError::Manifest(
+            "runtime value does not match declared artifact type".to_owned(),
+        )),
+    }
+}
+
+pub fn decode_artifact<B: Backend>(
+    backend: &mut B,
     artifact_type: ArtifactType,
     payload: ArtifactPayload,
 ) -> Result<RuntimeValue<B>, ExecutionError> {
@@ -5006,11 +6312,12 @@ mod tests {
     use crate::{
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
+        session::{SessionAliasDescriptor, SessionStatus},
     };
     use mxx_dsl::{DslContext, Family, HashTag, Int, MatType, Ring, Subgraph, iterate, parallel};
     use mxx_ir_core::{
         Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
-        artifact::ArtifactConfidentiality,
+        artifact::{ArtifactConfidentiality, Manifest},
         node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
     };
     use mxx_primitives::{
@@ -5023,6 +6330,271 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+    use std::sync::{Arc, Mutex};
+
+    struct TestPreparedLease {
+        names: Box<[String]>,
+        fail: Mutex<bool>,
+    }
+
+    impl PreparedOutputLease<PlacementProbeBackend> for TestPreparedLease {
+        fn output_count(&self) -> usize {
+            self.names.len()
+        }
+
+        fn output_name(&self, index: usize) -> Option<&str> {
+            self.names.get(index).map(String::as_str)
+        }
+
+        fn output_index(&self, name: &str) -> Option<usize> {
+            self.names.iter().position(|candidate| candidate == name)
+        }
+
+        fn materialize_at(
+            &self,
+            _index: usize,
+            _backend: &mut PlacementProbeBackend,
+        ) -> Result<RuntimeValue<PlacementProbeBackend>, ExecutionError> {
+            let mut fail = self.fail.lock().unwrap();
+            if std::mem::take(&mut *fail) {
+                Err(ExecutionError::Backend("transient resolver failure".into()))
+            } else {
+                Ok(RuntimeValue::Bool(true))
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_output_resolver_survives_materialization_failure() {
+        let mut backend = PlacementProbeBackend::default();
+        let mut result = ExecutionResult {
+            outputs: BTreeMap::new(),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(Arc::new(TestPreparedLease {
+                names: vec!["value".to_owned()].into_boxed_slice(),
+                fail: Mutex::new(true),
+            })),
+        };
+        let mut store = MemoryArtifactStore::default();
+        assert!(result.materialize_output("value", &mut backend, &mut store).is_err());
+        assert!(!result.outputs.contains_key("value"));
+        let value = result.materialize_output("value", &mut backend, &mut store).unwrap();
+        assert!(matches!(value, RuntimeValue::Bool(true)));
+    }
+
+    #[test]
+    fn output_names_include_deferred_without_fabricating_values() {
+        let result = ExecutionResult::<PlacementProbeBackend> {
+            outputs: BTreeMap::from([("resident".to_owned(), RuntimeValue::Bool(true))]),
+            production_id: None,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(Arc::new(TestPreparedLease {
+                names: vec!["deferred".to_owned(), "resident".to_owned()].into_boxed_slice(),
+                fail: Mutex::new(false),
+            })),
+        };
+        assert_eq!(result.output_names().collect::<Vec<_>>(), ["resident", "deferred"]);
+        assert!(!result.outputs.contains_key("deferred"));
+    }
+
+    #[test]
+    fn wave_admission_staging_is_per_output_port() {
+        let parallel_scope = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        let sequential_scope = FrozenGraphScopeId::SequentialBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(0),
+        };
+        // A two-port body whose owning scope exports only its first port. The
+        // rule is per output port, so the unexported port must not inherit the
+        // exported port's staging action, which a node-level rule would do.
+        let retained = [true, false];
+        assert_eq!(staged_loop_outputs(&sequential_scope, 2, 2, &retained), vec![true, false]);
+        assert_eq!(
+            staged_loop_outputs(&sequential_scope, 2, 2, &[retained[0] || retained[1]; 2]),
+            vec![true, true]
+        );
+
+        // The action is evaluated from the loop's whole body count, so a full
+        // wave and a shorter tail wave of the same loop agree, while treating
+        // the tail as its own total count would silently switch the action.
+        let bounded = [false];
+        let scope = parallel_scope;
+        assert_eq!(staged_loop_outputs(&scope, 19, 7, &bounded), vec![true]);
+        assert_eq!(staged_loop_outputs(&scope, 19, 2, &bounded), vec![true]);
+        assert_eq!(staged_loop_outputs(&scope, 2, 2, &bounded), vec![false]);
+
+        // A sequential body keeps its own exported port retained even when the
+        // whole loop fits in one admitted wave.
+        assert_eq!(staged_loop_outputs(&sequential_scope, 2, 2, &[true, false]), vec![true, false]);
+    }
+
+    #[test]
+    fn broadcast_capture_binds_the_loop_owner_for_matrix_bodies() {
+        // A matrix artifact captured as a Broadcast input must be materialized
+        // once for the whole loop: the body's capture input is bound to the
+        // loop-level owner, not to a descriptor that is reloaded per body.
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (1u8..=3).map(|value| DCRTPoly::from_biguints(&parameters, &[value.into()])).collect(),
+        );
+
+        let producer = DslContext::new("broadcast-capture-producer")
+            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .expect("matrix output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut producer_store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(matrix.clone()))]),
+            &mut producer_store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.clone().expect("artifact production");
+        let manifest = producer_store.manifest(&production).expect("manifest").clone();
+
+        let input = ring.artifact_input(
+            production.clone(),
+            "matrix",
+            (1, 3),
+            ArtifactConfidentiality::Public,
+        );
+        let negated = parallel(3, |_| Ok(-input.clone())).expect("broadcast body");
+        let built = DslContext::new("broadcast-capture-consumer")
+            .output("negated", negated)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = built
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("validation with the matrix manifest");
+
+        let mut store = LoadObservingStore::new(producer_store);
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("broadcast execution");
+        let RuntimeValue::IndexedFamily(members) =
+            result.materialize_output("negated", &mut backend, &mut store).expect("family output")
+        else {
+            panic!("broadcast result is an indexed family")
+        };
+        let load_key =
+            ArtifactKey { production: production.clone(), name: "matrix".to_owned(), index: None };
+        assert_eq!(
+            store.load_count(&load_key),
+            1,
+            "one loop-level load serves every body of every wave"
+        );
+        let expected = matrix.negate_out_of_place();
+        assert_eq!(members.len(), 3);
+        for member in members {
+            let RuntimeValue::Matrix(value) = member else { panic!("matrix member") };
+            assert_eq!(value.as_ref(), &expected);
+        }
+    }
+
+    #[test]
+    fn subgraph_call_capture_binds_the_supplied_lazy_artifact_once() {
+        // A named subgraph's captured artifact input is caller-bound exactly
+        // like a loop body's: the call must bind the value its caller supplied
+        // instead of loading the artifact again for the child scope.
+        use mxx_dsl::{Mat, MatType};
+
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            (1u8..=3).map(|value| DCRTPoly::from_biguints(&parameters, &[value.into()])).collect(),
+        );
+        let producer = DslContext::new("subgraph-capture-producer")
+            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .expect("matrix output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut producer_store = MemoryArtifactStore::default();
+        let produced = execute(
+            &producer,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(matrix.clone()))]),
+            &mut producer_store,
+            SamplingMode::Fresh,
+        )
+        .expect("producer execution");
+        let production = produced.production_id.clone().expect("artifact production");
+        let manifest = producer_store.manifest(&production).expect("manifest").clone();
+        let ty = MatType(ring.matrix_type((1, 3)));
+        let negate = Subgraph::define("negate-single-argument", ty, |value: Mat| Ok(-value))
+            .expect("subgraph definition");
+        let input = ring.artifact_input(
+            production.clone(),
+            "matrix",
+            (1, 3),
+            ArtifactConfidentiality::Public,
+        );
+        let called = negate.call(input).expect("subgraph call");
+        let built = DslContext::new("subgraph-capture-consumer")
+            .output("negated", called)
+            .expect("output")
+            .build()
+            .expect("build");
+        let validated = built
+            .validate_with_manifests(
+                &ParamEnv::default(),
+                &BTreeMap::from([(production.clone(), manifest)]),
+            )
+            .expect("validation with the matrix manifest");
+
+        let mut store = LoadObservingStore::new(producer_store);
+        let mut backend = cpu_backend([parameters.clone()]);
+        let result = execute_with_config(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .expect("subgraph execution");
+        let load_key = ArtifactKey { production, name: "matrix".to_owned(), index: None };
+        assert_eq!(
+            store.load_count(&load_key),
+            1,
+            "a subgraph call binds its supplied capture instead of loading again"
+        );
+        let RuntimeValue::Matrix(value) = &result.outputs["negated"] else {
+            panic!("matrix result")
+        };
+        assert_eq!(value.as_ref(), &matrix.negate_out_of_place());
+    }
 
     #[test]
     fn root_block_aliases_preserve_multiple_consumers_and_trace_results() {
@@ -5636,12 +7208,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
-    struct PlacementProbeSmallMatrix {
+    pub(super) struct PlacementProbeSmallMatrix {
         placement: usize,
     }
 
     #[derive(Debug, Error)]
-    enum PlacementProbeError {
+    pub(super) enum PlacementProbeError {
         #[error("small matrix belongs to placement {owner}, but codec is on placement {active}")]
         ParameterMismatch { owner: usize, active: usize },
         #[error("forced broadcast preparation failure at placement {placement}")]
@@ -5652,13 +7224,133 @@ mod tests {
         ForcedFailure { placement: usize },
     }
 
+    /// Artifact store wrapper that counts payload loads, so a fixture can
+    /// observe whether a load happened before or after wave admission.
     #[derive(Default)]
-    struct PlacementProbeBackend {
+    pub(super) struct LoadObservingStore {
+        inner: MemoryArtifactStore,
+    }
+
+    impl LoadObservingStore {
+        /// Wrap an existing store so its payloads stay available while loads
+        /// are counted from this point on.
+        pub(super) fn new(inner: MemoryArtifactStore) -> Self {
+            Self { inner, ..Self::default() }
+        }
+
+        pub(super) fn load_count(&self, key: &ArtifactKey) -> usize {
+            self.inner.load_count(key)
+        }
+    }
+
+    impl ArtifactStore for LoadObservingStore {
+        type Error = <MemoryArtifactStore as ArtifactStore>::Error;
+
+        fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+            self.inner.load_manifest(production)
+        }
+
+        fn load(
+            &mut self,
+            key: &ArtifactKey,
+            descriptor: &ManifestArtifact,
+        ) -> Result<ArtifactPayload, Self::Error> {
+            self.inner.load(key, descriptor)
+        }
+
+        fn store(
+            &mut self,
+            key: ArtifactKey,
+            artifact_type: &ArtifactType,
+            confidentiality: ArtifactConfidentiality,
+            layout: Option<&str>,
+            payload: ArtifactPayload,
+        ) -> Result<(), Self::Error> {
+            self.inner.store(key, artifact_type, confidentiality, layout, payload)
+        }
+
+        fn load_staged(
+            &mut self,
+            key: &ArtifactKey,
+            descriptor: &ManifestArtifact,
+        ) -> Result<ArtifactPayload, Self::Error> {
+            self.inner.load_staged(key, descriptor)
+        }
+
+        fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+            self.inner.remove_staged(key)
+        }
+
+        fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+            self.inner.store_manifest(manifest)
+        }
+    }
+
+    impl SessionStore for LoadObservingStore {
+        fn resolve_session_nonce(
+            &mut self,
+            descriptor: &SessionAliasDescriptor,
+        ) -> Result<[u8; 32], Self::Error> {
+            self.inner.resolve_session_nonce(descriptor)
+        }
+
+        fn open_session(
+            &mut self,
+            descriptor: &SessionDescriptor,
+        ) -> Result<SessionStatus, Self::Error> {
+            self.inner.open_session(descriptor)
+        }
+
+        fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
+            self.inner.release_session(production)
+        }
+
+        fn transcript_entry(
+            &mut self,
+            production: &ProductionId,
+            site: &DrawSite,
+        ) -> Result<Option<RecordedValue>, Self::Error> {
+            SessionStore::transcript_entry(&mut self.inner, production, site)
+        }
+
+        fn transcript_entries(
+            &mut self,
+            production: &ProductionId,
+        ) -> Result<Vec<(DrawSite, RecordedValue)>, Self::Error> {
+            SessionStore::transcript_entries(&mut self.inner, production)
+        }
+
+        fn record_transcript_batch(
+            &mut self,
+            production: &ProductionId,
+            entries: &[(DrawSite, RecordedValue)],
+        ) -> Result<(), Self::Error> {
+            SessionStore::record_transcript_batch(&mut self.inner, production, entries)
+        }
+
+        fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+            self.inner.commit_artifact(handle)
+        }
+
+        fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+            self.inner.finalize_session(manifest)
+        }
+    }
+
+    #[derive(Default)]
+    pub(super) struct PlacementProbeBackend {
+        #[cfg(feature = "gpu")]
+        pub(super) import_probe: Option<super::gpu_plan::ImportProbe>,
         active: usize,
         encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
         fail_broadcast_preparation: bool,
         fail_move_at: Option<usize>,
         fail_at: Option<(SmallMatrixSemanticKind, usize)>,
+        prepared_graph: bool,
+        prepared_spec_hash: Option<[u8; 32]>,
+        prepared_dispatches: usize,
+        prepared_modes: Vec<u8>,
+        prepared_trace_dispatches: usize,
     }
 
     macro_rules! unused_probe_operation {
@@ -5669,10 +7361,79 @@ mod tests {
     }
 
     impl Backend for PlacementProbeBackend {
+        const EXECUTION_STRATEGY: crate::backend::ExecutionStrategy =
+            crate::backend::ExecutionStrategy::Interpreted;
         type Matrix = ();
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        fn warm_up_prepared_graph(
+            &mut self,
+            validated: &mxx_ir_core::ValidatedGraph,
+            _inputs: &BTreeMap<String, RuntimeValue<Self>>,
+            _config: &ExecutionConfig,
+        ) -> Result<(), Self::Error> {
+            self.prepared_graph = true;
+            self.prepared_spec_hash = Some(
+                mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                    .map_err(|_| PlacementProbeError::ForcedFailure { placement: self.active })?
+                    .0,
+            );
+            Ok(())
+        }
+
+        fn prepared_spec_hash(&self) -> Option<[u8; 32]> {
+            self.prepared_spec_hash
+        }
+
+        fn execute_prepared_graph(
+            &mut self,
+            _spec_hash: [u8; 32],
+            validated: &mxx_ir_core::ValidatedGraph,
+            inputs: &BTreeMap<String, RuntimeValue<Self>>,
+            mut context: PreparedExecutionContext<'_, Self>,
+        ) -> Result<ExecutionResult<Self>, Self::Error> {
+            if !self.prepared_graph {
+                return Err(PlacementProbeError::ForcedFailure { placement: self.active });
+            }
+            self.prepared_dispatches += 1;
+            self.prepared_modes.push(match &context.sampling_mode {
+                SamplingMode::Fresh => 0,
+                SamplingMode::Record(_) => 1,
+                SamplingMode::Replay(_) => 2,
+            });
+            if context.capture_trace {
+                self.prepared_trace_dispatches += 1;
+            }
+            let value = inputs
+                .values()
+                .next()
+                .cloned()
+                .ok_or(PlacementProbeError::ForcedFailure { placement: self.active })?;
+            if context.capture_trace {
+                if let Some(trace) = context.trace.as_deref_mut() {
+                    if let Some((_, output)) = validated.source.outputs().iter().next() {
+                        trace.insert(
+                            WireId { instantiation_path: Vec::new(), wire: output.value },
+                            value.clone(),
+                        );
+                    }
+                }
+            }
+            Ok(ExecutionResult {
+                outputs: validated
+                    .source
+                    .outputs()
+                    .keys()
+                    .map(|name| (name.clone(), value.clone()))
+                    .collect(),
+                production_id: None,
+                artifact_handles: BTreeMap::new(),
+                staged_family_leases: Vec::new(),
+                prepared_outputs: None,
+            })
+        }
 
         fn polynomial_from_values(
             &mut self,
@@ -5917,6 +7678,29 @@ mod tests {
             unused_probe_operation!(value, destination, source_moduli, plaintext_modulus)
         }
 
+        fn centered_extend(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+        fn centered_extend_small(
+            &mut self,
+            value: &Self::SmallMatrix,
+            destination: &ConcreteMatrixType,
+        ) -> Result<Self::SmallMatrix, Self::Error> {
+            unused_probe_operation!(value, destination)
+        }
+        fn block_mod_switch(
+            &mut self,
+            value: &Self::Matrix,
+            destination: &ConcreteMatrixType,
+            plaintext_modulus: u64,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, destination, plaintext_modulus)
+        }
+
         fn preimage_target(
             &mut self,
             value: Arc<Self::Matrix>,
@@ -5928,10 +7712,15 @@ mod tests {
         }
 
         fn matrix_from_cpu_staging_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("staging", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -6052,15 +7841,20 @@ mod tests {
             )
         }
 
-        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
+        fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error> {
             unused_probe_operation!(value)
         }
 
         fn matrix_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Matrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("matrix", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
 
@@ -6085,11 +7879,16 @@ mod tests {
         }
 
         fn small_matrix_from_bytes(
-            &self,
+            &mut self,
             expected_schema: &ConcreteBoundedMatrixSchema,
             bytes: &[u8],
             expected_semantic_kind: SmallMatrixSemanticKind,
         ) -> Result<Self::SmallMatrix, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("small", self.active);
+                return Ok(PlacementProbeSmallMatrix { placement: self.active });
+            }
             unused_probe_operation!(expected_schema, bytes, expected_semantic_kind)
         }
 
@@ -6098,10 +7897,15 @@ mod tests {
         }
 
         fn trapdoor_from_bytes(
-            &self,
+            &mut self,
             ty: &ConcreteMatrixType,
             bytes: &[u8],
         ) -> Result<Self::Trapdoor, Self::Error> {
+            #[cfg(feature = "gpu")]
+            if let Some(probe) = &mut self.import_probe {
+                probe.import("trapdoor", self.active);
+                return Ok(());
+            }
             unused_probe_operation!(ty, bytes)
         }
     }
@@ -6182,16 +7986,18 @@ mod tests {
             vec![
                 (SmallMatrixSemanticKind::Generic, 0, 0),
                 (SmallMatrixSemanticKind::Preimage, 0, 0),
-                (SmallMatrixSemanticKind::Generic, 0, 0),
                 (SmallMatrixSemanticKind::Generic, 1, 1),
                 (SmallMatrixSemanticKind::Preimage, 1, 1),
-                (SmallMatrixSemanticKind::Generic, 1, 1),
             ]
         );
         assert_eq!(backend.active_placement(), 0);
         assert!(matches!(result.outputs["small"], RuntimeValue::StagedArtifactFamily { .. }));
         assert!(matches!(result.outputs["preimage"], RuntimeValue::StagedArtifactFamily { .. }));
-        assert!(matches!(result.outputs["broadcast"], RuntimeValue::StagedArtifactFamily { .. }));
+        // Lexical capture stays shared; it is not serialized once per loop member.
+        let RuntimeValue::SmallMatrix(broadcast) = &result.outputs["broadcast"] else {
+            panic!("expected the shared scalar broadcast");
+        };
+        assert_eq!(broadcast.placement, 0);
 
         let mut failing_backend = PlacementProbeBackend {
             fail_at: Some((SmallMatrixSemanticKind::Preimage, 1)),
@@ -6249,6 +8055,7 @@ mod tests {
             fail_broadcast_preparation: true,
             ..PlacementProbeBackend::default()
         };
+        // A shared output unused by the body needs no broadcast preparation.
         assert!(matches!(
             execute_with_config(
                 &validated,
@@ -6268,7 +8075,7 @@ mod tests {
                     ..ExecutionConfig::default()
                 },
             ),
-            Err(ExecutionError::Backend(_))
+            Ok(_)
         ));
         assert_eq!(broadcast_failing_backend.active_placement(), 0);
     }
@@ -6375,19 +8182,97 @@ mod tests {
             },
         )
         .expect("execution");
-        let RuntimeValue::StagedArtifactFamily { descriptor, .. } = &result.outputs["values"]
-        else {
-            panic!("matrix range output should be streamed");
+        let RuntimeValue::IndexedFamily(values) = &result.outputs["values"] else {
+            panic!("matrix range output should remain in host RAM");
         };
-        assert_eq!(descriptor.family_count, Some(3));
+        assert_eq!(values.len(), 3);
+        assert!(values.iter().all(|value| matches!(value, RuntimeValue::HostMatrix { .. })));
         let RuntimeValue::IndexedFamily(values) = result
-            .materialize_output("values", &backend, &mut store)
+            .materialize_output("values", &mut backend, &mut store)
             .expect("materialize range output")
         else {
             panic!("materialized range output is not an indexed family");
         };
         assert_eq!(values.len(), 3);
         result.cleanup_staged(&mut store).expect("staged cleanup");
+    }
+
+    #[test]
+    fn exported_family_is_written_directly_without_export_reload() {
+        use crate::artifact::{ArtifactStore, FileArtifactStore};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 8);
+        let family =
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .unwrap();
+        let nested = Subgraph::define("nested-export", (), |()| {
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+        })
+        .unwrap()
+        .call(())
+        .unwrap();
+        let graph = DslContext::new("direct-family-export")
+            .public_output("values", family)
+            .unwrap()
+            .public_output("nested-0", nested.at(0))
+            .unwrap()
+            .private_output("nested-1", nested.at(1))
+            .unwrap()
+            .public_output("nested-2", nested.at(2))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let mut result =
+            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        assert!(result.staged_family_leases.is_empty());
+        for handle in result.artifact_handles.values().flatten() {
+            assert_eq!(store.load_count(&handle.key), 0);
+        }
+        result.cleanup_staged(&mut store).unwrap();
+        drop(store);
+        let mut store = FileArtifactStore::open(directory.path()).unwrap();
+        let manifest = store.load_manifest(result.production_id.as_ref().unwrap()).unwrap();
+        for handle in result.artifact_handles.values().flatten() {
+            store.load(&handle.key, &manifest.artifacts[&handle.key.name]).unwrap();
+        }
+        result.materialize_output("values", &mut backend, &mut store).unwrap();
+    }
+
+    #[test]
+    fn intermediate_families_retire_before_later_loops_finish() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8);
+        let mut family =
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .unwrap();
+        for _ in 0..4 {
+            family =
+                parallel(3, |index| Ok(family.at(index) + ring.polynomial([IntExpr::constant(1)])))
+                    .unwrap();
+        }
+        let graph = DslContext::new("early-scratch-retirement")
+            .output("result", family)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        // At most the current input and output family coexist, regardless of chain length.
+        assert!(store.peak_entries <= 6, "peak staged entries: {}", store.peak_entries);
+        result.materialize_output("result", &mut backend, &mut store).unwrap();
+        result.cleanup_staged(&mut store).unwrap();
     }
 
     #[test]
@@ -6420,11 +8305,11 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let gathered = result
-            .materialize_output("gathered", &backend, &mut store)
+            .materialize_output("gathered", &mut backend, &mut store)
             .expect("materialized gathered family")
             .clone();
         let expected = result
-            .materialize_output("expected", &backend, &mut store)
+            .materialize_output("expected", &mut backend, &mut store)
             .expect("materialized expected family")
             .clone();
         let matrices = |value: RuntimeValue<CpuDcrtBackend>| {
@@ -6712,6 +8597,49 @@ mod tests {
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "product"), matrix_output(&result, "plain"));
+    }
+
+    #[test]
+    fn low_ring_digits_extend_to_high_ring_without_redecomposition() {
+        use num_bigint::BigUint;
+        let n =
+            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
+        let high = DCRTPolyParams::new(n, 3, 17, 4, None, None);
+        let low_q = high.to_crt().0[..2].iter().map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_q).unwrap();
+        let ring = Ring::new(BigInt::from(low_q), n as usize);
+        let q_high = BigInt::from(high.modulus().as_ref().clone());
+        let digits = low.modulus_digits();
+        let input = ring.input("input", (1, 1));
+        let bounded = input.decompose(16, digits).centered_extend(q_high.clone());
+        let gadget = ring.gadget(1, 16, digits).centered_extend(q_high);
+        let product = bounded
+            .clone()
+            .mul_small_rhs(gadget)
+            .reduce_modulus(BigInt::from(low.modulus().as_ref().clone()));
+        let graph = DslContext::new("bounded-digit-extension")
+            .private_output("digits", bounded)
+            .unwrap()
+            .output("product", product)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let expected = -DCRTPolyMatrix::identity(&low, 1, None);
+        let mut backend = cpu_backend([low, high]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute(
+            &graph,
+            &mut backend,
+            BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(expected.clone()))]),
+            &mut store,
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "product"), &expected);
+        result.materialize_output("digits", &mut backend, &mut store).unwrap();
+        assert!(matches!(result.outputs["digits"], RuntimeValue::SmallMatrix(_)));
     }
 
     #[test]
@@ -7078,6 +9006,9 @@ mod tests {
     }
 
     #[test]
+    // The CPU trapdoor representation uses GPU backing under this feature,
+    // so this fixture shares the existing GPU test isolation boundary.
+    #[cfg_attr(feature = "gpu", serial_test::serial(gpu_context))]
     fn transcript_replay_preserves_preimage_small_owner_and_relation() {
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
@@ -7376,8 +9307,9 @@ mod tests {
                 .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
         // Resolve the family through the public API before checking its values.
-        let RuntimeValue::IndexedFamily(state) =
-            result.materialize_output("state", &backend, &mut store).expect("materialized family")
+        let RuntimeValue::IndexedFamily(state) = result
+            .materialize_output("state", &mut backend, &mut store)
+            .expect("materialized family")
         else {
             panic!("state output is not a family")
         };
@@ -7430,8 +9362,9 @@ mod tests {
         .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
         // Resolve the family through the public API before checking its values.
-        let RuntimeValue::IndexedFamily(packed) =
-            result.materialize_output("packed", &backend, &mut store).expect("materialized family")
+        let RuntimeValue::IndexedFamily(packed) = result
+            .materialize_output("packed", &mut backend, &mut store)
+            .expect("materialized family")
         else {
             panic!("packed output is not a family")
         };
@@ -7589,7 +9522,7 @@ mod tests {
             execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .expect("execution");
         let bytes = |value: &RuntimeValue<_>| match value {
-            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix),
+            RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix).unwrap(),
             _ => panic!("expected matrix"),
         };
         assert_eq!(bytes(&result.outputs["actual-one"]), bytes(&result.outputs["expected-one"]));
@@ -7670,7 +9603,7 @@ mod tests {
             .expect("validation");
         let nonce = [47u8; 32];
         let mut store = MemoryArtifactStore::default();
-        let first = execute_in_session(
+        let mut first = execute_in_session(
             &sampled,
             &mut cpu_backend([parameters.clone()]),
             BTreeMap::new(),
@@ -7678,7 +9611,7 @@ mod tests {
             nonce,
         )
         .expect("first session execution");
-        let second = execute_in_session(
+        let mut second = execute_in_session(
             &sampled,
             &mut cpu_backend([parameters.clone()]),
             BTreeMap::new(),
@@ -7686,6 +9619,9 @@ mod tests {
             nonce,
         )
         .expect("resumed session execution");
+        let mut backend = cpu_backend([parameters.clone()]);
+        first.materialize_output("sample", &mut backend, &mut store).unwrap();
+        second.materialize_output("sample", &mut backend, &mut store).unwrap();
         assert_eq!(first.production_id, second.production_id);
         assert_eq!(matrix_output(&first, "sample"), matrix_output(&second, "sample"));
 
@@ -7726,6 +9662,56 @@ mod tests {
         output_type: WireType,
     ) -> ValueHandle {
         NodeHandle::new(kind, arguments, vec![output_type]).output(0).expect("scalar output")
+    }
+
+    #[test]
+    fn exported_integer_remains_available_to_downstream_arithmetic() {
+        let integer = BigInt::from(rand::random::<i64>());
+        let value =
+            scalar_value(NodeKind::ConstantInt(integer.clone()), Vec::new(), WireType::ConstantInt);
+        let one =
+            scalar_value(NodeKind::ConstantInt(BigInt::from(1)), Vec::new(), WireType::ConstantInt);
+        let successor = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Add),
+            vec![value.clone(), one],
+            WireType::Int,
+        );
+        let graph = Graph::freeze(
+            "exported-integer-consumer",
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    "value".to_owned(),
+                    GraphOutput { value, confidentiality: Some(ArtifactConfidentiality::Public) },
+                ),
+                ("successor".to_owned(), GraphOutput { value: successor, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let validated = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        let mut backend = cpu_backend([]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let RuntimeValue::Int(successor) = &result.outputs["successor"] else {
+            panic!("expected integer successor");
+        };
+        assert_eq!(successor, &(&integer + BigInt::from(1)));
+        let RuntimeValue::Int(exported) = &result.outputs["value"] else {
+            panic!("integer exports must retain their resident scalar result");
+        };
+        assert_eq!(exported, &integer);
+        let RuntimeValue::Int(exported) =
+            result.materialize_output("value", &mut backend, &mut store).unwrap()
+        else {
+            panic!("expected exported integer");
+        };
+        assert_eq!(exported, &integer);
     }
 
     #[test]
@@ -7807,6 +9793,72 @@ mod tests {
         assert!(
             matches!(&result.outputs["product"], RuntimeValue::Real(value) if (*value - 6.0).abs() < 1e-12)
         );
+    }
+
+    #[test]
+    fn failed_execution_removes_eager_exports_but_preserves_session_artifacts() {
+        use crate::artifact::FileArtifactStore;
+        let one = scalar_value(NodeKind::ConstantInt(1.into()), Vec::new(), WireType::ConstantInt);
+        let zero = scalar_value(NodeKind::ConstantInt(0.into()), Vec::new(), WireType::ConstantInt);
+        let quotient = scalar_value(
+            NodeKind::IntBinary(IntBinaryOp::Divide),
+            vec![one.clone(), zero],
+            WireType::Int,
+        );
+        let graph = Graph::freeze(
+            "failed-eager-export",
+            Vec::new(),
+            BTreeMap::from([
+                (
+                    "exported".into(),
+                    GraphOutput {
+                        value: one,
+                        confidentiality: Some(ArtifactConfidentiality::Public),
+                    },
+                ),
+                ("failure".into(), GraphOutput { value: quotient, confidentiality: None }),
+            ]),
+            Vec::new(),
+            Vec::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+        .0;
+        let graph = mxx_ir_core::validate(&graph, &ParamEnv::default()).unwrap();
+        for session in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut store = FileArtifactStore::new(directory.path()).unwrap();
+            let mut backend = cpu_backend([]);
+            let result = if session {
+                execute_in_session(
+                    &graph,
+                    &mut backend,
+                    BTreeMap::new(),
+                    &mut store,
+                    rand::random(),
+                )
+            } else {
+                execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+            };
+            assert!(matches!(result, Err(ExecutionError::DivisionByZero(_))));
+            let mut pending = vec![directory.path().to_path_buf()];
+            let mut artifacts = 0;
+            while let Some(path) = pending.pop() {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        pending.push(path);
+                    } else if path.extension().is_some_and(|extension| extension == "artifact") {
+                        artifacts += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                artifacts,
+                usize::from(session),
+                "only resumable sessions retain eager exports"
+            );
+        }
     }
 
     #[test]
@@ -7945,6 +9997,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_exact_rns_graph_executes_centered_lift_and_block_switch() {
+        use num_bigint::BigUint;
+        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .ok()
+            .map(|v| v.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let depth = std::env::var("MXX_PRIMITIVE_TEST_CRT_DEPTH")
+            .ok()
+            .map(|v| v.parse::<usize>().unwrap())
+            .unwrap_or(4);
+        assert!(depth >= 4);
+        let high = DCRTPolyParams::new(n, depth, 30, 2, None, None);
+        let low_modulus = high.to_crt().0.iter().step_by(2).map(|p| BigUint::from(*p)).product();
+        let low = high.select_modulus(&low_modulus).unwrap();
+        let ring = Ring::new(BigInt::from(low_modulus.clone()), n as usize);
+        let input = ring.input("input", (1, 2));
+        let lifted = input.centered_extend(BigInt::from(high.modulus().as_ref().clone()));
+        let switched = lifted.clone().block_mod_switch(BigInt::from(low_modulus.clone()), 17usize);
+        let graph = DslContext::new("exact-rns-runtime")
+            .output("lifted", lifted)
+            .unwrap()
+            .output("switched", switched)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let mut rng = rand::rng();
+        let values =
+            (0..n).map(|_| BigUint::from(rng.random::<u64>()) % &low_modulus).collect::<Vec<_>>();
+        let matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &low,
+            vec![DCRTPoly::from_biguints(&low, &values), DCRTPoly::const_one(&low)],
+        );
+        let expected_lift = matrix.centered_extend(&high).unwrap();
+        let expected_switch = expected_lift.block_mod_switch(&low, 17).unwrap();
+        let result = execute(
+            &graph,
+            &mut cpu_backend([low, high]),
+            BTreeMap::from([("input".into(), RuntimeValue::matrix(matrix))]),
+            &mut MemoryArtifactStore::default(),
+            SamplingMode::Fresh,
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&result, "lifted"), &expected_lift);
+        assert_eq!(matrix_output(&result, "switched"), &expected_switch);
     }
 
     #[test]

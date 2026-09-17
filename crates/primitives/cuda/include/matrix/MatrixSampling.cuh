@@ -2,24 +2,10 @@
 
 #include "ChaCha.cuh"
 #include "matrix/Matrix.cuh"
+#include "matrix/MatrixArith.cuh"
+#include "matrix/MatrixNTT.cuh"
 
-int launch_sample_distribution_multi_limb_kernel(
-    uint8_t *dst_base,
-    size_t poly_count,
-    size_t local_ncol,
-    size_t full_ncol,
-    size_t col_offset,
-    size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
-    int dist_type,
-    double sigma,
-    uint64_t max_coefficient_bound,
-    uint64_t coefficient_modulus,
-    gpu_chacha::GpuRngSeed seed,
-    cudaStream_t stream);
+typedef struct GpuPreparedPlanDescriptor GpuPreparedPlanDescriptor;
 
 #ifdef __cplusplus
 extern "C"
@@ -42,7 +28,59 @@ extern "C"
         uint64_t coefficient_modulus,
         gpu_chacha::GpuRngSeed seed,
         size_t full_ncol,
-        size_t col_offset);
+        size_t col_offset,
+        const GpuMatrixRange *range);
+
+    typedef struct GpuPreparedSampling GpuPreparedSampling;
+
+    typedef struct GpuPreparedSamplingLayout
+    {
+        size_t rows;
+        size_t columns;
+        size_t ring_dimension;
+        size_t limb_count;
+        size_t polynomial_count;
+        size_t blocks;
+        size_t workspace_bytes;
+        size_t alignment;
+        size_t event_count;
+        size_t transform_stage_count;
+        int device;
+        int format;
+        int dist_type;
+        int stream_role;
+    } GpuPreparedSamplingLayout;
+
+    int gpu_matrix_query_sampling_layout(
+        size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+        size_t full_ncol, size_t col_offset, int format, int dist_type,
+        int device, GpuPreparedSamplingLayout *out);
+
+    int gpu_matrix_prepare_sampling(
+        GpuMatrix *out,
+        int dist_type,
+        double sigma,
+        uint64_t max_coefficient_bound,
+        uint64_t coefficient_modulus,
+        size_t full_ncol,
+        size_t col_offset,
+        const GpuMatrixRange *range,
+        GpuPreparedSampling **plan);
+    int gpu_matrix_prepare_sampling_with_layout(
+        GpuMatrix *out,
+        int dist_type,
+        double sigma,
+        uint64_t max_coefficient_bound,
+        uint64_t coefficient_modulus,
+        size_t full_ncol,
+        size_t col_offset,
+        const GpuMatrixRange *range,
+        const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedSampling **plan);
+    int gpu_matrix_submit_sampling(
+        const GpuPreparedSampling *plan,
+        gpu_chacha::GpuRngSeed seed);
+    void gpu_matrix_destroy_sampling(GpuPreparedSampling *plan);
 
 #ifdef __cplusplus
 }

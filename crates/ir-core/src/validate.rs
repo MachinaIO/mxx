@@ -36,6 +36,9 @@ pub struct ValidatedScope {
 pub struct ValidatedGraph {
     pub source: Graph,
     pub bindings: ParamEnv,
+    /// Identity of this concrete graph instantiation, computed once during
+    /// validation so prepared execution can compare it in constant time.
+    pub spec_hash: crate::artifact::SpecHash,
     pub scopes: BTreeMap<FrozenGraphScopeId, ValidatedScope>,
     pub warnings: Vec<ElaborationWarning>,
 }
@@ -45,6 +48,37 @@ impl ValidatedGraph {
         self.scopes.get(id)
     }
 
+    pub fn spec_hash(&self) -> crate::artifact::SpecHash {
+        self.spec_hash.clone()
+    }
+
+    /// Resolve a validated wire in the environment of its actual invocation.
+    /// Cached root types apply only to the original validation bindings. Child
+    /// scopes and other environments resolve the declared type without another
+    /// structural validation pass.
+    pub fn concrete_wire_type(
+        &self,
+        scope: &FrozenGraphScopeId,
+        wire: WireRef,
+        bindings: &ParamEnv,
+    ) -> Result<ConcreteWireType, ValidationError> {
+        if *scope == FrozenGraphScopeId::Root && bindings == &self.bindings {
+            return Ok(self.root_scope().wire_types[&wire].clone());
+        }
+        let producer = self
+            .source
+            .scope(scope)
+            .expect("validated scope")
+            .node(wire.node)
+            .expect("validated producer");
+        concretize_wire_type(
+            &producer.output_types()[wire.port.0 as usize],
+            bindings,
+            scope,
+            wire.node,
+        )
+    }
+
     pub fn root_scope(&self) -> &ValidatedScope {
         self.scope(&FrozenGraphScopeId::Root).expect("validated graph has a root scope")
     }
@@ -52,6 +86,8 @@ impl ValidatedGraph {
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
+    #[error(transparent)]
+    Encoding(#[from] crate::encoding::EncodingError),
     #[error(transparent)]
     Expression(#[from] ExprError),
     #[error(transparent)]
@@ -379,7 +415,14 @@ pub fn validate_with_manifests(
         scopes.insert(scope_id.clone(), validated);
     }
     validate_structural_boundaries(graph, bindings, &scopes)?;
-    Ok(ValidatedGraph { source: graph.clone(), bindings: bindings.clone(), scopes, warnings })
+    let spec_hash = crate::encoding::spec_hash(graph, bindings)?;
+    Ok(ValidatedGraph {
+        source: graph.clone(),
+        bindings: bindings.clone(),
+        spec_hash,
+        scopes,
+        warnings,
+    })
 }
 
 fn collect_scope_bindings(
@@ -791,6 +834,60 @@ fn validate_node(
                 _ => unreachable!(),
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, rows, ..input })]
+        }
+        NodeKind::CenteredExtend { modulus } | NodeKind::BlockModSwitch { modulus, .. } => {
+            require_arity(scope, node, 1)?;
+            let (input, bound) = match argument(scope, values, node, 0)? {
+                ConcreteWireType::Matrix(matrix) => (matrix.clone(), None),
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                    if matches!(node.kind, NodeKind::CenteredExtend { .. }) =>
+                {
+                    (matrix.clone(), Some(max_coefficient_bound.clone()))
+                }
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "exact RNS conversion requires an ordinary matrix",
+                    )
+                }
+            };
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() ||
+                input.modulus <= BigInt::one() ||
+                modulus.is_even() ||
+                input.modulus.is_even()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "exact RNS conversion requires odd moduli greater than one",
+                );
+            }
+            let valid = if let NodeKind::BlockModSwitch { plaintext_modulus, .. } = node.kind {
+                let t = plaintext_modulus.evaluate(env)?;
+                t >= 1.into() &&
+                    t.to_u64().is_some() &&
+                    t.gcd(&input.modulus).is_one() &&
+                    modulus < input.modulus &&
+                    (&input.modulus % &modulus).is_zero()
+            } else {
+                (&modulus % &input.modulus).is_zero()
+            };
+            if !valid {
+                return node_error(
+                    scope,
+                    node.id,
+                    "invalid exact RNS modulus inclusion or plaintext modulus",
+                );
+            }
+            let matrix = ConcreteMatrixType { modulus, ..input };
+            vec![match bound {
+                Some(max_coefficient_bound) => {
+                    ConcreteWireType::Preimage { matrix, max_coefficient_bound }
+                }
+                None => ConcreteWireType::Matrix(matrix),
+            }]
         }
         NodeKind::RingAutomorphism { index } => {
             require_arity(scope, node, 1)?;

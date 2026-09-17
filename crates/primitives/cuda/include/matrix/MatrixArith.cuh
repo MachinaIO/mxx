@@ -1,19 +1,183 @@
 #pragma once
 
 #include "matrix/Matrix.cuh"
+#include "gpu_admission.cuh"
 
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
+    struct GpuPreparedPlanDescriptor;
+
+    typedef enum GpuMatrixBatchOperation
+    {
+        GPU_MATRIX_BATCH_BINARY = 0,
+        GPU_MATRIX_BATCH_NEGATE = 1,
+        GPU_MATRIX_BATCH_AUTOMORPHISM = 2,
+        GPU_MATRIX_BATCH_SCALAR = 3,
+        GPU_MATRIX_BATCH_MULTIPLY = 4,
+        GPU_MATRIX_BATCH_ACCUMULATE = 5,
+    } GpuMatrixBatchOperation;
+
+    typedef struct GpuMatrixBatchWorkspaceBytes
+    {
+        size_t workspace_bytes;
+        size_t additional_bytes;
+        size_t alignment;
+        size_t pinned_bytes;
+    } GpuMatrixBatchWorkspaceBytes;
+
+    typedef struct GpuMatrixRange
+    {
+        size_t row_start;
+        size_t row_end;
+        size_t column_start;
+        size_t column_end;
+    } GpuMatrixRange;
+
+    typedef struct GpuMatrixBatchView
+    {
+        GpuMatrixRange left;
+        GpuMatrixRange right;
+        GpuMatrixRange output;
+    } GpuMatrixBatchView;
+
+    typedef struct GpuPreparedArithmeticLayout
+    {
+        int kind;
+        int device;
+        size_t ring_dimension;
+        size_t limb_count;
+        size_t left_rows;
+        size_t left_columns;
+        size_t right_rows;
+        size_t right_columns;
+        size_t output_rows;
+        size_t output_columns;
+        size_t column_start;
+        size_t group_count;
+        size_t term_count;
+        size_t workspace_bytes;
+        size_t alignment;
+        size_t event_count;
+        unsigned int grid_x;
+        unsigned int grid_y;
+        unsigned int grid_z;
+        unsigned int block_x;
+        unsigned int block_y;
+        unsigned int block_z;
+        int thin;
+        int lazy_reduction;
+    } GpuPreparedArithmeticLayout;
+
+    typedef struct GpuPreparedRectLayout
+    {
+        size_t rows;
+        size_t columns;
+        size_t ring_dimension;
+        size_t limb_count;
+        size_t workspace_bytes;
+        size_t alignment;
+        size_t event_count;
+        unsigned int grid_x;
+        unsigned int grid_y;
+        unsigned int grid_z;
+        unsigned int block_x;
+        unsigned int block_y;
+        unsigned int block_z;
+        int stage_role;
+        int device;
+    } GpuPreparedRectLayout;
+
+    struct GpuPreparedArithmetic;
+    struct GpuPreparedInputCopy;
+    struct GpuPreparedTranspose;
+
+    typedef enum GpuPreparedArithmeticKind
+    {
+        GPU_PREPARED_ARITHMETIC_COPY = 0,
+        GPU_PREPARED_ARITHMETIC_ADD = 1,
+        GPU_PREPARED_ARITHMETIC_TENSOR = 2,
+        GPU_PREPARED_ARITHMETIC_TENSOR_SUM_ROWS = 3,
+        GPU_PREPARED_ARITHMETIC_MULTIPLY = 4,
+        GPU_PREPARED_ARITHMETIC_SUBTRACT = 5,
+        GPU_PREPARED_ARITHMETIC_NEGATE = 6,
+        GPU_PREPARED_ARITHMETIC_SCALE = 7,
+        GPU_PREPARED_ARITHMETIC_AUTOMORPHISM = 8,
+    } GpuPreparedArithmeticKind;
+
+    int gpu_matrix_prepare_arithmetic(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+        const size_t *rows, const size_t *offsets, size_t group_count,
+        size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+        const uint64_t *scalar_residues, size_t scalar_count,
+        size_t automorphism_index,
+        GpuPreparedArithmetic **plan);
+    int gpu_matrix_prepare_arithmetic_with_layout(
+        GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs, int kind,
+        const size_t *rows, const size_t *offsets, size_t group_count,
+        size_t term_count, const GpuMatrixBatchView *view, size_t column_start,
+        const uint64_t *scalar_residues, size_t scalar_count,
+        size_t automorphism_index, const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedArithmetic **plan);
+    int gpu_matrix_query_arithmetic_layout(
+        size_t ring_dimension, size_t limb_count, size_t left_rows,
+        size_t left_columns, size_t right_rows, size_t right_columns,
+        size_t output_rows, size_t output_columns, size_t column_start,
+        size_t group_count, size_t term_count, int kind, int device,
+        int evaluation_format, int thin, int lazy_reduction,
+        GpuPreparedArithmeticLayout *out);
+    int gpu_matrix_query_input_copy_layout(
+        size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+        int device, GpuPreparedRectLayout *out);
+    int gpu_matrix_query_transpose_layout(
+        size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+        int device, GpuPreparedRectLayout *out);
+    int gpu_matrix_submit_arithmetic(const GpuPreparedArithmetic *plan);
+    void gpu_matrix_destroy_arithmetic_plan(GpuPreparedArithmetic *plan);
+    int gpu_matrix_prepare_input_copy(
+        GpuMatrix *out, const GpuMatrix *source_template,
+        const GpuMatrixBatchView *view, GpuPreparedInputCopy **plan);
+    int gpu_matrix_prepare_input_copy_with_layout(
+        GpuMatrix *out, const GpuMatrix *source_template,
+        const GpuMatrixBatchView *view, const GpuPreparedPlanDescriptor *layout,
+        GpuPreparedInputCopy **plan);
+    int gpu_matrix_submit_input_copy(
+        const GpuPreparedInputCopy *plan, const GpuMatrix *source);
+    void gpu_matrix_destroy_input_copy(GpuPreparedInputCopy *plan);
+    int gpu_matrix_prepare_transpose(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        GpuPreparedTranspose **plan);
+    int gpu_matrix_prepare_transpose_with_layout(
+        GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view,
+        const GpuPreparedPlanDescriptor *layout, GpuPreparedTranspose **plan);
+    int gpu_matrix_submit_transpose(const GpuPreparedTranspose *plan);
+    void gpu_matrix_destroy_transpose(GpuPreparedTranspose *plan);
+
+    // Out-of-place batches use the first output's exclusive auxiliary storage.
+    // matrix_views is 0 or 1; add/sub, negate, scalar multiplication, and
+    // coefficient automorphism accept 1 and reserve each owner's row geometry.
+    // output_rows/output_cols describe the full first output owner, whose
+    // auxiliary capacity is shared by the complete batch.
+    int gpu_matrix_query_batch_workspace_bytes(
+        const GpuContext *ctx, int level, size_t output_rows, size_t output_cols,
+        size_t matrix_count, size_t product_count, GpuMatrixBatchOperation operation,
+        int matrix_views,
+        GpuMatrixBatchWorkspaceBytes *out);
+
+    // Protect release and reuse after an interrupted batch completion update.
+    // This retires submitted work by events; it does not wait for device completion.
+    int gpu_matrix_retire_submitted_work(const GpuMatrix *output);
+
     int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
-    int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source);
+    int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source, const GpuMatrixBatchView *view);
     int gpu_matrix_sum_rows(
         GpuMatrix *out, const GpuMatrix *source, const size_t *rows, const size_t *offsets,
-        size_t group_count, size_t term_count);
+        size_t group_count, size_t term_count, const GpuMatrixBatchView *view);
     int gpu_matrix_add_row_blocks(
-        GpuMatrix *out, const GpuMatrix *const *lhs_blocks, size_t block_count, const GpuMatrix *rhs);
+        GpuMatrix *out, const GpuMatrix *const *lhs_blocks, size_t block_count, const GpuMatrix *rhs,
+        const GpuMatrixRange *block_views, const GpuMatrixBatchView *view);
     int gpu_matrix_add_block(
         GpuMatrix *out,
         const GpuMatrix *src,
@@ -25,10 +189,15 @@ extern "C"
         size_t cols);
     int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
     int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
-    int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs);
+    int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
+        const GpuMatrixBatchView *view, size_t column_start);
     int gpu_matrix_tensor_sum_rows(
         GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs,
-        const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count);
+        const size_t *rows, const size_t *offsets, size_t group_count, size_t term_count,
+        const GpuMatrixBatchView *view, size_t column_start);
+    // One result span per active device, reused across its CRT limbs.
+    int gpu_matrix_query_equality_workspace(GpuPreparedWorkspaceLayout *out);
+
     int gpu_matrix_equal(const GpuMatrix *lhs, const GpuMatrix *rhs, int *out_equal);
     int gpu_matrix_mul_scalar(
         GpuMatrix *out,
@@ -38,16 +207,19 @@ extern "C"
         GpuMatrix *const *outputs,
         const GpuMatrix *const *left,
         const GpuMatrix *const *right,
+        const GpuMatrixBatchView *views,
         size_t matrix_count,
         int operation);
     int gpu_matrix_negate_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *inputs,
+        const GpuMatrixBatchView *views,
         size_t matrix_count);
     int gpu_matrix_mul_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *left,
         const GpuMatrix *const *right,
+        const GpuMatrixBatchView *views,
         size_t matrix_count);
     int gpu_matrix_validate_ring_automorphism(
         size_t ring_dimension,
@@ -57,6 +229,7 @@ extern "C"
         GpuMatrix *const *outputs,
         const GpuMatrix *const *inputs,
         const size_t *indices,
+        const GpuMatrixBatchView *views,
         size_t matrix_count);
     int gpu_matrix_mul_accumulate_batch(
         GpuMatrix *const *outputs,
@@ -66,12 +239,17 @@ extern "C"
         const GpuMatrix *const *biases,
         const size_t *inner_dimensions,
         size_t matrix_count,
-        size_t product_count);
+        size_t product_count,
+        const GpuMatrixBatchView *views,
+        const GpuMatrixRange *bias_view,
+        const uint64_t *integer_residues);
     int gpu_matrix_mul_scalar_batch(
         GpuMatrix *const *outputs,
         const GpuMatrix *const *matrices,
         const GpuMatrix *const *scalars,
-        size_t matrix_count);
+        const GpuMatrixBatchView *views,
+        size_t matrix_count,
+        const uint64_t *integer_residues);
     // Null inputs transform the exclusively owned outputs in place.
     int gpu_matrix_intt_batch(
         GpuMatrix *const *outputs,

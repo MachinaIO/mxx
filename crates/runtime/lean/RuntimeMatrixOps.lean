@@ -334,6 +334,36 @@ noncomputable def rnsModDownRuns {q p n rows columns : Nat}
         (-value * rnsInverse prime plaintext * rnsInverse prime factor)).sum
     (value + plaintext * correction) * rnsInverse p auxiliary)
 
+/-- Coefficient-domain centering; native RNS kernels evaluate this representative
+without reconstructing a full-modulus integer. -/
+def centeredResidue (modulus : Nat) (value : Int) : Int :=
+  let residue := value % Int.ofNat modulus
+  if residue > Int.ofNat (modulus / 2) then residue - Int.ofNat modulus else residue
+
+noncomputable def centeredExtend {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) : ExactMatrix p n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦
+    centeredResidue q (Int.ofNat ((input row column).coeff i).val)
+
+noncomputable def centeredExtendRuns {q p n rows columns : Nat}
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  1 < q ∧ q ∣ p ∧ q % 2 = 1 ∧ p % 2 = 1 ∧ output = centeredExtend input
+
+/-- Exact whole-block switching. t=1 is ordinary BFV ModDown; t>1 preserves
+that error multiplier. This is not sequential prime dropping. -/
+noncomputable def blockModSwitch {q p n rows columns : Nat} (t : Int)
+    (input : ExactMatrix q n rows columns) : ExactMatrix p n rows columns :=
+  fun row column ↦ polynomialOfCoefficients fun i ↦
+    let value := Int.ofNat ((input row column).coeff i).val
+    let inverse := ((t : ZMod (q / p))⁻¹ * (value : ZMod (q / p))).val
+    let rho := centeredResidue (q / p) (Int.ofNat inverse)
+    (value - t * rho) / Int.ofNat (q / p)
+
+noncomputable def blockModSwitchRuns {q p n rows columns : Nat} (t : Int)
+    (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
+  1 < p ∧ p < q ∧ p ∣ q ∧ q % 2 = 1 ∧ p % 2 = 1 ∧
+    1 ≤ t ∧ Nat.Coprime t.toNat q ∧ output = blockModSwitch t input
+
 /-- Substitution in the negacyclic quotient incorporates the runtime's wraparound sign. -/
 noncomputable def ringAutomorphism {q n rows columns : Nat} (index : Nat)
     (input : ExactMatrix q n rows columns) : ExactMatrix q n rows columns :=

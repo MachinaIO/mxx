@@ -11,10 +11,10 @@ struct PlanKey {
     plaintext_modulus: u64,
 }
 
-struct Plan {
-    scales: Vec<u64>,
-    inverses: Vec<u64>,
-    weights: Option<[u64; 64]>,
+pub(super) struct Plan {
+    pub(super) scales: Vec<u64>,
+    pub(super) inverses: Vec<u64>,
+    pub(super) weights: Option<[u64; 64]>,
 }
 
 thread_local! {
@@ -22,33 +22,69 @@ thread_local! {
     static PLANS: RefCell<BTreeMap<PlanKey, Arc<Plan>>> = const { RefCell::new(BTreeMap::new()) };
 }
 
-impl GpuDCRTPolyMatrix {
-    pub(super) fn rns_conversion(
-        &self,
-        destination: &GpuDCRTPolyParams,
-        digit_size: usize,
-        normalize: bool,
-        plaintext_modulus: u64,
-    ) -> Result<Self, String> {
-        let source = self.params.moduli();
-        let target = destination.moduli();
-        let down = plaintext_modulus != 0;
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.level + 1 != source.len() ||
-            self.params.execution_owner_id() != destination.execution_owner_id() ||
-            digit_size == 0 ||
-            source.len() > 64 ||
-            target.len() > 64
+/// Coefficient-domain approximate RNS basis conversion. ModUp emits one row
+/// block per source digit; ModDown preserves rows and removes auxiliary primes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMatrixRnsConversion {
+    Up { digit_size: usize, normalize: bool },
+    Down { plaintext_modulus: u64 },
+}
+
+impl GpuMatrixRnsConversion {
+    pub fn validate(
+        self,
+        source: &GpuDCRTPolyParams,
+        level: usize,
+        target: &GpuDCRTPolyParams,
+    ) -> Result<usize, String> {
+        if source.ring_dimension() != target.ring_dimension() ||
+            level.checked_add(1) != Some(source.crt_depth()) ||
+            source.execution_owner_id() != target.execution_owner_id() ||
+            source.device_ids() != target.device_ids() ||
+            source.crt_depth() > 64 ||
+            target.crt_depth() > 64
         {
-            return Err("RNS conversion requires full bases, matching dimensions, shared execution, nonzero digit size and at most 64 limbs".into());
+            return Err("RNS conversion requires full bases, matching dimensions, placement and shared execution, with at most 64 limbs".into());
         }
-        if if down {
-            target.len() >= source.len() || target.iter().any(|q| !source.contains(q))
-        } else {
-            source.iter().any(|q| !target.contains(q))
-        } {
-            return Err("invalid RNS source/destination subset relation".into());
+        match self {
+            Self::Up { digit_size, .. } => {
+                if digit_size == 0 || source.moduli().iter().any(|q| !target.moduli().contains(q)) {
+                    return Err(
+                        "RNS ModUp requires nonzero digit size and a containing destination basis"
+                            .into(),
+                    );
+                }
+                Ok(source.crt_depth().div_ceil(digit_size))
+            }
+            Self::Down { plaintext_modulus } => {
+                if plaintext_modulus < 2 ||
+                    target.crt_depth() >= source.crt_depth() ||
+                    target.moduli().iter().any(|q| !source.moduli().contains(q)) ||
+                    source
+                        .moduli()
+                        .iter()
+                        .filter(|q| !target.moduli().contains(q))
+                        .any(|q| crate::utils::mod_inverse(plaintext_modulus % q, *q).is_none())
+                {
+                    return Err("RNS ModDown requires a proper subset and invertible plaintext modulus at least two".into());
+                }
+                Ok(1)
+            }
         }
+    }
+
+    pub(super) fn plan(
+        self,
+        source: &GpuDCRTPolyParams,
+        target: &GpuDCRTPolyParams,
+    ) -> Result<Arc<Plan>, String> {
+        let source = source.moduli();
+        let target = target.moduli();
+        let (digit_size, normalize, plaintext_modulus) = match self {
+            Self::Up { digit_size, normalize } => (digit_size, normalize, 0),
+            Self::Down { plaintext_modulus } => (source.len(), false, plaintext_modulus),
+        };
+        let down = plaintext_modulus != 0;
         let key = PlanKey {
             source: source.to_vec(),
             target: target.to_vec(),
@@ -56,12 +92,12 @@ impl GpuDCRTPolyMatrix {
             normalize,
             plaintext_modulus,
         };
-        let plan = PLANS.with(|plans| -> Result<Arc<Plan>, String> {
+        PLANS.with(|plans| -> Result<Arc<Plan>, String> {
             if let Some(plan) = plans.borrow().get(&key) {
                 return Ok(Arc::clone(plan));
             }
             let groups = source
-                .chunks(digit_size)
+                .par_chunks(digit_size)
                 .map(|chunk| chunk.iter().fold(BigUint::from(1u8), |p, q| p * q))
                 .collect::<Vec<_>>();
             let product = source
@@ -135,32 +171,24 @@ impl GpuDCRTPolyMatrix {
             }
             plans.insert(key, Arc::clone(&plan));
             Ok(plan)
-        })?;
-        let groups = if down { 1 } else { source.len().div_ceil(digit_size) };
-        let rows = self.nrow.checked_mul(groups).ok_or("RNS output row count overflow")?;
-        if rows == 0 || self.ncol == 0 {
-            return Ok(Self::new_empty(destination, rows, self.ncol));
-        }
-        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
-        let input = coefficients.as_ref().unwrap_or(self);
-        let mut output =
-            Self::new_empty_with_state(destination, rows, self.ncol, target.len() - 1, false, None);
-        let status = unsafe {
-            gpu_matrix_rns_conversion(
-                output.raw,
-                input.raw,
-                digit_size,
-                plaintext_modulus,
-                plan.scales.as_ptr(),
-                plan.inverses.as_ptr(),
-                plan.weights.as_ref().map_or(std::ptr::null(), |weights| weights.as_ptr()),
-            )
+        })
+    }
+}
+
+impl GpuDCRTPolyMatrix {
+    pub(super) fn rns_conversion(
+        &self,
+        destination: &GpuDCRTPolyParams,
+        digit_size: usize,
+        normalize: bool,
+        plaintext_modulus: u64,
+    ) -> Result<Self, String> {
+        let conversion = if plaintext_modulus == 0 {
+            GpuMatrixRnsConversion::Up { digit_size, normalize }
+        } else {
+            GpuMatrixRnsConversion::Down { plaintext_modulus }
         };
-        if status != 0 {
-            return Err(crate::poly::dcrt::gpu::last_error_string());
-        }
-        output.ntt_all_in_place();
-        Ok(output)
+        self.column_view(0..self.ncol)?.rns_conversion(destination, conversion, None)
     }
 }
 
@@ -323,5 +351,112 @@ mod tests {
         assert!(input.rns_mod_down(&source, 0).is_err());
         let extended = GpuDCRTPolyMatrix::zero(&target, 1, 1);
         assert!(extended.rns_mod_down(&source, 1).is_err());
+    }
+}
+
+impl GpuDCRTPolyMatrix {
+    pub(super) fn exact_centered_conversion(
+        &self,
+        destination: &GpuDCRTPolyParams,
+        plaintext_modulus: Option<u64>,
+    ) -> Result<Self, String> {
+        self.column_view(0..self.ncol)?.convert_modulus(
+            destination,
+            plaintext_modulus
+                .map(|plaintext_modulus| GpuMatrixModulusConversion::BlockSwitch {
+                    plaintext_modulus,
+                })
+                .unwrap_or(GpuMatrixModulusConversion::CenteredExtend),
+            None,
+        )
+    }
+}
+
+#[cfg(test)]
+mod exact_tests {
+    use super::*;
+    use crate::{
+        element::finite_ring::FinRingElem, matrix::dcrt_poly::DCRTPolyMatrix,
+        poly::dcrt::poly::DCRTPoly,
+    };
+    use rand::Rng;
+
+    #[test]
+    #[serial_test::serial]
+    fn test_gpu_exact_rns_conversion_matches_cpu() {
+        let (n, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
+        let high = DCRTPolyParams::new(n, depth, bits, base, None, None);
+        let devices = crate::poly::dcrt::gpu::detected_gpu_device_ids();
+        assert!(!devices.is_empty());
+        let mut rng = rand::rng();
+        for device in devices {
+            let gpu_high = GpuDCRTPolyParams::new_with_gpu(
+                n,
+                high.to_crt().0,
+                base,
+                vec![device],
+                None,
+                None,
+                None,
+            );
+            for kept in [vec![0usize, 2], vec![1usize]] {
+                let low_modulus = kept.iter().map(|i| BigUint::from(high.to_crt().0[*i])).product();
+                let low = high.select_modulus(&low_modulus).unwrap();
+                let gpu_low = gpu_high.select_modulus(&low_modulus).unwrap();
+                let half = (&low_modulus - 1u8) / 2u8;
+                let coefficients = (0..n)
+                    .map(|i| {
+                        let value = match i % 4 {
+                            0 => half.clone(),
+                            1 => &half + 1u8,
+                            _ => BigUint::from(rng.random::<u64>()) % &low_modulus,
+                        };
+                        FinRingElem::new(value, low.modulus())
+                    })
+                    .collect::<Vec<_>>();
+                let input = DCRTPolyMatrix::from_poly_vec(
+                    &low,
+                    vec![
+                        vec![DCRTPoly::from_coeffs(&low, &coefficients), DCRTPoly::const_one(&low)],
+                        vec![
+                            DCRTPoly::const_zero(&low),
+                            DCRTPoly::from_coeffs(&low, &coefficients),
+                        ],
+                    ],
+                );
+                let gpu_input = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_low, &input);
+                // Decompose at the low ring, preserve compact signed digits
+                // across contexts, and multiply only after the source is dropped.
+                let cpu_digits = input.clone().gadget_decompose(false, None).unwrap();
+                let gpu_digits = gpu_input.clone().gadget_decompose(false, None).unwrap();
+                let extended_digits = gpu_digits.centered_extend(&gpu_high).unwrap();
+                drop(gpu_digits);
+                assert_eq!(
+                    extended_digits.max_coefficient_bound(),
+                    cpu_digits.max_coefficient_bound()
+                );
+                let low_gadget = DCRTPolyMatrix::gadget_matrix(&low, 2, None);
+                let high_gadget = low_gadget.centered_extend(&high).unwrap();
+                let gpu_gadget = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_high, &high_gadget);
+                assert_eq!(
+                    gpu_gadget.multiply_small_rhs(&extended_digits).unwrap().to_cpu_matrix(),
+                    high_gadget
+                        .multiply_small_rhs(&cpu_digits.centered_extend(&high).unwrap())
+                        .unwrap(),
+                );
+                let lifted = gpu_input.centered_extend(&gpu_high).unwrap();
+                let cpu_lifted = input.centered_extend(&high).unwrap();
+                assert_eq!(lifted.to_cpu_matrix(), cpu_lifted);
+                for t in [1, 2, 17] {
+                    let switched = lifted.block_mod_switch(&gpu_low, t).unwrap();
+                    assert_eq!(
+                        switched.to_cpu_matrix(),
+                        cpu_lifted.block_mod_switch(&low, t).unwrap()
+                    );
+                }
+                assert!(gpu_input.block_mod_switch(&gpu_high, 2).is_err());
+                assert!(lifted.centered_extend(&gpu_low).is_err());
+            }
+        }
     }
 }

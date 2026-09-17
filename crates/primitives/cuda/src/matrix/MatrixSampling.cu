@@ -1,3 +1,10 @@
+#include "gpu_prepared_plan.cuh"
+
+#include <array>
+#include <atomic>
+#include <cstring>
+#include <limits>
+
 using gpu_chacha::DeviceChaChaRng;
 using gpu_chacha::GpuRngSeed;
 using gpu_chacha::rng_init;
@@ -235,151 +242,287 @@ __device__ __forceinline__ int64_t centered_residue_i64(uint64_t value, uint64_t
     return -static_cast<int64_t>(neg);
 }
 
-__global__ void matrix_sample_distribution_multi_limb_kernel(
-    uint8_t *dst_base,
+// Sampling coordinates describe the logical full matrix, independently of
+// the retained owner's physical rectangle. Bounded metadata stays in arguments.
+struct MatrixSampleDescriptors {
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors;
+    uint32_t indices[GPU_RUNTIME_MAX_LIMBS];
+    uint64_t moduli[GPU_RUNTIME_MAX_LIMBS];
+    size_t offset, pitch;
+    const int32_t *completed = nullptr;
+};
+static_assert(sizeof(MatrixSampleDescriptors) + 128 < 4096, "bounded sampling arguments");
+
+struct GpuPreparedSampling {
+    GpuMatrix *out = nullptr;
+    MatrixSampleDescriptors layout{};
+    GpuMatrixRange range{};
+    GpuMatrixTransformPlan *transform = nullptr;
+    cudaStream_t stream = nullptr;
+    int device = -1;
+    int dist_type = GPU_MATRIX_DIST_UNIFORM;
+    double sigma = 0.0;
+    uint64_t max_coefficient_bound = 0;
+    uint64_t coefficient_modulus = 0;
+    size_t poly_count = 0;
+    size_t columns = 0;
+    size_t full_ncol = 0;
+    size_t col_offset = 0;
+    size_t n = 0;
+    size_t limb_count = 0;
+    size_t blocks = 0;
+    cudaEvent_t completed_event = nullptr;
+    std::array<std::unique_ptr<GpuCudaResource>, GPU_RUNTIME_MAX_LIMBS> completion;
+
+    ~GpuPreparedSampling()
+    {
+        if (transform)
+            gpu_matrix_destroy_ntt_plan(transform);
+        for (auto &event : completion)
+            if (event) (void)event->release();
+    }
+};
+
+
+extern "C" int gpu_matrix_query_sampling_layout(
+    size_t ring_dimension, size_t limb_count, size_t rows, size_t columns,
+    size_t full_ncol, size_t col_offset, int format, int dist_type,
+    int device, GpuPreparedSamplingLayout *out)
+{
+    if (!out || ring_dimension < 2 || ring_dimension > std::numeric_limits<uint32_t>::max() ||
+        !is_power_of_two_u32(static_cast<uint32_t>(ring_dimension)) ||
+        limb_count == 0 || limb_count > GPU_RUNTIME_MAX_LIMBS ||
+        (format != GPU_POLY_FORMAT_COEFF && format != GPU_POLY_FORMAT_EVAL) ||
+        dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY ||
+        col_offset > full_ncol || columns > full_ncol - col_offset)
+        return set_error("invalid prepared sampling layout request");
+    if (rows != 0 && columns > std::numeric_limits<size_t>::max() / rows)
+        return set_error("prepared sampling layout shape overflow");
+    const size_t polynomial_count = rows * columns;
+    if (ring_dimension > std::numeric_limits<size_t>::max() - 3)
+        return set_error("prepared sampling layout sample overflow");
+    const size_t samples_per_poly = (ring_dimension + 3) / 4;
+    if (polynomial_count != 0 && samples_per_poly > std::numeric_limits<size_t>::max() / polynomial_count)
+        return set_error("prepared sampling layout sample overflow");
+    const size_t chunks = polynomial_count * samples_per_poly;
+    if (chunks > std::numeric_limits<size_t>::max() - 255)
+        return set_error("prepared sampling layout block overflow");
+    const size_t blocks = chunks == 0 ? 0 : std::min<size_t>(65535, (chunks + 255) / 256);
+    size_t transform_stage_count = 0;
+    if (format == GPU_POLY_FORMAT_EVAL && polynomial_count != 0)
+    {
+        GpuPreparedNttLayout ntt{};
+        const int status = gpu_matrix_query_ntt_layout(
+            ring_dimension, limb_count, polynomial_count, device, true, &ntt);
+        if (status != 0) return status;
+        transform_stage_count = ntt.stage_count;
+    }
+    *out = GpuPreparedSamplingLayout{
+        rows, columns, ring_dimension, limb_count, polynomial_count, blocks,
+        0, alignof(uint64_t), limb_count, transform_stage_count, device,
+        format, dist_type, 3,
+    };
+    return 0;
+}
+
+static int prepare_sampling_layout(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
+    size_t full_ncol,
+    size_t col_offset,
+    const GpuMatrixRange *range,
+    GpuPreparedSampling &prepared)
+{
+    if (!out || !out->ctx || out->ctx->N < 2 || out->level < 0 ||
+        static_cast<size_t>(out->level) >= GPU_RUNTIME_MAX_LIMBS)
+        return set_error("invalid matrix in gpu_matrix_prepare_sampling");
+    if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
+        return set_error("invalid dist_type in gpu_matrix_prepare_sampling");
+    if (dist_type == GPU_MATRIX_DIST_GAUSS && (!(sigma > 0.0) || !std::isfinite(sigma)))
+        return set_error("sigma must be finite and positive in gpu_matrix_prepare_sampling");
+    const GpuMatrixRange rectangle = range ? *range : GpuMatrixRange{0, out->rows, 0, out->cols};
+    if (rectangle.row_start > rectangle.row_end || rectangle.row_end > out->rows ||
+        rectangle.column_start > rectangle.column_end || rectangle.column_end > out->cols)
+        return set_error("invalid destination rectangle in gpu_matrix_prepare_sampling");
+    const size_t rows = rectangle.row_end - rectangle.row_start;
+    const size_t columns = rectangle.column_end - rectangle.column_start;
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    const size_t limit = std::numeric_limits<size_t>::max();
+    if (col_offset > full_ncol || columns > full_ncol - col_offset ||
+        (out->rows && out->cols > limit / out->rows) ||
+        (rows && full_ncol > limit / rows) || (rows && columns > limit / rows / n))
+        return set_error("invalid logical shape in gpu_matrix_prepare_sampling");
+    if (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL)
+        return set_error("invalid output format in gpu_matrix_prepare_sampling");
+    if (out->ctx->limb_gpu_ids.size() < static_cast<size_t>(out->level) + 1 ||
+        out->ctx->moduli.size() < static_cast<size_t>(out->level) + 1)
+        return set_error("invalid limb count in gpu_matrix_prepare_sampling");
+
+    prepared.out = out;
+    prepared.range = rectangle;
+    prepared.layout.offset = rectangle.row_start * out->cols + rectangle.column_start;
+    prepared.layout.pitch = out->cols;
+    prepared.dist_type = dist_type;
+    prepared.sigma = sigma;
+    prepared.max_coefficient_bound = max_coefficient_bound;
+    prepared.coefficient_modulus = coefficient_modulus;
+    prepared.poly_count = rows * columns;
+    prepared.columns = columns;
+    prepared.full_ncol = full_ncol;
+    prepared.col_offset = col_offset;
+    prepared.n = n;
+    prepared.limb_count = static_cast<size_t>(out->level) + 1;
+    for (size_t limb = 0; limb < prepared.limb_count; ++limb) {
+        const dim3 id = out->ctx->limb_gpu_ids[limb];
+        int limb_device = -1;
+        int status = matrix_limb_device(out, id, &limb_device);
+        if (status != 0) return status;
+        if (id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid sampling partition");
+        const auto &buffer = out->shared_limb_buffers[id.x];
+        size_t stride = 0;
+        uint8_t width = 0;
+        if (!buffer.device_descriptors || id.y >= buffer.limb_count ||
+            !matrix_limb_ptr_by_id(out, 0, id) ||
+            !matrix_limb_metadata_by_id(out, id, &stride, &width) ||
+            width == 0 || width > 8 || stride < n * width || !out->ctx->moduli[limb])
+            return set_error("invalid sampling descriptor");
+        if (limb == 0) {
+            prepared.device = limb_device;
+            prepared.layout.descriptors = buffer.device_descriptors;
+            status = matrix_limb_stream(out, id, &prepared.stream);
+            if (status != 0) return status;
+        } else if (limb_device != prepared.device ||
+                   prepared.layout.descriptors != buffer.device_descriptors) {
+            return set_error("sampling requires one device and descriptor partition");
+        }
+        prepared.layout.indices[limb] = id.y;
+        prepared.layout.moduli[limb] = out->ctx->moduli[limb];
+    }
+    if (prepared.device < 0 || !prepared.stream)
+        return set_error("invalid sampling stream");
+    GpuPreparedSamplingLayout structural{};
+    const int status = gpu_matrix_query_sampling_layout(
+        n, prepared.limb_count, rows, columns, full_ncol, col_offset,
+        out->format, dist_type, prepared.device, &structural);
+    if (status != 0) return status;
+    prepared.blocks = structural.blocks;
+    if (out->format == GPU_POLY_FORMAT_EVAL && prepared.poly_count != 0) {
+        int status = gpu_matrix_prepare_ntt_plan(out, &rectangle, true, &prepared.transform);
+        if (status != 0) return status;
+    }
+    return 0;
+}
+
+__device__ void matrix_sample_distribution_multi_limb_kernel_body(
+    MatrixSampleDescriptors layout,
     size_t poly_count,
     size_t local_ncol,
     size_t full_ncol,
     size_t col_offset,
     size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
     int dist_type,
     double sigma,
     uint64_t max_coefficient_bound,
     uint64_t coefficient_modulus,
     GpuRngSeed seed)
 {
+    const size_t limb_idx = blockIdx.z;
+    const auto descriptor = layout.descriptors[layout.indices[limb_idx]];
+    const uint64_t modulus = layout.moduli[limb_idx];
     constexpr size_t kSamplesPerThread = 4;
     const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
-    const size_t chunk_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t total_chunks = poly_count * chunks_per_poly;
-    if (chunk_idx >= total_chunks)
+    for (size_t chunk_idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         chunk_idx < total_chunks;
+         chunk_idx += static_cast<size_t>(gridDim.x) * blockDim.x)
     {
-        return;
-    }
-    const size_t local_poly_idx = chunk_idx / chunks_per_poly;
-    const size_t coeff_start =
-        (chunk_idx - local_poly_idx * chunks_per_poly) * kSamplesPerThread;
-    const size_t row_idx = local_poly_idx / local_ncol;
-    const size_t local_col_idx = local_poly_idx - row_idx * local_ncol;
-    const size_t global_poly_idx = row_idx * full_ncol + (col_offset + local_col_idx);
+        const size_t local_poly_idx = chunk_idx / chunks_per_poly;
+        const size_t coeff_start =
+            (chunk_idx - local_poly_idx * chunks_per_poly) * kSamplesPerThread;
+        const size_t row_idx = local_poly_idx / local_ncol;
+        const size_t local_col_idx = local_poly_idx - row_idx * local_ncol;
+        const size_t global_poly_idx = row_idx * full_ncol + (col_offset + local_col_idx);
 
-    const uint64_t domain = dist_type == GPU_MATRIX_DIST_UNIFORM ?
-        0x6f70656e66686531ULL :
-        (dist_type == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
-         (dist_type == GPU_MATRIX_DIST_BIT ? 0x6f70656e66686533ULL :
-                                            0x6f70656e66686534ULL));
-    const uint64_t limb_domain =
-        dist_type == GPU_MATRIX_DIST_UNIFORM ? static_cast<uint64_t>(limb_idx + 1) : 0;
-    DeviceChaChaRng rng;
-    rng_init(
-        rng,
-        seed,
-        static_cast<uint64_t>(global_poly_idx + 1),
-        static_cast<uint64_t>(coeff_start + 1),
-        limb_domain,
-        domain);
-    const uint64_t uniform_rejection_threshold =
-        dist_type == GPU_MATRIX_DIST_UNIFORM && modulus != 0 ?
-        static_cast<uint64_t>(-modulus) % modulus : 0;
+        const uint64_t domain = dist_type == GPU_MATRIX_DIST_UNIFORM ?
+            0x6f70656e66686531ULL :
+            (dist_type == GPU_MATRIX_DIST_GAUSS ? 0x6f70656e66686532ULL :
+             (dist_type == GPU_MATRIX_DIST_BIT ? 0x6f70656e66686533ULL :
+                                                0x6f70656e66686534ULL));
+        const uint64_t limb_domain =
+            dist_type == GPU_MATRIX_DIST_UNIFORM ? static_cast<uint64_t>(limb_idx + 1) : 0;
+        DeviceChaChaRng rng;
+        rng_init(
+            rng,
+            seed,
+            static_cast<uint64_t>(global_poly_idx + 1),
+            static_cast<uint64_t>(coeff_start + 1),
+            limb_domain,
+            domain);
+        const uint64_t uniform_rejection_threshold =
+            dist_type == GPU_MATRIX_DIST_UNIFORM && modulus != 0 ?
+            static_cast<uint64_t>(-modulus) % modulus : 0;
 
-    for (size_t lane = 0; lane < kSamplesPerThread; ++lane)
-    {
-        const size_t coeff_idx = coeff_start + lane;
-        if (coeff_idx >= n) break;
-        uint64_t sample = 0;
-        if (dist_type == GPU_MATRIX_DIST_UNIFORM)
+        for (size_t lane = 0; lane < kSamplesPerThread; ++lane)
         {
-            sample = sample_uniform_mod(rng, modulus, uniform_rejection_threshold);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_GAUSS)
-        {
-            int64_t z;
-            do
+            const size_t coeff_idx = coeff_start + lane;
+            if (coeff_idx >= n) break;
+            uint64_t sample = 0;
+            if (dist_type == GPU_MATRIX_DIST_UNIFORM)
             {
-                z = sample_integer_karney(rng, 0.0, sigma);
-            } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
-            sample = signed_mod_i64(z, modulus);
-        }
-        else if (dist_type == GPU_MATRIX_DIST_BIT)
-        {
-            sample = rng_next_u64(rng) & 1ULL;
-        }
-        else if (dist_type == GPU_MATRIX_DIST_TERNARY)
-        {
-            const uint64_t pick = rng_next_u64(rng) % 3ULL;
-            const int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
-            sample = signed_mod_i64(z, modulus);
-        }
+                sample = sample_uniform_mod(rng, modulus, uniform_rejection_threshold);
+            }
+            else if (dist_type == GPU_MATRIX_DIST_GAUSS)
+            {
+                int64_t z;
+                do
+                {
+                    z = sample_integer_karney(rng, 0.0, sigma);
+                } while (centered_sample_abs_i64(z, coefficient_modulus) > max_coefficient_bound);
+                sample = signed_mod_i64(z, modulus);
+            }
+            else if (dist_type == GPU_MATRIX_DIST_BIT)
+            {
+                sample = rng_next_u64(rng) & 1ULL;
+            }
+            else if (dist_type == GPU_MATRIX_DIST_TERNARY)
+            {
+                const uint64_t pick = rng_next_u64(rng) % 3ULL;
+                const int64_t z = pick == 0 ? 0 : (pick == 1 ? 1 : -1);
+                sample = signed_mod_i64(z, modulus);
+            }
 
-        matrix_store_limb_u64(
-            dst_base,
-            local_poly_idx,
-            coeff_idx,
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            sample);
+            matrix_store_limb_u64(
+                descriptor.base,
+                layout.offset + row_idx * layout.pitch + local_col_idx,
+                coeff_idx,
+                descriptor.stride,
+                descriptor.width,
+                sample);
+        }
     }
 }
 
-int launch_sample_distribution_multi_limb_kernel(
-    uint8_t *dst_base,
+__global__ void matrix_sample_distribution_multi_limb_kernel(
+    MatrixSampleDescriptors layout,
     size_t poly_count,
     size_t local_ncol,
     size_t full_ncol,
     size_t col_offset,
     size_t n,
-    size_t dst_stride_bytes,
-    uint8_t dst_coeff_bytes,
-    uint64_t modulus,
-    uint32_t limb_idx,
     int dist_type,
     double sigma,
     uint64_t max_coefficient_bound,
     uint64_t coefficient_modulus,
-    GpuRngSeed seed,
-    cudaStream_t stream)
+    GpuRngSeed seed)
 {
-    if (!dst_base)
-    {
-        return set_error("null output base pointer in matrix_sample_distribution_multi_limb_kernel");
-    }
-    if (poly_count == 0 || n == 0)
-    {
-        return 0;
-    }
-
-    const int threads = 256;
-    constexpr size_t kSamplesPerThread = 4;
-    const size_t chunks_per_poly = (n + kSamplesPerThread - 1) / kSamplesPerThread;
-    const size_t total_chunks = poly_count * chunks_per_poly;
-    const int blocks = static_cast<int>((total_chunks + threads - 1) / threads);
-    matrix_sample_distribution_multi_limb_kernel<<<blocks, threads, 0, stream>>>(
-        dst_base,
-        poly_count,
-        local_ncol,
-        full_ncol,
-        col_offset,
-        n,
-        dst_stride_bytes,
-        dst_coeff_bytes,
-        modulus,
-        limb_idx,
-        dist_type,
-        sigma,
-        max_coefficient_bound,
-        coefficient_modulus,
-        seed);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-    {
-        return set_error(err);
-    }
-    return 0;
+    if (layout.completed && *layout.completed) return;
+    matrix_sample_distribution_multi_limb_kernel_body(layout, poly_count, local_ncol, full_ncol, col_offset, n, dist_type, sigma, max_coefficient_bound, coefficient_modulus, seed);
 }
+
 
 static int gpu_matrix_sample_distribution_impl(
     GpuMatrix *out,
@@ -389,126 +532,87 @@ static int gpu_matrix_sample_distribution_impl(
     uint64_t coefficient_modulus,
     GpuRngSeed seed,
     size_t full_ncol,
-    size_t col_offset)
+    size_t col_offset,
+    const GpuMatrixRange *range)
 {
-    if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
-    if (!out)
-    {
-        return set_error("invalid gpu_matrix_sample_distribution arguments");
-    }
+    if (!out || !out->ctx || out->ctx->N < 2 || out->level < 0 ||
+        static_cast<size_t>(out->level) >= GPU_RUNTIME_MAX_LIMBS)
+        return set_error("invalid matrix in gpu_matrix_sample_distribution");
+    GpuAllocationActivity activity(out->ctx->execution.get(), -1);
     if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
-    {
         return set_error("invalid dist_type in gpu_matrix_sample_distribution");
-    }
-    if (dist_type == GPU_MATRIX_DIST_GAUSS && !(sigma > 0.0))
-    {
-        return set_error("sigma must be positive in gpu_matrix_sample_distribution");
-    }
-    if (col_offset > full_ncol || out->cols > full_ncol - col_offset)
-    {
-        return set_error("column range out of bounds in gpu_matrix_sample_distribution");
-    }
-    const GpuPolyFormat requested_format = out->format;
-    if (requested_format != GPU_POLY_FORMAT_COEFF && requested_format != GPU_POLY_FORMAT_EVAL)
-    {
+    if (dist_type == GPU_MATRIX_DIST_GAUSS && (!(sigma > 0.0) || !std::isfinite(sigma)))
+        return set_error("sigma must be finite and positive in gpu_matrix_sample_distribution");
+    const GpuMatrixRange rectangle = range ? *range : GpuMatrixRange{0, out->rows, 0, out->cols};
+    if (rectangle.row_start > rectangle.row_end || rectangle.row_end > out->rows ||
+        rectangle.column_start > rectangle.column_end || rectangle.column_end > out->cols)
+        return set_error("invalid destination rectangle in gpu_matrix_sample_distribution");
+    const size_t rows = rectangle.row_end - rectangle.row_start;
+    const size_t columns = rectangle.column_end - rectangle.column_start;
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    const size_t limit = std::numeric_limits<size_t>::max();
+    if (col_offset > full_ncol || columns > full_ncol - col_offset ||
+        (out->rows && out->cols > limit / out->rows) ||
+        (rows && full_ncol > limit / rows) || (rows && columns > limit / rows / n))
+        return set_error("invalid logical shape in gpu_matrix_sample_distribution");
+    if (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL)
         return set_error("invalid output format in gpu_matrix_sample_distribution");
-    }
-
-    const size_t count = out->rows * out->cols;
-    if (count == 0)
+    const size_t count = rows * columns;
+    if (!count) return 0;
+    const size_t limb_count = static_cast<size_t>(out->level) + 1;
+    if (out->ctx->limb_gpu_ids.size() < limb_count || out->ctx->moduli.size() < limb_count)
+        return set_error("invalid limb count in gpu_matrix_sample_distribution");
+    MatrixSampleDescriptors layout{};
+    layout.offset = rectangle.row_start * out->cols + rectangle.column_start;
+    layout.pitch = out->cols;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    for (size_t limb = 0; limb < limb_count; ++limb)
     {
-        return 0;
-    }
-
-    const int level = out->level;
-    if (level < 0)
-    {
-        return set_error("invalid level in gpu_matrix_sample_distribution");
-    }
-    if (out->ctx->moduli.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected modulus count in gpu_matrix_sample_distribution");
-    }
-
-    auto &limb_map = out->ctx->limb_gpu_ids;
-    if (limb_map.size() < static_cast<size_t>(level + 1))
-    {
-        return set_error("unexpected limb mapping size in gpu_matrix_sample_distribution");
-    }
-    int status = 0;
-    for (int limb = 0; limb <= level; ++limb)
-    {
-        const dim3 limb_id = limb_map[static_cast<size_t>(limb)];
+        const dim3 id = out->ctx->limb_gpu_ids[limb];
         int limb_device = -1;
-        cudaStream_t limb_stream = nullptr;
-        status = matrix_limb_device(out, limb_id, &limb_device);
-        if (status != 0)
-        {
-            return status;
+        int status = matrix_limb_device(out, id, &limb_device);
+        if (status != 0) return status;
+        if (id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid sampling partition");
+        const auto &buffer = out->shared_limb_buffers[id.x];
+        size_t stride = 0;
+        uint8_t width = 0;
+        if (!buffer.device_descriptors || id.y >= buffer.limb_count ||
+            !matrix_limb_ptr_by_id(out, 0, id) ||
+            !matrix_limb_metadata_by_id(out, id, &stride, &width) ||
+            (width == 0 || width > 8) || stride < n * width || !out->ctx->moduli[limb])
+            return set_error("invalid sampling descriptor");
+        if (limb == 0) {
+            device = limb_device;
+            layout.descriptors = buffer.device_descriptors;
+            status = matrix_limb_stream(out, id, &stream);
+            if (status != 0) return status;
+        } else if (limb_device != device || layout.descriptors != buffer.device_descriptors) {
+            return set_error("sampling requires one device and descriptor partition");
         }
-        status = matrix_limb_stream(out, limb_id, &limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        if (limb_device < 0 || !limb_stream)
-        {
-            return set_error("invalid limb metadata in gpu_matrix_sample_distribution");
-        }
-        uint8_t *dst_base = matrix_limb_ptr_by_id(out, 0, limb_id);
-        if (!dst_base)
-        {
-            return set_error("null output limb base pointer in gpu_matrix_sample_distribution");
-        }
-        size_t dst_stride_bytes = 0;
-        uint8_t dst_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(out, limb_id, &dst_stride_bytes, &dst_coeff_bytes))
-        {
-            return set_error("invalid output limb metadata in gpu_matrix_sample_distribution");
-        }
-        cudaError_t err = cudaSetDevice(limb_device);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        status = launch_sample_distribution_multi_limb_kernel(
-            dst_base,
-            count,
-            out->cols,
-            full_ncol,
-            col_offset,
-            static_cast<size_t>(out->ctx->N),
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            out->ctx->moduli[static_cast<size_t>(limb)],
-            static_cast<uint32_t>(limb),
-            dist_type,
-            sigma,
-            max_coefficient_bound,
-            coefficient_modulus,
-            seed,
-            limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_record_limb_write(out, limb_id, limb_stream);
-        if (status != 0)
-        {
-            return status;
-        }
+        layout.indices[limb] = id.y;
+        layout.moduli[limb] = out->ctx->moduli[limb];
     }
-
-    out->format = GPU_POLY_FORMAT_COEFF;
-    if (requested_format == GPU_POLY_FORMAT_EVAL)
-    {
-        status = gpu_matrix_ntt_all(out);
-        if (status != 0)
-        {
-            return status;
-        }
-    }
-    out->format = requested_format;
+    if (device < 0 || !stream) return set_error("invalid sampling stream");
+    cudaError_t error = cudaSetDevice(device);
+    if (error != cudaSuccess) return set_error(error);
+    int status = matrix_wait_all_limb_streams(out, device, stream, true);
+    if (status != 0) return status;
+    constexpr size_t threads = 256;
+    const size_t chunks = count * ((n + 3) / 4);
+    const size_t blocks = std::min<size_t>(65535, chunks / threads + (chunks % threads != 0));
+    matrix_sample_distribution_multi_limb_kernel<<<dim3(blocks, 1, limb_count), threads, 0, stream>>>(
+        layout, count, columns, full_ncol, col_offset, n,
+        dist_type, sigma, max_coefficient_bound, coefficient_modulus, seed);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    status = matrix_record_all_limb_writes(out, stream);
+    if (status != 0) return status;
+    // Existing evaluation entries outside the rectangle must not be transformed.
+    // The same optimized NTT kernels consume only the newly sampled coefficients.
+    if (out->format == GPU_POLY_FORMAT_EVAL)
+        return run_matrix_transform_u64<true>(out, range);
     return 0;
 }
 
@@ -529,7 +633,8 @@ extern "C" int gpu_matrix_sample_distribution(
         coefficient_modulus,
         seed,
         out ? out->cols : 0,
-        0);
+        0,
+        nullptr);
 }
 
 extern "C" int gpu_matrix_sample_distribution_columns(
@@ -540,7 +645,8 @@ extern "C" int gpu_matrix_sample_distribution_columns(
     uint64_t coefficient_modulus,
     GpuRngSeed seed,
     size_t full_ncol,
-    size_t col_offset)
+    size_t col_offset,
+    const GpuMatrixRange *range)
 {
     return gpu_matrix_sample_distribution_impl(
         out,
@@ -550,5 +656,303 @@ extern "C" int gpu_matrix_sample_distribution_columns(
         coefficient_modulus,
         seed,
         full_ncol,
-        col_offset);
+        col_offset,
+        range);
+}
+
+static int validate_saved_sampling_descriptor(
+    GpuMatrix *out, int dist_type, double sigma, uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus, size_t full_ncol, size_t col_offset,
+    const GpuMatrixRange *range, const GpuPreparedPlanDescriptor *descriptor,
+    GpuPreparedSampling &prepared, GpuPreparedPlanDescriptor &ntt_descriptor)
+{
+    if (!out || !out->ctx || out->ctx->N < 2 || out->level < 0 ||
+        static_cast<size_t>(out->level) >= GPU_RUNTIME_MAX_LIMBS)
+        return set_error("invalid saved sampling matrix");
+    if (dist_type < GPU_MATRIX_DIST_UNIFORM || dist_type > GPU_MATRIX_DIST_TERNARY)
+        return set_error("invalid saved sampling distribution");
+    if (dist_type == GPU_MATRIX_DIST_GAUSS && (!(sigma > 0.0) || !std::isfinite(sigma)))
+        return set_error("invalid saved sampling sigma");
+    const GpuMatrixRange rectangle = range ? *range : GpuMatrixRange{0, out->rows, 0, out->cols};
+    if (rectangle.row_start > rectangle.row_end || rectangle.row_end > out->rows ||
+        rectangle.column_start > rectangle.column_end || rectangle.column_end > out->cols)
+        return set_error("invalid saved sampling range");
+    const size_t rows = rectangle.row_end - rectangle.row_start;
+    const size_t columns = rectangle.column_end - rectangle.column_start;
+    const size_t n = static_cast<size_t>(out->ctx->N);
+    const size_t limbs = static_cast<size_t>(out->level) + 1;
+    const size_t limit = std::numeric_limits<size_t>::max();
+    if (col_offset > full_ncol || columns > full_ncol - col_offset ||
+        (out->rows && out->cols > limit / out->rows) ||
+        (rows && full_ncol > limit / rows) || (rows && columns > limit / rows / n) ||
+        (out->format != GPU_POLY_FORMAT_COEFF && out->format != GPU_POLY_FORMAT_EVAL) ||
+        out->ctx->limb_gpu_ids.size() < limbs || out->ctx->moduli.size() < limbs)
+        return set_error("invalid saved sampling shape or format");
+    const size_t poly_count = rows * columns;
+    const size_t chunks_per_poly = (n + 3) / 4;
+    if (poly_count != 0 && chunks_per_poly > limit / poly_count)
+        return set_error("saved sampling sample count overflow");
+    const size_t chunks = poly_count * chunks_per_poly;
+    if (chunks > limit - 255)
+        return set_error("saved sampling block count overflow");
+    const size_t blocks = chunks == 0 ? 0 : std::min<size_t>(65535, (chunks + 255) / 256);
+    const bool has_transform = out->format == GPU_POLY_FORMAT_EVAL && poly_count != 0;
+    if (descriptor->allocation_count != limbs + has_transform ||
+        descriptor->stream_count != 1 ||
+        (descriptor->launch_count == 0 && has_transform) ||
+        (descriptor->launch_count != 0 && !has_transform))
+        return set_error("saved sampling descriptor counts mismatch");
+
+    prepared.out = out;
+    prepared.range = rectangle;
+    prepared.layout.offset = rectangle.row_start * out->cols + rectangle.column_start;
+    prepared.layout.pitch = out->cols;
+    prepared.dist_type = dist_type;
+    prepared.sigma = sigma;
+    prepared.max_coefficient_bound = max_coefficient_bound;
+    prepared.coefficient_modulus = coefficient_modulus;
+    prepared.poly_count = poly_count;
+    prepared.columns = columns;
+    prepared.full_ncol = full_ncol;
+    prepared.col_offset = col_offset;
+    prepared.n = n;
+    prepared.limb_count = limbs;
+    prepared.blocks = blocks;
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = 0;
+    for (size_t limb = 0; limb < limbs; ++limb)
+    {
+        const dim3 id = out->ctx->limb_gpu_ids[limb];
+        status = matrix_limb_device(out, id, &device);
+        if (status != 0) return status;
+        if (id.x >= out->shared_limb_buffers.size())
+            return set_error("invalid saved sampling partition");
+        const auto &buffer = out->shared_limb_buffers[id.x];
+        size_t stride = 0;
+        uint8_t width = 0;
+        if (!buffer.device_descriptors || id.y >= buffer.limb_count ||
+            !matrix_limb_ptr_by_id(out, 0, id) ||
+            !matrix_limb_metadata_by_id(out, id, &stride, &width) || width == 0 || width > 8 ||
+            stride < n * width || !out->ctx->moduli[limb])
+            return set_error("invalid saved sampling descriptor");
+        if (limb == 0)
+        {
+            prepared.device = device;
+            prepared.layout.descriptors = buffer.device_descriptors;
+            status = matrix_limb_stream(out, id, &stream);
+            if (status != 0 || !stream)
+                return status ? status : set_error("invalid saved sampling stream");
+        }
+        else if (device != prepared.device || prepared.layout.descriptors != buffer.device_descriptors)
+            return set_error("saved sampling requires one device and descriptor partition");
+        prepared.layout.indices[limb] = id.y;
+        prepared.layout.moduli[limb] = out->ctx->moduli[limb];
+        dim3 key_id{};
+        GpuPreparedResourceKey key{};
+        status = gpu_prepared_limb_key(out->ctx, out->level, limb,
+            GPU_PREPARED_STAGE_SAMPLING, &key_id, &key);
+        if (status != 0 || gpu_prepared_require_allocation(descriptor, limb,
+                GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0)
+            return set_error("saved sampling completion differs from descriptor");
+        const auto &event_entry = descriptor->allocations[limb];
+        if (event_entry.rows != 0 || event_entry.columns != 0 ||
+            event_entry.level != -1 || event_entry.format != -1)
+            return set_error("saved sampling completion metadata is invalid");
+    }
+    const auto &sampling_stream = descriptor->streams[0];
+    if (sampling_stream.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        gpu_prepared_require_stream_slot(out->ctx, out->ctx->limb_gpu_ids[0].x, stream,
+            sampling_stream.pool_slot) != 0)
+        return set_error("saved sampling owner stream differs from descriptor");
+    prepared.stream = stream;
+    dim3 sampling_limb{};
+    GpuPreparedResourceKey sampling_key{};
+    status = gpu_prepared_limb_key(out->ctx, out->level, 0,
+        GPU_PREPARED_STAGE_SAMPLING, &sampling_limb, &sampling_key);
+    if (status != 0 || std::memcmp(&sampling_stream.key, &sampling_key, sizeof(sampling_key)) != 0)
+        return set_error("saved sampling stream key differs from descriptor");
+    if (!has_transform) return 0;
+
+    dim3 first_limb{};
+    GpuPreparedResourceKey ntt_key{};
+    status = gpu_prepared_limb_key(out->ctx, out->level, 0,
+        GPU_PREPARED_STAGE_NTT, &first_limb, &ntt_key);
+    if (status != 0) return status;
+    const auto &allocation = descriptor->allocations[limbs];
+    if (descriptor->launch_count > limit / sizeof(GpuPreparedNttLaunchLayout) ||
+        gpu_prepared_require_allocation(descriptor, limbs, GPU_PREPARED_PLAN_HOST_ONLY,
+            &ntt_key, descriptor->launch_count * sizeof(GpuPreparedNttLaunchLayout), alignof(void *)) != 0 ||
+        allocation.rows != 0 || allocation.columns != 0 || allocation.level != -1 || allocation.format != -1)
+        return set_error("saved sampling transform allocation differs from descriptor");
+    const auto &stream_entry = descriptor->streams[0];
+    if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        gpu_prepared_require_stream_slot(out->ctx, first_limb.x, stream, stream_entry.pool_slot) != 0 ||
+        std::memcmp(&stream_entry.key, &sampling_key, sizeof(sampling_key)) != 0)
+        return set_error("saved sampling transform stream differs from descriptor");
+    ntt_descriptor = GpuPreparedPlanDescriptor{};
+    ntt_descriptor.allocation_count = 1;
+    ntt_descriptor.allocations[0] = allocation;
+    ntt_descriptor.stream_count = 1;
+    ntt_descriptor.streams[0] = GpuPreparedStreamFootprint{ntt_key,
+        GPU_PREPARED_STREAM_CONTEXT_REUSED, stream_entry.pool_slot};
+    ntt_descriptor.launch_count = descriptor->launch_count;
+    for (size_t index = 0; index < descriptor->launch_count; ++index)
+        ntt_descriptor.launches[index] = descriptor->launches[index];
+    return 0;
+}
+
+static int construct_saved_sampling_resources(
+    GpuPreparedSampling &prepared)
+{
+    for (size_t limb = 0; limb < prepared.limb_count; ++limb)
+    {
+        auto event = std::make_unique<GpuCudaResource>();
+        const int status = event->acquire(
+            prepared.out->ctx, prepared.device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) return status;
+        prepared.completion[limb] = std::move(event);
+    }
+    prepared.completed_event = prepared.completion[0]->event;
+    return 0;
+}
+
+static int prepare_sampling_legacy_impl(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
+    size_t full_ncol,
+    size_t col_offset,
+    const GpuMatrixRange *range,
+    GpuPreparedSampling **plan)
+{
+    if (!plan) return set_error("null prepared sampling output");
+    *plan = nullptr;
+    try {
+        auto prepared = std::make_unique<GpuPreparedSampling>();
+        const int status = prepare_sampling_layout(
+            out, dist_type, sigma, max_coefficient_bound, coefficient_modulus,
+            full_ncol, col_offset, range, *prepared);
+        if (status != 0) return status;
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+extern "C" int gpu_matrix_prepare_sampling_with_layout(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
+    size_t full_ncol,
+    size_t col_offset,
+    const GpuMatrixRange *range,
+    const GpuPreparedPlanDescriptor *layout,
+    GpuPreparedSampling **plan)
+{
+    if (!layout || !plan || gpu_prepared_validate_descriptor(layout) != 0)
+        return set_error("prepared sampling layout is missing");
+    *plan = nullptr;
+    // validate_saved_sampling_descriptor performs the
+    // gpu_prepared_require_allocation and gpu_prepared_require_stream_slot
+    // checks before any completion event or transform is acquired.
+    try
+    {
+        auto prepared = std::make_unique<GpuPreparedSampling>();
+        GpuPreparedPlanDescriptor ntt_descriptor{};
+        const int status = validate_saved_sampling_descriptor(
+            out, dist_type, sigma, max_coefficient_bound, coefficient_modulus,
+            full_ncol, col_offset, range, layout, *prepared, ntt_descriptor);
+        if (status != 0) return status;
+        const bool has_transform = out->format == GPU_POLY_FORMAT_EVAL && prepared->poly_count != 0;
+        if (has_transform)
+        {
+            // This direct NTT bind validates and materializes the saved launch
+            // table before any sampling completion event is acquired.
+            const int transform_status = gpu_matrix_prepare_ntt_plan_with_layout(
+                out, &prepared->range, true, &ntt_descriptor, &prepared->transform);
+            if (transform_status != 0) return transform_status;
+        }
+        const int resource_status = construct_saved_sampling_resources(*prepared);
+        if (resource_status != 0) return resource_status;
+        *plan = prepared.release();
+        return 0;
+    }
+    catch (const std::exception &error) { return set_error(error.what()); }
+}
+
+// Standalone non-prepared sampling API. Prepared runtime callers use the
+// descriptor-driven entry above; this entry remains for direct primitive use.
+extern "C" int gpu_matrix_prepare_sampling(
+    GpuMatrix *out,
+    int dist_type,
+    double sigma,
+    uint64_t max_coefficient_bound,
+    uint64_t coefficient_modulus,
+    size_t full_ncol,
+    size_t col_offset,
+    const GpuMatrixRange *range,
+    GpuPreparedSampling **plan)
+{
+    return prepare_sampling_legacy_impl(
+        out, dist_type, sigma, max_coefficient_bound, coefficient_modulus,
+        full_ncol, col_offset, range, plan);
+}
+
+extern "C" int gpu_matrix_submit_sampling(
+    const GpuPreparedSampling *opaque,
+    GpuRngSeed seed)
+{
+    if (!opaque || !opaque->out || !opaque->stream)
+        return set_error("invalid prepared sampling plan");
+    auto *prepared = const_cast<GpuPreparedSampling *>(opaque);
+    int status = cudaSetDevice(prepared->device);
+    if (status != cudaSuccess) return set_error(static_cast<cudaError_t>(status));
+    if (prepared->completed_event) {
+        const auto error = cudaStreamWaitEvent(prepared->stream, prepared->completed_event, 0);
+        if (error != cudaSuccess) return set_error(error);
+    }
+    status = matrix_wait_all_limb_streams(prepared->out, prepared->device, prepared->stream, true);
+    if (status != 0) return status;
+    if (prepared->poly_count != 0) {
+        gpu_test_record_kernel_launch();
+        matrix_sample_distribution_multi_limb_kernel<<<
+            dim3(prepared->blocks, 1, prepared->limb_count), 256, 0, prepared->stream>>>(
+            prepared->layout,
+            prepared->poly_count,
+            prepared->columns,
+            prepared->full_ncol,
+            prepared->col_offset,
+            prepared->n,
+            prepared->dist_type,
+            prepared->sigma,
+            prepared->max_coefficient_bound,
+            prepared->coefficient_modulus,
+            seed);
+        cudaError_t error = cudaGetLastError();
+        if (error != cudaSuccess) return set_error(error);
+        status = matrix_record_all_limb_writes(prepared->out, prepared->stream);
+        if (status != 0) return status;
+    }
+    if (prepared->transform)
+    {
+        status = gpu_matrix_submit_ntt_plan(prepared->transform, prepared->out);
+        if (status != 0) return status;
+    }
+    for (size_t limb = 0; limb < prepared->limb_count; ++limb)
+    {
+        if (!prepared->completion[limb]) continue;
+        const cudaError_t error = cudaEventRecord(prepared->completion[limb]->event, prepared->stream);
+        if (error != cudaSuccess) return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" void gpu_matrix_destroy_sampling(GpuPreparedSampling *plan)
+{
+    delete plan;
 }

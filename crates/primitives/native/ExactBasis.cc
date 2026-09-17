@@ -435,6 +435,132 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
     return std::make_unique<openfhe::DCRTPoly>(std::move(output));
 }
 
+namespace {
+uint64_t residue_product(uint64_t lhs, uint64_t rhs, uint64_t modulus) {
+    return static_cast<uint64_t>((static_cast<unsigned __int128>(lhs) * rhs) % modulus);
+}
+uint64_t residue_difference(uint64_t lhs, uint64_t rhs, uint64_t modulus) {
+    return lhs >= rhs ? lhs - rhs : modulus - (rhs - lhs);
+}
+struct CenteredConversionPlan {
+    std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters;
+    std::vector<size_t> selected, retained;
+    std::vector<uint64_t> primes, garner, scales, products, division_inverses;
+};
+}
+
+// Reuses the exact-basis/NTT plumbing of PR #157. Unlike its centered
+// CRT-term sum, this computes the canonical representative of the complete
+// source (or dropped) product. Ciphertext coefficients never become BigInteger.
+std::unique_ptr<openfhe::DCRTPoly> exact_centered_conversion(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli,
+    uint32_t destination_dimension, uint64_t plaintext_modulus) {
+    auto source = input.GetPoly();
+    const auto dimension = source.GetRingDimension();
+    if (dimension != destination_dimension) throw std::invalid_argument("ring dimension mismatch");
+    const bool down = plaintext_modulus != 0;
+    std::vector<uint64_t> source_primes;
+    for (const auto &tower : source.GetAllElements())
+        source_primes.push_back(tower.GetModulus().ConvertToInt());
+    using Key = std::tuple<uint32_t, std::vector<uint64_t>, std::vector<uint64_t>, uint64_t>;
+    const Key key(dimension, source_primes, std::vector<uint64_t>(moduli.begin(), moduli.end()), plaintext_modulus);
+    thread_local std::map<Key, CenteredConversionPlan> plans;
+    auto found = plans.find(key);
+    if (found == plans.end()) {
+        exact_basis_validate(dimension, moduli);
+        CenteredConversionPlan plan;
+        plan.parameters = parameters_for_basis(dimension, moduli);
+        if (down) {
+            if (moduli.size() >= source_primes.size())
+                throw std::invalid_argument("block ModSwitch needs a strict CRT subset");
+            for (const auto prime : moduli) {
+                const auto index = std::find(source_primes.begin(), source_primes.end(), prime);
+                if (index == source_primes.end())
+                    throw std::invalid_argument("block ModSwitch destination is not a CRT subset");
+                plan.retained.push_back(index - source_primes.begin());
+            }
+        } else {
+            for (const auto prime : source_primes)
+                if (std::find(moduli.begin(), moduli.end(), prime) == moduli.end())
+                    throw std::invalid_argument("centered extension destination must contain the source basis");
+        }
+        for (size_t i = 0; i < source_primes.size(); ++i) {
+            const uint64_t prime = source_primes[i];
+            if (!down || std::find(moduli.begin(), moduli.end(), prime) == moduli.end()) {
+                plan.selected.push_back(i);
+                plan.primes.push_back(prime);
+                plan.scales.push_back(down ? lbcrypto::NativeInteger(plaintext_modulus % prime)
+                    .ModInverse(lbcrypto::NativeInteger(prime)).ConvertToInt() : 1);
+            }
+            if (down && plaintext_modulus % prime == 0)
+                throw std::invalid_argument("plaintext modulus must be coprime to all ciphertext primes");
+        }
+        const size_t count = plan.primes.size();
+        plan.garner.resize(count * count);
+        for (size_t i = 0; i < count; ++i)
+            for (size_t j = 0; j < i; ++j)
+                plan.garner[j * count + i] = lbcrypto::NativeInteger(plan.primes[j] % plan.primes[i])
+                    .ModInverse(lbcrypto::NativeInteger(plan.primes[i])).ConvertToInt();
+        for (const uint64_t prime : moduli) {
+            uint64_t product = 1;
+            for (const uint64_t radix : plan.primes)
+                product = residue_product(product, radix % prime, prime);
+            plan.products.push_back(product);
+            plan.division_inverses.push_back(down ? lbcrypto::NativeInteger(product)
+                .ModInverse(lbcrypto::NativeInteger(prime)).ConvertToInt() : 1);
+        }
+        // Bound public host metadata across parameter searches.
+        if (plans.size() >= 16) plans.clear();
+        found = plans.emplace(key, std::move(plan)).first;
+    }
+    const auto &plan = found->second;
+    transform_format(source, Format::COEFFICIENT);
+    lbcrypto::DCRTPoly output(plan.parameters, Format::COEFFICIENT, true);
+    // O(number of towers) scratch per worker, independent of ring dimension.
+    // Secret-dependent centering never exits early and uses no full-width CRT.
+#pragma omp parallel num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(dimension))
+    {
+        const size_t count = plan.primes.size();
+        std::vector<uint64_t> digits(count);
+#pragma omp for
+        for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t prime = plan.primes[i];
+                uint64_t digit = residue_product(source.GetElementAtIndex(plan.selected[i])
+                    .GetValues()[coefficient].ConvertToInt(), plan.scales[i], prime);
+                for (size_t j = 0; j < i; ++j)
+                    digit = residue_product(residue_difference(digit, digits[j] % prime, prime),
+                        plan.garner[j * count + i], prime);
+                digits[i] = digit;
+            }
+            bool negative = false;
+            for (size_t i = 0; i < count; ++i) {
+                const uint64_t half = plan.primes[i] / 2;
+                negative = (digits[i] > half) | ((digits[i] == half) & negative);
+            }
+            for (size_t target = 0; target < moduli.size(); ++target) {
+                const uint64_t prime = moduli[target];
+                uint64_t value = 0;
+                for (size_t i = count; i-- > 0;)
+                    value = static_cast<uint64_t>((static_cast<unsigned __int128>(value) *
+                        plan.primes[i] + digits[i]) % prime);
+                const uint64_t correction = plan.products[target] & (uint64_t{0} - uint64_t(negative));
+                value = residue_difference(value, correction, prime);
+                if (down) {
+                    const uint64_t original = source.GetElementAtIndex(plan.retained[target])
+                        .GetValues()[coefficient].ConvertToInt();
+                    value = residue_product(residue_difference(original,
+                        residue_product(plaintext_modulus % prime, value, prime), prime),
+                        plan.division_inverses[target], prime);
+                }
+                output.GetAllElements()[target][coefficient] = lbcrypto::NativeInteger(value);
+            }
+        }
+    }
+    transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
+}
+
 std::unique_ptr<openfhe::DCRTPoly> exact_basis_poly(
     uint32_t dimension, rust::Slice<const uint64_t> moduli,
     rust::Slice<const uint64_t> values, size_t limbs_per_integer, bool evaluation) {

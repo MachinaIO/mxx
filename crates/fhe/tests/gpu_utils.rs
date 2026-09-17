@@ -12,10 +12,6 @@ use mxx_runtime::{
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, time::Instant};
 pub type Inputs = BTreeMap<String, RuntimeValue<GpuDcrtBackend>>;
-#[path = "../src/gpu_test_utils.rs"]
-mod gpu_test_utils;
-pub use gpu_test_utils::configure_widths;
-
 pub fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend {
     let rings = if let Some(bgv) = bgv {
         bgv.runtime_parameters().unwrap()
@@ -40,10 +36,18 @@ pub fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
     )
 }
 
-pub fn compile(graph: BuiltGraph, backend: &mut GpuDcrtBackend) -> ValidatedGraph {
+pub fn compile(graph: BuiltGraph, _backend: &mut GpuDcrtBackend) -> ValidatedGraph {
     let graph = graph.validate(&ParamEnv::default()).expect("valid integration graph");
-    configure_widths(backend, &graph);
     graph
+}
+
+/// Completes the non-timed setup boundary for one graph and input contract.
+/// Compilation, prepared lowering and fixed input-slot creation belong here;
+/// repeated runs must only bind their current inputs and execute the tape.
+pub fn setup(graph: &ValidatedGraph, backend: &mut GpuDcrtBackend, inputs: &Inputs) {
+    backend
+        .warm_up_prepared_graph(graph, inputs, &mxx_runtime::ExecutionConfig::default())
+        .expect("GPU prepared graph warmup");
 }
 
 /// Includes production execution, output retrieval and result-event completion.
@@ -51,6 +55,7 @@ pub fn compile(graph: BuiltGraph, backend: &mut GpuDcrtBackend) -> ValidatedGrap
 /// keygen/encryption outputs may persist artifacts and are measured separately.
 /// No device-wide synchronization, decryption, or correctness diagnostics are timed.
 pub fn run(graph: &ValidatedGraph, backend: &mut GpuDcrtBackend, inputs: Inputs) -> (Inputs, f64) {
+    setup(graph, backend, &inputs);
     let mut store = MemoryArtifactStore::default();
     // Complete releases from the preceding oracle or input preparation before
     // measuring this call. Default execute keeps releases asynchronous; output
@@ -60,11 +65,11 @@ pub fn run(graph: &ValidatedGraph, backend: &mut GpuDcrtBackend, inputs: Inputs)
     let start = Instant::now();
     let mut result =
         execute(graph, backend, inputs, &mut store, SamplingMode::Fresh).expect("GPU execution");
-    for name in result.outputs.keys().cloned().collect::<Vec<_>>() {
+    for name in result.output_names().map(str::to_owned).collect::<Vec<_>>() {
         if let RuntimeValue::Matrix(matrix) =
             result.materialize_output(&name, backend, &mut store).expect("materialize GPU output")
         {
-            matrix.wait_until_ready();
+            matrix.wait_until_ready().expect("GPU matrix output must become ready");
         }
     }
     let seconds = start.elapsed().as_secs_f64();
@@ -97,5 +102,5 @@ pub fn centered(value: &BigInt, modulus: &BigUint) -> BigInt {
 pub fn matrix_bytes(value: &RuntimeValue<GpuDcrtBackend>, backend: &GpuDcrtBackend) -> Vec<u8> {
     use mxx_runtime::backend::Backend;
     let RuntimeValue::Matrix(matrix) = value else { panic!("materialized matrix") };
-    backend.matrix_to_bytes(matrix)
+    backend.matrix_to_bytes(matrix).expect("export matrix bytes")
 }

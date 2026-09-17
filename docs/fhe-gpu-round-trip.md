@@ -201,8 +201,12 @@ policy. `ExecutionConfig::release_fence_interval = Some(...)` explicitly opts
 into periodic release fences and a final drain; `None` leaves releases protected
 by lifetime events and context teardown. Consequently, allocator memory can
 remain queued after a default execution returns, and errors arising only during
-reclamation may be observed at a later explicit release fence. Persisted-output timings
-from earlier development runs are excluded from the primary comparison.
+reclamation may be observed at a later explicit release fence. Prepared-pool
+executions use the same asynchronous ownership principle but are not governed by
+the ordinary executor's `release_fence_interval`: a prepared submission either
+acquires a free slot or returns `Busy` immediately, and slot recycling is driven
+by its recorded terminal event. Persisted-output timings from earlier development
+runs are excluded from the primary comparison.
 Graph construction/validation, input generation, key generation, encryption,
 decryption, and correctness diagnostics are outside evaluation timing. A warmup
 precedes each series. mxx does not currently expose an aggregate CUDA-event time
@@ -551,7 +555,7 @@ The working tree reduces allocation and dispatch overhead for BGV multiplication
 ### Implementation
 
 - **Tensor row sums.** The runtime recognizes a Tensor whose consumers are all covered by one eligible row-sum plan. It captures both operands at the original Tensor position and evaluates the selected tensor rows directly, avoiding the materialized tensor and separate row-sum allocation. Traced execution, an exported or retained tensor, mixed consumers, and multiple plans sharing the tensor retain the original tensor boundary. Argument materialization order, original node progress and liveness processing, and output staging remain intact. See [runtime planning and dispatch](../crates/runtime/src/executor.rs), [generic matrix interface](../crates/primitives/src/matrix/mod.rs), and [CUDA arithmetic](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
-- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/gpu_test_utils.rs).
+- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/tests/gpu_utils.rs).
 - **One allocation for data and auxiliary storage.** Each matrix partition allocates its coefficient data, aligned auxiliary pointer slots, and device descriptors together. The data buffer owns the allocation; the auxiliary pointer is a non-owning interior view. Accounting includes alignment padding, while peer copies retain the logical coefficient-data size and exclude auxiliary pointers. Existing completion dependencies protect the single asynchronous free. See [matrix allocation and destruction](../crates/primitives/cuda/src/matrix/MatrixData.cu).
 - **Less repeated host work.** The guarded root plan stores resolved argument WireRefs. Singleton execution borrows batch metadata instead of allocating singleton vectors and cloning parameter bindings; its calibration dispatch also avoids allocating group/index vectors. Private scratch production identity is initialized only when a streamed family is registered, once per execution. Public production identity remains unchanged. See [executor](../crates/runtime/src/executor.rs).
 - **Reuse of an existing completion event.** The grouped arithmetic path can supply its already-recorded output completion to consumer tracking, avoiding redundant temporary event records. Source producer-stream joins and source lifetime protection remain in place; this does not introduce a matrix allocation cache. See [consumer tracking](../crates/primitives/cuda/src/matrix/MatrixUtils.cu) and [grouped arithmetic dispatch](../crates/primitives/cuda/src/matrix/MatrixArith.cu).

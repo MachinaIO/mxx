@@ -1,5 +1,4 @@
 //! WE-owned decoder semantics for application-independent protocol Lean export.
-pub mod check;
 pub mod diamond;
 pub mod numeric;
 

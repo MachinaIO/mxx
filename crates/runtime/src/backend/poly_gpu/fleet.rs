@@ -1,13 +1,136 @@
-use super::super::poly::{
-    PolyBackend, PolyBackendError, decode_small_matrix_artifact, encode_small_matrix_artifact,
+use super::{
+    super::poly::{PolyBackend, PolyBackendError, encode_small_matrix_artifact},
+    gpu_prepared_lowering,
 };
+
+pub(crate) fn prepared_runtime_value(
+    value: &crate::backend::RuntimeValue<GpuDcrtBackend>,
+) -> Result<super::PreparedRuntimeValue, PolyBackendError> {
+    match value {
+        crate::backend::RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            Ok(super::PreparedRuntimeValue::HostMatrix {
+                matrix_type: matrix_type.clone(),
+                bytes: bytes.as_ref().clone().into_boxed_slice(),
+                staging_contract: None,
+            })
+        }
+        crate::backend::RuntimeValue::Matrix(value) => {
+            Ok(super::PreparedRuntimeValue::FleetMatrix(Arc::clone(value)))
+        }
+        crate::backend::RuntimeValue::SmallMatrix(value) => {
+            Ok(super::PreparedRuntimeValue::FleetSmallMatrix(Arc::clone(value)))
+        }
+        crate::backend::RuntimeValue::Int(value) => {
+            Ok(super::PreparedRuntimeValue::Int(value.clone()))
+        }
+        crate::backend::RuntimeValue::Real(value) => Ok(super::PreparedRuntimeValue::Real(*value)),
+        crate::backend::RuntimeValue::Bool(value) => Ok(super::PreparedRuntimeValue::Bool(*value)),
+        crate::backend::RuntimeValue::Bytes(value) => {
+            Ok(super::PreparedRuntimeValue::Bytes(value.as_slice().to_owned().into_boxed_slice()))
+        }
+        crate::backend::RuntimeValue::TypedBlob(value) => Ok(
+            super::PreparedRuntimeValue::TypedBlob(value.as_slice().to_owned().into_boxed_slice()),
+        ),
+        crate::backend::RuntimeValue::IndexedFamily(values) => {
+            let members =
+                values.iter().map(prepared_runtime_value).collect::<Result<Vec<_>, _>>()?;
+            Ok(super::PreparedRuntimeValue::Family(members.into()))
+        }
+        crate::backend::RuntimeValue::Trapdoor {
+            secret: Some(secret),
+            public,
+            matrix_type,
+            sigma,
+            gadget_base,
+            digit_count,
+            gadget_small,
+        } => Ok(super::PreparedRuntimeValue::Trapdoor {
+            secret: Arc::clone(secret),
+            public: Arc::clone(public),
+            matrix_type: matrix_type.clone(),
+            sigma: *sigma,
+            gadget_base: gadget_base.clone(),
+            digit_count: *digit_count,
+            gadget_small: *gadget_small,
+        }),
+        _ => Err(PolyBackendError::GpuSubmission(
+            "prepared input kind has no fixed runtime binding".into(),
+        )),
+    }
+}
+
+/// Convert warmup inputs to metadata-only prepared values. Host staging is
+/// validated before reservation; the generic prepared builder later binds
+/// each device's reserved upload target without materializing a source owner.
+pub(crate) fn prepared_runtime_value_for_warmup(
+    backend: &mut GpuDcrtBackend,
+    value: &crate::backend::RuntimeValue<GpuDcrtBackend>,
+) -> Result<super::PreparedRuntimeValue, PolyBackendError> {
+    match value {
+        crate::backend::RuntimeValue::HostMatrix { matrix_type, bytes } => {
+            let (layout, device_parameters) =
+                prepared_host_matrix_contract(backend, matrix_type, bytes)?;
+            Ok(super::PreparedRuntimeValue::HostMatrix {
+                matrix_type: matrix_type.clone(),
+                bytes: bytes.as_ref().clone().into_boxed_slice(),
+                staging_contract: Some(PreparedHostMatrixContract {
+                    layout,
+                    device_parameters: device_parameters.into_boxed_slice(),
+                }),
+            })
+        }
+        crate::backend::RuntimeValue::IndexedFamily(values) => {
+            let members = values
+                .iter()
+                .map(|value| prepared_runtime_value_for_warmup(backend, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(super::PreparedRuntimeValue::Family(members.into()))
+        }
+        _ => prepared_runtime_value(value),
+    }
+}
+
+fn prepared_host_matrix_contract(
+    backend: &GpuDcrtBackend,
+    matrix_type: &ConcreteMatrixType,
+    bytes: &[u8],
+) -> Result<
+    (
+        mxx_primitives::matrix::gpu_dcrt_poly::GpuCpuStagingLayout,
+        Vec<(i32, mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams)>,
+    ),
+    PolyBackendError,
+> {
+    let mut layout = None;
+    let mut device_parameters = Vec::with_capacity(backend.devices.len());
+    for (device_id, device) in &backend.devices {
+        let parameters = device
+            .parameters(matrix_type)
+            .map_err(|_| PolyBackendError::InvalidConstantShape)?
+            .clone();
+        let device_layout = GpuDCRTPolyMatrix::cpu_staging_layout(&parameters, bytes)
+            .map_err(PolyBackendError::GpuSubmission)?;
+        if let Some(expected) = layout {
+            if expected != device_layout {
+                return Err(PolyBackendError::GpuSubmission(
+                    "GPU RNS staging layout differs between prepared device contexts".into(),
+                ));
+            }
+        } else {
+            layout = Some(device_layout);
+        }
+        device_parameters.push((*device_id, parameters));
+    }
+    let layout = layout.ok_or(PolyBackendError::InvalidConstantShape)?;
+    Ok((layout, device_parameters))
+}
+
 use crate::{
-    backend::{Backend, IndexRange, MatrixMulAccumulateRequest, SampleRange},
-    gpu_calibration::{
-        FrozenGpuCalibrationRegistry, GpuCalibrationError, GpuCalibrationKey,
-        GpuCalibrationProfile, GpuColumnWidths, GpuDeviceCalibration, GpuDeviceMemory,
-        gpu_capped_waterfill_columns, gpu_matrix_multiply_scales_left,
+    backend::{
+        Backend, ExecutionStrategy, IndexRange, MatrixMulAccumulateRequest, PreimageTarget,
+        SampleRange,
     },
+    transcript::{SamplingMode, TranscriptRecorder, TranscriptReplayer},
 };
 use mxx_ir_core::{
     ParamEnv,
@@ -17,38 +140,41 @@ use mxx_ir_core::{
 };
 use mxx_primitives::{
     matrix::{
-        PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallPolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
+        PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix,
+        gpu_dcrt_poly::{
+            GpuDCRTMatrixRnsSnapshot, GpuDCRTPolyMatrix, GpuRnsSnapshotTransfer, GpuSmallMatrix,
+        },
     },
     poly::{
         PolyParams,
-        dcrt::gpu::{
-            GpuDCRTPolyParams, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
-            gpu_device_identity, gpu_device_memory_usage,
-        },
+        dcrt::gpu::{GpuDCRTPolyParams, gpu_device_identity},
     },
     sampler::{
-        DistType, PolyHashSampler,
         gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
         trapdoor::{GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor},
     },
 };
 use num_bigint::BigInt;
-use num_traits::ToPrimitive;
 use rayon::prelude::*;
 use std::{
-    borrow::Cow,
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     fmt,
     sync::{
-        Arc, Weak,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
 };
 
-const SHARED_POOL_CALIBRATION_ERROR: &str =
-    "GPU calibration cannot reset a pool shared by multiple contexts";
-const MAX_RUNTIME_PILOT_ATTEMPTS: usize = 4;
+#[path = "gpu_inventory.rs"]
+pub(crate) mod gpu_inventory;
+#[path = "gpu_prepare.rs"]
+mod gpu_prepare;
+use super::gpu_prepared::{PreparedGpuProgram, PreparedHostMatrixContract};
+pub(crate) use gpu_inventory::PreparedScheduleStreamKey;
+pub use gpu_prepare::{
+    MatrixDescriptor as GpuMatrixDescriptor,
+    MatrixFragmentDescriptor as GpuMatrixFragmentDescriptor,
+};
 
 type DeviceBackend = PolyBackend<
     GpuDCRTPolyMatrix,
@@ -60,6 +186,15 @@ type DeviceBackend = PolyBackend<
 static NEXT_FLEET_VALUE_ID: AtomicU64 = AtomicU64::new(1);
 
 type CompactMatrixEncoding = (u8, u8, u32, usize, usize, u16, u16, Vec<u8>);
+
+impl GpuDcrtBackend {
+    fn start_rns_snapshot<'a>(
+        &mut self,
+        matrix: &'a GpuDCRTPolyMatrix,
+    ) -> Result<GpuRnsSnapshotTransfer<'a>, PolyBackendError> {
+        Ok(matrix.start_rns_snapshot(self.rns_staging_buffers.pop()))
+    }
+}
 
 fn decode_compact_matrix(bytes: &[u8]) -> Result<CompactMatrixEncoding, PolyBackendError> {
     bincode::decode_from_slice(bytes, bincode::config::standard())
@@ -74,76 +209,33 @@ fn copy_packed_bits(
     destination_bit: usize,
     bit_count: usize,
 ) {
-    for bit in 0..bit_count {
-        if (source[(source_bit + bit) / 8] >> ((source_bit + bit) % 8)) & 1 != 0 {
-            destination[(destination_bit + bit) / 8] |= 1 << ((destination_bit + bit) % 8);
+    let mut copied = 0;
+    while copied < bit_count && (destination_bit + copied) % 8 != 0 {
+        let bit = (source[(source_bit + copied) / 8] >> ((source_bit + copied) % 8)) & 1;
+        destination[(destination_bit + copied) / 8] |= bit << ((destination_bit + copied) % 8);
+        copied += 1;
+    }
+    let bytes = (bit_count - copied) / 8;
+    let source_start = (source_bit + copied) / 8;
+    let target_start = (destination_bit + copied) / 8;
+    let shift = (source_bit + copied) % 8;
+    let target = &mut destination[target_start..target_start + bytes];
+    if shift == 0 {
+        for (target, source) in target.iter_mut().zip(&source[source_start..source_start + bytes]) {
+            *target |= source;
+        }
+    } else {
+        for (index, target) in target.iter_mut().enumerate() {
+            *target |= (source[source_start + index] >> shift) |
+                (source[source_start + index + 1] << (8 - shift));
         }
     }
-}
-
-fn preimage_seed_column_start(
-    source_global_column_start: usize,
-    wave_local_start: usize,
-) -> Result<usize, PolyBackendError> {
-    source_global_column_start.checked_add(wave_local_start).ok_or(PolyBackendError::InvalidInteger)
-}
-
-fn fleet_column_ranges(
-    device_count: usize,
-    columns: usize,
-    widths: GpuColumnWidths,
-) -> Vec<(usize, usize, usize)> {
-    assert!(device_count > 0, "a GPU fleet needs at least one device");
-    let mut ranges = Vec::new();
-    let mut start = 0usize;
-    while start < columns {
-        let assigned = gpu_capped_waterfill_columns(widths, device_count, columns - start)
-            .expect("validated GPU column capacities");
-        for (device, width) in assigned.into_iter().enumerate() {
-            let end = start.saturating_add(width).min(columns);
-            if start < end {
-                ranges.push((device, start, end));
-                start = end;
-            }
-        }
+    copied += bytes * 8;
+    while copied < bit_count {
+        let bit = (source[(source_bit + copied) / 8] >> ((source_bit + copied) % 8)) & 1;
+        destination[(destination_bit + copied) / 8] |= bit << ((destination_bit + copied) % 8);
+        copied += 1;
     }
-    ranges
-}
-
-fn fleet_column_wave(
-    device_count: usize,
-    start: usize,
-    columns: usize,
-    widths: GpuColumnWidths,
-    duplicate_nonzero_pilot: bool,
-) -> Vec<(usize, usize, usize)> {
-    let assigned =
-        gpu_capped_waterfill_columns(widths, device_count, columns.saturating_sub(start))
-            .expect("validated GPU column capacities");
-    let mut next = start;
-    let mut wave = Vec::with_capacity(device_count);
-    for (device, width) in assigned.into_iter().enumerate() {
-        let end = next.saturating_add(width).min(columns);
-        if next < end {
-            wave.push((device, next, end));
-            next = end;
-        }
-    }
-    if duplicate_nonzero_pilot && device_count > 1 && start < columns {
-        let has_nonzero_role = wave.iter().any(|(device, _, _)| *device == 1);
-        if !has_nonzero_role {
-            wave.push((1, start, (start + 1).min(columns)));
-        }
-    }
-    wave
-}
-
-fn pilot_interval_was_contaminated(baseline: &[u64], used_current: &[u64]) -> bool {
-    baseline.iter().zip(used_current).any(|(baseline, current)| current < baseline)
-}
-
-fn contaminated_pilot_can_retry(attempts: usize) -> bool {
-    attempts < MAX_RUNTIME_PILOT_ATTEMPTS
 }
 
 fn fleet_context_vram_percent<T>(
@@ -179,61 +271,6 @@ fn fleet_context_vram_percent<T>(
     Ok(fleet_percent)
 }
 
-fn derive_runtime_widths(
-    profile: &GpuCalibrationProfile,
-    memory: &[(GpuDeviceMemory, usize, u64)],
-    vram_percent: u32,
-) -> Result<GpuColumnWidths, GpuCalibrationError> {
-    let widths = profile.derive_widths(
-        memory[0].0,
-        memory.get(1).map(|(memory, _, _)| *memory),
-        vram_percent,
-    )?;
-    Ok(widths
-        .constrain_for_live_contexts(memory[0].1, memory.get(1).map(|(_, contexts, _)| *contexts)))
-}
-
-fn tensor_column_segments(
-    start: usize,
-    end: usize,
-    right_columns: usize,
-) -> Vec<(usize, usize, usize)> {
-    assert!(right_columns > 0);
-    let mut segments = Vec::new();
-    let mut column = start;
-    while column < end {
-        let left_column = column / right_columns;
-        let right_start = column % right_columns;
-        let count = (right_columns - right_start).min(end - column);
-        segments.push((left_column, right_start, right_start + count));
-        column += count;
-    }
-    segments
-}
-
-fn diagonal_column_overlaps(
-    input_columns: &[usize],
-    start: usize,
-    end: usize,
-) -> Vec<Option<(usize, usize, usize)>> {
-    let mut offset = 0;
-    input_columns
-        .iter()
-        .map(|columns| {
-            let input_end = offset + columns;
-            let overlap_start = start.max(offset);
-            let overlap_end = end.min(input_end);
-            let overlap = if overlap_start < overlap_end {
-                Some((overlap_start - start, overlap_start - offset, overlap_end - offset))
-            } else {
-                None
-            };
-            offset = input_end;
-            overlap
-        })
-        .collect()
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuColumnShard<T> {
     pub device_id: i32,
@@ -246,7 +283,16 @@ pub struct GpuFleetMatrix {
     id: u64,
     rows: usize,
     columns: usize,
-    shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>,
+    // Logical aliases share native allocation and release ownership. Cloning a
+    // primitive matrix here would allocate a second, unreserved GPU payload.
+    shards: Arc<Vec<GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>>,
+    // Publish immutable source geometry with the actual owner. Execution and
+    // downstream preparation share this metadata without re-inspecting shards.
+    input_layout: Arc<[gpu_prepare::MatrixInputFragment]>,
+    // A prepared execution slot remains pinned while the returned resident
+    // value is alive. Ordinary values leave this empty.
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
+    prepared_codec_wire: Option<mxx_ir_core::types::WireRef>,
 }
 
 impl PartialEq for GpuFleetMatrix {
@@ -258,9 +304,86 @@ impl PartialEq for GpuFleetMatrix {
 impl Eq for GpuFleetMatrix {}
 
 impl GpuFleetMatrix {
-    fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>) -> Self {
+    pub fn new(
+        rows: usize,
+        columns: usize,
+        shards: Vec<GpuColumnShard<GpuDCRTPolyMatrix>>,
+    ) -> Self {
+        let shards = shards
+            .into_iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: Arc::new(shard.value),
+            })
+            .collect::<Vec<_>>();
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
-        Self { id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed), rows, columns, shards }
+        let input_layout = shards
+            .iter()
+            .map(|shard| gpu_prepare::MatrixInputFragment {
+                device: shard.device_id,
+                context: shard.value.params().context_identity(),
+                start: shard.global_column_start,
+                end: shard.global_column_start + shard.value.col_size(),
+                level: shard.value.level(),
+                evaluation: shard.value.is_ntt(),
+            })
+            .collect();
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            input_layout,
+            prepared_lease: None,
+            prepared_codec_wire: None,
+        }
+    }
+
+    pub(super) fn with_prepared_lease(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value
+    }
+
+    pub(super) fn with_prepared_codec_binding(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
+        wire: mxx_ir_core::types::WireRef,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value.prepared_codec_wire = Some(wire);
+        value
+    }
+
+    pub(super) fn from_shared_shards<I>(rows: usize, columns: usize, shards: I) -> Self
+    where
+        I: IntoIterator<Item = GpuColumnShard<Arc<GpuDCRTPolyMatrix>>>,
+    {
+        let shards = shards.into_iter().collect::<Vec<_>>();
+        validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        let input_layout = shards
+            .iter()
+            .map(|shard| gpu_prepare::MatrixInputFragment {
+                device: shard.device_id,
+                context: shard.value.params().context_identity(),
+                start: shard.global_column_start,
+                end: shard.global_column_start + shard.value.col_size(),
+                level: shard.value.level(),
+                evaluation: shard.value.is_ntt(),
+            })
+            .collect();
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            input_layout,
+            prepared_lease: None,
+            prepared_codec_wire: None,
+        }
     }
 
     pub fn from_matrix(value: GpuDCRTPolyMatrix) -> Self {
@@ -272,11 +395,16 @@ impl GpuFleetMatrix {
     pub fn size(&self) -> (usize, usize) {
         (self.rows, self.columns)
     }
-    pub fn shards(&self) -> &[GpuColumnShard<GpuDCRTPolyMatrix>] {
+
+    pub fn shards(&self) -> &[GpuColumnShard<Arc<GpuDCRTPolyMatrix>>] {
         &self.shards
     }
-    pub fn wait_until_ready(&self) {
-        self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+    pub fn wait_until_ready(&self) -> Result<(), String> {
+        self.shards.iter().try_for_each(|shard| shard.value.wait_until_ready_result())?;
+        if let Some(lease) = &self.prepared_lease {
+            lease.check_device_scalar_status()?;
+        }
+        Ok(())
     }
 }
 
@@ -287,67 +415,13 @@ impl From<GpuDCRTPolyMatrix> for GpuFleetMatrix {
 }
 
 #[derive(Clone, Debug)]
-struct FleetStagedColumnSource {
-    params: GpuDCRTPolyParams,
-    rows: usize,
-    columns: usize,
-    bytes: Arc<Vec<u8>>,
-}
-
-impl PolyMatrixColumnSource<GpuFleetMatrix> for FleetStagedColumnSource {
-    fn row_size(&self) -> usize {
-        self.rows
-    }
-
-    fn col_size(&self) -> usize {
-        self.columns
-    }
-
-    fn load_columns(&self, start: usize, end: usize) -> GpuFleetMatrix {
-        assert!(start <= end && end <= self.columns, "invalid fleet staging column interval");
-        GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_columns(
-            &self.params,
-            self.bytes.as_slice(),
-            start,
-            end,
-        ))
-    }
-}
-
-#[derive(Clone, Debug)]
-struct OffsetGpuColumnSource {
-    value: GpuDCRTPolyMatrix,
-    global_column_start: usize,
-}
-
-impl PolyMatrixColumnSource<GpuDCRTPolyMatrix> for OffsetGpuColumnSource {
-    fn resident_matrix(&self) -> Option<&GpuDCRTPolyMatrix> {
-        Some(&self.value)
-    }
-
-    fn row_size(&self) -> usize {
-        self.value.row_size()
-    }
-
-    fn col_size(&self) -> usize {
-        self.value.col_size()
-    }
-
-    fn global_column_start(&self) -> usize {
-        self.global_column_start
-    }
-
-    fn load_columns(&self, start: usize, end: usize) -> GpuDCRTPolyMatrix {
-        assert!(start <= end && end <= self.value.col_size(), "invalid GPU column interval");
-        self.value.slice_columns(start, end)
-    }
-}
-
-#[derive(Clone, Debug)]
 pub struct GpuFleetSmallMatrix {
+    id: u64,
     rows: usize,
     columns: usize,
-    shards: Vec<GpuColumnShard<GpuSmallMatrix>>,
+    // Keep compact allocations alive until the last logical alias is dropped.
+    shards: Arc<Vec<GpuColumnShard<Arc<GpuSmallMatrix>>>>,
+    prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
 }
 
 impl PartialEq for GpuFleetSmallMatrix {
@@ -359,9 +433,46 @@ impl PartialEq for GpuFleetSmallMatrix {
 impl Eq for GpuFleetSmallMatrix {}
 
 impl GpuFleetSmallMatrix {
-    fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
+    pub fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
-        Self { rows, columns, shards }
+        let shards = shards
+            .into_iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: Arc::new(shard.value),
+            })
+            .collect();
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            prepared_lease: None,
+        }
+    }
+
+    pub(super) fn with_prepared_lease(
+        mut value: Self,
+        lease: Arc<super::gpu_prepared::PreparedGpuSlotToken>,
+    ) -> Self {
+        value.prepared_lease = Some(lease);
+        value
+    }
+
+    pub(super) fn from_shared_shards<I>(rows: usize, columns: usize, shards: I) -> Self
+    where
+        I: IntoIterator<Item = GpuColumnShard<Arc<GpuSmallMatrix>>>,
+    {
+        let shards = shards.into_iter().collect::<Vec<_>>();
+        validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        Self {
+            id: NEXT_FLEET_VALUE_ID.fetch_add(1, Ordering::Relaxed),
+            rows,
+            columns,
+            shards: Arc::new(shards),
+            prepared_lease: None,
+        }
     }
 
     pub fn from_matrix(value: GpuSmallMatrix) -> Self {
@@ -373,11 +484,15 @@ impl GpuFleetSmallMatrix {
     pub fn size(&self) -> (usize, usize) {
         (self.rows, self.columns)
     }
-    pub fn shards(&self) -> &[GpuColumnShard<GpuSmallMatrix>] {
+    pub fn shards(&self) -> &[GpuColumnShard<Arc<GpuSmallMatrix>>] {
         &self.shards
     }
-    pub fn wait_until_ready(&self) {
-        self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+    pub fn wait_until_ready(&self) -> Result<(), String> {
+        self.shards.iter().try_for_each(|shard| shard.value.wait_until_ready_result())?;
+        if let Some(lease) = &self.prepared_lease {
+            lease.check_device_scalar_status()?;
+        }
+        Ok(())
     }
 }
 
@@ -387,30 +502,19 @@ impl From<GpuSmallMatrix> for GpuFleetSmallMatrix {
     }
 }
 
-trait PilotReady {
-    fn wait_for_pilot(&self);
-}
-
-impl PilotReady for GpuDCRTPolyMatrix {
-    fn wait_for_pilot(&self) {
-        self.wait_until_ready();
-    }
-}
-
-impl PilotReady for GpuSmallMatrix {
-    fn wait_for_pilot(&self) {
-        self.wait_until_ready();
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct GpuFleetTrapdoor {
-    values: Vec<GpuDCRTTrapdoor>,
+    pub(super) values: Arc<Vec<Arc<GpuDCRTTrapdoor>>>,
+    pub(super) prepared_lease: Option<Arc<super::gpu_prepared::PreparedGpuSlotToken>>,
 }
 
 impl GpuFleetTrapdoor {
-    pub fn wait_until_ready(&self) {
-        self.values.iter().for_each(GpuDCRTTrapdoor::wait_until_ready);
+    pub fn wait_until_ready(&self) -> Result<(), String> {
+        if let Some(lease) = &self.prepared_lease {
+            lease.wait_until_ready()?;
+        }
+        self.values.iter().try_for_each(|value| value.wait_until_ready_result())?;
+        Ok(())
     }
 }
 
@@ -438,29 +542,136 @@ impl fmt::Display for GpuFleetTrapdoor {
 }
 
 pub struct GpuDcrtBackend {
-    devices: Vec<(i32, DeviceBackend)>,
-    operation_widths: HashMap<[u8; 32], GpuColumnWidths>,
-    manual_widths: HashSet<[u8; 32]>,
-    operation_profiles: HashMap<[u8; 32], GpuCalibrationProfile>,
-    calibration_misses: HashSet<[u8; 32]>,
-    pending_profile: Option<([u8; 32], GpuCalibrationProfile)>,
-    pending_pilot: Option<RuntimePilot>,
-    active_operation: Option<[u8; 32]>,
-    calibration_registry: FrozenGpuCalibrationRegistry,
+    pub(super) devices: Vec<(i32, DeviceBackend)>,
     vram_percent: u32,
-    matrix_replicas: HashMap<(u64, usize), Weak<GpuDCRTPolyMatrix>>,
+    rns_staging_buffers: Vec<GpuDCRTMatrixRnsSnapshot>,
+    prepared_wave_bound: Option<std::num::NonZeroUsize>,
+    prepared_live_executions: Option<std::num::NonZeroUsize>,
+    prepared_graph: Option<PreparedGpuProgram>,
+    prepared_spec_hash: Option<[u8; 32]>,
+    prepared_ledger: Option<crate::gpu_memory::GpuMemoryLedger>,
 }
 
-struct RuntimePilot {
-    operation: [u8; 32],
-    baseline_bytes: Vec<u64>,
-    planned_memory: Vec<GpuDeviceMemory>,
-    context_generations: Vec<u64>,
-    attempts: usize,
+fn rollback_failed_warmup_ledger(
+    ledger: &mut Option<crate::gpu_memory::GpuMemoryLedger>,
+    had_ledger: bool,
+    checkpoint: Option<crate::gpu_memory::GpuWarmupCheckpoint>,
+) {
+    if had_ledger {
+        if let (Some(ledger), Some(checkpoint)) = (ledger.as_mut(), checkpoint) {
+            ledger.rollback_warmup(checkpoint);
+        }
+    } else {
+        // The first warmup may install the ledger while provisioning its
+        // initial backing. Roll back its speculative inventory but retain the
+        // ledger while release probes are pending; dropping it would destroy
+        // the only charge-owned completion resources and permit over-admit on
+        // an immediate retry.
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.rollback_all_warmup();
+        }
+    }
 }
 
 impl GpuDcrtBackend {
-    pub(super) fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
+    #[cfg(all(test, feature = "gpu-instrumentation"))]
+    pub(super) fn prepared_execution_for_test(&self) -> &PreparedGpuProgram {
+        self.prepared_graph.as_ref().expect("warmed execution")
+    }
+
+    /// Prepare a static graph at the explicit warmup boundary. Unsupported
+    /// topologies fail here; they are never silently executed by the prepared
+    /// replay path. Reusing the same validated graph is already warmed.
+    pub fn warm_up_prepared_graph(
+        &mut self,
+        validated: &mxx_ir_core::ValidatedGraph,
+        inputs: &BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        config: &crate::ExecutionConfig,
+    ) -> Result<(), PolyBackendError> {
+        let wave_bound = config.max_parallel_instances;
+        let live_executions = config.max_live_gpu_executions;
+        let spec_hash = validated.spec_hash();
+        if self.prepared_wave_bound == Some(wave_bound) &&
+            self.prepared_live_executions == Some(live_executions) &&
+            self.prepared_spec_hash == Some(spec_hash.0) &&
+            self.prepared_graph.is_some()
+        {
+            // Graph/config identity alone is insufficient: resource planning
+            // also depends on each input's fixed shape, placement/context,
+            // family structure, byte kind, and trapdoor sampler metadata.
+            let prepared_inputs = inputs
+                .iter()
+                .map(|(name, value)| {
+                    prepared_runtime_value_for_warmup(self, value)
+                        .map(|value| (name.clone(), value))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
+            if self
+                .prepared_graph
+                .as_ref()
+                .expect("prepared graph checked above")
+                .input_contract_matches(&prepared_inputs)
+                .map_err(PolyBackendError::GpuSubmission)?
+            {
+                return Ok(());
+            }
+        }
+        // Capture export metadata before publishing a new program.  This is
+        // warmup-only graph access; production execute consumes the immutable
+        // table retained by PreparedGpuProgram.
+        let artifact_descriptors = crate::executor::prepared_artifact_descriptors(validated)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        let previous_graph = self.prepared_graph.take();
+        let previous_spec_hash = self.prepared_spec_hash;
+        let previous_wave_bound = self.prepared_wave_bound;
+        let previous_live_executions = self.prepared_live_executions;
+        let had_ledger = self.prepared_ledger.is_some();
+        let warmup_checkpoint =
+            self.prepared_ledger.as_ref().map(|ledger| ledger.warmup_checkpoint());
+        // Warmup is transactional across all discovery caches as well as the
+        // published replay.  A failed lowering/provisioning attempt must not
+        // leave a partial preimage or polynomial class visible to a later
+        // retry, since those entries may refer to owners that were rolled back.
+        let warmup = self.warm_up_prepared_graph_impl(
+            validated,
+            inputs,
+            wave_bound.get(),
+            config.max_live_gpu_executions.get(),
+            &artifact_descriptors,
+        );
+        let warmup = warmup.and_then(|_| {
+            if self.prepared_graph.is_some() {
+                Ok(())
+            } else {
+                Err(PolyBackendError::GpuSubmission(
+                    "prepared graph warmup did not publish an executable".into(),
+                ))
+            }
+        });
+        if warmup.is_err() {
+            // Native candidate commands and region views must be gone before
+            // rollback starts asynchronous storage teardown. Otherwise their
+            // last Arc can outlive the charge journal and make a failed
+            // replacement look like an accepted owner.
+            let failed_candidate = self.prepared_graph.take();
+            drop(failed_candidate);
+            rollback_failed_warmup_ledger(&mut self.prepared_ledger, had_ledger, warmup_checkpoint);
+            self.prepared_graph = previous_graph;
+            self.prepared_wave_bound = previous_wave_bound;
+            self.prepared_live_executions = previous_live_executions;
+            self.prepared_spec_hash = previous_spec_hash;
+        } else {
+            self.prepared_wave_bound = Some(wave_bound);
+            self.prepared_live_executions = Some(live_executions);
+            self.prepared_spec_hash = Some(spec_hash.0);
+            if let Some(execution) = self.prepared_graph.as_mut() {
+                execution.set_spec_hash(spec_hash.0);
+            }
+        }
+        warmup
+    }
+
+    pub fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
         let vram_percent = fleet_context_vram_percent(
             &placements,
@@ -468,7 +679,7 @@ impl GpuDcrtBackend {
             GpuDCRTPolyParams::vram_budget_bytes,
         )
         .unwrap_or_else(|error| panic!("invalid GPU fleet context configuration: {error}"));
-        let devices = placements
+        let devices: Vec<_> = placements
             .into_iter()
             .map(|parameters| {
                 let device_id = parameters
@@ -478,35 +689,68 @@ impl GpuDcrtBackend {
                 (device_id, DeviceBackend::new(parameters))
             })
             .collect();
+        let mut unique = HashSet::new();
+        assert!(
+            devices.iter().all(|(id, _)| unique.insert(*id)),
+            "GPU fleet device IDs must be unique"
+        );
+        let identities = devices
+            .par_iter()
+            .map(|(device, _)| gpu_device_identity(*device))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("query GPU fleet identities");
+        assert!(
+            identities.iter().all(|identity| identity == &identities[0]),
+            "GPU fleet requires matching models, compute capabilities and physical VRAM"
+        );
         Self {
             devices,
-            operation_widths: HashMap::new(),
-            manual_widths: HashSet::new(),
-            operation_profiles: HashMap::new(),
-            calibration_misses: HashSet::new(),
-            pending_profile: None,
-            pending_pilot: None,
-            active_operation: None,
-            calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent,
-            matrix_replicas: HashMap::new(),
+            rns_staging_buffers: Vec::new(),
+            prepared_wave_bound: None,
+            prepared_live_executions: None,
+            prepared_graph: None,
+            prepared_spec_hash: None,
+            prepared_ledger: None,
         }
-    }
-
-    pub fn set_calibration_registry(&mut self, registry: FrozenGpuCalibrationRegistry) {
-        self.calibration_registry = registry;
-        self.calibration_misses.clear();
-        self.operation_profiles.clear();
-        self.pending_profile = None;
-    }
-
-    pub fn calibration_registry(&self) -> &FrozenGpuCalibrationRegistry {
-        &self.calibration_registry
     }
 
     /// Percentage of physical VRAM fixed when this fleet context was created.
     pub fn vram_percent(&self) -> u32 {
         self.vram_percent
+    }
+
+    /// One context per configured device, in fleet order. Related parameter
+    /// views on a device share the execution owner used by device-span timing.
+    /// Clone registered parameter views, retaining each device's exact contexts.
+    /// This does not clone allocations, reservations, or calibration state.
+    pub fn parameter_placements(&self) -> Vec<Vec<GpuDCRTPolyParams>> {
+        self.devices
+            .iter()
+            .map(|(_, backend)| backend.parameters[0].values().cloned().collect())
+            .collect()
+    }
+
+    pub fn device_parameters(&self) -> Vec<GpuDCRTPolyParams> {
+        self.devices
+            .par_iter()
+            .map(|(_, backend)| {
+                backend.parameters[0]
+                    .values()
+                    .next()
+                    .expect("each GPU placement has parameters")
+                    .clone()
+            })
+            .collect()
+    }
+
+    /// Registered parameter views for this ring, in configured device order.
+    /// This only reads context metadata; it creates no GPU resource.
+    pub fn resource_parameters(
+        &self,
+        matrix: &ConcreteMatrixType,
+    ) -> Result<Vec<GpuDCRTPolyParams>, PolyBackendError> {
+        self.devices.par_iter().map(|(_, backend)| backend.parameters(matrix).cloned()).collect()
     }
 
     /// Concrete resident CRT tower count for an exactly registered ring.
@@ -519,508 +763,6 @@ impl GpuDcrtBackend {
     /// This is used by the estimator's single-device worker. Validation is
     /// deliberately against the complete declared matrix and gadget layout;
     /// only allocation and construction are restricted to the measured range.
-    pub fn measurement_gadget_columns(
-        &mut self,
-        full_type: &ConcreteMatrixType,
-        gadget_base: &BigInt,
-        digit_count: usize,
-        global_column_start: usize,
-        local_columns: usize,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if self.devices.len() != 1 {
-            return Err(PolyBackendError::UnsupportedPlacement);
-        }
-        if full_type.rows == 0 || !full_type.columns.is_multiple_of(full_type.rows) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        self.validate_gadget_layout(full_type, gadget_base, digit_count, false)?;
-        self.validate_gadget_layout(
-            full_type,
-            gadget_base,
-            full_type.columns / full_type.rows,
-            false,
-        )?;
-        if global_column_start > full_type.columns ||
-            local_columns > full_type.columns - global_column_start
-        {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let parameters = self.devices[0].1.parameters(full_type)?;
-        Ok(GpuFleetMatrix::from(GpuDCRTPolyMatrix::gadget_columns(
-            parameters,
-            full_type.rows,
-            false,
-            global_column_start,
-            local_columns,
-            Some(digit_count),
-        )))
-    }
-
-    pub fn set_column_widths_for_operation(
-        &mut self,
-        operation: [u8; 32],
-        widths: GpuColumnWidths,
-    ) {
-        assert!(widths.gpu0 > 0, "GPU-0 width must be positive");
-        if self.devices.len() > 1 {
-            assert!(widths.nonzero.is_some_and(|width| width > 0), "nonzero-GPU width required");
-        }
-        self.operation_widths.insert(operation, widths);
-        self.manual_widths.insert(operation);
-    }
-
-    pub fn select_operation(&mut self, operation: [u8; 32]) -> Result<(), PolyBackendError> {
-        self.active_operation = Some(operation);
-        self.pending_profile = None;
-        if self.manual_widths.contains(&operation) {
-            return Ok(());
-        }
-        self.operation_widths.remove(&operation);
-
-        // The default CUDA pool is shared by every context on a device. Its
-        // high-water mark cannot prove even a one-column capacity while another
-        // context is live, so fail before retaining any local plan state.
-        let memory = self.device_memories().map_err(PolyBackendError::GpuCalibration)?;
-        if memory.iter().any(|(_, live_contexts, _)| *live_contexts > 1) {
-            self.operation_profiles.remove(&operation);
-            return Err(PolyBackendError::GpuCalibration(format!(
-                "{SHARED_POOL_CALIBRATION_ERROR}: gpu0_contexts={}, nonzero_contexts={:?}",
-                memory[0].1,
-                memory.get(1).map(|(_, contexts, _)| *contexts)
-            )));
-        }
-
-        let profile = self.operation_profiles.get(&operation).cloned().or_else(|| {
-            let identity = gpu_device_identity(self.devices[0].0).ok()?;
-            let environment = crate::gpu_calibration::gpu_calibration_environment(
-                &identity,
-                self.devices.len(),
-                self.vram_percent,
-            );
-            self.calibration_registry
-                .get(&GpuCalibrationKey::new(operation.to_vec(), environment))
-                .map(|profile| (*profile).clone())
-        });
-        if let Some(profile) = profile {
-            self.operation_profiles.remove(&operation);
-            self.pending_profile = Some((operation, profile));
-            return Ok(());
-        }
-        if self.calibration_misses.contains(&operation) {
-            return Err(PolyBackendError::GpuCalibration(
-                "a previous runtime pilot for this operation failed".into(),
-            ));
-        }
-        match self.begin_runtime_pilot(operation) {
-            Ok(()) => {
-                tracing::info!("GPU calibration profile miss; measuring one-column runtime pilot")
-            }
-            Err(error) => {
-                if error != SHARED_POOL_CALIBRATION_ERROR {
-                    self.calibration_misses.insert(operation);
-                }
-                return Err(PolyBackendError::GpuCalibration(error));
-            }
-        }
-        Ok(())
-    }
-
-    fn device_memories(&self) -> Result<Vec<(GpuDeviceMemory, usize, u64)>, String> {
-        self.devices
-            .iter()
-            .map(|(device, _)| {
-                let usage = gpu_device_memory_usage(*device)?;
-                Ok((
-                    GpuDeviceMemory {
-                        total_bytes: usage.total as u64,
-                        resident_bytes: usage.resident as u64,
-                    },
-                    usage.live_contexts,
-                    usage.context_generation,
-                ))
-            })
-            .collect()
-    }
-
-    fn begin_runtime_pilot(&mut self, operation: [u8; 32]) -> Result<(), String> {
-        if let Some(stale) = self.pending_pilot.take() {
-            self.calibration_misses.insert(stale.operation);
-            return Err("a previous GPU runtime pilot did not reach a column wave".into());
-        }
-        let (baseline_bytes, planned_memory, context_generations) =
-            self.reset_runtime_pilot_baseline()?;
-        self.pending_pilot = Some(RuntimePilot {
-            operation,
-            baseline_bytes,
-            planned_memory,
-            context_generations,
-            attempts: 1,
-        });
-        Ok(())
-    }
-
-    fn reset_runtime_pilot_baseline(
-        &mut self,
-    ) -> Result<(Vec<u64>, Vec<GpuDeviceMemory>, Vec<u64>), String> {
-        // Async frees from earlier operations can otherwise complete after the
-        // baseline is sampled and make a live pilot allocation look like zero
-        // growth. This is a calibration-boundary wait on this context's release
-        // streams only; it does not synchronize a device or a compute stream.
-        self.devices
-            .par_iter_mut()
-            .try_for_each(|(_, backend)| backend.fence_released_memory())
-            .map_err(|error| error.to_string())?;
-        let memory = self.device_memories()?;
-        if memory.iter().any(|(_, contexts, _)| *contexts > 1) {
-            return Err(SHARED_POOL_CALIBRATION_ERROR.into());
-        }
-        for (device, _) in &self.devices {
-            gpu_default_mempool_reset_high_water(*device)?;
-        }
-        let baseline = self
-            .devices
-            .iter()
-            .map(|(device, _)| {
-                gpu_default_mempool_usage(*device).map(|usage| usage.used_high as u64)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let planned_memory = memory.iter().map(|(memory, _, _)| *memory).collect();
-        let generations = memory.into_iter().map(|(_, _, generation)| generation).collect();
-        Ok((baseline, planned_memory, generations))
-    }
-
-    fn restart_runtime_pilot_after_fixed_inputs(&mut self) -> Result<(), String> {
-        if let Some((operation, profile)) = self.pending_profile.take() {
-            // Fixed operands have already been staged at every placement.  An
-            // allocator-aware snapshot is sufficient to rederive a cached
-            // profile against their residency; unlike a runtime pilot, this
-            // path must not wait for input events or fence release streams.
-            let memory = self.device_memories()?;
-            if memory.iter().any(|(_, contexts, _)| *contexts > 1) {
-                self.operation_profiles.remove(&operation);
-                self.operation_widths.remove(&operation);
-                return Err(SHARED_POOL_CALIBRATION_ERROR.into());
-            }
-            let widths = derive_runtime_widths(&profile, &memory, self.vram_percent)
-                .map_err(|e| e.to_string())?;
-            self.operation_profiles.insert(operation, profile);
-            self.operation_widths.insert(operation, widths);
-            tracing::info!(
-                gpu0_columns = widths.gpu0,
-                nonzero_columns = widths.nonzero,
-                "selected GPU fleet calibration after staging fixed inputs"
-            );
-            return Ok(());
-        }
-        if self.pending_pilot.is_none() {
-            return Ok(());
-        }
-        let (baseline_bytes, planned_memory, context_generations) =
-            match self.reset_runtime_pilot_baseline() {
-                Ok(baseline) => baseline,
-                Err(error) if error == SHARED_POOL_CALIBRATION_ERROR => {
-                    self.pending_pilot.take();
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            };
-        if let Some(pilot) = &mut self.pending_pilot {
-            pilot.baseline_bytes = baseline_bytes;
-            pilot.planned_memory = planned_memory;
-            pilot.context_generations = context_generations;
-        }
-        Ok(())
-    }
-
-    fn restart_runtime_pilot_after_matrix_inputs(
-        &mut self,
-        inputs: &[&GpuFleetMatrix],
-    ) -> Result<(), PolyBackendError> {
-        if self.runtime_pilot_is_pending() {
-            inputs.iter().for_each(|input| input.wait_until_ready());
-        }
-        self.restart_runtime_pilot_after_fixed_inputs().map_err(PolyBackendError::GpuCalibration)
-    }
-
-    fn runtime_pilot_is_pending(&self) -> bool {
-        self.pending_pilot.is_some()
-    }
-
-    fn finish_runtime_pilot<T: PilotReady>(
-        &mut self,
-        outputs: &[GpuColumnShard<T>],
-    ) -> Result<bool, PolyBackendError> {
-        let Some(pilot) = self.pending_pilot.take() else { return Ok(true) };
-        outputs.iter().for_each(|output| output.value.wait_for_pilot());
-        let memory = self.device_memories().map_err(PolyBackendError::GpuCalibration)?;
-        let context_changed = memory
-            .iter()
-            .zip(&pilot.context_generations)
-            .any(|((_, contexts, generation), before)| *contexts > 1 || generation != before);
-        if context_changed {
-            self.operation_profiles.remove(&pilot.operation);
-            self.operation_widths.remove(&pilot.operation);
-            return Err(PolyBackendError::GpuCalibration(
-                "GPU context set changed during calibration; the measured capacity is invalid"
-                    .into(),
-            ));
-        }
-        let usages = self
-            .devices
-            .iter()
-            .map(|(device, _)| gpu_default_mempool_usage(*device))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let peaks = usages.iter().map(|usage| usage.used_high as u64).collect::<Vec<_>>();
-        for (device, _) in &self.devices {
-            gpu_default_mempool_reset_high_water(*device)
-                .map_err(PolyBackendError::GpuCalibration)?;
-        }
-        let current = usages.iter().map(|usage| usage.used_current as u64).collect::<Vec<_>>();
-        let baseline_drifted = pilot_interval_was_contaminated(&pilot.baseline_bytes, &current);
-        if baseline_drifted && contaminated_pilot_can_retry(pilot.attempts) {
-            tracing::warn!(
-                attempt = pilot.attempts,
-                baseline = ?pilot.baseline_bytes,
-                used_high = ?peaks,
-                used_current = ?current,
-                "retrying GPU runtime pilot after concurrent mempool usage decreased"
-            );
-            self.pending_pilot = Some(RuntimePilot {
-                operation: pilot.operation,
-                baseline_bytes: Vec::new(),
-                planned_memory: Vec::new(),
-                context_generations: Vec::new(),
-                attempts: pilot.attempts + 1,
-            });
-            return Ok(false);
-        }
-        if baseline_drifted {
-            self.calibration_misses.insert(pilot.operation);
-            return Err(PolyBackendError::GpuCalibration(format!(
-                "GPU calibration remained contaminated after {} attempts; baseline={:?}, used_high={peaks:?}, used_current={current:?}",
-                pilot.attempts, pilot.baseline_bytes
-            )));
-        }
-        let result = (|| {
-            let incremental = peaks
-                .iter()
-                .zip(&pilot.baseline_bytes)
-                .map(|(peak, baseline)| {
-                    peak.checked_sub(*baseline).ok_or_else(|| {
-                        GpuCalibrationError::InvalidPeakBaseline {
-                            peak_bytes: *peak,
-                            baseline_bytes: *baseline,
-                        }
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let gpu0 = GpuDeviceCalibration::from_pilot(1, incremental[0])?;
-            let nonzero = incremental
-                .get(1)
-                .map(|peak| GpuDeviceCalibration::from_pilot(1, *peak))
-                .transpose()?;
-            Ok::<_, GpuCalibrationError>((GpuCalibrationProfile { gpu0, nonzero }, incremental))
-        })();
-        match result {
-            Ok((profile, incremental)) => {
-                let baseline = profile
-                    .derive_widths(
-                        pilot.planned_memory[0],
-                        pilot.planned_memory.get(1).copied(),
-                        self.vram_percent,
-                    )
-                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()));
-                match baseline {
-                    Ok(widths) => {
-                        self.operation_profiles.insert(pilot.operation, profile);
-                        self.operation_widths.insert(pilot.operation, widths);
-                        tracing::info!(
-                            gpu0_peak_bytes = incremental[0],
-                            nonzero_peak_bytes = incremental.get(1),
-                            gpu0_columns = widths.gpu0,
-                            nonzero_columns = widths.nonzero,
-                            "completed one-column GPU runtime pilot"
-                        );
-                        Ok(true)
-                    }
-                    Err(error) => {
-                        self.calibration_misses.insert(pilot.operation);
-                        Err(error)
-                    }
-                }
-            }
-            Err(error) => {
-                self.calibration_misses.insert(pilot.operation);
-                Err(PolyBackendError::GpuCalibration(format!(
-                    "{error}; baseline={:?}, used_high={peaks:?}, used_current={:?}",
-                    pilot.baseline_bytes,
-                    usages.iter().map(|usage| usage.used_current).collect::<Vec<_>>()
-                )))
-            }
-        }
-    }
-
-    fn commit_column_wave<T: PilotReady>(
-        &mut self,
-        shards: &mut Vec<GpuColumnShard<T>>,
-        launched: Vec<GpuColumnShard<T>>,
-        next_column: &mut usize,
-    ) -> Result<(), PolyBackendError> {
-        let was_pilot = self.pending_pilot.is_some();
-        let pilot_completed = self.finish_runtime_pilot(&launched)?;
-        if was_pilot {
-            let pilot_start = launched
-                .iter()
-                .map(|shard| shard.global_column_start)
-                .min()
-                .expect("a completed pilot has at least one output");
-            drop(launched);
-            if !pilot_completed {
-                self.restart_runtime_pilot_after_fixed_inputs()
-                    .map_err(PolyBackendError::GpuCalibration)?;
-            }
-            *next_column = pilot_start;
-            return Ok(());
-        }
-        shards.extend(launched);
-        Ok(())
-    }
-
-    pub fn column_widths(&self, operation: &[u8; 32]) -> Option<GpuColumnWidths> {
-        self.operation_widths.get(operation).copied()
-    }
-
-    /// Stages a setup-time calibration profile. The operation entry point
-    /// re-derives its widths after its fixed operands become resident.
-    pub fn apply_calibration(
-        &mut self,
-        key: &GpuCalibrationKey,
-    ) -> Result<bool, GpuCalibrationError> {
-        let Some(profile) = self.calibration_registry.get(key) else {
-            return Ok(false);
-        };
-        let operation: [u8; 32] = key.operation().try_into().map_err(|_| {
-            GpuCalibrationError::InvalidOperationIdentityLength(key.operation().len())
-        })?;
-        self.operation_profiles.insert(operation, (*profile).clone());
-        self.select_operation(operation).map_err(|_| GpuCalibrationError::MemoryQueryFailed)?;
-        Ok(true)
-    }
-
-    fn column_ranges(&self, columns: usize) -> Vec<(usize, usize, usize)> {
-        let widths = self
-            .active_operation
-            .and_then(|operation| self.operation_widths.get(&operation).copied())
-            .expect("GPU operation widths must be derived before assigning column ranges");
-        fleet_column_ranges(self.devices.len(), columns, widths)
-    }
-
-    fn next_column_wave(&self, start: usize, columns: usize) -> Vec<(usize, usize, usize)> {
-        let widths = if self.pending_pilot.is_some() {
-            GpuColumnWidths { gpu0: 1, nonzero: (self.devices.len() > 1).then_some(1) }
-        } else {
-            self.active_operation
-                .and_then(|operation| self.operation_widths.get(&operation).copied())
-                .expect("GPU operation widths must be derived before launching a production wave")
-        };
-        fleet_column_wave(self.devices.len(), start, columns, widths, self.pending_pilot.is_some())
-    }
-
-    fn active_role_width(&self, device: usize) -> usize {
-        let widths = self
-            .active_operation
-            .and_then(|operation| self.operation_widths.get(&operation).copied())
-            .expect("GPU operation widths must be derived before compact RHS multiplication");
-        if device == 0 { widths.gpu0 } else { widths.nonzero.unwrap_or(widths.gpu0) }
-    }
-
-    fn matrix_piece_on_device(
-        backend: &mut DeviceBackend,
-        value: &GpuFleetMatrix,
-        start: usize,
-        end: usize,
-    ) -> Result<GpuDCRTPolyMatrix, PolyBackendError> {
-        let mut pieces = Vec::new();
-        for shard in &value.shards {
-            let shard_start = shard.global_column_start;
-            let shard_end = shard_start + shard.value.col_size();
-            let overlap_start = start.max(shard_start);
-            let overlap_end = end.min(shard_end);
-            if overlap_start >= overlap_end {
-                continue;
-            }
-            let local =
-                shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
-            // Transfer only the requested overlap through device/peer transport.
-            pieces.push(backend.matrix_to_active_placement_peer_only(&local)?);
-        }
-        let mut pieces = pieces.into_iter();
-        let first = pieces.next().expect("requested matrix range must be covered");
-        Ok(first.concat_columns_owned(pieces.collect()))
-    }
-
-    fn matrix_operand_on_device<'a>(
-        backend: &mut DeviceBackend,
-        value: &'a GpuFleetMatrix,
-        start: usize,
-        end: usize,
-    ) -> Result<Cow<'a, GpuDCRTPolyMatrix>, PolyBackendError> {
-        // Read-only operations may borrow a complete resident shard. The caller
-        // retains its owner through dispatch and primitives record consumer
-        // events, so an additional owned copy is unnecessary. Partial ranges
-        // and transfers still use independently owned materializations.
-        if let Some(shard) = value.shards.iter().find(|shard| {
-            shard.global_column_start == start &&
-                shard.global_column_start + shard.value.col_size() == end &&
-                backend.matrix_is_on_active_placement(&shard.value)
-        }) {
-            return Ok(Cow::Borrowed(&shard.value));
-        }
-        Self::matrix_piece_on_device(backend, value, start, end).map(Cow::Owned)
-    }
-
-    fn matrix_rows_on_device(
-        backend: &mut DeviceBackend,
-        value: &GpuFleetMatrix,
-        row_start: usize,
-        row_end: usize,
-    ) -> Result<GpuDCRTPolyMatrix, PolyBackendError> {
-        let mut pieces = value
-            .shards
-            .iter()
-            .map(|shard| {
-                let local = shard.value.slice(row_start, row_end, 0, shard.value.col_size());
-                backend.matrix_to_active_placement_peer_only(&local)
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter();
-        let first = pieces.next().ok_or(PolyBackendError::InvalidInteger)?;
-        Ok(first.concat_columns_owned(pieces.collect()))
-    }
-
-    fn full_matrix_on_device(
-        &mut self,
-        device: usize,
-        value: &GpuFleetMatrix,
-    ) -> Result<Arc<GpuDCRTPolyMatrix>, PolyBackendError> {
-        if let Some(cached) = self.matrix_replicas.get(&(value.id, device)).and_then(Weak::upgrade)
-        {
-            return Ok(cached);
-        }
-        let replica = Arc::new(Self::matrix_piece_on_device(
-            &mut self.devices[device].1,
-            value,
-            0,
-            value.columns,
-        )?);
-        self.matrix_replicas.retain(|_, value| value.strong_count() > 0);
-        self.matrix_replicas.insert((value.id, device), Arc::downgrade(&replica));
-        Ok(replica)
-    }
-
     fn gather_matrix(
         &mut self,
         value: &GpuFleetMatrix,
@@ -1038,1317 +780,28 @@ impl GpuDcrtBackend {
         self.gather_matrix(value)
     }
 
-    fn scatter_matrix(
-        &mut self,
-        value: GpuDCRTPolyMatrix,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if !self
-            .active_operation
-            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
-        {
-            // Materialization outside a calibrated operation retains its real
-            // owner. Consumers derive their own operation-specific partition.
-            return Ok(GpuFleetMatrix::from_matrix(value));
-        }
-        let (rows, columns) = value.size();
-        let ranges = self.column_ranges(columns);
-        let mut shards = Vec::with_capacity(ranges.len());
-        for wave in ranges.chunks(self.devices.len()) {
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    let local = value.slice_columns(start, end);
-                    Some(backend.matrix_to_active_placement_peer_only(&local).map(|value| {
-                        GpuColumnShard { device_id: *device_id, global_column_start: start, value }
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            shards.extend(launched);
-        }
-        Ok(GpuFleetMatrix::new(rows, columns, shards))
-    }
-
-    fn diagonal_range_on_device(
+    fn matrix_piece_on_device(
         backend: &mut DeviceBackend,
-        inputs: &[&GpuFleetMatrix],
-        input_columns: &[usize],
-        rows: usize,
-        modulus: &BigInt,
-        ring_dimension: usize,
+        value: &GpuFleetMatrix,
         start: usize,
         end: usize,
     ) -> Result<GpuDCRTPolyMatrix, PolyBackendError> {
-        let width = end - start;
-        let params = backend
-            .parameters(&ConcreteMatrixType {
-                modulus: modulus.clone(),
-                ring_dimension,
-                rows,
-                columns: width,
-            })?
-            .clone();
-        let overlaps = diagonal_column_overlaps(input_columns, start, end);
-        let blocks = inputs
-            .iter()
-            .zip(overlaps)
-            .map(|(input, overlap)| {
-                let Some((destination_start, source_start, source_end)) = overlap else {
-                    return Ok(GpuDCRTPolyMatrix::zero(&params, input.rows, width));
-                };
-                let piece = Self::matrix_piece_on_device(backend, input, source_start, source_end)?;
-                let mut columns = Vec::new();
-                if destination_start > 0 {
-                    columns.push(GpuDCRTPolyMatrix::zero(&params, input.rows, destination_start));
-                }
-                columns.push(piece);
-                let used = destination_start + source_end - source_start;
-                if used < width {
-                    columns.push(GpuDCRTPolyMatrix::zero(&params, input.rows, width - used));
-                }
-                let mut columns = columns.into_iter();
-                let first = columns.next().expect("nonempty diagonal row block");
-                Ok(first.concat_columns_owned(columns.collect()))
-            })
-            .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        let mut blocks = blocks.into_iter();
-        let first = blocks.next().expect("nonempty diagonal concat");
-        Ok(first.concat_rows_owned(blocks.collect()))
-    }
-
-    /// Executes one global output-column range of diagonal concatenation.
-    ///
-    /// This is exposed for setup-time calibration so it measures the production range kernel
-    /// without rewriting the original input block layout. Estimator workers contain one device.
-    #[doc(hidden)]
-    pub fn diagonal_concat_range_for_measurement(
-        &mut self,
-        inputs: &[&GpuFleetMatrix],
-        start: usize,
-        end: usize,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if self.devices.len() != 1 || inputs.is_empty() || start >= end {
-            return Err(PolyBackendError::InvalidConstantShape);
+        let mut pieces = Vec::new();
+        for shard in value.shards.iter() {
+            let shard_start = shard.global_column_start;
+            let shard_end = shard_start + shard.value.col_size();
+            let overlap_start = start.max(shard_start);
+            let overlap_end = end.min(shard_end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let local =
+                shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
+            pieces.push(backend.matrix_to_active_placement_peer_only(&local)?);
         }
-        let input_columns = inputs.iter().map(|value| value.columns).collect::<Vec<_>>();
-        let columns = input_columns.iter().sum::<usize>();
-        if end > columns {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let rows = inputs.iter().map(|value| value.rows).sum::<usize>();
-        let prototype = inputs[0].shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-        let modulus = BigInt::from(prototype.value.params().modulus().as_ref().clone());
-        let ring_dimension = prototype.value.params().ring_dimension() as usize;
-        let (device_id, backend) = &mut self.devices[0];
-        let value = Self::diagonal_range_on_device(
-            backend,
-            inputs,
-            &input_columns,
-            rows,
-            &modulus,
-            ring_dimension,
-            start,
-            end,
-        )?;
-        Ok(GpuFleetMatrix::new(
-            rows,
-            end - start,
-            vec![GpuColumnShard { device_id: *device_id, global_column_start: 0, value }],
-        ))
-    }
-
-    /// Executes one exact output-column range of a tensor product during setup-time calibration.
-    #[doc(hidden)]
-    pub fn tensor_range_for_measurement(
-        &mut self,
-        left: &GpuFleetMatrix,
-        right: &GpuFleetMatrix,
-        start: usize,
-        end: usize,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if self.devices.len() != 1 || start >= end {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let columns =
-            left.columns.checked_mul(right.columns).ok_or(PolyBackendError::InvalidInteger)?;
-        if right.columns == 0 || end > columns {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let rows = left.rows.checked_mul(right.rows).ok_or(PolyBackendError::InvalidInteger)?;
-        let (device_id, backend) = &mut self.devices[0];
-        let pieces = tensor_column_segments(start, end, right.columns)
-            .into_iter()
-            .map(|(left_column, right_start, right_end)| {
-                let left =
-                    Self::matrix_operand_on_device(backend, left, left_column, left_column + 1)?;
-                let right = Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
-                backend.tensor(&left, &right)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let mut pieces = pieces.into_iter();
-        let first = pieces.next().expect("nonempty tensor measurement range");
-        let value =
-            if pieces.len() == 0 { first } else { first.concat_columns_owned(pieces.collect()) };
-        Ok(GpuFleetMatrix::new(
-            rows,
-            end - start,
-            vec![GpuColumnShard { device_id: *device_id, global_column_start: 0, value }],
-        ))
-    }
-
-    fn launch_column_wave<T: Send>(
-        &mut self,
-        wave: &[(usize, usize, usize)],
-        columns: usize,
-        operation: impl Fn(&mut DeviceBackend, usize, usize) -> Result<T, PolyBackendError> + Sync,
-    ) -> Result<Vec<GpuColumnShard<T>>, PolyBackendError> {
-        // A calibrated full-width wave on one device has only one work item.
-        // Execute it on the calling thread without handing it to the Rayon pool.
-        if self.devices.len() == 1 && wave == [(0, 0, columns)] {
-            let (device_id, backend) = &mut self.devices[0];
-            let value = operation(backend, 0, columns)?;
-            return Ok(vec![GpuColumnShard {
-                device_id: *device_id,
-                global_column_start: 0,
-                value,
-            }]);
-        }
-        self.devices
-            .par_iter_mut()
-            .enumerate()
-            .filter_map(|(device, (device_id, backend))| {
-                let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                Some(operation(backend, start, end).map(|value| GpuColumnShard {
-                    device_id: *device_id,
-                    global_column_start: start,
-                    value,
-                }))
-            })
-            .collect()
-    }
-
-    fn unary_columns(
-        &mut self,
-        value: &GpuFleetMatrix,
-        operation: impl Fn(
-            &mut DeviceBackend,
-            &GpuDCRTPolyMatrix,
-        ) -> Result<GpuDCRTPolyMatrix, PolyBackendError>
-        + Sync,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < value.columns {
-            let wave = self.next_column_wave(next_column, value.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched =
-                self.launch_column_wave(&wave, value.columns, |backend, start, end| {
-                    let piece = Self::matrix_operand_on_device(backend, value, start, end)?;
-                    operation(backend, &piece)
-                })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        let rows = shards.first().map_or(value.rows, |shard| shard.value.row_size());
-        Ok(GpuFleetMatrix::new(rows, value.columns, shards))
-    }
-
-    fn binary_columns(
-        &mut self,
-        left: &GpuFleetMatrix,
-        right: &GpuFleetMatrix,
-        operation: impl Fn(
-            &mut DeviceBackend,
-            &GpuDCRTPolyMatrix,
-            &GpuDCRTPolyMatrix,
-        ) -> Result<GpuDCRTPolyMatrix, PolyBackendError>
-        + Sync,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if left.size() != right.size() {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < left.columns {
-            let wave = self.next_column_wave(next_column, left.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched =
-                self.launch_column_wave(&wave, left.columns, |backend, start, end| {
-                    let left = Self::matrix_operand_on_device(backend, left, start, end)?;
-                    let right = Self::matrix_operand_on_device(backend, right, start, end)?;
-                    operation(backend, &left, &right)
-                })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(left.rows, left.columns, shards))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use mxx_ir_core::IntExpr;
-    use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
-    use num_bigint::BigInt;
-
-    fn assert_profile_created(backend: &GpuDcrtBackend, operation: &[u8; 32]) {
-        assert!(backend.operation_profiles.contains_key(operation));
-        assert!(backend.column_widths(operation).is_some());
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_resident_operands_preserve_owners_and_inputs() {
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let mut backend =
-            super::super::gpu_backend_on([parameters.clone()], [detected_gpu_device_ids()[0]]);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 2,
-            columns: 2,
-        };
-        let left = GpuFleetMatrix::from_matrix(
-            backend.devices[0].1.sample_hash(&ty, rand::random(), b"borrowed-left").unwrap(),
-        );
-        let right = GpuFleetMatrix::from_matrix(
-            backend.devices[0].1.sample_hash(&ty, rand::random(), b"borrowed-right").unwrap(),
-        );
-        let expected_left = backend.matrix_to_bytes(&left);
-        let expected_right = backend.matrix_to_bytes(&right);
-        assert!(matches!(
-            GpuDcrtBackend::matrix_operand_on_device(&mut backend.devices[0].1, &left, 0, 2)
-                .unwrap(),
-            Cow::Borrowed(_)
-        ));
-        assert!(matches!(
-            GpuDcrtBackend::matrix_operand_on_device(&mut backend.devices[0].1, &left, 0, 1)
-                .unwrap(),
-            Cow::Owned(_)
-        ));
-        let expected =
-            backend.devices[0].1.multiply(&left.shards[0].value, &right.shards[0].value).unwrap();
-        let expected = backend.matrix_to_bytes(&GpuFleetMatrix::from_matrix(expected));
-        let operation = [61; 32];
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 2, nonzero: None });
-        backend.select_operation(operation).unwrap();
-        let product = backend.multiply(&left, &right).unwrap();
-        let sum = backend.add(&left, &right).unwrap();
-        let recovered = backend.sub(&sum, &right).unwrap();
-        let negative = backend.negate(&recovered).unwrap();
-        let recovered = backend.negate(&negative).unwrap();
-        let upper = backend.slice(&left, Some(&IndexRange { start: 0, end: 1 }), None).unwrap();
-        let lower = backend.slice(&left, Some(&IndexRange { start: 1, end: 2 }), None).unwrap();
-        let rejoined = backend.concat(&[&upper, &lower], ConcatAxis::Rows).unwrap();
-        let left_column =
-            backend.slice(&left, None, Some(&IndexRange { start: 0, end: 1 })).unwrap();
-        let right_column =
-            backend.slice(&right, None, Some(&IndexRange { start: 0, end: 1 })).unwrap();
-        let expected_tensor = left_column.shards[0].value.tensor(&right_column.shards[0].value);
-        let expected_tensor =
-            backend.matrix_to_bytes(&GpuFleetMatrix::from_matrix(expected_tensor));
-        let tensor = backend.tensor(&left_column, &right_column).unwrap();
-        let measured_tensor =
-            backend.tensor_range_for_measurement(&left_column, &right_column, 0, 1).unwrap();
-        assert_eq!(backend.matrix_to_bytes(&left), expected_left);
-        assert_eq!(backend.matrix_to_bytes(&right), expected_right);
-        drop((left, right, sum, negative, upper, lower, left_column, right_column));
-        product.wait_until_ready();
-        recovered.wait_until_ready();
-        rejoined.wait_until_ready();
-        tensor.wait_until_ready();
-        measured_tensor.wait_until_ready();
-        assert_eq!(backend.matrix_to_bytes(&product), expected);
-        assert_eq!(backend.matrix_to_bytes(&recovered), expected_left);
-        assert_eq!(backend.matrix_to_bytes(&rejoined), expected_left);
-        assert_eq!(backend.matrix_to_bytes(&tensor), expected_tensor);
-        assert_eq!(backend.matrix_to_bytes(&measured_tensor), expected_tensor);
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_compact_operations_preserve_resident_sources() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().expect("valid ring dimension"))
-            .unwrap_or(32);
-        let cpu_params =
-            mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(n, 3, 30, 8, None, None);
-        let (primes, _, _) = cpu_params.to_crt();
-        let parameters = GpuDCRTPolyParams::new(n, primes, 8, None);
-        for host_waited in [false, true] {
-            for width in [1, 3] {
-                let mut backend = super::super::gpu_backend_on(
-                    [parameters.clone()],
-                    [detected_gpu_device_ids()[0]],
-                );
-                let ty = ConcreteMatrixType {
-                    modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-                    ring_dimension: n as usize,
-                    rows: 2,
-                    columns: 3,
-                };
-                let input = backend.devices[0]
-                    .1
-                    .sample_hash(&ty, rand::random(), b"compact-source")
-                    .unwrap();
-                if host_waited {
-                    input.wait_until_ready();
-                }
-                let source = GpuFleetMatrix::from_matrix(input);
-                let expected = backend.matrix_to_bytes(&source);
-                let gadget = GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::gadget_matrix(
-                    &parameters,
-                    2,
-                    None,
-                ));
-                let operation = [62; 32];
-                backend.set_column_widths_for_operation(
-                    operation,
-                    GpuColumnWidths { gpu0: width, nonzero: None },
-                );
-                backend.select_operation(operation).unwrap();
-                let digits = backend.gadget_decompose(&source, false, None).unwrap();
-                let first = backend.multiply_small_rhs(&gadget, &digits).unwrap();
-                let second = backend.multiply_small_rhs(&gadget, &digits).unwrap();
-                let downstream = backend.sub(&first, &second).unwrap();
-                drop((gadget, digits, second));
-                assert_eq!(backend.matrix_to_bytes(&source), expected);
-                drop(source);
-                assert_eq!(backend.matrix_to_bytes(&first), expected);
-                let zero = GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(&parameters, 2, 3));
-                assert_eq!(backend.matrix_to_bytes(&downstream), backend.matrix_to_bytes(&zero));
-            }
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_compact_row_blocks_preserve_partial_waves() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().unwrap())
-            .unwrap_or(32);
-        let cpu_params =
-            mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(n, 3, 30, 8, None, None);
-        let parameters = GpuDCRTPolyParams::new(n, cpu_params.to_crt().0, 8, None);
-        for width in [1, 3] {
-            let mut backend =
-                super::super::gpu_backend_on([parameters.clone()], [detected_gpu_device_ids()[0]]);
-            let ty = ConcreteMatrixType {
-                modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-                ring_dimension: n as usize,
-                rows: 3,
-                columns: 3,
-            };
-            let source = GpuFleetMatrix::from_matrix(
-                backend.devices[0].1.sample_hash(&ty, rand::random(), b"row-block-source").unwrap(),
-            );
-            let operation = [63; 32];
-            backend.set_column_widths_for_operation(
-                operation,
-                GpuColumnWidths { gpu0: width, nonzero: None },
-            );
-            backend.select_operation(operation).unwrap();
-            let first =
-                backend.slice(&source, Some(&IndexRange { start: 0, end: 1 }), None).unwrap();
-            let second =
-                backend.slice(&source, Some(&IndexRange { start: 1, end: 3 }), None).unwrap();
-            let digits =
-                backend.gadget_decompose_row_blocks(&[&first, &second], false, None).unwrap();
-            let left_type = ConcreteMatrixType { columns: digits.rows, ..ty };
-            let left = GpuFleetMatrix::from_matrix(
-                backend.devices[0]
-                    .1
-                    .sample_hash(&left_type, rand::random(), b"row-block-left")
-                    .unwrap(),
-            );
-            let upper = backend.slice(&left, Some(&IndexRange { start: 0, end: 1 }), None).unwrap();
-            let lower = backend.slice(&left, Some(&IndexRange { start: 1, end: 3 }), None).unwrap();
-            let outputs =
-                backend.multiply_small_rhs_row_blocks(&[&upper, &lower], &digits).unwrap();
-            let reference_digits = backend.gadget_decompose(&source, false, None).unwrap();
-            let reference = backend.multiply_small_rhs(&left, &reference_digits).unwrap();
-            let expected_upper =
-                backend.slice(&reference, Some(&IndexRange { start: 0, end: 1 }), None).unwrap();
-            let expected_lower =
-                backend.slice(&reference, Some(&IndexRange { start: 1, end: 3 }), None).unwrap();
-            drop((source, first, second, digits, left, upper, lower, reference_digits, reference));
-            assert_eq!(
-                backend.matrix_to_bytes(&outputs[0]),
-                backend.matrix_to_bytes(&expected_upper)
-            );
-            assert_eq!(
-                backend.matrix_to_bytes(&outputs[1]),
-                backend.matrix_to_bytes(&expected_lower)
-            );
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_compact_block_graph_matches_traced_execution() {
-        use crate::{
-            MemoryArtifactStore, RuntimeValue, execute, execute_with_trace,
-            gpu_calibration::{
-                gpu_calibration_operation_identity, gpu_operation_is_column_separable_for_types,
-            },
-            transcript::SamplingMode,
-        };
-        use mxx_dsl::{DslContext, Mat, Ring};
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().unwrap())
-            .unwrap_or(32);
-        let cpu = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(n, 3, 30, 8, None, None);
-        let parameters = GpuDCRTPolyParams::new(n, cpu.to_crt().0, 8, None);
-        let mut backend =
-            super::super::gpu_backend_on([parameters.clone()], [detected_gpu_device_ids()[0]]);
-        let ring = Ring::new(parameters.modulus().as_ref().clone(), n as usize);
-        let digits = parameters.modulus_digits();
-        let column =
-            Mat::concat(ConcatAxis::Rows, vec![ring.input("a", (1, 3)), ring.input("b", (1, 3))]);
-        let left = Mat::concat(
-            ConcatAxis::Rows,
-            vec![ring.input("x", (1, 2 * digits)), ring.input("y", (1, 2 * digits))],
-        );
-        let product = column.decompose(256, digits).mul_small_rhs(left);
-        let graph = DslContext::new("gpu-compact-block-graph")
-            .output(
-                "first",
-                product.clone().slice(
-                    Some(mxx_ir_core::node::IndexRange { start: 0.into(), end: 1.into() }),
-                    None,
-                ),
-            )
-            .unwrap()
-            .output(
-                "second",
-                product.slice(
-                    Some(mxx_ir_core::node::IndexRange { start: 1.into(), end: 2.into() }),
-                    None,
-                ),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let scope = graph.source.root_scope();
-        let checked = graph.root_scope();
-        for node in &checked.execution_order {
-            let arguments = scope
-                .arguments(node)
-                .unwrap()
-                .iter()
-                .map(|wire| checked.wire_types[wire].clone())
-                .collect::<Vec<_>>();
-            if gpu_operation_is_column_separable_for_types(node.kind(), &arguments) {
-                let outputs = (0..node.output_types().len())
-                    .map(|port| {
-                        checked.wire_types
-                            [&scope.wire_ref(&node.output(port as u32).unwrap()).unwrap()]
-                            .clone()
-                    })
-                    .collect::<Vec<_>>();
-                let operation = gpu_calibration_operation_identity(
-                    node.kind(),
-                    &arguments,
-                    &outputs,
-                    &graph.bindings,
-                )
-                .unwrap();
-                backend.set_column_widths_for_operation(
-                    operation,
-                    GpuColumnWidths { gpu0: 3, nonzero: None },
-                );
-            }
-        }
-        let inputs = [("a", 3), ("b", 3), ("x", 2 * digits), ("y", 2 * digits)]
-            .into_iter()
-            .map(|(name, columns)| {
-                let ty = ConcreteMatrixType {
-                    modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-                    ring_dimension: n as usize,
-                    rows: 1,
-                    columns,
-                };
-                (
-                    name.to_owned(),
-                    RuntimeValue::matrix(GpuFleetMatrix::from_matrix(
-                        backend.devices[0]
-                            .1
-                            .sample_hash(&ty, rand::random(), name.as_bytes())
-                            .unwrap(),
-                    )),
-                )
-            })
-            .collect::<std::collections::BTreeMap<_, _>>();
-        let mut store = MemoryArtifactStore::default();
-        let optimized =
-            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
-        let (reference, _) =
-            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
-        for name in ["first", "second"] {
-            let RuntimeValue::Matrix(actual) = &optimized.outputs[name] else {
-                panic!("resident output")
-            };
-            let RuntimeValue::Matrix(expected) = &reference.outputs[name] else {
-                panic!("resident output")
-            };
-            assert_eq!(backend.matrix_to_bytes(actual), backend.matrix_to_bytes(expected));
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_polynomial_input_without_selected_operation() {
-        let devices = detected_gpu_device_ids();
-        assert!(!devices.is_empty());
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 1,
-            columns: 1,
-        };
-        let mut backend = super::super::gpu_backend_on([parameters], devices.clone());
-        let value = ConstantMatrix::Polynomial {
-            coefficients: (0..32)
-                .map(|_| IntExpr::constant(BigInt::from(rand::random::<i16>())))
-                .collect(),
-        };
-        let actual = backend.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
-        assert!(backend.active_operation.is_none());
-        assert!(backend.operation_widths.is_empty());
-        assert_eq!(actual.size(), (1, 1));
-        assert_eq!(actual.shards().len(), 1);
-        assert_eq!(actual.shards()[0].device_id, devices[0]);
-        let expected =
-            backend.devices[0].1.constant_matrix(&ty, &value, &ParamEnv::default()).unwrap();
-        assert_eq!(actual.shards()[0].value, expected);
-    }
-
-    fn first_bidirectional_peer_pair(
-        detected: &[i32],
-        parameters: &GpuDCRTPolyParams,
-    ) -> Option<[i32; 2]> {
-        for (index, &left_device) in detected.iter().enumerate() {
-            for &right_device in &detected[index + 1..] {
-                let left_params = parameters.params_for_device(left_device, None);
-                let right_params = parameters.params_for_device(right_device, None);
-                let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
-                if left.copy_to_params_direct(&right_params).is_none() {
-                    continue;
-                }
-                let right = GpuDCRTPolyMatrix::zero(&right_params, 1, 1);
-                if right.copy_to_params_direct(&left_params).is_some() {
-                    return Some([left_device, right_device]);
-                }
-            }
-        }
-        None
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_unplanned_materialization_preserves_payloads() {
-        let devices = detected_gpu_device_ids();
-        assert!(!devices.is_empty());
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 2,
-            columns: 5,
-        };
-        let mut backend = super::super::gpu_backend_on([parameters], devices);
-        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"load-input").unwrap();
-        let bytes = backend.devices[0].1.matrix_to_bytes(&source);
-        let staged = source.to_cpu_staging_bytes();
-        let small = backend.devices[0].1.gadget_decompose(&source, false, None).unwrap();
-        let schema = ConcreteBoundedMatrixSchema {
-            matrix: ConcreteMatrixType { rows: small.rows(), ..ty.clone() },
-            max_coefficient_bound: BigInt::from(small.max_coefficient_bound().clone()),
-        };
-        let small_bytes = backend.devices[0]
-            .1
-            .small_matrix_to_bytes(&small, &schema, SmallMatrixSemanticKind::Generic)
-            .unwrap();
-        // An operation identity alone is not a derived calibration plan.
-        for operation in [None, Some(rand::random())] {
-            backend.active_operation = operation;
-            assert!(backend.operation_widths.is_empty());
-            for restored in [
-                backend.matrix_from_bytes(&ty, &bytes).unwrap(),
-                backend.matrix_from_cpu_staging_bytes(&ty, &staged).unwrap(),
-                backend.scatter_matrix(source.clone()).unwrap(),
-            ] {
-                assert_eq!(restored.size(), (2, 5));
-                assert_eq!(restored.shards().len(), 1);
-                assert_eq!(restored.shards()[0].value, source);
-            }
-            let restored = backend
-                .small_matrix_from_bytes(&schema, &small_bytes, SmallMatrixSemanticKind::Generic)
-                .unwrap();
-            assert_eq!(restored.shards().len(), 1);
-            assert_eq!(restored.shards()[0].value, small);
-            let invalid = ConcreteMatrixType { columns: 6, ..ty.clone() };
-            assert!(backend.matrix_from_bytes(&invalid, &bytes).is_err());
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_preimage_staging_preserves_shards_without_device_gather() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let mut backend = super::super::gpu_backend_on([parameters.clone()], vec![device]);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 2,
-            columns: 24,
-        };
-        let matrix = backend.devices[0]
-            .1
-            .sample_hash(&ty, rand::random(), b"sharded-preimage-staging")
-            .unwrap();
-        let expected = matrix.to_cpu_staging_bytes();
-        let value = Arc::new(GpuFleetMatrix::new(
-            ty.rows,
-            ty.columns,
-            (0..ty.columns)
-                .step_by(4)
-                .map(|start| GpuColumnShard {
-                    device_id: device,
-                    global_column_start: start,
-                    value: matrix.slice_columns(start, start + 4),
-                })
-                .collect(),
-        ));
-        value.wait_until_ready();
-        backend.fence_released_memory().unwrap();
-        gpu_default_mempool_reset_high_water(device).unwrap();
-        let snapshot_baseline = gpu_default_mempool_usage(device).unwrap().used_current;
-        let snapshot = value.shards()[0].value.to_rns_snapshot();
-        let snapshot_scratch =
-            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(snapshot_baseline);
-        drop(snapshot);
-        assert!(snapshot_scratch > 0, "the primitive snapshot unpacks device limbs");
-        gpu_default_mempool_reset_high_water(device).unwrap();
-        let baseline = gpu_default_mempool_usage(device).unwrap().used_current;
-        let (source, bytes) = backend.preimage_target(value).unwrap();
-        let staging_scratch =
-            gpu_default_mempool_usage(device).unwrap().used_high.saturating_sub(baseline);
-        // Raw-RNS serialization has per-limb unpack buffers. Staging six shards
-        // must use at most one shard's measured primitive scratch, never a
-        // full-target gather or six simultaneous snapshots.
-        assert!(
-            staging_scratch <= snapshot_scratch,
-            "staging scratch {staging_scratch} exceeds one-shard bound {snapshot_scratch}"
-        );
-        assert_eq!(bytes.as_slice(), expected.as_slice());
-        assert_eq!(source.row_size(), 2);
-        assert_eq!(source.col_size(), 24);
-        for (start, end) in [(0, 1), (3, 9), (23, 24)] {
-            let loaded = source.load_columns(start, end);
-            assert_eq!(loaded.shards()[0].value, matrix.slice_columns(start, end));
-        }
-        let restored = backend.matrix_from_cpu_staging_bytes(&ty, &bytes).unwrap();
-        assert_eq!(restored.shards()[0].value, matrix);
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_range_transport_preserves_values_or_rejects_nonpeer() {
-        let devices = detected_gpu_device_ids();
-        assert!(!devices.is_empty());
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let mut backend = super::super::gpu_backend_on([parameters.clone()], devices);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 2,
-            columns: 5,
-        };
-        let source = backend.devices[0].1.sample_hash(&ty, rand::random(), b"transport").unwrap();
-        let expected = source.slice_columns(1, 4);
-        let expected_bytes = expected.to_cpu_staging_bytes();
-        let source = GpuFleetMatrix::from_matrix(source);
-        // Always exercise same-device transport. Every additional detected
-        // destination also checks successful peer copies or explicit rejection.
-        backend.devices.par_iter_mut().for_each(|(device, destination_backend)| {
-            let destination = destination_backend.parameters(&ty).unwrap();
-            let host_staging_required =
-                source.shards()[0].value.copy_to_params_direct(destination).is_none();
-            let transferred =
-                GpuDcrtBackend::matrix_piece_on_device(destination_backend, &source, 1, 4);
-            if host_staging_required {
-                assert!(matches!(transferred, Err(PolyBackendError::UnsupportedPlacement)));
-            } else {
-                let transferred = transferred.unwrap();
-                assert_eq!(transferred.size(), (2, 3));
-                assert_eq!(transferred.params().device_ids(), &[*device]);
-                assert_eq!(transferred.to_cpu_staging_bytes(), expected_bytes);
-            }
-        });
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_fleet_uses_context_vram_percent_after_environment_changes() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let name = "MXX_GPU_VRAM_PERCENT";
-        let previous = std::env::var_os(name);
-        unsafe { std::env::set_var(name, "37") };
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
-        unsafe { std::env::set_var(name, "91") };
-        let backend = super::super::gpu_backend_on([parameters], [device]);
-        match previous {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-        assert_eq!(backend.vram_percent(), 37);
-    }
-
-    #[test]
-    fn fleet_vram_configuration_rejects_inconsistent_contexts() {
-        assert!(
-            fleet_context_vram_percent(
-                &[vec![(37, 3_700)], vec![(80, 8_000)]],
-                |value| value.0,
-                |value| value.1
-            )
-            .is_err()
-        );
-        assert!(
-            fleet_context_vram_percent(
-                &[vec![(37, 3_700), (37, 3_701)]],
-                |value| value.0,
-                |value| value.1
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn fleet_ranges_preserve_role_widths_across_multiple_waves() {
-        let ranges = fleet_column_ranges(3, 17, GpuColumnWidths { gpu0: 2, nonzero: Some(3) });
-        assert_eq!(
-            ranges,
-            vec![
-                (0, 0, 2),
-                (1, 2, 5),
-                (2, 5, 8),
-                (0, 8, 10),
-                (1, 10, 13),
-                (2, 13, 16),
-                (0, 16, 17),
-            ]
-        );
-        assert!(ranges.windows(2).all(|pair| pair[0].2 == pair[1].1));
-    }
-
-    #[test]
-    fn fleet_ranges_waterfill_every_partial_wave() {
-        let equal = GpuColumnWidths { gpu0: 100, nonzero: Some(100) };
-        assert_eq!(fleet_column_wave(2, 0, 176, equal, false), vec![(0, 0, 88), (1, 88, 176)]);
-        assert_eq!(
-            fleet_column_ranges(2, 250, equal),
-            vec![(0, 0, 100), (1, 100, 200), (0, 200, 225), (1, 225, 250)]
-        );
-
-        let unequal = GpuColumnWidths { gpu0: 20, nonzero: Some(100) };
-        assert_eq!(
-            fleet_column_wave(3, 0, 176, unequal, false),
-            vec![(0, 0, 20), (1, 20, 98), (2, 98, 176)]
-        );
-    }
-
-    #[test]
-    fn one_gpu_uses_the_same_wave_abstraction() {
-        assert_eq!(
-            fleet_column_ranges(1, 5, GpuColumnWidths { gpu0: 2, nonzero: None }),
-            vec![(0, 0, 2), (0, 2, 4), (0, 4, 5)]
-        );
-    }
-
-    #[test]
-    fn one_column_pilot_measures_both_gpu_roles_without_advancing_output() {
-        let widths = GpuColumnWidths { gpu0: 1, nonzero: Some(1) };
-        assert_eq!(fleet_column_wave(4, 0, 1, widths, true), vec![(0, 0, 1), (1, 0, 1)]);
-        assert_eq!(fleet_column_wave(4, 0, 1, widths, false), vec![(0, 0, 1)]);
-        assert_eq!(fleet_column_wave(4, 0, 2, widths, true), vec![(0, 0, 1), (1, 1, 2)]);
-    }
-
-    #[test]
-    fn pilot_retry_rejects_every_observed_memory_release() {
-        assert!(pilot_interval_was_contaminated(&[186_440], &[95_512]));
-        assert!(pilot_interval_was_contaminated(&[186_440, 50], &[186_440, 49]));
-        assert!(!pilot_interval_was_contaminated(&[95_512], &[95_512]));
-        assert!(!pilot_interval_was_contaminated(&[95_512], &[120_000]));
-        assert!(contaminated_pilot_can_retry(MAX_RUNTIME_PILOT_ATTEMPTS - 1));
-        assert!(!contaminated_pilot_can_retry(MAX_RUNTIME_PILOT_ATTEMPTS));
-    }
-
-    #[test]
-    fn tensor_ranges_split_at_right_matrix_boundaries() {
-        assert_eq!(tensor_column_segments(2, 8, 3), vec![(0, 2, 3), (1, 0, 3), (2, 0, 2)]);
-    }
-
-    #[test]
-    fn diagonal_ranges_preserve_destination_and_source_offsets() {
-        assert_eq!(
-            diagonal_column_overlaps(&[2, 3, 1], 1, 5),
-            vec![Some((0, 1, 2)), Some((1, 0, 3)), None]
-        );
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_fleet_waves_preserve_decomposition_and_canonical_artifacts() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
-        let operation = [17u8; 32];
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 1, nonzero: None });
-        backend.select_operation(operation).unwrap();
-
-        let source_type = ConcreteMatrixType {
-            modulus: modulus.clone(),
-            ring_dimension: 32,
-            rows: 1,
-            columns: 3,
-        };
-        let source =
-            backend.sample_hash(&source_type, [29u8; 32], b"fleet-wave-roundtrip").unwrap();
-        assert_eq!(source.shards().len(), 3);
-        let replica = backend.full_matrix_on_device(0, &source).unwrap();
-        let cached = backend.matrix_replicas.get(&(source.id, 0)).unwrap().clone();
-        assert!(cached.upgrade().is_some());
-        drop(replica);
-        assert!(cached.upgrade().is_none(), "replica cache must not extend GPU value liveness");
-        let bytes = backend.matrix_to_bytes(&source);
-        assert_eq!(backend.matrix_from_bytes(&source_type, &bytes).unwrap(), source);
-
-        let digits = parameters.modulus_digits();
-        let base = BigInt::from(1u8) << parameters.base_bits();
-        let decomposed = backend.gadget_decompose(&source, false, None).unwrap();
-        let schema = ConcreteBoundedMatrixSchema {
-            matrix: ConcreteMatrixType { rows: digits, ..source_type.clone() },
-            max_coefficient_bound: BigInt::from(
-                decomposed.shards()[0].value.max_coefficient_bound().clone(),
-            ),
-        };
-        let compact_bytes = backend
-            .small_matrix_to_bytes(&decomposed, &schema, SmallMatrixSemanticKind::Generic)
-            .unwrap();
-        let decoded = backend
-            .small_matrix_from_bytes(&schema, &compact_bytes, SmallMatrixSemanticKind::Generic)
-            .unwrap();
-        assert_eq!(decoded, decomposed);
-        let alternate = backend.gadget_decompose(&source, true, None).unwrap();
-        let mut mismatched = decoded.clone();
-        mismatched.shards[1].value = alternate.shards[1].value.clone();
-        assert!(matches!(
-            backend.small_matrix_to_bytes(&mismatched, &schema, SmallMatrixSemanticKind::Generic),
-            Err(PolyBackendError::SmallMatrix(_)) |
-                Err(PolyBackendError::InvalidSmallMatrixArtifact(_))
-        ));
-
-        let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type };
-        let gadget = backend
-            .constant_matrix(
-                &gadget_type,
-                &ConstantMatrix::Gadget { base: IntExpr::constant(base), small: false },
-                &ParamEnv::default(),
-            )
-            .unwrap();
-        assert_eq!(backend.multiply_small_rhs(&gadget, &decoded).unwrap(), source);
-    }
-
-    #[test]
-    #[ignore = "requires at least two GPUs with bidirectional peer access"]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_bidirectional_peer_fleet_small_rhs_waves_match_single_device_canonical_output() {
-        let detected = detected_gpu_device_ids();
-        assert!(detected.len() >= 2, "this ignored test requires at least two detected GPUs");
-        for &device in &detected {
-            super::super::wait_for_gpu_test_context_quiescence(device);
-        }
-
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let devices = first_bidirectional_peer_pair(&detected, &parameters).unwrap_or_else(|| {
-            panic!(
-                "this ignored test requires a GPU pair with bidirectional CUDA peer access; \
-                 detected devices {detected:?} have no compatible pair"
-            )
-        });
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let gadget_base = BigInt::from(1u8) << parameters.base_bits();
-        let operation = [117u8; 32];
-        let hash_key: [u8; 32] = rand::random();
-        let mut fleet = super::super::gpu_backend_on([parameters.clone()], devices.iter().copied());
-        assert!(
-            fleet.devices.iter().map(|(device, _)| *device).eq(devices),
-            "test backend must use exactly the selected bidirectional peer pair"
-        );
-        fleet.set_column_widths_for_operation(
-            operation,
-            GpuColumnWidths { gpu0: 1, nonzero: Some(1) },
-        );
-        fleet.select_operation(operation).unwrap();
-
-        let source_type = ConcreteMatrixType {
-            modulus: modulus.clone(),
-            ring_dimension: 32,
-            rows: 1,
-            columns: 9,
-        };
-        let source = fleet.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
-        assert!(source.shards().len() > devices.len(), "test must use multiple waves");
-        assert!(
-            devices
-                .iter()
-                .all(|device| { source.shards().iter().any(|shard| shard.device_id == *device) })
-        );
-
-        let decomposed = fleet.gadget_decompose(&source, false, None).unwrap();
-        let digits = parameters.modulus_digits();
-        let gadget_type = ConcreteMatrixType { rows: 1, columns: digits, ..source_type.clone() };
-        let gadget = fleet
-            .constant_matrix(
-                &gadget_type,
-                &ConstantMatrix::Gadget {
-                    base: IntExpr::constant(gadget_base.clone()),
-                    small: false,
-                },
-                &ParamEnv::default(),
-            )
-            .unwrap();
-        let fleet_output = fleet.multiply_small_rhs(&gadget, &decomposed).unwrap();
-        assert!(fleet_output.shards().len() > devices.len());
-        assert!(
-            devices
-                .iter()
-                .all(|device| fleet_output.shards().iter().any(|shard| shard.device_id == *device))
-        );
-        let fleet_source_bytes = fleet.matrix_to_bytes(&source);
-        let fleet_output_bytes = fleet.matrix_to_bytes(&fleet_output);
-        assert_eq!(fleet_output_bytes, fleet_source_bytes);
-
-        let mut single = super::super::gpu_backend_on([parameters], [devices[0]]);
-        single.set_column_widths_for_operation(
-            operation,
-            GpuColumnWidths { gpu0: source_type.columns, nonzero: None },
-        );
-        single.select_operation(operation).unwrap();
-        let single_source =
-            single.sample_hash(&source_type, hash_key, b"two-device-direct-dif").unwrap();
-        let single_decomposed = single.gadget_decompose(&single_source, false, None).unwrap();
-        let single_gadget = single
-            .constant_matrix(
-                &gadget_type,
-                &ConstantMatrix::Gadget { base: IntExpr::constant(gadget_base), small: false },
-                &ParamEnv::default(),
-            )
-            .unwrap();
-        let single_output = single.multiply_small_rhs(&single_gadget, &single_decomposed).unwrap();
-        assert_eq!(fleet_output_bytes, single.matrix_to_bytes(&single_output));
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_runtime_miss_records_a_profile_and_cache_hit_defers_width_derivation() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let operation = [91u8; 32];
-        backend.select_operation(operation).unwrap();
-        let ty = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 1, columns: 3 };
-        let value = backend.sample_hash(&ty, [7u8; 32], b"runtime-calibration-pilot").unwrap();
-        let widths = backend.column_widths(&operation).expect("runtime operation width");
-        let profile = backend.operation_profiles.get(&operation).expect("runtime profile");
-        assert_eq!(profile.gpu0.pilot_columns(), 1);
-        assert!(profile.gpu0.pilot_peak_bytes() > 0);
-        assert_eq!(value.shards().len(), ty.columns.div_ceil(widths.gpu0));
-
-        backend.select_operation(operation).unwrap();
-        assert!(backend.column_widths(&operation).is_none());
-        assert!(backend.pending_profile.is_some());
-        let _ = backend.negate(&value).unwrap();
-        assert!(backend.pending_profile.is_none());
-        assert!(backend.column_widths(&operation).is_some());
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_shared_context_fails_without_retaining_a_profile_or_width() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let _other_context = GpuDCRTPolyParams::new(32, vec![65_537, 67_073], 2, None);
-        let operation = [92u8; 32];
-
-        assert!(matches!(
-            backend.select_operation(operation),
-            Err(PolyBackendError::GpuCalibration(message))
-                if message.contains(SHARED_POOL_CALIBRATION_ERROR)
-        ));
-        assert!(!backend.operation_profiles.contains_key(&operation));
-        assert!(backend.column_widths(&operation).is_none());
-        assert!(backend.pending_profile.is_none());
-        assert!(backend.pending_pilot.is_none());
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_runtime_pilots_reslice_wide_matrix_inputs() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let setup = [3u8; 32];
-        backend.set_column_widths_for_operation(setup, GpuColumnWidths { gpu0: 3, nonzero: None });
-        backend.select_operation(setup).unwrap();
-        let ty = ConcreteMatrixType {
-            modulus: modulus.clone(),
-            ring_dimension: 32,
-            rows: 1,
-            columns: 3,
-        };
-        let source = backend.sample_hash(&ty, [11u8; 32], b"wide-pilot-input").unwrap();
-        assert_eq!(source.shards().len(), 1);
-        let expected_source = backend.gather_matrix_for_host(&source).unwrap();
-        let scalar_ty = ConcreteMatrixType { columns: 1, ..ty.clone() };
-        let scalar = backend
-            .constant_matrix(&scalar_ty, &ConstantMatrix::Identity, &ParamEnv::default())
-            .unwrap();
-
-        let negate_operation = [31u8; 32];
-        backend.select_operation(negate_operation).unwrap();
-        let negated = backend.negate(&source).unwrap();
-        assert_eq!(
-            negated.shards().len(),
-            ty.columns.div_ceil(backend.column_widths(&negate_operation).unwrap().gpu0)
-        );
-
-        let add_operation = [32u8; 32];
-        backend.select_operation(add_operation).unwrap();
-        let added = backend.add(&source, &source).unwrap();
-        assert_eq!(
-            added.shards().len(),
-            ty.columns.div_ceil(backend.column_widths(&add_operation).unwrap().gpu0)
-        );
-
-        let multiply_operation = [33u8; 32];
-        backend.select_operation(multiply_operation).unwrap();
-        let multiplied = backend.multiply(&scalar, &source).unwrap();
-        assert_eq!(
-            multiplied.shards().len(),
-            ty.columns.div_ceil(backend.column_widths(&multiply_operation).unwrap().gpu0)
-        );
-
-        let scalar_right_operation = [35u8; 32];
-        backend.select_operation(scalar_right_operation).unwrap();
-        let scalar_right = backend.multiply(&source, &scalar).unwrap();
-        assert_eq!((scalar_right.rows, scalar_right.columns), (ty.rows, ty.columns));
-        assert_eq!(backend.gather_matrix_for_host(&scalar_right).unwrap(), expected_source);
-
-        let accumulate_operation = [34u8; 32];
-        backend.select_operation(accumulate_operation).unwrap();
-        let accumulated = backend
-            .matrix_mul_accumulate(MatrixMulAccumulateRequest {
-                products: vec![(
-                    BigInt::from(1u8),
-                    Arc::new(scalar.clone()),
-                    Arc::new(source.clone()),
-                )],
-                bias: None,
-            })
-            .unwrap();
-        assert_eq!(
-            accumulated.shards().len(),
-            ty.columns.div_ceil(backend.column_widths(&accumulate_operation).unwrap().gpu0)
-        );
-
-        let mixed_operation = [36u8; 32];
-        backend.select_operation(mixed_operation).unwrap();
-        let mixed = backend
-            .matrix_mul_accumulate(MatrixMulAccumulateRequest {
-                products: vec![
-                    (BigInt::from(0u8), Arc::new(scalar.clone()), Arc::new(source.clone())),
-                    (BigInt::from(1u8), Arc::new(source.clone()), Arc::new(scalar)),
-                ],
-                bias: None,
-            })
-            .unwrap();
-        assert_eq!(backend.active_operation, Some(mixed_operation));
-        assert_eq!((mixed.rows, mixed.columns), (ty.rows, ty.columns));
-        assert!(mixed.shards.windows(2).all(|pair| {
-            pair[0].global_column_start + pair[0].value.col_size() == pair[1].global_column_start
-        }));
-        assert_eq!(
-            mixed.shards.last().unwrap().global_column_start +
-                mixed.shards.last().unwrap().value.col_size(),
-            ty.columns
-        );
-        assert_eq!(backend.gather_matrix_for_host(&mixed).unwrap(), expected_source);
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn test_gpu_fleet_sum_rows_matches_cpu_full_and_partial_waves() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let ty = ConcreteMatrixType {
-            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
-            ring_dimension: 32,
-            rows: 4,
-            columns: 3,
-        };
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let operation = [64u8; 32];
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 3, nonzero: None });
-        backend.select_operation(operation).unwrap();
-        let source = backend.sample_hash(&ty, rand::random(), b"sum-rows-fleet").unwrap();
-        let cpu = backend.gather_matrix_for_host(&source).unwrap();
-        let first = cpu.slice(3, 4, 0, 3);
-        let repeated = cpu.slice(1, 2, 0, 3) + &cpu.slice(1, 2, 0, 3) + &cpu.slice(0, 1, 0, 3);
-        let cross = cpu.slice(0, 1, 0, 3) + &cpu.slice(2, 3, 0, 3);
-        let expected = first.concat_rows(&[&repeated, &cross]);
-        let groups = vec![vec![3], vec![1, 1, 0], vec![0, 2]];
-        let mut results = Vec::new();
-        for width in [3, 2] {
-            backend.set_column_widths_for_operation(
-                operation,
-                GpuColumnWidths { gpu0: width, nonzero: None },
-            );
-            backend.select_operation(operation).unwrap();
-            let result = backend.sum_rows(&source, &groups).unwrap();
-            assert_eq!(result.shards.len(), if width == 3 { 1 } else { 2 });
-            results.push(result);
-        }
-        drop(source);
-        for result in results {
-            assert_eq!(backend.gather_matrix_for_host(&result).unwrap(), expected);
-        }
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_tensor_and_diagonal_concat_match_single_device_semantics() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let operation = [63u8; 32];
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 2, nonzero: None });
-        backend.select_operation(operation).unwrap();
-        let ty = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 2, columns: 3 };
-        let source = backend.sample_hash(&ty, [19u8; 32], b"tensor-diagonal-fleet").unwrap();
-        let full_source = backend.gather_matrix_for_host(&source).unwrap();
-
-        let expected_tensor = full_source.tensor(&full_source);
-        let tensor = backend.tensor(&source, &source).unwrap();
-        assert_eq!(backend.gather_matrix_for_host(&tensor).unwrap(), expected_tensor);
-
-        // The same multi-column tensor must also match when one full-width wave
-        // dispatches directly instead of splitting at right-matrix boundaries.
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 9, nonzero: None });
-        backend.select_operation(operation).unwrap();
-        let full_wave_tensor = backend.tensor(&source, &source).unwrap();
-        assert_eq!(full_wave_tensor.shards.len(), 1);
-        assert_eq!(backend.gather_matrix_for_host(&full_wave_tensor).unwrap(), expected_tensor);
-        backend
-            .set_column_widths_for_operation(operation, GpuColumnWidths { gpu0: 2, nonzero: None });
-        backend.select_operation(operation).unwrap();
-
-        let expected_diagonal = full_source.concat_diag(&[&full_source]);
-        let diagonal = backend.concat(&[&source, &source], ConcatAxis::Diagonal).unwrap();
-        assert_eq!(backend.gather_matrix_for_host(&diagonal).unwrap(), expected_diagonal);
-    }
-
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn gpu_transpose_and_concat_calibration_preserve_mixed_layouts() {
-        let device = detected_gpu_device_ids()[0];
-        super::super::wait_for_gpu_test_context_quiescence(device);
-        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
-        let mut backend = super::super::gpu_backend_on([parameters], [device]);
-        let setup = [70u8; 32];
-        backend.set_column_widths_for_operation(setup, GpuColumnWidths { gpu0: 3, nonzero: None });
-        backend.select_operation(setup).unwrap();
-        let ty = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 2, columns: 3 };
-        let wide = backend.sample_hash(&ty, [23u8; 32], b"concat-wide-layout").unwrap();
-
-        let narrow_operation = [71u8; 32];
-        backend.set_column_widths_for_operation(
-            narrow_operation,
-            GpuColumnWidths { gpu0: 1, nonzero: None },
-        );
-        backend.select_operation(narrow_operation).unwrap();
-        let narrow = backend.negate(&wide).unwrap();
-        assert_ne!(wide.shards().len(), narrow.shards().len());
-
-        let row_operation = [72u8; 32];
-        backend.select_operation(row_operation).unwrap();
-        let rows = backend.concat(&[&wide, &narrow], ConcatAxis::Rows).unwrap();
-        assert_profile_created(&backend, &row_operation);
-        let full_wide = backend.gather_matrix_for_host(&wide).unwrap();
-        let full_narrow = backend.gather_matrix_for_host(&narrow).unwrap();
-        assert_eq!(
-            backend.gather_matrix_for_host(&rows).unwrap(),
-            full_wide.concat_rows(&[&full_narrow])
-        );
-
-        let column_operation = [73u8; 32];
-        backend.select_operation(column_operation).unwrap();
-        let columns = backend.concat(&[&wide, &wide], ConcatAxis::Columns).unwrap();
-        assert_profile_created(&backend, &column_operation);
-        assert_eq!(
-            backend.gather_matrix_for_host(&columns).unwrap(),
-            full_wide.concat_columns(&[&full_wide])
-        );
-
-        let transpose_operation = [74u8; 32];
-        backend.select_operation(transpose_operation).unwrap();
-        let transposed = backend.transpose(&wide).unwrap();
-        assert_profile_created(&backend, &transpose_operation);
-        assert_eq!(backend.gather_matrix_for_host(&transposed).unwrap(), full_wide.transpose());
-        let mut outputs = Vec::new();
-        for width in [wide.rows, 1] {
-            backend.set_column_widths_for_operation(
-                transpose_operation,
-                GpuColumnWidths { gpu0: width, nonzero: None },
-            );
-            backend.select_operation(transpose_operation).unwrap();
-            let output = backend.transpose(&wide).unwrap();
-            assert_eq!(output.shards.len(), wide.rows.div_ceil(width));
-            outputs.push(output);
-        }
-        drop(wide);
-        for output in outputs {
-            assert_eq!(backend.gather_matrix_for_host(&output).unwrap(), full_wide.transpose());
-        }
+        let first = pieces.next().expect("requested matrix range must be covered");
+        Ok(first.concat_columns_owned(pieces.collect()))
     }
 }
 
@@ -2357,18 +810,7 @@ impl Backend for GpuDcrtBackend {
     type SmallMatrix = GpuFleetSmallMatrix;
     type Trapdoor = GpuFleetTrapdoor;
     type Error = PolyBackendError;
-
-    fn polynomial_from_values(
-        &mut self,
-        ty: &ConcreteMatrixType,
-        values: &[BigInt],
-        evaluation: bool,
-    ) -> Result<Self::Matrix, Self::Error> {
-        self.devices[0]
-            .1
-            .polynomial_from_values(ty, values, evaluation)
-            .map(GpuFleetMatrix::from_matrix)
-    }
+    const EXECUTION_STRATEGY: ExecutionStrategy = ExecutionStrategy::Prepared;
 
     fn polynomial_values(
         &mut self,
@@ -2387,8 +829,118 @@ impl Backend for GpuDcrtBackend {
         self.devices[device].1.polynomial_values(&first.value, evaluation)
     }
 
-    fn select_gpu_operation(&mut self, operation: [u8; 32]) -> Result<(), Self::Error> {
-        self.select_operation(operation)
+    fn polynomial_from_values(
+        &mut self,
+        _ty: &ConcreteMatrixType,
+        _values: &[BigInt],
+        _evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn warm_up_prepared_graph(
+        &mut self,
+        validated: &mxx_ir_core::ValidatedGraph,
+        inputs: &std::collections::BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        config: &crate::executor::ExecutionConfig,
+    ) -> Result<(), Self::Error> {
+        GpuDcrtBackend::warm_up_prepared_graph(self, validated, inputs, config)
+    }
+
+    fn prepared_spec_hash(&self) -> Option<[u8; 32]> {
+        self.prepared_spec_hash
+    }
+
+    fn execute_prepared_graph(
+        &mut self,
+        spec_hash: [u8; 32],
+        _validated: &mxx_ir_core::ValidatedGraph,
+        inputs: &BTreeMap<String, crate::backend::RuntimeValue<Self>>,
+        mut context: crate::executor::PreparedExecutionContext<'_, Self>,
+    ) -> Result<crate::executor::ExecutionResult<Self>, Self::Error> {
+        let session = context.session.clone();
+        let mut sampling_mode = context.sampling_mode;
+        let mut transcript_store = context.transcript_store.take();
+        if self.prepared_graph.is_none() {
+            return Err(PolyBackendError::NotPrepared);
+        }
+        let execution = self
+            .prepared_graph
+            .as_ref()
+            .expect("prepared graph checked immediately before input binding");
+        if execution.spec_hash() != spec_hash {
+            return Err(PolyBackendError::PreparedContractMismatch);
+        }
+
+        // A prepared session owns its transcript policy.  Existing entries
+        // select replay; an empty session selects record.  Partial tapes are
+        // Sparse entries are intentional: zero-count loops and unselected
+        // branches have no draw. Any selected site is checked at its fixed
+        // replay step before submission.
+        let mut recorder = None;
+        let replayer = if let Some(production) = session.as_ref() {
+            let store = transcript_store.as_deref_mut().ok_or_else(|| {
+                PolyBackendError::GpuSubmission(
+                    "prepared session has no transcript store".to_owned(),
+                )
+            })?;
+            let entries =
+                store.transcript_entries(production).map_err(PolyBackendError::GpuSubmission)?;
+            if entries.is_empty() {
+                recorder = Some(TranscriptRecorder::default());
+                sampling_mode = SamplingMode::Record(recorder.as_mut().expect("recorder bound"));
+                None
+            } else {
+                Some(
+                    TranscriptReplayer::from_entries(entries)
+                        .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?,
+                )
+            }
+        } else {
+            None
+        };
+        if let Some(replayer) = replayer.as_ref() {
+            sampling_mode = SamplingMode::Replay(replayer);
+        }
+
+        let execution = execution
+            .run_with_runtime_bindings(inputs, &mut sampling_mode)
+            .map_err(|error| PolyBackendError::GpuSubmission(error.to_string()))?;
+        if let (Some(production), Some(recorder), Some(store)) =
+            (session.as_ref(), recorder.as_ref(), transcript_store.as_deref_mut())
+        {
+            let entries = recorder
+                .iter()
+                .map(|(site, value)| (site.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            store
+                .record_transcript_batch(production, &entries)
+                .map_err(PolyBackendError::GpuSubmission)?;
+        }
+        if context.capture_trace {
+            let trace = context.trace.as_deref_mut().ok_or_else(|| {
+                PolyBackendError::GpuSubmission(
+                    "prepared trace capture requested without a trace sink".into(),
+                )
+            })?;
+            self.prepared_graph
+                .as_ref()
+                .expect("prepared graph checked immediately before trace publication")
+                .capture_trace(&execution, trace)
+                .map_err(PolyBackendError::GpuSubmission)?;
+        }
+        Ok(crate::executor::ExecutionResult {
+            outputs: BTreeMap::new(),
+            production_id: session,
+            artifact_handles: BTreeMap::new(),
+            staged_family_leases: Vec::new(),
+            prepared_outputs: Some(
+                self.prepared_graph
+                    .as_ref()
+                    .expect("prepared graph checked immediately before output publication")
+                    .output_lease(execution.slot()),
+            ),
+        })
     }
 
     // A fleet is one production placement. Device parallelism is internal to
@@ -2403,484 +955,189 @@ impl Backend for GpuDcrtBackend {
 
     fn constant_matrix(
         &mut self,
-        ty: &ConcreteMatrixType,
-        value: &ConstantMatrix,
-        env: &ParamEnv,
+        _ty: &ConcreteMatrixType,
+        _value: &ConstantMatrix,
+        _env: &ParamEnv,
     ) -> Result<Self::Matrix, Self::Error> {
-        #[derive(Clone, Copy)]
-        enum RangeConstant {
-            Zero,
-            Identity,
-            UnitRow(usize),
-            Gadget(bool),
-            SingleColumn,
-        }
-        let range_constant = match value {
-            ConstantMatrix::Zero => Some(RangeConstant::Zero),
-            ConstantMatrix::Identity if ty.rows == ty.columns => Some(RangeConstant::Identity),
-            ConstantMatrix::UnitRow { index } if ty.rows == 1 => Some(RangeConstant::UnitRow(
-                index
-                    .evaluate(env)
-                    .ok()
-                    .and_then(|value| value.to_usize())
-                    .filter(|index| *index < ty.columns)
-                    .ok_or(PolyBackendError::InvalidInteger)?,
-            )),
-            ConstantMatrix::Gadget { base, small } if ty.columns.is_multiple_of(ty.rows) => {
-                let base = base.evaluate(env).map_err(|_| PolyBackendError::InvalidInteger)?;
-                self.validate_gadget_layout(ty, &base, ty.columns / ty.rows, *small)?;
-                Some(RangeConstant::Gadget(*small))
-            }
-            _ if ty.columns == 1 &&
-                (self.pending_pilot.is_some() ||
-                    self.active_operation.is_some_and(|operation| {
-                        self.operation_widths.contains_key(&operation)
-                    })) =>
-            {
-                Some(RangeConstant::SingleColumn)
-            }
-            _ => None,
-        };
-        if let Some(range_constant) = range_constant {
-            self.restart_runtime_pilot_after_fixed_inputs()
-                .map_err(PolyBackendError::GpuCalibration)?;
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < ty.columns {
-                let wave = self.next_column_wave(next_column, ty.columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                        Some((|| {
-                            let params = backend.parameters(&local_ty)?;
-                            let value = match range_constant {
-                                RangeConstant::Zero => {
-                                    GpuDCRTPolyMatrix::zero(params, ty.rows, end - start)
-                                }
-                                RangeConstant::Identity => GpuDCRTPolyMatrix::identity_columns(
-                                    params,
-                                    ty.rows,
-                                    start,
-                                    end - start,
-                                ),
-                                RangeConstant::UnitRow(index) => {
-                                    GpuDCRTPolyMatrix::unit_row_columns(
-                                        params,
-                                        ty.columns,
-                                        index,
-                                        start,
-                                        end - start,
-                                    )
-                                }
-                                RangeConstant::Gadget(small) => GpuDCRTPolyMatrix::gadget_columns(
-                                    params,
-                                    ty.rows,
-                                    small,
-                                    start,
-                                    end - start,
-                                    Some(ty.columns / ty.rows),
-                                ),
-                                RangeConstant::SingleColumn => {
-                                    backend.constant_matrix(&local_ty, value, env)?
-                                }
-                            };
-                            Ok::<_, PolyBackendError>(GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            })
-                        })())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards));
-        }
-        // Non-range constants are already materialized on one device, including
-        // setup inputs created before an operation has selected calibrated widths.
-        // Keep that ownership; consuming operations distribute their needed ranges.
-        let full = self.devices[0].1.constant_matrix(ty, value, env)?;
-        Ok(GpuFleetMatrix::from_matrix(full))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn add(
         &mut self,
-        left: &Self::Matrix,
-        right: &Self::Matrix,
+        _left: &Self::Matrix,
+        _right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.binary_columns(left, right, Backend::add)
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn add_batch(
+        &mut self,
+        _inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn add_row_blocks(
         &mut self,
-        blocks: &[&Self::Matrix],
-        right: &Self::Matrix,
+        _blocks: &[&Self::Matrix],
+        _right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        let rows = blocks.iter().try_fold(0usize, |rows, block| {
-            rows.checked_add(block.rows).ok_or(PolyBackendError::InvalidInteger)
-        })?;
-        if blocks.is_empty() ||
-            rows != right.rows ||
-            blocks.iter().any(|block| block.columns != right.columns)
-        {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let inputs = blocks.iter().copied().chain(std::iter::once(right)).collect::<Vec<_>>();
-        self.restart_runtime_pilot_after_matrix_inputs(&inputs)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < right.columns {
-            let wave = self.next_column_wave(next_column, right.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched =
-                self.launch_column_wave(&wave, right.columns, |backend, start, end| {
-                    // Complete resident column shards are borrowed directly; only partial
-                    // ranges or peer transfers allocate input pieces.
-                    let local = blocks
-                        .iter()
-                        .map(|block| Self::matrix_operand_on_device(backend, block, start, end))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let right = Self::matrix_operand_on_device(backend, right, start, end)?;
-                    let refs = local.iter().map(|block| block.as_ref()).collect::<Vec<_>>();
-                    backend.add_row_blocks(&refs, &right)
-                })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(rows, right.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sub(
         &mut self,
-        left: &Self::Matrix,
-        right: &Self::Matrix,
+        _left: &Self::Matrix,
+        _right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.binary_columns(left, right, Backend::sub)
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn sub_batch(
+        &mut self,
+        _inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn multiply(
         &mut self,
-        left: &Self::Matrix,
-        right: &Self::Matrix,
+        _left: &Self::Matrix,
+        _right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        if !self.runtime_pilot_is_pending() &&
-            self.devices.len() == 1 &&
-            left.shards.len() == 1 &&
-            right.shards.len() == 1 &&
-            self.devices[0].1.matrix_is_on_active_placement(&left.shards[0].value) &&
-            self.devices[0].1.matrix_is_on_active_placement(&right.shards[0].value)
-        {
-            let pending_profile = self.pending_profile.clone();
-            self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
-            let columns = if right.size() == (1, 1) { left.columns } else { right.columns };
-            if !self.runtime_pilot_is_pending() && columns <= self.active_role_width(0) {
-                // Complete operands already reside on the sole participating
-                // device. Respect the calibrated wave width, but avoid staging
-                // copies before an operation that only reads those operands.
-                let output =
-                    self.devices[0].1.multiply(&left.shards[0].value, &right.shards[0].value)?;
-                return Ok(GpuFleetMatrix::from_matrix(output));
-            }
-            // The general path may allocate fixed operand replicas. Re-derive
-            // its capacity after those allocations rather than retaining the
-            // borrowed path's earlier residency snapshot.
-            self.pending_profile = pending_profile;
-        }
-        if left.size() == (1, 1) {
-            let replicas = (0..self.devices.len())
-                .map(|device| self.full_matrix_on_device(device, left))
-                .collect::<Result<Vec<_>, _>>()?;
-            if self.runtime_pilot_is_pending() {
-                right.wait_until_ready();
-                replicas.iter().for_each(|replica| replica.wait_until_ready());
-            }
-            self.restart_runtime_pilot_after_fixed_inputs()
-                .map_err(PolyBackendError::GpuCalibration)?;
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < right.columns {
-                let wave = self.next_column_wave(next_column, right.columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        Some(Self::matrix_piece_on_device(backend, right, start, end).and_then(
-                            |right| {
-                                backend.multiply(&replicas[device], &right).map(|value| {
-                                    GpuColumnShard {
-                                        device_id: *device_id,
-                                        global_column_start: start,
-                                        value,
-                                    }
-                                })
-                            },
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(right.rows, right.columns, shards));
-        }
-        if right.size() == (1, 1) {
-            let replicas = (0..self.devices.len())
-                .map(|device| self.full_matrix_on_device(device, right))
-                .collect::<Result<Vec<_>, _>>()?;
-            if self.runtime_pilot_is_pending() {
-                left.wait_until_ready();
-                replicas.iter().for_each(|replica| replica.wait_until_ready());
-            }
-            self.restart_runtime_pilot_after_fixed_inputs()
-                .map_err(PolyBackendError::GpuCalibration)?;
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < left.columns {
-                let wave = self.next_column_wave(next_column, left.columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        Some(Self::matrix_piece_on_device(backend, left, start, end).and_then(
-                            |left| {
-                                backend.multiply(&left, &replicas[device]).map(|value| {
-                                    GpuColumnShard {
-                                        device_id: *device_id,
-                                        global_column_start: start,
-                                        value,
-                                    }
-                                })
-                            },
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(left.rows, left.columns, shards));
-        }
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
 
-        let left_replicas = (0..self.devices.len())
-            .map(|device| self.full_matrix_on_device(device, left))
-            .collect::<Result<Vec<_>, _>>()?;
-        if self.runtime_pilot_is_pending() {
-            right.wait_until_ready();
-            left_replicas.iter().for_each(|replica| replica.wait_until_ready());
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < right.columns {
-            let wave = self.next_column_wave(next_column, right.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(Self::matrix_piece_on_device(backend, right, start, end).and_then(
-                        |right| {
-                            backend.multiply(&left_replicas[device], &right).map(|value| {
-                                GpuColumnShard {
-                                    device_id: *device_id,
-                                    global_column_start: start,
-                                    value,
-                                }
-                            })
-                        },
-                    ))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(left.rows, right.columns, shards))
+    fn multiply_batch(
+        &mut self,
+        _inputs: Vec<(Arc<Self::Matrix>, Arc<Self::Matrix>)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn matrix_mul_accumulate(
         &mut self,
-        request: MatrixMulAccumulateRequest<Self::Matrix>,
+        _request: MatrixMulAccumulateRequest<Self::Matrix>,
     ) -> Result<Self::Matrix, Self::Error> {
-        let first = request.products.first().expect("validated request has a product");
-        let first_scales_left = gpu_matrix_multiply_scales_left(
-            first.1.rows,
-            first.1.columns,
-            first.2.rows,
-            first.2.columns,
-        );
-        let output_columns = if first_scales_left { first.1.columns } else { first.2.columns };
-        let output_rows = if first.1.size() == (1, 1) { first.2.rows } else { first.1.rows };
-        let mut fixed_replicas = Vec::with_capacity(request.products.len());
-        for (_, left, right) in &request.products {
-            let scales_left =
-                gpu_matrix_multiply_scales_left(left.rows, left.columns, right.rows, right.columns);
-            let product_rows = if left.size() == (1, 1) { right.rows } else { left.rows };
-            let product_columns = if scales_left { left.columns } else { right.columns };
-            if (product_rows, product_columns) != (output_rows, output_columns) {
-                return Err(PolyBackendError::InvalidInteger);
-            }
-            let fixed = if scales_left { right } else { left };
-            fixed_replicas.push(
-                (0..self.devices.len())
-                    .map(|device| self.full_matrix_on_device(device, fixed))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        if self.runtime_pilot_is_pending() {
-            request.products.iter().for_each(|(_, left, right)| {
-                let scalable = if gpu_matrix_multiply_scales_left(
-                    left.rows,
-                    left.columns,
-                    right.rows,
-                    right.columns,
-                ) {
-                    left
-                } else {
-                    right
-                };
-                scalable.wait_until_ready();
-            });
-            if let Some(bias) = &request.bias {
-                bias.wait_until_ready();
-            }
-            fixed_replicas.iter().flatten().for_each(|replica| replica.wait_until_ready());
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < output_columns {
-            let wave = self.next_column_wave(next_column, output_columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    let mut products = Vec::with_capacity(request.products.len());
-                    for (product, replicas) in request.products.iter().zip(&fixed_replicas) {
-                        let scales_left = gpu_matrix_multiply_scales_left(
-                            product.1.rows,
-                            product.1.columns,
-                            product.2.rows,
-                            product.2.columns,
-                        );
-                        let scalable = if scales_left { &product.1 } else { &product.2 };
-                        let piece =
-                            match Self::matrix_piece_on_device(backend, scalable, start, end) {
-                                Ok(piece) => Arc::new(piece),
-                                Err(error) => return Some(Err(error)),
-                            };
-                        let (left, right) = if scales_left {
-                            (piece, replicas[device].clone())
-                        } else {
-                            (replicas[device].clone(), piece)
-                        };
-                        products.push((product.0.clone(), left, right));
-                    }
-                    let bias = match request.bias.as_ref() {
-                        Some(bias) => match Self::matrix_piece_on_device(backend, bias, start, end)
-                        {
-                            Ok(bias) => Some(Arc::new(bias)),
-                            Err(error) => return Some(Err(error)),
-                        },
-                        None => None,
-                    };
-                    let local = MatrixMulAccumulateRequest { products, bias };
-                    Some(backend.matrix_mul_accumulate(local).map(|value| GpuColumnShard {
-                        device_id: *device_id,
-                        global_column_start: start,
-                        value,
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(output_rows, output_columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
-    fn negate(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, Backend::negate)
+    fn matrix_mul_accumulate_batch(
+        &mut self,
+        _requests: Vec<MatrixMulAccumulateRequest<Self::Matrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn negate(&mut self, _value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn negate_batch(
+        &mut self,
+        _inputs: Vec<Arc<Self::Matrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn scale_integer(
         &mut self,
-        value: &Self::Matrix,
-        scalar: &BigInt,
+        _value: &Self::Matrix,
+        _scalar: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, value| backend.scale_integer(value, scalar))
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn scale_integer_batch(
+        &mut self,
+        _inputs: Vec<(Arc<Self::Matrix>, BigInt)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn ring_automorphism(
         &mut self,
-        value: &Self::Matrix,
-        index: usize,
+        _value: &Self::Matrix,
+        _index: usize,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, value| backend.ring_automorphism(value, index))
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn ring_automorphism_batch(
+        &mut self,
+        _inputs: Vec<(Arc<Self::Matrix>, usize)>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn modulus_switch(
         &mut self,
-        value: &Self::Matrix,
-        destination: &ConcreteMatrixType,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, input| backend.modulus_switch(input, destination))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn centered_rebase(
         &mut self,
-        value: &Self::Matrix,
-        destination: &ConcreteMatrixType,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, input| backend.centered_rebase(input, destination))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn rns_mod_up(
         &mut self,
-        value: &Self::Matrix,
-        destination: &ConcreteMatrixType,
-        source_moduli: &[u64],
-        digit_size: usize,
-        normalize: bool,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
+        _source_moduli: &[u64],
+        _digit_size: usize,
+        _normalize: bool,
     ) -> Result<Self::Matrix, Self::Error> {
-        if value.columns == 0 {
-            return Ok(GpuFleetMatrix::new(destination.rows, 0, Vec::new()));
-        }
-        self.unary_columns(value, |backend, input| {
-            backend.rns_mod_up(input, destination, source_moduli, digit_size, normalize)
-        })
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn rns_mod_down(
         &mut self,
-        value: &Self::Matrix,
-        destination: &ConcreteMatrixType,
-        source_moduli: &[u64],
-        plaintext_modulus: u64,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
+        _source_moduli: &[u64],
+        _plaintext_modulus: u64,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, input| {
-            backend.rns_mod_down(input, destination, source_moduli, plaintext_modulus)
-        })
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn reduce_modulus(
         &mut self,
-        value: &Self::Matrix,
-        destination: &ConcreteMatrixType,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.unary_columns(value, |backend, input| backend.reduce_modulus(input, destination))
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn centered_extend(
+        &mut self,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn centered_extend_small(
+        &mut self,
+        _value: &Self::SmallMatrix,
+        _destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        _value: &Self::Matrix,
+        _destination: &ConcreteMatrixType,
+        _plaintext_modulus: u64,
+    ) -> Result<Self::Matrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn preimage_target(
@@ -2892,13 +1149,29 @@ impl Backend for GpuDcrtBackend {
         let first = value.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
         let params = first.value.params().clone();
         let mut metadata = None;
-        let mut payload = Vec::new();
-        // Copy existing shards directly to host, one at a time. Gathering on a
+        let mut bytes = Vec::new();
+        let mut payload_start = 0;
+        // Copy existing shards directly to host. Gathering on a
         // device would temporarily allocate the entire logical target there.
-        // Sequential snapshots bound pinned and device unpack scratch to one
-        // existing shard; raw-RNS serialization allocates temporary u64 limbs.
-        for shard in &value.shards {
-            let snapshot = shard.value.to_rns_snapshot();
+        // Two stages overlap transfers while bounding pinned/unpack scratch
+        // to two shards. The next transfer starts before the previous wait.
+        let mut chunks = value.shards.iter();
+        let mut pending = chunks
+            .next()
+            .map(|shard| {
+                self.start_rns_snapshot(&shard.value)
+                    .map(|transfer| (shard.global_column_start, transfer))
+            })
+            .transpose()?;
+        while let Some((global_column_start, transfer)) = pending {
+            let next = chunks
+                .next()
+                .map(|shard| {
+                    self.start_rns_snapshot(&shard.value)
+                        .map(|transfer| (shard.global_column_start, transfer))
+                })
+                .transpose()?;
+            let snapshot = transfer.finish();
             let current = (snapshot.level(), snapshot.is_ntt(), snapshot.bytes_per_poly());
             if let Some(expected) = metadata {
                 if current != expected {
@@ -2910,41 +1183,75 @@ impl Backend for GpuDcrtBackend {
                     .checked_mul(columns)
                     .and_then(|size| size.checked_mul(snapshot.bytes_per_poly()))
                     .ok_or(PolyBackendError::InvalidInteger)?;
-                payload.resize(length, 0);
+                // The byte-slice encoding is its length followed by raw bytes.
+                // Allocate the final staging representation once and write
+                // shards directly into it, avoiding a second full-size copy.
+                let header = bincode::encode_to_vec(
+                    (1u8, rows, columns, current.0, current.1, current.2, length),
+                    bincode::config::standard(),
+                )
+                .map_err(|_| PolyBackendError::InvalidInteger)?;
+                payload_start = header.len();
+                bytes = vec![0; payload_start + length];
+                bytes[..payload_start].copy_from_slice(&header);
             }
             let row_bytes = columns * snapshot.bytes_per_poly();
             let shard_row_bytes = snapshot.ncol() * snapshot.bytes_per_poly();
             if row_bytes != 0 {
-                payload.par_chunks_mut(row_bytes).enumerate().for_each(|(row, target)| {
-                    let start = shard.global_column_start * snapshot.bytes_per_poly();
-                    target[start..start + shard_row_bytes].copy_from_slice(
-                        &snapshot.bytes()[row * shard_row_bytes..(row + 1) * shard_row_bytes],
-                    );
-                });
+                bytes[payload_start..].par_chunks_mut(row_bytes).enumerate().for_each(
+                    |(row, target)| {
+                        let start = global_column_start * snapshot.bytes_per_poly();
+                        target[start..start + shard_row_bytes]
+                            .par_chunks_mut(snapshot.bytes_per_poly())
+                            .enumerate()
+                            .for_each(|(column, target)| {
+                                let offset =
+                                    row * shard_row_bytes + column * snapshot.bytes_per_poly();
+                                target.copy_from_slice(
+                                    &snapshot.bytes()[offset..offset + target.len()],
+                                );
+                            });
+                    },
+                );
             }
+            self.rns_staging_buffers.push(snapshot);
+            pending = next;
         }
-        let (level, is_ntt, bytes_per_poly) =
-            metadata.ok_or(PolyBackendError::InvalidConstantShape)?;
-        // Use the primitive raw-RNS staging representation, preserving both
-        // coefficient/evaluation format and the logical row-major layout.
-        let bytes = Arc::new(
-            bincode::encode_to_vec(
-                (1u8, rows, columns, level, is_ntt, bytes_per_poly, payload.as_slice()),
-                bincode::config::standard(),
-            )
-            .map_err(|_| PolyBackendError::InvalidInteger)?,
-        );
-        let source = FleetStagedColumnSource { params, rows, columns, bytes: bytes.clone() };
+        let bytes = Arc::new(bytes);
+        let source = PreimageTarget::staged(&params, rows, columns, bytes.clone());
         Ok((Arc::new(source), bytes))
     }
 
     fn matrix_from_cpu_staging_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
-        let params = self.devices[0].1.parameters(ty)?;
-        Ok(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_cpu_staging_bytes(params, bytes)))
+        let (rows, columns) = {
+            let parameters = self
+                .devices
+                .first()
+                .ok_or(PolyBackendError::InvalidConstantShape)?
+                .1
+                .parameters(ty)?;
+            let layout = GpuDCRTPolyMatrix::cpu_staging_layout(parameters, bytes)
+                .map_err(PolyBackendError::GpuSubmission)?;
+            (layout.rows, layout.columns)
+        };
+        let device_count = self.devices.len();
+        let mut shards = Vec::with_capacity(device_count);
+        for (index, (device_id, backend)) in self.devices.iter_mut().enumerate() {
+            let parameters = backend.parameters(ty)?.clone();
+            let start = columns.saturating_mul(index) / device_count;
+            let end = columns.saturating_mul(index + 1) / device_count;
+            let value = GpuDCRTPolyMatrix::from_cpu_staging_columns(&parameters, bytes, start, end);
+            shards.push(GpuColumnShard {
+                device_id: *device_id,
+                global_column_start: start,
+                value: Arc::new(value),
+            });
+        }
+        Ok(GpuFleetMatrix::from_shared_shards(rows, columns, shards))
     }
 
     fn preimage_target_from_staging(
@@ -2958,7 +1265,7 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         let params = self.devices[0].1.parameters(ty)?.clone();
-        Ok(Arc::new(FleetStagedColumnSource { params, rows, columns, bytes }))
+        Ok(Arc::new(PreimageTarget::staged(&params, rows, columns, bytes)))
     }
 
     fn validate_preimage_bound(
@@ -2978,626 +1285,130 @@ impl Backend for GpuDcrtBackend {
         )
     }
 
-    fn transpose(&mut self, value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < value.rows {
-            let wave = self.next_column_wave(next_column, value.rows);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let single_wave = self.devices.len() == 1 && wave == [(0, 0, value.rows)];
-            let launched = self.launch_column_wave(&wave, value.rows, |backend, start, end| {
-                if single_wave {
-                    let input = Self::matrix_operand_on_device(backend, value, 0, value.columns)?;
-                    backend.transpose(&input)
-                } else {
-                    let input = Self::matrix_rows_on_device(backend, value, start, end)?;
-                    backend.transpose(&input)
-                }
-            })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(value.columns, value.rows, shards))
+    fn transpose(&mut self, _value: &Self::Matrix) -> Result<Self::Matrix, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn slice(
         &mut self,
-        value: &Self::Matrix,
-        rows: Option<&IndexRange>,
-        columns: Option<&IndexRange>,
+        _value: &Self::Matrix,
+        _rows: Option<&IndexRange>,
+        _columns: Option<&IndexRange>,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(&[value])?;
-        let row_range = rows.cloned().unwrap_or(IndexRange { start: 0, end: value.rows });
-        let column_range = columns.cloned().unwrap_or(IndexRange { start: 0, end: value.columns });
-        let output_columns = column_range.end - column_range.start;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < output_columns {
-            let wave = self.next_column_wave(next_column, output_columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched =
-                self.launch_column_wave(&wave, output_columns, |backend, start, end| {
-                    let piece = Self::matrix_operand_on_device(
-                        backend,
-                        value,
-                        column_range.start + start,
-                        column_range.start + end,
-                    )?;
-                    Ok(piece.slice_rows(row_range.start, row_range.end))
-                })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(row_range.end - row_range.start, output_columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sum_rows(
         &mut self,
-        value: &Self::Matrix,
-        rows: &[Vec<usize>],
+        _value: &Self::Matrix,
+        _rows: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
-        let mut output =
-            self.unary_columns(value, |backend, piece| backend.sum_rows(piece, rows))?;
-        // A zero-column matrix has no shards from which unary_columns can infer rows.
-        output.rows = rows.len();
-        Ok(output)
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn tensor(
         &mut self,
-        left: &Self::Matrix,
-        right: &Self::Matrix,
+        _left: &Self::Matrix,
+        _right: &Self::Matrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
-        let rows = left.rows.checked_mul(right.rows).ok_or(PolyBackendError::InvalidInteger)?;
-        let columns =
-            left.columns.checked_mul(right.columns).ok_or(PolyBackendError::InvalidInteger)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < columns {
-            let wave = self.next_column_wave(next_column, columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let single_wave = self.devices.len() == 1 && wave == [(0, 0, columns)];
-            let launched = self.launch_column_wave(&wave, columns, |backend, start, end| {
-                if single_wave {
-                    let left = Self::matrix_operand_on_device(backend, left, 0, left.columns)?;
-                    let right = Self::matrix_operand_on_device(backend, right, 0, right.columns)?;
-                    return backend.tensor(&left, &right);
-                }
-                let pieces = tensor_column_segments(start, end, right.columns)
-                    .into_iter()
-                    .map(|(left_column, right_start, right_end)| {
-                        let left = Self::matrix_operand_on_device(
-                            backend,
-                            left,
-                            left_column,
-                            left_column + 1,
-                        )?;
-                        let right =
-                            Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
-                        backend.tensor(&left, &right)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut pieces = pieces.into_iter();
-                let first = pieces.next().expect("nonempty tensor range");
-                Ok(if pieces.len() == 0 {
-                    first
-                } else {
-                    first.concat_columns_owned(pieces.collect())
-                })
-            })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(rows, columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn tensor_sum_rows(
         &mut self,
-        left: &Self::Matrix,
-        right: &Self::Matrix,
-        groups: &[Vec<usize>],
+        _left: &Self::Matrix,
+        _right: &Self::Matrix,
+        _groups: &[Vec<usize>],
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(&[left, right])?;
-        let rows = groups.len();
-        let columns =
-            left.columns.checked_mul(right.columns).ok_or(PolyBackendError::InvalidInteger)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < columns {
-            let wave = self.next_column_wave(next_column, columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let single_wave = self.devices.len() == 1 && wave == [(0, 0, columns)];
-            let launched = self.launch_column_wave(&wave, columns, |backend, start, end| {
-                if single_wave {
-                    let left = Self::matrix_operand_on_device(backend, left, 0, left.columns)?;
-                    let right = Self::matrix_operand_on_device(backend, right, 0, right.columns)?;
-                    return backend.tensor_sum_rows(&left, &right, groups);
-                }
-                let pieces = tensor_column_segments(start, end, right.columns)
-                    .into_iter()
-                    .map(|(left_column, right_start, right_end)| {
-                        let left = Self::matrix_operand_on_device(
-                            backend,
-                            left,
-                            left_column,
-                            left_column + 1,
-                        )?;
-                        let right =
-                            Self::matrix_operand_on_device(backend, right, right_start, right_end)?;
-                        backend.tensor_sum_rows(&left, &right, groups)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut pieces = pieces.into_iter();
-                let first = pieces.next().expect("nonempty tensor range");
-                Ok(if pieces.len() == 0 {
-                    first
-                } else {
-                    first.concat_columns_owned(pieces.collect())
-                })
-            })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(rows, columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn concat(
         &mut self,
-        inputs: &[&Self::Matrix],
-        axis: ConcatAxis,
+        _inputs: &[&Self::Matrix],
+        _axis: ConcatAxis,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(inputs)?;
-        if axis == ConcatAxis::Rows {
-            let rows = inputs.iter().map(|value| value.rows).sum();
-            let columns = inputs.first().ok_or(PolyBackendError::InvalidConstantShape)?.columns;
-            if inputs.iter().any(|value| value.columns != columns) {
-                return Err(PolyBackendError::InvalidConstantShape);
-            }
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < columns {
-                let wave = self.next_column_wave(next_column, columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        Some(
-                            inputs
-                                .iter()
-                                .map(|value| {
-                                    Self::matrix_operand_on_device(backend, value, start, end)
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                                .and_then(|local| {
-                                    let refs = local
-                                        .iter()
-                                        .map(|piece| piece.as_ref())
-                                        .collect::<Vec<_>>();
-                                    backend.concat(&refs, axis)
-                                })
-                                .map(|value| GpuColumnShard {
-                                    device_id: *device_id,
-                                    global_column_start: start,
-                                    value,
-                                }),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(rows, columns, shards));
-        }
-        if axis == ConcatAxis::Columns {
-            let first = inputs.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-            if inputs.iter().any(|value| value.rows != first.rows) {
-                return Err(PolyBackendError::InvalidConstantShape);
-            }
-            let columns = inputs.iter().map(|value| value.columns).sum::<usize>();
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < columns {
-                let wave = self.next_column_wave(next_column, columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        let mut input_start = 0usize;
-                        let mut pieces = Vec::new();
-                        for input in inputs {
-                            let input_end = input_start + input.columns;
-                            let overlap_start = start.max(input_start);
-                            let overlap_end = end.min(input_end);
-                            if overlap_start < overlap_end {
-                                pieces.push(Self::matrix_piece_on_device(
-                                    backend,
-                                    input,
-                                    overlap_start - input_start,
-                                    overlap_end - input_start,
-                                ));
-                            }
-                            input_start = input_end;
-                        }
-                        Some(pieces.into_iter().collect::<Result<Vec<_>, _>>().map(|pieces| {
-                            let mut pieces = pieces.into_iter();
-                            let first = pieces.next().expect("nonempty concat range");
-                            GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value: first.concat_columns_owned(pieces.collect()),
-                            }
-                        }))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(first.rows, columns, shards));
-        }
-        if axis == ConcatAxis::Diagonal {
-            let first = inputs.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-            let rows = inputs.iter().map(|value| value.rows).sum::<usize>();
-            let input_columns = inputs.iter().map(|value| value.columns).collect::<Vec<_>>();
-            let columns = input_columns.iter().sum::<usize>();
-            let prototype = first.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-            let modulus = BigInt::from(prototype.value.params().modulus().as_ref().clone());
-            let ring_dimension = prototype.value.params().ring_dimension() as usize;
-            let mut shards = Vec::new();
-            let mut next_column = 0;
-            while next_column < columns {
-                let wave = self.next_column_wave(next_column, columns);
-                next_column = wave.last().expect("nonempty GPU wave").2;
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, start, end) =
-                            *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                        Some(
-                            Self::diagonal_range_on_device(
-                                backend,
-                                inputs,
-                                &input_columns,
-                                rows,
-                                &modulus,
-                                ring_dimension,
-                                start,
-                                end,
-                            )
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            }),
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-            }
-            return Ok(GpuFleetMatrix::new(rows, columns, shards));
-        }
-        let gathered =
-            inputs.iter().map(|value| self.gather_matrix(value)).collect::<Result<Vec<_>, _>>()?;
-        let refs = gathered.iter().collect::<Vec<_>>();
-        let output = self.devices[0].1.concat(&refs, axis)?;
-        self.scatter_matrix(output)
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_uniform(
         &mut self,
-        ty: &ConcreteMatrixType,
-        range: &SampleRange,
+        _ty: &ConcreteMatrixType,
+        _range: &SampleRange,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < ty.columns {
-            let wave = self.next_column_wave(next_column, ty.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                    Some(backend.sample_uniform(&local_ty, range).map(|value| GpuColumnShard {
-                        device_id: *device_id,
-                        global_column_start: start,
-                        value,
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_gaussian(
         &mut self,
-        ty: &ConcreteMatrixType,
-        sigma: f64,
-        max_coefficient_bound: &BigInt,
+        _ty: &ConcreteMatrixType,
+        _sigma: f64,
+        _max_coefficient_bound: &BigInt,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < ty.columns {
-            let wave = self.next_column_wave(next_column, ty.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                    Some(backend.sample_gaussian(&local_ty, sigma, max_coefficient_bound).map(
-                        |value| GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: start,
-                            value,
-                        },
-                    ))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_hash(
         &mut self,
-        ty: &ConcreteMatrixType,
-        key: [u8; 32],
-        tag: &[u8],
+        _ty: &ConcreteMatrixType,
+        _key: [u8; 32],
+        _tag: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < ty.columns {
-            let wave = self.next_column_wave(next_column, ty.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(backend.parameters(ty).map(|params| {
-                        GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: start,
-                            value: GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new()
-                                .sample_hash_columns(
-                                    params,
-                                    key,
-                                    tag,
-                                    ty.rows,
-                                    ty.columns,
-                                    start,
-                                    end - start,
-                                    DistType::FinRingDist,
-                                ),
-                        }
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(ty.rows, ty.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_hash_decomposed(
         &mut self,
-        ty: &ConcreteMatrixType,
-        key: [u8; 32],
-        tag: &[u8],
-        gadget_base: &BigInt,
-        digit_count: usize,
+        _ty: &ConcreteMatrixType,
+        _key: [u8; 32],
+        _tag: &[u8],
+        _gadget_base: &BigInt,
+        _digit_count: usize,
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        self.validate_gadget_layout(ty, gadget_base, digit_count, false)?;
-        if digit_count == 0 || !ty.rows.is_multiple_of(digit_count) {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let source_rows = ty.rows / digit_count;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < ty.columns {
-            let wave = self.next_column_wave(next_column, ty.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(backend.parameters(ty).and_then(|params| {
-                        let source = GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new()
-                            .sample_hash_gadget_source_columns(
-                                params,
-                                key,
-                                tag,
-                                source_rows,
-                                ty.columns,
-                                start,
-                                end - start,
-                                DistType::FinRingDist,
-                            );
-                        source
-                            .gadget_decompose(false, Some(digit_count))
-                            .map_err(PolyBackendError::from)
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            })
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetSmallMatrix::new(ty.rows, ty.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_hash_small_decomposed(
         &mut self,
-        ty: &ConcreteMatrixType,
-        key: [u8; 32],
-        tag: &[u8],
-        gadget_base: &BigInt,
-        digit_count: usize,
+        _ty: &ConcreteMatrixType,
+        _key: [u8; 32],
+        _tag: &[u8],
+        _gadget_base: &BigInt,
+        _digit_count: usize,
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        self.validate_gadget_layout(ty, gadget_base, digit_count, true)?;
-        if digit_count == 0 || !ty.rows.is_multiple_of(digit_count) {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let source_rows = ty.rows / digit_count;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < ty.columns {
-            let wave = self.next_column_wave(next_column, ty.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(backend.parameters(ty).and_then(|params| {
-                        let source = GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new()
-                            .sample_hash_gadget_source_columns(
-                                params,
-                                key,
-                                tag,
-                                source_rows,
-                                ty.columns,
-                                start,
-                                end - start,
-                                DistType::FinRingDist,
-                            );
-                        source
-                            .gadget_decompose(true, Some(digit_count))
-                            .map_err(PolyBackendError::from)
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            })
-                    }))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetSmallMatrix::new(ty.rows, ty.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_trapdoor(
         &mut self,
-        ty: &ConcreteMatrixType,
-        sigma: f64,
-        gadget_base: &BigInt,
-        digit_count: usize,
+        _ty: &ConcreteMatrixType,
+        _sigma: f64,
+        _gadget_base: &BigInt,
+        _digit_count: usize,
     ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error> {
-        let (public, first) =
-            self.devices[0].1.sample_trapdoor(ty, sigma, gadget_base, digit_count)?;
-        let bytes = self.devices[0].1.trapdoor_to_bytes(&first);
-        let mut values = Vec::with_capacity(self.devices.len());
-        values.push(first);
-        for (_, backend) in self.devices.iter().skip(1) {
-            values.push(backend.trapdoor_from_bytes(ty, &bytes)?);
-        }
-        let public = self.scatter_matrix(public)?;
-        Ok((public, GpuFleetTrapdoor { values }))
+        Err(PolyBackendError::PreparedExecutionRequired)
+    }
+
+    fn sample_preimage_batch(
+        &mut self,
+        _requests: Vec<crate::backend::PreimageRequest<Self::Matrix, Self::Trapdoor>>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn sample_preimage(
         &mut self,
-        ty: &ConcreteMatrixType,
-        sigma: f64,
-        gadget_base: &BigInt,
-        digit_count: usize,
-        max_coefficient_bound: &BigInt,
-        trapdoor: &Self::Trapdoor,
-        public: &Self::Matrix,
-        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
-        randomness_seed: [u8; 32],
+        _ty: &ConcreteMatrixType,
+        _sigma: f64,
+        _gadget_base: &BigInt,
+        _digit_count: usize,
+        _max_coefficient_bound: &BigInt,
+        _trapdoor: &Self::Trapdoor,
+        _public: &Self::Matrix,
+        _target: &dyn PolyMatrixColumnSource<Self::Matrix>,
+        _randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
-        if trapdoor.values.len() != self.devices.len() {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        let public_replicas = (0..self.devices.len())
-            .map(|device| self.full_matrix_on_device(device, public))
-            .collect::<Result<Vec<_>, _>>()?;
-        if self.runtime_pilot_is_pending() {
-            trapdoor.wait_until_ready();
-            public_replicas.iter().for_each(|replica| replica.wait_until_ready());
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        let source_global_column_start = target.global_column_start();
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < target.col_size() {
-            let wave = self.next_column_wave(next_column, target.col_size());
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    Some(
-                        Self::matrix_piece_on_device(
-                            backend,
-                            &target.load_columns(start, end),
-                            0,
-                            end - start,
-                        )
-                        .and_then(|target| {
-                            let local_ty =
-                                ConcreteMatrixType { columns: end - start, ..ty.clone() };
-                            let global_column_start =
-                                preimage_seed_column_start(source_global_column_start, start)?;
-                            let target =
-                                OffsetGpuColumnSource { value: target, global_column_start };
-                            backend.sample_preimage(
-                                &local_ty,
-                                sigma,
-                                gadget_base,
-                                digit_count,
-                                max_coefficient_bound,
-                                &trapdoor.values[device],
-                                &public_replicas[device],
-                                &target,
-                                randomness_seed,
-                            )
-                        })
-                        .map(|value| GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: start,
-                            value,
-                        }),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        let rows = shards.first().map(|shard| shard.value.rows()).unwrap_or(ty.rows);
-        Ok(GpuFleetSmallMatrix::new(rows, target.col_size(), shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn validate_gadget_layout(
@@ -3612,45 +1423,20 @@ impl Backend for GpuDcrtBackend {
 
     fn gadget_decompose(
         &mut self,
-        value: &Self::Matrix,
-        small: bool,
-        digit_count: Option<usize>,
+        _value: &Self::Matrix,
+        _small: bool,
+        _digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        self.gadget_decompose_row_blocks(&[value], small, digit_count)
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn gadget_decompose_row_blocks(
         &mut self,
-        blocks: &[&Self::Matrix],
-        small: bool,
-        digit_count: Option<usize>,
+        _blocks: &[&Self::Matrix],
+        _small: bool,
+        _digit_count: Option<usize>,
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        let value = *blocks.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-        if blocks.iter().any(|block| block.columns != value.columns) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        self.restart_runtime_pilot_after_matrix_inputs(blocks)?;
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < value.columns {
-            let wave = self.next_column_wave(next_column, value.columns);
-            next_column = wave.last().expect("nonempty GPU wave").2;
-            let launched =
-                self.launch_column_wave(&wave, value.columns, |backend, start, end| {
-                    let pieces = blocks
-                        .iter()
-                        .map(|block| Self::matrix_operand_on_device(backend, block, start, end))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    backend.gadget_decompose_row_blocks(
-                        &pieces.iter().map(|piece| piece.as_ref()).collect::<Vec<_>>(),
-                        small,
-                        digit_count,
-                    )
-                })?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        let rows = shards.first().map(|shard| shard.value.rows()).unwrap_or(0);
-        Ok(GpuFleetSmallMatrix::new(rows, value.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn gadget_error_bound(
@@ -3663,370 +1449,91 @@ impl Backend for GpuDcrtBackend {
 
     fn multiply_small_rhs(
         &mut self,
-        lhs: &Self::Matrix,
-        rhs: &Self::SmallMatrix,
+        _lhs: &Self::Matrix,
+        _rhs: &Self::SmallMatrix,
     ) -> Result<Self::Matrix, Self::Error> {
-        let lhs_replicas = self
-            .devices
-            .iter_mut()
-            .map(|(_, backend)| Self::matrix_operand_on_device(backend, lhs, 0, lhs.columns))
-            .collect::<Result<Vec<_>, _>>()?;
-        let pilot_rhs = if self.pending_pilot.is_some() {
-            let source = rhs.shards.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-            let local = source.value.slice_columns(0, 1);
-            let payload = local.to_canonical_coefficients()?;
-            let params = local.params();
-            let local_type = ConcreteMatrixType {
-                modulus: BigInt::from(params.modulus().as_ref().clone()),
-                ring_dimension: params.ring_dimension() as usize,
-                rows: rhs.rows,
-                columns: 1,
-            };
-            Some(
-                self.devices
-                    .iter()
-                    .take(2)
-                    .map(|(_, backend)| {
-                        let target_params = backend.parameters(&local_type)?;
-                        GpuSmallMatrix::from_canonical_coefficients(
-                            target_params,
-                            rhs.rows,
-                            1,
-                            local.max_coefficient_bound().clone(),
-                            &payload,
-                        )
-                        .map_err(PolyBackendError::from)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
-        } else {
-            None
-        };
-        if self.runtime_pilot_is_pending() {
-            rhs.wait_until_ready();
-            lhs_replicas.iter().for_each(|replica| replica.wait_until_ready());
-        }
-        self.restart_runtime_pilot_after_fixed_inputs()
-            .map_err(PolyBackendError::GpuCalibration)?;
-        if let Some(pilot_rhs) = pilot_rhs {
-            loop {
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let rhs = pilot_rhs.get(device)?;
-                        Some(backend.multiply_small_rhs(&lhs_replicas[device], rhs).map(|value| {
-                            GpuColumnShard { device_id: *device_id, global_column_start: 0, value }
-                        }))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let completed = self.finish_runtime_pilot(&launched)?;
-                drop(launched);
-                if completed {
-                    break;
-                }
-                self.restart_runtime_pilot_after_fixed_inputs()
-                    .map_err(PolyBackendError::GpuCalibration)?;
-            }
-        }
-        if self.devices.len() == 1 &&
-            rhs.shards.len() == 1 &&
-            rhs.shards[0].device_id == self.devices[0].0 &&
-            rhs.shards[0].global_column_start == 0 &&
-            rhs.shards[0].value.columns() == rhs.columns &&
-            rhs.columns <= self.active_role_width(0)
-        {
-            let (device_id, backend) = &mut self.devices[0];
-            let value = backend.multiply_small_rhs(&lhs_replicas[0], &rhs.shards[0].value)?;
-            return Ok(GpuFleetMatrix::new(
-                lhs.rows,
-                rhs.columns,
-                vec![GpuColumnShard { device_id: *device_id, global_column_start: 0, value }],
-            ));
-        }
-        let mut shards = Vec::new();
-        for source_wave in rhs.shards.chunks(self.devices.len()) {
-            let mut consumed = vec![0usize; self.devices.len()];
-            while source_wave.iter().any(|shard| {
-                self.devices
-                    .iter()
-                    .position(|(device, _)| *device == shard.device_id)
-                    .is_some_and(|device| consumed[device] < shard.value.columns())
-            }) {
-                let pieces = self
-                    .devices
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, _))| {
-                        let shard =
-                            source_wave.iter().find(|shard| shard.device_id == *device_id)?;
-                        let start = consumed[device];
-                        let end = start
-                            .saturating_add(self.active_role_width(device))
-                            .min(shard.value.columns());
-                        (start < end).then_some((device, start, end))
-                    })
-                    .collect::<Vec<_>>();
-                let views = pieces
-                    .iter()
-                    .map(|(device, start, end)| {
-                        let source = source_wave
-                            .iter()
-                            .find(|shard| shard.device_id == self.devices[*device].0)
-                            .expect("piece source must exist");
-                        (
-                            *device,
-                            source.global_column_start,
-                            source.value.column_view(*start, *end),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let launched = self
-                    .devices
-                    .par_iter_mut()
-                    .enumerate()
-                    .filter_map(|(device, (device_id, backend))| {
-                        let (_, source_start, view) =
-                            views.iter().find(|(owner, _, _)| *owner == device)?;
-                        let start = consumed[device];
-                        Some(backend.multiply_small_rhs(&lhs_replicas[device], view.as_ref()).map(
-                            |value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: source_start + start,
-                                value,
-                            },
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                for (device, _, end) in pieces {
-                    consumed[device] = end;
-                }
-                shards.extend(launched);
-            }
-        }
-        shards.sort_by_key(|shard| shard.global_column_start);
-        Ok(GpuFleetMatrix::new(lhs.rows, rhs.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn multiply_small_rhs_row_blocks(
         &mut self,
-        blocks: &[&Self::Matrix],
-        rhs: &Self::SmallMatrix,
+        _blocks: &[&Self::Matrix],
+        _rhs: &Self::SmallMatrix,
     ) -> Result<Vec<Self::Matrix>, Self::Error> {
-        if blocks.is_empty() ||
-            blocks.len() > 32 ||
-            blocks.iter().any(|block| block.columns != rhs.rows)
-        {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        // Calibration keeps its established materialized pilot and residency
-        // accounting. Only steady-state execution uses block descriptors.
-        if self.pending_pilot.is_some() || self.runtime_pilot_is_pending() {
-            let backend = &mut self.devices[0].1;
-            let pieces = blocks
-                .iter()
-                .map(|block| Self::matrix_operand_on_device(backend, block, 0, block.columns))
-                .collect::<Result<Vec<_>, _>>()?;
-            let references = pieces.iter().map(|piece| piece.as_ref()).collect::<Vec<_>>();
-            let lhs = GpuFleetMatrix::from_matrix(backend.concat(&references, ConcatAxis::Rows)?);
-            let output = self.multiply_small_rhs(&lhs, rhs)?;
-            let mut start = 0;
-            return blocks
-                .iter()
-                .map(|block| {
-                    let end = start + block.rows;
-                    let result = self.slice(&output, Some(&IndexRange { start, end }), None);
-                    start = end;
-                    result
-                })
-                .collect();
-        }
-        let replicas = self
-            .devices
-            .iter_mut()
-            .map(|(_, backend)| {
-                blocks
-                    .iter()
-                    .map(|block| Self::matrix_operand_on_device(backend, block, 0, block.columns))
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut outputs = (0..blocks.len()).map(|_| Vec::new()).collect::<Vec<_>>();
-        for source_wave in rhs.shards.chunks(self.devices.len()) {
-            let mut consumed = vec![0usize; self.devices.len()];
-            loop {
-                let pieces = self
-                    .devices
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(device, (id, _))| {
-                        let source = source_wave.iter().find(|source| source.device_id == *id)?;
-                        let start = consumed[device];
-                        let end = start
-                            .saturating_add(self.active_role_width(device))
-                            .min(source.value.columns());
-                        (start < end).then_some((device, start, end, source))
-                    })
-                    .collect::<Vec<_>>();
-                if pieces.is_empty() {
-                    break;
-                }
-                let dispatch = |device: usize, backend: &mut DeviceBackend| {
-                    let (_, start, end, source) =
-                        pieces.iter().find(|(owner, _, _, _)| *owner == device)?;
-                    let view = source.value.column_view(*start, *end);
-                    let references =
-                        replicas[device].iter().map(|piece| piece.as_ref()).collect::<Vec<_>>();
-                    Some(backend.multiply_small_rhs_row_blocks(&references, view.as_ref()).map(
-                        |values| {
-                            values
-                                .into_iter()
-                                .map(|value| GpuColumnShard {
-                                    device_id: source.device_id,
-                                    global_column_start: source.global_column_start + start,
-                                    value,
-                                })
-                                .collect::<Vec<_>>()
-                        },
-                    ))
-                };
-                let launched =
-                    if self.devices.len() == 1 && pieces[0].1 == 0 && pieces[0].2 == rhs.columns {
-                        vec![dispatch(0, &mut self.devices[0].1).expect("single block wave")?]
-                    } else {
-                        self.devices
-                            .par_iter_mut()
-                            .enumerate()
-                            .filter_map(|(device, (_, backend))| dispatch(device, backend))
-                            .collect::<Result<Vec<_>, _>>()?
-                    };
-                for shards in launched {
-                    for (output, shard) in outputs.iter_mut().zip(shards) {
-                        output.push(shard);
-                    }
-                }
-                for (device, _, end, _) in pieces {
-                    consumed[device] = end;
-                }
-            }
-        }
-        for output in &mut outputs {
-            output.sort_by_key(|shard| shard.global_column_start);
-        }
-        Ok(blocks
-            .iter()
-            .zip(outputs)
-            .map(|(block, shards)| GpuFleetMatrix::new(block.rows, rhs.columns, shards))
-            .collect())
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn extract_coefficient(
         &mut self,
-        value: &Self::Matrix,
-        position: usize,
+        _value: &Self::Matrix,
+        _position: usize,
     ) -> Result<BigInt, Self::Error> {
-        let first = value.shards.first().ok_or(PolyBackendError::InvalidInteger)?;
-        let device = self
-            .devices
-            .iter()
-            .position(|(id, _)| *id == first.device_id)
-            .ok_or(PolyBackendError::InvalidInteger)?;
-        self.devices[device].1.extract_coefficient(&first.value, position)
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn threshold_decode(
         &mut self,
-        value: &Self::Matrix,
-        plaintext_modulus: &BigInt,
-        length: usize,
+        _value: &Self::Matrix,
+        _plaintext_modulus: &BigInt,
+        _length: usize,
     ) -> Result<Vec<BigInt>, Self::Error> {
-        let full = self.gather_matrix(value)?;
-        self.devices[0].1.threshold_decode(&full, plaintext_modulus, length)
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn pack_polynomial_coefficients(
         &mut self,
-        ty: &ConcreteMatrixType,
-        bits: &[bool],
-        coefficient_bits: usize,
+        _ty: &ConcreteMatrixType,
+        _bits: &[bool],
+        _coefficient_bits: usize,
     ) -> Result<Self::Matrix, Self::Error> {
-        let value = self.devices[0].1.pack_polynomial_coefficients(ty, bits, coefficient_bits)?;
-        Ok(GpuFleetMatrix::from_matrix(value))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
     fn crt_recompose(
         &mut self,
-        levels: &[Self::Matrix],
-        plaintext_moduli: &[BigInt],
-        reconstruction_coefficients: &[BigInt],
-        destination: &ConcreteMatrixType,
+        _levels: &[Self::Matrix],
+        _plaintext_moduli: &[BigInt],
+        _reconstruction_coefficients: &[BigInt],
+        _destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
-        self.restart_runtime_pilot_after_matrix_inputs(&levels.iter().collect::<Vec<_>>())?;
-        let first = levels.first().ok_or(PolyBackendError::InvalidInteger)?;
-        // Each calibrated wave stages its exact columns independently from
-        // every input's existing shards; pilot widths do not exist yet here.
-        if levels.iter().any(|level| level.size() != first.size()) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let mut shards = Vec::new();
-        let mut next_column = 0;
-        while next_column < first.columns {
-            let wave = self.next_column_wave(next_column, first.columns);
-            next_column = wave.iter().map(|(_, _, end)| *end).max().expect("nonempty GPU wave");
-            let launched = self
-                .devices
-                .par_iter_mut()
-                .enumerate()
-                .filter_map(|(device, (device_id, backend))| {
-                    let (_, start, end) = *wave.iter().find(|(owner, _, _)| *owner == device)?;
-                    let local = levels
-                        .iter()
-                        .map(|level| Self::matrix_piece_on_device(backend, level, start, end))
-                        .collect::<Result<Vec<_>, _>>();
-                    Some(
-                        local
-                            .and_then(|local| {
-                                backend.crt_recompose(
-                                    &local,
-                                    plaintext_moduli,
-                                    reconstruction_coefficients,
-                                    destination,
-                                )
-                            })
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: start,
-                                value,
-                            }),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            self.commit_column_wave(&mut shards, launched, &mut next_column)?;
-        }
-        Ok(GpuFleetMatrix::new(first.rows, first.columns, shards))
+        Err(PolyBackendError::PreparedExecutionRequired)
     }
 
-    fn matrix_to_bytes(&self, value: &Self::Matrix) -> Vec<u8> {
-        // Construction guarantees that a lone shard covers the whole matrix.
-        // Its canonical encoding already has the global shape and bit width.
-        if let [shard] = value.shards.as_slice() {
-            return shard.value.to_compact_bytes();
+    fn matrix_to_bytes(&self, value: &Self::Matrix) -> Result<Vec<u8>, Self::Error> {
+        if let Some(lease) = &value.prepared_lease {
+            lease.check_device_scalar_status().map_err(PolyBackendError::GpuSubmission)?;
         }
-        let decoded = value
+        let shard_bytes = value
             .shards
             .iter()
             .map(|shard| {
-                let bytes = self
+                if let Some(lease) = &value.prepared_lease {
+                    let wire = value.prepared_codec_wire.ok_or_else(|| {
+                        PolyBackendError::GpuSubmission(
+                            "prepared output matrix has no immutable codec binding".into(),
+                        )
+                    })?;
+                    return lease
+                        .matrix_to_bytes_for_wire(&shard.value, wire, shard.device_id)
+                        .map_err(PolyBackendError::GpuSubmission);
+                }
+                let (_, device) = self
                     .devices
                     .iter()
                     .find(|(id, _)| *id == shard.device_id)
-                    .expect("fleet shard device must be registered")
-                    .1
-                    .matrix_to_bytes(&shard.value);
-                decode_compact_matrix(&bytes).expect("backend produced invalid compact bytes")
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                device.matrix_to_bytes(&shard.value)
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        // Construction guarantees that a lone shard covers the whole matrix.
+        // Its canonical encoding already has the global shape and bit width.
+        if let [bytes] = shard_bytes.as_slice() {
+            return Ok(bytes.clone());
+        }
+        let decoded = shard_bytes
+            .iter()
+            .map(|bytes| decode_compact_matrix(bytes))
+            .collect::<Result<Vec<_>, _>>()?;
         let first = decoded.first().expect("nonempty matrix has a shard");
         let bytes_per_coefficient = decoded.iter().map(|encoding| encoding.6).max().unwrap_or(0);
         let max_coefficient_bits = decoded.iter().map(|encoding| encoding.5).max().unwrap_or(0);
@@ -4046,6 +1553,21 @@ impl Backend for GpuDcrtBackend {
         for (shard, encoding) in value.shards.iter().zip(&decoded) {
             let local_bits = usize::from(encoding.5);
             for row in 0..value.rows {
+                // Equal-width shards are contiguous rows of packed coefficients.
+                // Copy the entire row, without visiting every coefficient or bit.
+                if local_bits == global_bits {
+                    let row_bits = shard.value.col_size() * ring_dimension * local_bits;
+                    copy_packed_bits(
+                        &encoding.7,
+                        row * row_bits,
+                        &mut payload,
+                        (row * value.columns + shard.global_column_start) *
+                            ring_dimension *
+                            global_bits,
+                        row_bits,
+                    );
+                    continue;
+                }
                 for column in 0..shard.value.col_size() {
                     for coefficient in 0..ring_dimension {
                         let source_index = ((row * shard.value.col_size() + column) *
@@ -4067,7 +1589,7 @@ impl Backend for GpuDcrtBackend {
                 }
             }
         }
-        bincode::encode_to_vec(
+        Ok(bincode::encode_to_vec(
             (
                 first.0,
                 first.1,
@@ -4080,78 +1602,15 @@ impl Backend for GpuDcrtBackend {
             ),
             bincode::config::standard(),
         )
-        .expect("fleet matrix serialization")
+        .expect("fleet matrix serialization"))
     }
 
     fn matrix_from_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
-        let (version, format, level, rows, columns, max_bits, bytes_per_coefficient, payload) =
-            decode_compact_matrix(bytes)?;
-        if rows != ty.rows || columns != ty.columns {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        if !self
-            .active_operation
-            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
-        {
-            return self.devices[0].1.matrix_from_bytes(ty, bytes).map(GpuFleetMatrix::from_matrix);
-        }
-        let coefficient_bits = usize::from(max_bits);
-        let ring_dimension = ty.ring_dimension;
-        let ranges = self.column_ranges(columns);
-        let mut shards = Vec::with_capacity(ranges.len());
-        for (device, start, end) in ranges {
-            let local_columns = end - start;
-            let local_count = rows * local_columns * ring_dimension;
-            let mut local_payload = vec![0u8; (local_count * coefficient_bits).div_ceil(8)];
-            for row in 0..rows {
-                for column in start..end {
-                    for coefficient in 0..ring_dimension {
-                        let source_index = ((row * columns + column) * ring_dimension +
-                            coefficient) *
-                            coefficient_bits;
-                        let local_column = column - start;
-                        let target_index = ((row * local_columns + local_column) * ring_dimension +
-                            coefficient) *
-                            coefficient_bits;
-                        copy_packed_bits(
-                            &payload,
-                            source_index,
-                            &mut local_payload,
-                            target_index,
-                            coefficient_bits,
-                        );
-                    }
-                }
-            }
-            let local_bytes = bincode::encode_to_vec(
-                (
-                    version,
-                    format,
-                    level,
-                    rows,
-                    local_columns,
-                    max_bits,
-                    bytes_per_coefficient,
-                    local_payload,
-                ),
-                bincode::config::standard(),
-            )
-            .expect("local compact matrix serialization");
-            let value = self.devices[device].1.matrix_from_bytes(
-                &ConcreteMatrixType { columns: local_columns, ..ty.clone() },
-                &local_bytes,
-            )?;
-            shards.push(GpuColumnShard {
-                device_id: self.devices[device].0,
-                global_column_start: start,
-                value,
-            });
-        }
-        Ok(GpuFleetMatrix::new(rows, columns, shards))
+        self.devices[0].1.matrix_from_bytes(ty, bytes).map(GpuFleetMatrix::from_matrix)
     }
 
     fn small_matrix_to_bytes(
@@ -4175,7 +1634,7 @@ impl Backend for GpuDcrtBackend {
             .checked_add(1)
             .ok_or(PolyBackendError::InvalidSmallMatrixArtifact("coefficient width overflows"))?;
         let mut shard_payloads = Vec::with_capacity(value.shards.len());
-        for shard in &value.shards {
+        for shard in value.shards.iter() {
             let device =
                 self.devices.iter().position(|(device, _)| *device == shard.device_id).ok_or(
                     PolyBackendError::InvalidSmallMatrixArtifact("shard device is not registered"),
@@ -4233,63 +1692,15 @@ impl Backend for GpuDcrtBackend {
     }
 
     fn small_matrix_from_bytes(
-        &self,
+        &mut self,
         expected_schema: &ConcreteBoundedMatrixSchema,
         bytes: &[u8],
         expected_semantic_kind: SmallMatrixSemanticKind,
     ) -> Result<Self::SmallMatrix, Self::Error> {
-        if !self
-            .active_operation
-            .is_some_and(|operation| self.operation_widths.contains_key(&operation))
-        {
-            return self.devices[0]
-                .1
-                .small_matrix_from_bytes(expected_schema, bytes, expected_semantic_kind)
-                .map(GpuFleetSmallMatrix::from_matrix);
-        }
-        let (bound, payload) =
-            decode_small_matrix_artifact(expected_schema, bytes, expected_semantic_kind)?;
-        let rows = expected_schema.matrix.rows;
-        let columns = expected_schema.matrix.columns;
-        let ring_dimension = expected_schema.matrix.ring_dimension;
-        let coefficient_count = rows
-            .checked_mul(columns)
-            .and_then(|count| count.checked_mul(ring_dimension))
-            .ok_or(PolyBackendError::InvalidInteger)?;
-        if coefficient_count == 0 || !payload.len().is_multiple_of(coefficient_count) {
-            return Err(PolyBackendError::InvalidSmallMatrixArtifact(
-                "compact payload size mismatch",
-            ));
-        }
-        let coefficient_width = payload.len() / coefficient_count;
-        let mut shards = Vec::new();
-        for (device, start, end) in self.column_ranges(columns) {
-            let local_columns = end - start;
-            let mut local_payload =
-                Vec::with_capacity(rows * local_columns * ring_dimension * coefficient_width);
-            for row in 0..rows {
-                let source_start = (row * columns + start) * ring_dimension * coefficient_width;
-                let source_end = (row * columns + end) * ring_dimension * coefficient_width;
-                local_payload.extend_from_slice(&payload[source_start..source_end]);
-            }
-            let params = self.devices[device].1.parameters(&ConcreteMatrixType {
-                columns: local_columns,
-                ..expected_schema.matrix.clone()
-            })?;
-            let value = GpuSmallMatrix::from_canonical_coefficients(
-                params,
-                rows,
-                local_columns,
-                bound.clone(),
-                &local_payload,
-            )?;
-            shards.push(GpuColumnShard {
-                device_id: self.devices[device].0,
-                global_column_start: start,
-                value,
-            });
-        }
-        Ok(GpuFleetSmallMatrix::new(rows, columns, shards))
+        self.devices[0]
+            .1
+            .small_matrix_from_bytes(expected_schema, bytes, expected_semantic_kind)
+            .map(GpuFleetSmallMatrix::from_matrix)
     }
 
     fn trapdoor_to_bytes(&self, value: &Self::Trapdoor) -> Vec<u8> {
@@ -4299,15 +1710,50 @@ impl Backend for GpuDcrtBackend {
     }
 
     fn trapdoor_from_bytes(
-        &self,
+        &mut self,
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Trapdoor, Self::Error> {
         let values = self
             .devices
-            .iter()
-            .map(|(_, backend)| backend.trapdoor_from_bytes(ty, bytes))
+            .iter_mut()
+            .map(|(_, backend)| backend.trapdoor_from_bytes(ty, bytes).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(GpuFleetTrapdoor { values })
+        Ok(GpuFleetTrapdoor { values: Arc::new(values), prepared_lease: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rollback_failed_warmup_ledger;
+    use crate::{gpu_calibration::GpuDeviceMemory, gpu_memory::GpuMemoryLedger};
+
+    #[test]
+    fn failed_initial_warmup_retains_ledger_for_retry() {
+        let mut ledger = Some(
+            GpuMemoryLedger::synthetic_for_test(
+                &[GpuDeviceMemory { total_bytes: 1024, resident_bytes: 0 }],
+                &[0],
+                100,
+                Some(&[(0, 7)]),
+            )
+            .expect("synthetic ledger"),
+        );
+        ledger
+            .as_mut()
+            .expect("initial ledger")
+            .begin_prepared_provisioning(&[17], &[3])
+            .expect("speculative initial charge")
+            .commit();
+        assert_eq!(ledger.as_ref().expect("initial ledger").devices()[0].allocation_bytes, 17);
+        assert_eq!(
+            ledger.as_ref().expect("initial ledger").devices()[0].pinned_allocation_bytes,
+            3
+        );
+
+        rollback_failed_warmup_ledger(&mut ledger, false, None);
+        let ledger = ledger.expect("ledger owns any release-pending probes");
+        assert_eq!(ledger.devices()[0].allocation_bytes, 0);
+        assert_eq!(ledger.devices()[0].pinned_allocation_bytes, 0);
     }
 }

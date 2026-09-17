@@ -124,7 +124,7 @@ impl PolyTrapdoorSampler for DCRTPolyTrapdoorSampler {
                 minimum,
             });
         }
-        let target = target.load_columns(0, target.col_size());
+        let target = target.column_range(0, target.col_size()).materialize(params)?;
         loop {
             let candidate =
                 expanded_preimage_candidate(self, params, trapdoor, public_matrix, &target);

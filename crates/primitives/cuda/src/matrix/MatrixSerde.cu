@@ -1,3 +1,10 @@
+#include "gpu_prepared_plan.cuh"
+#include "matrix/MatrixNTT.cuh"
+
+static std::atomic<size_t> readback_prepared_acquisitions{0};
+static std::atomic<size_t> rns_upload_prepared_acquisitions{0};
+static std::atomic<size_t> reconstruction_prepared_acquisitions{0};
+
 namespace
 {
     constexpr int kMaxRnsLimbs = 64;
@@ -8,6 +15,55 @@ namespace
         int device;
         cudaStream_t stream;
     };
+
+    int serde_begin_private_stream(GpuMatrix *matrix, int device, GpuCudaResource &resource, cudaStream_t *stream)
+    {
+        const int acquired = resource.acquire(matrix->ctx, device, GPU_PREPARED_SUBMISSION_STREAM);
+        if (acquired != 0) return acquired;
+        *stream = resource.stream;
+        cudaError_t error = cudaSuccess;
+        cudaStream_t producer = nullptr;
+        int status = matrix_limb_stream(matrix, matrix->ctx->limb_gpu_ids[0], &producer);
+        if (status != 0) return status;
+        const cudaEvent_t start = resource.event;
+        // Include the producer's current boundary, not only an older matrix
+        // writer event. This also gates existing matrices on benchmark starts.
+        error = cudaEventRecord(start, producer);
+        if (error == cudaSuccess) error = cudaStreamWaitEvent(*stream, start, 0);
+        return error == cudaSuccess ? 0 : set_error(error);
+    }
+
+    int serde_finish_private_stream(GpuMatrix *matrix, int device, GpuCudaResource &resource, cudaStream_t &stream)
+    {
+        if (!stream) return 0;
+        auto &owner = *matrix->ctx->execution;
+        if (owner.unretired_work.load(std::memory_order_acquire)) {
+            resource.quarantine();
+            return set_error("compact serialization has unretired work");
+        }
+        // The caller has enqueued all temporary frees. Join their completion to
+        // this matrix's producers, keeping unrelated owners independent.
+        const cudaError_t recorded = cudaEventRecord(resource.event, stream);
+        int status = recorded == cudaSuccess
+            ? matrix_track_all_limb_consumers(matrix, device, stream, resource.event)
+            : set_error(recorded);
+        if (status != 0)
+        {
+            owner.memory_release_failed.store(true, std::memory_order_release);
+            owner.unretired_work.store(true, std::memory_order_release);
+            resource.quarantine();
+            return status;
+        }
+        const int released = resource.release();
+        if (released != 0)
+        {
+            owner.memory_release_failed.store(true, std::memory_order_release);
+            owner.unretired_work.store(true, std::memory_order_release);
+            return released;
+        }
+        stream = nullptr;
+        return 0;
+    }
 
     bool serde_checked_mul_size(size_t a, size_t b, size_t *out)
     {
@@ -39,21 +95,8 @@ namespace
         streams.push_back(SerdeStreamRef{device, stream});
     }
 
-    void serde_destroy_event_set(GpuEventSet *events)
-    {
-        if (!events)
-        {
-            return;
-        }
-        for (const auto &entry : events->entries)
-        {
-            cudaSetDevice(entry.device);
-            cudaEventDestroy(entry.event);
-        }
-        delete events;
-    }
-
-    int serde_build_event_set_from_streams(const std::vector<SerdeStreamRef> &streams, GpuEventSet **out_events)
+    int serde_build_event_set_from_streams(
+        GpuContext *ctx, const std::vector<SerdeStreamRef> &streams, GpuEventSet **out_events)
     {
         if (!out_events)
         {
@@ -66,31 +109,31 @@ namespace
         }
 
         auto *event_set = new GpuEventSet();
+        event_set->execution = ctx->execution;
         event_set->entries.reserve(streams.size());
         for (const auto &entry : streams)
         {
             cudaError_t err = cudaSetDevice(entry.device);
             if (err != cudaSuccess)
             {
-                serde_destroy_event_set(event_set);
+                gpu_event_set_destroy(event_set);
                 return set_error(err);
             }
 
-            cudaEvent_t ev = nullptr;
-            err = cudaEventCreateWithFlags(&ev, cudaEventDisableTiming);
-            if (err != cudaSuccess)
-            {
-                serde_destroy_event_set(event_set);
+            auto resource = std::make_shared<GpuCudaResource>();
+            const int status = resource->acquire(ctx, entry.device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status != 0) {
+                gpu_event_set_destroy(event_set);
+                return status;
+            }
+            err = cudaEventRecord(resource->event, entry.stream);
+            if (err != cudaSuccess) {
+                resource->quarantine();
+                gpu_execution_mark_allocation_unknown(ctx->execution.get());
+                gpu_event_set_destroy(event_set);
                 return set_error(err);
             }
-            err = cudaEventRecord(ev, entry.stream);
-            if (err != cudaSuccess)
-            {
-                cudaEventDestroy(ev);
-                serde_destroy_event_set(event_set);
-                return set_error(err);
-            }
-            event_set->entries.push_back(GpuEventSet::Entry{ev, entry.device});
+            event_set->entries.push_back(GpuEventSet::Entry{resource->event, entry.device, resource});
         }
 
         *out_events = event_set;
@@ -107,56 +150,39 @@ namespace
         return static_cast<uint64_t>(prod % static_cast<unsigned __int128>(modulus));
     }
 
-    __global__ void serde_pack_u64_limb_to_packed_kernel(
+    __global__ void serde_pack_u64_limbs_to_packed_kernel(
         const uint64_t *src_words,
-        size_t src_stride_words,
-        uint8_t *dst_base,
-        size_t dst_stride_bytes,
-        uint8_t dst_coeff_bytes,
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limbs,
+        size_t limb_count,
         size_t poly_count,
         size_t n)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const size_t total = poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        const size_t poly_idx = idx / n;
-        const size_t coeff_idx = idx % n;
-        const uint64_t value = src_words[poly_idx * src_stride_words + coeff_idx];
+        const size_t total = poly_count * limb_count * n;
+        if (idx >= total) return;
+        const size_t poly_limb = idx / n;
+        const size_t poly_idx = poly_limb / limb_count;
+        const auto limb = limbs[poly_limb % limb_count];
         matrix_store_limb_u64(
-            dst_base,
-            poly_idx,
-            coeff_idx,
-            dst_stride_bytes,
-            dst_coeff_bytes,
-            value);
+            limb.base, poly_idx, idx % n, limb.stride, limb.width, src_words[idx]);
     }
 
-    __global__ void serde_unpack_packed_limb_to_u64_kernel(
-        const uint8_t *src_base,
-        size_t src_stride_bytes,
-        uint8_t src_coeff_bytes,
+    __global__ void serde_unpack_packed_limbs_to_u64_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *limbs,
+        size_t limb_count,
         uint64_t *dst_words,
-        size_t dst_stride_words,
         size_t poly_count,
         size_t n)
     {
         const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        const size_t total = poly_count * n;
-        if (idx >= total)
-        {
-            return;
-        }
-        const size_t poly_idx = idx / n;
-        const size_t coeff_idx = idx % n;
-        dst_words[poly_idx * dst_stride_words + coeff_idx] = matrix_load_limb_u64(
-            src_base,
-            poly_idx,
-            coeff_idx,
-            src_stride_bytes,
-            src_coeff_bytes);
+        const size_t total = poly_count * limb_count * n;
+        if (idx >= total) return;
+        const size_t poly_limb = idx / n;
+        const size_t poly_idx = poly_limb / limb_count;
+        const size_t limb_idx = poly_limb % limb_count;
+        const auto limb = limbs[limb_idx];
+        dst_words[idx] = matrix_load_limb_u64(
+            limb.base, poly_idx, idx % n, limb.stride, limb.width);
     }
 
     __global__ void serde_reconstruct_rns_to_words_kernel(
@@ -704,6 +730,25 @@ namespace
 
 }
 
+#include "MatrixSerdeWorkspace.cu"
+
+extern "C" int gpu_matrix_query_rns_workspace(
+    GpuContext *ctx, int level, size_t rows, size_t columns,
+    GpuPreparedWorkspaceLayout *out)
+{
+    if (!ctx || !out || ctx->gpu_ids.size() != 1 || ctx->N <= 0 || level < 0 ||
+        static_cast<size_t>(level) >= ctx->moduli.size())
+        return set_error("invalid single-device RNS transfer layout");
+    size_t bytes = 0;
+    if (!serde_checked_mul_size(rows, columns, &bytes) ||
+        !serde_checked_mul_size(bytes, static_cast<size_t>(ctx->N), &bytes) ||
+        !serde_checked_mul_size(bytes, static_cast<size_t>(level) + 1, &bytes) ||
+        !serde_checked_mul_size(bytes, sizeof(uint64_t), &bytes))
+        return set_error("RNS transfer workspace size overflow");
+    *out = {bytes, alignof(uint64_t), GPU_PREPARED_TRANSFER_WORKSPACE};
+    return 0;
+}
+
 extern "C" int gpu_matrix_load_rns_batch(
     GpuMatrix *mat,
     const uint8_t *bytes,
@@ -711,6 +756,10 @@ extern "C" int gpu_matrix_load_rns_batch(
     int format,
     GpuEventSet **out_events)
 {
+    if (!mat || !mat->ctx || !mat->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_load_rns_batch");
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+
     if (mat) mat->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!mat || !out_events)
     {
@@ -779,107 +828,91 @@ extern "C" int gpu_matrix_load_rns_batch(
 
     std::vector<SerdeStreamRef> streams;
     streams.reserve(limb_count);
+    const size_t batch_limbs = mat->shared_limb_buffers.size() == 1 ? limb_count : 1;
     const size_t host_limb_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
-    const size_t host_limb_words = static_cast<size_t>(N);
-    size_t total_coeff = 0;
+    size_t batch_poly_bytes = 0;
     size_t staging_bytes = 0;
-    if (!serde_checked_mul_size(count, host_limb_words, &total_coeff) ||
-        !serde_checked_mul_size(total_coeff, sizeof(uint64_t), &staging_bytes))
-    {
+    if (!serde_checked_mul_size(batch_limbs, host_limb_bytes, &batch_poly_bytes) ||
+        !serde_checked_mul_size(count, batch_poly_bytes, &staging_bytes))
         return set_error("staging size overflow in gpu_matrix_load_rns_batch");
-    }
-    for (size_t limb = 0; limb < limb_count; ++limb)
+    for (size_t limb = 0; limb < limb_count; limb += batch_limbs)
     {
         const dim3 limb_id = limb_map[limb];
-        uint8_t *dst = matrix_limb_ptr_by_id(mat, 0, limb_id);
-        if (!dst)
-        {
-            return set_error("null matrix limb base pointer in gpu_matrix_load_rns_batch");
-        }
-
-        int device = -1;
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const int device = buffer.device;
         cudaStream_t stream = nullptr;
-        int status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        size_t dst_pitch = 0;
-        uint8_t dst_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(mat, limb_id, &dst_pitch, &dst_coeff_bytes))
-        {
-            return set_error("invalid limb metadata in gpu_matrix_load_rns_batch");
-        }
-        const size_t dst_width = static_cast<size_t>(N) * static_cast<size_t>(dst_coeff_bytes);
-        if (dst_coeff_bytes == 0 || dst_pitch < dst_width)
-        {
-            return set_error("invalid destination stride in gpu_matrix_load_rns_batch");
-        }
-        const uint8_t *src = bytes + limb * host_limb_bytes;
-
+        int status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0) return status;
         cudaError_t err = cudaSetDevice(device);
-        if (err != cudaSuccess)
+        if (err != cudaSuccess) return set_error(err);
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return set_error(err);
+            status = matrix_wait_limb_stream(mat, limb_map[limb + index], device, stream);
+            if (status != 0) return status;
         }
-        uint64_t *src_words_device = nullptr;
-        err = cudaMallocAsync(reinterpret_cast<void **>(&src_words_device), staging_bytes, stream);
-        if (err != cudaSuccess)
+        GpuDeviceWorkspace staging;
+        status = staging.acquire(mat->ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE,
+            staging_bytes, alignof(uint64_t), stream);
+        if (status != 0) return status;
+        auto *src_words_device = reinterpret_cast<uint64_t *>(staging.data);
+        if (bytes_per_poly == batch_poly_bytes)
         {
-            return set_error(err);
+            err = cudaMemcpyAsync(
+                src_words_device, bytes, staging_bytes, cudaMemcpyHostToDevice, stream);
         }
-        err = cudaMemcpy2DAsync(
-            src_words_device,
-            host_limb_bytes,
-            src,
-            bytes_per_poly,
-            host_limb_bytes,
-            count,
-            cudaMemcpyHostToDevice,
-            stream);
-        if (err != cudaSuccess)
+        else
         {
-            cudaFreeAsync(src_words_device, stream);
-            return set_error(err);
+            err = cudaMemcpy2DAsync(
+                src_words_device,
+                batch_poly_bytes,
+                bytes + limb * host_limb_bytes,
+                bytes_per_poly,
+                batch_poly_bytes,
+                count,
+                cudaMemcpyHostToDevice,
+                stream);
         }
-        const int threads = 256;
-        const int blocks =
-            static_cast<int>((total_coeff + static_cast<size_t>(threads) - 1) /
-                             static_cast<size_t>(threads));
-        serde_pack_u64_limb_to_packed_kernel<<<blocks, threads, 0, stream>>>(
-            src_words_device,
-            host_limb_words,
-            dst,
-            dst_pitch,
-            dst_coeff_bytes,
-            count,
-            static_cast<size_t>(N));
-        err = cudaGetLastError();
-        if (err != cudaSuccess)
+        if (err == cudaSuccess)
         {
-            cudaFreeAsync(src_words_device, stream);
-            return set_error(err);
+            const size_t total_coeff = staging_bytes / sizeof(uint64_t);
+            const int threads = 256;
+            const int blocks = static_cast<int>((total_coeff + threads - 1) / threads);
+            serde_pack_u64_limbs_to_packed_kernel<<<blocks, threads, 0, stream>>>(
+                src_words_device,
+                buffer.device_descriptors + limb_id.y,
+                batch_limbs,
+                count,
+                static_cast<size_t>(N));
+            err = cudaGetLastError();
         }
-        err = cudaFreeAsync(src_words_device, stream);
-        if (err != cudaSuccess)
+        status = staging.release();
+        if (err != cudaSuccess) return set_error(err);
+        if (status != 0) return status;
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return set_error(err);
-        }
-        status = matrix_record_limb_write(mat, limb_id, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_record_limb_write(mat, limb_map[limb + index], stream);
+            if (status != 0) return status;
         }
         serde_append_unique_stream(streams, device, stream);
     }
 
     mat->format = target_format;
-    return serde_build_event_set_from_streams(streams, out_events);
+    return serde_build_event_set_from_streams(mat->ctx, streams, out_events);
+}
+
+extern "C" int gpu_matrix_rns_store_completion_events(const GpuMatrix *mat, size_t *out_count)
+{
+    if (!mat || !mat->ctx || !out_count || mat->level < 0)
+        return set_error("invalid matrix RNS event query");
+    *out_count = 0;
+    if (mat->rows == 0 || mat->cols == 0) return 0;
+    const size_t limbs = static_cast<size_t>(mat->level) + 1;
+    if (mat->ctx->limb_gpu_ids.size() < limbs)
+        return set_error("invalid matrix RNS event query basis");
+    // One event per unpack/transfer batch is shared by all limb readers and
+    // the returned snapshot, independently of the backing's producer streams.
+    *out_count = mat->shared_limb_buffers.size() == 1 ? 1 : limbs;
+    return 0;
 }
 
 extern "C" int gpu_matrix_store_rns_batch(
@@ -889,6 +922,10 @@ extern "C" int gpu_matrix_store_rns_batch(
     int format,
     GpuEventSet **out_events)
 {
+    if (!mat || !mat->ctx || !mat->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_store_rns_batch");
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+
     if (!mat || !out_events)
     {
         return set_error("invalid gpu_matrix_store_rns_batch arguments");
@@ -956,113 +993,96 @@ extern "C" int gpu_matrix_store_rns_batch(
         return set_error("unexpected limb mapping size in gpu_matrix_store_rns_batch");
     }
 
-    std::vector<SerdeStreamRef> streams;
-    streams.reserve(limb_count);
+    std::unique_ptr<GpuEventSet, decltype(&gpu_event_set_destroy)> events(
+        new GpuEventSet(), gpu_event_set_destroy);
+    events->execution = mat->ctx->execution;
+    events->entries.reserve(limb_count);
+    // Fleet matrices keep all CRT limbs on one device. Unpack that complete
+    // allocation in one kernel and transfer each polynomial contiguously,
+    // instead of allocating and scheduling a D2H copy for every CRT limb.
+    const size_t batch_limbs = mat->shared_limb_buffers.size() == 1 ? limb_count : 1;
     const size_t host_limb_bytes = static_cast<size_t>(N) * sizeof(uint64_t);
-    const size_t host_limb_words = static_cast<size_t>(N);
-    size_t total_coeff = 0;
+    size_t batch_poly_bytes = 0;
     size_t staging_bytes = 0;
-    if (!serde_checked_mul_size(count, host_limb_words, &total_coeff) ||
-        !serde_checked_mul_size(total_coeff, sizeof(uint64_t), &staging_bytes))
-    {
+    if (!serde_checked_mul_size(batch_limbs, host_limb_bytes, &batch_poly_bytes) ||
+        !serde_checked_mul_size(count, batch_poly_bytes, &staging_bytes))
         return set_error("staging size overflow in gpu_matrix_store_rns_batch");
-    }
-    for (size_t limb = 0; limb < limb_count; ++limb)
+    for (size_t limb = 0; limb < limb_count; limb += batch_limbs)
     {
         const dim3 limb_id = limb_map[limb];
-        const uint8_t *src = matrix_limb_ptr_by_id(mat, 0, limb_id);
-        if (!src)
-        {
-            return set_error("null matrix limb base pointer in gpu_matrix_store_rns_batch");
-        }
-
-        int device = -1;
+        const auto &buffer = mat->shared_limb_buffers[limb_id.x];
+        const int device = buffer.device;
         cudaStream_t stream = nullptr;
-        int status = matrix_limb_device(mat, limb_id, &device);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_limb_stream(mat, limb_id, &stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        size_t src_pitch = 0;
-        uint8_t src_coeff_bytes = 0;
-        if (!matrix_limb_metadata_by_id(mat, limb_id, &src_pitch, &src_coeff_bytes))
-        {
-            return set_error("invalid limb metadata in gpu_matrix_store_rns_batch");
-        }
-        const size_t src_width = static_cast<size_t>(N) * static_cast<size_t>(src_coeff_bytes);
-        if (src_coeff_bytes == 0 || src_pitch < src_width)
-        {
-            return set_error("invalid source stride in gpu_matrix_store_rns_batch");
-        }
-        uint8_t *dst = bytes_out + limb * host_limb_bytes;
-
+        int status = matrix_limb_stream(mat, limb_id, &stream);
+        if (status != 0) return status;
         cudaError_t err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        status = matrix_wait_limb_stream(mat, limb_id, device, stream, false, true);
-        if (status != 0)
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            return status;
+            status = matrix_wait_limb_stream(mat, limb_map[limb + index], device, stream, false, true);
+            if (status != 0) return status;
         }
-        uint64_t *dst_words_device = nullptr;
-        err = cudaMallocAsync(reinterpret_cast<void **>(&dst_words_device), staging_bytes, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
+        GpuDeviceWorkspace staging;
+        status = staging.acquire(mat->ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE,
+            staging_bytes, alignof(uint64_t), stream);
+        if (status != 0) return status;
+        auto *dst_words_device = reinterpret_cast<uint64_t *>(staging.data);
+        const size_t total_coeff = staging_bytes / sizeof(uint64_t);
         const int threads = 256;
-        const int blocks =
-            static_cast<int>((total_coeff + static_cast<size_t>(threads) - 1) /
-                             static_cast<size_t>(threads));
-        serde_unpack_packed_limb_to_u64_kernel<<<blocks, threads, 0, stream>>>(
-            src,
-            src_pitch,
-            src_coeff_bytes,
+        const int blocks = static_cast<int>((total_coeff + threads - 1) / threads);
+        serde_unpack_packed_limbs_to_u64_kernel<<<blocks, threads, 0, stream>>>(
+            buffer.device_descriptors + limb_id.y,
+            batch_limbs,
             dst_words_device,
-            host_limb_words,
             count,
             static_cast<size_t>(N));
         err = cudaGetLastError();
-        if (err != cudaSuccess)
+        if (err == cudaSuccess && bytes_per_poly == batch_poly_bytes)
         {
-            cudaFreeAsync(dst_words_device, stream);
+            err = cudaMemcpyAsync(
+                bytes_out, dst_words_device, staging_bytes, cudaMemcpyDeviceToHost, stream);
+        }
+        else if (err == cudaSuccess)
+        {
+            err = cudaMemcpy2DAsync(
+                bytes_out + limb * host_limb_bytes,
+                bytes_per_poly,
+                dst_words_device,
+                batch_poly_bytes,
+                batch_poly_bytes,
+                count,
+                cudaMemcpyDeviceToHost,
+                stream);
+        }
+        status = staging.release();
+        if (err != cudaSuccess) return set_error(err);
+        if (status != 0) return status;
+        // The whole batch finishes on this stream. Share its completion event
+        // between the snapshot and all limb readers instead of claiming one
+        // extra event for each limb whose producer uses a different stream.
+        auto completion = std::make_shared<GpuCudaResource>();
+        status = completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+        if (status != 0) return status;
+        err = cudaEventRecord(completion->event, stream);
+        if (err != cudaSuccess) {
+            completion->quarantine();
+            gpu_execution_mark_allocation_unknown(mat->ctx->execution.get());
             return set_error(err);
         }
-        err = cudaMemcpy2DAsync(
-            dst,
-            bytes_per_poly,
-            dst_words_device,
-            host_limb_bytes,
-            host_limb_bytes,
-            count,
-            cudaMemcpyDeviceToHost,
-            stream);
-        if (err != cudaSuccess)
+        events->entries.push_back(GpuEventSet::Entry{completion->event, device, completion});
+        for (size_t index = 0; index < batch_limbs; ++index)
         {
-            cudaFreeAsync(dst_words_device, stream);
-            return set_error(err);
+            status = matrix_track_limb_consumer(
+                mat, limb_map[limb + index], device, stream, completion->event);
+            if (status != 0) return status;
         }
-        err = cudaFreeAsync(dst_words_device, stream);
-        if (err != cudaSuccess)
-        {
-            return set_error(err);
-        }
-        status = matrix_track_limb_consumer(mat, limb_id, device, stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        serde_append_unique_stream(streams, device, stream);
     }
 
-    return serde_build_event_set_from_streams(streams, out_events);
+    *out_events = events.release();
+    return 0;
 }
 
 extern "C" int gpu_matrix_store_const_coeff_batch(
@@ -1071,6 +1091,10 @@ extern "C" int gpu_matrix_store_const_coeff_batch(
     size_t words_per_poly,
     GpuEventSet **out_events)
 {
+    if (!mat || !mat->ctx || !mat->ctx->execution)
+        return set_error("invalid allocation owner in gpu_matrix_store_const_coeff_batch");
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+
     if (!mat || !out_events)
     {
         return set_error("invalid gpu_matrix_store_const_coeff_batch arguments");
@@ -1202,7 +1226,915 @@ extern "C" int gpu_matrix_store_const_coeff_batch(
         serde_append_unique_stream(streams, device, stream);
     }
 
-    return serde_build_event_set_from_streams(streams, out_events);
+    return serde_build_event_set_from_streams(mat->ctx, streams, out_events);
+}
+
+struct GpuPreparedConstCoeffReadbackLimb
+{
+    size_t ordinal;
+    dim3 limb_id;
+    int device;
+    cudaStream_t stream;
+    const uint8_t *source;
+    size_t source_pitch;
+    uint8_t source_width;
+    cudaEvent_t completion;
+    std::unique_ptr<GpuCudaResource> completion_resource;
+    // Terminal-event generations. `armed` names the submission that may have
+    // queued work for this limb, `recorded` names the submission whose
+    // completion event was actually recorded on this limb's stream. A reclaim
+    // decision is only valid for a generation whose armed limbs are all
+    // recorded, so a partially submitted or unrecorded event can never be
+    // mistaken for the current one.
+    uint64_t armed_generation;
+    uint64_t recorded_generation;
+    uint64_t consumer_tracked_generation;
+};
+
+struct GpuPreparedConstCoeffReadback
+{
+    const GpuMatrix *matrix;
+    uint64_t *words;
+    size_t polynomial_count;
+    size_t words_per_poly;
+    size_t coefficient_index;
+    size_t coefficient_count;
+    std::vector<GpuPreparedConstCoeffReadbackLimb> limbs;
+    uint64_t submission_generation;
+    // Query and submit may be called from different host workers.  Protect
+    // generation state as one transaction so a query can never observe a
+    // partially armed submission.
+    mutable std::mutex mutex;
+};
+
+extern "C" int gpu_matrix_prepare_const_coeff_readback(
+    const GpuMatrix *mat,
+    uint64_t *words_out,
+    size_t words_per_poly,
+    size_t coefficient_index,
+    size_t coefficient_count,
+    const GpuPreparedPlanDescriptor *plan,
+    GpuPreparedConstCoeffReadback **out_plan)
+{
+    if (!out_plan)
+        return set_error("null prepared coefficient readback output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution ||
+        (mat->format != GPU_POLY_FORMAT_COEFF && mat->format != GPU_POLY_FORMAT_EVAL))
+        return set_error("invalid prepared polynomial readback matrix");
+    if (!plan || gpu_prepared_validate_descriptor(plan) != 0)
+        return set_error("prepared coefficient readback requires a saved descriptor");
+    if (mat->level < 0 || mat->ctx->N <= 0 || coefficient_count == 0 ||
+        coefficient_index >= static_cast<size_t>(mat->ctx->N) ||
+        coefficient_count > static_cast<size_t>(mat->ctx->N) - coefficient_index)
+        return set_error("invalid prepared coefficient readback dimensions");
+
+    size_t polynomial_count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &polynomial_count))
+        return set_error("prepared coefficient readback matrix size overflow");
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    if (polynomial_count == 0 || !words_out ||
+        words_per_poly < limb_count * coefficient_count)
+        return set_error("invalid prepared coefficient readback output");
+    size_t total_words = 0;
+    if (!serde_checked_mul_size(polynomial_count, words_per_poly, &total_words))
+        return set_error("prepared coefficient readback output size overflow");
+    size_t total_bytes = 0;
+    if (!serde_checked_mul_size(total_words, sizeof(uint64_t), &total_bytes))
+        return set_error("prepared coefficient readback output byte size overflow");
+    if (mat->ctx->limb_gpu_ids.size() < limb_count)
+        return set_error("prepared coefficient readback limb metadata is incomplete");
+
+    const GpuMatrix *owner = gpu_prepared_base_owner(mat);
+    if (!owner || owner->ctx != mat->ctx || owner->level != mat->level)
+        return set_error("prepared coefficient readback owner is invalid");
+    if (plan->allocation_count != limb_count + 1 || plan->stream_count != limb_count)
+        return set_error("prepared coefficient readback plan shape does not match its owner");
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_READBACK};
+    if (gpu_prepared_require_allocation(
+            plan, 0, GPU_PREPARED_PINNED_HOST, &host_key, total_bytes, alignof(uint64_t)) != 0)
+        return set_error("prepared coefficient readback plan destination does not match its owner");
+
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+    auto *prepared = new GpuPreparedConstCoeffReadback{
+        mat, words_out, polynomial_count, words_per_poly,
+        coefficient_index, coefficient_count, {}, 1, {}};
+    try
+    {
+        prepared->limbs.reserve(limb_count);
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+            const uint8_t *source_base = matrix_limb_ptr_by_id(mat, 0, limb_id);
+            if (!source_base)
+                throw std::runtime_error("null prepared coefficient readback source");
+
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+                throw std::runtime_error("invalid prepared coefficient readback limb device");
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0 || !stream)
+                throw std::runtime_error("invalid prepared coefficient readback stream");
+
+            dim3 planned_limb{};
+            GpuPreparedResourceKey key{};
+            status = gpu_prepared_limb_key(
+                owner->ctx, owner->level, limb, GPU_PREPARED_STAGE_READBACK, &planned_limb, &key);
+            if (status != 0 || planned_limb.x != limb_id.x || planned_limb.y != limb_id.y ||
+                key.device != device)
+                throw std::runtime_error(
+                    "prepared coefficient readback owner differs from its saved plan");
+            status = gpu_prepared_require_allocation(
+                plan, limb + 1, GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1);
+            if (status != 0)
+                throw std::runtime_error("prepared coefficient readback completion claim missing");
+            const auto &stream_entry = plan->streams[limb];
+            if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+                std::memcmp(&stream_entry.key, &key, sizeof(key)) != 0 ||
+                gpu_prepared_require_stream_slot(
+                    owner->ctx, limb_id.x, stream, stream_entry.pool_slot) != 0)
+                throw std::runtime_error(
+                    "prepared coefficient readback stream differs from its saved descriptor");
+
+            size_t source_pitch = 0;
+            uint8_t source_width = 0;
+            if (!matrix_limb_metadata_by_id(mat, limb_id, &source_pitch, &source_width) ||
+                source_width == 0 ||
+                source_pitch < static_cast<size_t>(mat->ctx->N) * source_width)
+                throw std::runtime_error("invalid prepared coefficient readback layout");
+            const uint8_t *source = source_base + coefficient_index * source_width;
+
+            auto completion = std::make_unique<GpuCudaResource>();
+            const int resource_status =
+                completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (resource_status != 0)
+                throw std::runtime_error("failed to acquire prepared readback completion event");
+            prepared->limbs.push_back(GpuPreparedConstCoeffReadbackLimb{
+                limb,
+                limb_id,
+                device,
+                stream,
+                source,
+                source_pitch,
+                source_width,
+                completion->event,
+                std::move(completion),
+                0,
+                0,
+                0,
+            });
+        }
+    }
+    catch (const std::exception &error)
+    {
+        delete prepared;
+        return set_error(error.what());
+    }
+    *out_plan = prepared;
+    readback_prepared_acquisitions.fetch_add(limb_count, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" void gpu_matrix_test_reset_serde_bind_counters()
+{
+    readback_prepared_acquisitions.store(0, std::memory_order_relaxed);
+    rns_upload_prepared_acquisitions.store(0, std::memory_order_relaxed);
+    reconstruction_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_readback_prepared_acquisitions()
+{
+    return readback_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_rns_upload_prepared_acquisitions()
+{
+    return rns_upload_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_reconstruction_prepared_acquisitions()
+{
+    return reconstruction_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+namespace
+{
+    // Reports a failed submission while still recording and retaining every
+    // limb that may have queued work. A failed readonly registration falls
+    // back to stream retirement, which quarantines the execution if that
+    // retirement cannot be established before the source can be recycled.
+    int fail_const_coeff_readback_submission(
+        GpuPreparedConstCoeffReadback *plan, uint64_t generation, int status)
+    {
+        for (auto &limb : plan->limbs)
+        {
+            if (limb.armed_generation != generation)
+                continue;
+            if (limb.recorded_generation != generation)
+            {
+                if (cudaSetDevice(limb.device) == cudaSuccess &&
+                    cudaEventRecord(limb.completion, limb.stream) == cudaSuccess)
+                    limb.recorded_generation = generation;
+                else
+                {
+                    // The completion event may have an uncertain record
+                    // status. Never return its prepared slot to the pool;
+                    // stream retirement protects the source when possible,
+                    // while quarantine preserves the event lease fail-closed.
+                    limb.completion_resource->quarantine();
+                    (void)gpu_context_retire_stream(plan->matrix->ctx, limb.device, limb.stream);
+                    continue;
+                }
+            }
+            if (limb.consumer_tracked_generation != generation)
+            {
+                const int tracked = matrix_track_limb_consumer_readonly(
+                    plan->matrix, limb.limb_id, limb.device, limb.stream,
+                    limb.completion, true);
+                if (tracked == 0)
+                    limb.consumer_tracked_generation = generation;
+                else
+                    (void)gpu_context_retire_stream(plan->matrix->ctx, limb.device, limb.stream);
+            }
+        }
+        return status;
+    }
+}
+
+extern "C" int gpu_matrix_submit_const_coeff_readback(
+    GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx || !plan->words ||
+        plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback plan");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    size_t total_words = 0;
+    if (!serde_checked_mul_size(plan->polynomial_count, plan->words_per_poly, &total_words))
+        return set_error("prepared coefficient readback output size overflow");
+    if (plan->submission_generation == std::numeric_limits<uint64_t>::max())
+        return set_error("prepared coefficient readback submission generation exhausted");
+    std::fill_n(plan->words, total_words, static_cast<uint64_t>(0));
+
+    const uint64_t generation = ++plan->submission_generation;
+    for (auto &limb : plan->limbs)
+    {
+        cudaError_t error = cudaSetDevice(limb.device);
+        if (error != cudaSuccess)
+            return fail_const_coeff_readback_submission(plan, generation, set_error(error));
+        int status = matrix_wait_limb_stream(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, true, true);
+        if (status != 0)
+            return fail_const_coeff_readback_submission(plan, generation, status);
+        // Matrix storage is row-major: a device row contains `cols` complete
+        // polynomials, while the prepared host result is polynomial-major.
+        // Copy one matrix row at a time; the per-polynomial source pitch is
+        // already the matrix's bytes_per_poly stride and includes all limbs.
+        size_t destination_row_words = 0;
+        if (!serde_checked_mul_size(
+                plan->matrix->cols, plan->words_per_poly, &destination_row_words))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback destination pitch overflow"));
+        size_t source_row_pitch = 0;
+        if (!serde_checked_mul_size(
+                plan->matrix->cols, limb.source_pitch, &source_row_pitch))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback source row pitch overflow"));
+        size_t limb_offset_words = 0;
+        if (!serde_checked_mul_size(
+                limb.ordinal, plan->coefficient_count, &limb_offset_words))
+            return fail_const_coeff_readback_submission(
+                plan, generation, set_error("prepared coefficient readback limb offset overflow"));
+        limb.armed_generation = generation;
+        for (size_t row = 0; row < plan->matrix->rows; ++row)
+        {
+            size_t destination_words = 0;
+            if (!serde_checked_mul_size(row, destination_row_words, &destination_words) ||
+                destination_words > total_words ||
+                limb_offset_words > total_words - destination_words)
+                return fail_const_coeff_readback_submission(
+                    plan, generation, set_error("prepared coefficient readback destination offset overflow"));
+            destination_words += limb_offset_words;
+            auto *destination = reinterpret_cast<uint8_t *>(plan->words) +
+                destination_words * sizeof(uint64_t);
+            const auto *source = limb.source + row * source_row_pitch;
+            if (limb.source_width == sizeof(uint64_t))
+            {
+                error = cudaMemcpy2DAsync(
+                    destination,
+                    plan->words_per_poly * sizeof(uint64_t),
+                    source,
+                    limb.source_pitch,
+                    static_cast<size_t>(limb.source_width) * plan->coefficient_count,
+                    plan->matrix->cols,
+                    cudaMemcpyDeviceToHost,
+                    limb.stream);
+                if (error != cudaSuccess)
+                    return fail_const_coeff_readback_submission(plan, generation, set_error(error));
+            }
+            else
+            {
+                // Narrow limbs are packed on device, but the prepared API
+                // exposes one zero-extended u64 per residue. Copy each
+                // coefficient into its strided u64 destination so adjacent
+                // narrow residues do not get packed into one host word.
+                for (size_t coefficient = 0; coefficient < plan->coefficient_count;
+                     ++coefficient)
+                {
+                    error = cudaMemcpy2DAsync(
+                        destination + coefficient * sizeof(uint64_t),
+                        plan->words_per_poly * sizeof(uint64_t),
+                        source + coefficient * limb.source_width,
+                        limb.source_pitch,
+                        limb.source_width,
+                        plan->matrix->cols,
+                        cudaMemcpyDeviceToHost,
+                        limb.stream);
+                    if (error != cudaSuccess)
+                        return fail_const_coeff_readback_submission(
+                            plan, generation, set_error(error));
+                }
+            }
+        }
+        // The copies are queued: this limb now owes a terminal record for this
+        // generation before the pinned destination may be released.
+        error = cudaEventRecord(limb.completion, limb.stream);
+        if (error != cudaSuccess)
+            return fail_const_coeff_readback_submission(plan, generation, set_error(error));
+        limb.recorded_generation = generation;
+        status = matrix_track_limb_consumer_readonly(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, limb.completion, true);
+        if (status != 0)
+            return fail_const_coeff_readback_submission(plan, generation, status);
+        limb.consumer_tracked_generation = generation;
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_wait_const_coeff_readback(
+    const GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan || plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback wait");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    for (const auto &limb : plan->limbs)
+    {
+        const cudaError_t error = cudaEventSynchronize(limb.completion);
+        if (error != cudaSuccess)
+            return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_const_coeff_readback(
+    const GpuPreparedConstCoeffReadback *plan, int *out_ready)
+{
+    if (!plan || !out_ready || plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback query");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    *out_ready = 1;
+    int current = 0;
+    cudaError_t error = cudaGetDevice(&current);
+    if (error != cudaSuccess) return set_error(error);
+    for (const auto &limb : plan->limbs)
+    {
+        // A limb that queued nothing for the newest submission holds a stale
+        // event and cannot speak for it, and an armed limb whose terminal event
+        // was never recorded is unproven rather than complete. Either way the
+        // answer is "not ready", never a completion claim.
+        if (limb.armed_generation != plan->submission_generation)
+        {
+            *out_ready = 0;
+            continue;
+        }
+        if (limb.recorded_generation != plan->submission_generation)
+        {
+            *out_ready = 0;
+            continue;
+        }
+        error = cudaSetDevice(limb.device);
+        if (error == cudaSuccess) error = cudaEventQuery(limb.completion);
+        if (error == cudaErrorNotReady)
+        {
+            *out_ready = 0;
+            error = cudaSuccess;
+        }
+        if (error != cudaSuccess) break;
+    }
+    const cudaError_t restored = cudaSetDevice(current);
+    if (error == cudaSuccess) error = restored;
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+extern "C" void gpu_matrix_destroy_const_coeff_readback(
+    GpuPreparedConstCoeffReadback *plan)
+{
+    if (!plan) return;
+    delete plan;
+}
+
+namespace
+{
+    // Moves a plan's pinned host allocation to the context-owned reclaimer
+    // behind one freshly recorded event per stream the plan is allowed to queue
+    // work on. The records are taken after the caller stopped submitting, so
+    // they dominate every queued operation, including work that a partial
+    // submission left without a terminal event. Ownership only moves when the
+    // reclaimer accepts it; a nonzero status leaves the allocation unretired
+    // for the caller to leak instead of freeing it early.
+    int defer_pinned_free_behind_plan_streams(
+        GpuContext *ctx, const std::vector<SerdeStreamRef> &streams, void *pointer)
+    {
+        if (!ctx || !pointer)
+            return set_error("invalid prepared pinned free request");
+        if (streams.empty())
+            return set_error("prepared plan has no submission stream");
+        GpuEventSet *events = nullptr;
+        const int status = serde_build_event_set_from_streams(ctx, streams, &events);
+        if (status != 0) return status;
+        return gpu_event_set_defer_pinned_free(ctx, events, pointer);
+    }
+}
+
+extern "C" int gpu_matrix_defer_const_coeff_readback_pinned_free(
+    const GpuPreparedConstCoeffReadback *plan, void *pointer)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx || !plan->matrix->ctx->execution ||
+        !pointer || plan->limbs.empty())
+        return set_error("invalid prepared coefficient readback pinned free");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    std::vector<SerdeStreamRef> streams;
+    try
+    {
+        streams.reserve(plan->limbs.size());
+    }
+    catch (const std::exception &error)
+    {
+        return set_error(error.what());
+    }
+    for (const auto &limb : plan->limbs)
+        serde_append_unique_stream(streams, limb.device, limb.stream);
+    return defer_pinned_free_behind_plan_streams(plan->matrix->ctx, streams, pointer);
+}
+
+struct GpuPreparedRnsUploadLimb
+{
+    size_t ordinal;
+    dim3 limb_id;
+    int device;
+    cudaStream_t stream;
+    GpuMatrix::SharedLimbBuffer::DeviceDescriptor *destination;
+    size_t staging_bytes;
+    size_t blocks;
+    std::unique_ptr<GpuDeviceWorkspace> workspace;
+    std::unique_ptr<GpuCudaResource> completion_resource;
+    // Terminal-event generations. `armed` names the submission that may have
+    // queued work for this limb, `recorded` names the submission whose
+    // completion event was actually recorded on this limb's stream. A reclaim
+    // decision is only valid for a generation whose armed limbs are all
+    // recorded, so a partially submitted or unrecorded event can never be
+    // mistaken for the current one.
+    uint64_t armed_generation;
+    uint64_t recorded_generation;
+};
+
+struct GpuPreparedRnsUpload
+{
+    GpuMatrix *matrix;
+    const uint8_t *host_bytes;
+    size_t bytes_per_poly;
+    size_t polynomial_count;
+    size_t limb_count;
+    GpuPolyFormat format;
+    bool transform_to_eval;
+    GpuMatrixTransformPlan *transform;
+    std::vector<GpuPreparedRnsUploadLimb> limbs;
+    uint64_t submission_generation;
+    // See GpuPreparedConstCoeffReadback::mutex.  The Rust busy bit prevents
+    // ordinary overlap, but native query/submit calls still need a data-race
+    // boundary when separate callers arrive concurrently.
+    mutable std::mutex mutex;
+};
+
+extern "C" int gpu_matrix_prepare_rns_upload(
+    GpuMatrix *mat,
+    const uint8_t *bytes,
+    size_t bytes_per_poly,
+    int format,
+    bool transform_to_eval,
+    const GpuPreparedPlanDescriptor *plan,
+    GpuPreparedRnsUpload **out_plan)
+{
+    if (!out_plan)
+        return set_error("null prepared RNS upload output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution || !bytes || mat->level < 0 ||
+        mat->ctx->N <= 0)
+        return set_error("invalid prepared RNS upload arguments");
+    if (!plan || gpu_prepared_validate_descriptor(plan) != 0)
+        return set_error("prepared RNS upload requires a saved descriptor");
+    GpuPolyFormat target_format;
+    if (!parse_format(format, target_format))
+        return set_error("invalid prepared RNS upload format");
+    if (transform_to_eval && target_format != GPU_POLY_FORMAT_COEFF)
+        return set_error("prepared RNS upload transform requires coefficient input");
+    if (transform_to_eval && mat->format != GPU_POLY_FORMAT_EVAL)
+        return set_error("prepared RNS upload transform requires evaluation destination");
+    if (!transform_to_eval && mat->format != target_format)
+        return set_error("prepared RNS upload destination format mismatch");
+
+    size_t polynomial_count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &polynomial_count) || polynomial_count == 0)
+        return set_error("invalid prepared RNS upload matrix size");
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    size_t expected_words = 0;
+    size_t expected_bytes = 0;
+    if (!serde_checked_mul_size(limb_count, static_cast<size_t>(mat->ctx->N), &expected_words) ||
+        !serde_checked_mul_size(expected_words, sizeof(uint64_t), &expected_bytes) ||
+        bytes_per_poly < expected_bytes)
+        return set_error("prepared RNS upload byte span is too small");
+    if (mat->ctx->limb_gpu_ids.size() < limb_count)
+        return set_error("prepared RNS upload limb metadata is incomplete");
+
+    const size_t host_limb_bytes = static_cast<size_t>(mat->ctx->N) * sizeof(uint64_t);
+    size_t total_coefficients = 0;
+    size_t staging_bytes = 0;
+    size_t host_bytes = 0;
+    if (!serde_checked_mul_size(polynomial_count, static_cast<size_t>(mat->ctx->N), &total_coefficients) ||
+        !serde_checked_mul_size(total_coefficients, sizeof(uint64_t), &staging_bytes) ||
+        !serde_checked_mul_size(polynomial_count, bytes_per_poly, &host_bytes) ||
+        host_limb_bytes > bytes_per_poly)
+        return set_error("prepared RNS upload host stride is invalid");
+    const size_t expected_allocations = 1 + 2 * limb_count + (transform_to_eval ? 1 : 0);
+    const size_t expected_streams = limb_count + (transform_to_eval ? 1 : 0);
+    const GpuMatrix *owner = gpu_prepared_base_owner(mat);
+    if (!owner || owner->ctx != mat->ctx || owner->level != mat->level)
+        return set_error("prepared RNS upload owner is invalid");
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    if (plan->allocation_count != expected_allocations || plan->stream_count != expected_streams ||
+        gpu_prepared_require_allocation(
+            plan, 0, GPU_PREPARED_PINNED_HOST, &host_key, host_bytes, alignof(uint8_t)) != 0)
+        return set_error("prepared RNS upload plan shape does not match its owner");
+
+    // Validate every physical claim and stream before constructing the first
+    // workspace. This keeps malformed later-limb descriptors side-effect free.
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+        int device = -1;
+        cudaStream_t stream = nullptr;
+        dim3 planned_limb{};
+        GpuPreparedResourceKey key{};
+        if (matrix_limb_device(mat, limb_id, &device) != 0 ||
+            matrix_limb_stream(mat, limb_id, &stream) != 0 || !stream ||
+            gpu_prepared_limb_key(owner->ctx, owner->level, limb,
+                GPU_PREPARED_STAGE_UPLOAD, &planned_limb, &key) != 0 ||
+            planned_limb.x != limb_id.x || planned_limb.y != limb_id.y || key.device != device ||
+            gpu_prepared_require_allocation(plan, 1 + 2 * limb,
+                GPU_PREPARED_TRANSFER_WORKSPACE, &key, staging_bytes, alignof(uint64_t)) != 0 ||
+            gpu_prepared_require_allocation(plan, 2 + 2 * limb,
+                GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1) != 0 ||
+            plan->streams[limb].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+            std::memcmp(&plan->streams[limb].key, &key, sizeof(key)) != 0 ||
+            gpu_prepared_require_stream_slot(owner->ctx, limb_id.x, stream,
+                plan->streams[limb].pool_slot) != 0)
+            return set_error("prepared RNS upload descriptor has an invalid limb claim");
+    }
+    if (transform_to_eval)
+    {
+        size_t launch_count = 0;
+        if (gpu_prepared_ntt_launch_table(static_cast<uint32_t>(mat->ctx->N), limb_count,
+                polynomial_count, 1, nullptr, 0, &launch_count) != 0)
+            return set_error("prepared RNS upload transform geometry is invalid");
+        size_t geometry_bytes = 0;
+        if (!serde_checked_mul_size(launch_count, sizeof(GpuPreparedNttLaunchLayout),
+                &geometry_bytes))
+            return set_error("prepared RNS upload transform geometry overflow");
+        dim3 ntt_limb{};
+        GpuPreparedResourceKey ntt_key{};
+        if (gpu_prepared_limb_key(owner->ctx, owner->level, 0,
+                GPU_PREPARED_STAGE_NTT, &ntt_limb, &ntt_key) != 0 ||
+            gpu_prepared_require_allocation(plan, expected_allocations - 1,
+                GPU_PREPARED_PLAN_HOST_ONLY, &ntt_key, geometry_bytes, alignof(void *)) != 0 ||
+            plan->streams[limb_count].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+            std::memcmp(&plan->streams[limb_count].key, &ntt_key, sizeof(ntt_key)) != 0)
+            return set_error("prepared RNS upload transform descriptor is invalid");
+        GpuPreparedPlanDescriptor ntt_layout{};
+        ntt_layout.allocation_count = 1;
+        ntt_layout.allocations[0] = plan->allocations[expected_allocations - 1];
+        ntt_layout.stream_count = 1;
+        ntt_layout.streams[0] = plan->streams[limb_count];
+        ntt_layout.launch_count = plan->launch_count;
+        if (ntt_layout.launch_count > GPU_PREPARED_PLAN_MAX_STREAMS)
+            return set_error("prepared RNS upload transform launch table is too large");
+        for (size_t index = 0; index < ntt_layout.launch_count; ++index)
+            ntt_layout.launches[index] = plan->launches[index];
+        GpuMatrixTransformPlan *validated_transform = nullptr;
+        if (gpu_matrix_prepare_ntt_plan_with_layout(mat, nullptr, true,
+                &ntt_layout, &validated_transform) != 0)
+            return set_error("prepared RNS upload transform geometry differs");
+        gpu_matrix_destroy_ntt_plan(validated_transform);
+    }
+
+    GpuAllocationActivity activity(mat->ctx->execution.get(), -1);
+    auto *prepared = new GpuPreparedRnsUpload{
+        mat, bytes, bytes_per_poly, polynomial_count, limb_count, target_format,
+        transform_to_eval, nullptr, {}, 0, {}};
+    try
+    {
+        prepared->limbs.reserve(limb_count);
+        const size_t blocks = (total_coefficients + 255) / 256;
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+            if (limb_id.x >= mat->shared_limb_buffers.size())
+                throw std::runtime_error("invalid prepared RNS upload partition");
+            auto &buffer = mat->shared_limb_buffers[limb_id.x];
+            if (!buffer.device_descriptors || limb_id.y >= buffer.limb_count)
+                throw std::runtime_error("missing prepared RNS upload descriptors");
+            int device = -1;
+            cudaStream_t stream = nullptr;
+            int status = matrix_limb_device(mat, limb_id, &device);
+            if (status != 0)
+                throw std::runtime_error("invalid prepared RNS upload device");
+            status = matrix_limb_stream(mat, limb_id, &stream);
+            if (status != 0 || !stream)
+                throw std::runtime_error("invalid prepared RNS upload stream");
+
+            dim3 planned_limb{};
+            GpuPreparedResourceKey key{};
+            status = gpu_prepared_limb_key(
+                owner->ctx, owner->level, limb, GPU_PREPARED_STAGE_UPLOAD, &planned_limb, &key);
+            if (status != 0 || planned_limb.x != limb_id.x || planned_limb.y != limb_id.y ||
+                key.device != device)
+                throw std::runtime_error("prepared RNS upload owner differs from its saved plan");
+            status = gpu_prepared_require_allocation(
+                plan, 1 + 2 * limb, GPU_PREPARED_TRANSFER_WORKSPACE, &key, staging_bytes,
+                alignof(uint64_t));
+            if (status != 0)
+                throw std::runtime_error("prepared RNS upload staging claim missing");
+            status = gpu_prepared_require_allocation(
+                plan, 2 + 2 * limb, GPU_PREPARED_COMPLETION_EVENT, &key, 0, 1);
+            if (status != 0)
+                throw std::runtime_error("prepared RNS upload completion claim missing");
+            const auto &stream_entry = plan->streams[limb];
+            if (stream_entry.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+                std::memcmp(&stream_entry.key, &key, sizeof(key)) != 0 ||
+                gpu_prepared_require_stream_slot(
+                    owner->ctx, limb_id.x, stream, stream_entry.pool_slot) != 0)
+                throw std::runtime_error(
+                    "prepared RNS upload stream differs from its saved descriptor");
+
+            auto workspace = std::make_unique<GpuDeviceWorkspace>();
+            status = workspace->acquire(
+                mat->ctx, device, GPU_PREPARED_TRANSFER_WORKSPACE,
+                staging_bytes, alignof(uint64_t), stream);
+            if (status != 0)
+                throw std::runtime_error("failed to acquire prepared RNS upload workspace");
+            auto completion = std::make_unique<GpuCudaResource>();
+            status = completion->acquire(mat->ctx, device, GPU_PREPARED_COMPLETION_EVENT);
+            if (status != 0)
+                throw std::runtime_error("failed to acquire prepared RNS upload completion event");
+            prepared->limbs.push_back(GpuPreparedRnsUploadLimb{
+                limb,
+                limb_id,
+                device,
+                stream,
+                buffer.device_descriptors + limb_id.y,
+                staging_bytes,
+                blocks,
+                std::move(workspace),
+                std::move(completion),
+                0,
+                0,
+            });
+            if (host_limb_bytes > bytes_per_poly)
+                throw std::runtime_error("prepared RNS upload host stride is invalid");
+        }
+        if (transform_to_eval)
+        {
+            const GpuMatrixRange range{0, mat->rows, 0, mat->cols};
+            GpuPreparedPlanDescriptor ntt_plan{};
+            ntt_plan.allocation_count = 1;
+            ntt_plan.allocations[0] = plan->allocations[expected_allocations - 1];
+            ntt_plan.stream_count = 1;
+            ntt_plan.streams[0] = plan->streams[limb_count];
+            ntt_plan.launch_count = plan->launch_count;
+            if (ntt_plan.launch_count > GPU_PREPARED_PLAN_MAX_STREAMS)
+                throw std::runtime_error("prepared RNS upload transform launch table is too large");
+            for (size_t index = 0; index < ntt_plan.launch_count; ++index)
+                ntt_plan.launches[index] = plan->launches[index];
+            const int status = gpu_matrix_prepare_ntt_plan_with_layout(
+                mat, &range, true, &ntt_plan, &prepared->transform);
+            if (status != 0)
+                throw std::runtime_error("failed to prepare RNS upload NTT transform");
+            GpuPreparedResourceKey transform_key{};
+            dim3 planned_limb{};
+            const int key_status = gpu_prepared_limb_key(
+                owner->ctx, owner->level, 0, GPU_PREPARED_STAGE_NTT, &planned_limb,
+                &transform_key);
+            if (key_status != 0)
+                throw std::runtime_error("invalid prepared RNS upload transform plan");
+            const int geometry_status = gpu_prepared_require_allocation(
+                plan, expected_allocations - 1, GPU_PREPARED_PLAN_HOST_ONLY, &transform_key,
+                plan->allocations[expected_allocations - 1].bytes, alignof(void *));
+            if (geometry_status != 0)
+                throw std::runtime_error("prepared RNS upload transform geometry missing");
+            const auto &transform_stream = plan->streams[limb_count];
+            if (transform_stream.origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+                std::memcmp(&transform_stream.key, &transform_key, sizeof(transform_key)) != 0 ||
+                gpu_prepared_require_stream_slot(
+                    owner->ctx, planned_limb.x, prepared->transform->launches.front().stream,
+                    transform_stream.pool_slot) != 0)
+                throw std::runtime_error("prepared RNS upload transform stream is not planned");
+        }
+    }
+    catch (const std::exception &error)
+    {
+        if (prepared->transform)
+            gpu_matrix_destroy_ntt_plan(prepared->transform);
+        delete prepared;
+        return set_error(error.what());
+    }
+    *out_plan = prepared;
+    rns_upload_prepared_acquisitions.fetch_add(
+        2 * limb_count + (transform_to_eval ? 1 : 0), std::memory_order_relaxed);
+    return 0;
+}
+
+namespace
+{
+    // Records this plan's terminal completion on every limb stream that already
+    // queued work for `generation`. Called after the queued work and on every
+    // failure return, so the pinned staging allocation can only be reclaimed
+    // through an event that provably covers the queued copies.
+    int record_rns_upload_terminal(GpuPreparedRnsUpload *plan, uint64_t generation)
+    {
+        for (auto &limb : plan->limbs)
+        {
+            if (limb.armed_generation != generation || limb.recorded_generation == generation)
+                continue;
+            cudaError_t error = cudaSetDevice(limb.device);
+            if (error == cudaSuccess)
+                error = cudaEventRecord(limb.completion_resource->event, limb.stream);
+            if (error != cudaSuccess) return set_error(error);
+            limb.recorded_generation = generation;
+        }
+        return 0;
+    }
+
+    // Reports a failed submission while still recording the terminal completion
+    // of every limb that may already have queued work. The submission's own
+    // cause is the more specific report; when a terminal record is refused the
+    // generation stays unproven, so the pinned staging allocation is retained
+    // instead of freed while a queued copy could still read it.
+    int fail_rns_upload_submission(
+        GpuPreparedRnsUpload *plan, uint64_t generation, int status)
+    {
+        // The terminal record's own status is deliberately not reported: the
+        // submission cause is what the caller must see, and a refused record
+        // leaves the generation unproven, which fails closed.
+        record_rns_upload_terminal(plan, generation);
+        return status;
+    }
+}
+
+extern "C" int gpu_matrix_submit_rns_upload(GpuPreparedRnsUpload *plan)
+{
+    if (!plan || !plan->matrix || !plan->host_bytes || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload plan");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    const size_t host_limb_bytes = static_cast<size_t>(plan->matrix->ctx->N) * sizeof(uint64_t);
+    const uint64_t generation = ++plan->submission_generation;
+    for (auto &limb : plan->limbs)
+    {
+        cudaError_t error = cudaSetDevice(limb.device);
+        if (error != cudaSuccess)
+            return fail_rns_upload_submission(plan, generation, set_error(error));
+        int status = matrix_wait_limb_stream(
+            plan->matrix, limb.limb_id, limb.device, limb.stream, true, false);
+        if (status != 0)
+            return fail_rns_upload_submission(plan, generation, status);
+        auto *staging = reinterpret_cast<uint64_t *>(limb.workspace->data);
+        const auto *source = plan->host_bytes + limb.ordinal * host_limb_bytes;
+        error = cudaMemcpy2DAsync(
+            staging,
+            limb.staging_bytes / plan->polynomial_count,
+            source,
+            plan->bytes_per_poly,
+            host_limb_bytes,
+            plan->polynomial_count,
+            cudaMemcpyHostToDevice,
+            limb.stream);
+        if (error != cudaSuccess)
+            return fail_rns_upload_submission(plan, generation, set_error(error));
+        // The staged copy is queued: this limb now owes a terminal record for
+        // this generation before the pinned staging allocation may be released.
+        limb.armed_generation = generation;
+        serde_pack_u64_limbs_to_packed_kernel<<<
+            static_cast<unsigned int>(limb.blocks), 256, 0, limb.stream>>>(
+            staging, limb.destination, 1, plan->polynomial_count,
+            static_cast<size_t>(plan->matrix->ctx->N));
+        error = cudaGetLastError();
+        if (error != cudaSuccess)
+            return fail_rns_upload_submission(plan, generation, set_error(error));
+        status = matrix_record_limb_write(plan->matrix, limb.limb_id, limb.stream, true);
+        if (status != 0)
+            return fail_rns_upload_submission(plan, generation, status);
+    }
+    if (plan->transform_to_eval)
+    {
+        const int status = gpu_matrix_submit_ntt_plan(plan->transform, plan->matrix);
+        if (status != 0)
+            return fail_rns_upload_submission(plan, generation, status);
+    }
+    else
+    {
+        plan->matrix->format = plan->format;
+    }
+    // The terminal record is taken last so it also covers the optional
+    // evaluation transform queued behind the per-limb copies.
+    return record_rns_upload_terminal(plan, generation);
+}
+
+extern "C" int gpu_matrix_wait_rns_upload(const GpuPreparedRnsUpload *plan)
+{
+    if (!plan || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload wait");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    for (const auto &limb : plan->limbs)
+    {
+        const cudaError_t error = cudaEventSynchronize(limb.completion_resource->event);
+        if (error != cudaSuccess)
+            return set_error(error);
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_rns_upload(
+    const GpuPreparedRnsUpload *plan, int *out_ready)
+{
+    if (!plan || !out_ready || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload query");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    *out_ready = 1;
+    int current = 0;
+    cudaError_t error = cudaGetDevice(&current);
+    if (error != cudaSuccess) return set_error(error);
+    for (const auto &limb : plan->limbs)
+    {
+        // A limb that queued nothing for the newest submission holds a stale
+        // event and cannot speak for it, and an armed limb whose terminal event
+        // was never recorded is unproven rather than complete. Either way the
+        // answer is "not ready", never a completion claim.
+        if (limb.armed_generation != plan->submission_generation) continue;
+        if (limb.recorded_generation != plan->submission_generation)
+        {
+            *out_ready = 0;
+            continue;
+        }
+        error = cudaSetDevice(limb.device);
+        if (error == cudaSuccess) error = cudaEventQuery(limb.completion_resource->event);
+        if (error == cudaErrorNotReady)
+        {
+            *out_ready = 0;
+            error = cudaSuccess;
+        }
+        if (error != cudaSuccess) break;
+    }
+    const cudaError_t restored = cudaSetDevice(current);
+    if (error == cudaSuccess) error = restored;
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+extern "C" int gpu_matrix_defer_rns_upload_pinned_free(
+    const GpuPreparedRnsUpload *plan, void *pointer)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx || !plan->matrix->ctx->execution ||
+        !pointer || plan->limbs.empty())
+        return set_error("invalid prepared RNS upload pinned free");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    std::vector<SerdeStreamRef> streams;
+    try
+    {
+        streams.reserve(plan->limbs.size());
+    }
+    catch (const std::exception &error)
+    {
+        return set_error(error.what());
+    }
+    for (const auto &limb : plan->limbs)
+        serde_append_unique_stream(streams, limb.device, limb.stream);
+    return defer_pinned_free_behind_plan_streams(plan->matrix->ctx, streams, pointer);
+}
+
+extern "C" void gpu_matrix_destroy_rns_upload(GpuPreparedRnsUpload *plan)
+{
+    if (!plan) return;
+    if (plan->transform)
+        gpu_matrix_destroy_ntt_plan(plan->transform);
+    delete plan;
 }
 
 extern "C" int gpu_poly_store_compact_bytes(
@@ -1213,6 +2145,10 @@ extern "C" int gpu_poly_store_compact_bytes(
     uint16_t *out_bytes_per_coeff,
     size_t *out_payload_len)
 {
+    if (!poly || !poly->ctx || !poly->ctx->execution)
+        return set_error("invalid allocation owner in gpu_poly_store_compact_bytes");
+    GpuAllocationActivity activity(poly->ctx->execution.get(), -1);
+
     if (!poly || !payload_out || !out_max_coeff_bits || !out_bytes_per_coeff || !out_payload_len)
     {
         return set_error("invalid gpu_poly_store_compact_bytes arguments");
@@ -1367,51 +2303,25 @@ extern "C" int gpu_poly_store_compact_bytes(
     unsigned int *d_max_abs_bits = nullptr;
     uint8_t *d_payload = nullptr;
     cudaStream_t work_stream = nullptr;
-    auto free_ptr = [&](auto *&ptr) {
-        if (!ptr)
-        {
-            return;
-        }
-        if (work_stream)
-        {
-            cudaFreeAsync(ptr, work_stream);
-        }
-        else
-        {
-            cudaFree(ptr);
-        }
-        ptr = nullptr;
-    };
+    GpuCudaResource private_stream;
+    CompactWorkspace workspace;
     auto release = [&]() {
-        free_ptr(d_payload);
-        free_ptr(d_max_abs_bits);
-        free_ptr(d_sign_bits);
-        free_ptr(d_overflow);
-        free_ptr(d_coeff_words);
-        free_ptr(d_garner_inv);
-        free_ptr(d_moduli);
-        free_ptr(d_half_modulus_words);
-        free_ptr(d_modulus_words);
-        free_ptr(d_limb_coeff_bytes);
-        free_ptr(d_limb_strides);
-        free_ptr(d_limb_ptrs);
-        if (work_stream)
-        {
-            cudaStreamDestroy(work_stream);
-            work_stream = nullptr;
-        }
+        const int released = workspace.storage.release(work_stream);
+        const int finished = serde_finish_private_stream(poly, common_device, private_stream, work_stream);
+        return released != 0 ? released : finished;
     };
 
-    err = cudaStreamCreateWithFlags(&work_stream, cudaStreamNonBlocking);
-    if (err != cudaSuccess)
+    const int stream_status = serde_begin_private_stream(poly, common_device, private_stream, &work_stream);
+    if (stream_status != 0)
     {
         release();
-        return set_error(err);
+        return stream_status;
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_modulus_words),
-        words_per_coeff * sizeof(uint64_t),
-        work_stream);
+    const int workspace_status = workspace.acquire(poly->ctx, common_device, level,
+        poly->rows, poly->cols, 1, 0, 0, work_stream, &private_stream);
+    if (workspace_status != 0) { release(); return workspace_status; }
+
+    err = workspace.span(0, &d_modulus_words, words_per_coeff * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1428,10 +2338,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_half_modulus_words),
-        words_per_coeff * sizeof(uint64_t),
-        work_stream);
+    err = workspace.span(1, &d_half_modulus_words, words_per_coeff * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1462,10 +2369,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         }
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_ptrs),
-        limb_count * sizeof(const uint8_t *),
-        work_stream);
+    err = workspace.span(2, &d_limb_ptrs, limb_count * sizeof(const uint8_t *));
     if (err != cudaSuccess)
     {
         release();
@@ -1483,10 +2387,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_strides),
-        limb_count * sizeof(size_t),
-        work_stream);
+    err = workspace.span(3, &d_limb_strides, limb_count * sizeof(size_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1503,10 +2404,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_coeff_bytes),
-        limb_count * sizeof(uint8_t),
-        work_stream);
+    err = workspace.span(4, &d_limb_coeff_bytes, limb_count * sizeof(uint8_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1524,10 +2422,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_moduli),
-        moduli_subset.size() * sizeof(uint64_t),
-        work_stream);
+    err = workspace.span(5, &d_moduli, moduli_subset.size() * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1545,10 +2440,7 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_garner_inv),
-        inverse_table.size() * sizeof(uint64_t),
-        work_stream);
+    err = workspace.span(6, &d_garner_inv, inverse_table.size() * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
@@ -1566,16 +2458,13 @@ extern "C" int gpu_poly_store_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_coeff_words),
-        coeff_word_len * sizeof(uint64_t),
-        work_stream);
+    err = workspace.span(7, &d_coeff_words, coeff_word_len * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(reinterpret_cast<void **>(&d_overflow), sizeof(int), work_stream);
+    err = workspace.span(8, &d_overflow, sizeof(int));
     if (err != cudaSuccess)
     {
         release();
@@ -1587,19 +2476,13 @@ extern "C" int gpu_poly_store_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_sign_bits),
-        coeff_count * sizeof(uint8_t),
-        work_stream);
+    err = workspace.span(9, &d_sign_bits, coeff_count * sizeof(uint8_t));
     if (err != cudaSuccess)
     {
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_max_abs_bits),
-        sizeof(unsigned int),
-        work_stream);
+    err = workspace.span(10, &d_max_abs_bits, sizeof(unsigned int));
     if (err != cudaSuccess)
     {
         release();
@@ -1721,7 +2604,7 @@ extern "C" int gpu_poly_store_compact_bytes(
     if (payload_len > 0)
     {
         err =
-            cudaMallocAsync(reinterpret_cast<void **>(&d_payload), payload_len, work_stream);
+            workspace.span(11, &d_payload, payload_len);
         if (err != cudaSuccess)
         {
             release();
@@ -1767,8 +2650,7 @@ extern "C" int gpu_poly_store_compact_bytes(
     *out_max_coeff_bits = static_cast<uint16_t>(h_signed_bits);
     *out_bytes_per_coeff = static_cast<uint16_t>(h_bytes_per_coeff);
     *out_payload_len = payload_len;
-    release();
-    return 0;
+    return release();
 }
 
 extern "C" int gpu_poly_load_compact_bytes(
@@ -1777,6 +2659,10 @@ extern "C" int gpu_poly_load_compact_bytes(
     size_t payload_len,
     uint16_t max_coeff_bits)
 {
+    if (!poly || !poly->ctx || !poly->ctx->execution)
+        return set_error("invalid allocation owner in gpu_poly_load_compact_bytes");
+    GpuAllocationActivity activity(poly->ctx->execution.get(), -1);
+
     if (!poly || !poly->ctx)
     {
         return set_error("invalid gpu_poly_load_compact_bytes arguments");
@@ -1894,40 +2780,24 @@ extern "C" int gpu_poly_load_compact_bytes(
     uint8_t *d_limb_coeff_bytes = nullptr;
     uint64_t *d_moduli = nullptr;
     cudaStream_t work_stream = nullptr;
-    auto free_ptr = [&](auto *&ptr) {
-        if (!ptr)
-        {
-            return;
-        }
-        if (work_stream)
-        {
-            cudaFreeAsync(ptr, work_stream);
-        }
-        else
-        {
-            cudaFree(ptr);
-        }
-        ptr = nullptr;
-    };
+    GpuCudaResource private_stream;
+    CompactWorkspace workspace;
     auto release = [&]() {
-        free_ptr(d_moduli);
-        free_ptr(d_limb_coeff_bytes);
-        free_ptr(d_limb_strides);
-        free_ptr(d_limb_ptrs);
-        free_ptr(d_payload);
-        if (work_stream)
-        {
-            cudaStreamDestroy(work_stream);
-            work_stream = nullptr;
-        }
+        const int released = workspace.storage.release(work_stream);
+        const int finished = serde_finish_private_stream(poly, common_device, private_stream, work_stream);
+        return released != 0 ? released : finished;
     };
 
-    err = cudaStreamCreateWithFlags(&work_stream, cudaStreamNonBlocking);
-    if (err != cudaSuccess)
+    const int stream_status = serde_begin_private_stream(poly, common_device, private_stream, &work_stream);
+    if (stream_status != 0)
     {
         release();
-        return set_error(err);
+        return stream_status;
     }
+    const int workspace_status = workspace.acquire(poly->ctx, common_device, level,
+        poly->rows, poly->cols, 1, 2, max_coeff_bits, work_stream, &private_stream);
+    if (workspace_status != 0) { release(); return workspace_status; }
+
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
         const int wait_status = matrix_wait_limb_stream(
@@ -1944,10 +2814,7 @@ extern "C" int gpu_poly_load_compact_bytes(
 
     if (payload_len > 0)
     {
-        err = cudaMallocAsync(
-            reinterpret_cast<void **>(&d_payload),
-            payload_len,
-            work_stream);
+        err = workspace.span(0, &d_payload, payload_len);
         if (err != cudaSuccess)
         {
             release();
@@ -1966,10 +2833,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         }
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_ptrs),
-        limb_count * sizeof(uint8_t *),
-        work_stream);
+    err = workspace.span(1, &d_limb_ptrs, limb_count * sizeof(uint8_t *));
     if (err != cudaSuccess)
     {
         release();
@@ -1987,10 +2851,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         return set_error(err);
     }
 
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_strides),
-        limb_count * sizeof(size_t),
-        work_stream);
+    err = workspace.span(2, &d_limb_strides, limb_count * sizeof(size_t));
     if (err != cudaSuccess)
     {
         release();
@@ -2007,10 +2868,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         release();
         return set_error(err);
     }
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_limb_coeff_bytes),
-        limb_count * sizeof(uint8_t),
-        work_stream);
+    err = workspace.span(3, &d_limb_coeff_bytes, limb_count * sizeof(uint8_t));
     if (err != cudaSuccess)
     {
         release();
@@ -2029,10 +2887,7 @@ extern "C" int gpu_poly_load_compact_bytes(
     }
 
     std::vector<uint64_t> moduli_subset(poly->ctx->moduli.begin(), poly->ctx->moduli.begin() + limb_count);
-    err = cudaMallocAsync(
-        reinterpret_cast<void **>(&d_moduli),
-        moduli_subset.size() * sizeof(uint64_t),
-        work_stream);
+    err = workspace.span(4, &d_moduli, moduli_subset.size() * sizeof(uint64_t));
     if (err != cudaSuccess)
     {
         release();
@@ -2080,7 +2935,8 @@ extern "C" int gpu_poly_load_compact_bytes(
         }
     }
 
-    release();
+    const int released = release();
+    if (released != 0) return released;
     poly->format = GPU_POLY_FORMAT_COEFF;
     return 0;
 }
@@ -2102,6 +2958,37 @@ extern "C" int gpu_matrix_store_compact_bytes(
         out_payload_len);
 }
 
+extern "C" int gpu_matrix_store_compact_bytes_borrowed(
+    GpuMatrix *mat,
+    uint8_t *payload_out,
+    size_t payload_capacity,
+    uint16_t *out_max_coeff_bits,
+    uint16_t *out_bytes_per_coeff,
+    size_t *out_payload_len)
+{
+    if (!mat || !mat->ctx)
+        return set_error("invalid borrowed compact store matrix");
+    const bool restore_ntt = mat->format == GPU_POLY_FORMAT_EVAL;
+    int status = gpu_poly_store_compact_bytes(
+        mat, payload_out, payload_capacity, out_max_coeff_bits,
+        out_bytes_per_coeff, out_payload_len);
+    // The production store changes an evaluation owner to coefficient form
+    // before encoding. Restore it even when encoding failed after INTT, so a
+    // retained prepared result never leaks a domain mutation to aliases.
+    if (restore_ntt && mat->format == GPU_POLY_FORMAT_COEFF) {
+        const int restored = gpu_matrix_ntt_all(mat);
+        if (restored != 0) {
+            if (mat->ctx->execution) {
+                mat->ctx->execution->unretired_work.store(true, std::memory_order_release);
+                mat->ctx->execution->memory_release_failed.store(true, std::memory_order_release);
+                gpu_execution_mark_allocation_unknown(mat->ctx->execution.get());
+            }
+            return set_error("borrowed compact store failed to restore evaluation format");
+        }
+    }
+    return status;
+}
+
 extern "C" int gpu_matrix_load_compact_bytes(
     GpuMatrix *mat,
     const uint8_t *payload,
@@ -2109,4 +2996,316 @@ extern "C" int gpu_matrix_load_compact_bytes(
     uint16_t max_coeff_bits)
 {
     return gpu_poly_load_compact_bytes(mat, payload, payload_len, max_coeff_bits);
+}
+
+// Prepared compact replay.  Unlike gpu_poly_load_compact_bytes this object
+// owns its workspace, metadata and terminal event for its entire lifetime;
+// submit only changes the bytes and codec width in the already pinned input
+// slot.  In particular, no temporary vectors, private streams, or CUDA
+// allocations are permitted on the submission path.
+static std::atomic<size_t> compact_upload_legacy_prepare_calls{0};
+static std::atomic<size_t> compact_upload_prepared_acquisitions{0};
+struct GpuPreparedCompactUpload
+{
+    GpuMatrix *matrix;
+    const uint8_t *host_payload;
+    size_t payload_capacity;
+    size_t coeff_count;
+    size_t n;
+    size_t limb_count;
+    int device;
+    cudaStream_t stream;
+    CompactWorkspace workspace;
+    std::unique_ptr<GpuCudaResource> completion;
+    std::unique_ptr<GpuMatrixTransformPlan> transform;
+    mutable std::mutex mutex;
+    uint64_t generation;
+    bool armed;
+};
+
+extern "C" int gpu_matrix_prepare_compact_upload(
+    GpuMatrix *mat,
+    const uint8_t *payload,
+    size_t payload_capacity,
+    uint16_t max_coeff_bits,
+    const GpuPreparedPlanDescriptor *plan,
+    GpuPreparedCompactUpload **out_plan)
+{
+    if (!out_plan) return set_error("null prepared compact upload output");
+    *out_plan = nullptr;
+    if (!mat || !mat->ctx || !mat->ctx->execution || !payload || mat->level < 0 ||
+        mat->ctx->N <= 0 || payload_capacity == 0)
+        return set_error("invalid prepared compact upload arguments");
+    if (!plan || gpu_prepared_validate_descriptor(plan) != 0)
+        return set_error("prepared compact upload requires a saved descriptor");
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    size_t poly_count = 0, coeff_count = 0;
+    if (!serde_checked_mul_size(mat->rows, mat->cols, &poly_count) ||
+        !serde_checked_mul_size(poly_count, static_cast<size_t>(mat->ctx->N), &coeff_count) ||
+        poly_count == 0 || limb_count > mat->ctx->limb_gpu_ids.size())
+        return set_error("invalid prepared compact upload dimensions");
+    uint32_t max_bits = 0;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+        max_bits += bit_width_u64(mat->ctx->moduli[limb]);
+    if (max_bits == 0 || max_bits > std::numeric_limits<uint16_t>::max())
+        return set_error("prepared compact upload codec width is invalid");
+    if (max_coeff_bits == 0 || max_coeff_bits > max_bits)
+        return set_error("prepared compact upload codec width exceeds destination");
+    size_t expected = 0;
+    if (!serde_compute_payload_len(coeff_count, max_coeff_bits, &expected) ||
+        payload_capacity < expected)
+        return set_error("prepared compact upload staging is too small");
+
+    const size_t expected_allocations = mat->format == GPU_POLY_FORMAT_EVAL ? 4 : 3;
+    const size_t expected_streams = mat->format == GPU_POLY_FORMAT_EVAL ? 2 : 1;
+    if (plan->allocation_count != expected_allocations || plan->stream_count != expected_streams)
+        return set_error("prepared compact upload descriptor counts mismatch");
+    const GpuPreparedResourceKey host_key{0, 0, 0, -1, -1, 0, 0, GPU_PREPARED_STAGE_UPLOAD};
+    if (gpu_prepared_require_allocation(plan, 0, GPU_PREPARED_PINNED_HOST, &host_key,
+            payload_capacity, 1) != 0)
+        return set_error("prepared compact upload pinned staging claim differs from descriptor");
+
+    int common_device = -1;
+    cudaStream_t stream = nullptr;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        int device = -1;
+        cudaStream_t limb_stream = nullptr;
+        if (matrix_limb_device(mat, mat->ctx->limb_gpu_ids[limb], &device) != 0 ||
+            matrix_limb_stream(mat, mat->ctx->limb_gpu_ids[limb], &limb_stream) != 0 || !limb_stream)
+            return set_error("prepared compact upload limb metadata is invalid");
+        if (common_device < 0) common_device = device;
+        if (common_device != device)
+            return set_error("prepared compact upload requires one GPU");
+        if (limb == 0) stream = limb_stream;
+    }
+    auto prepared = std::make_unique<GpuPreparedCompactUpload>();
+    prepared->matrix = mat;
+    prepared->host_payload = payload;
+    prepared->payload_capacity = payload_capacity;
+    prepared->coeff_count = coeff_count;
+    prepared->n = static_cast<size_t>(mat->ctx->N);
+    prepared->limb_count = limb_count;
+    prepared->device = common_device;
+    prepared->stream = stream;
+    prepared->generation = 0;
+    prepared->armed = false;
+    dim3 upload_limb{};
+    GpuPreparedResourceKey upload_key{};
+    if (gpu_prepared_limb_key(mat->ctx, mat->level, 0, GPU_PREPARED_STAGE_UPLOAD,
+            &upload_limb, &upload_key) != 0 || upload_limb.x != mat->ctx->limb_gpu_ids[0].x ||
+        upload_limb.y != mat->ctx->limb_gpu_ids[0].y)
+        return set_error("prepared compact upload owner key is invalid");
+    GpuPreparedWorkspaceLayout workspace_layout{};
+    if (gpu_matrix_query_compact_workspace(mat->ctx, mat->level, mat->rows, mat->cols,
+            1, 2, static_cast<uint16_t>(max_bits), &workspace_layout) != 0 ||
+        gpu_prepared_require_allocation(plan, 1, workspace_layout.kind, &upload_key,
+            workspace_layout.bytes, workspace_layout.alignment) != 0 ||
+        gpu_prepared_require_allocation(plan, 2, GPU_PREPARED_COMPLETION_EVENT, &upload_key,
+            0, 1) != 0)
+        return set_error("prepared compact upload resource claims differ from descriptor");
+    if (plan->streams[0].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+        std::memcmp(&plan->streams[0].key, &upload_key, sizeof(upload_key)) != 0 ||
+        gpu_prepared_require_stream_slot(mat->ctx, upload_limb.x, stream,
+            plan->streams[0].pool_slot) != 0)
+        return set_error("prepared compact upload stream differs from descriptor");
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        size_t stride = 0;
+        uint8_t width = 0;
+        const dim3 id = mat->ctx->limb_gpu_ids[limb];
+        if (!matrix_limb_ptr_by_id(mat, 0, id) ||
+            !matrix_limb_metadata_by_id(mat, id, &stride, &width) || width == 0)
+            return set_error("prepared compact upload destination metadata is invalid");
+    }
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+    {
+        size_t launch_count = 0, geometry_bytes = 0;
+        if (gpu_prepared_ntt_launch_table(static_cast<uint32_t>(mat->ctx->N), limb_count,
+                poly_count, 1, nullptr, 0, &launch_count) != 0 ||
+            !serde_checked_mul_size(launch_count, sizeof(GpuPreparedNttLaunchLayout),
+                &geometry_bytes))
+            return set_error("prepared compact upload NTT geometry is invalid");
+        dim3 ntt_limb{};
+        GpuPreparedResourceKey ntt_key{};
+        if (gpu_prepared_limb_key(mat->ctx, mat->level, 0,
+                GPU_PREPARED_STAGE_NTT, &ntt_limb, &ntt_key) != 0 ||
+            gpu_prepared_require_allocation(plan, 3, GPU_PREPARED_PLAN_HOST_ONLY,
+                &ntt_key, geometry_bytes, alignof(void *)) != 0 ||
+            plan->streams[1].origin != GPU_PREPARED_STREAM_CONTEXT_REUSED ||
+            std::memcmp(&plan->streams[1].key, &ntt_key, sizeof(ntt_key)) != 0 ||
+            gpu_prepared_require_stream_slot(mat->ctx, ntt_limb.x, stream,
+                plan->streams[1].pool_slot) != 0)
+            return set_error("prepared compact upload NTT descriptor differs");
+    }
+    const int workspace_status = prepared->workspace.acquire(
+        mat->ctx, common_device, mat->level, mat->rows, mat->cols, 1, 2,
+        static_cast<uint16_t>(max_bits), stream);
+    if (workspace_status != 0) return workspace_status;
+    prepared->completion = std::make_unique<GpuCudaResource>();
+    if (prepared->completion->acquire(mat->ctx, common_device,
+                                      GPU_PREPARED_COMPLETION_EVENT) != 0)
+        return set_error("prepared compact upload completion event allocation failed");
+    // The metadata arrays are immutable and copied once while the plan is
+    // prepared.  This is the only host-side vector construction in the plan.
+    cudaError_t err = cudaSetDevice(common_device);
+    if (err != cudaSuccess) return set_error(err);
+    uint8_t *d_ptrs = nullptr, *d_bytes = nullptr;
+    size_t *d_strides = nullptr;
+    uint64_t *d_moduli = nullptr;
+    if (prepared->workspace.span(1, &d_ptrs, limb_count * sizeof(uint8_t *)) != cudaSuccess ||
+        prepared->workspace.span(2, &d_strides, limb_count * sizeof(size_t)) != cudaSuccess ||
+        prepared->workspace.span(3, &d_bytes, limb_count * sizeof(uint8_t)) != cudaSuccess ||
+        prepared->workspace.span(4, &d_moduli, limb_count * sizeof(uint64_t)) != cudaSuccess)
+        return set_error("prepared compact upload metadata workspace is invalid");
+    std::vector<uint8_t *> ptrs(limb_count);
+    std::vector<size_t> strides(limb_count);
+    std::vector<uint8_t> widths(limb_count);
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 id = mat->ctx->limb_gpu_ids[limb];
+        ptrs[limb] = matrix_limb_ptr_by_id(mat, 0, id);
+        if (!ptrs[limb] || !matrix_limb_metadata_by_id(mat, id, &strides[limb], &widths[limb]) ||
+            widths[limb] == 0)
+            return set_error("prepared compact upload destination metadata is invalid");
+    }
+    err = cudaMemcpyAsync(d_ptrs, ptrs.data(), limb_count * sizeof(uint8_t *),
+                          cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess) err = cudaMemcpyAsync(d_strides, strides.data(),
+        limb_count * sizeof(size_t), cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess) err = cudaMemcpyAsync(d_bytes, widths.data(),
+        limb_count * sizeof(uint8_t), cudaMemcpyHostToDevice, stream);
+    if (err == cudaSuccess) err = cudaMemcpyAsync(d_moduli, mat->ctx->moduli.data(),
+        limb_count * sizeof(uint64_t), cudaMemcpyHostToDevice, stream);
+    if (err != cudaSuccess) return set_error(err);
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+    {
+        GpuMatrixRange range{0, mat->rows, 0, mat->cols};
+        GpuPreparedPlanDescriptor ntt_plan{};
+        ntt_plan.allocation_count = 1;
+        ntt_plan.allocations[0] = plan->allocations[3];
+        ntt_plan.stream_count = 1;
+        ntt_plan.streams[0] = plan->streams[1];
+        ntt_plan.launch_count = plan->launch_count;
+        for (size_t index = 0; index < plan->launch_count; ++index)
+            ntt_plan.launches[index] = plan->launches[index];
+        GpuMatrixTransformPlan *transform = nullptr;
+        if (gpu_matrix_prepare_ntt_plan_with_layout(mat, &range, true, &ntt_plan, &transform) != 0 ||
+            !transform)
+            return set_error("prepared compact upload evaluation transform failed");
+        prepared->transform.reset(transform);
+    }
+    *out_plan = prepared.release();
+    compact_upload_prepared_acquisitions.fetch_add(
+        expected_allocations - 1, std::memory_order_relaxed);
+    return 0;
+}
+
+extern "C" void gpu_matrix_test_reset_compact_upload_bind_counters()
+{
+    compact_upload_legacy_prepare_calls.store(0, std::memory_order_relaxed);
+    compact_upload_prepared_acquisitions.store(0, std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_legacy_compact_upload_prepare_calls()
+{
+    return compact_upload_legacy_prepare_calls.load(std::memory_order_relaxed);
+}
+
+extern "C" size_t gpu_matrix_test_compact_upload_prepared_acquisitions()
+{
+    return compact_upload_prepared_acquisitions.load(std::memory_order_relaxed);
+}
+
+extern "C" int gpu_matrix_submit_compact_upload(
+    GpuPreparedCompactUpload *plan, uint16_t max_coeff_bits, size_t payload_len)
+{
+    if (!plan || !plan->matrix || !plan->host_payload) return set_error("invalid prepared compact upload");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    if (plan->armed) return set_error("prepared compact upload has unretired work");
+    size_t expected = 0;
+    if (max_coeff_bits == 0 || !serde_compute_payload_len(plan->coeff_count,
+            max_coeff_bits, &expected) || payload_len != expected || payload_len > plan->payload_capacity)
+        return set_error("prepared compact upload payload length mismatch");
+    cudaError_t err = cudaSetDevice(plan->device);
+    if (err == cudaSuccess)
+        for (size_t limb = 0; limb < plan->limb_count; ++limb)
+            if (matrix_wait_limb_stream(plan->matrix,
+                    plan->matrix->ctx->limb_gpu_ids[limb], plan->device, plan->stream) != 0)
+                return 1;
+    if (err == cudaSuccess) err = cudaMemcpyAsync(plan->workspace.storage.data,
+        plan->host_payload, payload_len, cudaMemcpyHostToDevice, plan->stream);
+    if (err == cudaSuccess)
+    {
+        uint8_t *d_payload = nullptr, **d_ptrs = nullptr, *d_bytes = nullptr;
+        size_t *d_strides = nullptr;
+        uint64_t *d_moduli = nullptr;
+        if (plan->workspace.span(0, &d_payload, payload_len) != cudaSuccess ||
+            plan->workspace.span(1, &d_ptrs, plan->limb_count * sizeof(uint8_t *)) != cudaSuccess ||
+            plan->workspace.span(2, &d_strides, plan->limb_count * sizeof(size_t)) != cudaSuccess ||
+            plan->workspace.span(3, &d_bytes, plan->limb_count * sizeof(uint8_t)) != cudaSuccess ||
+            plan->workspace.span(4, &d_moduli, plan->limb_count * sizeof(uint64_t)) != cudaSuccess)
+            return set_error("prepared compact upload workspace span failed");
+        const int blocks = static_cast<int>((plan->coeff_count + 255) / 256);
+        serde_unpack_packed_coeffs_mod_kernel<<<blocks, 256, 0, plan->stream>>>(
+            d_payload, plan->coeff_count, plan->n, max_coeff_bits, d_moduli,
+            static_cast<int>(plan->limb_count), d_ptrs, d_strides, d_bytes);
+        err = cudaGetLastError();
+        if (err == cudaSuccess)
+            for (size_t limb = 0; limb < plan->limb_count; ++limb)
+                if (matrix_record_limb_write(plan->matrix, plan->matrix->ctx->limb_gpu_ids[limb], plan->stream) != 0)
+                    return 1;
+        if (err == cudaSuccess && plan->transform)
+        {
+            const int transform_status = gpu_matrix_submit_ntt_plan(
+                plan->transform.get(), plan->matrix);
+            if (transform_status != 0) return transform_status;
+        }
+    }
+    if (err != cudaSuccess) return set_error(err);
+    ++plan->generation;
+    plan->armed = true;
+    err = cudaEventRecord(plan->completion->event, plan->stream);
+    if (err != cudaSuccess) return set_error(err);
+    plan->matrix->format = plan->transform ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
+    return 0;
+}
+
+extern "C" int gpu_matrix_query_compact_upload(
+    const GpuPreparedCompactUpload *plan, int *out_ready)
+{
+    if (!plan || !out_ready) return set_error("invalid prepared compact upload query");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    *out_ready = 0;
+    if (!plan->armed) return 0;
+    const cudaError_t status = cudaEventQuery(plan->completion->event);
+    if (status == cudaSuccess) { *out_ready = 1; const_cast<GpuPreparedCompactUpload *>(plan)->armed = false; return 0; }
+    if (status == cudaErrorNotReady) return 0;
+    return set_error(status);
+}
+
+extern "C" int gpu_matrix_wait_compact_upload(const GpuPreparedCompactUpload *plan)
+{
+    if (!plan) return set_error("invalid prepared compact upload wait");
+    std::lock_guard<std::mutex> lock(plan->mutex);
+    if (!plan->armed) return 0;
+    const cudaError_t status = cudaEventSynchronize(plan->completion->event);
+    if (status != cudaSuccess) return set_error(status);
+    const_cast<GpuPreparedCompactUpload *>(plan)->armed = false;
+    return 0;
+}
+
+extern "C" int gpu_matrix_defer_compact_upload_pinned_free(
+    const GpuPreparedCompactUpload *plan, void *pointer)
+{
+    if (!plan || !plan->matrix || !plan->matrix->ctx ||
+        !plan->matrix->ctx->execution || !pointer || !plan->stream)
+        return set_error("invalid prepared compact upload pinned free");
+    return gpu_defer_pinned_frees(plan->matrix->ctx, plan->device,
+        plan->stream, &pointer, 1);
+}
+
+extern "C" void gpu_matrix_destroy_compact_upload(GpuPreparedCompactUpload *plan)
+{
+    delete plan;
 }

@@ -497,4 +497,87 @@ theorem balancedExpansion_eq_sum (base : Nat) (value : Int)
       rw [hsum, ih]
       simp [balancedDigitAt, balancedResidual]
 
+/-- The balanced carry used by the concrete runtime radix operation. -/
+def balancedNext (base : Nat) (value : Int) : Int :=
+  (value - balancedDigit base value) / base
+
+/-- Exact endpoint recurrence, including round-to-even at a half digit. -/
+def balancedIntervalNext (base bound : Nat) : Nat :=
+  max (balancedNext base (bound : Int)).natAbs (balancedNext base (-(bound : Int))).natAbs
+
+theorem balancedNext_eq (base : Nat) (hbase : 1 < base) (value : Int) :
+    balancedNext base value = value / base +
+      if value % base < (base / 2 : Nat) then 0
+      else if value % base > (base / 2 : Nat) then 1
+      else if (value / base) % 2 = 0 then 0 else 1 := by
+  have hstep := balancedStep_eq base hbase value
+  have hdiv := Int.mul_ediv_add_emod value (base : Int)
+  change value = balancedDigit base value + (base : Int) * balancedNext base value at hstep
+  dsimp only [balancedDigit] at hstep
+  split_ifs at hstep ⊢ <;> nlinarith
+
+theorem balancedNext_monotone (base : Nat) (hbase : 1 < base) :
+    Monotone (balancedNext base) := by
+  intro a b hab
+  have hq := Int.ediv_le_ediv (show (0 : Int) < base by omega) hab
+  have ha := Int.mul_ediv_add_emod a (base : Int)
+  have hb := Int.mul_ediv_add_emod b (base : Int)
+  rw [balancedNext_eq base hbase, balancedNext_eq base hbase]
+  by_cases heq : a / (base : Int) = b / (base : Int)
+  · have hrem : a % (base : Int) ≤ b % (base : Int) := by nlinarith
+    split_ifs <;> omega
+  · split_ifs <;> omega
+
+theorem balancedNext_interval {base bound : Nat} (hbase : 1 < base) {value : Int}
+    (hvalue : value.natAbs ≤ bound) :
+    (balancedNext base value).natAbs ≤ balancedIntervalNext base bound := by
+  have hlo : -(bound : Int) ≤ value := by omega
+  have hhi : value ≤ (bound : Int) := by omega
+  have hl := balancedNext_monotone base hbase hlo
+  have hh := balancedNext_monotone base hbase hhi
+  unfold balancedIntervalNext
+  omega
+
+theorem balancedDigit_le_value (base : Nat) (hbase : 1 < base) (heven : Even base)
+    (value : Int) : (balancedDigit base value).natAbs ≤ value.natAbs := by
+  by_cases hlarge : base / 2 ≤ value.natAbs
+  · exact (balancedDigit_abs_le base hbase heven value).trans hlarge
+  · have hsmall : value.natAbs < base / 2 := by omega
+    have hdiv := Int.mul_ediv_add_emod value (base : Int)
+    by_cases hnonneg : 0 ≤ value
+    · have hrem := Int.emod_eq_of_lt hnonneg (show value < (base : Int) by omega)
+      dsimp only [balancedDigit]
+      rw [hrem, if_pos (show value < (base / 2 : Nat) by omega)]
+    · have hquot := Int.ediv_eq_neg_one_of_neg_of_le (show value < 0 by omega)
+        (show -value ≤ (base : Int) by omega)
+      have hrem : value % (base : Int) = value + base := by rw [hquot] at hdiv; omega
+      dsimp only [balancedDigit]
+      rw [hrem, if_neg (by omega), if_pos (by omega)]
+      simp
+
+/-- State bounds and sharp per-digit maxima mirror `dense_coefficient_gain`. -/
+def denseStateBound (base bound : Nat) : Nat → Nat
+  | 0 => bound
+  | digit + 1 => denseStateBound base (balancedIntervalNext base bound) digit
+
+def denseDigitBound (base bound digit : Nat) : Nat :=
+  min (denseStateBound base bound digit) (base / 2)
+
+theorem balancedResidual_bound {base bound : Nat} (hbase : 1 < base) {value : Int}
+    (hvalue : value.natAbs ≤ bound) (digit : Nat) :
+    (balancedResidual base value digit).natAbs ≤ denseStateBound base bound digit := by
+  induction digit generalizing value bound with
+  | zero => exact hvalue
+  | succ digit ih => exact ih (balancedNext_interval hbase hvalue)
+
+theorem balancedDigitAt_sharp_bound {base bound : Nat}
+    (hbase : 1 < base) (heven : Even base) {value : Int}
+    (hvalue : value.natAbs ≤ bound) (digit : Nat) :
+    (balancedDigitAt base value digit).natAbs ≤ denseDigitBound base bound digit := by
+  apply Nat.le_min.mpr
+  constructor
+  · exact (balancedDigit_le_value base hbase heven _).trans
+      (balancedResidual_bound hbase hvalue digit)
+  · exact balancedDigit_abs_le base hbase heven _
+
 end Mxx.Primitives

@@ -3,7 +3,7 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 use mxx_ir_core::{
-    artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId, SpecHash},
+    artifact::{ArtifactType, Manifest, ProductionId, SpecHash},
     encoding::IR_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,6 @@ pub enum SessionStatus {
 pub struct ArtifactHandle {
     pub key: ArtifactKey,
     pub artifact_type: ArtifactType,
-    pub confidentiality: ArtifactConfidentiality,
     pub layout: Option<String>,
 }
 
@@ -81,6 +80,19 @@ pub struct ArtifactHandle {
 /// releasing the writer lock. The executor releases that lock only after
 /// scratch cleanup completes.
 pub trait SessionStore: ArtifactStore {
+    /// Loads the complete manifest of a finalized production.
+    ///
+    /// This is deliberately narrower than [`ArtifactStore::load_manifest`]:
+    /// checkpoint construction must establish that the manifest belongs to a
+    /// session which reached the durable `Finalized` state, rather than
+    /// trusting the presence of a manifest file alone.  Implementations must
+    /// validate the production identity and existing IR version before
+    /// returning the manifest, and must not load any artifact payloads.
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error>;
+
     /// Resolves a stable caller-selected session name to its immutable nonce.
     ///
     /// The first call allocates and durably records a fresh nonce. Repeating

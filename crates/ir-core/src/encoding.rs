@@ -124,7 +124,7 @@ mod tests {
         Graph::freeze(
             "tiny-golden",
             Vec::new(),
-            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("result".to_owned(), GraphOutput { artifact_output: false, value })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -209,7 +209,7 @@ mod tests {
         let graph = Graph::freeze(
             "parameterized",
             Vec::new(),
-            BTreeMap::from([("result".to_owned(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("result".to_owned(), GraphOutput { artifact_output: false, value })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -242,10 +242,10 @@ mod tests {
 
     #[test]
     fn tiny_graph_canonical_json_and_spec_hash_match_the_pre_streaming_golden() {
-        const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"confidentiality":null,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
+        const CANONICAL_JSON: &[u8] = br#"{"effect_roots":[],"name":"tiny-golden","outputs":{"result":{"artifact_output":false,"value":{"node":0,"port":0}}},"parameters":[],"real_constants":{},"scopes":[{"id":{"tag":"Root"},"scope":{"inputs":[],"nodes":[{"arguments":[],"id":0,"kind":{"tag":"ConstantInt","value":"7"},"output_types":[{"tag":"ConstantInt"}]}],"outputs":[{"node":0,"port":0}]}}]}"#;
         const SPEC_HASH: [u8; 32] = [
-            8, 90, 9, 182, 175, 97, 67, 133, 225, 175, 203, 101, 88, 208, 23, 166, 88, 180, 206,
-            225, 64, 187, 231, 32, 0, 135, 5, 79, 142, 182, 87, 27,
+            107, 14, 31, 106, 91, 29, 70, 120, 137, 239, 9, 32, 46, 158, 89, 140, 209, 195, 70, 67,
+            26, 48, 163, 224, 249, 52, 109, 94, 179, 84, 2, 239,
         ];
         let graph = tiny_graph();
 

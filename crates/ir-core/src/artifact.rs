@@ -5,7 +5,6 @@ use crate::{
     validate::ValidatedGraph,
 };
 use num_bigint::BigInt;
-use num_traits::Signed;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -115,27 +114,17 @@ mod catalog_tests {
             ManifestArtifact {
                 artifact_type: ArtifactType::Bytes { length: 1 },
                 family_count: None,
-                confidentiality: ArtifactConfidentiality::Private,
-                content_hash: None,
                 layout: None,
             },
         );
         let other = ArtifactCatalog::from_manifest(conflict.clone()).unwrap();
         assert!(catalog.merge(other).is_err());
         assert_eq!(catalog.manifests()[&production], manifest);
-        conflict.artifacts.get_mut("value").unwrap().content_hash = Some([0; 32]);
-        assert!(ArtifactCatalog::from_manifest(conflict).is_err());
         let mut second = manifest.clone();
         second.production_id.execution_nonce[1] ^= 1;
         catalog.merge(ArtifactCatalog::from_manifest(second).unwrap()).unwrap();
         assert_eq!(catalog.manifests().len(), 2);
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum ArtifactConfidentiality {
-    Public,
-    Private,
 }
 
 /// Complete validated schema for a compact bounded-coefficient matrix.
@@ -254,32 +243,23 @@ impl ArtifactType {
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
-    pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ManifestValidationError {
-    #[error("private artifact {name} must not expose a content hash")]
-    PrivateContentHash { name: String },
     #[error("bounded artifact {name} has a negative coefficient bound")]
     NegativeCoefficientBound { name: String },
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationError> {
     for (name, artifact) in &manifest.artifacts {
-        if artifact.confidentiality == ArtifactConfidentiality::Private &&
-            artifact.content_hash.is_some()
-        {
-            return Err(ManifestValidationError::PrivateContentHash { name: name.clone() });
-        }
         let bound = match &artifact.artifact_type {
             ArtifactType::SmallMatrix { max_coefficient_bound, .. } |
             ArtifactType::Preimage { max_coefficient_bound, .. } => Some(max_coefficient_bound),
             _ => None,
         };
-        if bound.is_some_and(|bound| bound.is_negative()) {
+        if bound.is_some_and(|bound| bound.sign() == num_bigint::Sign::Minus) {
             return Err(ManifestValidationError::NegativeCoefficientBound { name: name.clone() });
         }
     }
@@ -291,8 +271,6 @@ pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
-    pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
 
@@ -320,11 +298,6 @@ pub fn export_manifest(
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
                     family_count: artifact.family_count,
-                    confidentiality: artifact.confidentiality,
-                    content_hash: match artifact.confidentiality {
-                        ArtifactConfidentiality::Public => artifact.content_hash,
-                        ArtifactConfidentiality::Private => None,
-                    },
                     layout: artifact.layout.clone(),
                 },
             )
@@ -337,7 +310,7 @@ pub fn export_manifest(
 ///
 /// Indexed-family outputs become artifact families; compatible scalar wires
 /// become singular artifacts. Every persisted output must be backed by an
-/// graph output carrying an explicit confidentiality declaration.
+/// graph output carrying an artifact declaration.
 pub fn export_validated_manifest(
     production_id: ProductionId,
     graph: &ValidatedGraph,
@@ -347,7 +320,9 @@ pub fn export_validated_manifest(
         .outputs()
         .iter()
         .filter_map(|(name, output)| {
-            let confidentiality = output.confidentiality?;
+            if !output.artifact_output {
+                return None;
+            }
             Some((|| {
                 let id = WireId { instantiation_path: Vec::new(), wire: output.value };
                 let wire_type = graph
@@ -369,8 +344,6 @@ pub fn export_validated_manifest(
                         wire: id,
                         artifact_type,
                         family_count: first_class_family_count,
-                        confidentiality,
-                        content_hash: None,
                         layout: None,
                     },
                 ))
@@ -385,7 +358,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_manifest_artifacts_cannot_expose_content_hashes() {
+    fn manifest_artifact_schema_contains_only_persistence_metadata() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
@@ -394,17 +367,12 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: Some([3; 32]),
                     layout: None,
                 },
             )]),
         };
 
-        assert!(matches!(
-            validate_manifest(&manifest),
-            Err(ManifestValidationError::PrivateContentHash { name }) if name == "private"
-        ));
+        validate_manifest(&manifest).unwrap();
     }
 
     #[test]
@@ -458,8 +426,6 @@ mod tests {
                         max_coefficient_bound: BigInt::from(-1),
                     },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Public,
-                    content_hash: None,
                     layout: None,
                 },
             )]),

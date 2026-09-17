@@ -529,13 +529,13 @@ use `GraphValueSchema` without depending on Program cache transport.
 Prepared LUTs own their binding metadata; Program cache entries refer directly
 to that metadata for helper preparation and online checks, rather than retaining
 a second scalar/family binding copy.
-Public artifact exporters persist the mask matrices and bindings, not the
-online rows. Input artifact transport preserves private payload contributions
-separately from public keys. Public RNS-BGG blocks use the same `GraphValue` flattened
-ports as structural families; schema-based imports reopen those ports without
-backend-specific row/column artifact naming. `DslContext::public_outputs` owns
-ordered public field emission for scalar and structural values; RNS-BGG direct,
-linear and LUT-branch exporters supply their named fields to that common path.
+Artifact exporters persist the mask matrices and bindings, not the online rows.
+Input artifact transport preserves payload contributions separately from public keys.
+Public RNS-BGG blocks use the same `GraphValue` flattened ports as structural families;
+schema-based imports reopen those ports without backend-specific row/column artifact naming.
+`DslContext::artifact_output` owns persisted field emission for scalar and structural values;
+ordinary `output` remains an in-memory result. RNS-BGG direct, linear and LUT-branch exporters
+supply their named fields to that common path.
 Scalar/family terminal and native digit readout operations follow the same
 RNS-BGG public-preparation versus online-evaluation ownership split. The former
 `family.rs`, `program.rs`, `program_artifacts.rs`, and `readout.rs` modules are

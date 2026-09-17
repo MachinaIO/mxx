@@ -82,8 +82,6 @@ pub enum ProtocolError {
     ArtifactNameMismatch,
     #[error("an artifact binding connects incompatible wire types")]
     ArtifactTypeMismatch,
-    #[error("an artifact binding connects incompatible confidentiality declarations")]
-    ArtifactConfidentialityMismatch,
     #[error("a workflow stage does not contribute to the entrypoint")]
     UnreachableStage,
     #[error("protocol parameter names must be unique")]
@@ -223,9 +221,6 @@ impl ProtocolDecl {
                 }
                 if producer_type != *consumer_type {
                     return Err(ProtocolError::ArtifactTypeMismatch);
-                }
-                if output.confidentiality != Some(consumer_artifact.confidentiality) {
-                    return Err(ProtocolError::ArtifactConfidentialityMismatch);
                 }
             }
         }

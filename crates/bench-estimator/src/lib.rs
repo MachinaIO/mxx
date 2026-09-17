@@ -9,9 +9,7 @@ pub mod harness;
 
 use mxx_ir_core::{
     BenchmarkRole, FrozenGraphScopeId, IntExpr, LivenessSchedule, ParamEnv, RealExpr,
-    ValidatedGraph,
-    artifact::ArtifactConfidentiality,
-    encoding,
+    ValidatedGraph, encoding,
     node::NodeKind,
     types::{ConcreteWireType, NodeId, WireRef, WireType},
 };
@@ -166,11 +164,7 @@ pub trait MeasurementBackend {
     /// representation differs from their resident representation.
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         match kind {
-            NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.confidentiality == ArtifactConfidentiality::Private =>
-            {
-                0
-            }
+            NodeKind::Input { artifact: Some(_), .. } => 0,
             NodeKind::Input { .. } => self.persistent_bytes_for_node(kind, wire_type),
             _ => 0,
         }
@@ -1764,20 +1758,15 @@ mod tests {
     }
 
     #[test]
-    fn private_artifact_inputs_are_local_persistence_not_transport() {
+    fn artifact_inputs_are_local_persistence_not_transport() {
         let ring = Ring::new(17, 8);
         let production_id = mxx_ir_core::artifact::ProductionId {
             spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
             execution_nonce: [8; 32],
         };
-        let private = ring.artifact_input(
-            production_id.clone(),
-            "private-setup-t",
-            (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-        );
-        let built = DslContext::new("estimate-private-artifact")
-            .output("setup-t", private)
+        let artifact = ring.artifact_input(production_id.clone(), "artifact-setup-t", (1, 1));
+        let built = DslContext::new("estimate-artifact-input")
+            .output("setup-t", artifact)
             .expect("output")
             .build()
             .expect("build");
@@ -1787,7 +1776,7 @@ mod tests {
             artifacts: BTreeMap::new(),
         };
         manifest.artifacts.insert(
-            "private-setup-t".to_owned(),
+            "artifact-setup-t".to_owned(),
             mxx_ir_core::artifact::ManifestArtifact {
                 artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(
                     mxx_ir_core::types::ConcreteMatrixType {
@@ -1798,8 +1787,6 @@ mod tests {
                     },
                 ),
                 family_count: None,
-                confidentiality: mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-                content_hash: None,
                 layout: None,
             },
         );
@@ -1807,7 +1794,7 @@ mod tests {
         manifests.insert(production_id, manifest);
         let validated = built
             .validate_with_manifests(&ParamEnv::default(), &manifests)
-            .expect("private artifact graph validates");
+            .expect("artifact graph validates");
         let report = estimate(&validated, &mut UnitBackend).expect("estimate");
         assert_eq!(report.transmitted_bytes, 0);
         assert!(report.persistent_storage_bytes > 0);

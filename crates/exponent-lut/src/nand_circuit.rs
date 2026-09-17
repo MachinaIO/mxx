@@ -7,12 +7,14 @@
 //! state is never made into an RHS package.
 
 use crate::{
-    layout::ExpLayout,
+    api::PlaintextInputs,
     program::{
-        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, ProgramInputId,
-        ProgramValidationError, ProgramWireType, RhsId,
+        AttributeKnowledge, ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder, InputBinding,
+        LutOutputRepresentation, Operand, ProgramValidationError, RhsId, WireId,
     },
 };
+use mxx_primitives::poly::Poly;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 const STATE_WIDTH: usize = 8;
@@ -50,9 +52,11 @@ pub enum NandCircuitError {
     Program(#[from] ProgramValidationError),
     #[error("the exponent layout must contain the 16-entry NAND LUT domain")]
     LayoutTooNarrow,
+    #[error("NAND assignment has {actual} inputs, but the circuit declares {expected}")]
+    InputCountMismatch { expected: usize, actual: usize },
 }
 
-/// A compiled NAND circuit and the bindings required by its caller.
+/// A compiled NAND circuit and its structural Program metadata.
 ///
 /// `rhs_ids` is in LUT-round order.  For round `r`, bind `rhs_ids[r]` to
 /// `mono_m(8 * circuit_input_indices[r])`, and bind `state_input` to
@@ -60,74 +64,59 @@ pub enum NandCircuitError {
 #[derive(Clone, Debug)]
 pub struct CompiledNandCircuit {
     program: ExponentLutProgram,
-    state_input: ProgramInputId,
+    state_input: WireId,
     rhs_ids: Vec<RhsId>,
     circuit_input_indices: Vec<usize>,
     input_count: usize,
 }
 
 impl CompiledNandCircuit {
-    /// Bind circuit bits using the exponent packing committed by the Program.
-    /// The packed initial register state is (0, 1, 0), hence native exponent 2.
-    pub fn fixed_rhs(&self, assignment: &[bool]) -> Result<crate::FixedRhs, crate::ExecutionError> {
-        if assignment.len() != self.input_count {
-            return Err(crate::rns_bgg::api::ExecutionError::invalid(
-                "circuit assignment length mismatch",
-            ));
-        }
-        let stride = self.program.layout().expect("compiled layout").exponent.stride_log2;
-        Ok(crate::FixedRhs {
-            program: self.program.id(),
-            inputs: [(
-                self.state_input,
-                crate::rns_bgg::RnsBggProgramInput {
-                    level: 0,
-                    native_exponent: num_bigint::BigInt::from(2u8) << stride,
-                },
-            )]
-            .into(),
-            rhs: self
-                .rhs_ids
-                .iter()
-                .zip(&self.circuit_input_indices)
-                .map(|(id, input)| {
-                    let scale =
-                        self.program.rhs_exponent_scale_log2(*id).expect("compiled RHS scale");
-                    (*id, num_bigint::BigInt::from(u8::from(assignment[*input])) << scale)
-                })
-                .collect(),
-            sparse_lwr: None,
-        })
-    }
-
-    pub fn sample_secrets<B: mxx_runtime::Backend>(
-        &self,
-        engine: &crate::ExponentLut<B>,
-    ) -> Result<crate::EncodingSecrets, crate::ExecutionError> {
-        Ok(engine.sample_secrets(false))
-    }
-
-    pub fn output<'a>(
-        &self,
-        outputs: &'a crate::EncodedOutputs,
-    ) -> Result<&'a crate::EncodedOutput, crate::ExecutionError> {
-        outputs.for_program(self.program.id())
-    }
-
     /// The immutable Exponent-LUT program.
     pub const fn program(&self) -> &ExponentLutProgram {
         &self.program
     }
+
+    /// Convert Boolean circuit inputs into the declared scalar program inputs.
+    ///
+    /// The packed accumulator starts at `mono_m(2)`. Each original Boolean
+    /// input is represented by `mono_m(8 * bit)`, matching the binary LUT's
+    /// right-hand-side exponent contract. The returned maps are suitable for
+    /// the generic preprocessing and encryption APIs; scheme adapters own the
+    /// subsequent plaintext encoding.
+    pub fn plaintext_inputs<P: Poly>(
+        &self,
+        parameters: &P::Params,
+        assignment: &[bool],
+    ) -> Result<(PlaintextInputs<WireId, P>, PlaintextInputs<RhsId, P>), NandCircuitError> {
+        if assignment.len() != self.input_count {
+            return Err(NandCircuitError::InputCountMismatch {
+                expected: self.input_count,
+                actual: assignment.len(),
+            });
+        }
+        let state = P::const_rotate_poly(parameters, 2);
+        let inputs = BTreeMap::from([(self.state_input, InputBinding::Scalar(state))]);
+        let rhs = self
+            .rhs_ids
+            .iter()
+            .zip(&self.circuit_input_indices)
+            .map(|(id, input)| {
+                let exponent = 8 * usize::from(assignment[*input]);
+                (*id, InputBinding::Scalar(P::const_rotate_poly(parameters, exponent)))
+            })
+            .collect();
+        Ok((inputs, rhs))
+    }
 }
 
-/// Backend-facing details for benchmark and adapter integrations.
+/// Crate-local details used by backend adapters and the circuit tests.
 impl CompiledNandCircuit {
     /// Return the internal packed-state input used by adapter bindings.
-    pub fn state_input(&self) -> ProgramInputId {
+    pub fn state_input(&self) -> WireId {
         self.state_input
     }
 
-    /// Return the fixed right-hand-side identities used by the circuit.
+    /// Return the declared right-hand-side identities used by the circuit.
     pub fn rhs_ids(&self) -> &[RhsId] {
         &self.rhs_ids
     }
@@ -138,7 +127,7 @@ impl CompiledNandCircuit {
     }
 
     /// Consume the circuit and return its program and adapter metadata.
-    pub fn into_parts(self) -> (ExponentLutProgram, ProgramInputId, Vec<RhsId>, Vec<usize>) {
+    pub fn into_parts(self) -> (ExponentLutProgram, WireId, Vec<RhsId>, Vec<usize>) {
         (self.program, self.state_input, self.rhs_ids, self.circuit_input_indices)
     }
 }
@@ -187,6 +176,18 @@ impl NandCircuit {
     /// The layout's native domain may be wider than 16, but it must be wide
     /// enough for the fixed 8-by-2 table.  The returned program has one state
     /// input and one explicit RHS declaration per emitted LUT round.
+    ///
+    /// ```
+    /// use mxx_exponent_lut::{ExpLayout, NandCircuit};
+    ///
+    /// let circuit = NandCircuit::new(2, vec![[0, 1]], 2).unwrap();
+    /// let compiled = circuit.compile(ExpLayout { stride_log2: 0, width_log2: 4 }, 16, 4).unwrap();
+    /// // A single NAND expands to four binary LUT rounds: two input shears
+    /// // for each operand and the two repeated operand routes.
+    /// assert_eq!(compiled.rhs_ids().len(), 4);
+    /// assert_eq!(compiled.circuit_input_indices(), &[0, 1]);
+    /// assert_ne!(compiled.program().id().as_bytes(), &[0; 32]);
+    /// ```
     pub fn compile(
         &self,
         layout: ExpLayout,
@@ -213,21 +214,13 @@ impl NandCircuit {
         debug_assert_eq!(instructions.len(), round_count);
 
         let mut builder = ExponentLutProgramBuilder::new();
-        builder.set_layout(layout, ring_dimension)?;
-        let state_input = builder.input(
-            STATE_WIDTH,
-            ProgramWireType {
-                stride_log2: layout.stride_log2,
-                knowledge: AttributeKnowledge::Private,
-            },
-        )?;
-        let mut state = builder.input_wire(state_input)?;
-        let rhs_family = builder.rhs_family(RHS_WIDTH)?;
+        let state_input = builder.input(AttributeKnowledge::PrivatePayload)?;
+        let mut state = Operand::Scalar(state_input);
         let mut rhs_ids = Vec::with_capacity(instructions.len());
         let mut circuit_input_indices = Vec::with_capacity(instructions.len());
 
         for (round, instruction) in instructions.iter().enumerate() {
-            let rhs = builder.packed_rhs_input(rhs_family, STATE_WIDTH, RHS_WIDTH)?;
+            let rhs = builder.rhs_input()?;
             let output_width = if round + 1 == instructions.len() { 2 } else { STATE_WIDTH };
             let values = (0..RHS_WIDTH)
                 .flat_map(|bit| {
@@ -237,15 +230,20 @@ impl NandCircuit {
                     })
                 })
                 .collect();
-            let table =
-                crate::program::LutTable::binary(STATE_WIDTH, RHS_WIDTH, output_width, values)?;
-            state = builder.lut(state, table, Some(rhs))?;
+            let lut_id = builder.register_binary_lut(
+                STATE_WIDTH,
+                RHS_WIDTH,
+                output_width,
+                values,
+                LutOutputRepresentation::Exponent(layout),
+            )?;
+            let packed = builder.mul_private(state, Operand::Scalar(rhs))?;
+            state = Operand::Scalar(builder.lut(Operand::Scalar(packed), lut_id)?);
             rhs_ids.push(rhs);
             circuit_input_indices.push(instruction.input);
         }
 
-        builder.output(state)?;
-        let program = builder.build()?;
+        let program = builder.finish(vec![state])?;
         Ok(CompiledNandCircuit {
             program,
             state_input,
@@ -357,8 +355,128 @@ fn multiply(lhs: [[u8; 3]; 3], rhs: [[u8; 3]; 3]) -> [[u8; 3]; 3] {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompiledNandCircuit, NandCircuit, NandCircuitError};
-    use crate::{ExpLayout, program::Gate};
+    use super::{CompiledNandCircuit, NandCircuit, NandCircuitError, RHS_WIDTH, STATE_WIDTH};
+    use crate::{
+        ExpLayout,
+        program::{
+            Environment, ExponentLUTProgramLowering, FamilyExecution, InputBinding, LoweringSite,
+            LutOutputRepresentation, ProgramLowerError, ProgramLoweringContext, lower_program,
+        },
+    };
+    use mxx_ir_core::IntExpr;
+    use mxx_primitives::poly::{
+        Poly,
+        dcrt::{params::DCRTPolyParams, poly::DCRTPoly},
+    };
+
+    #[derive(Debug)]
+    struct LogicalError;
+
+    impl std::fmt::Display for LogicalError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("logical NAND evaluator error")
+        }
+    }
+
+    impl std::error::Error for LogicalError {}
+
+    #[derive(Default)]
+    struct LogicalEvaluator {
+        site: Option<LoweringSite>,
+    }
+
+    impl ExponentLUTProgramLowering for LogicalEvaluator {
+        type Wire = usize;
+        type Rhs = usize;
+        type Error = LogicalError;
+
+        fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
+            Ok(lhs.wrapping_add(*rhs))
+        }
+
+        fn mul_public(
+            &mut self,
+            private: &Self::Wire,
+            public: &Self::Wire,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(private.wrapping_mul(*public))
+        }
+
+        fn mul_private(
+            &mut self,
+            input: &Self::Wire,
+            rhs: &Self::Rhs,
+        ) -> Result<Self::Wire, Self::Error> {
+            Ok(input.saturating_add(STATE_WIDTH.saturating_mul(*rhs)))
+        }
+
+        fn lut(
+            &mut self,
+            input: &Self::Wire,
+            table: &crate::program::LutTable,
+        ) -> Result<Self::Wire, Self::Error> {
+            table.values().get(*input).copied().ok_or(LogicalError)
+        }
+    }
+
+    impl ProgramLoweringContext for LogicalEvaluator {
+        fn replace_site(&mut self, site: Option<LoweringSite>) -> Option<LoweringSite> {
+            std::mem::replace(&mut self.site, site)
+        }
+    }
+
+    #[derive(Default)]
+    struct NoFamilies;
+
+    impl FamilyExecution<LogicalEvaluator> for NoFamilies {
+        type WireFamily = ();
+        type RhsFamily = ();
+
+        fn wire_at(
+            &mut self,
+            _family: &Self::WireFamily,
+            _index: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no wire families".into(),
+            })
+        }
+
+        fn rhs_at(
+            &mut self,
+            _family: &Self::RhsFamily,
+            _index: &IntExpr,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no RHS families".into(),
+            })
+        }
+
+        fn parallel(
+            &mut self,
+            _evaluator: &mut LogicalEvaluator,
+            _range: &super::super::program::FamilyRange,
+            _body: impl FnOnce(
+                &mut Self,
+                &mut LogicalEvaluator,
+                IntExpr,
+            ) -> Result<usize, ProgramLowerError<LogicalError>>,
+        ) -> Result<Self::WireFamily, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no parallel bodies".into(),
+            })
+        }
+
+        fn sum(
+            &mut self,
+            _evaluator: &mut LogicalEvaluator,
+            _family: &Self::WireFamily,
+        ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            Err(ProgramLowerError::UnsupportedStructure {
+                reason: "NAND test has no family reductions".into(),
+            })
+        }
+    }
 
     fn compile(circuit: NandCircuit, budget: usize) -> CompiledNandCircuit {
         circuit.compile(ExpLayout { stride_log2: 0, width_log2: 4 }, 32, budget).unwrap()
@@ -382,14 +500,14 @@ mod tests {
         assert_eq!(compiled.rhs_ids().len(), 1);
         assert_eq!(compiled.circuit_input_indices(), &[0]);
         assert_eq!(compiled.program().outputs().len(), 1);
-        let gates = compiled.program().gates();
-        let Gate::Lut { lut_id, .. } = gates.last().unwrap() else {
-            panic!("last operation must be a LUT")
-        };
-        assert_eq!(compiled.program().lut(*lut_id).unwrap().output_width(), 2);
+        assert_eq!(compiled.program().luts().last().unwrap().output_width(), 2);
         assert_eq!(
-            compiled.program().wire_type(compiled.program().outputs()[0]).unwrap().stride_log2,
-            0
+            compiled.program().inputs()[&compiled.state_input()].shape(),
+            &InputBinding::Scalar(())
+        );
+        assert_eq!(
+            compiled.program().luts().last().unwrap().output_representation(),
+            LutOutputRepresentation::Exponent(ExpLayout { stride_log2: 0, width_log2: 4 })
         );
     }
 
@@ -421,11 +539,11 @@ mod tests {
     fn trusted_boolean_oracle_matches_compiled_round_schedule() {
         let circuit = NandCircuit::new(2, vec![[0, 1]], 2).unwrap();
         let compiled = compile(circuit.clone(), 4);
+        let mut instructions = Vec::new();
+        circuit.emit(circuit.output, 0, 1, 2, &mut instructions);
         for a in 0..=1 {
             for b in 0..=1 {
                 let inputs = [a, b];
-                let mut instructions = Vec::new();
-                circuit.emit(circuit.output, 0, 1, 2, &mut instructions);
                 let state =
                     instructions.iter().enumerate().fold(2usize, |state, (round, instruction)| {
                         let value = instruction
@@ -435,13 +553,11 @@ mod tests {
                 assert_eq!(state, 1 ^ (a & b));
             }
         }
-        assert!(
-            compiled
-                .program()
-                .gates()
-                .iter()
-                .all(|gate| matches!(gate, Gate::MulPrivate { .. } | Gate::Lut { .. }))
-        );
+        assert_eq!(compiled.program().luts().len(), instructions.len());
+        assert_eq!(compiled.program().rhs_inputs().len(), instructions.len());
+        for rhs in compiled.rhs_ids() {
+            assert_eq!(compiled.program().rhs_inputs().get(rhs), Some(&InputBinding::Scalar(())));
+        }
     }
 
     #[test]
@@ -450,15 +566,12 @@ mod tests {
         let compiled = compile(circuit.clone(), 4);
         let mut instructions = Vec::new();
         circuit.emit(circuit.output, 0, 1, 2, &mut instructions);
+        assert_eq!(compiled.program().rhs_inputs().len(), instructions.len());
         for (round, instruction) in instructions.iter().enumerate() {
-            let Gate::MulPrivate { rhs, .. } = compiled.program().gates()[2 * round] else {
-                panic!("binary LUT must bind an explicit RHS package")
-            };
-            assert_eq!(rhs, compiled.rhs_ids()[round]);
-            let Gate::Lut { lut_id, .. } = compiled.program().gates()[2 * round + 1] else {
-                panic!("binary LUT must lower through a LUT gate")
-            };
-            let table = compiled.program().lut(lut_id).unwrap();
+            let rhs = compiled.rhs_ids()[round];
+            assert_eq!(compiled.program().rhs_inputs().get(&rhs), Some(&InputBinding::Scalar(())));
+            let table = &compiled.program().luts()[round];
+            assert_eq!(table.input_width(), STATE_WIDTH * RHS_WIDTH);
             for bit in 0..2 {
                 for packed in 0..8 {
                     let expected = instruction.apply(packed, bit);
@@ -474,6 +587,61 @@ mod tests {
         assert_eq!((2usize >> 1) & 1, 1);
         assert_eq!((2usize >> 2) & 1, 0);
         assert!(compiled.circuit_input_indices().iter().all(|index| *index < 2));
+    }
+
+    #[test]
+    fn lowering_dispatches_each_binary_round_and_matches_boolean_oracle() {
+        let circuit = NandCircuit::new(2, vec![[0, 1]], 2).unwrap();
+        let compiled = compile(circuit.clone(), 4);
+        let output = compiled.program().outputs()[0].clone();
+
+        for lhs in [false, true] {
+            for rhs in [false, true] {
+                let mut environment = Environment::new();
+                environment
+                    .bind_wire(compiled.state_input(), InputBinding::Scalar(2usize))
+                    .unwrap();
+                for (rhs_id, input_index) in
+                    compiled.rhs_ids().iter().zip(compiled.circuit_input_indices())
+                {
+                    let value = usize::from([lhs, rhs][*input_index]);
+                    environment.bind_rhs(*rhs_id, InputBinding::Scalar(value)).unwrap();
+                }
+
+                let values = lower_program(
+                    compiled.program(),
+                    &mut LogicalEvaluator::default(),
+                    &mut NoFamilies,
+                    &mut environment,
+                )
+                .unwrap();
+                assert_eq!(values, vec![usize::from(!(lhs && rhs))]);
+                assert_eq!(compiled.program().outputs(), &[output.clone()]);
+            }
+        }
+        assert_ne!(compiled.program().id().as_bytes(), &[0; 32]);
+    }
+
+    #[test]
+    fn plaintext_inputs_use_the_declared_state_and_rhs_monomials() {
+        let circuit = NandCircuit::new(2, vec![[0, 1]], 2).unwrap();
+        let compiled = compile(circuit, 4);
+        let parameters = DCRTPolyParams::try_new(16, 1, 16, 8, None, None).unwrap();
+        let (wires, rhs) =
+            compiled.plaintext_inputs::<DCRTPoly>(&parameters, &[false, true]).unwrap();
+
+        let InputBinding::Scalar(state) = wires.get(&compiled.state_input()).unwrap() else {
+            panic!("NAND state input must be scalar")
+        };
+        assert_eq!(state.coeffs_biguints()[2], 1u8.into());
+        for (rhs_id, input_index) in compiled.rhs_ids().iter().zip(compiled.circuit_input_indices())
+        {
+            let InputBinding::Scalar(value) = rhs.get(rhs_id).unwrap() else {
+                panic!("NAND RHS input must be scalar")
+            };
+            let exponent = 8 * usize::from([false, true][*input_index]);
+            assert_eq!(value.coeffs_biguints()[exponent], 1u8.into());
+        }
     }
 
     #[test]

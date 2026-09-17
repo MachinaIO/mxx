@@ -1,5 +1,5 @@
 use crate::{
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::ProductionId,
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
@@ -211,7 +211,6 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
-    pub confidentiality: ArtifactConfidentiality,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

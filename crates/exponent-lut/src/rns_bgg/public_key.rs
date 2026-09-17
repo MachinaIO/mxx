@@ -1,5500 +1,2958 @@
-//! RNS-BGG public preparation and prepared artifact transport.
-//!
-//! Methods in this module construct preprocessing and online DSL graph
-//! values; they do not execute a backend. Public matrices and helper material
-//! are distinct from secret values. Every operation validates scheme context,
-//! modulus-chain level, key/material identity, and scalar or family range
-//! before connecting graph values. Artifact export/import carries an
-//! authenticated descriptor and rechecks its identity before reuse.
+//! Public-key preparation and preprocessing for RNS-BGG.
 #![warn(missing_docs)]
+
 use super::*;
-use sha2::Digest;
+use crate::{
+    api::{
+        ApiError, PlaintextInputs, PreprocessBuild, RefreshApplicationError, StageGraph,
+        apply_refresh,
+    },
+    noise_refresh::{
+        prf::PrfLabel,
+        refresh::{NoiseRefresh, RefreshError, RefreshPrfLabel},
+    },
+    program::{
+        AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
+        FamilyScope, GraphFamilyExecution, GraphParallelLowering, InputBinding, LoweringSite,
+        LutTable, ProgramLoweringContext, RhsId, RhsRef, WireId, lower_program,
+    },
+};
+use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
+use mxx_ir_core::{
+    IntExpr, ParamEnv, ValueHandle,
+    artifact::{ArtifactCatalog, ProductionId},
+    node::ConstantMatrix,
+    types::WireType,
+};
+use mxx_primitives::poly::Poly;
+use mxx_runtime::{Backend, RuntimeValue};
+use num_bigint::BigInt;
+use num_traits::{One, ToPrimitive, Zero};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{collections::BTreeMap, sync::Arc};
 
-impl<M: GraphValue> GraphValue for RnsBggPublicKeyFamily<M> {
-    type Schema = RnsBggPublicKeyFamily<M::Schema>;
-
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.matrices.flatten()
-    }
-
-    fn schema(&self) -> Self::Schema {
-        RnsBggPublicKeyFamily {
-            matrices: self.matrices.schema(),
-            level: self.level,
-            id: self.id,
-            context: self.context,
-            range: self.range.clone(),
-        }
-    }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            matrices: M::from_values(&schema.matrices, values)?,
-            level: schema.level,
-            id: schema.id,
-            context: schema.context,
-            range: schema.range.clone(),
-        })
-    }
+/// Public-key carrier paired with its validated Program wire.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct RnsBggPublicKey<M = RnsBggMatrix> {
+    pub(crate) wire: WireId,
+    pub(crate) matrix: M,
 }
 
-impl<M: GraphValueSchema> GraphValueSchema for RnsBggPublicKeyFamily<M> {
-    type Value = RnsBggPublicKeyFamily<M::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPublicKeyFamily {
-            matrices: self.matrices.placeholders_from(next),
-            level: self.level,
-            id: self.id,
-            context: self.context,
-            range: self.range.clone(),
-        }
+impl<M> RnsBggPublicKey<M> {
+    /// Construct a carrier for `wire` with a matrix matching that wire's
+    /// validated public-key schema.
+    ///
+    /// Callers are responsible for preserving the Program wire identity and
+    /// matrix schema; stage builders validate both when the carrier is used.
+    pub fn new(wire: WireId, matrix: M) -> Self {
+        Self { wire, matrix }
     }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        self.matrices.wire_types()
+    /// Program wire represented by this key.
+    pub fn wire(&self) -> WireId {
+        self.wire
+    }
+    /// Matrix carried by this key.
+    pub fn matrix(&self) -> &M {
+        &self.matrix
     }
 }
 
 impl<M: GraphValue> GraphValue for RnsBggPublicKey<M> {
     type Schema = RnsBggPublicKey<M::Schema>;
-
     fn flatten(&self) -> Vec<ValueHandle> {
         self.matrix.flatten()
     }
-
     fn schema(&self) -> Self::Schema {
-        RnsBggPublicKey {
-            matrix: self.matrix.schema(),
-            level: self.level,
-            id: self.id,
-            context: self.context,
-        }
+        RnsBggPublicKey::new(self.wire, self.matrix.schema())
     }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            matrix: M::from_values(&schema.matrix, values)?,
-            level: schema.level,
-            id: schema.id,
-            context: schema.context,
-        })
+    fn from_values(
+        schema: &Self::Schema,
+        values: &[ValueHandle],
+    ) -> Result<Self, mxx_dsl::DslError> {
+        Ok(Self::new(schema.wire, M::from_values(&schema.matrix, values)?))
     }
 }
-
 impl<M: GraphValueSchema> GraphValueSchema for RnsBggPublicKey<M> {
     type Value = RnsBggPublicKey<M::Value>;
-
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPublicKey {
-            matrix: self.matrix.placeholders_from(next),
-            level: self.level,
-            id: self.id,
-            context: self.context,
-        }
+        RnsBggPublicKey::new(self.wire, self.matrix.placeholders_from(next))
     }
-
     fn wire_types(&self) -> Vec<WireType> {
         self.matrix.wire_types()
     }
 }
 
-impl<C: GraphValue, L: GraphValue> GraphValue for RnsBggPrivateRhs<C, L> {
-    type Schema = RnsBggPrivateRhs<C::Schema, L::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.ciphertext.flatten(), self.lifted_ciphertext.flatten()].concat()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggPrivateRhs {
-            ciphertext: self.ciphertext.schema(),
-            lifted_ciphertext: self.lifted_ciphertext.schema(),
-            rhs_id: self.rhs_id,
-            level: self.level,
-            context: self.context,
-            id: self.id,
+fn graph(error: impl std::fmt::Display) -> RnsBggError {
+    RnsBggError::Graph(error.to_string())
+}
+
+#[derive(Clone)]
+pub(crate) struct PublicKeyParallelOutputs {
+    public: BTreeMap<String, RnsBggDecomposition>,
+    lut: BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+    helpers: BTreeMap<String, RnsBggLutPublicData>,
+    nested_public: BTreeMap<String, Family<RnsBggDecomposition>>,
+    nested_lut: BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+    nested_helpers: BTreeMap<String, RnsBggLutPublicData>,
+}
+
+impl Default for PublicKeyParallelOutputs {
+    fn default() -> Self {
+        Self {
+            public: BTreeMap::new(),
+            lut: BTreeMap::new(),
+            helpers: BTreeMap::new(),
+            nested_public: BTreeMap::new(),
+            nested_lut: BTreeMap::new(),
+            nested_helpers: BTreeMap::new(),
         }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (ciphertext, lifted_ciphertext) = <(C, L)>::from_values(
-            &(schema.ciphertext.clone(), schema.lifted_ciphertext.clone()),
-            values,
-        )?;
-        Ok(Self {
-            ciphertext,
-            lifted_ciphertext,
-            rhs_id: schema.rhs_id,
-            level: schema.level,
-            context: schema.context,
-            id: schema.id,
-        })
     }
 }
-impl<C: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for RnsBggPrivateRhs<C, L> {
-    type Value = RnsBggPrivateRhs<C::Value, L::Value>;
+
+#[derive(Clone, PartialEq)]
+pub(crate) struct PublicKeyParallelOutputsSchema(
+    <BTreeMap<String, RnsBggDecomposition> as GraphValue>::Schema,
+    <BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>> as GraphValue>::Schema,
+    <BTreeMap<String, RnsBggLutPublicData> as GraphValue>::Schema,
+    <BTreeMap<String, Family<RnsBggDecomposition>> as GraphValue>::Schema,
+    <BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>> as GraphValue>::Schema,
+    <BTreeMap<String, RnsBggLutPublicData> as GraphValue>::Schema,
+);
+
+impl mxx_dsl::GraphValueSchema for PublicKeyParallelOutputsSchema {
+    type Value = PublicKeyParallelOutputs;
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPrivateRhs {
-            ciphertext: self.ciphertext.placeholders_from(next),
-            lifted_ciphertext: self.lifted_ciphertext.placeholders_from(next),
-            rhs_id: self.rhs_id,
-            level: self.level,
-            context: self.context,
-            id: self.id,
-        }
+        let (public, lut, helpers, nested_public, nested_lut, nested_helpers) = (
+            self.0.clone(),
+            self.1.clone(),
+            self.2.clone(),
+            self.3.clone(),
+            self.4.clone(),
+            self.5.clone(),
+        )
+            .placeholders_from(next);
+        PublicKeyParallelOutputs { public, lut, helpers, nested_public, nested_lut, nested_helpers }
     }
     fn wire_types(&self) -> Vec<WireType> {
-        [self.ciphertext.wire_types(), self.lifted_ciphertext.wire_types()].concat()
+        [
+            self.0.wire_types(),
+            self.1.wire_types(),
+            self.2.wire_types(),
+            self.3.wire_types(),
+            self.4.wire_types(),
+            self.5.wire_types(),
+        ]
+        .concat()
     }
 }
 
-impl<K: GraphValue, C: GraphValue, D: GraphValue> GraphValue for RnsBggPreparedPrivateMul<K, C, D> {
-    type Schema = RnsBggPreparedPrivateMul<K::Schema, C::Schema, D::Schema>;
-
+impl GraphValue for PublicKeyParallelOutputs {
+    type Schema = PublicKeyParallelOutputsSchema;
     fn flatten(&self) -> Vec<ValueHandle> {
-        [self.input.flatten(), self.output.flatten(), self.rhs.flatten()]
-            .into_iter()
+        (
+            self.public.clone(),
+            self.lut.clone(),
+            self.helpers.clone(),
+            self.nested_public.clone(),
+            self.nested_lut.clone(),
+            self.nested_helpers.clone(),
+        )
             .flatten()
-            .collect()
     }
-
     fn schema(&self) -> Self::Schema {
-        RnsBggPreparedPrivateMul {
-            input: self.input.schema(),
-            output: self.output.schema(),
-            rhs: self.rhs.schema(),
-        }
+        PublicKeyParallelOutputsSchema(
+            self.public.schema(),
+            self.lut.schema(),
+            self.helpers.schema(),
+            self.nested_public.schema(),
+            self.nested_lut.schema(),
+            self.nested_helpers.schema(),
+        )
     }
-
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, output, rhs) = <(K, K, RnsBggPrivateRhs<C, D>)>::from_values(
-            &(schema.input.clone(), schema.output.clone(), schema.rhs.clone()),
-            values,
-        )?;
-        Ok(Self { input, output, rhs })
-    }
-}
-
-impl<K: GraphValueSchema, C: GraphValueSchema, D: GraphValueSchema> GraphValueSchema
-    for RnsBggPreparedPrivateMul<K, C, D>
-{
-    type Value = RnsBggPreparedPrivateMul<K::Value, C::Value, D::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPreparedPrivateMul {
-            input: self.input.placeholders_from(next),
-            output: self.output.placeholders_from(next),
-            rhs: self.rhs.placeholders_from(next),
-        }
-    }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.input.wire_types(), self.output.wire_types(), self.rhs.wire_types()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-}
-
-impl<K: GraphValue, M: GraphValue> GraphValue for RnsBggPreparedLinear<K, M> {
-    type Schema = RnsBggPreparedLinear<K::Schema, M::Schema>;
-
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.lhs.flatten(), self.rhs.flatten(), self.output.flatten(), self.operation.flatten()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    fn schema(&self) -> Self::Schema {
-        RnsBggPreparedLinear {
-            lhs: self.lhs.schema(),
-            rhs: self.rhs.schema(),
-            output: self.output.schema(),
-            operation: self.operation.schema(),
-        }
-    }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (lhs, rhs, output, operation) = <(K, K, K, LinearOperation<M>)>::from_values(
+        let (public, lut, helpers, nested_public, nested_lut, nested_helpers) = <(
+            BTreeMap<String, RnsBggDecomposition>,
+            BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+            BTreeMap<String, RnsBggLutPublicData>,
+            BTreeMap<String, Family<RnsBggDecomposition>>,
+            BTreeMap<String, Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+            BTreeMap<String, RnsBggLutPublicData>,
+        ) as GraphValue>::from_values(
             &(
-                schema.lhs.clone(),
-                schema.rhs.clone(),
-                schema.output.clone(),
-                schema.operation.clone(),
+                schema.0.clone(),
+                schema.1.clone(),
+                schema.2.clone(),
+                schema.3.clone(),
+                schema.4.clone(),
+                schema.5.clone(),
             ),
             values,
         )?;
-        Ok(Self { lhs, rhs, output, operation })
+        Ok(Self { public, lut, helpers, nested_public, nested_lut, nested_helpers })
     }
 }
 
-impl<K: GraphValueSchema, M: GraphValueSchema> GraphValueSchema for RnsBggPreparedLinear<K, M> {
-    type Value = RnsBggPreparedLinear<K::Value, M::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPreparedLinear {
-            lhs: self.lhs.placeholders_from(next),
-            rhs: self.rhs.placeholders_from(next),
-            output: self.output.placeholders_from(next),
-            operation: self.operation.placeholders_from(next),
-        }
-    }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        [
-            self.lhs.wire_types(),
-            self.rhs.wire_types(),
-            self.output.wire_types(),
-            self.operation.wire_types(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
+fn flatten_family<T: GraphValue>(nested: Family<Family<T>>) -> Result<Family<T>, RnsBggError> {
+    let inner_count = nested.at(Int::constant(0)).schema().count().clone();
+    let total = IntExpr::Mul(Box::new(nested.count().clone()), Box::new(inner_count.clone()))
+        .canonicalize();
+    mxx_dsl::parallel(total, |flat| {
+        let outer = flat.clone().div(Int::evaluate(inner_count.clone()));
+        let branch = flat.rem(Int::evaluate(inner_count));
+        Ok(nested.at(outer).at(branch))
+    })
+    .map_err(graph)
 }
 
-impl<M: GraphValue, D: GraphValue> GraphValue for PreparedBranch<M, D> {
-    type Schema = PreparedBranch<M::Schema, D::Schema>;
-
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [
-            self.lifted_ciphertext.flatten(),
-            self.lifted_intermediate.flatten(),
-            self.mask_public.flatten(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
-
-    fn schema(&self) -> Self::Schema {
-        PreparedBranch {
-            lifted_ciphertext: self.lifted_ciphertext.schema(),
-            lifted_intermediate: self.lifted_intermediate.schema(),
-            mask_public: self.mask_public.schema(),
-            sigma: self.sigma,
-        }
-    }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (lifted_ciphertext, lifted_intermediate, mask_public) = <(D, D, M)>::from_values(
-            &(
-                schema.lifted_ciphertext.clone(),
-                schema.lifted_intermediate.clone(),
-                schema.mask_public.clone(),
-            ),
-            values,
-        )?;
-        Ok(Self { lifted_ciphertext, lifted_intermediate, mask_public, sigma: schema.sigma })
-    }
+fn lut_helper_artifact_role(origin: WireId, scope: &FamilyScope) -> String {
+    lut_helper_artifact_name(origin, scope).trim_start_matches("lut-data/").to_owned()
 }
 
-impl<M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema for PreparedBranch<M, D> {
-    type Value = PreparedBranch<M::Value, D::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        PreparedBranch {
-            lifted_ciphertext: self.lifted_ciphertext.placeholders_from(next),
-            lifted_intermediate: self.lifted_intermediate.placeholders_from(next),
-            mask_public: self.mask_public.placeholders_from(next),
-            sigma: self.sigma,
-        }
-    }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        [
-            self.lifted_ciphertext.wire_types(),
-            self.lifted_intermediate.wire_types(),
-            self.mask_public.wire_types(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect()
-    }
+fn public_action_artifact_name(site: WireId) -> String {
+    format!("public-action/{site:?}")
 }
 
-impl<K: GraphValue, M: GraphValue, D: GraphValue> GraphValue for RnsBggPreparedLut<K, M, D> {
-    type Schema = RnsBggPreparedLut<K::Schema, M::Schema, D::Schema>;
-
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.input.flatten(), self.output.flatten(), self.branches.flatten()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
-
-    fn schema(&self) -> Self::Schema {
-        RnsBggPreparedLut {
-            input: self.input.schema(),
-            output: self.output.schema(),
-            branches: self.branches.schema(),
-            binding: self.binding.clone(),
-        }
-    }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, output, branches) = <(K, K, Vec<PreparedBranch<M, D>>)>::from_values(
-            &(schema.input.clone(), schema.output.clone(), schema.branches.clone()),
-            values,
-        )?;
-        Ok(Self { input, output, branches, binding: schema.binding.clone() })
-    }
+fn select_parallel_output<T: GraphValue>(
+    outputs: &Family<PublicKeyParallelOutputs>,
+    selector: impl Fn(&PublicKeyParallelOutputs) -> Option<T>,
+) -> Result<Family<T>, RnsBggError> {
+    mxx_dsl::parallel(outputs.count().clone(), |index| {
+        selector(&outputs.at(index)).ok_or(DslError::Schema)
+    })
+    .map_err(graph)
 }
 
-impl<K: GraphValueSchema, M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema
-    for RnsBggPreparedLut<K, M, D>
-{
-    type Value = RnsBggPreparedLut<K::Value, M::Value, D::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPreparedLut {
-            input: self.input.placeholders_from(next),
-            output: self.output.placeholders_from(next),
-            branches: self.branches.placeholders_from(next),
-            binding: self.binding.clone(),
-        }
-    }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.input.wire_types(), self.output.wire_types(), self.branches.wire_types()]
-            .into_iter()
-            .flatten()
-            .collect()
-    }
+fn matrix_entries(matrix: &RnsBggMatrix) -> [Mat; 4] {
+    [matrix.0.0.clone(), matrix.0.1.clone(), matrix.1.0.clone(), matrix.1.1.clone()]
 }
 
-impl<M: GraphValue> GraphValue for LinearOperation<M> {
-    type Schema = LinearOperation<M::Schema>;
-
-    fn flatten(&self) -> Vec<ValueHandle> {
-        match self {
-            Self::Add => Vec::new(),
-            Self::MulPublic(multiplier) => multiplier.flatten(),
-        }
-    }
-
-    fn schema(&self) -> Self::Schema {
-        match self {
-            Self::Add => LinearOperation::Add,
-            Self::MulPublic(multiplier) => LinearOperation::MulPublic(multiplier.schema()),
-        }
-    }
-
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        match schema {
-            LinearOperation::Add if values.is_empty() => Ok(Self::Add),
-            LinearOperation::Add => Err(DslError::Schema),
-            LinearOperation::MulPublic(multiplier) => {
-                Ok(Self::MulPublic(M::from_values(multiplier, values)?))
-            }
-        }
-    }
+fn public_lut_branch(public_data: RnsBggMatrix, e_sigma: RnsBggDecomposition) -> RnsBggMatrix {
+    multiply_public_action(public_data, e_sigma)
 }
 
-impl<M: GraphValueSchema> GraphValueSchema for LinearOperation<M> {
-    type Value = LinearOperation<M::Value>;
-
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        match self {
-            Self::Add => LinearOperation::Add,
-            Self::MulPublic(multiplier) => {
-                LinearOperation::MulPublic(multiplier.placeholders_from(next))
-            }
-        }
-    }
-
-    fn wire_types(&self) -> Vec<WireType> {
-        match self {
-            Self::Add => Vec::new(),
-            Self::MulPublic(multiplier) => multiplier.wire_types(),
-        }
-    }
+fn matrix_from_hash(
+    ring: &mxx_dsl::Ring,
+    key: Bytes,
+    tag: impl Into<mxx_dsl::HashTag>,
+    columns: usize,
+) -> RnsBggMatrix {
+    let tag = tag.into();
+    (
+        (
+            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
+            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
+        ),
+        (
+            ring.hash_matrix(key.clone(), tag.clone(), (1, columns)),
+            ring.hash_matrix(key, tag, (1, columns)),
+        ),
+    )
 }
 
-impl<K: GraphValue, M: GraphValue, P: GraphValue, D: GraphValue> GraphValue
-    for PreparedGate<K, M, P, D>
-{
-    type Schema = PreparedGate<K::Schema, M::Schema, P::Schema, D::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        match self {
-            Self::MulPrivate(value) => value.flatten(),
-            Self::Linear(value) => value.flatten(),
-            Self::Lut(value) => value.flatten(),
-            Self::Reduction(value) => value.flatten(),
-        }
+fn input_hash_tag(wire: WireId, level: usize, member: Option<Int>) -> mxx_dsl::HashTag {
+    let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/input/{wire:?}/{level}").into_bytes());
+    if let Some(member) = member {
+        tag.push("member");
+        tag.push(member);
     }
-    fn schema(&self) -> Self::Schema {
-        match self {
-            Self::MulPrivate(value) => PreparedGate::MulPrivate(value.schema()),
-            Self::Linear(value) => PreparedGate::Linear(value.schema()),
-            Self::Lut(value) => PreparedGate::Lut(value.schema()),
-            Self::Reduction(value) => PreparedGate::Reduction(value.schema()),
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(match schema {
-            PreparedGate::MulPrivate(schema) => {
-                Self::MulPrivate(RnsBggPreparedPrivateMul::from_values(schema, values)?)
-            }
-            PreparedGate::Linear(schema) => {
-                Self::Linear(RnsBggPreparedLinear::from_values(schema, values)?)
-            }
-            PreparedGate::Lut(schema) => Self::Lut(RnsBggPreparedLut::from_values(schema, values)?),
-            PreparedGate::Reduction(schema) => Self::Reduction(K::from_values(schema, values)?),
-        })
-    }
-}
-impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema, D: GraphValueSchema>
-    GraphValueSchema for PreparedGate<K, M, P, D>
-{
-    type Value = PreparedGate<K::Value, M::Value, P::Value, D::Value>;
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        match self {
-            Self::MulPrivate(value) => PreparedGate::MulPrivate(value.placeholders_from(next)),
-            Self::Linear(value) => PreparedGate::Linear(value.placeholders_from(next)),
-            Self::Lut(value) => PreparedGate::Lut(value.placeholders_from(next)),
-            Self::Reduction(value) => PreparedGate::Reduction(value.placeholders_from(next)),
-        }
-    }
-    fn wire_types(&self) -> Vec<WireType> {
-        match self {
-            Self::MulPrivate(value) => value.wire_types(),
-            Self::Linear(value) => value.wire_types(),
-            Self::Lut(value) => value.wire_types(),
-            Self::Reduction(value) => value.wire_types(),
-        }
-    }
-}
-impl<G: GraphValue, P: GraphValue> GraphValue for RnsBggProgramCache<G, P> {
-    type Schema = RnsBggProgramCache<G::Schema, P::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.gates.flatten(), self.plaintexts.flatten()].concat()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggProgramCache { gates: self.gates.schema(), plaintexts: self.plaintexts.schema() }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (gates, plaintexts) =
-            <(BTreeMap<ProgramGateInstance, G>, BTreeMap<ProgramGateInstance, P>)>::from_values(
-                &(schema.gates.clone(), schema.plaintexts.clone()),
-                values,
-            )?;
-        Ok(Self { gates, plaintexts })
-    }
-}
-impl<G: GraphValueSchema, P: GraphValueSchema> GraphValueSchema for RnsBggProgramCache<G, P> {
-    type Value = RnsBggProgramCache<G::Value, P::Value>;
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggProgramCache {
-            gates: self.gates.placeholders_from(next),
-            plaintexts: self.plaintexts.placeholders_from(next),
-        }
-    }
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.gates.wire_types(), self.plaintexts.wire_types()].concat()
-    }
+    tag
 }
 
-impl<M: GraphValue> GraphValue for MaskBranch<M> {
-    type Schema = MaskBranch<M::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.public.flatten()
-    }
-    fn schema(&self) -> Self::Schema {
-        MaskBranch { public: self.public.schema(), sigma: self.sigma }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self { public: <M>::from_values(&schema.public, values)?, sigma: schema.sigma })
-    }
-}
-impl<M: GraphValueSchema> GraphValueSchema for MaskBranch<M> {
-    type Value = MaskBranch<M::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        self.public.wire_types()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        MaskBranch { public: self.public.placeholders_from(next), sigma: self.sigma }
-    }
-}
-impl<M: GraphValue> GraphValue for RnsBggLutMaterial<M> {
-    type Schema = RnsBggLutMaterial<M::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.branches.flatten()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggLutMaterial {
-            branches: self.branches.schema(),
-            mask_bank: self.mask_bank,
-            id: self.id,
-            level: self.level,
-            context: self.context,
-            table: self.table,
-            rhs_id: self.rhs_id,
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            branches: <Vec<(MaskBranch<M>, M)>>::from_values(&schema.branches, values)?,
-            mask_bank: schema.mask_bank,
-            id: schema.id,
-            level: schema.level,
-            context: schema.context,
-            table: schema.table,
-            rhs_id: schema.rhs_id,
-        })
-    }
-}
-impl<M: GraphValueSchema> GraphValueSchema for RnsBggLutMaterial<M> {
-    type Value = RnsBggLutMaterial<M::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        self.branches.wire_types()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggLutMaterial {
-            branches: self.branches.placeholders_from(next),
-            mask_bank: self.mask_bank,
-            id: self.id,
-            level: self.level,
-            context: self.context,
-            table: self.table,
-            rhs_id: self.rhs_id,
-        }
-    }
-}
-impl<M: GraphValue, D: GraphValue> GraphValue for RnsBggPublicRhs<M, D> {
-    type Schema = RnsBggPublicRhs<M::Schema, D::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        match self {
-            Self::Fixed(rhs) => rhs.flatten(),
-            Self::Identity(_) => vec![],
-        }
-    }
-    fn schema(&self) -> Self::Schema {
-        match self {
-            Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.schema()),
-            Self::Identity(id) => RnsBggPublicRhs::Identity(*id),
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        match schema {
-            RnsBggPublicRhs::Fixed(rhs) => {
-                Ok(Self::Fixed(RnsBggPrivateRhs::from_values(rhs, values)?))
-            }
-            RnsBggPublicRhs::Identity(id) if values.is_empty() => Ok(Self::Identity(*id)),
-            _ => Err(DslError::Schema),
-        }
-    }
-}
-impl<M: GraphValueSchema, D: GraphValueSchema> GraphValueSchema for RnsBggPublicRhs<M, D> {
-    type Value = RnsBggPublicRhs<M::Value, D::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        match self {
-            Self::Fixed(rhs) => rhs.wire_types(),
-            Self::Identity(_) => vec![],
-        }
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        match self {
-            Self::Fixed(rhs) => RnsBggPublicRhs::Fixed(rhs.placeholders_from(next)),
-            Self::Identity(id) => RnsBggPublicRhs::Identity(*id),
-        }
-    }
-}
-impl<R: GraphValue> GraphValue for RnsBggOnlineMasks<R> {
-    type Schema = RnsBggOnlineMasks<R::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.rows.as_ref().flatten()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggOnlineMasks {
-            rows: Arc::new(self.rows.as_ref().schema()),
-            id: self.id,
-            level: self.level,
-            context: self.context,
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            rows: Arc::new(BTreeMap::from_values(schema.rows.as_ref(), values)?),
-            id: schema.id,
-            level: schema.level,
-            context: schema.context,
-        })
-    }
-}
-impl<R: GraphValueSchema> GraphValueSchema for RnsBggOnlineMasks<R> {
-    type Value = RnsBggOnlineMasks<R::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        self.rows.as_ref().wire_types()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggOnlineMasks {
-            rows: Arc::new(self.rows.as_ref().placeholders_from(next)),
-            id: self.id,
-            level: self.level,
-            context: self.context,
-        }
-    }
-}
-impl<R: GraphValue> GraphValue for RnsBggOnlineLutHelpers<R> {
-    type Schema = RnsBggOnlineLutHelpers<R::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.masks.flatten()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggOnlineLutHelpers { masks: self.masks.schema(), binding: self.binding.clone() }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            masks: RnsBggOnlineMasks::from_values(&schema.masks, values)?,
-            binding: schema.binding.clone(),
-        })
-    }
-}
-impl<R: GraphValueSchema> GraphValueSchema for RnsBggOnlineLutHelpers<R> {
-    type Value = RnsBggOnlineLutHelpers<R::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        self.masks.wire_types()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggOnlineLutHelpers {
-            masks: self.masks.placeholders_from(next),
-            binding: self.binding.clone(),
-        }
-    }
-}
-impl<I: GraphValue, K: GraphValue> GraphValue for RnsBggPreparedReduction<I, K> {
-    type Schema = RnsBggPreparedReduction<I::Schema, K::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.input.flatten(), self.output.flatten()].concat()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggPreparedReduction { input: self.input.schema(), output: self.output.schema() }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, output) =
-            <(I, K)>::from_values(&(schema.input.clone(), schema.output.clone()), values)?;
-        Ok(Self { input, output })
-    }
-}
-impl<I: GraphValueSchema, K: GraphValueSchema> GraphValueSchema for RnsBggPreparedReduction<I, K> {
-    type Value = RnsBggPreparedReduction<I::Value, K::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.input.wire_types(), self.output.wire_types()].concat()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPreparedReduction {
-            input: self.input.placeholders_from(next),
-            output: self.output.placeholders_from(next),
-        }
-    }
-}
-impl<T: GraphValue> GraphValue for RnsBggTerminalAccumulator<T> {
-    type Schema = RnsBggTerminalAccumulator<T::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        self.value.flatten()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggTerminalAccumulator {
-            value: self.value.schema(),
-            level: self.level,
-            context: self.context,
-            stages: self.stages.clone(),
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        Ok(Self {
-            value: T::from_values(&schema.value, values)?,
-            level: schema.level,
-            context: schema.context,
-            stages: schema.stages.clone(),
-        })
-    }
-}
-impl<T: GraphValueSchema> GraphValueSchema for RnsBggTerminalAccumulator<T> {
-    type Value = RnsBggTerminalAccumulator<T::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        self.value.wire_types()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggTerminalAccumulator {
-            value: self.value.placeholders_from(next),
-            level: self.level,
-            context: self.context,
-            stages: self.stages.clone(),
-        }
-    }
-}
-impl<M: GraphValue, L: GraphValue> GraphValue for RnsBggTerminalMaterial<M, L> {
-    type Schema = RnsBggTerminalMaterial<M::Schema, L::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.material.flatten(), self.lifted_ciphertexts.flatten()].concat()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggTerminalMaterial {
-            material: self.material.schema(),
-            lifted_ciphertexts: self.lifted_ciphertexts.schema(),
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (material, lifted_ciphertexts) = <(M, L)>::from_values(
-            &(schema.material.clone(), schema.lifted_ciphertexts.clone()),
-            values,
-        )?;
-        Ok(Self { material, lifted_ciphertexts })
-    }
-}
-impl<M: GraphValueSchema, L: GraphValueSchema> GraphValueSchema for RnsBggTerminalMaterial<M, L> {
-    type Value = RnsBggTerminalMaterial<M::Value, L::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.material.wire_types(), self.lifted_ciphertexts.wire_types()].concat()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggTerminalMaterial {
-            material: self.material.placeholders_from(next),
-            lifted_ciphertexts: self.lifted_ciphertexts.placeholders_from(next),
-        }
-    }
-}
-impl<K: GraphValue, M: GraphValue, P: GraphValue, D: GraphValue> GraphValue
-    for RnsBggPreparedTerminal<K, M, P, D>
-{
-    type Schema = RnsBggPreparedTerminal<K::Schema, M::Schema, P::Schema, D::Schema>;
-    fn flatten(&self) -> Vec<ValueHandle> {
-        [self.input.flatten(), self.branches.flatten(), self.raw_public.flatten()].concat()
-    }
-    fn schema(&self) -> Self::Schema {
-        RnsBggPreparedTerminal {
-            input: self.input.schema(),
-            branches: self.branches.schema(),
-            raw_public: self.raw_public.schema(),
-            binding: self.binding.clone(),
-            id: self.id,
-        }
-    }
-    fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
-        let (input, branches, raw_public) = <(K, Vec<PreparedBranch<M, D>>, P)>::from_values(
-            &(schema.input.clone(), schema.branches.clone(), schema.raw_public.clone()),
-            values,
-        )?;
-        Ok(Self { input, branches, raw_public, binding: schema.binding.clone(), id: schema.id })
-    }
-}
-impl<K: GraphValueSchema, M: GraphValueSchema, P: GraphValueSchema, D: GraphValueSchema>
-    GraphValueSchema for RnsBggPreparedTerminal<K, M, P, D>
-{
-    type Value = RnsBggPreparedTerminal<K::Value, M::Value, P::Value, D::Value>;
-    fn wire_types(&self) -> Vec<WireType> {
-        [self.input.wire_types(), self.branches.wire_types(), self.raw_public.wire_types()].concat()
-    }
-    fn placeholders_from(&self, next: &mut usize) -> Self::Value {
-        RnsBggPreparedTerminal {
-            input: self.input.placeholders_from(next),
-            branches: self.branches.placeholders_from(next),
-            raw_public: self.raw_public.placeholders_from(next),
-            binding: self.binding.clone(),
-            id: self.id,
-        }
-    }
-}
-fn terminal_family_stage_identity<C: serde::Serialize, P: serde::Serialize>(
-    parameters: [u8; 32],
-    context: [u8; 32],
-    input_id: [u8; 32],
-    input_level: usize,
-    binding: &RnsBggLutBinding,
-    mode: RnsBggTerminalFamilyMode,
-    finalization: TerminalFinalization,
-    range: &FamilyRange,
-    cache: &C,
-    public: &P,
-) -> Result<[u8; 32], RnsBggError> {
-    let encoded = serde_json::to_vec(&(
-        parameters,
-        context,
-        input_id,
-        input_level,
-        binding,
-        mode,
-        finalization,
-        range,
-        cache,
-        public,
+fn decompose_matrix(
+    parameters: &RnsBggParameters,
+    level: usize,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggDecomposition, RnsBggError> {
+    let p = parameters.level(level)?;
+    let base = 1u64
+        .checked_shl(p.base_bits())
+        .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
+    let digits = p.modulus_digits();
+    Ok((
+        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
+        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
     ))
-    .map_err(|_| RnsBggError::Context)?;
-    Ok(sha2::Sha256::digest(encoded).into())
 }
 
-impl RnsBggScheme {
-    /// Decompose in the low ring once, then transport bounded digits to the
-    /// input ring. The decomposition is independent of the input public key.
-    pub fn prepare_private_rhs(
-        &self,
-        rhs: &RnsBggPrivateRhs,
-    ) -> Result<RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>, RnsBggError> {
-        Ok(RnsBggPrivateRhs {
-            ciphertext: rhs.ciphertext.clone(),
-            lifted_ciphertext: self.prepare_digits(rhs.level, rhs.ciphertext.clone())?,
-            level: rhs.level,
-            context: rhs.context,
-            id: rhs.id,
-            rhs_id: rhs.rhs_id,
-        })
+fn centered_extend_decomposition(
+    value: RnsBggDecomposition,
+    modulus: BigInt,
+) -> RnsBggDecomposition {
+    (
+        (value.0.0.centered_extend(modulus.clone()), value.0.1.centered_extend(modulus.clone())),
+        (value.1.0.centered_extend(modulus.clone()), value.1.1.centered_extend(modulus)),
+    )
+}
+
+fn decompose_refresh_matrix(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggDecomposition, RnsBggError> {
+    let decomposition = parameters.level(decomposition_level)?;
+    let base = 1u64
+        .checked_shl(decomposition.base_bits())
+        .ok_or(RnsBggError::Parameters("refresh decomposition base overflow"))?;
+    let digits = decomposition.modulus_digits();
+    let value = (
+        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
+        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
+    );
+    let evaluation_modulus =
+        BigInt::from(parameters.level(evaluation_level)?.modulus().as_ref().clone());
+    Ok(centered_extend_decomposition(value, evaluation_modulus))
+}
+
+fn refresh_payload_action(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    payload: &RnsBggPayloadSecret,
+    desired: RnsBggRow,
+    hash_key: Bytes,
+    tag: impl Into<mxx_dsl::HashTag>,
+    target_columns: usize,
+) -> Result<RnsBggDecomposition, RnsBggError> {
+    let p_modulus = BigInt::from(parameters.level(decomposition_level)?.modulus().as_ref().clone());
+    let p_ring = parameters.ring(decomposition_level)?;
+    let top_matrix = matrix_from_hash(&p_ring, hash_key, tag, target_columns);
+    let r0 = checked_modulus_convert(payload.row.0.clone(), p_modulus.clone())?;
+    let eta =
+        crate::rns_bgg::encoding::fresh_error(parameters, decomposition_level, target_columns)?;
+    let bottom = (
+        desired.0 - r0.clone() * top_matrix.0.0.clone() + eta.0,
+        desired.1 - r0 * top_matrix.0.1.clone() + eta.1,
+    );
+    decompose_refresh_matrix(
+        parameters,
+        evaluation_level,
+        decomposition_level,
+        ((top_matrix.0.0, top_matrix.0.1), bottom),
+    )
+}
+
+fn lift_output_target_to_p(value: RnsBggRow, p_modulus: BigInt, h_p: Mat) -> RnsBggRow {
+    let h_p = h_p.centered_extend(p_modulus.clone());
+    super::map_row(value, |entry| h_p.clone() * entry.centered_extend(p_modulus.clone()))
+}
+
+fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: Mat) -> RnsBggRow {
+    (
+        scale.clone() * coefficient.clone() * payload.0 * gadget.clone(),
+        scale * coefficient * payload.1 * gadget,
+    )
+}
+
+fn sampled_key(
+    parameters: &RnsBggParameters,
+    level: usize,
+    hash_key: Bytes,
+    wire: WireId,
+    public: bool,
+    member: Option<Int>,
+) -> Result<RnsBggPublicKey, RnsBggError> {
+    let ring = parameters.ring(level)?;
+    let columns = if public {
+        parameters.level(level)?.modulus_digits()
+    } else {
+        parameters.component_columns(level)?
+    };
+    Ok(RnsBggPublicKey::new(
+        wire,
+        matrix_from_hash(&ring, hash_key, input_hash_tag(wire, level, member), columns),
+    ))
+}
+
+/// Structural public-key lowerer. All prepared values are compact graph
+/// handles; the maps do not own expanded matrices or concrete family members.
+pub struct PublicKeyLowering<'a> {
+    pub(crate) parameters: &'a RnsBggParameters,
+    pub(crate) program: Arc<ExponentLutProgram>,
+    pub(crate) workload: Arc<RnsBggDerivedWorkload>,
+    pub(crate) payload_secret: RnsBggPayloadSecret,
+    pub(crate) hash_key: Bytes,
+    pub(crate) rhs: BTreeMap<RhsId, InputBinding<Mat, Family<Mat>>>,
+    pub(crate) prepared_rhs:
+        BTreeMap<RhsId, InputBinding<RnsBggDecomposition, Family<RnsBggDecomposition>>>,
+    pub(crate) prepared_public_actions: BTreeMap<(WireId, FamilyScope), RnsBggDecomposition>,
+    pub(crate) prepared_lut_actions:
+        BTreeMap<(WireId, FamilyScope), Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+    pub(crate) prepared_helpers: BTreeMap<(WireId, FamilyScope), RnsBggLutPublicData>,
+    pub(crate) prepared_public_action_families: BTreeMap<WireId, Family<RnsBggDecomposition>>,
+    pub(crate) prepared_lut_action_families:
+        BTreeMap<WireId, Family<(RnsBggDecomposition, RnsBggDecomposition)>>,
+    pub(crate) prepared_helper_families: BTreeMap<(WireId, FamilyScope), Family<RnsBggMatrix>>,
+    /// Refresh targets and compact actions, keyed by declaration commitment
+    /// and CRT slot.  Keeping the commitment in the key prevents material
+    /// from one refresh declaration being reused by another invocation.
+    pub(crate) prepared_refresh_sums: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
+    pub(crate) prepared_refresh_stars: BTreeMap<([u8; 32], usize), RnsBggMatrix>,
+    pub(crate) prepared_refresh_actions: BTreeMap<([u8; 32], usize), RnsBggDecomposition>,
+    pub(crate) prepared_refresh_label_actions:
+        BTreeMap<([u8; 32], usize, usize), RnsBggDecomposition>,
+    pub(crate) current_site: Option<LoweringSite>,
+    parallel_outputs: Vec<PublicKeyParallelOutputs>,
+    parallel_lut_keys: BTreeMap<String, WireId>,
+    parallel_nested_public_keys: BTreeMap<String, WireId>,
+    parallel_nested_lut_keys: BTreeMap<String, WireId>,
+    parallel_nested_helper_keys: BTreeMap<String, (WireId, FamilyScope)>,
+    parallel_public_key_scopes: Vec<BTreeMap<String, WireId>>,
+    parallel_lut_key_scopes: Vec<BTreeMap<String, WireId>>,
+    parallel_helper_key_scopes: Vec<BTreeMap<String, (WireId, FamilyScope)>>,
+    finished_parallel_public_keys: BTreeMap<String, WireId>,
+    finished_parallel_lut_keys: BTreeMap<String, WireId>,
+    finished_parallel_helper_keys: BTreeMap<String, (WireId, FamilyScope)>,
+}
+
+impl<'a> PublicKeyLowering<'a> {
+    /// Construct a public-key lowerer for one immutable Program/workload pair.
+    pub(crate) fn new(
+        parameters: &'a RnsBggParameters,
+        program: Arc<ExponentLutProgram>,
+        workload: Arc<RnsBggDerivedWorkload>,
+        payload_secret: RnsBggPayloadSecret,
+        hash_key: Bytes,
+    ) -> Self {
+        Self {
+            parameters,
+            program,
+            workload,
+            payload_secret,
+            hash_key,
+            rhs: BTreeMap::new(),
+            prepared_rhs: BTreeMap::new(),
+            prepared_public_actions: BTreeMap::new(),
+            prepared_lut_actions: BTreeMap::new(),
+            prepared_helpers: BTreeMap::new(),
+            prepared_public_action_families: BTreeMap::new(),
+            prepared_lut_action_families: BTreeMap::new(),
+            prepared_helper_families: BTreeMap::new(),
+            prepared_refresh_sums: BTreeMap::new(),
+            prepared_refresh_stars: BTreeMap::new(),
+            prepared_refresh_actions: BTreeMap::new(),
+            prepared_refresh_label_actions: BTreeMap::new(),
+            current_site: None,
+            parallel_outputs: Vec::new(),
+            parallel_lut_keys: BTreeMap::new(),
+            parallel_nested_public_keys: BTreeMap::new(),
+            parallel_nested_lut_keys: BTreeMap::new(),
+            parallel_nested_helper_keys: BTreeMap::new(),
+            parallel_public_key_scopes: Vec::new(),
+            parallel_lut_key_scopes: Vec::new(),
+            parallel_helper_key_scopes: Vec::new(),
+            finished_parallel_public_keys: BTreeMap::new(),
+            finished_parallel_lut_keys: BTreeMap::new(),
+            finished_parallel_helper_keys: BTreeMap::new(),
+        }
     }
-    /// Select the active external range before decomposing. Both returned families
-    /// use packed local indices; the scope's input range owns the external offset.
-    pub fn prepare_private_rhs_family(
-        &self,
-        rhs: &RnsBggPrivateRhs<RnsBggRhsFamily>,
-        range: &FamilyRange,
-    ) -> Result<RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>, RnsBggError> {
-        validate_family_range(range, rhs.ciphertext.count())?;
-        let values = mxx_dsl::parallel(range.count().clone(), |index| {
-            let element = RnsBggPrivateRhs {
-                ciphertext: rhs.ciphertext.at(index.add(Int::evaluate(range.start().clone())))?,
-                lifted_ciphertext: (),
-                level: rhs.level,
-                context: rhs.context,
-                id: rhs.id,
-                rhs_id: rhs.rhs_id,
-            };
-            self.prepare_private_rhs(&element).map_err(|_| DslError::Schema)
-        })?;
-        Ok(RnsBggPrivateRhs {
-            ciphertext: values.field(|value| value.ciphertext)?,
-            lifted_ciphertext: values.field(|value| value.lifted_ciphertext)?,
-            level: rhs.level,
-            context: rhs.context,
-            id: rhs.id,
-            rhs_id: rhs.rhs_id,
-        })
+    fn site(&self) -> Result<&LoweringSite, RnsBggError> {
+        self.current_site.as_ref().ok_or(RnsBggError::Binding("missing lowering site"))
+    }
+    fn output(&self) -> Result<WireId, RnsBggError> {
+        Ok(self.site()?.output)
     }
 
-    /// At Q=p*q, prepare MD(A*Dec(C)) once. No internal public rounding,
-    /// automorphism bank, or mask-secret-dependent helper enters this operation.
-    pub fn prepare_mul_private(
-        &self,
-        input: &RnsBggPublicKey,
-        rhs: &RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedPrivateMul, RnsBggError> {
-        use mxx_primitives::poly::PolyParams;
-        self.check_key(input)?;
-        if input.level != rhs.level || input.context != rhs.context {
-            return Err(RnsBggError::Context);
-        }
-        let next = num_bigint::BigInt::from(
-            self.parameters.level(input.level + 1)?.modulus().as_ref().clone(),
-        );
-        let output = RnsBggPublicKey {
-            matrix: (input.matrix.clone() * rhs.lifted_ciphertext.clone()).block_mod_switch(next),
-            level: input.level + 1,
-            id: output_id,
-            context: self.context,
-        };
-        Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
+    fn scope(&self) -> Result<FamilyScope, RnsBggError> {
+        self.site()?
+            .family_scope()
+            .map_err(|_| RnsBggError::Binding("invalid lowering family scope"))
     }
-    /// Prepare a private product independently for every matching family
-    /// member while retaining one structural family body.
-    pub fn prepare_mul_private_family(
+
+    /// Sample an input key with shape selected from Program knowledge.
+    pub(crate) fn sample_input_public_key(
         &self,
-        input: &RnsBggPublicKeyFamily,
-        rhs: &ProgramValue<
-            RnsBggPrivateRhs<RnsBggMatrix, RnsBggDigits>,
-            RnsBggPrivateRhs<Family<RnsBggMatrix>, Family<RnsBggDigits>>,
-        >,
-        output_id: [u8; 32],
-    ) -> Result<
-        RnsBggPreparedPrivateMul<
-            RnsBggPublicKeyFamily,
-            ProgramValue<RnsBggMatrix, Family<RnsBggMatrix>>,
-            ProgramValue<RnsBggDigits, Family<RnsBggDigits>>,
-        >,
-        RnsBggError,
-    > {
-        self.check_public_family(input)?;
-        let (level, context, id, rhs_id) = match rhs {
-            ProgramValue::Scalar(rhs) => (rhs.level, rhs.context, rhs.id, rhs.rhs_id),
-            ProgramValue::Family(rhs) => (rhs.level, rhs.context, rhs.id, rhs.rhs_id),
-        };
-        if input.level != level || input.context != context {
-            return Err(RnsBggError::Context);
-        }
-        if let ProgramValue::Family(rhs) = rhs &&
-            rhs.ciphertext.count() != input.range.count()
-        {
-            return Err(RnsBggError::Context);
-        }
-        let (ciphertext, lifted_ciphertext) = match rhs {
-            ProgramValue::Scalar(rhs) => (
-                ProgramValue::Scalar(rhs.ciphertext.clone()),
-                ProgramValue::Scalar(rhs.lifted_ciphertext.clone()),
-            ),
-            ProgramValue::Family(rhs) => (
-                ProgramValue::Family(rhs.ciphertext.clone()),
-                ProgramValue::Family(rhs.lifted_ciphertext.clone()),
-            ),
-        };
-        let rhs = RnsBggPrivateRhs { ciphertext, lifted_ciphertext, level, context, id, rhs_id };
-        let matrices = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let input = input.element_at_local(index.clone());
-            let rhs = RnsBggPrivateRhs {
-                ciphertext: rhs.ciphertext.at(index.clone()),
-                lifted_ciphertext: rhs.lifted_ciphertext.at(index),
-                level: rhs.level,
-                context: rhs.context,
-                id: rhs.id,
-                rhs_id: rhs.rhs_id,
-            };
-            self.prepare_mul_private(&input, &rhs, output_id)
-                .map(|prepared| prepared.output.matrix)
-                .map_err(|_| DslError::Schema)
-        })
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        let output = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(matrices),
-            level: input.level + 1,
-            id: output_id,
-            context: self.context,
-            range: input.range.clone(),
-        };
-        Ok(RnsBggPreparedPrivateMul { input: input.clone(), output, rhs: rhs.clone() })
-    }
-    /// Prepare an Add operation at one level without changing its modulus.
-    pub fn prepare_add(
-        &self,
-        lhs: &RnsBggPublicKey,
-        rhs: &RnsBggPublicKey,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
-        self.check_key(lhs)?;
-        self.check_key(rhs)?;
-        if lhs.level != rhs.level {
-            return Err(RnsBggError::Context);
-        }
-        Ok(RnsBggPreparedLinear {
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
-            output: RnsBggPublicKey {
-                matrix: lhs.matrix.clone() + rhs.matrix.clone(),
-                level: lhs.level,
-                id: output_id,
-                context: self.context,
-            },
-            operation: LinearOperation::Add,
-        })
-    }
-    /// The multiplier is the known plaintext polynomial of the public operand.
-    /// Its key is checked even though its mask does not enter the output formula.
-    pub fn prepare_mul_public(
-        &self,
-        private: &RnsBggPublicKey,
-        public: &RnsBggPublicKey,
-        multiplier: Mat,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
-        self.check_key(private)?;
-        self.check_key(public)?;
-        if private.level != public.level ||
-            multiplier.matrix_type() != &self.ring(private.level)?.matrix_type((1, 1))
-        {
-            return Err(RnsBggError::Context);
-        }
-        Ok(RnsBggPreparedLinear {
-            lhs: private.clone(),
-            rhs: public.clone(),
-            output: RnsBggPublicKey {
-                matrix: multiplier.clone() * private.matrix.clone(),
-                level: private.level,
-                id: output_id,
-                context: self.context,
-            },
-            operation: LinearOperation::MulPublic(multiplier),
-        })
-    }
-    /// Sample a public input key matrix from a domain-separated hash.
-    ///
-    /// The returned key is public graph material; the payload secret is added
-    /// later by `prepare_input` and `encode`.
-    pub fn sample_input_key(
-        &self,
-        level: usize,
-        hash_key: Bytes,
-        tag: impl Into<HashTag>,
-        id: [u8; 32],
+        wire: WireId,
     ) -> Result<RnsBggPublicKey, RnsBggError> {
-        Ok(RnsBggPublicKey {
-            matrix: RnsBggMatrix::hash(
-                &self.ring(level)?,
-                hash_key,
-                tag,
-                self.parameters.component_columns(level)?,
-            ),
-            level,
-            id,
-            context: self.context,
-        })
+        self.sample_input_public_key_member(wire, None)
     }
-    /// Prepare the payload-dependent public contribution for an input key.
-    ///
-    /// This constructs preprocessing graph material from the secret and does
-    /// not execute or reveal the secret.
-    pub fn prepare_input(
+
+    fn sample_input_public_key_member(
         &self,
-        secret: &RnsBggPayloadSecret,
-        key: &RnsBggPublicKey,
-        payload: Mat,
-    ) -> Result<RnsBggInputMaterial, RnsBggError> {
-        self.check_key(key)?;
-        if payload.matrix_type() != &self.ring(key.level)?.matrix_type((1, 1)) {
-            return Err(RnsBggError::Context);
-        }
-        let r = self.reduce_payload_secret_modulus(secret, key.level)?;
-        let scale = -BigInt::from(self.parameters.scale(key.level)?.clone());
-        let gadget = self.state_gadget(key.level)?;
-        let row =
-            (self.scalar(key.level, scale)? * payload * r).map(|entry| entry * gadget.clone());
-        Ok(RnsBggInputMaterial { row, level: key.level, key_id: key.id, context: self.context })
+        wire: WireId,
+        member: Option<Int>,
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        let public = matches!(
+            self.program
+                .wire_knowledge(wire)
+                .map_err(|_| RnsBggError::Binding("wire knowledge"))?,
+            AttributeKnowledge::PublicPayload
+        );
+        sampled_key(
+            self.parameters,
+            self.workload.level(wire)?,
+            self.hash_key.clone(),
+            wire,
+            public,
+            member,
+        )
     }
-    pub(crate) fn check_key(&self, key: &RnsBggPublicKey) -> Result<(), RnsBggError> {
-        if key.context != self.context ||
-            key.matrix.matrix_type() !=
-                &self
-                    .ring(key.level)?
-                    .matrix_type((2, 2 * self.parameters.component_columns(key.level)?))
-        {
-            return Err(RnsBggError::Context);
+    /// Produce and cache a compact RHS decomposition. Same-ID uses share this handle.
+    fn prepare_rhs_material(
+        &mut self,
+        rhs: &RhsRef<Int>,
+    ) -> Result<RnsBggDecomposition, RnsBggError> {
+        let level = self.workload.rhs_level(rhs.id)?;
+        let next_level =
+            level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
+        let next_modulus =
+            BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
+        let next_ring = self.parameters.ring(next_level)?;
+        let target_columns = self.parameters.component_columns(next_level)?;
+        // Bind the sampled RHS to the caller's plaintext through the same
+        // payload-constrained ciphertext relation used by private input
+        // encryption. The plaintext is a graph handle; it is never copied
+        // into the artifact identity or the online lowerer.
+        let plaintext = match self.rhs.get(&rhs.id) {
+            Some(InputBinding::Scalar(value)) => value.clone(),
+            Some(InputBinding::Family(values)) => {
+                values.at(rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?)
+            }
+            None => return Err(RnsBggError::Binding("RHS plaintext was not bound")),
+        };
+        let ring = self.parameters.ring(level)?;
+        if *plaintext.matrix_type() != ring.matrix_type((1, 1)) {
+            return Err(RnsBggError::Binding("RHS plaintext ring"));
         }
-        Ok(())
+        let nu = checked_modulus_convert(plaintext, next_modulus.clone())?;
+        let payload = checked_modulus_convert_row(self.payload_secret.row.clone(), next_modulus)?;
+        let gadget = self.parameters.state_gadget(next_level)?;
+        let scale =
+            self.parameters.scalar(next_level, self.parameters.scale(next_level)?.clone())?;
+        let target = (payload.0.clone() * gadget.clone(), payload.1.clone() * gadget);
+        let desired = (target.0 * scale.clone() * nu.clone(), target.1 * scale * nu);
+        let tag = mxx_dsl::HashTag::from(
+            format!("rns-bgg/rhs/{:?}/{level}/{next_level}", rhs.id).into_bytes(),
+        );
+        let top_matrix = matrix_from_hash(&next_ring, self.hash_key.clone(), tag, target_columns);
+        let error =
+            crate::rns_bgg::encoding::fresh_error(self.parameters, next_level, target_columns)?;
+        let bottom = (
+            desired.0 - payload.0.clone() * top_matrix.0.0.clone() + error.0,
+            desired.1 - payload.0 * top_matrix.0.1.clone() + error.1,
+        );
+        let compact = decompose_matrix(
+            self.parameters,
+            next_level,
+            ((top_matrix.0.0, top_matrix.0.1), bottom),
+        )?;
+        let evaluation_modulus =
+            BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
+        Ok(centered_extend_decomposition(compact, evaluation_modulus))
     }
-    /// Public preprocessing only. `id` is unique to these public matrices and
-    /// is retained by artifact import; it is not a ciphertext commitment.
-    pub fn sample_mask_bank(
-        &self,
-        level: usize,
-        layout: ExpLayout,
-        hash_key: Bytes,
-        tag: impl Into<HashTag>,
-        id: [u8; 32],
-    ) -> Result<RnsBggMaskBank, RnsBggError> {
-        let ring = self.ring(level)?;
-        self.parameters.level(level + 1)?;
+
+    /// Produce and cache a compact scalar RHS decomposition.
+    pub(crate) fn prepare_rhs(
+        &mut self,
+        rhs: &RhsRef<Int>,
+    ) -> Result<RnsBggDecomposition, RnsBggError> {
+        if rhs.index.is_none() {
+            if let Some(InputBinding::Scalar(value)) = self.prepared_rhs.get(&rhs.id) {
+                return Ok(value.clone());
+            }
+        }
+        let value = self.prepare_rhs_material(rhs)?;
+        if rhs.index.is_none() {
+            self.prepared_rhs.insert(rhs.id, InputBinding::Scalar(value.clone()));
+        }
+        Ok(value)
+    }
+    /// Prepare the neutral public action for a private carrier.
+    pub(crate) fn prepare_mul_public_action(
+        &mut self,
+        private_key: &RnsBggPublicKey,
+    ) -> Result<RnsBggDecomposition, RnsBggError> {
+        let site = self.output()?;
+        let scope = self.scope()?;
+        let value = decompose_matrix(
+            self.parameters,
+            self.workload.level(self.output()?)?,
+            private_key.matrix.clone(),
+        )?;
+        if let Some(outputs) = self.parallel_outputs.last_mut() {
+            let key = format!("{site:?}");
+            outputs.public.insert(key.clone(), value.clone());
+            if let Some(scope) = self.parallel_public_key_scopes.last_mut() {
+                scope.insert(key, site);
+            }
+        } else {
+            self.prepared_public_actions.insert((site, scope), value.clone());
+        }
+        Ok(value)
+    }
+    /// Prepare public LUT data at the workload-selected helper origin.
+    pub(crate) fn prepare_lut_public_data(
+        &mut self,
+        table: &LutTable,
+    ) -> Result<RnsBggLutPublicData, RnsBggError> {
+        let origin = self.workload.lut_helper_origin(self.output()?)?;
+        let level = self.workload.level(origin)?;
+        let ring = self.parameters.ring(level)?;
+        let columns = self.parameters.component_columns(level)?;
+        Family::pack(
+            (0..table.values().len())
+                .map(|index| {
+                    Ok(matrix_from_hash(
+                        &ring,
+                        self.hash_key.clone(),
+                        mxx_dsl::HashTag::from(
+                            format!("rns-bgg/lut-data/{origin:?}/{index}").into_bytes(),
+                        ),
+                        columns,
+                    ))
+                })
+                .collect::<Result<Vec<_>, RnsBggError>>()?,
+        )
+        .map_err(graph)
+    }
+    /// Prepare the compact action for a unary LUT input.
+    pub(crate) fn prepare_lut_actions(
+        &mut self,
+        input: &RnsBggPublicKey,
+        table: &LutTable,
+    ) -> Result<Family<(RnsBggDecomposition, RnsBggDecomposition)>, RnsBggError> {
+        let level = self.workload.level(input.wire)?;
+        let next_level =
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
+        let source_modulus = BigInt::from(self.parameters.level(level)?.modulus().as_ref().clone());
+        let target_modulus =
+            BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
+        let origin = self.workload.lut_helper_origin(self.output()?)?;
+        let count = IntExpr::constant(table.values().len());
+        let layout =
+            ExpLayout { stride_log2: 0, width_log2: table.values().len().trailing_zeros() };
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
-        let root = tag.into();
-        let columns = self.parameters.component_columns(level)?;
-        let batch = crate::utils::preprocess_batch_size()?;
-        let mut branches = Vec::with_capacity(sigmas.len());
-        for start in (0..sigmas.len()).step_by(batch) {
-            let len = batch.min(sigmas.len() - start);
-            let public = mxx_dsl::parallel(len, |local| {
-                let index = local.add(Int::constant(start));
-                let sigma = layout
-                    .automorphism_index_expression(
-                        self.parameters.level(level).unwrap().ring_dimension() as usize,
-                        index.expression()?,
-                    )
-                    .map_err(|_| DslError::Schema)?;
-                let mut tag = root.clone();
-                tag.push("rns_bgg-mask");
-                tag.push(mxx_ir_core::IntExpr::constant(level));
-                tag.push(sigma);
-                Ok(RnsBggMatrix::hash(&ring, hash_key.clone(), tag, columns))
-            })?;
-            for local in 0..len {
-                branches
-                    .push(MaskBranch { sigma: sigmas[start + local], public: public.at(local) });
-            }
-        }
-        Ok(RnsBggMaskBank { id, level, context: self.context, branches })
-    }
-    /// Prepare one scalar LUT by decomposing helper material once and building
-    /// input-key-dependent branch products in the graph.
-    pub fn prepare_lut(
-        &self,
-        input: &RnsBggPublicKey,
-        material: &RnsBggLutMaterial,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedLut, RnsBggError> {
-        if material.table.is_some() && material.rhs_id.is_some() {
-            return Err(RnsBggError::Lut);
-        }
-        let lifted = self.prepare_lut_material_digits(input.level, material)?;
-        let (raw_public, branches) = self.prepare_lut_raw(input, material, &lifted)?;
-        let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
-        let output = RnsBggPublicKey {
-            matrix: raw_public.block_mod_switch(next),
-            level: input.level + 1,
-            id: output_id,
-            context: self.context,
-        };
-        Ok(RnsBggPreparedLut {
-            binding: material.binding(),
-            input: input.clone(),
-            output,
-            branches,
-        })
-    }
-
-    /// Prepare material-only branch decompositions once. This depends on the
-    /// helper ciphertexts and level, but not on the input public key.
-    fn prepare_lut_material_digits(
-        &self,
-        level: usize,
-        material: &RnsBggLutMaterial,
-    ) -> Result<Vec<RnsBggDigits>, RnsBggError> {
-        material
-            .branches
-            .iter()
-            .map(|(_, ciphertext)| self.prepare_digits(level, ciphertext.clone()))
-            .collect()
-    }
-    /// Shared branch preparation; terminal batches retain K before its outer switch.
-    pub(super) fn prepare_lut_raw(
-        &self,
-        input: &RnsBggPublicKey,
-        material: &RnsBggLutMaterial,
-        lifted_ciphertexts: &[RnsBggDigits],
-    ) -> Result<(RnsBggMatrix, Vec<PreparedBranch>), RnsBggError> {
-        self.check_key(input)?;
-        if input.level != material.level || input.context != material.context {
-            return Err(RnsBggError::Context);
-        }
-        let level = input.level;
-        let next = BigInt::from(self.parameters.level(level + 1)?.modulus().as_ref().clone());
-        let batch = crate::utils::preprocess_batch_size()?;
-        let ring = self.ring(level)?;
-        let first = &material.branches[0].1;
-        let mut raw_public = RnsBggMatrix::new(std::array::from_fn(|row| {
-            std::array::from_fn(|column| {
-                ring.zero((1, first.entry(row, column).matrix_type().columns.clone()))
-            })
-        }))?;
-        let mut branches = Vec::with_capacity(material.branches.len());
-        for start in (0..material.branches.len()).step_by(batch) {
-            let end = (start + batch).min(material.branches.len());
-            let members = &material.branches[start..end];
-            let lifted = &lifted_ciphertexts[start..end];
-            let inputs = Family::pack(
-                members
-                    .iter()
-                    .zip(lifted)
-                    .map(|((mask, _), lifted)| (mask.public.clone(), lifted.clone()))
-                    .collect(),
-            )?;
-            let prepared = mxx_dsl::parallel(members.len(), |index| {
-                let sigma = IntExpr::Select {
-                    selector: Box::new(index.expression()?),
-                    branches: members
-                        .iter()
-                        .map(|(mask, _)| IntExpr::constant(mask.sigma))
-                        .collect(),
-                };
-                let (mask, lifted) = inputs.at(index);
-                let intermediate = (input.matrix.clone().ring_automorphism(sigma) * lifted)
-                    .block_mod_switch(next.clone());
-                let intermediate =
-                    self.prepare_digits(level, intermediate).map_err(|_| DslError::Schema)?;
-                let public = mask.clone() * intermediate.clone();
-                Ok(((mask, intermediate), public))
-            })?;
-            let sum = crate::utils::balanced_sum_family(prepared.field(|(_, public)| public)?)
-                .map_err(|_| DslError::Schema)?;
-            raw_public = raw_public + sum;
-            let cache = prepared.field(|(cache, _)| cache)?;
-            for (index, (mask, _)) in members.iter().enumerate() {
-                let (mask_public, lifted_intermediate) = cache.at(index);
-                branches.push(PreparedBranch {
-                    sigma: mask.sigma,
-                    mask_public,
-                    lifted_ciphertext: lifted[index].clone(),
-                    lifted_intermediate,
-                });
-            }
-        }
-        Ok((raw_public, branches))
-    }
-    /// Build the public CRT recomposition coefficients for a refresh output.
-    pub fn prepare_refresh_recomposition(
-        &self,
-        output_key: RnsBggPublicKey,
-    ) -> Result<RnsBggRefreshRecomposition, RnsBggError> {
-        let parameters = self.parameters.level(output_key.level)?;
-        let q = BigInt::from(parameters.modulus().as_ref().clone());
-        let coefficients = parameters
-            .to_crt()
-            .0
-            .into_iter()
-            .map(|prime| {
-                let prime = BigInt::from(prime);
-                let h = &q / &prime;
-                let inverse = crate::utils::modular_inverse(&h, &prime)
-                    .ok_or(RnsBggError::Parameters("non-coprime CRT basis"))?;
-                self.scalar(output_key.level, h * inverse)
-            })
-            .collect::<Result<_, _>>()?;
-        Ok(RnsBggRefreshRecomposition { output_key, coefficients })
-    }
-    /// Export terminal public artifacts and its descriptor into a DSL graph.
-    ///
-    /// The descriptor records the expected production, parameter identity,
-    /// stage binding, and artifact names; import validates those identities.
-    pub fn export_prepared_terminal(
-        &self,
-        prepared: &RnsBggPreparedTerminal,
-        mut graph: mxx_dsl::DslContext,
-        prefix: &str,
-    ) -> Result<(mxx_dsl::DslContext, RnsBggPreparedTerminalDescriptor), RnsBggError> {
-        self.check_key(&prepared.input)?;
-        graph = graph.public_output(prefix, prepared.clone())?;
-        Ok((
-            graph,
-            RnsBggPreparedTerminalDescriptor {
-                prepared: RnsBggPreparedLutDescriptor {
-                    prefix: prefix.into(),
-                    parameters: self.parameter_identity(),
-                    binding: prepared.binding.clone(),
-                    input_id: prepared.input.id,
-                    output_id: prepared.id,
-                    sigmas: prepared.branches.iter().map(|branch| branch.sigma).collect(),
-                    schema: prepared.schema(),
-                },
-            },
-        ))
-    }
-    /// Expected identities come from preprocessing. Online s is only needed
-    /// later, by prepare_online_masks on the restored public mask bank.
-    pub fn import_prepared_terminal(
-        &self,
-        descriptor: &RnsBggPreparedTerminalDescriptor,
-        production: mxx_ir_core::artifact::ProductionId,
-        binding: &RnsBggLutBinding,
-        input_id: [u8; 32],
-        stage_id: [u8; 32],
-    ) -> Result<RnsBggPreparedTerminal, RnsBggError> {
-        let data = &descriptor.prepared;
-        self.check_prepared_descriptor(data, binding, input_id, stage_id)?;
-        Ok(data.schema.artifact_input(production, &data.prefix, ArtifactConfidentiality::Public)?)
-    }
-
-    pub(super) fn artifact_binding(&self) -> RnsBggArtifactBinding {
-        RnsBggArtifactBinding { parameters: self.parameter_identity(), context: self.context }
-    }
-    pub(super) fn parameter_identity(&self) -> [u8; 32] {
-        *self.parameter_identity.get_or_init(|| {
-            use sha2::Digest;
-            let mut hash = sha2::Sha256::new();
-            hash.update(b"rns_bgg-prepared-parameters");
-            let sigma = self.parameters.encoding_error_sigma.to_string();
-            hash.update((sigma.len() as u64).to_le_bytes());
-            hash.update(sigma.as_bytes());
-            let bound = self.parameters.encoding_error_bound.to_bytes_be();
-            hash.update((bound.len() as u64).to_le_bytes());
-            hash.update(bound);
-            hash.update((self.parameters.operations_per_drop() as u64).to_le_bytes());
-            hash.update((self.parameters.levels().len() as u64).to_le_bytes());
-            for level in self.parameters.levels() {
-                hash.update(level.ring_dimension().to_le_bytes());
-                hash.update(level.base_bits().to_le_bytes());
-                let primes = level.to_crt().0;
-                hash.update((primes.len() as u64).to_le_bytes());
-                for prime in primes {
-                    hash.update(prime.to_le_bytes());
-                }
-            }
-            hash.finalize().into()
-        })
-    }
-    pub(super) fn check_public_family(
-        &self,
-        family: &RnsBggPublicKeyFamily,
-    ) -> Result<(), RnsBggError> {
-        validate_family_range(&family.range, family.range.capacity())?;
-        if family.context != self.context ||
-            matches!(&family.matrices, ProgramValue::Family(values) if values.count() != family.range.count()) ||
-            family.matrices.element_schema().matrix_type() !=
-                self.ring(family.level)?
-                    .matrix_type((2, 2 * self.parameters.component_columns(family.level)?))
-        {
-            return Err(RnsBggError::Context);
-        }
-        Ok(())
-    }
-    /// Double-scale note (8.4): combine slot ciphertexts in the low base before
-    /// preparing any public intermediates or applying block ModSwitch.
-    /// `multipliers` contains active public labels only; `range.start` indexes
-    /// the full ciphertext family. Monomial labels and one-hot selectors are
-    /// caller contracts, not runtime ciphertext checks. The fresh-error bound
-    /// includes every active label's l1 gain, including zero-selector slots.
-    /// `rhs_id` identifies this label-specific composed RHS artifact, including
-    /// the source material and active range, and is also its material identity.
-    pub fn compose_lut_material(
-        &self,
-        material: &RnsBggLutMaterialFamily,
-        multipliers: &Family<Mat>,
-        range: &FamilyRange,
-        rhs_id: [u8; 32],
-    ) -> Result<RnsBggLutMaterial, RnsBggError> {
-        if material.binding.context != self.context ||
-            material.binding.rhs.is_none() ||
-            material.binding.table.is_some() ||
-            multipliers.count() != range.count() ||
-            multipliers.element_type() !=
-                &self.ring(material.binding.level + 1)?.matrix_type((1, 1))
-        {
-            return Err(RnsBggError::Context);
-        }
-        validate_family_range(range, &material.ciphertexts.count())?;
-        let branches = material
-            .masks
-            .iter()
-            .enumerate()
-            .map(|(branch, mask)| {
-                let count = range
-                    .count()
-                    .evaluate(&ParamEnv::default())
-                    .ok()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .ok_or(RnsBggError::Context)?;
-                let ciphertext = crate::utils::reduce_generated_segments(
-                    1,
-                    count,
-                    |_, index| {
-                        let external = index.clone().add(Int::evaluate(range.start().clone()));
-                        multipliers.at(&index).ring_automorphism(mask.sigma) *
-                            material.ciphertexts.at(external).0[branch].clone()
-                    },
-                    |left, right| left + right,
-                )
-                .map_err(|error| RnsBggError::Graph(error.to_string()))?
-                .at(0);
-                Ok((mask.clone(), ciphertext))
-            })
-            .collect::<Result<Vec<_>, RnsBggError>>()?;
-        Ok(RnsBggLutMaterial {
-            mask_bank: material.binding.mask_bank,
-            id: rhs_id,
-            level: material.binding.level,
-            context: material.binding.context,
-            table: material.binding.table,
-            rhs_id: Some(rhs_id),
-            branches,
-        })
-    }
-    /// Prepare a unary LUT for every member of a public-key family.
-    ///
-    /// Material-only digit decomposition is performed outside the indexed
-    /// body; input-key-dependent products remain inside the family body.
-    pub fn prepare_lut_family(
-        &self,
-        input: &RnsBggPublicKeyFamily,
-        material: &RnsBggLutMaterialFamily,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedLutFamily, RnsBggError> {
-        self.check_public_family(input)?;
-        if input.level != material.binding.level || input.context != material.binding.context {
-            return Err(RnsBggError::Context);
-        }
-        validate_family_range(&input.range, &material.ciphertexts.count())?;
-        let lifted_material = mxx_dsl::parallel(material.ciphertexts.count().clone(), |member| {
-            let ciphertexts = material.ciphertexts.at(member);
-            let lifted = ciphertexts
-                .0
-                .into_iter()
-                .map(|ciphertext| self.prepare_digits(input.level, ciphertext))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| DslError::Schema)?;
-            Ok(RnsBggLiftedBranches(lifted))
-        })
-        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        let prepared = mxx_dsl::parallel(input.range.count().clone(), |index| {
-            let external = index.clone().add(Int::evaluate(input.range.start().clone()));
-            let scalar_material = material.element_at_external(external.clone());
-            let lifted_member = lifted_material.at(external);
-            let lifted = (0..material.masks.len())
-                .map(|branch| lifted_member.0[branch].clone())
-                .collect::<Vec<_>>();
-            let key = input.element_at_local(index);
-            let (raw_public, branches) = self
-                .prepare_lut_raw(&key, &scalar_material, &lifted)
-                .map_err(|_| DslError::Schema)?;
-            let next = BigInt::from(
-                self.parameters
-                    .level(input.level + 1)
-                    .map_err(|_| DslError::Schema)?
-                    .modulus()
-                    .as_ref()
-                    .clone(),
-            );
-            let output = RnsBggPublicKey {
-                matrix: raw_public.block_mod_switch(next),
-                level: input.level + 1,
-                id: output_id,
-                context: self.context,
+        let actions = mxx_dsl::parallel(count, |index| {
+            let sigma = IntExpr::Select {
+                selector: Box::new(index.expression()?),
+                branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            Ok(RnsBggPreparedLut {
-                binding: scalar_material.binding(),
-                input: key,
-                output,
-                branches,
-            })
-        })?;
-        let matrices = prepared.field(|value| value.output.matrix)?;
-        Ok(RnsBggPreparedLutFamily {
-            input: input.clone(),
-            output: RnsBggPublicKeyFamily {
-                matrices: ProgramValue::Family(matrices),
-                level: input.level + 1,
-                id: output_id,
-                context: self.context,
-                range: input.range.clone(),
-            },
-            prepared,
-        })
-    }
-    /// A supplied multiplier selects public multiplication; absence selects
-    /// addition. The resulting prepared operation fixes the online formula.
-    pub fn prepare_linear_family(
-        &self,
-        lhs: &RnsBggPublicKeyFamily,
-        rhs: &RnsBggPublicKeyFamily,
-        multiplier: Option<ProgramValue<Mat, Family<Mat>>>,
-        output_id: [u8; 32],
-    ) -> Result<
-        RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
-        RnsBggError,
-    > {
-        self.check_public_family(lhs)?;
-        self.check_public_family(rhs)?;
-        if lhs.level != rhs.level || lhs.range != rhs.range {
-            return Err(RnsBggError::Context);
-        }
-        let scalar_type = self.ring(lhs.level)?.matrix_type((1, 1));
-        if multiplier.as_ref().is_some_and(|value| {
-            matches!(value, ProgramValue::Family(values) if values.count() != lhs.range.count()) ||
-                value.element_schema() != MatType(scalar_type.clone())
-        }) {
-            return Err(RnsBggError::Context);
-        }
-        let matrices = mxx_dsl::parallel(lhs.range.count().clone(), |index| {
-            let left = lhs.element_at_local(index.clone());
-            let right = rhs.element_at_local(index.clone());
-            let prepared = match &multiplier {
-                Some(multiplier) => {
-                    self.prepare_mul_public(&left, &right, multiplier.at(index), output_id)
-                }
-                None => self.prepare_add(&left, &right, output_id),
-            }
-            .map_err(|_| DslError::Schema)?;
-            Ok(prepared.output.matrix)
-        })
-        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        Ok(RnsBggPreparedLinear {
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
-            operation: multiplier.map_or(LinearOperation::Add, LinearOperation::MulPublic),
-            output: RnsBggPublicKeyFamily {
-                matrices: ProgramValue::Family(matrices),
-                level: lhs.level,
-                id: output_id,
-                context: self.context,
-                range: lhs.range.clone(),
-            },
-        })
-    }
-    /// Prepare reduction of a family into one scalar public key.
-    pub fn prepare_reduce_family(
-        &self,
-        value: &RnsBggPublicKeyFamily,
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedReduction, RnsBggError> {
-        self.check_public_family(value)?;
-        let matrix = match &value.matrices {
-            ProgramValue::Scalar(matrix) => {
-                self.ring(value.level)?.polynomial([value.range.count().clone()]) * matrix.clone()
-            }
-            ProgramValue::Family(matrices) => sum(matrices.clone())?,
-        };
-        Ok(RnsBggPreparedReduction {
-            input: value.clone(),
-            output: RnsBggPublicKey {
-                matrix,
-                level: value.level,
-                id: output_id,
-                context: self.context,
-            },
-        })
-    }
-    pub(super) fn check_linear_descriptor(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        expected: &RnsBggLinearBinding,
-    ) -> Result<(), RnsBggError> {
-        if descriptor.parameters != self.parameter_identity() ||
-            descriptor.binding != *expected ||
-            expected.context != self.context
-        {
-            return Err(RnsBggError::Context);
-        }
-        self.ring(expected.level)?;
-        Ok(())
-    }
-    pub(super) fn import_linear_key(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        production: &ProductionId,
-        role: &str,
-        id: [u8; 32],
-    ) -> Result<RnsBggPublicKey, RnsBggError> {
-        Ok(RnsBggPublicKey {
-            matrix: import_blocks(
-                &self.ring(descriptor.binding.level)?,
-                production,
-                &format!("{}.{role}", descriptor.prefix),
-                self.parameters.component_columns(descriptor.binding.level)?,
-            ),
-            level: descriptor.binding.level,
-            id,
-            context: self.context,
-        })
-    }
-    pub(super) fn import_linear_key_family(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        production: &ProductionId,
-        role: &str,
-        id: [u8; 32],
-    ) -> Result<RnsBggPublicKeyFamily, RnsBggError> {
-        let range = descriptor.binding.operation.input_range().ok_or(RnsBggError::Context)?;
-        let ring = self.ring(descriptor.binding.level)?;
-        let schema = BlocksType::<2, 2>(std::array::from_fn(|_| {
-            std::array::from_fn(|_| {
-                MatType(
-                    ring.matrix_type((
-                        1,
-                        self.parameters
-                            .component_columns(descriptor.binding.level)
-                            .expect("validated key level"),
-                    )),
-                )
-            })
-        }));
-        let output_storage = ProgramValue::Family(vec![false; 4]);
-        Ok(RnsBggPublicKeyFamily {
-            matrices: import_family_value(
-                schema,
-                range.count().clone(),
-                match role {
-                    "lhs" => &descriptor.key_storage[0],
-                    "rhs" => &descriptor.key_storage[1],
-                    _ => &output_storage,
-                },
-                production.clone(),
-                &format!("{}.{role}", descriptor.prefix),
-            )?,
-            level: descriptor.binding.level,
-            id,
-            context: self.context,
-            range: range.clone(),
-        })
-    }
-    /// Export scalar linear-operation artifacts and an identity descriptor.
-    pub fn export_prepared_linear(
-        &self,
-        prepared: &RnsBggPreparedLinear,
-        mut graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
-        let keys = [("lhs", &prepared.lhs), ("rhs", &prepared.rhs), ("output", &prepared.output)];
-        for (_, key) in &keys {
-            self.check_key(key)?;
-        }
-        graph = graph.public_outputs(
-            keys.map(|(role, key)| (format!("{prefix}.{role}"), key.matrix.clone())),
-        )?;
-        let (graph, operation) = prepared.operation.export(graph, prefix, prepared.rhs.id, None)?;
-        Ok((
-            graph,
-            RnsBggPreparedLinearDescriptor {
-                key_storage: [ProgramValue::Scalar(()), ProgramValue::Scalar(())],
-                multiplier_storage: ProgramValue::Scalar(()),
-                prefix: prefix.into(),
-                parameters: self.parameter_identity(),
-                binding: RnsBggLinearBinding {
-                    context: self.context,
-                    level: prepared.lhs.level,
-                    lhs: prepared.lhs.id,
-                    output: prepared.output.id,
-                    operation,
-                },
-            },
-        ))
-    }
-    /// Validate metadata once when constructing the consuming graph. The
-    /// production manifest must also be supplied when freezing that graph.
-    pub fn import_prepared_linear(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        production: ProductionId,
-        expected: &RnsBggLinearBinding,
-    ) -> Result<RnsBggPreparedLinear, RnsBggError> {
-        self.check_linear_descriptor(descriptor, expected)?;
-        if expected.operation.input_range().is_some() {
-            return Err(RnsBggError::Context);
-        }
-        let (operation, rhs_id) = LinearOperation::import(
-            &expected.operation,
-            &MatType(self.ring(expected.level)?.matrix_type((1, 1))),
-            production.clone(),
-            &descriptor.prefix,
-        )?;
-        Ok(RnsBggPreparedLinear {
-            lhs: self.import_linear_key(descriptor, &production, "lhs", expected.lhs)?,
-            rhs: self.import_linear_key(descriptor, &production, "rhs", rhs_id)?,
-            output: self.import_linear_key(descriptor, &production, "output", expected.output)?,
-            operation,
-        })
-    }
-    /// Export family linear-operation artifacts with their range binding.
-    pub fn export_prepared_linear_family(
-        &self,
-        prepared: &RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
-        mut graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
-        let keys = [("lhs", &prepared.lhs), ("rhs", &prepared.rhs), ("output", &prepared.output)];
-        for (_, key) in &keys {
-            self.check_public_family(key)?;
-        }
-        graph = graph.public_outputs(
-            keys.map(|(role, key)| (format!("{prefix}.{role}"), key.matrices.clone())),
-        )?;
-        let (graph, operation) = prepared.operation.export(
-            graph,
-            prefix,
-            prepared.rhs.id,
-            Some(prepared.lhs.range.clone()),
-        )?;
-        Ok((
-            graph,
-            RnsBggPreparedLinearDescriptor {
-                key_storage: [
-                    family_storage(&prepared.lhs.matrices),
-                    family_storage(&prepared.rhs.matrices),
-                ],
-                multiplier_storage: match &prepared.operation {
-                    LinearOperation::Add => ProgramValue::Scalar(()),
-                    LinearOperation::MulPublic(value) => family_storage(value),
-                },
-                prefix: prefix.into(),
-                parameters: self.parameter_identity(),
-                binding: RnsBggLinearBinding {
-                    context: self.context,
-                    level: prepared.lhs.level,
-                    lhs: prepared.lhs.id,
-                    output: prepared.output.id,
-                    operation,
-                },
-            },
-        ))
-    }
-    /// Import and validate family linear artifacts from a production graph.
-    pub fn import_prepared_linear_family(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        production: ProductionId,
-        expected: &RnsBggLinearBinding,
-    ) -> Result<
-        RnsBggPreparedLinear<RnsBggPublicKeyFamily, ProgramValue<Mat, Family<Mat>>>,
-        RnsBggError,
-    > {
-        self.check_linear_descriptor(descriptor, expected)?;
-        let range = expected.operation.input_range().ok_or(RnsBggError::Context)?;
-        let ring = self.ring(expected.level)?;
-        let (operation, rhs_id) = LinearOperation::import(
-            &expected.operation,
-            &match &descriptor.multiplier_storage {
-                ProgramValue::Scalar(()) => ProgramValue::Scalar(MatType(ring.matrix_type((1, 1)))),
-                ProgramValue::Family(shared) => ProgramValue::Family(FamilyType {
-                    element: MatType(ring.matrix_type((1, 1))),
-                    count: range.count().clone(),
-                    shared: shared.clone(),
-                }),
-            },
-            production.clone(),
-            &descriptor.prefix,
-        )?;
-        Ok(RnsBggPreparedLinear {
-            lhs: self.import_linear_key_family(descriptor, &production, "lhs", expected.lhs)?,
-            rhs: self.import_linear_key_family(descriptor, &production, "rhs", rhs_id)?,
-            output: self.import_linear_key_family(
-                descriptor,
-                &production,
-                "output",
-                expected.output,
-            )?,
-            operation,
-        })
-    }
-    /// Export a family reduction descriptor and its public artifacts.
-    pub fn export_prepared_reduction(
-        &self,
-        prepared: &RnsBggPreparedReduction,
-        graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedLinearDescriptor), RnsBggError> {
-        self.check_public_family(&prepared.input)?;
-        self.check_key(&prepared.output)?;
-        let graph = graph
-            .public_output(format!("{prefix}.lhs"), prepared.input.matrices.clone())
-            .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        let graph =
-            graph.public_output(&format!("{prefix}.output"), (prepared.output.matrix).clone())?;
-        Ok((
-            graph,
-            RnsBggPreparedLinearDescriptor {
-                key_storage: [family_storage(&prepared.input.matrices), ProgramValue::Scalar(())],
-                multiplier_storage: ProgramValue::Scalar(()),
-                prefix: prefix.into(),
-                parameters: self.parameter_identity(),
-                binding: RnsBggLinearBinding {
-                    context: self.context,
-                    level: prepared.input.level,
-                    lhs: prepared.input.id,
-                    output: prepared.output.id,
-                    operation: RnsBggLinearOperation::Reduce {
-                        range: prepared.input.range.clone(),
-                    },
-                },
-            },
-        ))
-    }
-    /// Import and validate a previously exported family reduction.
-    pub fn import_prepared_reduction(
-        &self,
-        descriptor: &RnsBggPreparedLinearDescriptor,
-        production: ProductionId,
-        expected: &RnsBggLinearBinding,
-    ) -> Result<RnsBggPreparedReduction, RnsBggError> {
-        self.check_linear_descriptor(descriptor, expected)?;
-        if !matches!(expected.operation, RnsBggLinearOperation::Reduce { .. }) {
-            return Err(RnsBggError::Context);
-        }
-        Ok(RnsBggPreparedReduction {
-            input: self.import_linear_key_family(descriptor, &production, "lhs", expected.lhs)?,
-            output: self.import_linear_key(descriptor, &production, "output", expected.output)?,
-        })
-    }
-    /// Persist the public key and private -p*mu*r contribution separately.
-    /// This graph needs no online mask secret and exports neither secret key.
-    pub fn export_input_material(
-        &self,
-        key: &RnsBggPublicKey,
-        material: &RnsBggInputMaterial,
-        mut graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggInputMaterialDescriptor), RnsBggError> {
-        self.check_key(key)?;
-        if material.context != self.context ||
-            material.level != key.level ||
-            material.key_id != key.id
-        {
-            return Err(RnsBggError::Context);
-        }
-        graph = graph.public_output(&format!("{prefix}.key"), (key.matrix).clone())?;
-        for column in 0..2 {
-            graph = graph
-                .private_output(
-                    format!("{prefix}.payload.{column}"),
-                    material.row.entry(0, column).clone(),
-                )
-                .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        }
-        Ok((
-            graph,
-            RnsBggInputMaterialDescriptor {
-                prefix: prefix.into(),
-                scheme: self.artifact_binding(),
-                level: key.level,
-                key_id: key.id,
-            },
-        ))
-    }
-    /// Restore the input pair with private artifact ports for the contribution.
-    /// The caller selects the descriptor/production for the intended payload;
-    /// the runtime manifest enforces the declared confidentiality and shapes.
-    pub fn import_input_material(
-        &self,
-        descriptor: &RnsBggInputMaterialDescriptor,
-        production: ProductionId,
-        key_id: [u8; 32],
-        level: usize,
-    ) -> Result<(RnsBggPublicKey, RnsBggInputMaterial), RnsBggError> {
-        if descriptor.scheme != self.artifact_binding() ||
-            descriptor.key_id != key_id ||
-            descriptor.level != level
-        {
-            return Err(RnsBggError::Context);
-        }
-        let ring = self.ring(level)?;
-        let columns = self.parameters.component_columns(level)?;
-        let key = RnsBggPublicKey {
-            matrix: import_blocks(
-                &ring,
-                &production,
-                &format!("{}.key", descriptor.prefix),
-                columns,
-            ),
-            level,
-            id: key_id,
-            context: self.context,
-        };
-        let row = crate::rns_bgg::RnsBggRow::new([std::array::from_fn(|column| {
-            ring.artifact_input(
-                production.clone(),
-                format!("{}.payload.{column}", descriptor.prefix),
-                (1, columns),
-                ArtifactConfidentiality::Private,
+            let coefficient = super::EncodingLowering::lut_coefficient(
+                self.parameters,
+                next_level,
+                table.output_representation(),
+                sigma.clone(),
+                table.values(),
             )
-        })])
-        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-        Ok((key, RnsBggInputMaterial { row, level, key_id, context: self.context }))
-    }
-    pub(super) fn check_prepared_descriptor<S>(
-        &self,
-        descriptor: &RnsBggPreparedLutDescriptor<S>,
-        binding: &RnsBggLutBinding,
-        input_id: [u8; 32],
-        output_id: [u8; 32],
-    ) -> Result<(), RnsBggError> {
-        if descriptor.parameters != self.parameter_identity() ||
-            descriptor.binding != *binding ||
-            binding.context != self.context ||
-            descriptor.input_id != input_id ||
-            descriptor.output_id != output_id ||
-            descriptor.sigmas.is_empty()
-        {
-            return Err(RnsBggError::Context);
-        }
-        let width = descriptor.sigmas.len();
-        if !width.is_power_of_two() || (binding.table.is_none() && width != 1) {
-            return Err(RnsBggError::Lut);
-        }
-        // Branch indices come from the selected preprocessing descriptor.
-        // Its table binding commits the layout, including terminal strides;
-        // regenerating a stride-zero set here would reject valid subrings.
-        Ok(())
-    }
-    /// Persist indexed families without enumerating slots on the host. The
-    /// existing runtime streams each polynomial family into its artifact store.
-    pub fn export_prepared_lut_family(
-        &self,
-        prepared: &RnsBggPreparedLutFamily,
-        mut graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedLutFamilyDescriptor), RnsBggError> {
-        self.check_public_family(&prepared.input)?;
-        self.check_public_family(&prepared.output)?;
-        let schema = prepared.prepared.schema();
-        graph = graph.public_output(prefix, prepared.prepared.clone())?;
-        let element = prepared.prepared.schema().element;
-        Ok((
-            graph,
-            RnsBggPreparedLutFamilyDescriptor {
-                prepared: RnsBggPreparedLutDescriptor {
-                    prefix: prefix.into(),
-                    parameters: self.parameter_identity(),
-                    binding: element.binding,
-                    input_id: prepared.input.id,
-                    output_id: prepared.output.id,
-                    sigmas: element.branches.iter().map(|branch| branch.sigma).collect(),
-                    schema,
-                },
-                range: prepared.input.range.clone(),
-            },
-        ))
-    }
-    /// Restore the structural family views. Range and setup contracts are
-    /// checked once here, while slot payloads remain runtime-managed artifacts.
-    pub fn import_prepared_lut_family(
-        &self,
-        descriptor: &RnsBggPreparedLutFamilyDescriptor,
-        production: ProductionId,
-        binding: &RnsBggLutBinding,
-        input_id: [u8; 32],
-        output_id: [u8; 32],
-        range: &FamilyRange,
-    ) -> Result<RnsBggPreparedLutFamily, RnsBggError> {
-        if binding.table.is_some() && binding.rhs.is_some() {
-            return Err(RnsBggError::Lut);
-        }
-        let data = &descriptor.prepared;
-        self.check_prepared_descriptor(data, binding, input_id, output_id)?;
-        if descriptor.range != *range {
-            return Err(RnsBggError::Context);
-        }
-        let prepared = data.schema.artifact_input(
-            production,
-            &data.prefix,
-            ArtifactConfidentiality::Public,
-        )?;
-        let input = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(prepared.field(|value| value.input.matrix)?),
-            level: binding.level,
-            id: input_id,
-            context: self.context,
-            range: range.clone(),
-        };
-        let output = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(prepared.field(|value| value.output.matrix)?),
-            level: binding.level + 1,
-            id: output_id,
-            context: self.context,
-            range: range.clone(),
-        };
-        Ok(RnsBggPreparedLutFamily { input, output, prepared })
-    }
-    /// Export existing public helper values. Low-base C/b remain low-base;
-    /// no dense concatenation, coefficient extraction, or extra lift is used.
-    pub fn export_prepared_lut(
-        &self,
-        prepared: &RnsBggPreparedLut,
-        mut graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedLutDescriptor), RnsBggError> {
-        self.check_key(&prepared.input)?;
-        self.check_key(&prepared.output)?;
-        graph = graph.public_output(prefix, prepared.clone())?;
-        Ok((
-            graph,
-            RnsBggPreparedLutDescriptor {
-                prefix: prefix.into(),
-                parameters: self.parameter_identity(),
-                binding: prepared.binding.clone(),
-                input_id: prepared.input.id,
-                output_id: prepared.output.id,
-                sigmas: prepared.branches.iter().map(|branch| branch.sigma).collect(),
-                schema: prepared.schema(),
-            },
-        ))
-    }
-    /// Expected identities come from the setup contract. Freeze the resulting
-    /// graph with the runtime production manifest before executing it. The
-    /// imported online graph has no public-key preprocessing multiplications.
-    pub fn import_prepared_lut(
-        &self,
-        descriptor: &RnsBggPreparedLutDescriptor,
-        production: ProductionId,
-        binding: &RnsBggLutBinding,
-        input_id: [u8; 32],
-        output_id: [u8; 32],
-    ) -> Result<RnsBggPreparedLut, RnsBggError> {
-        if binding.table.is_some() && binding.rhs.is_some() {
-            return Err(RnsBggError::Lut);
-        }
-        self.check_prepared_descriptor(descriptor, binding, input_id, output_id)?;
-        Ok(descriptor.schema.artifact_input(
-            production,
-            &descriptor.prefix,
-            ArtifactConfidentiality::Public,
-        )?)
-    }
-    /// Export terminal readout material and its descriptor.
-    pub fn export_prepared_readout(
-        &self,
-        prepared: &RnsBggPreparedReadout,
-        graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedReadoutDescriptor), RnsBggError> {
-        let (graph, terminal) = match &prepared.terminal {
-            RnsBggReadoutTerminal::Scalar { terminal, offset } => {
-                let (graph, terminal) =
-                    self.export_prepared_terminal(terminal, graph, &format!("{prefix}.terminal"))?;
-                let graph = graph.public_output(
-                    &format!("{prefix}.output"),
-                    (prepared.public.values.scalar().ok_or(RnsBggError::Context)?).clone(),
-                )?;
-                let graph = graph.public_output(format!("{prefix}.offset"), offset.clone())?;
-                (graph, ProgramValue::Scalar(terminal))
-            }
-            RnsBggReadoutTerminal::Family { terminal, offset } => {
-                let (mut graph, terminal) = self.export_prepared_terminal_family(
-                    terminal,
-                    graph,
-                    &format!("{prefix}.terminal"),
-                )?;
-                if let RnsBggReadoutWeights::Indexed { rows, .. } = &prepared.public.weight {
-                    graph = graph
-                        .public_output(format!("{prefix}.weights"), rows.clone())
-                        .map_err(|e| RnsBggError::Graph(e.to_string()))?;
-                }
-                let graph = match offset {
-                    ProgramValue::Scalar(row) => {
-                        graph.public_output(format!("{prefix}.offset"), row.clone())?
-                    }
-                    ProgramValue::Family(rows) => {
-                        graph.public_output(format!("{prefix}.offset"), rows.clone())?
-                    }
-                };
-                (graph, ProgramValue::Family(terminal))
-            }
-        };
-        let weight = match &prepared.public.weight {
-            RnsBggReadoutWeights::Shared(weight) => RnsBggReadoutWeights::Shared(weight.clone()),
-            RnsBggReadoutWeights::Indexed { coefficient_bound, .. } => {
-                RnsBggReadoutWeights::Indexed {
-                    rows: (),
-                    coefficient_bound: coefficient_bound.clone(),
-                }
-            }
-        };
-        Ok((
-            graph,
-            RnsBggPreparedReadoutDescriptor {
-                prefix: prefix.into(),
-                identity: prepared.identity,
-                terminal,
-                weight,
-            },
-        ))
-    }
-    /// Restore finalized public outputs without repeating public switching.
-    /// Expected bindings come from preprocessing; no online secret is needed.
-    pub fn import_prepared_readout(
-        &self,
-        descriptor: &RnsBggPreparedReadoutDescriptor,
-        production: ProductionId,
-        readout: &ValueReadout,
-        binding: &crate::rns_bgg::RnsBggLutBinding,
-        input_id: [u8; 32],
-        stage_id: [u8; 32],
-    ) -> Result<RnsBggPreparedReadout, RnsBggError> {
-        if descriptor.identity != readout.identity() {
-            return Err(RnsBggError::Context);
-        }
-        let data = match &descriptor.terminal {
-            ProgramValue::Scalar(data) => data,
-            ProgramValue::Family(data) => {
-                let terminal = self.import_prepared_terminal_family(
-                    data,
-                    production.clone(),
-                    binding,
-                    input_id,
-                    stage_id,
-                )?;
-                let level = terminal.level();
-                let ring = self.ring(level)?;
-                let columns = terminal.public_matrices().schema().element.matrix_type().columns /
-                    IntExpr::constant(2);
-                let row_schema = crate::rns_bgg::BlocksType::<1, 2>([[
-                    mxx_dsl::MatType(ring.matrix_type((1, columns.clone()))),
-                    mxx_dsl::MatType(ring.matrix_type((1, columns.clone()))),
-                ]]);
-                let weight = match &descriptor.weight {
-                    RnsBggReadoutWeights::Shared(weight) => {
-                        RnsBggReadoutWeights::Shared(weight.clone())
-                    }
-                    RnsBggReadoutWeights::Indexed { coefficient_bound, .. } => {
-                        let rows = FamilyType {
-                            element: row_schema.clone(),
-                            shared: vec![false; 2],
-                            count: terminal.range().count().clone(),
-                        }
-                        .artifact_input(
-                            production.clone(),
-                            &format!("{}.weights", descriptor.prefix),
-                            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-                        )?;
-                        RnsBggReadoutWeights::Indexed {
-                            rows,
-                            coefficient_bound: coefficient_bound.clone(),
-                        }
-                    }
-                };
-                let offset = if terminal.mode() == RnsBggTerminalFamilyMode::Sum ||
-                    matches!(&weight, RnsBggReadoutWeights::Shared(_))
-                {
-                    ProgramValue::Scalar(crate::rns_bgg::import_blocks(
-                        &ring,
-                        &production,
-                        &format!("{}.offset", descriptor.prefix),
-                        columns.clone(),
-                    ))
-                } else {
-                    ProgramValue::Family(
-                        FamilyType {
-                            element: row_schema,
-                            count: terminal.range().count().clone(),
-                            shared: vec![false; 2],
-                        }
-                        .artifact_input(
-                            production.clone(),
-                            &format!("{}.offset", descriptor.prefix),
-                            mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-                        )?,
-                    )
-                };
-                let public = RnsBggReadoutPublicOutput {
-                    values: ProgramValue::Family((
-                        terminal.public_matrices().clone(),
-                        terminal.output_range(),
-                    )),
-                    level,
-                    weight,
-                };
-                return Ok(RnsBggPreparedReadout {
-                    identity: descriptor.identity,
-                    public,
-                    terminal: RnsBggReadoutTerminal::Family { terminal, offset },
-                });
-            }
-        };
-        let RnsBggReadoutWeights::Shared(weight) = &descriptor.weight else {
-            return Err(RnsBggError::Context);
-        };
-        let terminal =
-            self.import_prepared_terminal(data, production.clone(), binding, input_id, stage_id)?;
-        let level = binding.level + 1;
-        let ring = self.ring(level)?;
-        let public = RnsBggReadoutPublicOutput {
-            values: ProgramValue::Scalar(crate::rns_bgg::import_blocks(
-                &ring,
-                &production,
-                &format!("{}.output", descriptor.prefix),
-                1,
-            )),
-            level,
-            weight: RnsBggReadoutWeights::Shared(weight.clone()),
-        };
-        let offset = crate::rns_bgg::import_blocks(
-            &ring,
-            &production,
-            &format!("{}.offset", descriptor.prefix),
-            1,
-        );
-        Ok(RnsBggPreparedReadout {
-            identity: descriptor.identity,
-            public,
-            terminal: RnsBggReadoutTerminal::Scalar { terminal, offset },
+            .map_err(|_| DslError::Schema)?;
+            // B_sigma is sampled in the next ring and constrained by the
+            // payload secret.  D_sigma is its signed decomposition, with
+            // each compact digit centered-extended to the source ring; the
+            // full B matrix is never extended as a dense matrix.
+            let payload = checked_modulus_convert_row(
+                self.payload_secret.row.clone(),
+                target_modulus.clone(),
+            )
+            .map_err(|_| DslError::Schema)?;
+            let gadget = self.parameters.state_gadget(next_level).map_err(|_| DslError::Schema)?;
+            let scale = self
+                .parameters
+                .scalar(
+                    next_level,
+                    self.parameters.scale(next_level).map_err(|_| DslError::Schema)?.clone(),
+                )
+                .map_err(|_| DslError::Schema)?;
+            let target = lut_payload_target(scale, coefficient, payload.clone(), gadget);
+            let ring_next = self.parameters.ring(next_level).map_err(|_| DslError::Schema)?;
+            let columns =
+                self.parameters.component_columns(next_level).map_err(|_| DslError::Schema)?;
+            let mut tag = mxx_dsl::HashTag::from(format!("rns-bgg/lut-b/{origin:?}").into_bytes());
+            tag.push("branch");
+            tag.push(index.expression()?);
+            let top_matrix = matrix_from_hash(&ring_next, self.hash_key.clone(), tag, columns);
+            let top = (top_matrix.0.0, top_matrix.0.1);
+            let prefix = payload.0.ring_automorphism(sigma.clone());
+            let error = crate::rns_bgg::encoding::fresh_error(self.parameters, next_level, columns)
+                .map_err(|_| DslError::Schema)?;
+            let b_sigma = (
+                top.clone(),
+                (
+                    -prefix.clone() * top.0 + target.0 + error.0,
+                    -prefix * top.1 + target.1 + error.1,
+                ),
+            );
+            let low_d = decompose_matrix(self.parameters, next_level, b_sigma)
+                .map_err(|_| DslError::Schema)?;
+            let d_sigma = centered_extend_decomposition(low_d, source_modulus.clone());
+            let routed = super::map_matrix(input.matrix.clone(), |entry| {
+                entry.ring_automorphism(sigma.clone())
+            });
+            let u_sigma = super::mod_down_public(
+                super::multiply_public_action(routed, d_sigma.clone()),
+                target_modulus.clone(),
+            );
+            let e_sigma = centered_extend_decomposition(
+                decompose_matrix(self.parameters, next_level, u_sigma)
+                    .map_err(|_| DslError::Schema)?,
+                source_modulus.clone(),
+            );
+            Ok((d_sigma, e_sigma))
         })
-    }
-    /// Prepare scalar terminal material and its raw public accumulator.
-    ///
-    /// Final terminal ModDown remains deferred to the explicit finalizer.
-    pub fn prepare_terminal(
-        &self,
-        input: &RnsBggPublicKey,
-        material: &RnsBggTerminalMaterial,
-    ) -> Result<RnsBggPreparedTerminal, RnsBggError> {
-        let (raw_public, branches) =
-            self.prepare_lut_raw(input, &material.material, &material.lifted_ciphertexts)?;
-        let mut hash = Sha256::new();
-        hash.update(b"rns_bgg-terminal-stage");
-        hash.update(self.context);
-        hash.update(input.id);
-        hash.update(material.material.id);
-        Ok(RnsBggPreparedTerminal {
-            binding: material.material.binding(),
-            input: input.clone(),
-            id: hash.finalize().into(),
-            branches,
-            raw_public,
-        })
-    }
-    /// Finalize a raw terminal public accumulator with exactly one ModDown.
-    ///
-    /// The stage list and input level are checked before the output key is
-    /// constructed; this is graph construction, not backend execution.
-    pub fn finalize_terminal_public(
-        &self,
-        raw: RnsBggTerminalAccumulator<RnsBggMatrix>,
-    ) -> Result<RnsBggTerminalPublicKey, RnsBggError> {
-        if raw.context != self.context {
-            return Err(RnsBggError::Context);
+        .map_err(graph)?;
+        let site = self.output()?;
+        if let Some(outputs) = self.parallel_outputs.last_mut() {
+            let key = format!("{site:?}");
+            outputs.lut.insert(key.clone(), actions.clone());
+            self.parallel_lut_keys.insert(key, site);
+            if let Some(scope) = self.parallel_lut_key_scopes.last_mut() {
+                scope.insert(format!("{site:?}"), site);
+            }
+        } else {
+            self.prepared_lut_actions.insert((site, self.scope()?), actions.clone());
         }
-        let next = BigInt::from(self.parameters.level(raw.level + 1)?.modulus().as_ref().clone());
-        Ok(RnsBggTerminalPublicKey {
-            matrix: raw.value.block_mod_switch(next),
-            level: raw.level + 1,
-            context: self.context,
-            stages: raw.stages,
-        })
+        Ok(actions)
     }
 
-    /// Prepare shared or indexed row targets across the active input range.
-    /// No member is enumerated on the host; key-dependent work stays structural.
-    pub(crate) fn prepare_terminal_family(
-        &self,
-        input: &RnsBggPublicKeyFamily,
-        material: &ProgramValue<RnsBggTerminalMaterial, Family<RnsBggTerminalMaterial>>,
-        mode: RnsBggTerminalFamilyMode,
-        finalization: TerminalFinalization,
-    ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
-        self.check_public_family(input)?;
-        let binding = material.element_schema().material.binding();
-        let next = BigInt::from(self.parameters.level(input.level + 1)?.modulus().as_ref().clone());
-        let (cache, public) = crate::rns_bgg::terminal::prepare_terminal_value(
-            self,
-            &input.clone().into_program()?,
-            material,
-            mode == RnsBggTerminalFamilyMode::Sum,
-            |raw| {
-                Ok(if finalization.is_finalized() {
-                    raw.value.block_mod_switch(next)
+    /// ModDown declared coefficient outputs once after graph aggregation.
+    pub(crate) fn finish_outputs(
+        &mut self,
+        outputs: Vec<RnsBggPublicKey>,
+    ) -> Result<Vec<RnsBggPublicKey>, RnsBggError> {
+        outputs
+            .into_iter()
+            .map(|output| {
+                if self
+                    .program
+                    .wire_is_coefficient_output(output.wire)
+                    .map_err(|_| RnsBggError::Binding("coefficient output metadata"))?
+                {
+                    let level = self.workload.level(output.wire)?;
+                    let target = level
+                        .checked_add(1)
+                        .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
+                    let q = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
+                    Ok(RnsBggPublicKey::new(output.wire, super::mod_down_public(output.matrix, q)))
                 } else {
-                    raw.value
-                })
-            },
-        )
-        .map_err(|error| match error {
-            crate::rns_bgg::TerminalError::Scheme(error) => error,
-            error => RnsBggError::Graph(error.to_string()),
-        })?;
-        let ProgramValue::Family(cache) = cache else { return Err(RnsBggError::Context) };
-        let public = match public {
-            ProgramValue::Scalar(value) => Family::pack(vec![value])?,
-            ProgramValue::Family(values) => values,
-        };
-        let cache_schema = cache.schema();
-        let public_schema = public.schema();
-        let id = terminal_family_stage_identity(
-            self.parameter_identity(),
-            self.context,
-            input.id,
-            input.level,
-            &binding,
-            mode,
-            finalization,
-            &input.range,
-            &cache_schema,
-            &public_schema,
-        )?;
-        Ok(RnsBggPreparedTerminalFamily {
-            mode,
-            finalization,
-            input: input.clone(),
-            id,
-            cache,
-            public,
-        })
-    }
-    /// Export family terminal artifacts and their authenticated descriptor.
-    pub fn export_prepared_terminal_family(
-        &self,
-        prepared: &RnsBggPreparedTerminalFamily,
-        graph: DslContext,
-        prefix: &str,
-    ) -> Result<(DslContext, RnsBggPreparedTerminalFamilyDescriptor), RnsBggError> {
-        let graph =
-            graph.public_output(prefix, (prepared.cache.clone(), prepared.public.clone()))?;
-        Ok((
-            graph,
-            RnsBggPreparedTerminalFamilyDescriptor {
-                prefix: prefix.to_owned(),
-                parameters: self.parameter_identity(),
-                mode: prepared.mode,
-                finalization: prepared.finalization,
-                id: prepared.id,
-                range: prepared.input.range.clone(),
-                cache: prepared.cache.schema(),
-                public: prepared.public.schema(),
-            },
-        ))
-    }
-    /// The descriptor carries actual graph schemas, including captured shared ports.
-    pub fn import_prepared_terminal_family(
-        &self,
-        descriptor: &RnsBggPreparedTerminalFamilyDescriptor,
-        production: ProductionId,
-        binding: &RnsBggLutBinding,
-        input_id: [u8; 32],
-        stage_id: [u8; 32],
-    ) -> Result<RnsBggPreparedTerminalFamily, RnsBggError> {
-        let metadata = &descriptor.cache.element;
-        let expected_public_count = match descriptor.mode {
-            RnsBggTerminalFamilyMode::Independent => descriptor.range.count().clone(),
-            RnsBggTerminalFamilyMode::Sum => 1.into(),
-        };
-        if descriptor.cache.count != descriptor.range.count().clone() ||
-            descriptor.public.count != expected_public_count
-        {
-            return Err(RnsBggError::Context);
-        }
-        let expected_id = terminal_family_stage_identity(
-            self.parameter_identity(),
-            self.context,
-            metadata.input.id,
-            metadata.input.level,
-            binding,
-            descriptor.mode,
-            descriptor.finalization,
-            &descriptor.range,
-            &descriptor.cache,
-            &descriptor.public,
-        )?;
-        if descriptor.parameters != self.parameter_identity() ||
-            metadata.binding != *binding ||
-            metadata.input.id != input_id ||
-            descriptor.id != expected_id ||
-            descriptor.id != stage_id ||
-            metadata.input.context != self.context
-        {
-            return Err(RnsBggError::Context);
-        }
-        let (cache, public) = (descriptor.cache.clone(), descriptor.public.clone())
-            .artifact_input(production, &descriptor.prefix, ArtifactConfidentiality::Public)?;
-        let keys = cache.field(|term| (term.input, None))?;
-        let mut input = RnsBggPublicKeyFamily::from_program(
-            &ProgramValue::Family(keys),
-            descriptor.range.count().clone(),
-        )?;
-        input.range = descriptor.range.clone();
-        Ok(RnsBggPreparedTerminalFamily {
-            mode: descriptor.mode,
-            finalization: descriptor.finalization,
-            id: descriptor.id,
-            input,
-            cache,
-            public,
-        })
+                    Ok(output)
+                }
+            })
+            .collect()
     }
 }
 
-impl ExponentProgramLowering for RnsBggPublicEvaluator<'_> {
-    fn mul_private(
-        &mut self,
-        input: &Self::Wire,
-        rhs: &Self::Rhs,
-        _: Option<&Self::HelperSet>,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, RnsBggError> {
-        let (key, _) = input;
-        let RnsBggPublicRhs::Fixed(material) = rhs else {
-            return Err(RnsBggError::Context);
-        };
-        let prepared = self.scheme.prepare_mul_private(
-            key,
-            material,
-            output_id(self.scheme.context, b"mul-private", gate, &[key.id, material.id]),
-        )?;
-        let key = prepared.output_key().clone();
-        self.cache.gates.insert(gate, PreparedGate::MulPrivate(prepared));
-        Ok((key, None))
+impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
+    type Wire = RnsBggPublicKey;
+    type Rhs = RhsRef<Int>;
+    type Error = RnsBggError;
+    fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
+        if self.workload.level(lhs.wire)? != self.workload.level(rhs.wire)? {
+            return Err(RnsBggError::Binding("Add level mismatch"));
+        }
+        Ok(RnsBggPublicKey::new(
+            self.output()?,
+            super::add_public_matrices(lhs.matrix.clone(), rhs.matrix.clone()),
+        ))
     }
     fn mul_public(
         &mut self,
         private: &Self::Wire,
         public: &Self::Wire,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, RnsBggError> {
-        let (a, a_plaintext) = private;
-        let (b, b_plaintext) = public;
-        let multiplier = b_plaintext.clone().ok_or(RnsBggError::Context)?;
-        let prepared = self.scheme.prepare_mul_public(
-            a,
-            b,
-            multiplier.clone(),
-            output_id(self.scheme.context, b"mul-public", gate, &[a.id, b.id]),
-        )?;
-        let key = prepared.output_key().clone();
-        self.cache.gates.insert(gate, PreparedGate::Linear(prepared));
-        let plaintext = a_plaintext.clone().map(|mu| mu * multiplier);
-        if let Some(value) = &plaintext {
-            self.cache.plaintexts.insert(gate, value.clone());
-        }
-        Ok((key, plaintext))
+    ) -> Result<Self::Wire, Self::Error> {
+        let action = self.prepare_mul_public_action(private)?;
+        Ok(RnsBggPublicKey::new(
+            self.output()?,
+            super::multiply_public_action(public.matrix.clone(), action),
+        ))
     }
-    fn add(
+    fn mul_private(
         &mut self,
-        lhs: &Self::Wire,
-        rhs: &Self::Wire,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, RnsBggError> {
-        let (a, a_plaintext) = lhs;
-        let (b, b_plaintext) = rhs;
-        let prepared = self.scheme.prepare_add(
-            a,
-            b,
-            output_id(self.scheme.context, b"add", gate, &[a.id, b.id]),
-        )?;
-        let key = prepared.output_key().clone();
-        self.cache.gates.insert(gate, PreparedGate::Linear(prepared));
-        let plaintext = a_plaintext.clone().zip(b_plaintext.clone()).map(|(a, b)| a + b);
-        if let Some(value) = &plaintext {
-            self.cache.plaintexts.insert(gate, value.clone());
-        }
-        Ok((key, plaintext))
-    }
-    fn lut(
-        &mut self,
-        program: &ExponentLutProgram,
-        lut: LutId,
         input: &Self::Wire,
-        helpers: Option<&Self::HelperSet>,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, RnsBggError> {
-        let (input, input_plaintext) = input;
-        let helpers = helpers.ok_or(RnsBggError::Context)?;
-        let material = helpers;
-        let binding = material.binding();
-        check_lut_binding(self.scheme, program, lut, input.level, &binding)?;
-        let mut identities = vec![input.id, binding.material_id];
-        if let Some(table) = binding.table {
-            identities.push(table);
+        rhs: &Self::Rhs,
+    ) -> Result<Self::Wire, Self::Error> {
+        let action = match self.prepared_rhs.get(&rhs.id) {
+            Some(InputBinding::Scalar(value)) => value.clone(),
+            Some(InputBinding::Family(values)) => {
+                values.at(rhs.index.clone().ok_or(RnsBggError::Binding("family RHS index"))?)
+            }
+            None => return Err(RnsBggError::Binding("RHS decomposition was not prepared")),
+        };
+        let target_level = self.workload.level(self.output()?)?;
+        let target_modulus =
+            BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+        Ok(RnsBggPublicKey::new(
+            self.output()?,
+            super::mod_down_public(
+                super::multiply_public_action(input.matrix.clone(), action),
+                target_modulus,
+            ),
+        ))
+    }
+    fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        let data = self.prepare_lut_public_data(table)?;
+        let origin = self.workload.lut_helper_origin(self.output()?)?;
+        let helper_scope = self.scope()?;
+        if let Some(outputs) = self.parallel_outputs.last_mut() {
+            let key = lut_helper_artifact_name(origin, &helper_scope);
+            outputs.helpers.insert(key.clone(), data.clone());
+            if let Some(scopes) = self.parallel_helper_key_scopes.last_mut() {
+                scopes.insert(key, (origin, helper_scope));
+            }
+        } else {
+            self.prepared_helpers.insert((origin, helper_scope), data.clone());
         }
-        let prepared = self.scheme.prepare_lut(
-            input,
-            material,
-            output_id(self.scheme.context, b"L", gate, &identities),
-        )?;
-        let key = prepared.output_key().clone();
-        let plaintext = input_plaintext
-            .as_ref()
-            .map(|mu| lut_plaintext(self.scheme, program, lut, key.level, mu))
-            .transpose()?;
-        self.cache.gates.insert(gate, PreparedGate::Lut(prepared));
-        if let Some(value) = &plaintext {
-            self.cache.plaintexts.insert(gate, value.clone());
+        let actions = self.prepare_lut_actions(input, table)?;
+        let mut result = None;
+        for index in 0..table.values().len() {
+            let (_d_sigma, e_sigma) = actions.at(Int::constant(index));
+            let branch = public_lut_branch(data.at(Int::constant(index)), e_sigma);
+            result = Some(match result {
+                None => branch,
+                Some(previous) => super::add_public_matrices(previous, branch),
+            });
         }
-        Ok((key, plaintext))
+        let output = self.output()?;
+        let result = result.ok_or(RnsBggError::Lut)?;
+        if !self
+            .program
+            .wire_is_coefficient_output(output)
+            .map_err(|_| RnsBggError::Binding("coefficient output metadata"))?
+        {
+            let target = self.workload.level(output)?;
+            let modulus = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
+            return Ok(RnsBggPublicKey::new(output, super::mod_down_public(result, modulus)));
+        }
+        Ok(RnsBggPublicKey::new(output, result))
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-/// Serialized description of a public linear operation and its family scope.
-pub enum RnsBggLinearOperation {
-    /// Add a public key identified by `rhs`.
-    Add {
-        /// Identity of the right-hand public key.
-        rhs: [u8; 32],
-        /// Active family range, or `None` for scalar inputs.
-        range: Option<FamilyRange>,
-    },
-    /// Multiply a private key by a public multiplier identified by `rhs`.
-    MulPublic {
-        /// Identity of the public multiplier source.
-        rhs: [u8; 32],
-        /// Active family range, or `None` for scalar inputs.
-        range: Option<FamilyRange>,
-    },
-    /// Reduce a family over its external range into a scalar result.
-    Reduce {
-        /// External family range being reduced.
-        range: FamilyRange,
-    },
-}
-
-impl RnsBggLinearOperation {
-    /// Return the family range expected by the operation's inputs.
-    pub fn input_range(&self) -> Option<&FamilyRange> {
-        match self {
-            Self::Add { range, .. } | Self::MulPublic { range, .. } => range.as_ref(),
-            Self::Reduce { range } => Some(range),
-        }
-    }
-
-    /// Return the family range of the operation's output, if it remains a family.
-    pub fn output_range(&self) -> Option<&FamilyRange> {
-        match self {
-            Self::Add { range, .. } | Self::MulPublic { range, .. } => range.as_ref(),
-            Self::Reduce { .. } => None,
-        }
-    }
-}
-
-impl<M: GraphValue> LinearOperation<M> {
-    fn import(
-        operation: &RnsBggLinearOperation,
-        schema: &M::Schema,
-        production: ProductionId,
-        prefix: &str,
-    ) -> Result<(Self, [u8; 32]), RnsBggError> {
-        match operation {
-            RnsBggLinearOperation::Add { rhs, .. } => Ok((Self::Add, *rhs)),
-            RnsBggLinearOperation::MulPublic { rhs, .. } => Ok((
-                Self::MulPublic(schema.artifact_input(
-                    production,
-                    format!("{prefix}.multiplier"),
-                    ArtifactConfidentiality::Public,
-                )?),
-                *rhs,
-            )),
-            RnsBggLinearOperation::Reduce { .. } => Err(RnsBggError::Context),
-        }
-    }
-
-    fn export(
+impl PublicKeyLowering<'_> {
+    fn validate_refresh_declaration(
         &self,
-        graph: DslContext,
-        prefix: &str,
-        rhs: [u8; 32],
-        range: Option<FamilyRange>,
-    ) -> Result<(DslContext, RnsBggLinearOperation), RnsBggError> {
-        match self {
-            Self::Add => Ok((graph, RnsBggLinearOperation::Add { rhs, range })),
-            Self::MulPublic(multiplier) => Ok((
-                graph.public_output(format!("{prefix}.multiplier"), multiplier.clone())?,
-                RnsBggLinearOperation::MulPublic { rhs, range },
-            )),
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+    ) -> Result<(), RnsBggError> {
+        if declaration.source_program() != self.program.id() {
+            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
         }
-    }
-}
-
-/// Expected metadata supplied by setup. The output identity binds the public
-/// multiplier, if any, by the same caller contract as public preparation.
-/// A range denotes active family members; reduction has a scalar output.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggLinearBinding {
-    /// Scheme context identity.
-    pub context: [u8; 32],
-    /// Modulus-chain level of both inputs.
-    pub level: usize,
-    /// Identity of the left/private input.
-    pub lhs: [u8; 32],
-    /// Identity assigned to the prepared output.
-    pub output: [u8; 32],
-    /// Operation kind and family scope.
-    pub operation: RnsBggLinearOperation,
-}
-
-/// Serialized descriptor for scalar or family linear preparation.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RnsBggPreparedLinearDescriptor {
-    key_storage: [ProgramValue<(), Vec<bool>>; 2],
-    multiplier_storage: ProgramValue<(), Vec<bool>>,
-    prefix: String,
-    parameters: [u8; 32],
-    binding: RnsBggLinearBinding,
-}
-
-impl RnsBggPreparedLinearDescriptor {
-    /// Return the authenticated expected binding for this descriptor.
-    pub fn binding(&self) -> &RnsBggLinearBinding {
-        &self.binding
-    }
-}
-
-/// Metadata for a public input key and its private payload contribution.
-/// Keep the descriptor bound to the selected production and payload at setup;
-/// key identity alone does not distinguish different payloads for that key.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RnsBggInputMaterialDescriptor {
-    prefix: String,
-    scheme: crate::rns_bgg::RnsBggArtifactBinding,
-    level: usize,
-    key_id: [u8; 32],
-}
-
-/// Store this public descriptor alongside the runtime production manifest.
-/// Import checks expected setup identities once at graph construction. The
-/// runtime manifest supplies artifact shapes/confidentiality and production
-/// binding; this descriptor is not a separate authentication protocol.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RnsBggPreparedLutDescriptor<S = <RnsBggPreparedLut as GraphValue>::Schema> {
-    pub(super) prefix: String,
-    pub(super) parameters: [u8; 32],
-    pub(super) binding: RnsBggLutBinding,
-    pub(super) input_id: [u8; 32],
-    pub(super) output_id: [u8; 32],
-    pub(super) sigmas: Vec<usize>,
-    schema: S,
-}
-
-/// Serialized descriptor for family LUT preparation and its range.
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RnsBggPreparedLutFamilyDescriptor {
-    pub(super) prepared:
-        RnsBggPreparedLutDescriptor<<Family<RnsBggPreparedLut> as GraphValue>::Schema>,
-    pub(super) range: FamilyRange,
-}
-
-#[cfg(test)]
-pub(crate) mod terminal_artifact_tests {
-    use super::*;
-    use crate::rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest, RnsBggRow};
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality};
-    use mxx_primitives::{
-        element::PolyElem,
-        poly::{Poly, PolyParams},
-    };
-    use mxx_runtime::{
-        Backend, RuntimeValue,
-        artifact::{ArtifactStore, FileArtifactStore},
-        backend::poly::cpu_backend,
-        executor::execute,
-        transcript::SamplingMode,
-    };
-    use num_bigint::{BigInt, BigUint};
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn test_rns_bgg_family_range_checks_external_end_and_symbolic_bounds() {
-        let valid = FamilyRange::bounded(2, 2, 4).unwrap();
-        assert!(validate_family_range(&valid, &4.into()).is_ok());
-
-        let invalid_end = FamilyRange::bounded(3, 2, 4).unwrap();
-        assert!(validate_family_range(&invalid_end, &4.into()).is_err());
-
-        let symbolic_start = FamilyRange::bounded(IntExpr::LoopIndex(0), 2, 4).unwrap();
-        assert!(validate_family_range(&symbolic_start, &4.into()).is_err());
-    }
-
-    #[test]
-    fn test_rns_bgg_fixed_product_schema_preserves_family_bindings() {
-        let ring = mxx_dsl::Ring::new(257, 8);
-        let matrix = RnsBggMatrix::new(std::array::from_fn(|row| {
-            std::array::from_fn(|column| ring.input(format!("key-{row}-{column}"), (1, 1)))
-        }))
-        .unwrap();
-        let context = rand::random();
-        let key = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Scalar(matrix.clone()),
-            level: 0,
-            id: rand::random(),
-            context,
-            range: FamilyRange::bounded(3, 2, 7).unwrap(),
-        };
-        let mut output = key.clone();
-        output.matrices = ProgramValue::Family(Family::pack(vec![matrix.clone(), matrix]).unwrap());
-        output.level = 1;
-        output.id = rand::random();
-        let prepared = RnsBggPreparedPrivateMul {
-            rhs: RnsBggPrivateRhs {
-                ciphertext: output.matrices.clone(),
-                lifted_ciphertext: key.matrices.clone(),
-                level: 0,
-                rhs_id: rand::random(),
-                id: rand::random(),
-                context,
-            },
-            input: key,
-            output,
-        };
-        let schema = prepared.schema();
-        let encoded = serde_json::to_vec(&schema).unwrap();
-        let restored = serde_json::from_slice(&encoded).unwrap();
-        assert!(schema == restored);
-        let producer = DslContext::new("fixed-product-schema-producer")
-            .public_output("fixed", prepared)
-            .unwrap()
-            .build()
-            .unwrap();
-        let producer = producer.validate(&ParamEnv::default()).unwrap();
-        let production = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash(rand::random()),
-            execution_nonce: rand::random(),
-        };
-        let manifest =
-            mxx_ir_core::artifact::export_validated_manifest(production.clone(), &producer)
-                .unwrap();
-        let imported = restored
-            .artifact_input(production.clone(), "fixed", ArtifactConfidentiality::Public)
-            .unwrap();
-        assert!(imported.schema() == schema);
-        let consumer = DslContext::new("fixed-product-schema-consumer")
-            .public_output("reopened", imported)
-            .unwrap()
-            .build()
-            .unwrap();
-        consumer
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn test_rns_bgg_terminal_artifacts_reused_with_independent_online_secrets() {
-        check_terminal_artifacts(
-            |parameters| cpu_backend(parameters.levels().iter().cloned()),
-            |matrix, name, q, bound| {
-                for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
-                    for coefficient in polynomial.coeffs() {
-                        let absolute = coefficient.value().clone().min(q - coefficient.value());
-                        assert!(&absolute <= bound, "{name}: {absolute} > {bound}");
-                    }
-                }
-            },
-        );
-    }
-
-    pub(crate) fn check_terminal_artifacts<B: Backend>(
-        make_backend: impl FnOnce(&RnsBggParameters) -> B,
-        check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
-    ) {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|value| value.parse().unwrap())
-            .unwrap_or(16);
-        let values = [
-            vec![[vec![], vec![0.into(), 5.into()]], [vec![(-3).into()], vec![]]],
-            vec![[vec![2.into()], vec![]], [vec![], vec![0.into(), 0.into(), 7.into()]]],
-        ];
-        let tables =
-            values.clone().map(|values| crate::readout::RowLutTable::new(values, None).unwrap());
-        let value_bound = tables[0].coefficient_bound() + tables[1].coefficient_bound();
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 2,
-            max_crt_depth: 12,
-            terminal_value_bound: value_bound.clone(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let high = scheme.ring(0).unwrap();
-        let low = scheme.ring(1).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let payload_secret = scheme.sample_payload_secret().unwrap();
-        let key =
-            scheme.sample_input_key(0, seed.clone(), b"key".as_slice(), rand::random()).unwrap();
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                crate::layout::ExpLayout {
-                    stride_log2: 0,
-                    width_log2: (2 as usize).trailing_zeros(),
-                },
-                seed.clone(),
-                b"bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        use crate::rns_bgg::PreparedTerminal;
-        let materials = tables
-            .iter()
-            .enumerate()
-            .map(|(stage, table)| {
-                scheme
-                    .sample_terminal_material(
-                        &payload_secret,
-                        Some(table),
-                        None,
-                        None,
-                        &bank,
-                        seed.clone(),
-                        format!("terminal-{stage}").as_bytes(),
-                        rand::random(),
-                    )
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let public_input = (key.clone(), None);
-        let prepared = PreparedTerminal::new(
-            &scheme,
-            &materials.iter().map(|material| (&public_input, material)).collect::<Vec<_>>(),
-        )
-        .unwrap();
-        let expected = prepared
-            .prepared_terms()
-            .iter()
-            .map(|term| (term.binding().clone(), key.id, term.id()))
-            .collect::<Vec<_>>();
-        let (mut producer, descriptor, expectation) =
-            prepared.export(DslContext::new("rns_bgg-terminal-preprocessing"), "terminal").unwrap();
-        let descriptor: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        let mut inputs = Vec::new();
-        for x in 0..2 {
-            let payload = high.polynomial((0..=x).map(|i| BigInt::from(u8::from(i == x)).into()));
-            let material = scheme.prepare_input(&payload_secret, &key, payload).unwrap();
-            let (graph, descriptor) = scheme
-                .export_input_material(&key, &material, producer, &format!("input-{x}"))
-                .unwrap();
-            producer = graph;
-            inputs.push(descriptor);
-        }
-        let producer = producer.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        std::fs::create_dir_all("test_data/rns_bgg_terminal_artifacts").unwrap();
-        let directory = tempfile::tempdir_in("test_data/rns_bgg_terminal_artifacts").unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let mut backend = make_backend(&parameters);
-        let produced = execute(
-            &producer,
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.unwrap();
-        drop(store);
-        let mut store = FileArtifactStore::open(directory.path()).unwrap();
-        let mut renamed_term = serde_json::to_value(&descriptor).unwrap();
-        renamed_term["terms"][0]["prepared"][0] = serde_json::json!("terminal.term.renamed");
-        let renamed_term: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_value(renamed_term).unwrap();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &renamed_term,
-                &expectation,
-                production.clone(),
-                &expected,
-            )
-            .is_err()
-        );
-        let mut renamed_output = serde_json::to_value(&descriptor).unwrap();
-        renamed_output["output_name"] = serde_json::json!("terminal.output.renamed");
-        let renamed_output: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_value(renamed_output).unwrap();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &renamed_output,
-                &expectation,
-                production.clone(),
-                &expected,
-            )
-            .is_err()
-        );
-        let mut empty_branches = serde_json::to_value(&descriptor).unwrap();
-        empty_branches["terms"][0]["prepared"][1]["branches"] = serde_json::json!([]);
-        let empty_branches: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_value(empty_branches).unwrap();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &empty_branches,
-                &expectation,
-                production.clone(),
-                &expected,
-            )
-            .is_err()
-        );
-        let mut incompatible_output = serde_json::to_value(&descriptor).unwrap();
-        incompatible_output["output_level"] = serde_json::json!(usize::MAX);
-        let incompatible_output: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_value(incompatible_output).unwrap();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &incompatible_output,
-                &expectation,
-                production.clone(),
-                &expected,
-            )
-            .is_err()
-        );
-        let mut redirected = serde_json::to_value(&descriptor).unwrap();
-        redirected["prefix"] = serde_json::json!("redirected");
-        for (index, term) in redirected["terms"].as_array_mut().unwrap().iter_mut().enumerate() {
-            term["prepared"][0] = serde_json::json!(format!("redirected.term.{index}"));
-        }
-        redirected["output_name"] = serde_json::json!("redirected.output");
-        let redirected: crate::rns_bgg::PreparedTerminalDescriptor =
-            serde_json::from_value(redirected).unwrap();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &redirected,
-                &expectation,
-                production.clone(),
-                &expected,
-            )
-            .is_err()
-        );
-        let manifest = store.load_manifest(&production).unwrap();
-        for (name, artifact) in &manifest.artifacts {
-            assert!(!name.contains(".d."), "online helper persisted: {name}");
-            let expected = if name.contains(".payload.") {
-                ArtifactConfidentiality::Private
-            } else {
-                ArtifactConfidentiality::Public
-            };
-            assert_eq!(artifact.confidentiality, expected, "{name}");
-        }
-        let prepared = PreparedTerminal::import(
-            &scheme,
-            &descriptor,
-            &expectation,
-            production.clone(),
-            &expected,
-        )
-        .unwrap();
-        let mut wrong = expected.clone();
-        wrong[0].2[0] ^= 1;
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &descriptor,
-                &expectation,
-                production.clone(),
-                &wrong
-            )
-            .is_err()
-        );
-        wrong = expected.clone();
-        wrong[0].0.mask_bank[0] ^= 1;
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &descriptor,
-                &expectation,
-                production.clone(),
-                &wrong
-            )
-            .is_err()
-        );
-        wrong = expected.clone();
-        wrong.reverse();
-        assert!(
-            PreparedTerminal::import(
-                &scheme,
-                &descriptor,
-                &expectation,
-                production.clone(),
-                &wrong
-            )
-            .is_err()
-        );
-        assert!(
-            PreparedTerminal::import(&scheme, &descriptor, &expectation, production.clone(), &[])
-                .is_err()
-        );
-        let public = prepared.public();
-        // Import each artifact port once, then share its graph value across s.
-        let inputs = inputs
-            .iter()
-            .map(|descriptor| {
-                scheme.import_input_material(descriptor, production.clone(), key.id, 0).unwrap()
-            })
-            .collect::<Vec<_>>();
-        let bound = RnsBggNoiseBound {
-            error: parameters.encoding_error_bound.clone(),
-            payload_l1: 1u8.into(),
-        };
-        let gain = BigUint::from(1u8);
-        let noise = parameters
-            .terminal_noise_bound(0, [(&bound, 2, &gain), (&bound, 2, &gain)], value_bound)
-            .unwrap();
-        assert!(parameters.terminal_noise_fits(1, &noise).unwrap());
-        let q = parameters.level(1).unwrap().modulus();
-        let modulus = BigInt::from(q.as_ref().clone());
-        let mut online = DslContext::new("rns_bgg-terminal-independent-online-secrets");
-        // No s exists before the preprocessing production is finished/reopened.
-        for run in 0..2 {
-            let secret = scheme.sample_mask_secret().unwrap();
-            let helpers = scheme
-                .prepare_online_masks(&secret, &prepared.prepared_terms()[0].mask_bank())
-                .unwrap();
-            let s = secret.row.clone().reduce_modulus(modulus.clone());
-            for (x, (key, material)) in inputs.iter().enumerate() {
-                let encoding = scheme.encode(&secret, key, material).unwrap();
-                let input = (encoding, None);
-                let result = prepared.evaluate(&[(&input, &helpers), (&input, &helpers)]).unwrap();
-                let row = |coefficients: &[Vec<BigInt>; 2]| {
-                    RnsBggRow::new([coefficients.each_ref().map(|p| {
-                        if p.is_empty() {
-                            low.zero((1, 1))
-                        } else {
-                            low.polynomial(p.iter().cloned().map(mxx_ir_core::IntExpr::constant))
-                        }
-                    })])
-                    .unwrap()
-                };
-                let expected = row(&values[0][x]) + row(&values[1][x]);
-                let error = result.row().clone() - s.clone() * public.matrix().clone() - expected;
-                online = online.output(format!("error-{run}-{x}"), error).unwrap();
-            }
-        }
-        let online = online
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
-            )
-            .unwrap();
-        assert!(
-            online.source.scopes().values().flat_map(|scope| scope.nodes()).all(|node| {
-                !matches!(node.kind(), mxx_ir_core::node::NodeKind::GadgetDecompose { .. }) &&
-                    !(matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. }) &&
-                        node.output_types()
-                            .iter()
-                            .any(|ty| matches!(ty, WireType::Preimage { .. })))
-            }),
-            "online terminal evaluation must reuse persisted bounded ciphertext and intermediate actions"
-        );
-        let switches = online
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
-        assert_eq!(
-            switches,
-            2 * 2 * 2,
-            "one final row switch per evaluation; all public switches were persisted by preprocessing"
-        );
-        let results =
-            execute(&online, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        for (name, value) in results.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("polynomial") };
-            check_matrix(&matrix, &name, q.as_ref(), &noise.error);
-        }
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod program_artifacts_tests {
-    use super::*;
-    use crate::{
-        layout::ExpLayout,
-        program::{
-            AttributeKnowledge, ExponentLutProgramBuilder, FamilyProgram, FamilyRhsSource,
-            FamilyWireSource, Gate, LutTable, ProgramBindings, ProgramFamilyId, ProgramWireType,
-            RhsId,
-        },
-        rns_bgg::{
-            RnsBggEncoding, RnsBggParameters, RnsBggPlanRequest, RnsBggRhsPlaintextFamily,
-            RnsBggRow,
-        },
-    };
-    use mxx_ir_core::ParamEnv;
-    use mxx_runtime::{
-        RuntimeValue,
-        artifact::{ArtifactStore, FileArtifactStore},
-        backend::poly::cpu_backend,
-        execute,
-        transcript::SamplingMode,
-    };
-
-    fn observed_outputs(
-        mut graph: DslContext,
-        program: &PreparedProgram<RnsBggScheme>,
-        online: &BTreeMap<WireId, (RnsBggEncoding, Option<Mat>)>,
-    ) -> DslContext {
-        for (index, (wire, value)) in online.iter().enumerate() {
-            let (value, value_plaintext) = value;
-            graph = graph.output(format!("wire-{index}"), value.row.clone()).unwrap();
-            if let Some(plaintext) = &value_plaintext {
-                graph = graph.output(format!("plain-{index}"), plaintext.clone()).unwrap();
-            }
-            let (public, public_plaintext) = &program.public_values()[wire];
-            graph = graph.output(format!("key-{index}"), public.matrix.clone()).unwrap();
-            if let Some(plaintext) = &public_plaintext {
-                graph = graph.output(format!("public-plain-{index}"), plaintext.clone()).unwrap();
-            }
-        }
-        graph
-    }
-
-    #[test]
-    fn test_rns_bgg_program_artifacts_restore_all_gate_kinds_and_public_values() {
-        check_program_artifacts(
-            |parameters| cpu_backend(parameters.levels().iter().cloned()),
-            |actual, expected, name| assert_eq!(actual, expected, "{name}"),
-        );
-    }
-
-    pub(crate) fn check_program_artifacts<B: mxx_runtime::Backend>(
-        make_backend: impl FnOnce(&RnsBggParameters) -> B,
-        check_matrix: impl Fn(&B::Matrix, &B::Matrix, &str),
-    ) {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(16);
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 8,
-            terminal_value_bound: 16u8.into(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let high = scheme.ring(0).unwrap();
-        let low = scheme.ring(1).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let secret = scheme.test_secrets().unwrap();
-        let private_key = scheme
-            .sample_input_key(0, seed.clone(), b"private".as_slice(), rand::random())
-            .unwrap();
-        let public_key =
-            scheme.sample_input_key(0, seed.clone(), b"public".as_slice(), rand::random()).unwrap();
-        let member_key =
-            scheme.sample_input_key(1, seed.clone(), b"member".as_slice(), rand::random()).unwrap();
-        let public_plaintext = high.polynomial([1.into()]);
-        let member_plaintext = low.polynomial([2.into(), (-1).into()]);
-        let private = scheme
-            .encode(
-                &secret.mask,
-                &private_key,
-                &scheme
-                    .prepare_input(
-                        &secret.payload,
-                        &private_key,
-                        high.polynomial([0.into(), 1.into()]),
-                    )
-                    .unwrap(),
-            )
-            .unwrap();
-        let public = scheme
-            .encode(
-                &secret.mask,
-                &public_key,
-                &scheme
-                    .prepare_input(&secret.payload, &public_key, public_plaintext.clone())
-                    .unwrap(),
-            )
-            .unwrap();
-        let member = scheme
-            .encode(
-                &secret.mask,
-                &member_key,
-                &scheme
-                    .prepare_input(&secret.payload, &member_key, member_plaintext.clone())
-                    .unwrap(),
-            )
-            .unwrap();
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                crate::layout::ExpLayout {
-                    stride_log2: 0,
-                    width_log2: (2 as usize).trailing_zeros(),
-                },
-                seed.clone(),
-                b"bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let table = LutTable::unary(2, 2, vec![1, 0]).unwrap();
-        let scalar_material = scheme
-            .sample_lut_material(
-                &secret.payload,
-                &table,
-                &bank,
-                seed.clone(),
-                b"scalar".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let rhs_id = rand::random();
-        let family_material = scheme
-            .sample_private_rhs_family(
-                &secret.payload,
-                0,
-                &RnsBggRhsPlaintextFamily {
-                    payloads: mxx_dsl::parallel(4, |_| Ok(low.polynomial([1.into()]))).unwrap(),
-                    id: rhs_id,
-                },
-                seed.clone(),
-                b"family".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let table_family_material = scheme
-            .sample_lut_material_family(
-                &secret.payload,
-                &table,
-                &bank,
-                4.into(),
-                seed.clone(),
-                b"table-family".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        assert_eq!(table_family_material.binding().rhs, None);
-        let private_material = scheme
-            .sample_private_rhs(
-                &secret.payload,
-                0,
-                crate::rns_bgg::RnsBggRhsPlaintext {
-                    payload: low.polynomial([1.into()]),
-                    id: rhs_id,
-                },
-                seed.clone(),
-                b"scalar-private".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-
-        let private_material = scheme.prepare_private_rhs(&private_material).unwrap();
-        let mut builder = ExponentLutProgramBuilder::new();
-        builder.set_layout(ExpLayout { stride_log2: 0, width_log2: 1 }, n as usize).unwrap();
-        let private_input = builder
-            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
-            .unwrap();
-        let public_input = builder
-            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Public })
-            .unwrap();
-        let private_wire = builder.input_wire(private_input).unwrap();
-        let public_wire = builder.input_wire(public_input).unwrap();
-        let added = builder.add(public_wire, public_wire).unwrap();
-        let product = builder.mul_public(public_wire, added).unwrap();
-        let lut = builder.register_lut(table).unwrap();
-        let mapped = builder.lut(private_wire, lut, None).unwrap();
-        let rhs_family = builder.rhs_family(2).unwrap();
-        let wire_family = builder.wire_family(2).unwrap();
-        let w = WireId::from_index;
-        let r = RhsId::from_index(0);
-        let selected = builder
-            .family(
-                4,
-                FamilyProgram::new(
-                    BTreeMap::from([
-                        (w(0), FamilyWireSource::Broadcast(private_wire)),
-                        (w(1), FamilyWireSource::Member(wire_family)),
-                    ]),
-                    BTreeMap::from([(r, FamilyRhsSource::Member(rhs_family))]),
-                    vec![
-                        Gate::MulPrivate { lhs: w(0), rhs: r, output: w(2) },
-                        Gate::Add { lhs: w(1), rhs: w(1), output: w(3) },
-                        Gate::MulPublic { private: w(2), public: w(3), output: w(4) },
-                        Gate::Add { lhs: w(4), rhs: w(4), output: w(5) },
-                    ],
-                    w(5),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let public_sum = builder
-            .family(
-                4,
-                FamilyProgram::new(
-                    BTreeMap::from([(w(0), FamilyWireSource::Member(wire_family))]),
-                    BTreeMap::new(),
-                    vec![Gate::Add { lhs: w(0), rhs: w(0), output: w(1) }],
-                    w(1),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let combined = builder.add(mapped, selected).unwrap();
-        let mapped_family = builder
-            .family(
-                4,
-                FamilyProgram::new(
-                    BTreeMap::from([(w(0), FamilyWireSource::Broadcast(private_wire))]),
-                    BTreeMap::new(),
-                    vec![Gate::Lut { input: w(0), lut_id: lut, output: w(1) }],
-                    w(1),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let scalar_rhs = builder.rhs_input(rhs_family, 2, 2).unwrap();
-        let private_product = builder.private_mul(private_wire, scalar_rhs).unwrap();
-        let shared_product = builder
-            .family(
-                4,
-                FamilyProgram::new(
-                    BTreeMap::from([(w(0), FamilyWireSource::Broadcast(private_wire))]),
-                    BTreeMap::from([(r, FamilyRhsSource::Broadcast(scalar_rhs))]),
-                    vec![Gate::MulPrivate { lhs: w(0), rhs: r, output: w(1) }],
-                    w(1),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let doubled_private_product = builder.add(private_product, private_product).unwrap();
-        for output in [
-            product,
-            combined,
-            public_sum,
-            mapped_family,
-            private_product,
-            shared_product,
-            doubled_private_product,
-        ] {
-            builder.output(output).unwrap();
-        }
-        let frozen = builder.build().unwrap();
-        let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let family_material = scheme.prepare_private_rhs_family(&family_material, &range).unwrap();
-        let mut ranges = ProgramFamilyBindings::new();
-        for index in 0..4 {
-            ranges.bind(ProgramFamilyId::from_index(index), range.clone());
-        }
-        let scalar_gate = ProgramGateInstance::Gate { step: 2 };
-        let family_gate = ProgramGateInstance::FamilyGate {
-            step: 3,
-            gate: 0,
-            family: match &frozen.steps()[3] {
-                crate::program::ProgramStep::Family { id, .. } => *id,
-                _ => unreachable!(),
-            },
-        };
-        let table_family_gate = ProgramGateInstance::FamilyGate {
-            step: 6,
-            gate: 0,
-            family: match &frozen.steps()[6] {
-                crate::program::ProgramStep::Family { id, .. } => *id,
-                _ => unreachable!(),
-            },
-        };
-        let private_gate = ProgramGateInstance::Gate { step: 7 };
-        let shared_gate = ProgramGateInstance::FamilyGate {
-            step: 8,
-            gate: 0,
-            family: match &frozen.steps()[8] {
-                crate::program::ProgramStep::Family { id, .. } => *id,
-                _ => unreachable!(),
-            },
-        };
-        let scalar_rhs_bindings =
-            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Fixed(private_material))]);
-        let rhs_bindings = BTreeMap::from([(
-            rhs_family,
-            (
-                mxx_dsl::parallel(2, |index| {
-                    Ok(RnsBggPublicRhs::Fixed(RnsBggPrivateRhs {
-                        ciphertext: family_material.ciphertext.at(&index),
-                        lifted_ciphertext: family_material.lifted_ciphertext.at(&index),
-                        rhs_id: family_material.rhs_id,
-                        id: family_material.id,
-                        context: family_material.context,
-                        level: family_material.level,
-                    }))
-                })
-                .unwrap(),
-                range.clone(),
-            ),
-        )]);
-        let online_scalar_rhs_bindings =
-            BTreeMap::from([(scalar_rhs, RnsBggPublicRhs::Identity(rhs_id))]);
-        let online_rhs_bindings = BTreeMap::from([(
-            rhs_family,
-            (
-                mxx_dsl::parallel(2, |_| Ok(RnsBggPublicRhs::Identity(rhs_id))).unwrap(),
-                range.clone(),
-            ),
-        )]);
-        let public_helpers = BTreeMap::from([
-            (
-                table_family_gate,
-                ProgramValue::Family((
-                    mxx_dsl::parallel(range.count().clone(), |index| {
-                        Ok(table_family_material
-                            .element_at_external(index.add(Int::evaluate(range.start().clone()))))
-                    })
-                    .unwrap(),
-                    range.clone(),
-                )),
-            ),
-            (scalar_gate, ProgramValue::Scalar(scalar_material.clone())),
-        ]);
-        let public_inputs = BTreeMap::from([
-            (private_input, (private_key.clone(), None)),
-            (public_input, (public_key.clone(), Some(public_plaintext.clone()))),
-        ]);
-        let public_members = BTreeMap::from([(
-            wire_family,
-            (
-                mxx_dsl::parallel(2, |_| Ok((member_key.clone(), Some(member_plaintext.clone()))))
-                    .unwrap(),
-                range.clone(),
-            ),
-        )]);
-        let prepared = PreparedProgram::new(
-            scheme.clone(),
-            frozen.clone(),
-            &ProgramBindings::new()
-                .inputs(public_inputs.iter().map(|(&id, value)| (id, value.clone())))
-                .rhs_values(scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())))
-                .rhs_family_values(rhs_bindings.iter().map(|(&id, value)| (id, value.clone())))
-                .wire_families(public_members.iter().map(|(&id, value)| (id, value.clone())))
-                .gate_helpers(public_helpers.iter().map(|(&id, value)| (id, value.clone()))),
-            ranges.clone(),
-            None,
-        )
-        .unwrap();
-        let ProgramGateInstance::FamilyGate { family, .. } = shared_gate else { unreachable!() };
-        let shared_cache = prepared.family_caches[&family].at(0);
-        let PreparedGate::MulPrivate(shared) = &shared_cache.gates[&shared_gate] else {
-            panic!("shared private product")
-        };
-        let other_cache = prepared.family_caches[&family].at(1);
-        let PreparedGate::MulPrivate(other) = &other_cache.gates[&shared_gate] else {
-            panic!("other shared product")
-        };
-        assert_eq!(shared.rhs.ciphertext.flatten(), other.rhs.ciphertext.flatten());
-        assert_eq!(shared.rhs.lifted_ciphertext.flatten(), other.rhs.lifted_ciphertext.flatten());
-        let lift_graph = DslContext::new("rns_bgg-shared-rhs-lift")
-            .public_output("lift", shared.rhs.lifted_ciphertext.clone())
-            .unwrap()
-            .build()
-            .unwrap()
-            .graph;
-        let count_lifts = |scope: &mxx_ir_core::graph::GraphScope| {
-            scope
-                .nodes()
-                .iter()
-                .filter(|node| {
-                    matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. })
-                })
-                .count()
-        };
-        assert_eq!(
-            count_lifts(lift_graph.root_scope()),
-            4,
-            "one lift per block outside member loops"
-        );
-        assert_eq!(lift_graph.scopes().values().map(count_lifts).sum::<usize>(), 4);
-        let online_inputs = BTreeMap::from([
-            (private_input, (private.clone(), None)),
-            (public_input, (public.clone(), Some(public_plaintext.clone()))),
-        ]);
-        let online_members = BTreeMap::from([(
-            wire_family,
-            (
-                mxx_dsl::parallel(2, |_| Ok((member.clone(), Some(member_plaintext.clone()))))
-                    .unwrap(),
-                range.clone(),
-            ),
-        )]);
-        let mut online_helpers = prepared.prepare_online_helpers(&secret.mask).unwrap();
-        assert!(!online_helpers.contains_key(&private_gate));
-        assert!(!online_helpers.contains_key(&family_gate));
-        let ProgramValue::Scalar(scalar_helpers) = &online_helpers[&scalar_gate] else {
-            panic!("shared masks")
-        };
-        let online_bank = scalar_helpers.masks.clone();
-        assert_eq!(online_bank.rows.len(), 2, "explicit scalar and family LUT helper sigmas");
-        let ProgramValue::Scalar(family_helpers) = &online_helpers[&table_family_gate] else {
-            panic!("shared family masks")
-        };
-        assert!(
-            std::sync::Arc::ptr_eq(&online_bank.rows, &family_helpers.masks.rows),
-            "one shared online mask bank, not one sampler per gate"
-        );
-        let online = prepared
-            .evaluate(
-                &ProgramBindings::new()
-                    .inputs(online_inputs.iter().map(|(&id, value)| (id, value.clone())))
-                    .rhs_values(
-                        online_scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
-                    )
-                    .rhs_family_values(
-                        online_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
-                    )
-                    .wire_families(online_members.iter().map(|(&id, value)| (id, value.clone())))
-                    .gate_helpers(online_helpers.iter().map(|(&id, value)| (id, value.clone()))),
-            )
-            .unwrap();
-        let (mut producer, descriptor) = prepared
-            .export(
-                scheme.artifact_binding(),
-                DslContext::new("rns_bgg-program-producer"),
-                "program",
-            )
-            .unwrap();
-        let identity = descriptor.identity().unwrap();
-        for (name, value) in [("private", &private), ("public", &public), ("member", &member)] {
-            for column in 0..2 {
-                producer = producer
-                    .private_output(
-                        format!("input-{name}-{column}"),
-                        value.row.entry(0, column).clone(),
-                    )
-                    .unwrap();
-            }
-        }
-        let producer = crate::rns_bgg::encoding::encoding_tests::export_online_masks(
-            &online_bank,
-            producer,
-            "online-mask",
-        );
-        let producer = observed_outputs(producer, &prepared, &online)
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let mut backend = make_backend(&parameters);
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let mut produced = execute(
-            &producer,
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let wire_name = |wire, column| {
-            format!("wire-{}.{}", online.keys().position(|value| *value == wire).unwrap(), column)
-        };
-        for column in 0..2 {
-            let RuntimeValue::Matrix(shared_result) =
-                &produced.outputs[&wire_name(shared_product, column)]
-            else {
-                panic!("shared product component")
-            };
-            let RuntimeValue::Matrix(expected_result) =
-                &produced.outputs[&wire_name(doubled_private_product, column)]
-            else {
-                panic!("doubled scalar product component")
-            };
-            check_matrix(
-                shared_result,
-                expected_result,
-                "shared RHS family matches scalar products",
-            );
-        }
-        let production = produced.production_id.clone().unwrap();
-        let online_bank = crate::rns_bgg::encoding::encoding_tests::import_online_masks(
-            &scheme,
-            &online_bank,
-            &production,
-            "online-mask",
-        );
-        for helpers in online_helpers.values_mut() {
-            let ProgramValue::Scalar(helpers) = helpers else { panic!("shared mask bank") };
-            helpers.masks = online_bank.clone();
-        }
-        drop(store);
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let descriptor: crate::scheme::PreparedProgramDescriptor<
-            <RnsBggProgramCache as GraphValue>::Schema,
-            <(RnsBggPublicKey, Option<Mat>) as GraphValue>::Schema,
-            RnsBggArtifactBinding,
-        > = serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        let restored = PreparedProgram::import(
-            scheme.artifact_binding(),
-            scheme.clone(),
-            frozen.clone(),
-            ranges.clone(),
-            &descriptor,
-            production.clone(),
-            identity,
-        )
-        .unwrap();
-        let ProgramGateInstance::FamilyGate { family, .. } = shared_gate else { unreachable!() };
-        let shared_cache = restored.family_caches[&family].at(0);
-        let PreparedGate::MulPrivate(shared) = &shared_cache.gates[&shared_gate] else {
-            panic!("restored shared product")
-        };
-        let other_cache = restored.family_caches[&family].at(1);
-        let PreparedGate::MulPrivate(other) = &other_cache.gates[&shared_gate] else {
-            panic!("other shared product")
-        };
-        assert_eq!(shared.rhs.ciphertext.flatten(), other.rhs.ciphertext.flatten());
-        assert_eq!(shared.rhs.lifted_ciphertext.flatten(), other.rhs.lifted_ciphertext.flatten());
-        let import_input = |name: &str, key: &RnsBggPublicKey| {
-            let ring = scheme.ring(key.level).unwrap();
-            RnsBggEncoding {
-                row: RnsBggRow::new([std::array::from_fn(|column| {
-                    ring.artifact_input(
-                        production.clone(),
-                        format!("input-{name}-{column}"),
-                        (1, parameters.component_columns(key.level).unwrap()),
-                        ArtifactConfidentiality::Private,
-                    )
-                })])
-                .unwrap(),
-                level: key.level,
-                key_id: key.id,
-                context: scheme.context,
-            }
-        };
-        let online_inputs = BTreeMap::from([
-            (private_input, (import_input("private", &private_key), None)),
-            (public_input, (import_input("public", &public_key), Some(public_plaintext))),
-        ]);
-        let imported_member = import_input("member", &member_key);
-        let online_members = BTreeMap::from([(
-            wire_family,
-            (
-                mxx_dsl::parallel(2, |_| {
-                    Ok((imported_member.clone(), Some(member_plaintext.clone())))
-                })
-                .unwrap(),
-                range.clone(),
-            ),
-        )]);
-        let actual = restored
-            .evaluate(
-                &ProgramBindings::new()
-                    .inputs(online_inputs.iter().map(|(&id, value)| (id, value.clone())))
-                    .rhs_values(
-                        online_scalar_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
-                    )
-                    .rhs_family_values(
-                        online_rhs_bindings.iter().map(|(&id, value)| (id, value.clone())),
-                    )
-                    .wire_families(online_members.iter().map(|(&id, value)| (id, value.clone())))
-                    .gate_helpers(online_helpers.iter().map(|(&id, value)| (id, value.clone()))),
-            )
-            .unwrap();
-        let consumer =
-            observed_outputs(DslContext::new("rns_bgg-program-consumer"), &restored, &actual)
-                .build()
-                .unwrap()
-                .validate_with_manifests(
-                    &ParamEnv::default(),
-                    &BTreeMap::from([(
-                        production.clone(),
-                        store.load_manifest(&production).unwrap(),
-                    )]),
-                )
-                .unwrap();
-        let switches = consumer
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
-        assert_eq!(
-            switches, 10,
-            "scalar/family LUT and indexed/shared direct product, two online polynomials each"
-        );
-        let mut consumed =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        let names = consumed.outputs.keys().cloned().collect::<Vec<_>>();
-        for name in names {
-            let RuntimeValue::Matrix(actual) =
-                consumed.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
-            else {
-                panic!("polynomial")
-            };
-            let RuntimeValue::Matrix(expected) =
-                produced.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
-            else {
-                panic!("polynomial")
-            };
-            check_matrix(actual.as_ref(), expected.as_ref(), &name);
-        }
-        let mut changed = descriptor.clone();
-        changed.cache.gates.pop_first();
-        assert!(
-            PreparedProgram::import(
-                scheme.artifact_binding(),
-                scheme.clone(),
-                frozen.clone(),
-                ranges.clone(),
-                &changed,
-                production.clone(),
-                identity
-            )
-            .is_err()
-        );
-        let mut changed_ranges = ranges.clone();
-        changed_ranges.bind(ProgramFamilyId::from_index(0), FamilyRange::bounded(0, 2, 4).unwrap());
-        assert!(
-            PreparedProgram::import(
-                scheme.artifact_binding(),
-                scheme.clone(),
-                frozen.clone(),
-                changed_ranges,
-                &descriptor,
-                production.clone(),
-                identity
-            )
-            .is_err()
-        );
-        let mut other_program = ExponentLutProgramBuilder::new();
-        other_program.set_layout(ExpLayout { stride_log2: 0, width_log2: 1 }, n as usize).unwrap();
-        let other_input = other_program
-            .input(2, ProgramWireType { stride_log2: 0, knowledge: AttributeKnowledge::Private })
-            .unwrap();
-        other_program.output(other_program.input_wire(other_input).unwrap()).unwrap();
-        assert!(
-            PreparedProgram::import(
-                scheme.artifact_binding(),
-                scheme,
-                other_program.build().unwrap(),
-                ranges.clone(),
-                &descriptor,
-                production.clone(),
-                identity,
-            )
-            .is_err()
-        );
-        let other = RnsBggScheme::new(parameters, rand::random());
-        assert!(
-            PreparedProgram::import(
-                other.artifact_binding(),
-                other,
-                frozen,
-                ranges,
-                &descriptor,
-                production,
-                identity
-            )
-            .is_err()
-        );
-    }
-}
-
-#[cfg(test)]
-mod linear_artifact_tests {
-    use super::*;
-    use crate::rns_bgg::{
-        RnsBggEncoding, RnsBggEncodingFamily, RnsBggParameters, RnsBggPlanRequest, RnsBggRow,
-    };
-    use mxx_ir_core::ParamEnv;
-    use mxx_runtime::{
-        RuntimeValue,
-        artifact::{ArtifactStore, FileArtifactStore},
-        backend::poly::cpu_backend,
-        execute,
-        transcript::SamplingMode,
-    };
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn test_rns_bgg_linear_artifacts_roundtrip_preserves_outputs_and_bindings() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(16);
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 8,
-            terminal_value_bound: 1u8.into(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let ring = scheme.ring(0).unwrap();
-        let key = scheme
-            .sample_input_key(
-                0,
-                ring.bytes_input("hash-key", 32),
-                b"key".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let secret = scheme.test_secrets().unwrap();
-        let input = scheme
-            .encode(
-                &secret.mask,
-                &key,
-                &scheme
-                    .prepare_input(&secret.payload, &key, ring.uniform_interval((1, 1), -1, 1))
-                    .unwrap(),
-            )
-            .unwrap();
-        let multiplier =
-            ring.uniform_interval((1, 1), -1, 1) + ring.uniform_interval((1, 1), -1, 1);
-        let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let family_key = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(
-                mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
-            ),
-            level: key.level,
-            id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let family_input = RnsBggEncodingFamily {
-            rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let mut graph = DslContext::new("rns_bgg-linear-artifact-producer");
-        let mut descriptors = Vec::new();
-        for (name, is_mul) in [("add", false), ("mul", true)] {
-            let prepared = if is_mul {
-                scheme.prepare_mul_public(&key, &key, multiplier.clone(), rand::random())
-            } else {
-                scheme.prepare_add(&key, &key, rand::random())
-            }
-            .unwrap();
-            let expected = scheme.evaluate_linear(&input, &input, &prepared).unwrap();
-            let (next, descriptor) = scheme.export_prepared_linear(&prepared, graph, name).unwrap();
-            graph = next
-                .output(format!("expected-{name}"), expected.row)
-                .unwrap()
-                .output(format!("expected-{name}-key"), prepared.output_key().matrix.clone())
-                .unwrap();
-            descriptors.push((name.to_owned(), descriptor));
-            let name = format!("family-{name}");
-            let prepared = scheme
-                .prepare_linear_family(
-                    &family_key,
-                    &family_key,
-                    if is_mul {
-                        Some(ProgramValue::Family(
-                            mxx_dsl::parallel(2, |_| Ok(multiplier.clone())).unwrap(),
-                        ))
-                    } else {
-                        None
-                    },
-                    rand::random(),
-                )
-                .unwrap();
-            let expected =
-                scheme.evaluate_linear_family(&family_input, &family_input, &prepared).unwrap();
-            let (next, descriptor) =
-                scheme.export_prepared_linear_family(&prepared, graph, &name).unwrap();
-            graph = next;
-            for member in 0..2 {
-                graph = graph
-                    .output(format!("expected-{name}-{member}"), expected.rows.at(member))
-                    .unwrap()
-                    .output(
-                        format!("expected-{name}-{member}-key"),
-                        prepared.output_key().matrices.at(member),
-                    )
-                    .unwrap();
-            }
-            descriptors.push((name, descriptor));
-        }
-        let prepared = scheme.prepare_reduce_family(&family_key, rand::random()).unwrap();
-        let expected = scheme.evaluate_reduce_family(&family_input, &prepared).unwrap();
-        let (next, descriptor) =
-            scheme.export_prepared_reduction(&prepared, graph, "reduce").unwrap();
-        descriptors.push(("reduce".into(), descriptor));
-        graph = next
-            .output("expected-reduce", expected.row)
-            .unwrap()
-            .output("expected-reduce-key", prepared.output_key().matrix.clone())
-            .unwrap();
-        for column in 0..2 {
-            graph = graph
-                .private_output(format!("input-{column}"), input.row.entry(0, column).clone())
-                .unwrap();
-        }
-        let graph = graph.build().unwrap().validate(&ParamEnv::default()).unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let mut backend = cpu_backend(parameters.levels().iter().cloned());
-        let mut produced = execute(
-            &graph,
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.clone().unwrap();
-        drop(store);
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let input = RnsBggEncoding {
-            row: RnsBggRow::new([std::array::from_fn(|column| {
-                ring.artifact_input(
-                    production.clone(),
-                    format!("input-{column}"),
-                    (1, parameters.component_columns(0).unwrap()),
-                    ArtifactConfidentiality::Private,
-                )
-            })])
-            .unwrap(),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-        };
-        let family_input = RnsBggEncodingFamily {
-            rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-            range,
-        };
-        let mut consumer = DslContext::new("rns_bgg-linear-artifact-consumer");
-        for (name, original) in descriptors {
-            let descriptor: RnsBggPreparedLinearDescriptor =
-                serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
-            let binding = original.binding();
-            if matches!(binding.operation, RnsBggLinearOperation::Reduce { .. }) {
-                let prepared = scheme
-                    .import_prepared_reduction(&descriptor, production.clone(), binding)
-                    .unwrap();
-                let actual = scheme.evaluate_reduce_family(&family_input, &prepared).unwrap();
-                consumer = consumer
-                    .output(format!("expected-{name}"), actual.row)
-                    .unwrap()
-                    .output(format!("expected-{name}-key"), prepared.output_key().matrix.clone())
-                    .unwrap();
-                assert!(
-                    scheme
-                        .import_prepared_linear_family(&descriptor, production.clone(), binding)
-                        .is_err()
-                );
-            } else if binding.operation.input_range().is_some() {
-                let prepared = scheme
-                    .import_prepared_linear_family(&descriptor, production.clone(), binding)
-                    .unwrap();
-                let actual =
-                    scheme.evaluate_linear_family(&family_input, &family_input, &prepared).unwrap();
-                for member in 0..2 {
-                    consumer = consumer
-                        .output(format!("expected-{name}-{member}"), actual.rows.at(member))
-                        .unwrap()
-                        .output(
-                            format!("expected-{name}-{member}-key"),
-                            prepared.output_key().matrices.at(member),
-                        )
-                        .unwrap();
-                }
-                let mut wrong = binding.clone();
-                match &mut wrong.operation {
-                    RnsBggLinearOperation::Add { range, .. } |
-                    RnsBggLinearOperation::MulPublic { range, .. } => {
-                        *range = Some(FamilyRange::bounded(0, 2, 4).unwrap());
-                    }
-                    RnsBggLinearOperation::Reduce { .. } => unreachable!("binary family operation"),
-                }
-                assert!(
-                    scheme
-                        .import_prepared_linear_family(&descriptor, production.clone(), &wrong)
-                        .is_err()
-                );
-            } else {
-                let prepared = scheme
-                    .import_prepared_linear(&descriptor, production.clone(), binding)
-                    .unwrap();
-                let actual = scheme.evaluate_linear(&input, &input, &prepared).unwrap();
-                consumer = consumer
-                    .output(format!("expected-{name}"), actual.row)
-                    .unwrap()
-                    .output(format!("expected-{name}-key"), prepared.output_key().matrix.clone())
-                    .unwrap();
-            }
-            let mut wrong = binding.clone();
-            wrong.output[0] ^= 1;
-            assert!(scheme.check_linear_descriptor(&descriptor, &wrong).is_err());
-            wrong = binding.clone();
-            wrong.operation = match &binding.operation {
-                RnsBggLinearOperation::Add { rhs, range } => {
-                    RnsBggLinearOperation::MulPublic { rhs: *rhs, range: range.clone() }
-                }
-                RnsBggLinearOperation::MulPublic { rhs, range } => {
-                    RnsBggLinearOperation::Add { rhs: *rhs, range: range.clone() }
-                }
-                RnsBggLinearOperation::Reduce { range } => {
-                    RnsBggLinearOperation::Add { rhs: binding.lhs, range: Some(range.clone()) }
-                }
-            };
-            assert!(scheme.check_linear_descriptor(&descriptor, &wrong).is_err());
-        }
-        let consumer = consumer
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production.clone(), store.load_manifest(&production).unwrap())]),
-            )
-            .unwrap();
-        let mut consumed =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        let names = consumed.outputs.keys().cloned().collect::<Vec<_>>();
-        for name in names {
-            let RuntimeValue::Matrix(actual) =
-                consumed.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
-            else {
-                panic!("polynomial")
-            };
-            let RuntimeValue::Matrix(expected) =
-                produced.materialize_output(&name, &mut backend, &mut store).unwrap().clone()
-            else {
-                panic!("polynomial")
-            };
-            assert_eq!(actual.as_ref(), expected.as_ref(), "{name}");
-        }
-    }
-}
-
-#[cfg(test)]
-mod lut_artifact_tests {
-    use super::*;
-    use crate::{
-        program::LutTable,
-        rns_bgg::{RnsBggEncoding, RnsBggParameters, RnsBggRow},
-    };
-    use mxx_ir_core::ParamEnv;
-    use mxx_runtime::{
-        RuntimeValue,
-        artifact::{ArtifactStore, FileArtifactStore},
-        backend::poly::cpu_backend,
-        execute,
-        transcript::SamplingMode,
-    };
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn test_rns_bgg_prepared_artifacts_roundtrip_preserves_online_outputs() {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(16);
-        let high_parameters = DCRTPolyParams::new(n, 2, 17, 4, None, None);
-        let prime = high_parameters.to_crt().0[0];
-        let low_parameters = DCRTPolyParams::new(n, 1, 17, 4, Some(vec![prime]), None);
-        let parameters =
-            RnsBggParameters::new(vec![high_parameters, low_parameters], 2, 1).unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let high = scheme.ring(0).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let secret = scheme.test_secrets().unwrap();
-        let key =
-            scheme.sample_input_key(0, seed.clone(), b"input".as_slice(), rand::random()).unwrap();
-        let input = scheme
-            .encode(
-                &secret.mask,
-                &key,
-                &scheme
-                    .prepare_input(&secret.payload, &key, high.polynomial([0.into(), 1.into()]))
-                    .unwrap(),
-            )
-            .unwrap();
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                crate::layout::ExpLayout {
-                    stride_log2: 0,
-                    width_log2: (2 as usize).trailing_zeros(),
-                },
-                seed.clone(),
-                b"bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let online_bank = scheme.prepare_online_masks(&secret.mask, &bank).unwrap();
-        let table = LutTable::unary(2, 2, vec![1, 0]).unwrap();
-        let material = scheme
-            .sample_lut_material(
-                &secret.payload,
-                &table,
-                &bank,
-                seed.clone(),
-                b"helpers".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let prepared = scheme.prepare_lut(&key, &material, rand::random()).unwrap();
-        let expected = scheme.evaluate_lut(&input, &prepared, &online_bank).unwrap();
-        let (mut graph, descriptor) = scheme
-            .export_prepared_lut(&prepared, DslContext::new("rns_bgg-prepared-producer"), "lut")
-            .unwrap();
-        let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let family_key = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(
-                mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
-            ),
-            level: 0,
-            id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let family_input = crate::rns_bgg::RnsBggEncodingFamily {
-            rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let family_material = scheme
-            .sample_lut_material_family(
-                &secret.payload,
-                &table,
-                &bank,
-                4.into(),
-                seed,
-                b"family-helpers".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let family_prepared =
-            scheme.prepare_lut_family(&family_key, &family_material, rand::random()).unwrap();
-
-        let structural = DslContext::new("rns_bgg-lut-structure")
-            .output("prepared", family_prepared.output.matrices.clone())
-            .unwrap()
-            .build()
-            .unwrap();
-        fn descendant_lift_counts(
-            graph: &mxx_ir_core::Graph,
-            scope_id: &mxx_ir_core::graph::FrozenGraphScopeId,
-        ) -> (usize, usize) {
-            let scope = graph.scope(scope_id).unwrap();
-            let mut decompositions = 0;
-            let mut extends = 0;
-            for (index, node) in scope.nodes().iter().enumerate() {
-                decompositions += usize::from(matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::GadgetDecompose { .. }
-                ));
-                extends += usize::from(matches!(
-                    node.kind(),
-                    mxx_ir_core::node::NodeKind::CenteredExtend { .. }
-                ));
-                if let Some(child) =
-                    graph.child_scope_id(scope_id, mxx_ir_core::NodeId(index as u64))
-                {
-                    let (child_decompositions, child_extends) =
-                        descendant_lift_counts(graph, &child);
-                    decompositions += child_decompositions;
-                    extends += child_extends;
-                }
-            }
-            (decompositions, extends)
-        }
-        let mut material_candidates = 0;
-        let mut input_candidates = 0;
-        for (index, node) in structural.graph.root_scope().nodes().iter().enumerate() {
-            if matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_)) {
-                let child = structural
-                    .graph
-                    .child_scope_id(
-                        &mxx_ir_core::graph::FrozenGraphScopeId::Root,
-                        mxx_ir_core::NodeId(index as u64),
-                    )
-                    .unwrap();
-                let child_scope = structural.graph.scope(&child).unwrap();
-                let direct_decompositions = child_scope
-                    .nodes()
-                    .iter()
-                    .filter(|node| {
-                        matches!(node.kind(), mxx_ir_core::node::NodeKind::GadgetDecompose { .. })
-                    })
-                    .count();
-                let direct_extends = child_scope
-                    .nodes()
-                    .iter()
-                    .filter(|node| {
-                        matches!(node.kind(), mxx_ir_core::node::NodeKind::CenteredExtend { .. })
-                    })
-                    .count();
-                let (decompositions, extends) = descendant_lift_counts(&structural.graph, &child);
-                let mxx_ir_core::node::NodeKind::ParallelLoop(spec) = node.kind() else {
-                    unreachable!()
-                };
-                if direct_decompositions > 0 {
-                    material_candidates += 1;
-                    assert_eq!(spec.count, mxx_ir_core::IntExpr::constant(4));
-                    assert_eq!((direct_decompositions, direct_extends), (8, 8));
-                    assert_eq!((decompositions, extends), (8, 8));
-                }
-                if direct_decompositions == 0 && decompositions > 0 {
-                    input_candidates += 1;
-                    assert_eq!(spec.count, mxx_ir_core::IntExpr::constant(2));
-                    assert!(child_scope.nodes().iter().any(|node| {
-                        matches!(node.kind(), mxx_ir_core::node::NodeKind::ParallelLoop(_))
-                    }));
-                    assert_eq!((decompositions, extends), (4, 4));
-                }
-            }
-        }
-        assert_eq!(
-            material_candidates, 1,
-            "material branch lifting must have one sibling family loop"
-        );
-        assert_eq!(input_candidates, 1, "input-dependent lifting must have one member family loop");
-
-        let family_expected =
-            scheme.evaluate_lut_family(&family_input, &family_prepared, &online_bank).unwrap();
-        let (family_graph, family_descriptor) =
-            scheme.export_prepared_lut_family(&family_prepared, graph, "family-lut").unwrap();
-        graph = family_graph;
-        for member in 0..2 {
-            graph = graph
-                .output(format!("expected-family-{member}"), family_expected.rows.at(member))
-                .unwrap();
-        }
-        for column in 0..2 {
-            graph = graph
-                .private_output(format!("input-{column}"), input.row.entry(0, column).clone())
-                .unwrap();
-        }
-        let graph = crate::rns_bgg::encoding::encoding_tests::export_online_masks(
-            &online_bank,
-            graph,
-            "online-mask",
-        );
-        let graph = graph
-            .output("expected", expected.row)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-        let mut backend = cpu_backend(parameters.levels().iter().cloned());
-        let directory = tempfile::tempdir().unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let produced = execute(
-            &graph,
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.clone().unwrap();
-        let online_bank = crate::rns_bgg::encoding::encoding_tests::import_online_masks(
-            &scheme,
-            &online_bank,
-            &production,
-            "online-mask",
-        );
-        drop(store);
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let descriptor: RnsBggPreparedLutDescriptor =
-            serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        let imported = scheme
-            .import_prepared_lut(
-                &descriptor,
-                production.clone(),
-                &material.binding(),
-                key.id,
-                prepared.output.id,
-            )
-            .unwrap();
-        let input = RnsBggEncoding {
-            row: RnsBggRow::new([std::array::from_fn(|column| {
-                high.artifact_input(
-                    production.clone(),
-                    format!("input-{column}"),
-                    (1, parameters.component_columns(0).unwrap()),
-                    ArtifactConfidentiality::Private,
-                )
-            })])
-            .unwrap(),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-        };
-        let actual = scheme.evaluate_lut(&input, &imported, &online_bank).unwrap();
-        let graph = DslContext::new("rns_bgg-prepared-consumer")
-            .output("actual", actual.row)
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production.clone(), store.load_manifest(&production).unwrap())]),
-            )
-            .unwrap();
-        // Only the two output polynomials are switched online. Import must
-        // not pull the internal b/public-key preprocessing switches back in.
-        let switches = graph
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
-        assert_eq!(switches, 2);
-        let consumed =
-            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        for column in 0..2 {
-            let RuntimeValue::Matrix(actual) = &consumed.outputs[&format!("actual.{column}")]
-            else {
-                panic!("polynomial")
-            };
-            let RuntimeValue::Matrix(expected) = &produced.outputs[&format!("expected.{column}")]
-            else {
-                panic!("polynomial")
-            };
-            assert_eq!(actual.as_ref(), expected.as_ref());
-        }
-        let family_descriptor: RnsBggPreparedLutFamilyDescriptor =
-            serde_json::from_slice(&serde_json::to_vec(&family_descriptor).unwrap()).unwrap();
-        let family_imported = scheme
-            .import_prepared_lut_family(
-                &family_descriptor,
-                production.clone(),
-                family_material.binding(),
-                key.id,
-                family_prepared.output.id,
-                &range,
-            )
-            .unwrap();
-        let family_input = crate::rns_bgg::RnsBggEncodingFamily {
-            rows: ProgramValue::Family(mxx_dsl::parallel(2, |_| Ok(input.row.clone())).unwrap()),
-            level: 0,
-            key_id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let result =
-            scheme.evaluate_lut_family(&family_input, &family_imported, &online_bank).unwrap();
-        let mut consumer = DslContext::new("rns_bgg-prepared-family-consumer");
-        for member in 0..2 {
-            consumer =
-                consumer.output(format!("actual-family-{member}"), result.rows.at(member)).unwrap();
-        }
-        let consumer = consumer
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production.clone(), store.load_manifest(&production).unwrap())]),
-            )
-            .unwrap();
-        let family_switches = consumer
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
-        assert_eq!(family_switches, 2, "one final switch per polynomial in the family body");
-        let result =
-            execute(&consumer, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        for member in 0..2 {
-            for column in 0..2 {
-                let RuntimeValue::Matrix(actual) =
-                    &result.outputs[&format!("actual-family-{member}.{column}")]
-                else {
-                    panic!("polynomial")
-                };
-                let RuntimeValue::Matrix(expected) =
-                    &produced.outputs[&format!("expected-family-{member}.{column}")]
-                else {
-                    panic!("polynomial")
-                };
-                assert_eq!(actual.as_ref(), expected.as_ref());
-            }
-        }
-        assert!(
-            scheme
-                .import_prepared_lut_family(
-                    &family_descriptor,
-                    production.clone(),
-                    family_material.binding(),
-                    key.id,
-                    family_prepared.output.id,
-                    &FamilyRange::bounded(0, 2, 4).unwrap()
-                )
-                .is_err()
-        );
-        let mut wrong = material.binding();
-        wrong.material_id[0] ^= 1;
-        assert!(
-            scheme
-                .import_prepared_lut(
-                    &descriptor,
-                    production.clone(),
-                    &wrong,
-                    key.id,
-                    prepared.output.id
-                )
-                .is_err()
-        );
-        assert!(
-            scheme
-                .import_prepared_lut(
-                    &descriptor,
-                    production,
-                    &material.binding(),
-                    rand::random(),
-                    prepared.output.id
-                )
-                .is_err()
-        );
-    }
-}
-
-#[cfg(test)]
-pub(crate) mod readout_tests {
-    use super::*;
-    use crate::{
-        layout::ExpLayout,
-        noise_refresh::prf::SparseLwrPrfProfile,
-        rns_bgg::{RnsBggNoiseBound, RnsBggParameters, RnsBggPlanRequest},
-    };
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
-    use mxx_primitives::{element::PolyElem, poly::Poly};
-    use mxx_runtime::{
-        Backend, RuntimeValue,
-        artifact::{ArtifactStore, FileArtifactStore},
-        backend::poly::cpu_backend,
-        execute,
-        transcript::SamplingMode,
-    };
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn test_rns_bgg_affine_readout_covers_full_native_domain() {
-        check_cpu_domain(0, [vec![1.into()], vec![]], false, false);
-    }
-
-    #[test]
-    fn test_rns_bgg_affine_readout_covers_strided_native_domain() {
-        check_cpu_domain(1, [vec![1.into()], vec![]], false, false);
-    }
-
-    #[test]
-    fn test_rns_bgg_weighted_readout_preserves_noise_multiplier() {
-        check_cpu_domain(1, [vec![], vec![0.into(), 17.into()]], false, false);
-    }
-
-    #[test]
-    fn test_rns_bgg_indexed_readout_weights_survive_artifact_reopen() {
-        check_cpu_domain(1, [vec![17.into()], vec![]], true, false);
-    }
-
-    #[test]
-    fn test_rns_bgg_aggregate_readout_survives_artifact_reopen() {
-        for indexed in [false, true] {
-            check_cpu_domain(2, [vec![17.into()], vec![]], indexed, true);
-        }
-    }
-
-    fn check_cpu_domain(stride_log2: u32, weight: RnsBggReadoutWeight, indexed: bool, sum: bool) {
-        check_full_domain(
-            stride_log2,
-            weight,
-            indexed,
-            sum,
-            |parameters| cpu_backend(parameters.levels().iter().cloned()),
-            |matrix, name, q, bound| {
-                for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
-                    for coefficient in polynomial.coeffs() {
-                        let absolute = coefficient.value().clone().min(q - coefficient.value());
-                        assert!(&absolute <= bound, "{name}: {absolute} > {bound}");
-                    }
-                }
-            },
-        );
-    }
-
-    pub(crate) fn check_full_domain<B: Backend>(
-        stride_log2: u32,
-        weight: RnsBggReadoutWeight,
-        indexed: bool,
-        sum: bool,
-        make_backend: impl FnOnce(&RnsBggParameters) -> B,
-        check_matrix: impl Fn(&B::Matrix, &str, &BigUint, &BigUint),
-    ) {
-        let n: u32 = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(8);
-        let profile = SparseLwrPrfProfile::new(
-            ExpLayout { stride_log2, width_log2: n.trailing_zeros() - stride_log2 },
-            2,
-        )
-        .unwrap();
-        let width = profile.layout.width();
-        let readout = profile.canonical_readout().unwrap();
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![width],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 12,
-            terminal_value_bound: BigUint::from(3u8) *
-                weight.iter().flatten().map(|x| x.magnitude()).max().unwrap().clone(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let secrets = scheme.test_secrets().unwrap();
-        let high = scheme.ring(0).unwrap();
-        let low = scheme.ring(1).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let key =
-            scheme.sample_input_key(0, seed.clone(), b"input".as_slice(), rand::random()).unwrap();
-        let bank = scheme
-            .sample_mask_bank(0, profile.layout, seed.clone(), b"bank".as_slice(), rand::random())
-            .unwrap();
-        let material = scheme
-            .sample_readout_material(
-                &secrets.payload,
-                &readout,
-                &bank,
-                seed.clone(),
-                b"readout".as_slice(),
-                rand::random(),
-                Some(RnsBggReadoutWeights::Shared(weight.clone())),
-                None,
-            )
-            .unwrap();
-        let public_input = RnsBggPublicProgramValue::Scalar((key.clone(), None));
-        let prepared = scheme.prepare_readout(&readout, &public_input, &material).unwrap();
-        let (mut producer, descriptor) = scheme
-            .export_prepared_readout(
-                &prepared,
-                DslContext::new("rns_bgg-readout-preprocess"),
-                "readout",
-            )
-            .unwrap();
-        let descriptor: RnsBggPreparedReadoutDescriptor =
-            serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
-        let range = crate::program::FamilyRange::bounded(1, 2 * width, 2 * width + 2).unwrap();
-        let family_input = crate::rns_bgg::RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(
-                mxx_dsl::parallel(range.count().clone(), |_| Ok(key.matrix.clone())).unwrap(),
-            ),
-            level: key.level,
-            id: key.id,
-            context: key.context,
-            range: range.clone(),
-        }
-        .into_program()
-        .unwrap();
-        let routed_weights = (0..2 * width)
-            .map(|index| {
-                let row = readout_offset(&low, &weight).unwrap();
-                if index % 2 == 0 {
-                    row
+        self.program
+            .wire_is_coefficient_output(declaration.source_output())
+            .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidSourceOutput))
+            .and_then(|is_coefficient| {
+                if is_coefficient {
+                    Err(RnsBggError::Refresh(RefreshError::InvalidSourceOutput))
                 } else {
-                    // Swap destinations and rotate one coefficient, preserving the bound.
-                    RnsBggRow::new([[
-                        low.polynomial([0.into(), (-1).into()]) * row.entry(0, 1).clone(),
-                        low.polynomial([0.into(), (-1).into()]) * row.entry(0, 0).clone(),
-                    ]])
-                    .unwrap()
+                    Ok(())
                 }
-            })
-            .collect::<Vec<_>>();
-        let family_material = if indexed || sum {
-            let weights = if indexed {
-                RnsBggReadoutWeights::Indexed {
-                    rows: Family::pack(routed_weights.clone()).unwrap(),
-                    coefficient_bound: weight
-                        .iter()
-                        .flatten()
-                        .map(|v| v.magnitude())
-                        .max()
-                        .cloned()
-                        .unwrap_or_default(),
-                }
-            } else {
-                RnsBggReadoutWeights::Shared(weight.clone())
-            };
-            Some(
-                scheme
-                    .sample_readout_material(
-                        &secrets.payload,
-                        &readout,
-                        &bank,
-                        seed,
-                        b"family-readout".as_slice(),
-                        rand::random(),
-                        Some(weights),
-                        Some(if sum {
-                            crate::rns_bgg::RnsBggTerminalFamilyMode::Sum
-                        } else {
-                            crate::rns_bgg::RnsBggTerminalFamilyMode::Independent
-                        }),
-                    )
-                    .unwrap(),
-            )
-        } else {
-            None
-        };
-        let family_prepared = scheme
-            .prepare_readout(&readout, &family_input, family_material.as_ref().unwrap_or(&material))
-            .unwrap();
-        let family_binding = family_prepared.binding();
-        let family_id = family_prepared.id();
-        let (next, family_descriptor) =
-            scheme.export_prepared_readout(&family_prepared, producer, "family-readout").unwrap();
-        producer = next;
-        let family_descriptor: RnsBggPreparedReadoutDescriptor =
-            serde_json::from_slice(&serde_json::to_vec(&family_descriptor).unwrap()).unwrap();
+            })?;
+        // Resolve both logical levels before graph construction.  This checks
+        // the target ring and ensures the source output has a valid RNS
+        // representation; the declaration itself owns CRT divisibility and
+        // the exact sparse-PRF schema.
+        self.workload.level(declaration.source_output())?;
+        self.parameters.level(declaration.target_level())?;
+        if declaration.output_schema().is_empty() || declaration.prf_labels().is_empty() {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
+        }
+        Ok(())
+    }
+}
+impl ProgramLoweringContext for PublicKeyLowering<'_> {
+    fn replace_site(&mut self, site: Option<LoweringSite>) -> Option<LoweringSite> {
+        std::mem::replace(&mut self.current_site, site)
+    }
+}
 
-        let binding = prepared.binding();
-        let stage_id = prepared.id();
-        let mut input_descriptors = Vec::new();
-        for x in 0..2 * width {
-            let mu = profile.layout.mono(&high, &BigInt::from(x)).unwrap();
-            let material = scheme.prepare_input(&secrets.payload, &key, mu).unwrap();
-            let (next, descriptor) = scheme
-                .export_input_material(&key, &material, producer, &format!("input-{x}"))
-                .unwrap();
-            producer = next;
-            input_descriptors.push(descriptor);
-        }
-        let mut backend = make_backend(&parameters);
-        std::fs::create_dir_all("test_data/rns_bgg_readout_artifacts").unwrap();
-        let directory = tempfile::tempdir_in("test_data/rns_bgg_readout_artifacts").unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let produced = execute(
-            &producer.build().unwrap().validate(&ParamEnv::default()).unwrap(),
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.unwrap();
-        drop(store);
-        let mut store = FileArtifactStore::open(directory.path()).unwrap();
-        let prepared = scheme
-            .import_prepared_readout(
-                &descriptor,
-                production.clone(),
-                &readout,
-                &binding,
-                key.id,
-                stage_id,
-            )
-            .unwrap();
-        let mut wrong_id = stage_id;
-        wrong_id[0] ^= 1;
-        assert!(
-            scheme
-                .import_prepared_readout(
-                    &descriptor,
-                    production.clone(),
-                    &readout,
-                    &binding,
-                    key.id,
-                    wrong_id,
-                )
-                .is_err()
-        );
-        let public = scheme.project_readout(&readout, &public_input, &prepared, &()).unwrap();
-        let family_prepared = scheme
-            .import_prepared_readout(
-                &family_descriptor,
-                production.clone(),
-                &readout,
-                &family_binding,
-                key.id,
-                family_id,
-            )
-            .unwrap();
-        let family_public =
-            scheme.project_readout(&readout, &family_input, &family_prepared, &()).unwrap();
+impl GraphParallelLowering for PublicKeyLowering<'_> {
+    type SideOutput = PublicKeyParallelOutputs;
 
-        assert!(
-            matches!(public.weight(), RnsBggReadoutWeights::Shared(actual) if actual == &weight)
-        );
-        let masks = scheme.prepare_online_masks(&secrets.mask, &prepared.mask_bank()).unwrap();
-        let noise = parameters
-            .terminal_noise_bound(
-                0,
-                [(
-                    &RnsBggNoiseBound {
-                        error: parameters.encoding_error_bound.clone(),
-                        payload_l1: 1u8.into(),
-                    },
-                    width,
-                    &1u8.into(),
-                )],
-                material.target_bound().clone(),
-            )
-            .unwrap();
-        assert!(parameters.terminal_noise_fits(1, &noise).unwrap());
-        let q = parameters.level(1).unwrap().modulus();
-        let s = secrets.mask.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
-        let mut graph = DslContext::new("rns_bgg-affine-full-native-domain");
-        let mut input_rows = Vec::new();
-        let mut scalar_rows = Vec::new();
-        for (x, descriptor) in input_descriptors.iter().enumerate() {
-            let (key, material) =
-                scheme.import_input_material(descriptor, production.clone(), key.id, 0).unwrap();
-            let input = scheme.encode(&secrets.mask, &key, &material).unwrap();
-            input_rows.push(input.row.clone());
-            let input = RnsBggEncodingProgramValue::Scalar((input, None));
-            let value = scheme.evaluate_readout(&readout, &input, &prepared, &masks).unwrap();
-            scalar_rows.push(value.values.scalar().unwrap().clone());
-            // The canonical PRF definition, independent of the affine target construction.
-            let half_value = BigInt::from(profile.p_prime * (x % width) / width + 1);
-            let expected = if x < width { half_value } else { 1u8 - half_value };
-            let expected =
-                scheme.scalar(1, expected).unwrap() * readout_offset(&low, &weight).unwrap();
-            let error = value.values.scalar().unwrap().clone() -
-                s.clone() * public.values.scalar().unwrap().clone() -
-                expected;
-            graph = graph.output(format!("error-{x}"), error).unwrap();
+    fn begin_graph_parallel(&mut self) {
+        if self.parallel_outputs.is_empty() {
+            self.parallel_lut_keys.clear();
+            self.parallel_nested_public_keys.clear();
+            self.parallel_nested_lut_keys.clear();
+            self.parallel_nested_helper_keys.clear();
         }
-        let family_encodings = crate::rns_bgg::RnsBggEncodingFamily {
-            rows: ProgramValue::Family(Family::pack(input_rows).unwrap()),
-            level: key.level,
-            key_id: key.id,
-            context: key.context,
-            range,
-        }
-        .into_program()
-        .unwrap();
-        let family_value =
-            scheme.evaluate_readout(&readout, &family_encodings, &family_prepared, &masks).unwrap();
-        let ProgramValue::Family((rows, _)) = family_value.values else { panic!("family") };
-        let ProgramValue::Family((matrices, _)) = family_public.values else { panic!("family") };
-        if sum {
-            assert_eq!(rows.count(), &1.into());
-            assert_eq!(matrices.count(), &1.into());
-            let expected = (0..2 * width)
-                .map(|index| {
-                    let half_value = BigInt::from(profile.p_prime * (index % width) / width + 1);
-                    let value = if index < width { half_value } else { 1u8 - half_value };
-                    let weight_row = if indexed {
-                        routed_weights[index].clone()
-                    } else {
-                        readout_offset(&low, &weight).unwrap()
-                    };
-                    scheme.scalar(1, value).unwrap() * weight_row
-                })
-                .reduce(|lhs, rhs| lhs + rhs)
-                .unwrap();
-            graph = graph
-                .output("aggregate-error", rows.at(0) - s.clone() * matrices.at(0) - expected)
-                .unwrap();
-        } else {
-            for (index, row) in scalar_rows.into_iter().enumerate() {
-                if indexed {
-                    let half_value = BigInt::from(profile.p_prime * (index % width) / width + 1);
-                    let value = if index < width { half_value } else { 1u8 - half_value };
-                    let expected = scheme.scalar(1, value).unwrap() * routed_weights[index].clone();
-                    graph = graph
-                        .output(
-                            format!("indexed-error-{index}"),
-                            rows.at(index) - s.clone() * matrices.at(index) - expected,
-                        )
-                        .unwrap();
+        self.parallel_outputs.push(PublicKeyParallelOutputs::default());
+        self.parallel_public_key_scopes.push(BTreeMap::new());
+        self.parallel_lut_key_scopes.push(BTreeMap::new());
+        self.parallel_helper_key_scopes.push(BTreeMap::new());
+    }
+
+    fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
+        self.finished_parallel_public_keys =
+            self.parallel_public_key_scopes.pop().unwrap_or_default();
+        self.finished_parallel_lut_keys = self.parallel_lut_key_scopes.pop().unwrap_or_default();
+        self.finished_parallel_helper_keys =
+            self.parallel_helper_key_scopes.pop().unwrap_or_default();
+        Ok(self.parallel_outputs.pop().unwrap_or_default())
+    }
+
+    fn commit_graph_parallel(
+        &mut self,
+        outputs: Family<Self::SideOutput>,
+    ) -> Result<(), Self::Error> {
+        if !self.parallel_outputs.is_empty() {
+            let public = self.finished_parallel_public_keys.clone();
+            for (key, site) in public {
+                let family =
+                    select_parallel_output(&outputs, |value| value.public.get(&key).cloned())?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_public
+                    .insert(key.clone(), family);
+                self.parallel_nested_public_keys.insert(key, site);
+            }
+            let lut = self.finished_parallel_lut_keys.clone();
+            for (key, site) in lut {
+                let family =
+                    select_parallel_output(&outputs, |value| value.lut.get(&key).cloned())?;
+                let family = flatten_family(family)?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_lut
+                    .insert(key.clone(), family);
+                self.parallel_nested_lut_keys.insert(key, site);
+            }
+            let helpers = self.finished_parallel_helper_keys.clone();
+            for (key, origin_scope) in helpers {
+                let family =
+                    select_parallel_output(&outputs, |value| value.helpers.get(&key).cloned())?;
+                let family = flatten_family(family)?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_helpers
+                    .insert(key.clone(), family);
+                self.parallel_nested_helper_keys.insert(key, origin_scope);
+            }
+            // A child parallel may itself have committed nested scopes.  Lift
+            // those families through this loop as well; only keys present in
+            // this child are selected, so sibling scopes cannot cause a
+            // missing-key panic.
+            let child = outputs.at(Int::constant(0));
+            let nested_public = self.parallel_nested_public_keys.clone();
+            for (key, site) in nested_public {
+                if !child.nested_public.contains_key(&key) {
                     continue;
                 }
-                graph = graph
-                    .output(format!("family-match-row-{index}"), rows.at(index) - row)
-                    .unwrap();
-                graph = graph
-                    .output(
-                        format!("family-match-public-{index}"),
-                        matrices.at(index) - public.values.scalar().unwrap().clone(),
-                    )
-                    .unwrap();
+                let family = select_parallel_output(&outputs, |value| {
+                    value.nested_public.get(&key).cloned()
+                })?;
+                let family = flatten_family(family)?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_public
+                    .insert(key.clone(), family);
+                self.parallel_nested_public_keys.insert(key, site);
             }
+            let nested_lut = self.parallel_nested_lut_keys.clone();
+            for (key, site) in nested_lut {
+                if !child.nested_lut.contains_key(&key) {
+                    continue;
+                }
+                let family =
+                    select_parallel_output(&outputs, |value| value.nested_lut.get(&key).cloned())?;
+                let family = flatten_family(family)?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_lut
+                    .insert(key.clone(), family);
+                self.parallel_nested_lut_keys.insert(key, site);
+            }
+            let nested_helpers = self.parallel_nested_helper_keys.clone();
+            for (key, origin_scope) in nested_helpers {
+                if !child.nested_helpers.contains_key(&key) {
+                    continue;
+                }
+                let family = select_parallel_output(&outputs, |value| {
+                    value.nested_helpers.get(&key).cloned()
+                })?;
+                let family = flatten_family(family)?;
+                self.parallel_outputs
+                    .last_mut()
+                    .ok_or(RnsBggError::Binding("parallel output scope"))?
+                    .nested_helpers
+                    .insert(key.clone(), family);
+                self.parallel_nested_helper_keys.insert(key, origin_scope);
+            }
+            return Ok(());
         }
-        let manifest = store.load_manifest(&production).unwrap();
-        let graph = graph
-            .build()
-            .unwrap()
-            .validate_with_manifests(
-                &ParamEnv::default(),
-                &BTreeMap::from([(production, manifest)]),
-            )
-            .unwrap();
-        let switches = graph
-            .source
-            .scopes()
-            .values()
-            .flat_map(|scope| scope.nodes())
-            .filter(|node| {
-                matches!(node.kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-            })
-            .count();
-        assert_eq!(
-            switches,
-            4 * width + 2,
-            "two blocks per scalar input and one family body; public switches stay in preprocessing"
-        );
-        let results =
-            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
-        for (name, value) in results.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("matrix") };
-            let bound = if name == "aggregate-error" {
-                let input_bound = RnsBggNoiseBound {
-                    error: parameters.encoding_error_bound.clone(),
-                    payload_l1: 1u8.into(),
-                };
-                let gain = 1u8.into();
-                parameters
-                    .terminal_noise_bound(
-                        0,
-                        [(&input_bound, width * (2 * width), &gain)],
-                        material.target_bound() * (2 * width),
-                    )
-                    .unwrap()
-                    .error
-            } else if name.starts_with("family-match") {
-                BigUint::from(0u8)
-            } else {
-                noise.error.clone()
-            };
-            check_matrix(&matrix, &name, q.as_ref(), &bound);
+        for (key, site) in &self.finished_parallel_public_keys {
+            let family = select_parallel_output(&outputs, |value| value.public.get(key).cloned())?;
+            self.prepared_public_action_families.insert(*site, family);
         }
+        for (key, site) in &self.finished_parallel_lut_keys {
+            let family = select_parallel_output(&outputs, |value| value.lut.get(key).cloned())?;
+            let family = flatten_family(family)?;
+            self.prepared_lut_action_families.insert(*site, family);
+        }
+        for (key, (origin, scope)) in &self.finished_parallel_helper_keys {
+            let family = select_parallel_output(&outputs, |value| value.helpers.get(key).cloned())?;
+            let family = flatten_family(family)?;
+            self.prepared_helper_families.insert((*origin, scope.clone()), family);
+        }
+        for (key, site) in &self.parallel_nested_public_keys {
+            if !outputs.at(Int::constant(0)).nested_public.contains_key(key) {
+                continue;
+            }
+            let family =
+                select_parallel_output(&outputs, |value| value.nested_public.get(key).cloned())?;
+            let family = flatten_family(family)?;
+            self.prepared_public_action_families.insert(*site, family);
+        }
+        for (key, site) in &self.parallel_nested_lut_keys {
+            if !outputs.at(Int::constant(0)).nested_lut.contains_key(key) {
+                continue;
+            }
+            let family =
+                select_parallel_output(&outputs, |value| value.nested_lut.get(key).cloned())?;
+            let family = flatten_family(family)?;
+            self.prepared_lut_action_families.insert(*site, family);
+        }
+        for (key, (origin, scope)) in &self.parallel_nested_helper_keys {
+            if !outputs.at(Int::constant(0)).nested_helpers.contains_key(key) {
+                continue;
+            }
+            let family =
+                select_parallel_output(&outputs, |value| value.nested_helpers.get(key).cloned())?;
+            let family = flatten_family(family)?;
+            self.prepared_helper_families.insert((*origin, scope.clone()), family);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
-pub(crate) mod terminal_family_tests {
-    use super::*;
-    use crate::{
-        program::FamilyRange,
-        rns_bgg::{RnsBggParameters, RnsBggPlanRequest},
-    };
-    use mxx_dsl::DslContext;
-    use mxx_ir_core::ParamEnv;
-    use mxx_primitives::{element::PolyElem, poly::Poly};
-    use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
-    };
-    use num_traits::Zero;
-    use std::collections::BTreeMap;
+fn scale_public_matrix(matrix: RnsBggMatrix, scalar: &BigInt) -> RnsBggMatrix {
+    map_matrix(matrix, |entry| entry * scalar.clone())
+}
 
-    #[test]
-    fn test_rns_bgg_terminal_family_matches_scalar_members() {
-        let (graph, parameters) = fixture();
-        let result = execute(
-            &graph,
-            &mut cpu_backend(parameters.levels().iter().cloned()),
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        for (name, value) in result.outputs {
-            let RuntimeValue::Matrix(matrix) = value else { panic!("matrix") };
-            for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
-                assert!(polynomial.coeffs().iter().all(|c| c.value().is_zero()), "{name}");
+#[cfg(test)]
+fn mod_down_lift_public(
+    matrix: RnsBggMatrix,
+    channel_modulus: BigInt,
+    target_modulus: BigInt,
+) -> RnsBggMatrix {
+    map_matrix(matrix, |entry| {
+        entry.block_mod_switch(channel_modulus.clone(), 1).centered_extend(target_modulus.clone())
+    })
+}
+
+/// Project one refresh anchor into its plaintext channel and then preserve
+/// that centered representative in the combined CRT ring.
+///
+/// This is deliberately not [`mod_down_lift_public`]: the public refresh
+/// carrier is the channel's `A_star`, so it must be reduced modulo `q_t`
+/// without dividing by `q_t`.  The decoder target is formed separately from
+/// `A_sum - H*A_star` by the encoding stage.
+fn reduce_lift_public_anchor(
+    matrix: RnsBggMatrix,
+    channel_modulus: BigInt,
+    target_modulus: BigInt,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let reduced = checked_modulus_convert_matrix(matrix, channel_modulus)?;
+    Ok(map_matrix(reduced, |entry| entry.centered_extend(target_modulus.clone())))
+}
+
+fn matrix_schema_matches(lhs: &RnsBggMatrix, rhs: &RnsBggMatrix) -> bool {
+    lhs.0.0.matrix_type() == rhs.0.0.matrix_type() &&
+        lhs.0.1.matrix_type() == rhs.0.1.matrix_type() &&
+        lhs.1.0.matrix_type() == rhs.1.0.matrix_type() &&
+        lhs.1.1.matrix_type() == rhs.1.1.matrix_type()
+}
+
+#[cfg(test)]
+fn refresh_label_target(
+    parameters: &RnsBggParameters,
+    level: usize,
+    base: usize,
+    label: RefreshPrfLabel,
+    fresh_h: Option<BigInt>,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    refresh_label_target_with_columns(
+        parameters,
+        level,
+        parameters.component_columns(level)?,
+        base,
+        label,
+        fresh_h,
+    )
+}
+
+fn refresh_label_target_with_columns(
+    parameters: &RnsBggParameters,
+    level: usize,
+    columns: usize,
+    base: usize,
+    label: RefreshPrfLabel,
+    fresh_h: Option<BigInt>,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let ring = parameters.ring(level)?;
+    let (component, coefficient, digit, fresh, h) = match label {
+        RefreshPrfLabel::Mask { component, coefficient, digit, .. } => {
+            (component, coefficient, digit, false, BigInt::from(1u8))
+        }
+        RefreshPrfLabel::FreshError { component, coefficient, digit, .. } => {
+            (component, coefficient, digit, true, fresh_h.unwrap_or_else(|| BigInt::from(1u8)))
+        }
+    };
+    let component_limit = columns
+        .checked_mul(2)
+        .ok_or(RnsBggError::Parameters("refresh component index overflow"))?;
+    if component >= component_limit {
+        return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+    }
+    let block = component / columns;
+    let column = component % columns;
+    let power = ring.constant(
+        (1, 1),
+        ConstantMatrix::PowerOfBase {
+            base: IntExpr::constant(base),
+            exponent: IntExpr::constant(digit),
+        },
+    );
+    let rotation = ring
+        .constant((1, 1), ConstantMatrix::Rotation { exponent: IntExpr::constant(coefficient) });
+    let mut weight = power * rotation;
+    if fresh {
+        weight = weight * ring.polynomial([IntExpr::constant(h)]);
+    }
+    let unit =
+        ring.constant((1, columns), ConstantMatrix::UnitRow { index: IntExpr::constant(column) });
+    let row = weight * unit;
+    let first = ring.polynomial([IntExpr::constant(1usize - block)]);
+    let second = ring.polynomial([IntExpr::constant(block)]);
+    let row = (first * row.clone(), second * row);
+    let zero = ring.zero((1, columns));
+    Ok(((row.0.clone(), row.1.clone()), (zero.clone(), zero)))
+}
+
+fn validate_refresh_prf_wire(actual: WireId, expected: WireId) -> Result<(), RnsBggError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))
+    }
+}
+
+fn validate_refresh_source(
+    parameters: &RnsBggParameters,
+    anchor: &RnsBggPublicKey,
+    expected_wire: WireId,
+    slot: &crate::noise_refresh::refresh::RefreshSlot,
+) -> Result<usize, RnsBggError> {
+    if anchor.wire != expected_wire {
+        return Err(RnsBggError::Refresh(RefreshError::AnchorMismatch));
+    }
+    let modulus =
+        slot.q.to_biguint().ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    let level = refresh_modulus_level(parameters, &modulus, "refresh source modulus")?;
+    let expected = parameters.ring(level)?.matrix_type((1, parameters.component_columns(level)?));
+    if [
+        anchor.matrix.0.0.matrix_type(),
+        anchor.matrix.0.1.matrix_type(),
+        anchor.matrix.1.0.matrix_type(),
+        anchor.matrix.1.1.matrix_type(),
+    ]
+    .iter()
+    .any(|actual| **actual != expected)
+    {
+        return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+    }
+    Ok(level)
+}
+
+fn refresh_output_anchor(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    target_columns: usize,
+    hash_key: Bytes,
+    commitment: [u8; 32],
+    slot: usize,
+    wire: WireId,
+) -> Result<RnsBggPublicKey, RnsBggError> {
+    let ring = parameters.ring(evaluation_level)?;
+    let tag = mxx_dsl::HashTag::from(
+        format!("rns-bgg/refresh-anchor/{commitment:?}/{slot}").into_bytes(),
+    );
+    Ok(RnsBggPublicKey::new(wire, matrix_from_hash(&ring, hash_key, tag, target_columns)))
+}
+
+fn refresh_modulus_level(
+    parameters: &RnsBggParameters,
+    modulus: &BigUint,
+    context: &'static str,
+) -> Result<usize, RnsBggError> {
+    parameters
+        .levels()
+        .iter()
+        .position(|level| level.modulus().as_ref() == modulus)
+        .ok_or(RnsBggError::Binding(context))
+}
+
+fn validate_refresh_qp_levels(
+    parameters: &RnsBggParameters,
+    slot: &crate::noise_refresh::refresh::RefreshSlot,
+    evaluation_level: usize,
+) -> Result<usize, RnsBggError> {
+    let decomposition_level = evaluation_level
+        .checked_add(1)
+        .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    let decomposition = parameters.level(decomposition_level).map_err(|_| {
+        RnsBggError::Binding("refresh p modulus is not the immediate q state level")
+    })?;
+    let p_modulus =
+        slot.p.to_biguint().ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    if decomposition.modulus().as_ref() != &p_modulus {
+        return Err(RnsBggError::Binding("refresh p modulus is not the immediate q state level"));
+    }
+    let q_modulus =
+        slot.q.to_biguint().ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    if &q_modulus % &p_modulus != BigUint::zero() {
+        return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+    }
+    Ok(decomposition_level)
+}
+
+fn declared_refresh_target_modulus(
+    slots: &[crate::noise_refresh::refresh::RefreshSlot],
+) -> Result<BigUint, RnsBggError> {
+    slots.iter().try_fold(BigUint::one(), |product, slot| {
+        slot.q_t
+            .to_biguint()
+            .map(|modulus| product * modulus)
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))
+    })
+}
+
+fn validate_refresh_target_modulus(
+    slots: &[crate::noise_refresh::refresh::RefreshSlot],
+    target: &BigUint,
+) -> Result<(), RnsBggError> {
+    if declared_refresh_target_modulus(slots)? != *target {
+        return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+    }
+    Ok(())
+}
+
+fn expected_refresh_slots(
+    label: &RefreshPrfLabel,
+    slot_count: usize,
+) -> Result<Vec<usize>, RnsBggError> {
+    match label {
+        RefreshPrfLabel::Mask { slot, .. } => {
+            if *slot >= slot_count {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
             }
+            Ok(vec![*slot])
+        }
+        RefreshPrfLabel::FreshError { .. } => {
+            if slot_count == 0 {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+            }
+            Ok((0..slot_count).collect())
         }
     }
+}
 
-    pub(crate) fn check_indexed_artifacts<B: mxx_runtime::Backend>(
-        make_backend: impl Fn(&RnsBggParameters) -> B,
-        check_matrix: impl Fn(&B::Matrix, &str, &num_bigint::BigUint, &num_bigint::BigUint),
-    ) {
-        use mxx_runtime::artifact::{ArtifactStore, FileArtifactStore};
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|v| v.parse().unwrap())
-            .unwrap_or(8);
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 2,
-            max_crt_depth: 12,
-            terminal_value_bound: 18u8.into(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let high = scheme.ring(0).unwrap();
-        let low = scheme.ring(1).unwrap();
-        let seed = high.bytes_input("hash-key", 32);
-        let payload_secret = scheme.sample_payload_secret().unwrap();
-        let key =
-            scheme.sample_input_key(0, seed.clone(), b"key".as_slice(), rand::random()).unwrap();
-        let private_input = scheme
-            .prepare_input(&payload_secret, &key, high.polynomial([0.into(), 1.into()]))
-            .unwrap();
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                crate::layout::ExpLayout { stride_log2: 0, width_log2: 1 },
-                seed.clone(),
-                b"bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let table =
-            RowLutTable::new(vec![[vec![], vec![]], [vec![1.into()], vec![]]], None).unwrap();
-        let destinations = [
-            RnsBggRow::new([[low.identity(1), low.zero((1, 1))]]).unwrap(),
-            RnsBggRow::new([[low.zero((1, 1)), low.polynomial([0.into(), 17.into()])]]).unwrap(),
-        ];
-        let transforms = Family::pack(
-            destinations
-                .iter()
-                .cloned()
-                .map(|row| {
-                    RnsBggMatrix::from_rows(
-                        row,
-                        RnsBggRow::new([[low.zero((1, 1)), low.zero((1, 1))]]).unwrap(),
-                    )
-                })
-                .collect(),
-        )
-        .unwrap();
-        let material = scheme
-            .sample_terminal_material_family(
-                &payload_secret,
-                &table,
-                &transforms,
-                &bank,
-                seed,
-                b"targets".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        for index in 0..2 {
-            let member = material.at(index);
-            for (mask, _) in &member.material.branches {
-                let original =
-                    bank.branches.iter().find(|branch| branch.sigma == mask.sigma).unwrap();
-                assert_eq!(
-                    mask.public.flatten(),
-                    original.public.flatten(),
-                    "indexed terminal material must capture the original shared mask bank"
+fn refresh_crt_weight(
+    slots: &[crate::noise_refresh::refresh::RefreshSlot],
+    slot: usize,
+) -> Result<BigInt, RnsBggError> {
+    let total = slots.iter().try_fold(BigUint::one(), |total, slot| {
+        let modulus = slot
+            .q_t
+            .to_biguint()
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        Ok::<_, RnsBggError>(total * modulus)
+    })?;
+    let qt = slots
+        .get(slot)
+        .and_then(|entry| entry.q_t.to_biguint())
+        .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    let base = &total / &qt;
+    let inverse = mxx_primitives::utils::mod_inverse_biguints(&(&base % &qt), &qt)
+        .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+    Ok(BigInt::from(base * inverse))
+}
+
+impl PublicKeyLowering<'_> {
+    fn finish_channel_refresh(
+        &mut self,
+        inputs: &BTreeMap<usize, RnsBggPublicKey>,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+        outputs: &BTreeMap<PrfLabel, BTreeMap<usize, RnsBggPublicKey>>,
+    ) -> Result<RnsBggPublicKey, RnsBggError> {
+        self.validate_refresh_declaration(declaration)?;
+        let source_wire = declaration.source_output();
+        let slot_count = declaration.slots().len();
+        if inputs.len() != slot_count || inputs.keys().copied().ne(0..slot_count) {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
+        let target_columns = self.parameters.component_columns(declaration.target_level())?;
+        let mut anchor_levels = Vec::with_capacity(slot_count);
+        let mut decomposition_levels = Vec::with_capacity(slot_count);
+        let mut output_anchors = Vec::with_capacity(slot_count);
+        for slot in 0..slot_count {
+            let ain = inputs.get(&slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+            let evaluation_level = validate_refresh_source(
+                self.parameters,
+                ain,
+                source_wire,
+                declaration
+                    .slots()
+                    .get(slot)
+                    .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?,
+            )?;
+            let decomposition_level = validate_refresh_qp_levels(
+                self.parameters,
+                declaration
+                    .slots()
+                    .get(slot)
+                    .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?,
+                evaluation_level,
+            )?;
+            anchor_levels.push(evaluation_level);
+            decomposition_levels.push(decomposition_level);
+            output_anchors.push(refresh_output_anchor(
+                self.parameters,
+                evaluation_level,
+                target_columns,
+                self.hash_key.clone(),
+                *declaration.commitment(),
+                slot,
+                source_wire,
+            )?);
+        }
+
+        let target_parameters = self.parameters.level(declaration.target_level())?;
+        let target_ring = self.parameters.ring(declaration.target_level())?;
+        let expected_port = target_ring.matrix_type((1, target_columns));
+        let schema_ports = declaration
+            .output_schema()
+            .iter()
+            .filter_map(|wire| match wire {
+                WireType::Matrix(matrix) => Some(matrix),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if schema_ports.len() != 4 || schema_ports.iter().any(|port| **port != expected_port) {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
+        }
+        validate_refresh_target_modulus(declaration.slots(), target_parameters.modulus().as_ref())?;
+
+        // A_sum is built independently in each intermediate ring.  Mask
+        // labels may contribute only to their owning slot; fresh labels must
+        // be present in every slot and therefore preserve their shared source.
+        let mut sums = vec![None::<RnsBggMatrix>; slot_count];
+        let ordered_wires = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(label, wire)| (label.clone(), wire))
+            .collect::<Vec<_>>();
+        if ordered_wires.len() != declaration.prf_labels().len() {
+            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+        }
+        for (index, expected_label) in declaration.prf_labels().iter().enumerate() {
+            let (ordered_label, expected_wire) = ordered_wires
+                .get(index)
+                .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+            if ordered_label != expected_label {
+                return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+            }
+            let label = declaration
+                .labels()
+                .label(index)
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+            let channels = outputs
+                .get(expected_label)
+                .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+            let fresh = match label {
+                RefreshPrfLabel::Mask { slot, digit, .. } => {
+                    if slot >= declaration.digits().mask_counts.len() ||
+                        digit >= declaration.digits().mask_counts[slot]
+                    {
+                        return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+                    }
+                    false
+                }
+                RefreshPrfLabel::FreshError { digit, .. } => {
+                    if digit >= declaration.digits().fresh_count {
+                        return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+                    }
+                    true
+                }
+            };
+            let expected_slots = expected_refresh_slots(&label, slot_count)?;
+            if channels.len() != expected_slots.len() ||
+                channels.keys().copied().ne(expected_slots.iter().copied())
+            {
+                return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+            }
+            for slot in expected_slots {
+                let value = channels
+                    .get(&slot)
+                    .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+                let ain =
+                    inputs.get(&slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+                validate_refresh_prf_wire(value.wire, *expected_wire)?;
+                if !matrix_schema_matches(&value.matrix, &ain.matrix) {
+                    return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+                }
+                let slot_metadata = &declaration.slots()[slot];
+                let modulus = slot_metadata
+                    .q
+                    .to_biguint()
+                    .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+                let expected_modulus = IntExpr::constant(BigInt::from(modulus));
+                if ain.matrix.0.0.matrix_type().modulus != expected_modulus ||
+                    value.matrix.0.0.matrix_type().modulus != expected_modulus
+                {
+                    return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+                }
+                let h = fresh.then(|| &slot_metadata.p / &slot_metadata.q_t);
+                let evaluation_level = anchor_levels[slot];
+                let decomposition_level = decomposition_levels[slot];
+                let target_columns =
+                    self.parameters.component_columns(declaration.target_level())?;
+                let target_q = refresh_label_target_with_columns(
+                    self.parameters,
+                    evaluation_level,
+                    target_columns,
+                    declaration.digits().base,
+                    label,
+                    h.clone(),
+                )?;
+                let p_modulus = BigInt::from(
+                    self.parameters.level(decomposition_level)?.modulus().as_ref().clone(),
                 );
+                // Encoding carries the private payload with a minus sign.
+                // The preprocessing action therefore stores -W_label so
+                // that applying it to the PRF value contributes +z*W_label.
+                let target_p = checked_modulus_convert_matrix(target_q, p_modulus.clone())
+                    .map(|target| map_matrix(target, |entry| -entry))?;
+                let label_action = refresh_payload_action(
+                    self.parameters,
+                    evaluation_level,
+                    decomposition_level,
+                    &self.payload_secret,
+                    (target_p.0.0, target_p.0.1),
+                    self.hash_key.clone(),
+                    mxx_dsl::HashTag::from(
+                        format!(
+                            "rns-bgg/refresh-label/{:?}/{slot}/{index}",
+                            declaration.commitment()
+                        )
+                        .into_bytes(),
+                    ),
+                    target_columns,
+                )?;
+                let contribution =
+                    super::multiply_public_action(value.matrix.clone(), label_action.clone());
+                self.prepared_refresh_label_actions
+                    .insert((*declaration.commitment(), slot, index), label_action);
+                sums[slot] = Some(match sums[slot].take() {
+                    None => contribution,
+                    Some(sum) => add_public_matrices(sum, contribution),
+                });
             }
         }
-        let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let input = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(
-                mxx_dsl::parallel(2, |_| Ok(key.matrix.clone())).unwrap(),
-            ),
-            level: 0,
-            id: key.id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let (mut producer, input_descriptor) = scheme
-            .export_input_material(
-                &key,
-                &private_input,
-                DslContext::new("indexed-terminal-producer"),
-                "input",
-            )
-            .unwrap();
-        let mut descriptors = Vec::new();
-        for (mode, prefix) in [
-            (RnsBggTerminalFamilyMode::Independent, "independent"),
-            (RnsBggTerminalFamilyMode::Sum, "sum"),
-        ] {
-            let prepared = scheme
-                .prepare_terminal_family(&input, &material, mode, TerminalFinalization::Finalize)
-                .unwrap();
-            let (next, descriptor) =
-                scheme.export_prepared_terminal_family(&prepared, producer, prefix).unwrap();
-            producer = next;
-            let descriptor: RnsBggPreparedTerminalFamilyDescriptor =
-                serde_json::from_slice(&serde_json::to_vec(&descriptor).unwrap()).unwrap();
-            descriptors.push((descriptor, prepared.binding(), prepared.id()));
-        }
-        std::fs::create_dir_all("test_data/rns_bgg_indexed_terminal_artifacts").unwrap();
-        let directory =
-            tempfile::tempdir_in("test_data/rns_bgg_indexed_terminal_artifacts").unwrap();
-        let mut store = FileArtifactStore::new(directory.path()).unwrap();
-        let mut backend = make_backend(&parameters);
-        let produced = execute(
-            &producer.build().unwrap().validate(&ParamEnv::default()).unwrap(),
-            &mut backend,
-            BTreeMap::from([(
-                "hash-key".into(),
-                RuntimeValue::Bytes(rand::random::<[u8; 32]>().to_vec()),
-            )]),
-            &mut store,
-            SamplingMode::Fresh,
-        )
-        .unwrap();
-        let production = produced.production_id.unwrap();
-        drop(store);
-        let mut store = FileArtifactStore::open(directory.path()).unwrap();
-        let (descriptor, binding, stage_id) = &descriptors[0];
-        let mut tampered = descriptor.clone();
-        tampered.mode = RnsBggTerminalFamilyMode::Sum;
-        assert!(
-            scheme
-                .import_prepared_terminal_family(
-                    &tampered,
-                    production.clone(),
-                    binding,
-                    key.id,
-                    *stage_id,
-                )
-                .is_err()
-        );
-        let mut tampered = descriptor.clone();
-        tampered.finalization = TerminalFinalization::Deferred;
-        assert!(
-            scheme
-                .import_prepared_terminal_family(
-                    &tampered,
-                    production.clone(),
-                    binding,
-                    key.id,
-                    *stage_id,
-                )
-                .is_err()
-        );
-        let mut tampered = descriptor.clone();
-        tampered.range = FamilyRange::bounded(0, 2, 4).unwrap();
-        assert!(
-            scheme
-                .import_prepared_terminal_family(
-                    &tampered,
-                    production.clone(),
-                    binding,
-                    key.id,
-                    *stage_id,
-                )
-                .is_err()
-        );
-        let mut tampered = descriptor.clone();
-        tampered.public.count = 99.into();
-        assert!(
-            scheme
-                .import_prepared_terminal_family(
-                    &tampered,
-                    production.clone(),
-                    binding,
-                    key.id,
-                    *stage_id,
-                )
-                .is_err()
-        );
-        // No online s was constructed in the producer. Both consumers use
-        // fresh s and freshly prepared online masks with the same stored t-data.
-        for online in 0..2 {
-            let mask_secret = scheme.sample_mask_secret().unwrap();
-            let (imported_key, imported_input) = scheme
-                .import_input_material(&input_descriptor, production.clone(), key.id, 0)
-                .unwrap();
-            let encoding = scheme.encode(&mask_secret, &imported_key, &imported_input).unwrap();
-            let inputs = RnsBggEncodingFamily {
-                rows: ProgramValue::Family(
-                    mxx_dsl::parallel(2, |_| Ok(encoding.row.clone())).unwrap(),
-                ),
-                level: 0,
-                key_id: key.id,
-                context: scheme.context,
-                range: range.clone(),
-            };
-            let q = parameters.level(1).unwrap().modulus();
-            let s = mask_secret.row.clone().reduce_modulus(BigInt::from(q.as_ref().clone()));
 
-            let mut consumer = DslContext::new(format!("indexed-terminal-consumer-{online}"));
-            for (descriptor, binding, stage_id) in &descriptors {
-                let prepared = scheme
-                    .import_prepared_terminal_family(
-                        descriptor,
-                        production.clone(),
-                        binding,
-                        key.id,
-                        *stage_id,
-                    )
-                    .unwrap();
-                let masks =
-                    scheme.prepare_online_masks(&mask_secret, &prepared.mask_bank()).unwrap();
-                let rows = scheme.evaluate_terminal_family(&inputs, &prepared, &masks).unwrap();
-                let expected = match prepared.mode() {
-                    RnsBggTerminalFamilyMode::Independent => destinations.to_vec(),
-                    RnsBggTerminalFamilyMode::Sum => {
-                        vec![destinations[0].clone() + destinations[1].clone()]
+        let target_modulus = target_parameters.modulus().as_ref().clone();
+        let mut values = Vec::with_capacity(slot_count);
+        let mut coefficients = Vec::with_capacity(slot_count);
+        for slot in 0..slot_count {
+            let ain = inputs.get(&slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+            let aout = output_anchors
+                .get(slot)
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+            let a_sum =
+                sums[slot].take().ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+            let h = &declaration.slots()[slot].p / &declaration.slots()[slot].q_t;
+            let slot_modulus = declaration.slots()[slot]
+                .q
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let evaluation_level = anchor_levels[slot];
+            let decomposition_level = decomposition_levels[slot];
+            let target_level = declaration.target_level();
+            let target_columns = self.parameters.component_columns(target_level)?;
+            let p_modulus = BigInt::from(
+                self.parameters.level(decomposition_level)?.modulus().as_ref().clone(),
+            );
+            let p_ring = self.parameters.ring(decomposition_level)?;
+            let h_p = p_ring.polynomial([IntExpr::constant(h.clone())]);
+            let output_modulus =
+                BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+            let output_gadget = self.parameters.state_gadget(target_level)?;
+            let output_scale = self
+                .parameters
+                .scalar(target_level, self.parameters.scale(target_level)?.clone())?;
+            let output_payload =
+                checked_modulus_convert_row(self.payload_secret.row.clone(), output_modulus)?;
+            let desired_output = (
+                output_scale.clone() * output_payload.0 * output_gadget.clone(),
+                output_scale * output_payload.1 * output_gadget,
+            );
+            let desired_data = lift_output_target_to_p(desired_output, p_modulus.clone(), h_p);
+            let action = refresh_payload_action(
+                self.parameters,
+                evaluation_level,
+                decomposition_level,
+                &self.payload_secret,
+                desired_data,
+                self.hash_key.clone(),
+                mxx_dsl::HashTag::from(
+                    format!("rns-bgg/refresh-data/{:?}/{slot}", declaration.commitment())
+                        .into_bytes(),
+                ),
+                target_columns,
+            )?;
+            let data_public = super::multiply_public_action(ain.matrix.clone(), action.clone());
+            if &slot_modulus % &target_modulus != BigUint::zero() {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+            }
+            // The refresh carrier is the per-slot A_star anchor.  Reduce it
+            // modulo q_t without scaling, then centered-extend into Q* before
+            // CRT recomposition.  Decoder targets remain A_sum-H*A_star and
+            // are assembled by the encoding stage from the raw artifacts.
+            let aout_p = checked_modulus_convert_matrix(aout.matrix.clone(), p_modulus.clone())?;
+            let target_at_output = reduce_lift_public_anchor(
+                aout_p.clone(),
+                BigInt::from(
+                    declaration.slots()[slot]
+                        .q_t
+                        .to_biguint()
+                        .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?,
+                ),
+                BigInt::from(target_modulus.clone()),
+            )?;
+            if values.first().is_some_and(|first| !matrix_schema_matches(first, &target_at_output))
+            {
+                return Err(RnsBggError::Binding("refresh CRT channel schemas differ"));
+            }
+            let a_sum = add_public_matrices(a_sum, data_public);
+            let a_sum = mod_down_public(a_sum, p_modulus.clone());
+            self.prepared_refresh_sums.insert((*declaration.commitment(), slot), a_sum);
+            self.prepared_refresh_stars.insert((*declaration.commitment(), slot), aout_p);
+            self.prepared_refresh_actions.insert((*declaration.commitment(), slot), action);
+            values.push(target_at_output);
+            coefficients.push(self.parameters.scalar(
+                declaration.target_level(),
+                refresh_crt_weight(declaration.slots(), slot)?,
+            )?);
+        }
+        let values = Family::pack(values).map_err(graph)?;
+        let coefficients = Family::pack(coefficients).map_err(graph)?;
+        let output =
+            RnsBggPublicKey::new(source_wire, super::recompose_public(values, coefficients)?);
+        if output.schema().wire_types() != declaration.output_schema() {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
+        }
+        Ok(output)
+    }
+}
+
+/// Preprocessing stage adapter using the common stage lifecycle.
+pub struct RnsPreprocessBuild<'a, B: Backend> {
+    parameters: &'a RnsBggParameters,
+    context: [u8; 32],
+    evaluator: Option<PublicKeyLowering<'a>>,
+    families: GraphFamilyExecution,
+    environment:
+        Environment<RnsBggPublicKey, RhsRef<Int>, Family<RnsBggPublicKey>, Family<RhsRef<Int>>>,
+    runtime: BTreeMap<String, RuntimeValue<B>>,
+    refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
+    pending_refresh: Option<(usize, RnsBggPublicKey)>,
+    refresh_prf_binding: Option<([u8; 32], usize, ExponentLutProgramId)>,
+    refresh_prf_children: BTreeMap<usize, PublicKeyLowering<'a>>,
+}
+impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
+    /// Create an unbound preprocessing adapter.
+    pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
+        Self {
+            parameters,
+            context,
+            evaluator: None,
+            families: GraphFamilyExecution,
+            environment: Environment::new(),
+            runtime: BTreeMap::new(),
+            refresh_declaration: None,
+            pending_refresh: None,
+            refresh_prf_binding: None,
+            refresh_prf_children: BTreeMap::new(),
+        }
+    }
+
+    /// Bind the common refresh declaration before the preprocessing graph is
+    /// built.  The declaration is copied as immutable metadata only; sampled
+    /// matrices remain graph/artifact values owned by this stage.
+    pub fn bind_refresh_declaration(
+        &mut self,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+    ) -> Result<(), ApiError> {
+        let evaluator =
+            self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
+        evaluator.validate_refresh_declaration(declaration).map_err(ApiError::scheme)?;
+        self.refresh_declaration = Some(declaration.clone());
+        Ok(())
+    }
+
+    /// Bind this builder to one channel of the declaration's prepared PRF.
+    ///
+    /// A channel builder is intentionally separate from the source-stage
+    /// declaration binding: it owns the prepared PRF Program and is lowered
+    /// only when [`Self::apply_refresh`] dispatches the common refresh
+    /// operation.  This check therefore validates the PRF output schema and
+    /// coefficient lineage, without accepting a source carrier as a
+    /// substitute for the prepared evaluator.
+    pub fn bind_refresh_prf(
+        &mut self,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+        slot: usize,
+    ) -> Result<(), ApiError> {
+        if slot >= declaration.slots().len() {
+            return Err(ApiError::input("refresh PRF slot is outside declaration"));
+        }
+        let evaluator =
+            self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
+        let expected_program = declaration.prepared().program().id();
+        if evaluator.program.id() != expected_program {
+            return Err(ApiError::input("refresh PRF Program does not match declaration"));
+        }
+        let outputs = declaration.prepared().declaration().ordered_outputs().collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Err(ApiError::input("refresh declaration has no prepared PRF outputs"));
+        }
+        for (_, wire) in outputs {
+            let coefficient = evaluator
+                .program
+                .wire_is_coefficient_output(wire)
+                .map_err(|error| ApiError::input(error.to_string()))?;
+            if !coefficient {
+                return Err(ApiError::input("refresh PRF output is not a coefficient output"));
+            }
+            if !evaluator.program.outputs().iter().any(|operand| {
+                matches!(operand, crate::program::Operand::Scalar(output) if *output == wire)
+            }) {
+                return Err(ApiError::input("refresh PRF output is not a Program output"));
+            }
+        }
+        if self.refresh_prf_binding.is_some() {
+            return Err(ApiError::input("refresh PRF is already bound"));
+        }
+        self.refresh_prf_binding = Some((*declaration.commitment(), slot, expected_program));
+        Ok(())
+    }
+
+    fn lower_refresh_prf(
+        &mut self,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+    ) -> Result<BTreeMap<PrfLabel, RnsBggPublicKey>, RnsBggError> {
+        let (commitment, slot, program) =
+            self.refresh_prf_binding.ok_or(RnsBggError::Binding("refresh PRF is not bound"))?;
+        if commitment != *declaration.commitment() ||
+            slot >= declaration.slots().len() ||
+            program != declaration.prepared().program().id()
+        {
+            return Err(RnsBggError::Refresh(RefreshError::Commitment));
+        }
+        let evaluator = self
+            .evaluator
+            .as_mut()
+            .ok_or(RnsBggError::Binding("refresh PRF builder was not bound"))?;
+        let expected = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(label, wire)| (label.clone(), wire))
+            .collect::<Vec<_>>();
+        let program = evaluator.program.clone();
+        let outputs = lower_program(&program, evaluator, &mut self.families, &mut self.environment)
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        if outputs.len() != expected.len() {
+            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+        }
+        expected
+            .into_iter()
+            .zip(outputs)
+            .map(|((label, expected_wire), value)| {
+                validate_refresh_prf_wire(value.wire, expected_wire)?;
+                Ok((label, value))
+            })
+            .collect()
+    }
+
+    /// Apply one declared channel-aware refresh through the common lifecycle.
+    /// The refreshed carrier replaces the selected preprocess output exactly
+    /// once before graph construction.
+    pub fn apply_refresh(
+        &mut self,
+        output_index: usize,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
+        inputs: BTreeMap<usize, RnsBggPublicKey>,
+        mut channels: BTreeMap<usize, RnsPreprocessBuild<'a, B>>,
+    ) -> Result<(), RnsBggError> {
+        if self.pending_refresh.is_some() || output_index >= declaration.output_schema().len() {
+            return Err(RnsBggError::Binding(
+                "refresh output was already selected or is out of range",
+            ));
+        }
+        if self
+            .refresh_declaration
+            .as_ref()
+            .is_some_and(|bound| bound.commitment() != declaration.commitment())
+        {
+            return Err(RnsBggError::Refresh(RefreshError::Commitment));
+        }
+        if channels.len() != declaration.slots().len() ||
+            channels.keys().copied().ne(0..declaration.slots().len())
+        {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
+        let (output, child_material) = {
+            let evaluator = self
+                .evaluator
+                .as_mut()
+                .ok_or(RnsBggError::Binding("preprocess builder was not bound"))?;
+            let mut refresh = RnsBggRefresh::new(evaluator, inputs, declaration)?;
+            let mut child_material = Vec::with_capacity(channels.len());
+            let output =
+                apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
+                    let mut per_label =
+                        BTreeMap::<PrfLabel, BTreeMap<usize, RnsBggPublicKey>>::new();
+                    for slot in 0..callback_declaration.slots().len() {
+                        let child = channels
+                            .get_mut(&slot)
+                            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+                        let outputs = child.lower_refresh_prf(callback_declaration)?;
+                        for (label, value) in outputs {
+                            let label_index = declaration
+                                .prf_labels()
+                                .iter()
+                                .position(|expected| expected == &label)
+                                .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+                            let refresh_label = declaration
+                                .labels()
+                                .label(label_index)
+                                .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+                            let expected_slots = expected_refresh_slots(
+                                &refresh_label,
+                                callback_declaration.slots().len(),
+                            )?;
+                            if !expected_slots.contains(&slot) {
+                                continue;
+                            }
+                            if per_label.entry(label).or_default().insert(slot, value).is_some() {
+                                return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+                            }
+                        }
                     }
-                };
-                assert_eq!(rows.count(), &expected.len().into());
-                for (index, target) in expected.into_iter().enumerate() {
-                    consumer = consumer
-                        .output(
-                            format!("{:?}-{index}", prepared.mode()),
-                            rows.at(index) -
-                                s.clone() * prepared.public_matrices().at(index) -
-                                target,
-                        )
-                        .unwrap();
+                    if per_label.len() != labels.len() ||
+                        labels.iter().any(|label| {
+                            let index = declaration
+                                .prf_labels()
+                                .iter()
+                                .position(|expected| expected == label);
+                            let Some(index) = index else { return true };
+                            let Some(refresh_label) = declaration.labels().label(index) else {
+                                return true;
+                            };
+                            let Ok(expected_slots) =
+                                expected_refresh_slots(&refresh_label, declaration.slots().len())
+                            else {
+                                return true;
+                            };
+                            match per_label.get(label) {
+                                Some(values) => {
+                                    values.len() == expected_slots.len() &&
+                                        values.keys().copied().eq(expected_slots.into_iter())
+                                }
+                                None => false,
+                            }
+                        })
+                    {
+                        return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+                    }
+                    for (slot, mut child) in std::mem::take(&mut channels) {
+                        let evaluator = child
+                            .evaluator
+                            .take()
+                            .ok_or(RnsBggError::Binding("refresh PRF builder was not bound"))?;
+                        child_material.push((slot, evaluator, std::mem::take(&mut child.runtime)));
+                    }
+                    Ok(per_label)
+                })
+                .map_err(|error| match error {
+                    RefreshApplicationError::Refresh(error) => error,
+                    RefreshApplicationError::OutputMismatch => {
+                        RnsBggError::Refresh(RefreshError::PrfOutputMismatch)
+                    }
+                })?;
+            (output, child_material)
+        };
+        for (slot, child, runtime) in child_material {
+            merge_runtime(&mut self.runtime, runtime)?;
+            if self.refresh_prf_children.insert(slot, child).is_some() {
+                return Err(RnsBggError::Binding("refresh PRF slot was already retained"));
+            }
+        }
+        self.pending_refresh = Some((output_index, output));
+        self.refresh_declaration = Some(declaration.clone());
+        Ok(())
+    }
+}
+
+fn merge_runtime<B: Backend>(
+    destination: &mut BTreeMap<String, RuntimeValue<B>>,
+    source: BTreeMap<String, RuntimeValue<B>>,
+) -> Result<(), RnsBggError> {
+    for (name, value) in source {
+        match destination.get(&name) {
+            Some(RuntimeValue::Bytes(existing)) => match &value {
+                RuntimeValue::Bytes(candidate) if existing == candidate => continue,
+                RuntimeValue::Bytes(_) => {
+                    return Err(RnsBggError::Binding("refresh child runtime input conflicts"));
+                }
+                _ => return Err(RnsBggError::Binding("refresh child runtime input schema")),
+            },
+            Some(_) => return Err(RnsBggError::Binding("refresh child runtime input schema")),
+            None => {
+                destination.insert(name, value);
+            }
+        }
+    }
+    Ok(())
+}
+
+impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B> {
+    type Evaluator = PublicKeyLowering<'a>;
+    type Families = GraphFamilyExecution;
+    type PayloadSecret = RnsBggPayloadSecret;
+    type EncryptDescriptor = RnsBggArtifactBinding;
+    type OnlineDescriptor = RnsBggArtifactBinding;
+    type Encrypt = RnsEncryptBuild<'a, B>;
+    type Online = RnsOnlineBuild<'a>;
+    fn lowering_state(
+        &mut self,
+    ) -> Result<
+        (
+            &mut Self::Evaluator,
+            &mut Self::Families,
+            &mut Environment<
+                RnsBggPublicKey,
+                RhsRef<Int>,
+                Family<RnsBggPublicKey>,
+                Family<RhsRef<Int>>,
+            >,
+        ),
+        ApiError,
+    > {
+        Ok((
+            self.evaluator.as_mut().ok_or_else(|| ApiError::input("bind_inputs first"))?,
+            &mut self.families,
+            &mut self.environment,
+        ))
+    }
+    fn bind_inputs(
+        &mut self,
+        program: &ExponentLutProgram,
+        parameters: &mxx_ir_core::ParamEnv,
+        rhs: &PlaintextInputs<RhsId, P>,
+        payload: &Self::PayloadSecret,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        if rhs.len() != program.rhs_inputs().len() ||
+            rhs.keys().any(|id| !program.rhs_inputs().contains_key(id))
+        {
+            return Err(ApiError::input("RHS bindings do not exactly match Program inputs"));
+        }
+        let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
+        let bytes = ring.bytes_input("rns-bgg/hash-key", hash_key.len());
+        let program = Arc::new(program.clone());
+        let workload =
+            Arc::new(RnsBggDerivedWorkload::from_program(&program).map_err(ApiError::scheme)?);
+        let mut evaluator = PublicKeyLowering::new(
+            self.parameters,
+            program.clone(),
+            workload,
+            payload.clone(),
+            bytes,
+        );
+        for (wire, declaration) in program.inputs() {
+            let binding = match declaration.shape() {
+                InputBinding::Scalar(()) => InputBinding::Scalar(
+                    evaluator.sample_input_public_key(*wire).map_err(ApiError::scheme)?,
+                ),
+                InputBinding::Family(count) => {
+                    let family = mxx_dsl::parallel(count.clone(), |index| {
+                        evaluator
+                            .sample_input_public_key_member(*wire, Some(index))
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    InputBinding::Family(family)
+                }
+            };
+            self.environment
+                .bind_wire(*wire, binding)
+                .map_err(|e| ApiError::input(e.to_string()))?;
+        }
+        for (id, declaration) in program.rhs_inputs() {
+            let value = rhs.get(id).ok_or_else(|| ApiError::input("missing RHS plaintext"))?;
+            match (declaration, value) {
+                (InputBinding::Scalar(()), InputBinding::Scalar(poly)) => {
+                    let plaintext = ring.polynomial(
+                        poly.coeffs_biguints()
+                            .into_iter()
+                            .map(|v| IntExpr::constant(BigInt::from(v))),
+                    );
+                    evaluator.rhs.insert(*id, InputBinding::Scalar(plaintext));
+                    let reference = RhsRef { id: *id, index: None::<Int> };
+                    evaluator.prepare_rhs(&reference).map_err(ApiError::scheme)?;
+                    self.environment
+                        .bind_rhs(*id, InputBinding::Scalar(reference))
+                        .map_err(|e| ApiError::input(e.to_string()))?;
+                }
+                (InputBinding::Family(count), InputBinding::Family(values)) => {
+                    let expected = count
+                        .clone()
+                        .evaluate(parameters)
+                        .ok()
+                        .and_then(|value| value.to_usize())
+                        .ok_or_else(|| ApiError::input("RHS family count is not concrete"))?;
+                    if expected != values.len() {
+                        return Err(ApiError::input("RHS family count does not match Program"));
+                    }
+                    let plaintexts = Family::pack(
+                        values
+                            .iter()
+                            .map(|value| {
+                                ring.polynomial(
+                                    value
+                                        .coeffs_biguints()
+                                        .into_iter()
+                                        .map(|v| IntExpr::constant(BigInt::from(v))),
+                                )
+                            })
+                            .collect(),
+                    )
+                    .map_err(|error| ApiError::input(error.to_string()))?;
+                    evaluator.rhs.insert(*id, InputBinding::Family(plaintexts));
+                    let prepared = mxx_dsl::parallel(IntExpr::constant(values.len()), |index| {
+                        evaluator
+                            .prepare_rhs_material(&RhsRef { id: *id, index: Some(index) })
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    evaluator.prepared_rhs.insert(*id, InputBinding::Family(prepared));
+                    let references = mxx_dsl::parallel(IntExpr::constant(values.len()), |index| {
+                        Ok(RhsRef { id: *id, index: Some(index) })
+                    })
+                    .map_err(ApiError::scheme)?;
+                    self.environment
+                        .bind_rhs(*id, InputBinding::Family(references))
+                        .map_err(|e| ApiError::input(e.to_string()))?;
+                }
+                _ => return Err(ApiError::input("RHS plaintext shape does not match Program")),
+            }
+        }
+        // Plaintext RHS graph handles are needed only while preparing the
+        // compact decompositions.  Do not retain an original ciphertext/RHS
+        // family in the lowerer after preparation; later consumers use the
+        // persisted compact artifacts through `prepared_rhs`.
+        evaluator.rhs.clear();
+        self.runtime.insert("rns-bgg/hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()));
+        self.evaluator = Some(evaluator);
+        Ok(())
+    }
+    fn artifact_identities(&self) -> ([u8; 32], [u8; 32]) {
+        let Some(evaluator) = self.evaluator.as_ref() else {
+            return ([0; 32], [0; 32]);
+        };
+        let mut digest = Sha256::new();
+        digest.update(evaluator.program.id().as_bytes());
+        digest.update(self.parameters.parameter_identity());
+        if let Some(declaration) = &self.refresh_declaration {
+            digest.update(declaration.commitment());
+        }
+        let encryption = digest.clone().finalize().into();
+        digest.update(b"online");
+        let online = digest.finalize().into();
+        (encryption, online)
+    }
+    fn finalize_descriptors(
+        production: &ProductionId,
+        (encrypt, online): (Self::EncryptDescriptor, Self::OnlineDescriptor),
+    ) -> Result<(Self::EncryptDescriptor, Self::OnlineDescriptor), ApiError> {
+        let encrypt = encrypt.with_source(production.clone()).map_err(ApiError::scheme)?;
+        Ok((encrypt, online))
+    }
+
+    fn build_graph(
+        mut self,
+        outputs: Vec<RnsBggPublicKey>,
+    ) -> Result<(StageGraph<B>, (Self::EncryptDescriptor, Self::OnlineDescriptor)), ApiError> {
+        let mut evaluator =
+            self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
+        let mut outputs = outputs;
+        if let Some((index, output)) = self.pending_refresh.take() {
+            let target = outputs.get_mut(index).ok_or_else(|| {
+                ApiError::input("refresh output index is outside lowered outputs")
+            })?;
+            *target = output;
+        }
+        let outputs = evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?;
+        let mut graph = DslContext::new("rns-bgg-preprocess");
+        for output in outputs {
+            graph = graph
+                .artifact_output(format!("public-key/{:?}", output.wire), output)
+                .map_err(ApiError::scheme)?;
+        }
+        for (rhs, prepared) in &evaluator.prepared_rhs {
+            match prepared {
+                InputBinding::Scalar(value) => {
+                    graph = graph
+                        .artifact_output(format!("rhs/{rhs:?}"), value.clone())
+                        .map_err(ApiError::scheme)?;
+                }
+                InputBinding::Family(value) => {
+                    graph = graph
+                        .artifact_output(format!("rhs/{rhs:?}/family"), value.clone())
+                        .map_err(ApiError::scheme)?;
                 }
             }
-            let graph = consumer
-                .build()
-                .unwrap()
-                .validate_with_manifests(
-                    &ParamEnv::default(),
-                    &BTreeMap::from([(
-                        production.clone(),
-                        store.load_manifest(&production).unwrap(),
-                    )]),
-                )
-                .unwrap();
-            let input_bound = crate::rns_bgg::RnsBggNoiseBound {
-                error: parameters.encoding_error_bound.clone(),
-                payload_l1: 1u8.into(),
-            };
-            let gain = 1u8.into();
-            let scalar_noise = parameters
-                .terminal_noise_bound(0, [(&input_bound, 2, &gain)], 17u8.into())
-                .unwrap();
-            let sum_noise = parameters
-                .terminal_noise_bound(
-                    0,
-                    [(&input_bound, 2, &gain), (&input_bound, 2, &gain)],
-                    18u8.into(),
-                )
-                .unwrap();
-            let result =
-                execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                    .unwrap();
-            for (name, value) in result.outputs {
-                let RuntimeValue::Matrix(matrix) = value else { panic!("matrix") };
-                let bound =
-                    if name.starts_with("Sum") { &sum_noise.error } else { &scalar_noise.error };
-                check_matrix(&matrix, &name, q.as_ref(), bound);
+        }
+        for ((origin, scope), helper) in &evaluator.prepared_helpers {
+            if !scope.ranges().is_empty() {
+                continue;
+            }
+            graph = graph
+                .artifact_output(lut_helper_artifact_name(*origin, scope), helper.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        for ((site, scope), action) in &evaluator.prepared_public_actions {
+            if !scope.ranges().is_empty() {
+                continue;
+            }
+            graph = graph
+                .artifact_output(public_action_artifact_name(*site), action.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        for ((site, scope), action) in &evaluator.prepared_lut_actions {
+            if !scope.ranges().is_empty() {
+                continue;
+            }
+            graph = graph
+                .artifact_output(format!("lut-action/{site:?}"), action.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        for (site, action) in &evaluator.prepared_public_action_families {
+            graph = graph
+                .artifact_output(public_action_artifact_name(*site), action.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        for (site, action) in &evaluator.prepared_lut_action_families {
+            graph = graph
+                .artifact_output(format!("lut-action/{site:?}"), action.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        for ((origin, scope), helper) in &evaluator.prepared_helper_families {
+            if scope.ranges().is_empty() {
+                continue;
+            }
+            graph = graph
+                .artifact_output(lut_helper_artifact_name(*origin, scope), helper.clone())
+                .map_err(ApiError::scheme)?;
+        }
+        if let Some(declaration) = &self.refresh_declaration {
+            let commitment = *declaration.commitment();
+            for (slot, child) in &self.refresh_prf_children {
+                for (rhs, prepared) in &child.prepared_rhs {
+                    match prepared {
+                        InputBinding::Scalar(value) => {
+                            graph = graph
+                                .artifact_output(
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        *slot,
+                                        &format!("rhs/{rhs:?}"),
+                                    ),
+                                    value.clone(),
+                                )
+                                .map_err(ApiError::scheme)?;
+                        }
+                        InputBinding::Family(value) => {
+                            graph = graph
+                                .artifact_output(
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        *slot,
+                                        &format!("rhs/{rhs:?}/family"),
+                                    ),
+                                    value.clone(),
+                                )
+                                .map_err(ApiError::scheme)?;
+                        }
+                    }
+                }
+                for ((site, scope), action) in &child.prepared_public_actions {
+                    if !scope.ranges().is_empty() {
+                        continue;
+                    }
+                    let name = refresh_prf_artifact_name(
+                        commitment,
+                        *slot,
+                        &public_action_artifact_name(*site),
+                    );
+                    graph =
+                        graph.artifact_output(name, action.clone()).map_err(ApiError::scheme)?;
+                }
+                for ((site, scope), action) in &child.prepared_lut_actions {
+                    if !scope.ranges().is_empty() {
+                        continue;
+                    }
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(
+                                commitment,
+                                *slot,
+                                &format!("lut-action/{site:?}"),
+                            ),
+                            action.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
+                for ((origin, scope), helper) in &child.prepared_helpers {
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(
+                                commitment,
+                                *slot,
+                                &format!("helper/{}", lut_helper_artifact_role(*origin, scope)),
+                            ),
+                            helper.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
+                for (site, action) in &child.prepared_public_action_families {
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(
+                                commitment,
+                                *slot,
+                                &public_action_artifact_name(*site),
+                            ),
+                            action.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
+                for (site, action) in &child.prepared_lut_action_families {
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(
+                                commitment,
+                                *slot,
+                                &format!("lut-action/{site:?}"),
+                            ),
+                            action.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
+                for ((origin, scope), helper) in &child.prepared_helper_families {
+                    if scope.ranges().is_empty() {
+                        continue;
+                    }
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(
+                                commitment,
+                                *slot,
+                                &format!("helper/{}", lut_helper_artifact_role(*origin, scope)),
+                            ),
+                            helper.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
             }
         }
+        for ((commitment, slot), sum) in &evaluator.prepared_refresh_sums {
+            for (index, entry) in matrix_entries(sum).into_iter().enumerate() {
+                graph = graph
+                    .artifact_output(
+                        refresh_artifact_name(*commitment, *slot, &format!("a-sum.{index}")),
+                        entry,
+                    )
+                    .map_err(ApiError::scheme)?;
+            }
+        }
+        for ((commitment, slot), star) in &evaluator.prepared_refresh_stars {
+            for (index, entry) in matrix_entries(star).into_iter().enumerate() {
+                graph = graph
+                    .artifact_output(
+                        refresh_artifact_name(*commitment, *slot, &format!("a-star.{index}")),
+                        entry,
+                    )
+                    .map_err(ApiError::scheme)?;
+            }
+        }
+        for ((commitment, slot), action) in &evaluator.prepared_refresh_actions {
+            graph = graph
+                .artifact_output(
+                    refresh_artifact_name(*commitment, *slot, "target"),
+                    action.clone(),
+                )
+                .map_err(ApiError::scheme)?;
+        }
+        for ((commitment, slot, label), action) in &evaluator.prepared_refresh_label_actions {
+            graph = graph
+                .artifact_output(
+                    refresh_label_artifact_name(*commitment, *slot, *label),
+                    action.clone(),
+                )
+                .map_err(ApiError::scheme)?;
+        }
+        let graph = graph.build().map_err(ApiError::scheme)?;
+        let mut binding = RnsBggArtifactBinding::new(
+            self.context,
+            evaluator.program.id(),
+            self.parameters.parameter_identity(),
+            Vec::<ProductionId>::new(),
+        )
+        .map_err(ApiError::scheme)?;
+        if let Some(declaration) = &self.refresh_declaration {
+            binding = binding.with_refresh_declaration(declaration);
+        }
+        for ((origin, scope), data) in &evaluator.prepared_helper_families {
+            if !scope.ranges().is_empty() {
+                continue;
+            }
+            if evaluator.prepared_helpers.contains_key(&(*origin, scope.clone())) {
+                return Err(ApiError::input("root LUT helper artifacts collide"));
+            }
+            let count = data
+                .count()
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|value| value.to_usize())
+                .ok_or_else(|| ApiError::input("LUT helper family count is not concrete"))?;
+            let level = evaluator.workload.level(*origin).map_err(ApiError::scheme)?;
+            binding = binding.with_lut_helper(*origin, level, count).map_err(ApiError::scheme)?;
+        }
+        for ((origin, scope), data) in &evaluator.prepared_helpers {
+            if !scope.ranges().is_empty() {
+                continue;
+            }
+            if evaluator.prepared_helper_families.contains_key(&(*origin, scope.clone())) {
+                return Err(ApiError::input("root LUT helper artifacts collide"));
+            }
+            let count = data
+                .count()
+                .evaluate(&ParamEnv::default())
+                .ok()
+                .and_then(|value| value.to_usize())
+                .ok_or_else(|| ApiError::input("LUT helper family count is not concrete"))?;
+            let level = evaluator.workload.level(*origin).map_err(ApiError::scheme)?;
+            binding = binding.with_lut_helper(*origin, level, count).map_err(ApiError::scheme)?;
+        }
+        Ok((
+            StageGraph::new(graph, self.runtime, ArtifactCatalog::default()),
+            (binding.clone(), binding),
+        ))
+    }
+}
+
+/// Public-key refresh dispatch through the common PRF callback contract.
+impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
+    type PrfOutput = BTreeMap<usize, RnsBggPublicKey>;
+    type Output = RnsBggPublicKey;
+    type Error = RnsBggError;
+    fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error> {
+        Ok(self.declaration().prf_labels().to_vec())
+    }
+    fn finish_noise_refresh(
+        &mut self,
+        outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
+    ) -> Result<Self::Output, Self::Error> {
+        let declaration = self.declaration().clone();
+        let labels = self.required_prf_labels()?;
+        if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label))
+        {
+            return Err(RefreshError::PrfOutputMismatch.into());
+        }
+        let inputs = self.inputs().clone();
+        self.lowerer().finish_channel_refresh(&inputs, &declaration, &outputs)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn public_key_carrier_is_wire_and_matrix() {
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let key = RnsBggPublicKey::<Mat>::new(
+            WireId(3),
+            ring.polynomial([IntExpr::constant(BigInt::from(0u8))]),
+        );
+        assert_eq!(key.wire(), WireId(3));
+        assert_eq!(key.matrix().matrix_type(), &ring.matrix_type((1, 1)));
     }
 
     #[test]
-    fn test_rns_bgg_indexed_terminal_artifacts_reopen_with_new_online_secrets() {
-        check_indexed_artifacts(
-            |parameters| cpu_backend(parameters.levels().iter().cloned()),
-            |matrix, name, q, bound| {
-                for polynomial in matrix.block_entries(0..1, 0..1).into_iter().flatten() {
-                    for coefficient in polynomial.coeffs() {
-                        let absolute = coefficient.value().clone().min(q - coefficient.value());
-                        assert!(&absolute <= bound, "{name}: {absolute} > {bound}");
-                    }
-                }
-            },
-        );
+    fn refresh_routes_masks_to_owner_and_fresh_error_to_every_slot() {
+        let refresh_id = [0xabu8; 32];
+        let mask =
+            RefreshPrfLabel::Mask { refresh_id, slot: 1, component: 0, coefficient: 0, digit: 0 };
+        let fresh =
+            RefreshPrfLabel::FreshError { refresh_id, component: 0, coefficient: 0, digit: 0 };
+        assert_eq!(expected_refresh_slots(&mask, 3).unwrap(), vec![1]);
+        assert_eq!(expected_refresh_slots(&fresh, 3).unwrap(), vec![0, 1, 2]);
+        assert!(expected_refresh_slots(&mask, 1).is_err());
     }
 
-    pub(crate) fn fixture() -> (mxx_ir_core::ValidatedGraph, RnsBggParameters) {
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .ok()
-            .map(|s| s.parse().unwrap())
-            .unwrap_or(8);
-        let (parameters, _) = RnsBggParameters::plan(&RnsBggPlanRequest {
-            ring_dimension: n,
-            widths: vec![2],
-            encoding_error_sigma: bigdecimal::BigDecimal::from(2u8),
-            crt_bits: 30,
-            terminal_depth: 1,
-            max_crt_depth: 12,
-            terminal_value_bound: 3u8.into(),
-            operations_per_drop: 1,
-        })
-        .unwrap();
-        let scheme = RnsBggScheme::new(parameters.clone(), rand::random());
-        let secrets = scheme.test_secrets().unwrap();
-        let ring = scheme.ring(0).unwrap();
-        let seed = ring.bytes_input("hash-key", 32);
-        let bank = scheme
-            .sample_mask_bank(
-                0,
-                crate::layout::ExpLayout {
-                    stride_log2: 0,
-                    width_log2: (2 as usize).trailing_zeros(),
-                },
-                seed.clone(),
-                b"bank".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let table = RowLutTable::new(
-            vec![[vec![2.into()], vec![0.into(), 1.into()]], [vec![(-3).into()], vec![]]],
+    #[test]
+    fn refresh_label_target_keeps_component_coefficient_and_digit_coordinates() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level], 1, 1).unwrap();
+        let first = refresh_label_target(
+            &parameters,
+            0,
+            3,
+            RefreshPrfLabel::Mask {
+                refresh_id: [1; 32],
+                slot: 0,
+                component: 0,
+                coefficient: 0,
+                digit: 0,
+            },
             None,
         )
         .unwrap();
-        let material = scheme
-            .sample_terminal_material(
-                &secrets.payload,
-                Some(&table),
-                None,
-                None,
-                &bank,
-                seed.clone(),
-                b"table".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let masks = scheme.prepare_online_masks(&secrets.mask, &bank).unwrap();
-        let mut keys = Vec::new();
-        let mut encodings = Vec::new();
-        let mut scalar_public = Vec::new();
-        let mut scalar_rows = Vec::new();
-        let mut aggregate_public: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggMatrix>> =
-            None;
-        let mut aggregate_rows: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggRow>> = None;
-        let key_id = rand::random();
-        for x in 0..2 {
-            let key = scheme
-                .sample_input_key(0, seed.clone(), format!("input-{x}").as_bytes(), key_id)
-                .unwrap();
-            let payload = ring.polynomial((0..=x).map(|i| BigInt::from(u8::from(i == x)).into()));
-            let encoding = scheme
-                .encode(
-                    &secrets.mask,
-                    &key,
-                    &scheme.prepare_input(&secrets.payload, &key, payload).unwrap(),
-                )
-                .unwrap();
-            let prepared = scheme.prepare_terminal(&key, &material).unwrap();
-            let raw_public = prepared.public_accumulator();
-            aggregate_public = Some(match aggregate_public {
-                Some(sum) => sum.combine(raw_public).unwrap(),
-                None => raw_public,
-            });
-            let raw_row = scheme.evaluate_terminal_raw(&encoding, &prepared, &masks).unwrap();
-            aggregate_rows = Some(match aggregate_rows {
-                Some(sum) => sum.combine(raw_row).unwrap(),
-                None => raw_row,
-            });
-            let public = scheme.finalize_terminal_public(prepared.public_accumulator()).unwrap();
-            let value = scheme
-                .finalize_terminal_encoding(
-                    scheme.evaluate_terminal_raw(&encoding, &prepared, &masks).unwrap(),
-                    &public,
-                )
-                .unwrap();
-            keys.push(key.matrix);
-            encodings.push(encoding.row);
-            scalar_public.push(public.matrix);
-            scalar_rows.push(value.row().clone());
-        }
-        let range = FamilyRange::bounded(1, 2, 4).unwrap();
-        let public_input = RnsBggPublicKeyFamily {
-            matrices: ProgramValue::Family(Family::pack(keys).unwrap()),
-            level: 0,
-            id: key_id,
-            context: scheme.context,
-            range: range.clone(),
-        };
-        let encoding_input = RnsBggEncodingFamily {
-            rows: ProgramValue::Family(Family::pack(encodings).unwrap()),
-            level: 0,
-            key_id,
-            context: scheme.context,
-            range,
-        };
-        // A scalar prepared term may broadcast to a scalar input, but it must
-        // not silently consume only member zero when the input is a family.
-        let scalar_key = scheme
-            .sample_input_key(0, seed.clone(), b"scalar-terminal".as_slice(), rand::random())
-            .unwrap();
-        let (scalar_prepared, _) =
-            scheme.prepare_terminal_term(&(scalar_key, None), &material).unwrap();
-        let family_input = encoding_input.clone().into_program().unwrap();
-        let family_with_scalar_prepared = crate::rns_bgg::terminal::evaluate_terminal_value(
-            &scheme,
-            &family_input,
-            &ProgramValue::Scalar(scalar_prepared),
-            &masks,
-            false,
-            |raw| Ok(raw.value),
-        );
-        assert!(matches!(
-            family_with_scalar_prepared,
-            Err(crate::rns_bgg::TerminalError::InputCount)
-        ));
-        let prepared = scheme
-            .prepare_terminal_family(
-                &public_input,
-                &ProgramValue::Scalar(material.clone()),
-                RnsBggTerminalFamilyMode::Independent,
-                TerminalFinalization::Finalize,
-            )
-            .unwrap();
-        let rows = scheme.evaluate_terminal_family(&encoding_input, &prepared, &masks).unwrap();
-        let aggregate = scheme
-            .prepare_terminal_family(
-                &public_input,
-                &ProgramValue::Scalar(material.clone()),
-                RnsBggTerminalFamilyMode::Sum,
-                TerminalFinalization::Finalize,
-            )
-            .unwrap();
-        let aggregate_encoding =
-            scheme.evaluate_terminal_family(&encoding_input, &aggregate, &masks).unwrap();
-        let deferred = scheme
-            .prepare_terminal_family(
-                &public_input,
-                &ProgramValue::Scalar(material.clone()),
-                RnsBggTerminalFamilyMode::Sum,
-                TerminalFinalization::Deferred,
-            )
-            .unwrap();
-        assert_eq!(deferred.level(), public_input.level);
-        let deferred_rows =
-            scheme.evaluate_terminal_family(&encoding_input, &deferred, &masks).unwrap();
-        let deferred_switch = deferred_rows.at(0).block_mod_switch(BigInt::from(
-            scheme.parameters.level(public_input.level + 1).unwrap().modulus().as_ref().clone(),
-        ));
-        // The graph also contains internal modulus switches from preparation
-        // and evaluation.  The final switch is identified by the direct
-        // producer of each deferred output coefficient, so those ancestors
-        // are not counted. Each coefficient must have exactly one such layer;
-        // separate coefficients may have separate switch nodes.
-        let final_outputs = deferred_switch.flatten();
-        assert!(!final_outputs.is_empty());
-        assert!(final_outputs.iter().all(|output| {
-            matches!(output.node().kind(), mxx_ir_core::node::NodeKind::BlockModSwitch { .. })
-        }));
-        let short_material =
-            ProgramValue::Family(mxx_dsl::parallel(1, |_| Ok(material.clone())).unwrap());
-        assert!(
-            scheme
-                .prepare_terminal_family(
-                    &public_input,
-                    &short_material,
-                    RnsBggTerminalFamilyMode::Independent,
-                    TerminalFinalization::Finalize,
-                )
-                .is_err()
-        );
-        let expected_public = scheme.finalize_terminal_public(aggregate_public.unwrap()).unwrap();
-        let expected_row =
-            scheme.finalize_terminal_encoding(aggregate_rows.unwrap(), &expected_public).unwrap();
-        assert_eq!(aggregate.public_matrices().count(), &1.into());
-        assert_eq!(aggregate_encoding.count(), &1.into());
-        assert_ne!(prepared.id(), aggregate.id());
-        let mut graph = DslContext::new("rns_bgg-terminal-family")
-            .output("aggregate-public", aggregate.public_matrices().at(0) - expected_public.matrix)
-            .unwrap()
-            .output("aggregate-row", aggregate_encoding.at(0) - expected_row.row().clone())
-            .unwrap();
-        for (index, (public, row)) in scalar_public.into_iter().zip(scalar_rows).enumerate() {
-            graph = graph
-                .output(format!("public-{index}"), prepared.public_matrices().at(index) - public)
-                .unwrap();
-            graph = graph.output(format!("row-{index}"), rows.at(index) - row).unwrap();
-        }
-        let low = scheme.ring(1).unwrap();
-        let transforms = Family::pack(vec![
-            RnsBggMatrix::new([
-                [low.identity(1), low.zero((1, 1))],
-                [low.zero((1, 1)), low.identity(1)],
-            ])
-            .unwrap(),
-            RnsBggMatrix::new([
-                [low.zero((1, 1)), low.polynomial([0.into(), 17.into()])],
-                [low.identity(1), low.zero((1, 1))],
-            ])
-            .unwrap(),
-        ])
+        let second = refresh_label_target(
+            &parameters,
+            0,
+            3,
+            RefreshPrfLabel::FreshError {
+                refresh_id: [1; 32],
+                component: 1,
+                coefficient: 1,
+                digit: 2,
+            },
+            Some(BigInt::from(5u8)),
+        )
         .unwrap();
-        let indexed_material = scheme
-            .sample_terminal_material_family(
-                &secrets.payload,
-                &table,
-                &transforms,
-                &bank,
-                seed.clone(),
-                b"indexed-targets".as_slice(),
-                rand::random(),
-            )
-            .unwrap();
-        let indexed = scheme
-            .prepare_terminal_family(
-                &public_input,
-                &indexed_material,
-                RnsBggTerminalFamilyMode::Independent,
-                TerminalFinalization::Finalize,
-            )
-            .unwrap();
-        let indexed_rows =
-            scheme.evaluate_terminal_family(&encoding_input, &indexed, &masks).unwrap();
-        let indexed_sum = scheme
-            .prepare_terminal_family(
-                &public_input,
-                &indexed_material,
-                RnsBggTerminalFamilyMode::Sum,
-                TerminalFinalization::Finalize,
-            )
-            .unwrap();
-        let indexed_sum_rows =
-            scheme.evaluate_terminal_family(&encoding_input, &indexed_sum, &masks).unwrap();
-        let mut raw_public_sum: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggMatrix>> =
-            None;
-        let mut raw_row_sum: Option<crate::rns_bgg::RnsBggTerminalAccumulator<RnsBggRow>> = None;
-        for index in 0..2 {
-            let key = RnsBggPublicKey {
-                matrix: public_input.matrices.at(index),
-                level: 0,
-                id: key_id,
-                context: scheme.context,
-            };
-            let encoding = RnsBggEncoding {
-                row: encoding_input.rows.at(index),
-                level: 0,
-                key_id,
-                context: scheme.context,
-            };
-            let scalar = scheme
-                .prepare_terminal(&key, &indexed_material.at(mxx_dsl::Int::constant(index)))
-                .unwrap();
-            let raw_public = scalar.public_accumulator();
-            let raw_row = scheme.evaluate_terminal_raw(&encoding, &scalar, &masks).unwrap();
-            raw_public_sum = Some(match raw_public_sum {
-                Some(sum) => sum.combine(raw_public).unwrap(),
-                None => raw_public,
-            });
-            raw_row_sum = Some(match raw_row_sum {
-                Some(sum) => sum.combine(raw_row).unwrap(),
-                None => raw_row,
-            });
-            let public = scheme.finalize_terminal_public(scalar.public_accumulator()).unwrap();
-            let row = scheme
-                .finalize_terminal_encoding(
-                    scheme.evaluate_terminal_raw(&encoding, &scalar, &masks).unwrap(),
-                    &public,
-                )
-                .unwrap();
-            graph = graph
-                .output(
-                    format!("indexed-public-{index}"),
-                    indexed.public_matrices().at(index) - public.matrix,
-                )
-                .unwrap()
-                .output(format!("indexed-row-{index}"), indexed_rows.at(index) - row.row().clone())
-                .unwrap();
+        assert_ne!(first.0.0.flatten(), second.0.0.flatten());
+        assert_ne!(first.0.1.flatten(), second.0.1.flatten());
+    }
+
+    #[test]
+    fn refresh_rejects_a_prf_wire_from_the_wrong_ordered_output() {
+        assert!(validate_refresh_prf_wire(WireId(9), WireId(10)).is_err());
+        assert!(validate_refresh_prf_wire(WireId(10), WireId(10)).is_ok());
+    }
+
+    #[test]
+    fn refresh_prf_artifacts_are_slot_scoped() {
+        let commitment = [0xabu8; 32];
+        assert_eq!(
+            refresh_prf_artifact_name(commitment, 0, "rhs/RhsId(1)"),
+            "refresh/abababababababababababababababababababababababababababababababab/slot/0/prf/rhs/RhsId(1)"
+        );
+        assert_ne!(
+            refresh_prf_artifact_name(commitment, 0, "rhs/RhsId(1)"),
+            refresh_prf_artifact_name(commitment, 1, "rhs/RhsId(1)")
+        );
+        assert_eq!(
+            refresh_label_artifact_name(commitment, 0, 7),
+            refresh_artifact_name(commitment, 0, "target/7")
+        );
+        assert_eq!(
+            refresh_checkpoint_artifact_name(commitment, "target"),
+            "refresh/abababababababababababababababababababababababababababababababab/target"
+        );
+    }
+
+    #[test]
+    fn refresh_target_modulus_is_the_product_of_all_plaintext_slots() {
+        let slots = vec![
+            crate::noise_refresh::refresh::RefreshSlot {
+                slot: 0,
+                q: BigInt::from(15u8),
+                p: BigInt::from(5u8),
+                q_t: BigInt::from(3u8),
+            },
+            crate::noise_refresh::refresh::RefreshSlot {
+                slot: 1,
+                q: BigInt::from(35u8),
+                p: BigInt::from(7u8),
+                q_t: BigInt::from(5u8),
+            },
+        ];
+        assert_eq!(declared_refresh_target_modulus(&slots).unwrap(), BigUint::from(15u8));
+        let mismatched = vec![
+            slots[0].clone(),
+            crate::noise_refresh::refresh::RefreshSlot {
+                q_t: BigInt::from(7u8),
+                ..slots[1].clone()
+            },
+        ];
+        assert!(validate_refresh_target_modulus(&mismatched, &BigUint::from(15u8)).is_err());
+    }
+
+    #[test]
+    fn refresh_two_prime_channels_mod_down_then_lift_to_combined_ring() {
+        let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
+        let value = source.input("refresh-source", (1, 1));
+        let matrix = ((value.clone(), value.clone()), (value.clone(), value));
+        let lifted = mod_down_lift_public(matrix, BigInt::from(3u8), BigInt::from(15u8));
+        for row in [lifted.0, lifted.1] {
+            for entry in [row.0, row.1] {
+                assert_eq!(entry.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
+            }
         }
-        let public_sum = scheme.finalize_terminal_public(raw_public_sum.unwrap()).unwrap();
-        let row_sum = scheme.finalize_terminal_encoding(raw_row_sum.unwrap(), &public_sum).unwrap();
-        graph = graph
-            .output("indexed-public-sum", indexed_sum.public_matrices().at(0) - public_sum.matrix)
+        assert_eq!(
+            refresh_crt_weight(
+                &[
+                    crate::noise_refresh::refresh::RefreshSlot {
+                        slot: 0,
+                        q: 105.into(),
+                        p: 105.into(),
+                        q_t: 3.into(),
+                    },
+                    crate::noise_refresh::refresh::RefreshSlot {
+                        slot: 1,
+                        q: 105.into(),
+                        p: 105.into(),
+                        q_t: 5.into(),
+                    },
+                ],
+                0
+            )
+            .unwrap(),
+            BigInt::from(10u8)
+        );
+    }
+
+    #[test]
+    fn refresh_anchor_reduction_is_not_moddown_and_decoder_target_is_distinct() {
+        let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
+        let anchor_entry = source.input("refresh-anchor", (1, 1));
+        let anchor = (
+            (anchor_entry.clone(), anchor_entry.clone()),
+            (anchor_entry.clone(), anchor_entry.clone()),
+        );
+        let a_sum_entry = source.input("refresh-a-sum", (1, 1));
+        let a_sum =
+            ((a_sum_entry, source.zero((1, 1))), (source.zero((1, 1)), source.zero((1, 1))));
+
+        // Both channels are present in the CRT declaration.  The anchor
+        // carrier uses plaintext reduction for each q_t, while the old
+        // ModDown path divides by q_t and therefore produces a different
+        // graph even when the final ring is the same Q* ring.
+        for channel_modulus in [BigInt::from(3u8), BigInt::from(5u8)] {
+            let reduced = reduce_lift_public_anchor(
+                anchor.clone(),
+                channel_modulus.clone(),
+                BigInt::from(15u8),
+            )
+            .unwrap();
+            let divided = mod_down_lift_public(anchor.clone(), channel_modulus, BigInt::from(15u8));
+            assert_ne!(reduced.flatten(), divided.flatten());
+            assert_eq!(reduced.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
+        }
+
+        // H is intentionally non-unit (p/q_t = 105/5 = 21).  The decoder
+        // target includes the A_sum contribution and remains a separate
+        // artifact from the public A_star carrier.
+        let decoder_target = mod_down_lift_public(
+            add_public_matrices(a_sum, scale_public_matrix(anchor.clone(), &BigInt::from(-21i8))),
+            BigInt::from(5u8),
+            BigInt::from(15u8),
+        );
+        let public_anchor =
+            reduce_lift_public_anchor(anchor, BigInt::from(5u8), BigInt::from(15u8)).unwrap();
+        assert_ne!(decoder_target.flatten(), public_anchor.flatten());
+    }
+
+    #[test]
+    fn refresh_nonzero_anchor_data_action_is_part_of_published_a_sum() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let anchor_entry = ring.input("refresh-q-anchor", (1, 1));
+        let anchor = (
+            (anchor_entry.clone(), anchor_entry.clone()),
+            (anchor_entry.clone(), anchor_entry.clone()),
+        );
+        let action = decompose_matrix(
+            &parameters,
+            0,
+            scale_public_matrix(anchor.clone(), &BigInt::from(-3i8)),
+        )
+        .unwrap();
+        let data_public = multiply_public_action(anchor, action);
+        let zero = ring.zero((1, 1));
+        let empty_sum = ((zero.clone(), zero.clone()), (zero.clone(), zero));
+        let published_sum = add_public_matrices(empty_sum.clone(), data_public.clone());
+
+        assert_ne!(data_public.flatten(), empty_sum.flatten());
+        assert_ne!(published_sum.flatten(), empty_sum.flatten());
+        assert_eq!(published_sum.0.0.matrix_type(), data_public.0.0.matrix_type());
+    }
+
+    #[test]
+    fn refresh_data_terminal_zero_noise_oracle_keeps_ain_and_aout_distinct() {
+        let q = 35i64;
+        let p = 5i64;
+        let h = 5i64;
+        let r0 = 2i64;
+        let r1 = 1i64;
+        let mu = 3i64;
+        let ain = 11i64;
+        let aout = 17i64;
+        assert!(q > p && p > 1 && mu != 0 && r0 != 0 && ain != aout);
+
+        let top = [4i64, 2i64];
+        let target = [1i64, 3i64];
+        let bottom = [h * target[0] - r0 * top[0], h * target[1] - r0 * top[1]];
+        for component in 0..2 {
+            let payload_relation = (r0 * top[component] + r1 * bottom[component]).rem_euclid(p);
+            assert_eq!(payload_relation, (h * target[component]).rem_euclid(p));
+        }
+        let data = bottom.map(|value| (ain * value).rem_euclid(q));
+        let anchor = aout.rem_euclid(p);
+        assert_ne!(data[0], data[1]);
+        assert_ne!(anchor, ain.rem_euclid(p));
+        assert_eq!(bottom[0].rem_euclid(p), 2);
+        assert_eq!(bottom[1].rem_euclid(p), 1);
+    }
+
+    #[test]
+    fn refresh_output_target_lifts_qstar_into_containing_p() {
+        let qstar = mxx_dsl::Ring::new(BigInt::from(15u8), 4);
+        let value = qstar.input("refresh-qstar-target", (1, 1));
+        let row = (value.clone(), value);
+        let lifted = lift_output_target_to_p(
+            row.clone(),
+            BigInt::from(105u8),
+            qstar.polynomial([IntExpr::constant(BigInt::from(3u8))]),
+        );
+        let reduced = checked_modulus_convert_row(row, BigInt::from(105u8)).unwrap();
+        let reduced = super::map_row(reduced, |entry| {
+            qstar.polynomial([IntExpr::constant(BigInt::from(3u8))]) * entry
+        });
+        assert_eq!(lifted.0.matrix_type().modulus, IntExpr::constant(BigInt::from(105u8)));
+        assert_ne!(lifted.flatten(), reduced.flatten());
+        let graph = DslContext::new("refresh-qstar-to-p")
+            .artifact_output("lifted", lifted)
             .unwrap()
-            .output("indexed-row-sum", indexed_sum_rows.at(0) - row_sum.row().clone())
+            .build()
             .unwrap();
-        (graph.build().unwrap().validate(&ParamEnv::default()).unwrap(), parameters)
+        graph.validate(&ParamEnv::default()).unwrap();
     }
-}
 
-fn family_storage<T: GraphValue>(
-    value: &ProgramValue<T, Family<T>>,
-) -> ProgramValue<(), Vec<bool>> {
-    match value {
-        ProgramValue::Scalar(_) => ProgramValue::Scalar(()),
-        ProgramValue::Family(values) => ProgramValue::Family(values.schema().shared),
+    #[test]
+    fn refresh_target_width_is_used_across_q_anchor_p_action_and_a_star() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let evaluation_level = 0;
+        let decomposition_level = 1;
+        let target_level = 1;
+        let evaluation_columns = parameters.component_columns(evaluation_level).unwrap();
+        let target_columns = parameters.component_columns(target_level).unwrap();
+        assert_ne!(evaluation_columns, target_columns);
+        let hash_key =
+            parameters.ring(evaluation_level).unwrap().bytes_input("refresh-width-key", 32);
+
+        let anchor = refresh_output_anchor(
+            &parameters,
+            evaluation_level,
+            target_columns,
+            hash_key.clone(),
+            [3u8; 32],
+            0,
+            WireId(4),
+        )
+        .unwrap();
+        assert_eq!(
+            anchor.matrix.0.0.matrix_type(),
+            &parameters.ring(evaluation_level).unwrap().matrix_type((1, target_columns))
+        );
+
+        let payload = RnsBggPayloadSecret {
+            row: (
+                parameters.ring(evaluation_level).unwrap().uniform_interval((1, 1), -1, 1),
+                parameters.ring(evaluation_level).unwrap().identity(1),
+            ),
+        };
+        let p_ring = parameters.ring(decomposition_level).unwrap();
+        let desired = (p_ring.zero((1, target_columns)), p_ring.zero((1, target_columns)));
+        let action = refresh_payload_action(
+            &parameters,
+            evaluation_level,
+            decomposition_level,
+            &payload,
+            desired,
+            hash_key,
+            mxx_dsl::HashTag::from(b"refresh-width-test".to_vec()),
+            target_columns,
+        )
+        .unwrap();
+        assert_eq!(
+            action.0.0.matrix_type().modulus,
+            IntExpr::constant(BigInt::from(
+                parameters.level(evaluation_level).unwrap().modulus().as_ref().clone()
+            ))
+        );
+        assert_eq!(action.0.0.matrix_type().columns, IntExpr::constant(target_columns));
+
+        let graph = DslContext::new("refresh-target-width")
+            .artifact_output("anchor", anchor.matrix.clone())
+            .unwrap()
+            .artifact_output("action", action.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+
+        let a_star = checked_modulus_convert_matrix(
+            anchor.matrix,
+            BigInt::from(parameters.level(decomposition_level).unwrap().modulus().as_ref().clone()),
+        )
+        .unwrap();
+        assert_eq!(a_star.0.0.matrix_type(), &p_ring.matrix_type((1, target_columns)));
     }
-}
 
-fn import_family_value<T: GraphValue>(
-    element: T::Schema,
-    count: IntExpr,
-    storage: &ProgramValue<(), Vec<bool>>,
-    production: ProductionId,
-    name: impl Into<String>,
-) -> Result<ProgramValue<T, Family<T>>, RnsBggError> {
-    let schema = match storage {
-        ProgramValue::Scalar(()) => ProgramValue::Scalar(element),
-        ProgramValue::Family(shared) => {
-            ProgramValue::Family(FamilyType { element, count, shared: shared.clone() })
-        }
-    };
-    Ok(schema.artifact_input(production, name, ArtifactConfidentiality::Public)?)
+    #[test]
+    fn rhs_preparation_uses_next_level_payload_ciphertext_and_compact_schema() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let output = builder
+            .mul_private(
+                crate::program::Operand::Scalar(input),
+                crate::program::Operand::Scalar(rhs),
+            )
+            .unwrap();
+        let program =
+            Arc::new(builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap());
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        assert_eq!(workload.rhs_level(rhs).unwrap(), 0);
+
+        let ring = parameters.ring(0).unwrap();
+        let payload =
+            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) };
+        let mut lowering = PublicKeyLowering::new(
+            &parameters,
+            program,
+            workload,
+            payload,
+            ring.bytes_input("rhs-schema-key", 32),
+        );
+        lowering.rhs.insert(
+            rhs,
+            InputBinding::Scalar(ring.polynomial([IntExpr::constant(BigInt::from(3u8))])),
+        );
+        let action = lowering.prepare_rhs(&RhsRef { id: rhs, index: None::<Int> }).unwrap();
+        let cached = lowering.prepare_rhs(&RhsRef { id: rhs, index: None::<Int> }).unwrap();
+        assert_eq!(action.flatten(), cached.flatten());
+        let expected_columns = parameters.level(1).unwrap().modulus_digits();
+        assert_eq!(
+            action.0.0.matrix_type(),
+            &ring.matrix_type((expected_columns, parameters.component_columns(1).unwrap())),
+            "RHS action uses the next-level signed decomposition, centered in the input ring"
+        );
+        let graph = DslContext::new("rhs-next-level-payload-action")
+            .artifact_output("rhs", action)
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn rhs_payload_ciphertext_has_zero_noise_private_product_residual() {
+        // This is the scalar oracle for the graph construction above.  The
+        // top sample U cancels from the payload product; the remaining term
+        // is the desired next-level payload target (up to the configured
+        // fresh error).
+        let p = 11i64;
+        let q = 121i64;
+        let nu = 3i64;
+        let delta_next = 5i64;
+        let gadget_next = 7i64;
+        let r0 = 2i64;
+        let r1 = 1i64;
+        let u = 4i64;
+        let desired = nu * delta_next * gadget_next;
+        let bottom = desired - r0 * u;
+        let payload_product = (r0 * u + r1 * bottom).rem_euclid(p);
+        assert_eq!(payload_product, desired.rem_euclid(p));
+
+        let private_input = 9i64;
+        let product = (private_input * payload_product).rem_euclid(q);
+        assert_eq!(product.rem_euclid(p), (private_input * desired).rem_euclid(p));
+        assert_ne!(desired.rem_euclid(p), 0);
+        assert!(q > p && p > 1);
+    }
+
+    #[test]
+    fn rhs_family_members_reuse_the_next_level_action_schema() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let products = builder
+            .parallel(
+                crate::program::FamilyRange::full(IntExpr::constant(2)).unwrap(),
+                |builder, index| {
+                    builder
+                        .mul_private(
+                            crate::program::Operand::Scalar(input),
+                            crate::program::Operand::Member { family: rhs, index },
+                        )
+                        .map(crate::program::Operand::Scalar)
+                },
+            )
+            .unwrap();
+        let output = builder.sum(products).unwrap();
+        let program =
+            Arc::new(builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap());
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let ring = parameters.ring(0).unwrap();
+        let payload =
+            RnsBggPayloadSecret { row: (ring.uniform_interval((1, 1), -1, 1), ring.identity(1)) };
+        let mut lowering = PublicKeyLowering::new(
+            &parameters,
+            program,
+            workload,
+            payload,
+            ring.bytes_input("rhs-family-schema-key", 32),
+        );
+        lowering.rhs.insert(
+            rhs,
+            InputBinding::Family(
+                Family::pack(vec![
+                    ring.polynomial([IntExpr::constant(BigInt::from(2u8))]),
+                    ring.polynomial([IntExpr::constant(BigInt::from(5u8))]),
+                ])
+                .unwrap(),
+            ),
+        );
+        let first = lowering
+            .prepare_rhs_material(&RhsRef { id: rhs, index: Some(Int::constant(0usize)) })
+            .unwrap();
+        let second = lowering
+            .prepare_rhs_material(&RhsRef { id: rhs, index: Some(Int::constant(1usize)) })
+            .unwrap();
+        assert_eq!(first.0.0.matrix_type(), second.0.0.matrix_type());
+        assert_ne!(first.flatten(), second.flatten());
+    }
+
+    #[test]
+    fn equal_width_lut_tables_produce_distinct_public_branch_coefficients() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level], 1, 1).unwrap();
+        let constant = EncodingLowering::lut_coefficient(
+            &parameters,
+            0,
+            crate::program::LutOutputRepresentation::Coefficient,
+            IntExpr::constant(1),
+            &[0, 0],
+        )
+        .unwrap();
+        let identity = EncodingLowering::lut_coefficient(
+            &parameters,
+            0,
+            crate::program::LutOutputRepresentation::Coefficient,
+            IntExpr::constant(1),
+            &[0, 1],
+        )
+        .unwrap();
+        assert_ne!(constant.flatten(), identity.flatten());
+    }
+
+    #[test]
+    fn public_lut_branch_is_helper_action_only() {
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let data = (
+            (ring.input("lut-data-00", (1, 1)), ring.input("lut-data-01", (1, 1))),
+            (ring.input("lut-data-10", (1, 1)), ring.input("lut-data-11", (1, 1))),
+        );
+        let e = (
+            (
+                ring.preimage_input("lut-e-00", (1, 1), 17),
+                ring.preimage_input("lut-e-01", (1, 1), 17),
+            ),
+            (
+                ring.preimage_input("lut-e-10", (1, 1), 17),
+                ring.preimage_input("lut-e-11", (1, 1), 17),
+            ),
+        );
+        let branch = public_lut_branch(data.clone(), e.clone());
+        let expected = multiply_public_action(data, e);
+        assert_eq!(branch.0.0.matrix_type(), expected.0.0.matrix_type());
+        let graph = DslContext::new("public-lut-branch")
+            .artifact_output("branch", branch)
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn public_action_artifact_name_uses_only_the_site() {
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let action = (
+            (
+                ring.preimage_input("public-action-00", (1, 1), 17),
+                ring.preimage_input("public-action-01", (1, 1), 17),
+            ),
+            (
+                ring.preimage_input("public-action-10", (1, 1), 17),
+                ring.preimage_input("public-action-11", (1, 1), 17),
+            ),
+        );
+        let site = WireId(41);
+        let built = DslContext::new("public-action-artifact-name")
+            .artifact_output(public_action_artifact_name(site), action)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert!(built.graph.outputs().contains_key("public-action/WireId(41).0"));
+        assert!(built.graph.outputs().contains_key("public-action/WireId(41).3"));
+        assert!(!built.graph.outputs().keys().any(|name| name.contains("/1")));
+    }
+
+    #[test]
+    fn lut_payload_target_uses_distinct_r0_and_r1_components() {
+        let ring = mxx_dsl::Ring::new(BigInt::from(257u16), 4);
+        let r0 = ring.input("lut-r0", (1, 1));
+        let r1 = ring.identity(1);
+        let one = ring.identity(1);
+        let target = lut_payload_target(one.clone(), one, (r0, r1), ring.identity(1));
+        assert_ne!(target.0.flatten(), target.1.flatten());
+    }
+
+    #[test]
+    fn lut_e_sigma_is_centered_extended_into_the_source_ring() {
+        let next = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let compact = next.preimage_input("lut-e-next", (1, 1), 17);
+        let decomposition = ((compact.clone(), compact.clone()), (compact.clone(), compact));
+        let extended = centered_extend_decomposition(decomposition, BigInt::from(257u16));
+        assert_eq!(extended.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
+        assert_eq!(extended.1.1.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
+    }
+
+    #[test]
+    fn helper_families_keep_root_and_nested_origins_distinct() {
+        let origin = WireId(23);
+        let root = FamilyScope::new(Vec::new(), Vec::new()).unwrap();
+        let nested = FamilyScope::new(
+            vec![
+                crate::program::FamilyRange::bounded(
+                    IntExpr::constant(2),
+                    IntExpr::constant(2),
+                    IntExpr::constant(4),
+                )
+                .unwrap(),
+            ],
+            vec![IntExpr::constant(2)],
+        )
+        .unwrap();
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let matrix =
+            ((ring.zero((1, 1)), ring.zero((1, 1))), (ring.zero((1, 1)), ring.zero((1, 1))));
+        let root_helper = Family::pack(vec![matrix.clone()]).unwrap();
+        let nested_helper = Family::pack(vec![matrix]).unwrap();
+        let mut families = BTreeMap::new();
+        families.insert((origin, root.clone()), root_helper.clone());
+        families.insert((origin, nested.clone()), nested_helper.clone());
+
+        assert_eq!(families.len(), 2);
+        assert_ne!(
+            lut_helper_artifact_name(origin, &root),
+            lut_helper_artifact_name(origin, &nested)
+        );
+        let graph = DslContext::new("helper-root-and-nested")
+            .artifact_output(lut_helper_artifact_name(origin, &root), root_helper)
+            .unwrap()
+            .artifact_output(lut_helper_artifact_name(origin, &nested), nested_helper)
+            .unwrap()
+            .build()
+            .unwrap();
+        graph.validate(&ParamEnv::default()).unwrap();
+    }
+
+    #[test]
+    fn helper_families_preserve_two_nested_scope_keys() {
+        let origin = WireId(29);
+        let first = FamilyScope::new(
+            vec![
+                crate::program::FamilyRange::bounded(
+                    IntExpr::constant(1),
+                    IntExpr::constant(2),
+                    IntExpr::constant(6),
+                )
+                .unwrap(),
+                crate::program::FamilyRange::bounded(
+                    IntExpr::constant(0),
+                    IntExpr::constant(3),
+                    IntExpr::constant(4),
+                )
+                .unwrap(),
+            ],
+            vec![IntExpr::constant(1), IntExpr::constant(0)],
+        )
+        .unwrap();
+        let second = FamilyScope::new(
+            vec![
+                crate::program::FamilyRange::bounded(
+                    IntExpr::constant(3),
+                    IntExpr::constant(2),
+                    IntExpr::constant(6),
+                )
+                .unwrap(),
+                crate::program::FamilyRange::bounded(
+                    IntExpr::constant(0),
+                    IntExpr::constant(3),
+                    IntExpr::constant(4),
+                )
+                .unwrap(),
+            ],
+            vec![IntExpr::constant(3), IntExpr::constant(0)],
+        )
+        .unwrap();
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let matrix =
+            ((ring.zero((1, 1)), ring.zero((1, 1))), (ring.zero((1, 1)), ring.zero((1, 1))));
+        let mut families = BTreeMap::new();
+        families.insert((origin, first.clone()), Family::pack(vec![matrix.clone()]).unwrap());
+        families.insert((origin, second.clone()), Family::pack(vec![matrix]).unwrap());
+
+        assert_eq!(families.len(), 2);
+        assert_ne!(
+            lut_helper_artifact_name(origin, &first),
+            lut_helper_artifact_name(origin, &second)
+        );
+    }
+
+    #[test]
+    fn nested_side_family_flattens_outer_then_branch_axis() {
+        let nested = mxx_dsl::parallel(IntExpr::constant(2), |outer| {
+            mxx_dsl::parallel(IntExpr::constant(3), |inner| {
+                Ok(outer.mul(Int::constant(10usize)).add(inner))
+            })
+        })
+        .unwrap();
+        let flat = flatten_family(nested).unwrap();
+        assert_eq!(flat.count(), &IntExpr::constant(6));
+        assert_eq!(flat.at(Int::constant(0)).flatten().len(), 1);
+        assert_eq!(flat.at(Int::constant(5)).flatten().len(), 1);
+    }
 }

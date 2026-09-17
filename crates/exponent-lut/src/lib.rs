@@ -1,50 +1,20 @@
-//! Scheme-independent Exponent-LUT programs and their BGG+ and RNS-BGG adapters.
+//! Scheme-independent Exponent-LUT programs and their RNS-BGG adapter.
 //!
-//! Public preprocessing and online evaluation interpret the same frozen Program
-//! through [`scheme::ExponentLUTEncodingScheme`]. Concrete cryptographic types
-//! and errors belong to the corresponding backend module.
+//! Public preprocessing and online evaluation are exposed through [`api`].
+//! Concrete cryptographic types and errors belong to the corresponding
+//! backend evaluator.
 
-pub mod bgg;
-pub mod layout;
-pub mod lean;
+pub mod api;
 pub mod nand_circuit;
 pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
-pub mod readout;
 pub mod rns_bgg;
-pub mod scheme;
 mod utils;
 
-pub use layout::{ExpLayout, LayoutError};
 pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
 pub use noise_refresh::prf::SparseLwrPrfProfile;
-pub use program::ExponentLutProgram;
-pub use rns_bgg::api::{
-    ArtifactWorkingDirectory, EncodedOutput, EncodedOutputs, EncodingSecrets, EncryptionArtifacts,
-    EvaluationArtifacts, ExecutionError, ExpectedEncoding, ExponentLut, FixedRhs, InputArtifacts,
-    PreprocessedProgram, RuntimeConfiguration, SparseLwrPrfProgram, SparseLwrPrfSelectorKey,
-};
-
-/// Advanced compatibility surface for backend adapters and migration tooling.
-///
-/// These types expose the frozen Program binding and durable-artifact details
-/// used by the cryptographic implementations. Ordinary applications should use
-/// the typed facade re-exported at the crate root instead.
-pub mod advanced {
-    pub use crate::{
-        program::{
-            AttributeKnowledge, FamilyAggregation, FamilyProgram, FamilyRhsSource,
-            FamilyWireSource, Gate, ProgramBindings, ProgramFamilyBindings, ProgramFamilyId,
-            ProgramGateInstance, ProgramInputId, ProgramStep, ProgramValidationError, ProgramValue,
-            ProgramWireType, RhsFamilyId, RhsId, WireFamilyId, WireId,
-        },
-        rns_bgg::api::{
-            ArtifactNamespace, ArtifactReferenceToken, FacadeBenchmarkGraphs, MaskSecret,
-            OutputReferenceToken, PayloadSecret,
-        },
-    };
-}
+pub use program::{ExpLayout, ExponentLutProgram, ExponentLutProgramId, LayoutError};
 use thiserror::Error;
 
 /// Shared declaration and graph-construction errors, independent of a backend.
@@ -52,7 +22,7 @@ use thiserror::Error;
 pub enum ExponentLutError {
     #[error(transparent)]
     Program(#[from] program::ProgramValidationError),
-    #[error("LUT dimensions, output exponents, or RHS width are invalid")]
+    #[error("LUT dimensions or output exponents are invalid")]
     InvalidLut,
     #[error("program operation {gate} failed: {detail}")]
     ProgramOperation { gate: String, detail: String },

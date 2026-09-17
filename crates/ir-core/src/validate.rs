@@ -535,13 +535,6 @@ fn validate_node(
                         artifact: artifact.artifact_name.clone(),
                     }
                 })?;
-                if artifact.confidentiality != stored.confidentiality {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "artifact confidentiality does not match manifest",
-                    );
-                }
                 let (element, count) = family_element(&declared);
                 if ArtifactType::from_wire_type(element).as_ref() != Some(&stored.artifact_type) ||
                     count != stored.family_count
@@ -2067,7 +2060,6 @@ mod tests {
                 artifact: Some(ArtifactInput {
                     production_id: production_id.clone(),
                     artifact_name: artifact_name.clone(),
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
                 }),
             },
             Vec::new(),
@@ -2080,13 +2072,7 @@ mod tests {
             production_id: production_id.clone(),
             artifacts: BTreeMap::from([(
                 artifact_name,
-                ManifestArtifact {
-                    artifact_type,
-                    family_count: None,
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
-                    content_hash: None,
-                    layout: None,
-                },
+                ManifestArtifact { artifact_type, family_count: None, layout: None },
             )]),
         };
         (value, BTreeMap::from([(production_id, manifest)]))
@@ -2154,7 +2140,7 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { value: output, confidentiality: None },
+                GraphOutput { artifact_output: false, value: output },
             )]),
             Vec::new(),
             Vec::new(),

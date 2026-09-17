@@ -547,8 +547,8 @@ mod tests {
             "linked-claim",
             vec![],
             std::collections::BTreeMap::from([
-                ("bit".into(), GraphOutput { value: bit, confidentiality: None }),
-                ("residual".into(), GraphOutput { value: residual, confidentiality: None }),
+                ("bit".into(), GraphOutput { artifact_output: false, value: bit }),
+                ("residual".into(), GraphOutput { artifact_output: false, value: residual }),
             ]),
             vec![],
             vec![],

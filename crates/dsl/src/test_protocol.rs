@@ -3,7 +3,7 @@
 use crate::{DslContext, IdealSpec, Ring};
 use mxx_ir_core::{
     IntExpr, RealExpr,
-    artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+    artifact::{ProductionId, SpecHash},
     protocol::{
         ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
         ComparatorSpec, EndpointBinding, EndpointBindings, EndpointSemanticBinding, EndpointSpecId,
@@ -26,16 +26,15 @@ pub fn protocol() -> ProtocolDecl {
     let residual = ciphertext.clone() - encoded;
     let encrypt = DslContext::new("toy-example-encrypt")
         .int_parameter("cutoff")
-        .public_output("ciphertext", ciphertext)
+        .artifact_output("ciphertext", ciphertext)
         .expect("unique output")
-        .private_output("operational-residual", residual)
+        .artifact_output("operational-residual", residual)
         .expect("unique operational residual output")
         .build()
         .expect("toy encryption graph");
 
     let placeholder = ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] };
-    let ciphertext =
-        ring.artifact_input(placeholder, "ciphertext", (1, 1), ArtifactConfidentiality::Public);
+    let ciphertext = ring.artifact_input(placeholder, "ciphertext", (1, 1));
     let decoded = ciphertext
         .threshold_decode_bools(IntExpr::constant(2), 1)
         .into_iter()

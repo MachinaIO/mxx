@@ -216,7 +216,7 @@ pub(crate) fn streamed_root_outputs(
         .source
         .outputs()
         .values()
-        .filter(|output| output.confidentiality.is_some())
+        .filter(|output| output.artifact_output)
         .map(|output| output.value)
         .collect::<BTreeSet<_>>();
     let checked = validated.scope(scope_id).expect("validated scope");
@@ -464,7 +464,7 @@ mod tests {
         for streamed in [false, true] {
             let value = ring.gaussian((1, 1), 3, 19);
             let context = if streamed {
-                DslContext::new("streamed-root-export").private_output("value", value).unwrap()
+                DslContext::new("streamed-root-export").artifact_output("value", value).unwrap()
             } else {
                 DslContext::new("retained-root-output").output("value", value).unwrap()
             };
@@ -491,7 +491,7 @@ mod tests {
 
         let input = ring.input("streamed-input", (1, 1));
         let validated = DslContext::new("streamed-root-input")
-            .private_output("value", input)
+            .artifact_output("value", input)
             .unwrap()
             .build()
             .unwrap()
@@ -523,7 +523,7 @@ mod tests {
         let second_matrix = ring.input("second-matrix", (2, 2));
         let second_product = second_matrix.mul_small_rhs(bounded.clone());
         let validated = DslContext::new("streamed-owner-before-consumer")
-            .private_output("bounded", bounded)
+            .artifact_output("bounded", bounded)
             .unwrap()
             .output("first-product", first_product)
             .unwrap()
@@ -562,7 +562,7 @@ mod tests {
         for streamed in [false, true] {
             let family = parallel(3, |_| Ok(ring.gaussian((1, 1), 3, 19))).unwrap();
             let context = if streamed {
-                DslContext::new("streamed-family-export").private_output("values", family).unwrap()
+                DslContext::new("streamed-family-export").artifact_output("values", family).unwrap()
             } else {
                 DslContext::new("retained-family-output").output("values", family).unwrap()
             };
@@ -593,7 +593,7 @@ mod tests {
         let packed =
             Family::pack(vec![ring.gaussian((1, 1), 3, 19), ring.gaussian((1, 1), 3, 19)]).unwrap();
         let validated = DslContext::new("retained-packed-family")
-            .private_output("values", packed)
+            .artifact_output("values", packed)
             .unwrap()
             .build()
             .unwrap()

@@ -261,9 +261,9 @@ mod tests {
         let ct = scheme.encrypt(&ek, &common.ring().from_coefficients(&message)).unwrap();
         let doubled = scheme.add(&ct, &ct).unwrap();
         let mut ctx = ctx
-            .private_output("roundtrip", scheme.decrypt(&sk, &ct).unwrap().coefficients())
+            .artifact_output("roundtrip", scheme.decrypt(&sk, &ct).unwrap().coefficients())
             .unwrap()
-            .private_output("double", scheme.decrypt(&sk, &doubled).unwrap().coefficients())
+            .artifact_output("double", scheme.decrypt(&sk, &doubled).unwrap().coefficients())
             .unwrap();
         let mut inputs = BTreeMap::new();
         // Sample coefficients of m(X) within the declared plaintext bound of 2.
@@ -280,7 +280,7 @@ mod tests {
                 scheme.encrypt_gsw(&sk, &common.ring().from_coefficients(&multiplier)).unwrap();
             let result = scheme.mul(&ct, &gsw, &()).unwrap();
             ctx = ctx
-                .private_output(
+                .artifact_output(
                     format!("result-{name}"),
                     scheme.decrypt(&sk, &result).unwrap().coefficients(),
                 )
@@ -293,7 +293,7 @@ mod tests {
         let gsw = scheme.encrypt_gsw(&sk, &common.ring().from_coefficients(&polynomial)).unwrap();
         let product = scheme.mul(&ct, &gsw, &()).unwrap();
         ctx = ctx
-            .private_output(
+            .artifact_output(
                 "polynomial-product",
                 scheme.decrypt(&sk, &product).unwrap().coefficients(),
             )
@@ -457,11 +457,11 @@ mod tests {
         let residual =
             &sum.b - &secret * &sum.a - &expected * scalar(&common.ring, scheme.scale.clone());
         let graph = context
-            .private_output("decoded", scheme.decrypt(&secret, &sum).unwrap().coefficients())
+            .artifact_output("decoded", scheme.decrypt(&secret, &sum).unwrap().coefficients())
             .unwrap()
-            .private_output("expected", expected.coefficients())
+            .artifact_output("expected", expected.coefficients())
             .unwrap()
-            .private_output("residual", residual.coefficients())
+            .artifact_output("residual", residual.coefficients())
             .unwrap()
             .build()
             .unwrap();

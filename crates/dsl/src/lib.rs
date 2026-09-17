@@ -5,7 +5,7 @@
 use mxx_ir_core::{
     CapturePolicy, CompileParameter, CompileParameterKind, FreezeError, Graph, GraphOutput,
     IntExpr, NodeHandle, ParamEnv, RealExpr, SubgraphHandle, ValueHandle,
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::ProductionId,
     graph::with_new_construction_scope,
     node::{
         ArtifactInput, ConstantMatrix, HashTagComponent, HashVariant, IndexRange, MatrixBinaryOp,
@@ -36,7 +36,6 @@ use thiserror::Error;
 
 pub use mxx_ir_core::{
     Rational,
-    artifact::ArtifactConfidentiality as Confidentiality,
     protocol::{IdealSpec, PurePredicateSpec},
 };
 #[cfg(test)]
@@ -247,13 +246,12 @@ impl Ring {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
-        confidentiality: ArtifactConfidentiality,
     ) -> Mat {
         let artifact_name = artifact_name.into();
         Mat::source_input(
             artifact_name.clone(),
             self.matrix_type(shape),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name }),
         )
     }
 
@@ -279,14 +277,13 @@ impl Ring {
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
     ) -> SmallMatrix {
         let artifact_name = artifact_name.into();
         SmallMatrix::source_input(
             artifact_name.clone(),
             self.matrix_type(shape),
             max_coefficient_bound.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name }),
         )
     }
 
@@ -312,7 +309,6 @@ impl Ring {
         artifact_name: impl Into<String>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Preimage {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(shape);
@@ -325,7 +321,7 @@ impl Ring {
             NodeKind::Input {
                 name: artifact_name.clone(),
                 wire_type: wire_type.clone(),
-                artifact: Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+                artifact: Some(ArtifactInput { production_id, artifact_name }),
             },
             Vec::new(),
             vec![wire_type],
@@ -366,7 +362,6 @@ impl Ring {
             Some(ArtifactInput {
                 production_id: production_id.clone(),
                 artifact_name: public_artifact_name,
-                confidentiality: ArtifactConfidentiality::Public,
             }),
         );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
@@ -384,7 +379,6 @@ impl Ring {
                 artifact: Some(ArtifactInput {
                     production_id,
                     artifact_name: trapdoor_artifact_name,
-                    confidentiality: ArtifactConfidentiality::Private,
                 }),
             },
             Vec::new(),
@@ -434,7 +428,6 @@ impl Ring {
             Some(ArtifactInput {
                 production_id: production_id.clone(),
                 artifact_name: public_artifact_name,
-                confidentiality: ArtifactConfidentiality::Public,
             }),
         );
         let trapdoor_artifact_name = trapdoor_artifact_name.into();
@@ -450,11 +443,7 @@ impl Ring {
             public,
             element,
             count,
-            Some(ArtifactInput {
-                production_id,
-                artifact_name: trapdoor_artifact_name,
-                confidentiality: ArtifactConfidentiality::Private,
-            }),
+            Some(ArtifactInput { production_id, artifact_name: trapdoor_artifact_name }),
         )
     }
 
@@ -525,14 +514,13 @@ impl Ring {
         artifact_name: impl Into<String>,
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
-        confidentiality: ArtifactConfidentiality,
     ) -> Family<Mat> {
         let artifact_name = artifact_name.into();
         Family::<Mat>::source_input(
             format!("artifact:{artifact_name}"),
             Mat::source_input("__family-element".to_owned(), self.matrix_type(shape), None),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name }),
         )
     }
 
@@ -544,7 +532,6 @@ impl Ring {
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Family<SmallMatrix> {
         let artifact_name = artifact_name.into();
         Family::<SmallMatrix>::source_input(
@@ -556,7 +543,7 @@ impl Ring {
                 None,
             ),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name }),
         )
     }
 
@@ -568,7 +555,6 @@ impl Ring {
         count: impl Into<IntExpr>,
         shape: impl IntoShape,
         max_coefficient_bound: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Family<Preimage> {
         let artifact_name = artifact_name.into();
         let matrix_type = self.matrix_type(shape);
@@ -582,7 +568,7 @@ impl Ring {
                 None,
             ),
             count.into(),
-            Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+            Some(ArtifactInput { production_id, artifact_name }),
         )
     }
 
@@ -897,7 +883,6 @@ impl Ring {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
         length: impl Into<IntExpr>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Bytes {
         let artifact_name = artifact_name.into();
         let ty = WireType::Bytes { length: length.into() };
@@ -905,7 +890,7 @@ impl Ring {
             NodeKind::Input {
                 name: artifact_name.clone(),
                 wire_type: ty.clone(),
-                artifact: Some(ArtifactInput { production_id, artifact_name, confidentiality }),
+                artifact: Some(ArtifactInput { production_id, artifact_name }),
             },
             Vec::new(),
             vec![ty],
@@ -1686,59 +1671,28 @@ impl DslContext {
         name: impl Into<String>,
         value: V,
     ) -> Result<Self, DslError> {
-        self.insert_graph_value(name.into(), value, None)?;
+        self.insert_graph_value(name.into(), value, false)?;
         Ok(self)
     }
 
-    pub fn public_output<V: GraphValue>(
+    pub fn artifact_output<V: GraphValue>(
         mut self,
         name: impl Into<String>,
         value: V,
     ) -> Result<Self, DslError> {
-        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
+        self.insert_graph_value(name.into(), value, true)?;
         Ok(self)
     }
 
-    /// Export a sequence of named public values in declaration order. Each
+    /// Export a sequence of named artifact values in declaration order. Each
     /// value retains its own schema; structural families are never expanded.
-    pub fn public_outputs<V: GraphValue, N: Into<String>>(
+    pub fn artifact_outputs<V: GraphValue, N: Into<String>>(
         mut self,
         values: impl IntoIterator<Item = (N, V)>,
     ) -> Result<Self, DslError> {
         for (name, value) in values {
-            self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Public))?;
+            self.insert_graph_value(name.into(), value, true)?;
         }
-        Ok(self)
-    }
-
-    pub fn private_output<V: GraphValue>(
-        mut self,
-        name: impl Into<String>,
-        value: V,
-    ) -> Result<Self, DslError> {
-        self.insert_graph_value(name.into(), value, Some(ArtifactConfidentiality::Private))?;
-        Ok(self)
-    }
-
-    pub fn private_trapdoor_output(
-        mut self,
-        name: impl Into<String>,
-        trapdoor: Trapdoor,
-    ) -> Result<Self, DslError> {
-        self.insert_output(name.into(), trapdoor.value, Some(ArtifactConfidentiality::Private))?;
-        Ok(self)
-    }
-
-    pub fn private_trapdoor_family_output(
-        mut self,
-        name: impl Into<String>,
-        trapdoors: Family<Trapdoor>,
-    ) -> Result<Self, DslError> {
-        self.insert_output(
-            name.into(),
-            trapdoors.values[1].clone(),
-            Some(ArtifactConfidentiality::Private),
-        )?;
         Ok(self)
     }
 
@@ -1746,7 +1700,7 @@ impl DslContext {
         &mut self,
         name: String,
         value: V,
-        confidentiality: Option<ArtifactConfidentiality>,
+        artifact_output: bool,
     ) -> Result<(), DslError> {
         let values = value.flatten();
         if values.is_empty() {
@@ -1759,7 +1713,7 @@ impl DslContext {
             return Err(DslError::DuplicateOutput(name.clone()));
         }
         for (name, value) in names.into_iter().zip(values) {
-            self.insert_output(name, value, confidentiality)?;
+            self.insert_output(name, value, artifact_output)?;
         }
         Ok(())
     }
@@ -1768,9 +1722,9 @@ impl DslContext {
         &mut self,
         name: String,
         value: ValueHandle,
-        confidentiality: Option<ArtifactConfidentiality>,
+        artifact_output: bool,
     ) -> Result<(), DslError> {
-        if self.outputs.insert(name.clone(), GraphOutput { value, confidentiality }).is_some() {
+        if self.outputs.insert(name.clone(), GraphOutput { value, artifact_output }).is_some() {
             return Err(DslError::DuplicateOutput(name));
         }
         Ok(())
@@ -2423,11 +2377,11 @@ mod tests {
         .unwrap();
         let built = DslContext::new("parameterized-trapdoor-families")
             .int_parameter("count")
-            .public_output("public", trapdoors.public_matrices())
+            .artifact_output("public", trapdoors.public_matrices())
             .unwrap()
-            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .artifact_output("trapdoors", trapdoors)
             .unwrap()
-            .private_output("preimages", preimages)
+            .artifact_output("preimages", preimages)
             .unwrap()
             .build()
             .unwrap();
@@ -2460,9 +2414,9 @@ mod tests {
         let gathered =
             parallel(indices.count().clone(), |i| Ok(trapdoors.at(indices.at(i)))).unwrap();
         let built = DslContext::new("trapdoor-family-gather")
-            .public_output("public", gathered.public_matrices())
+            .artifact_output("public", gathered.public_matrices())
             .unwrap()
-            .private_trapdoor_family_output("secret", gathered)
+            .artifact_output("secret", gathered)
             .unwrap()
             .build()
             .unwrap();
@@ -2552,7 +2506,7 @@ mod tests {
         let indices = DslContext::new("indices").int_family_input("indices", 2);
         let output = parallel(2, |i| Ok(source.at(&i) + shared.at(indices.at(i)))).unwrap();
         let built = DslContext::new("indexed-with-shared-source")
-            .public_output("output", output)
+            .artifact_output("output", output)
             .unwrap()
             .build()
             .unwrap();
@@ -2607,7 +2561,7 @@ mod tests {
             ))
         })
         .unwrap();
-        let built = context.public_output("output", output).unwrap().build().unwrap();
+        let built = context.artifact_output("output", output).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
         let loop_node = built
             .graph
@@ -2762,7 +2716,7 @@ mod tests {
         let left = Family::pack(vec![ring.zero((1, 1)), one.clone()]).unwrap();
         let right = Family::pack(vec![one, ring.zero((1, 1))]).unwrap();
         let selected = select(selector, vec![left, right]).unwrap();
-        let built = context.public_output("selected", selected).unwrap().build().unwrap();
+        let built = context.artifact_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
     }
 
@@ -2783,7 +2737,7 @@ mod tests {
                         if *max_coefficient_bound == IntExpr::constant(7)
                 ) && *count == IntExpr::constant(2)
         ));
-        let built = context.public_output("selected", selected).unwrap().build().unwrap();
+        let built = context.artifact_output("selected", selected).unwrap().build().unwrap();
         built.validate(&ParamEnv::default()).unwrap();
 
         let bound_mismatch = select(

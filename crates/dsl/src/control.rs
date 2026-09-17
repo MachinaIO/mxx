@@ -194,14 +194,16 @@ mod tests {
             spec_hash: mxx_ir_core::artifact::SpecHash([1; 32]),
             execution_nonce: [2; 32],
         };
-        let imported =
-            schema.artifact_input(production, "cache", ArtifactConfidentiality::Public).unwrap();
+        let imported = schema.artifact_input(production, "cache").unwrap();
         assert_eq!(imported.schema(), cache.schema());
         assert_eq!(imported.at(0).0.flatten(), imported.at(2).0.flatten());
         assert!(matches!(imported.flatten()[0].wire_type(), WireType::Matrix(_)));
         assert!(matches!(imported.flatten()[1].wire_type(), WireType::IndexedFamily { .. }));
-        let graph =
-            DslContext::new("shared-cache").public_output("cache", cache).unwrap().build().unwrap();
+        let graph = DslContext::new("shared-cache")
+            .artifact_output("cache", cache)
+            .unwrap()
+            .build()
+            .unwrap();
         graph.validate(&ParamEnv::default()).unwrap();
         assert_eq!(
             graph

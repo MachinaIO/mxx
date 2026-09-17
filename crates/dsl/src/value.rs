@@ -17,14 +17,13 @@ pub trait GraphValueSchema: Clone + PartialEq {
     fn placeholders_from(&self, next: &mut usize) -> Self::Value;
     fn wire_types(&self) -> Vec<WireType>;
 
-    /// Reopen the fields emitted by `DslContext::public_output` or
-    /// `private_output`, preserving their exact scalar/family schemas.
+    /// Reopen the fields emitted by `DslContext::artifact_output`, preserving
+    /// their exact scalar/family schemas.
     #[track_caller]
     fn artifact_input(
         &self,
         production_id: ProductionId,
         name: impl Into<String>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Result<Self::Value, DslError> {
         let name = name.into();
         let types = self.wire_types();
@@ -41,7 +40,6 @@ pub trait GraphValueSchema: Clone + PartialEq {
                         artifact: Some(ArtifactInput {
                             production_id: production_id.clone(),
                             artifact_name: name,
-                            confidentiality,
                         }),
                     },
                     vec![],

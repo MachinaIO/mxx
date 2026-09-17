@@ -332,7 +332,7 @@ fn device_members(
 ) {
     use crate::dataflow::ValueStorage;
     if !value.has_device_owner() {
-        return
+        return;
     }
     match value {
         ValueLayout::Leaf(_, ValueStorage::Device, Some(owner)) => visit(owner, path),
@@ -787,7 +787,7 @@ impl GpuGraphInventory {
                                     mxx_ir_core::artifact::ArtifactType::from_wire_type(ty).is_some() &&
                                     !matches!(ty, mxx_ir_core::types::ConcreteWireType::Matrix(_)));
                             if frame.staged.get(port).copied().unwrap_or(false) || artifact {
-                                continue
+                                continue;
                             }
                             device_members(value, &mut Vec::new(), &mut |owner, _| {
                                 parent.returned.insert(owner.clone());
@@ -859,7 +859,7 @@ impl GpuGraphInventory {
                     ConcreteWireType::SmallMatrix { matrix, .. } |
                     ConcreteWireType::Preimage { matrix, .. } => matrix,
                     ConcreteWireType::IndexedFamily { .. } | ConcreteWireType::Trapdoor { .. } => {
-                        return Ok(None)
+                        return Ok(None);
                     }
                     _ => {
                         descriptors.push(None);
@@ -873,7 +873,7 @@ impl GpuGraphInventory {
                 let fragments = if *storage == crate::dataflow::ValueStorage::Device {
                     let layout = value.gpu_inventory(&self.inventory.sources)?;
                     if layout.alternatives || layout.lazy {
-                        return Ok(None)
+                        return Ok(None);
                     }
                     let Some(fragments) = layout.fragments else { return Ok(None) };
                     fragments
@@ -1013,7 +1013,7 @@ impl GpuGraphInventory {
                 GpuMatrixPlacementInvocation::new(backend, &operation, descriptors)
                     .map_err(|error| GpuMeasurementError(error.to_string()))?
             else {
-                return Ok(None)
+                return Ok(None);
             };
             invocations.push(invocation);
             output_keys.push((output.modulus.to_string(), output.ring_dimension));
@@ -1194,7 +1194,7 @@ impl GpuGraphInventory {
                     }
 
                     if self.owners.contains_key(owner) {
-                        return
+                        return;
                     }
                     if node == Some(wire.node) &&
                         wire.port.0 == 0 &&
@@ -1684,10 +1684,7 @@ mod tests {
     use crate::dataflow::{ScopeAdmissionState, ValueStorage};
     use mxx_dsl::{DslContext, Family, Ring, parallel};
     use mxx_ir_core::{
-        artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
-        },
+        artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash},
         encoding,
         node::NodeKind,
         types::{ConcreteMatrixType, ConcreteWireType, Port},
@@ -1709,8 +1706,6 @@ mod tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix.clone()),
                         family_count: None,
-                        confidentiality: ArtifactConfidentiality::Public,
-                        content_hash: None,
                         layout: None,
                     },
                 ),
@@ -1719,17 +1714,13 @@ mod tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix.clone()),
                         family_count: None,
-                        confidentiality: ArtifactConfidentiality::Public,
-                        content_hash: None,
                         layout: None,
                     },
                 ),
             ]),
         };
-        let a =
-            ring.artifact_input(production.clone(), "a", (1, 20), ArtifactConfidentiality::Public);
-        let b =
-            ring.artifact_input(production.clone(), "b", (1, 20), ArtifactConfidentiality::Public);
+        let a = ring.artifact_input(production.clone(), "a", (1, 20));
+        let b = ring.artifact_input(production.clone(), "b", (1, 20));
         let graph = DslContext::new("lazy-artifact-input-retirement")
             .output("a_product", 2 * a)
             .unwrap()
@@ -1789,7 +1780,7 @@ mod tests {
         let spacer_product = spacer.clone() + spacer;
         let second = produced.clone() + spacer_product.clone();
         let graph = DslContext::new("streamed-non-input-matrix-reimport")
-            .private_output("produced", produced)
+            .artifact_output("produced", produced)
             .unwrap()
             .output("first", first)
             .unwrap()

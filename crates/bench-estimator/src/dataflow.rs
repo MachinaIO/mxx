@@ -492,7 +492,7 @@ pub(crate) fn estimate<B: MeasurementBackend>(
         primitives: None,
         missing_primitive: None,
     };
-    for output in graph.source.outputs().values().filter(|v| v.confidentiality.is_some()) {
+    for output in graph.source.outputs().values().filter(|v| v.artifact_output) {
         let mut scope = FrozenGraphScopeId::Root;
         let mut wire = output.value;
         let mut member = None;
@@ -541,7 +541,7 @@ pub(crate) fn estimate<B: MeasurementBackend>(
     }
     cost.primitives = analysis.primitives.take();
     for (output, value) in graph.source.outputs().values().zip(&mut outputs) {
-        if output.confidentiality.is_some() && matches!(value, ValueLayout::Family { .. }) {
+        if output.artifact_output && matches!(value, ValueLayout::Family { .. }) {
             value.store(&mut cost, true, &mut analysis.next_owner);
         }
     }
@@ -594,7 +594,7 @@ impl<B: MeasurementBackend> Analysis<'_, B> {
                     .source
                     .outputs()
                     .values()
-                    .any(|output| output.value == wire && output.confidentiality.is_some())
+                    .any(|output| output.value == wire && output.artifact_output)
             {
                 // Scalar exports are persisted eagerly and replaced by lazy artifacts.
                 // A subsequent use of this wire therefore reloads it, just as in runtime.
@@ -1113,7 +1113,7 @@ pub(crate) fn dispatch_graph() -> Result<ValidatedGraph, EstimateError> {
     let (graph, _) = Graph::freeze(
         "executor-dispatch-calibration",
         vec![],
-        BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+        BTreeMap::from([("value".into(), GraphOutput { value, artifact_output: false })]),
         vec![],
         vec![],
         BTreeMap::new(),
@@ -1328,7 +1328,7 @@ mod tests {
             ("view_b", public_view()),
         ])
         .into_iter()
-        .map(|(name, value)| (name.into(), GraphOutput { value, confidentiality: None }))
+        .map(|(name, value)| (name.into(), GraphOutput { value, artifact_output: false }))
         .collect();
         let (graph, _) =
             Graph::freeze("logical-aliases", vec![], outputs, vec![], vec![], BTreeMap::new())
@@ -1782,7 +1782,7 @@ mod tests {
         })
         .unwrap();
         let graph = DslContext::new("admission-before-materialization")
-            .public_output("input", input)
+            .artifact_output("input", input)
             .unwrap()
             .output("out", out)
             .unwrap()
@@ -1829,12 +1829,12 @@ mod tests {
             let context = DslContext::new("family-placement-boundary");
             let (context, family) = if descriptor {
                 let family = parallel(2, |_| Ok(ring.uniform_residue((1, 1)))).unwrap();
-                (context.public_output("family", family.clone()).unwrap(), family)
+                (context.artifact_output("family", family.clone()).unwrap(), family)
             } else {
                 let a = ring.uniform_residue((1, 1));
                 let b = ring.uniform_residue((1, 1));
                 let family = mxx_dsl::Family::pack(vec![a.clone(), b.clone()]).unwrap();
-                (context.public_output("a", a).unwrap().public_output("b", b).unwrap(), family)
+                (context.artifact_output("a", a).unwrap().artifact_output("b", b).unwrap(), family)
             };
             // A transformed index forces a whole-family Broadcast, not Zip.
             let output = parallel(5, |index| Ok(-family.at(index.rem(2)))).unwrap();
@@ -1860,7 +1860,7 @@ mod tests {
             let input = ring.identity(1);
             let output = parallel(count, |_| Ok(-input.clone())).unwrap();
             let graph = DslContext::new("artifact-broadcast-transfer")
-                .public_output("input", input)
+                .artifact_output("input", input)
                 .unwrap()
                 .output("out", output)
                 .unwrap()
@@ -1884,7 +1884,7 @@ mod tests {
         })
         .unwrap();
         let graph = DslContext::new("family-export")
-            .public_output("v", output)
+            .artifact_output("v", output)
             .unwrap()
             .build()
             .unwrap()
@@ -1901,7 +1901,7 @@ mod tests {
         let ring = Ring::new(257, 8);
         let value = ring.identity(1);
         let graph = DslContext::new("eager-export")
-            .public_output("exported", value.clone())
+            .artifact_output("exported", value.clone())
             .unwrap()
             .output("consumer", value.clone() + value)
             .unwrap()
@@ -1920,7 +1920,7 @@ mod tests {
         let ring = Ring::new(257, 8);
         let family = parallel(4, |_| Ok(ring.identity(1))).unwrap();
         let graph = DslContext::new("partial-export")
-            .public_output("v", family.at(2))
+            .artifact_output("v", family.at(2))
             .unwrap()
             .build()
             .unwrap()
@@ -1938,14 +1938,14 @@ mod tests {
         for export_other in [false, true] {
             let family = parallel(2, |_| Ok(ring.identity(1))).unwrap();
             let mut context = DslContext::new("duplicate-member-exports")
-                .public_output("first", family.at(0))
+                .artifact_output("first", family.at(0))
                 .unwrap()
-                .public_output("alias", family.at(0))
+                .artifact_output("alias", family.at(0))
                 .unwrap()
                 .output("consumer", family.at(1) + ring.identity(1))
                 .unwrap();
             if export_other {
-                context = context.public_output("other", family.at(1)).unwrap();
+                context = context.artifact_output("other", family.at(1)).unwrap();
             }
             let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
             let actual = counts(&graph);

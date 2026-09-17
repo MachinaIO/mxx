@@ -15,7 +15,7 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv,
-    artifact::{ArtifactConfidentiality, ArtifactType},
+    artifact::ArtifactType,
     encoding,
     node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
     types::{ConcreteMatrixType, ConcreteWireType},
@@ -3832,11 +3832,7 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
 
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         match kind {
-            NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.confidentiality == ArtifactConfidentiality::Private =>
-            {
-                0
-            }
+            NodeKind::Input { artifact: Some(_), .. } => 0,
             NodeKind::Input { .. } => self.persistent_storage_bytes_for_node(kind, wire_type),
             _ => 0,
         }
@@ -4779,18 +4775,11 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(matrix),
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
         };
-        let input = ring.artifact_input(
-            production.clone(),
-            "input",
-            (2, 3),
-            ArtifactConfidentiality::Private,
-        );
+        let input = ring.artifact_input(production.clone(), "input", (2, 3));
         let output = -input.clone() + input;
         let graph = mxx_dsl::DslContext::new("unknown-checkpoint-layout")
             .output("out", output)
@@ -4902,7 +4891,7 @@ mod tests {
             })
             .unwrap();
             let context = DslContext::new("normal-admitted-family")
-                .public_output("input", input.clone())
+                .artifact_output("input", input.clone())
                 .unwrap();
             let context =
                 if retain_parent { context.output("held", held).unwrap() } else { context };

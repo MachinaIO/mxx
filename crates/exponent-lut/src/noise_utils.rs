@@ -1,11 +1,14 @@
 //! Exact noise arithmetic shared by encoding schemes.
 //!
-//! These values have no implicit ciphertext coordinate units. In particular,
-//! BGG stores variance in doubled coordinates at its adapter boundary.
+//! These values have no implicit ciphertext coordinate units. Coordinate
+//! conventions belong to the scheme adapter that consumes them.
 use num_bigint::{BigInt, BigUint};
 use num_traits::{One, Zero};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use thiserror::Error;
+
+use crate::program::{FamilyRange, LutId, WireId};
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum NoiseArithmeticError {
@@ -44,6 +47,15 @@ impl NonnegativeRational {
     pub fn scaled(&self, gain: &BigUint) -> Self {
         Self::new(&self.numerator * gain, self.denominator.clone())
             .expect("positive variance denominator")
+    }
+
+    /// Scale this exact rational by a (possibly fractional) nonnegative
+    /// rational. Modulus-alignment transfers use this for the `1/alpha`
+    /// action; no floating-point approximation is involved.
+    pub fn scaled_ratio(&self, numerator: &BigUint, denominator: &BigUint) -> Self {
+        assert!(!denominator.is_zero(), "a rational scale cannot have zero denominator");
+        Self::new(&self.numerator * numerator, &self.denominator * denominator)
+            .expect("positive rational scale denominator")
     }
 
     /// Bound a heterogeneous sum without assuming independence. Zero-variance
@@ -226,6 +238,45 @@ mod covariance_tests {
             }
         }
     }
+
+    #[test]
+    fn discrete_rounding_keeps_even_ratio_bias_and_exact_variance() {
+        let odd = NoiseMoments::discrete_rounding_residue(&5u8.into()).unwrap();
+        assert_eq!(odd.mean_numerator, BigInt::zero());
+        assert_eq!(odd.variance, NonnegativeRational::new(2u8.into(), 25u8.into()).unwrap());
+
+        let even = NoiseMoments::discrete_rounding_residue(&4u8.into()).unwrap();
+        assert_eq!(even.mean_numerator, BigInt::one());
+        assert_eq!(even.mean_denominator, BigUint::from(8u8));
+        assert_eq!(even.variance, NonnegativeRational::new(5u8.into(), 64u8.into()).unwrap());
+        assert_eq!(
+            NoiseMoments::discrete_rounding_residue(&1u8.into()).unwrap().variance,
+            NonnegativeRational::zero()
+        );
+    }
+
+    #[test]
+    fn continuous_rounding_is_explicit_and_not_discrete_default() {
+        let continuous = NoiseMomentPolicy::Continuous.rounding_moments().unwrap();
+        let discrete =
+            NoiseMomentPolicy::Discrete { alpha: 4u8.into() }.rounding_moments().unwrap();
+        assert_eq!(continuous.variance, NonnegativeRational::new(1u8.into(), 12u8.into()).unwrap());
+        assert_ne!(continuous, discrete);
+    }
+
+    #[test]
+    fn second_moment_keeps_nonzero_mean_and_interval_radius() {
+        let moments = NoiseMoments {
+            mean_numerator: 1.into(),
+            mean_denominator: 2u8.into(),
+            mean_radius: NonnegativeRational::new(1u8.into(), 4u8.into()).unwrap(),
+            variance: NonnegativeRational::new(1u8.into(), 4u8.into()).unwrap(),
+        };
+        assert_eq!(
+            moments.second_moment_bound(),
+            NonnegativeRational::new(13u8.into(), 16u8.into()).unwrap()
+        );
+    }
 }
 
 /// Physical moment enclosure, conditional on the caller's stated distribution
@@ -241,6 +292,55 @@ pub struct NoiseMoments {
 }
 
 impl NoiseMoments {
+    /// Exact moments of the centered nearest-rounding residue for an integer
+    /// modulus ratio. The support is `-floor(alpha/2)..ceil(alpha/2)-1`, and
+    /// the residue is divided by `alpha`. Even ratios retain their real tie
+    /// bias (`1/(2*alpha)`) instead of silently using a continuous `1/12`
+    /// approximation.
+    pub fn discrete_rounding_residue(alpha: &BigUint) -> Result<Self, NoiseArithmeticError> {
+        if alpha.is_zero() {
+            return Err(NoiseArithmeticError::ZeroDenominator);
+        }
+        if *alpha == BigUint::one() {
+            return Ok(Self {
+                mean_numerator: BigInt::zero(),
+                mean_denominator: BigUint::one(),
+                mean_radius: NonnegativeRational::zero(),
+                variance: NonnegativeRational::zero(),
+            });
+        }
+        let alpha_squared = alpha.pow(2u32);
+        let variance =
+            NonnegativeRational::new(&alpha_squared - 1u8, BigUint::from(12u8) * &alpha_squared)
+                .expect("positive discrete rounding variance");
+        let (mean_numerator, mean_denominator) = if !alpha.bit(0) {
+            // The centered integer support has sum -alpha/2. The rounding
+            // residue is its negative divided by alpha.
+            (BigInt::one(), BigUint::from(2u8) * alpha)
+        } else {
+            (BigInt::zero(), BigUint::one())
+        };
+        Ok(Self {
+            mean_numerator,
+            mean_denominator,
+            mean_radius: NonnegativeRational::zero(),
+            variance,
+        })
+    }
+
+    /// Continuous centered-uniform approximation on `[-1/2, 1/2]`.
+    /// Callers must select this explicitly; integer modulus alignment uses
+    /// [`Self::discrete_rounding_residue`] when exact support is available.
+    pub fn continuous_rounding_residue() -> Self {
+        Self {
+            mean_numerator: BigInt::zero(),
+            mean_denominator: BigUint::one(),
+            mean_radius: NonnegativeRational::zero(),
+            variance: NonnegativeRational::new(1u8.into(), 12u8.into())
+                .expect("positive continuous rounding denominator"),
+        }
+    }
+
     /// Outward integer envelope for the caller's explicit tail model.
     pub fn tail_bound(&self, z_squared: &NonnegativeRational) -> BigUint {
         let bias = NonnegativeRational::new(
@@ -296,6 +396,22 @@ impl NoiseMoments {
             &z_squared.numerator * &self.variance.numerator * denominator.pow(2)
     }
 
+    /// Conservative centered-plus-bias second-moment enclosure. The stored
+    /// variance is centered; reporting only it would drop a nonzero mean or
+    /// interval radius from an MSE calculation.
+    pub fn second_moment_bound(&self) -> NonnegativeRational {
+        let bias = NonnegativeRational::new(
+            self.mean_numerator.magnitude().clone(),
+            self.mean_denominator.clone(),
+        )
+        .expect("positive mean denominator")
+        .add(&self.mean_radius);
+        let bias_squared =
+            NonnegativeRational::new(bias.numerator.pow(2u32), bias.denominator.pow(2u32))
+                .expect("positive bias denominator");
+        self.variance.add(&bias_squared)
+    }
+
     /// Enclose a linear image with a known row-l1 bound. The caller derives
     /// its centered variance transfer under the applicable coefficient model.
     /// A uniform scalar mean need not stay uniform after negacyclic wrapping;
@@ -319,8 +435,59 @@ impl NoiseMoments {
         }
     }
 
+    /// Apply a positive scalar exactly to this mean interval and supply the
+    /// centered variance of its linear image.
+    pub fn affine_scale(
+        &self,
+        factor: &NonnegativeRational,
+        variance: NonnegativeRational,
+    ) -> Self {
+        let mean_numerator = &self.mean_numerator * BigInt::from(factor.numerator.clone());
+        let mean_denominator = &self.mean_denominator * &factor.denominator;
+        let divisor = gcd(mean_numerator.magnitude(), &mean_denominator);
+        Self {
+            mean_numerator: mean_numerator / BigInt::from(divisor.clone()),
+            mean_denominator: mean_denominator / divisor,
+            mean_radius: self.mean_radius.scaled_ratio(&factor.numerator, &factor.denominator),
+            variance,
+        }
+    }
+
+    /// Negate this enclosed error, preserving its signed mean and centered
+    /// variance. The interval radius is unchanged.
+    pub fn negated(&self) -> Self {
+        Self {
+            mean_numerator: -&self.mean_numerator,
+            mean_denominator: self.mean_denominator.clone(),
+            mean_radius: self.mean_radius.clone(),
+            variance: self.variance.clone(),
+        }
+    }
+
+    /// Subtract moments while retaining the unknown/shared covariance bound.
+    pub fn subtract(&self, rhs: &Self) -> Self {
+        self.add(&rhs.negated())
+    }
+
     /// Sum mean intervals and retain unknown/shared-source covariance.
     pub fn add(&self, rhs: &Self) -> Self {
+        self.add_with_variance(rhs, self.variance.sum_variance_bound(&rhs.variance))
+    }
+
+    /// Add moments under an explicitly justified correlation classification.
+    /// Only `Independent` permits a linear variance sum; shared or unknown
+    /// sources retain the Cauchy covariance envelope.
+    pub fn add_with_covariance(&self, rhs: &Self, correlation: NoiseCorrelation) -> Self {
+        let variance = match correlation {
+            NoiseCorrelation::Independent => self.variance.add(&rhs.variance),
+            NoiseCorrelation::SharedSource | NoiseCorrelation::Unknown => {
+                self.variance.sum_variance_bound(&rhs.variance)
+            }
+        };
+        self.add_with_variance(rhs, variance)
+    }
+
+    fn add_with_variance(&self, rhs: &Self, variance: NonnegativeRational) -> Self {
         let numerator = &self.mean_numerator * BigInt::from(rhs.mean_denominator.clone()) +
             &rhs.mean_numerator * BigInt::from(self.mean_denominator.clone());
         let denominator = &self.mean_denominator * &rhs.mean_denominator;
@@ -329,7 +496,7 @@ impl NoiseMoments {
             mean_numerator: numerator / BigInt::from(divisor.clone()),
             mean_denominator: denominator / divisor,
             mean_radius: self.mean_radius.add(&rhs.mean_radius),
-            variance: self.variance.sum_variance_bound(&rhs.variance),
+            variance,
         }
     }
 
@@ -370,22 +537,114 @@ pub struct RightActionNoiseGain {
 }
 
 impl RightActionNoiseGain {
-    /// Convolution gains of distinct coefficients of an integer polynomial lift.
-    pub(crate) fn from_polynomial_coefficients(
-        coefficients: impl IntoIterator<Item = BigInt>,
-    ) -> Self {
-        let mut gain = Self { l1: BigUint::zero(), l2_squared: BigUint::zero() };
-        for coefficient in coefficients {
-            let magnitude = coefficient.magnitude();
-            gain.l1 += magnitude;
-            gain.l2_squared += magnitude * magnitude;
-        }
-        gain
-    }
-
     pub fn unit() -> Self {
         Self { l1: BigUint::one(), l2_squared: BigUint::one() }
     }
+}
+
+/// Distribution policy for a modulus-switch rounding residue.
+///
+/// The discrete policy is the default for an integer source/target ratio.
+/// Continuous rounding is retained as an explicit approximation for models
+/// that document that assumption; it is never selected by a missing value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum NoiseMomentPolicy {
+    /// Exact centered integer-residue law for the supplied ratio.
+    Discrete { alpha: BigUint },
+    /// Centered continuous-uniform approximation on `[-1/2, 1/2]`.
+    Continuous,
+}
+
+impl NoiseMomentPolicy {
+    /// Construct the exact or approximate rounding moments selected by this
+    /// policy. A zero discrete ratio is rejected rather than interpreted as a
+    /// noiseless conversion.
+    pub fn rounding_moments(&self) -> Result<NoiseMoments, NoiseArithmeticError> {
+        match self {
+            Self::Discrete { alpha } => NoiseMoments::discrete_rounding_residue(alpha),
+            Self::Continuous => Ok(NoiseMoments::continuous_rounding_residue()),
+        }
+    }
+}
+
+/// Named assumptions attached to an average-case transfer.
+///
+/// These labels are diagnostic only. The deterministic bound channel remains
+/// authoritative unless the caller's existing acceptance policy explicitly
+/// opts into the average model.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum NoiseHeuristicId {
+    /// State coefficient/error decorrelation.
+    H1StateUncorrelated,
+    /// Centered digit or residue approximation.
+    H2DigitUniform,
+    /// Independent setup randomness across flat branches.
+    H3BranchIndependence,
+    /// Fixed-RHS conditional independence.
+    H4RhsIndependence,
+    /// Distinct routed-label independence.
+    H5RouteIndependence,
+    /// Gaussian/subgaussian tail closure.
+    H6GaussianTail,
+    /// Exact under the selected Gaussian or discrete law.
+    ExactDistribution,
+    /// An unknown covariance was bounded, not set to zero.
+    UnknownCovarianceBound,
+}
+
+/// Deduplicated, serializable heuristic ledger for one transfer.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NoiseHeuristicLedger {
+    ids: Vec<NoiseHeuristicId>,
+}
+
+impl NoiseHeuristicLedger {
+    /// Create an empty ledger.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add a label once, preserving deterministic enum order in the result.
+    pub fn insert(&mut self, id: NoiseHeuristicId) {
+        if !self.ids.contains(&id) {
+            self.ids.push(id);
+            self.ids.sort_unstable();
+        }
+    }
+
+    /// Add several labels and return the updated ledger.
+    pub fn with(mut self, ids: impl IntoIterator<Item = NoiseHeuristicId>) -> Self {
+        for id in ids {
+            self.insert(id);
+        }
+        self
+    }
+
+    /// Return the deduplicated labels.
+    pub fn ids(&self) -> &[NoiseHeuristicId] {
+        &self.ids
+    }
+}
+
+/// Stable source and route identity carried by alignment/moment reports.
+/// Reusing a source on a different route does not make it independent.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct NoiseSourceProvenance {
+    /// Sampler/source identity.
+    pub source: [u8; 32],
+    /// Ordered route/site indices used to reach this term.
+    pub route: Vec<usize>,
+}
+
+/// Correlation classification for a pair of transfer terms.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum NoiseCorrelation {
+    /// Same sampled source or a known shared ancestor.
+    SharedSource,
+    /// Distinct samples with a declared independence assumption.
+    Independent,
+    /// No relationship was established; use a Cauchy bound.
+    Unknown,
 }
 
 fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
@@ -399,250 +658,54 @@ fn gcd(left: &BigUint, right: &BigUint) -> BigUint {
     left
 }
 
-use crate::program::{
-    ExponentLutProgram, ExponentProgramLowering, FamilyRange, LutId, ProgramBindings,
-    ProgramFamilyBindings, ProgramGateInstance, ProgramInputId, ProgramLowerError,
-    ProgramLoweringTypes, RhsFamilyId, RhsId, WireFamilyId, WireId,
-};
-use std::collections::BTreeMap;
-
-/// An index into one trace's flat dependency arena, never a sampler identity.
+/// An index into one trace's flat dependency arena.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoiseNodeId(pub usize);
 
-/// Program binding provenance. Distinct bindings do not imply independent
-/// noise: sampling contracts must establish that separately. Repeated uses of
-/// a binding retain the same node even when the backend clones its carrier.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// Program binding provenance used by symbolic noise traces.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum NoiseBinding {
-    Input(ProgramInputId),
-    Family(WireFamilyId),
-    Rhs(RhsId),
-    RhsFamily(RhsFamilyId),
+    Input(WireId),
+    RhsSite { gate: Option<WireId>, indices: Vec<mxx_ir_core::IntExpr> },
     Helper(LutId),
-    GateHelper(ProgramGateInstance),
+    GateHelper(WireId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NoiseDependencyNode {
     Binding(NoiseBinding),
     Add {
-        gate: ProgramGateInstance,
+        gate: Option<WireId>,
         lhs: NoiseNodeId,
         rhs: NoiseNodeId,
     },
     MulPublic {
-        gate: ProgramGateInstance,
+        gate: Option<WireId>,
         private: NoiseNodeId,
         public: NoiseNodeId,
     },
     MulPrivate {
-        gate: ProgramGateInstance,
+        gate: Option<WireId>,
         input: NoiseNodeId,
         rhs: NoiseNodeId,
         helper: Option<NoiseNodeId>,
     },
     Lut {
-        gate: ProgramGateInstance,
+        gate: Option<WireId>,
         table: LutId,
         input: NoiseNodeId,
         helper: Option<NoiseNodeId>,
     },
-    /// A symbolic family reduction preserves the active range and ancestors;
-    /// it does not assert independence between family indices.
     Reduction {
-        gate: ProgramGateInstance,
+        gate: Option<WireId>,
         input: NoiseNodeId,
         range: FamilyRange,
     },
 }
 
-/// Dependencies recorded during the actual noise interpreter traversal.
-/// Storage is proportional to bindings and static operations, not family
-/// capacity or coefficient count. Serialization stores the arena once.
-/// This graph supplies provenance for moment transfers; by itself it supplies
-/// neither per-sampler distributions nor covariance estimates.
+/// Dependencies recorded by a symbolic noise trace.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NoiseDependencyGraph {
     pub nodes: Vec<NoiseDependencyNode>,
     pub wires: BTreeMap<WireId, NoiseNodeId>,
-}
-
-#[derive(Clone)]
-struct Dependent<V> {
-    value: V,
-    node: NoiseNodeId,
-}
-
-struct DependencyEvaluator<E> {
-    inner: E,
-    graph: NoiseDependencyGraph,
-}
-
-impl<E> DependencyEvaluator<E> {
-    fn record<V>(&mut self, value: V, node: NoiseDependencyNode) -> Dependent<V> {
-        let id = NoiseNodeId(self.graph.nodes.len());
-        self.graph.nodes.push(node);
-        Dependent { value, node: id }
-    }
-
-    fn bind<V: Clone>(&mut self, value: &V, binding: NoiseBinding) -> Dependent<V> {
-        self.record(value.clone(), NoiseDependencyNode::Binding(binding))
-    }
-}
-
-impl<E: ExponentProgramLowering> ProgramLoweringTypes for DependencyEvaluator<E> {
-    type Wire = Dependent<E::Wire>;
-    type Rhs = Dependent<E::Rhs>;
-    type HelperSet = Dependent<E::HelperSet>;
-    type Error = E::Error;
-}
-
-impl<E: ExponentProgramLowering> ExponentProgramLowering for DependencyEvaluator<E> {
-    fn add(
-        &mut self,
-        lhs: &Self::Wire,
-        rhs: &Self::Wire,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error> {
-        let value = self.inner.add(&lhs.value, &rhs.value, gate)?;
-        Ok(self.record(value, NoiseDependencyNode::Add { gate, lhs: lhs.node, rhs: rhs.node }))
-    }
-    fn mul_public(
-        &mut self,
-        private: &Self::Wire,
-        public: &Self::Wire,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error> {
-        let value = self.inner.mul_public(&private.value, &public.value, gate)?;
-        Ok(self.record(
-            value,
-            NoiseDependencyNode::MulPublic { gate, private: private.node, public: public.node },
-        ))
-    }
-    fn mul_private(
-        &mut self,
-        input: &Self::Wire,
-        rhs: &Self::Rhs,
-        helper: Option<&Self::HelperSet>,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error> {
-        let value =
-            self.inner.mul_private(&input.value, &rhs.value, helper.map(|h| &h.value), gate)?;
-        Ok(self.record(
-            value,
-            NoiseDependencyNode::MulPrivate {
-                gate,
-                input: input.node,
-                rhs: rhs.node,
-                helper: helper.map(|h| h.node),
-            },
-        ))
-    }
-    fn lut(
-        &mut self,
-        program: &ExponentLutProgram,
-        table: LutId,
-        input: &Self::Wire,
-        helper: Option<&Self::HelperSet>,
-        gate: ProgramGateInstance,
-    ) -> Result<Self::Wire, Self::Error> {
-        let value = self.inner.lut(program, table, &input.value, helper.map(|h| &h.value), gate)?;
-        Ok(self.record(
-            value,
-            NoiseDependencyNode::Lut {
-                gate,
-                table,
-                input: input.node,
-                helper: helper.map(|h| h.node),
-            },
-        ))
-    }
-}
-
-pub(crate) fn trace_dependencies<E: ExponentProgramLowering>(
-    program: &ExponentLutProgram,
-    bindings: &ProgramBindings<E::Wire, E::Rhs, E::HelperSet>,
-    ranges: &ProgramFamilyBindings,
-    evaluator: E,
-    mut reduce: impl FnMut(
-        &mut E,
-        &E::Wire,
-        &FamilyRange,
-        ProgramGateInstance,
-    ) -> Result<E::Wire, E::Error>,
-) -> Result<(BTreeMap<WireId, E::Wire>, E, NoiseDependencyGraph), ProgramLowerError<E::Error>>
-where
-    E::HelperSet: Clone,
-{
-    let mut evaluator =
-        DependencyEvaluator { inner: evaluator, graph: NoiseDependencyGraph::default() };
-    let inputs: BTreeMap<_, _> = bindings
-        .inputs
-        .iter()
-        .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Input(*id))))
-        .collect();
-    let rhs: BTreeMap<_, _> = bindings
-        .rhs_scalars()
-        .map(|(id, v)| (id, evaluator.bind(v, NoiseBinding::Rhs(id))))
-        .collect();
-    let families: BTreeMap<_, _> = bindings
-        .wire_values
-        .iter()
-        .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Family(*id))))
-        .collect();
-    let rhs_families: BTreeMap<_, _> = bindings
-        .rhs_families()
-        .map(|(id, v)| (id, evaluator.bind(v, NoiseBinding::RhsFamily(id))))
-        .collect();
-    let helpers: BTreeMap<_, _> = bindings
-        .helpers
-        .iter()
-        .map(|(id, v)| (*id, evaluator.bind(v, NoiseBinding::Helper(*id))))
-        .collect();
-    let gate_helpers = bindings
-        .gate_helpers
-        .iter()
-        .map(|(id, value)| (*id, evaluator.bind(value, NoiseBinding::GateHelper(*id))))
-        .collect::<Vec<_>>();
-    let mut bindings = ProgramBindings::new();
-    for (id, value) in inputs {
-        bindings = bindings.input(id, value);
-    }
-    for (id, value) in rhs {
-        bindings = bindings.rhs(id, value);
-    }
-    for (id, value) in rhs_families {
-        bindings = bindings.rhs_family(id, value);
-    }
-    for (id, value) in families {
-        bindings = bindings.wire_family(id, value);
-    }
-    for (id, value) in helpers {
-        bindings = bindings.helper(id, value);
-    }
-    for (id, value) in gate_helpers {
-        bindings = bindings.gate_helper(id, value);
-    }
-    let wires = crate::program::lower_program(
-        program,
-        &bindings,
-        ranges,
-        &mut evaluator,
-        |evaluator, input, range, gate| {
-            let value = reduce(&mut evaluator.inner, &input.value, range, gate)?;
-            Ok(evaluator.record(
-                value,
-                NoiseDependencyNode::Reduction { gate, input: input.node, range: range.clone() },
-            ))
-        },
-    )?;
-    let wires = wires
-        .into_iter()
-        .map(|(id, value)| {
-            evaluator.graph.wires.insert(id, value.node);
-            (id, value.value)
-        })
-        .collect();
-    Ok((wires, evaluator.inner, evaluator.graph))
 }

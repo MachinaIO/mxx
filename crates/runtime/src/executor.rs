@@ -10,8 +10,8 @@ use crate::{
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{
-        ArtifactConfidentiality, ArtifactType, ConcreteBoundedMatrixSchema, ManifestArtifact,
-        ProductionId, SmallMatrixSemanticKind,
+        ArtifactType, ConcreteBoundedMatrixSchema, ManifestArtifact, ProductionId,
+        SmallMatrixSemanticKind,
     },
     expr::euclidean_div_rem,
     graph::{FrozenGraphScopeId, GraphScope},
@@ -1313,16 +1313,19 @@ where
         root_exports: {
             let mut exports = BTreeMap::<_, Vec<_>>::new();
             for (name, output) in validated.source.outputs() {
-                if let Some(confidentiality) = output.confidentiality {
-                    exports.entry(output.value).or_default().push((name.clone(), confidentiality));
+                if !output.artifact_output {
+                    continue;
                 }
+                exports.entry(output.value).or_default().push(name.clone());
             }
             exports
         },
         member_exports: {
             let mut exports = BTreeMap::<WireId, BTreeMap<usize, Vec<_>>>::new();
             for (name, output) in validated.source.outputs() {
-                let Some(confidentiality) = output.confidentiality else { continue };
+                if !output.artifact_output {
+                    continue;
+                }
                 let mut scope = validated.source.root_scope();
                 let mut wire = output.value;
                 let mut path = Vec::new();
@@ -1355,7 +1358,7 @@ where
                                     .or_default()
                                     .entry(index)
                                     .or_default()
-                                    .push((name.clone(), confidentiality));
+                                    .push(name.clone());
                             }
                             break;
                         }
@@ -1454,8 +1457,8 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     production: ProductionId,
     scratch_production: Option<ProductionId>,
     staged_families: BTreeMap<(ProductionId, String), (ManifestArtifact, Arc<()>)>,
-    root_exports: BTreeMap<WireRef, Vec<(String, ArtifactConfidentiality)>>,
-    member_exports: BTreeMap<WireId, BTreeMap<usize, Vec<(String, ArtifactConfidentiality)>>>,
+    root_exports: BTreeMap<WireRef, Vec<String>>,
+    member_exports: BTreeMap<WireId, BTreeMap<usize, Vec<String>>>,
     streamed_exports: BTreeMap<String, (ArtifactHandle, ManifestArtifact)>,
     preimage_progress: Option<PreimageProgress>,
     executed_node_count: usize,
@@ -2439,13 +2442,25 @@ where
             return Ok(())
         };
         let declarations = self.root_exports[&wire].clone();
-        if declarations.iter().all(|(name, _)| self.streamed_exports.contains_key(name)) {
+        if declarations.iter().all(|name| self.streamed_exports.contains_key(name)) {
             return Ok(())
         }
         let value = self.materialize(values, wire)?;
         let replacement = self.store_scalar_exports(&value, &artifact_type, declarations)?;
-        if let Some(previous) = values.insert(wire, replacement) {
-            self.retire_value(previous)?;
+        // An ordinary output alias owns the eager graph value returned to the
+        // caller.  Keep that resident value in the wire map while persisting
+        // artifact aliases; otherwise replacing it here would turn both
+        // aliases into a lazy artifact and retire the caller-owned value.
+        let has_ordinary_alias = self
+            .validated
+            .source
+            .outputs()
+            .values()
+            .any(|output| !output.artifact_output && output.value == wire);
+        if !has_ordinary_alias {
+            if let Some(previous) = values.insert(wire, replacement) {
+                self.retire_value(previous)?;
+            }
         }
         Ok(())
     }
@@ -2454,14 +2469,13 @@ where
         &mut self,
         value: &RuntimeValue<B>,
         artifact_type: &ArtifactType,
-        declarations: Vec<(String, ArtifactConfidentiality)>,
+        declarations: Vec<String>,
     ) -> Result<RuntimeValue<B>, ExecutionError> {
-        let (payload, bytes) = encode_artifact(self.backend, value, artifact_type)?;
-        let hash = Sha256::digest(&bytes).into();
+        let payload = encode_artifact(self.backend, value, artifact_type)?.0;
         let mut replacement = None;
         let count = declarations.len();
         let mut payload = Some(payload);
-        for (index, (name, confidentiality)) in declarations.into_iter().enumerate() {
+        for (index, name) in declarations.into_iter().enumerate() {
             let handle = ArtifactHandle {
                 key: ArtifactKey {
                     production: self.production.clone(),
@@ -2469,14 +2483,12 @@ where
                     index: None,
                 },
                 artifact_type: artifact_type.clone(),
-                confidentiality,
                 layout: None,
             };
             self.artifact_store
                 .store(
                     handle.key.clone(),
                     artifact_type,
-                    confidentiality,
                     None,
                     if index + 1 == count {
                         payload.take().expect("last payload owner")
@@ -2485,12 +2497,18 @@ where
                     },
                 )
                 .map_err(Self::artifact_error)?;
+            // Named session artifacts become durable as soon as their payload
+            // is stored.  This ordering is required before the caller can
+            // retire the resident value (or a later family wave can advance);
+            // execution finalization still publishes the manifest only after
+            // the complete graph has run.
+            if self.session.is_some() {
+                self.artifact_store.commit_artifact(&handle).map_err(Self::artifact_error)?;
+            }
             let descriptor = ManifestArtifact {
                 artifact_type: artifact_type.clone(),
-                confidentiality,
                 family_count: None,
                 layout: None,
-                content_hash: (confidentiality == ArtifactConfidentiality::Public).then_some(hash),
             };
             replacement.get_or_insert_with(|| RuntimeValue::LazyArtifact {
                 production: self.production.clone(),
@@ -2524,13 +2542,10 @@ where
         let mut handles = BTreeMap::<String, Vec<ArtifactHandle>>::new();
         let mut staged_replacements = Vec::new();
         for (name, output_root) in self.validated.source.outputs() {
-            let Some(confidentiality) = output_root.confidentiality else {
+            if !output_root.artifact_output {
                 continue;
-            };
+            }
             if let Some((handle, descriptor)) = self.streamed_exports.get(name) {
-                if self.session.is_some() {
-                    self.artifact_store.commit_artifact(handle).map_err(Self::artifact_error)?;
-                }
                 handles.entry(name.clone()).or_default().push(handle.clone());
                 artifacts.insert(
                     name.clone(),
@@ -2538,13 +2553,11 @@ where
                         wire: WireId { instantiation_path: Vec::new(), wire: output_root.value },
                         artifact_type: descriptor.artifact_type.clone(),
                         family_count: None,
-                        confidentiality,
-                        content_hash: descriptor.content_hash,
                         layout: None,
                     },
                 );
                 // One scalar wire may have several exported names (and even
-                // different confidentiality declarations). Its live graph value
+                // different artifact-output declarations). Its live graph value
                 // uses one lazy alias, but each returned named output must refer
                 // to its own finalized artifact and descriptor. No resident
                 // value is discarded without retirement: a later consumer may
@@ -2618,14 +2631,8 @@ where
                                 index: Some(index),
                             },
                             artifact_type: artifact_type.clone(),
-                            confidentiality,
                             layout: None,
                         };
-                        if self.session.is_some() {
-                            self.artifact_store
-                                .commit_artifact(&handle)
-                                .map_err(Self::artifact_error)?;
-                        }
                         handles.entry(name.clone()).or_default().push(handle);
                     }
                     artifacts.insert(
@@ -2634,14 +2641,11 @@ where
                             wire,
                             artifact_type,
                             family_count,
-                            confidentiality,
-                            content_hash: descriptor.content_hash,
                             layout: None,
                         },
                     );
                     continue;
                 }
-                let mut family_hasher = Sha256::new();
                 for index in 0..count {
                     let staged_key = ArtifactKey {
                         production: staged_production.clone(),
@@ -2652,10 +2656,6 @@ where
                         .artifact_store
                         .load_staged(&staged_key, descriptor)
                         .map_err(Self::artifact_error)?;
-                    let bytes = crate::artifact::payload_bytes(&payload);
-                    family_hasher.update((index as u64).to_le_bytes());
-                    family_hasher.update((bytes.len() as u64).to_le_bytes());
-                    family_hasher.update(&bytes);
                     let handle = ArtifactHandle {
                         key: ArtifactKey {
                             production: production.clone(),
@@ -2663,14 +2663,12 @@ where
                             index: Some(index),
                         },
                         artifact_type: artifact_type.clone(),
-                        confidentiality,
                         layout: None,
                     };
                     self.artifact_store
                         .store(
                             handle.key.clone(),
                             &artifact_type,
-                            confidentiality,
                             handle.layout.as_deref(),
                             payload,
                         )
@@ -2688,8 +2686,6 @@ where
                         wire,
                         artifact_type,
                         family_count,
-                        confidentiality,
-                        content_hash: Some(family_hasher.finalize().into()),
                         layout: None,
                     },
                 );
@@ -2710,13 +2706,9 @@ where
                         "output {name} family count does not match validated metadata"
                     )));
                 }
-                let mut family_hasher = Sha256::new();
                 for (index, member) in members.iter().enumerate() {
                     let member = self.materialize_value(member.clone())?;
-                    let (payload, bytes) = encode_artifact(self.backend, &member, &artifact_type)?;
-                    family_hasher.update((index as u64).to_le_bytes());
-                    family_hasher.update((bytes.len() as u64).to_le_bytes());
-                    family_hasher.update(&bytes);
+                    let payload = encode_artifact(self.backend, &member, &artifact_type)?.0;
                     let handle = ArtifactHandle {
                         key: ArtifactKey {
                             production: production.clone(),
@@ -2724,14 +2716,12 @@ where
                             index: Some(index),
                         },
                         artifact_type: artifact_type.clone(),
-                        confidentiality,
                         layout: None,
                     };
                     self.artifact_store
                         .store(
                             handle.key.clone(),
                             &artifact_type,
-                            confidentiality,
                             handle.layout.as_deref(),
                             payload,
                         )
@@ -2749,15 +2739,12 @@ where
                         wire,
                         artifact_type,
                         family_count,
-                        confidentiality,
-                        content_hash: Some(family_hasher.finalize().into()),
                         layout: None,
                     },
                 );
                 continue;
             }
-            let (payload, bytes) = encode_artifact(self.backend, output, &artifact_type)?;
-            let content_hash = Sha256::digest(&bytes).into();
+            let payload = encode_artifact(self.backend, output, &artifact_type)?.0;
             let handle = ArtifactHandle {
                 key: ArtifactKey {
                     production: production.clone(),
@@ -2765,17 +2752,10 @@ where
                     index: None,
                 },
                 artifact_type: artifact_type.clone(),
-                confidentiality,
                 layout: None,
             };
             self.artifact_store
-                .store(
-                    handle.key.clone(),
-                    &artifact_type,
-                    confidentiality,
-                    handle.layout.as_deref(),
-                    payload,
-                )
+                .store(handle.key.clone(), &artifact_type, handle.layout.as_deref(), payload)
                 .map_err(Self::artifact_error)?;
             if self.session.is_some() {
                 self.artifact_store.commit_artifact(&handle).map_err(Self::artifact_error)?;
@@ -2787,8 +2767,6 @@ where
                     wire,
                     artifact_type,
                     family_count: None,
-                    confidentiality,
-                    content_hash: Some(content_hash),
                     layout: None,
                 },
             );
@@ -2894,20 +2872,16 @@ where
         // Root families declared as exports are written directly under their
         // final artifact identity. The manifest is published only after execution.
         if path.is_empty() {
-            if let Some((name, output)) =
-                self.validated.source.outputs().iter().find(|(_, output)| {
-                    output.value == wire_id.wire && output.confidentiality.is_some()
-                })
+            if let Some((name, _output)) = self
+                .validated
+                .source
+                .outputs()
+                .iter()
+                .find(|(_, output)| output.artifact_output && output.value == wire_id.wire)
             {
                 return Ok(Some((
                     name.clone(),
-                    ManifestArtifact {
-                        artifact_type,
-                        family_count: Some(count),
-                        confidentiality: output.confidentiality.expect("export confidentiality"),
-                        content_hash: None,
-                        layout: None,
-                    },
+                    ManifestArtifact { artifact_type, family_count: Some(count), layout: None },
                 )));
             }
         }
@@ -2926,8 +2900,6 @@ where
         let descriptor = ManifestArtifact {
             artifact_type,
             family_count: Some(count),
-            confidentiality: ArtifactConfidentiality::Private,
-            content_hash: None,
             layout: Some(crate::artifact::STAGED_FAMILY_LAYOUT.to_owned()),
         };
         // Scratch identity is private to streamed families. Ordinary resident
@@ -4297,15 +4269,6 @@ where
                             .cloned()
                     })
                     .collect::<Vec<_>>();
-                let mut export_hashers = staged
-                    .iter()
-                    .map(|entry| {
-                        entry
-                            .as_ref()
-                            .filter(|(_, descriptor)| descriptor.layout.is_none())
-                            .map(|_| Sha256::new())
-                    })
-                    .collect::<Vec<_>>();
                 let mut families =
                     staged
                         .iter()
@@ -4433,17 +4396,14 @@ where
                                     // while the containing wave still owns its
                                     // import and serialization capacity.
                                     let value = self.materialize_value(value)?;
-                                    let (payload, bytes) = encode_artifact(
+                                    let payload = encode_artifact(
                                         self.backend,
                                         &value,
                                         &descriptor.artifact_type,
-                                    )?;
-                                    if let Some(hasher) = &mut export_hashers[port] {
-                                        hasher.update(((wave_start + offset) as u64).to_le_bytes());
-                                        hasher.update((bytes.len() as u64).to_le_bytes());
-                                        hasher.update(&bytes);
-                                    }
-                                    let production = if descriptor.layout.is_none() {
+                                    )?
+                                    .0;
+                                    let persistent = descriptor.layout.is_none();
+                                    let production = if persistent {
                                         self.production.clone()
                                     } else {
                                         self.scratch_production
@@ -4453,19 +4413,33 @@ where
                                             )
                                             .clone()
                                     };
+                                    let key = ArtifactKey {
+                                        production,
+                                        name: name.clone(),
+                                        index: Some(wave_start + offset),
+                                    };
                                     self.artifact_store
                                         .store(
-                                            ArtifactKey {
-                                                production,
-                                                name: name.clone(),
-                                                index: Some(wave_start + offset),
-                                            },
+                                            key.clone(),
                                             &descriptor.artifact_type,
-                                            descriptor.confidentiality,
                                             descriptor.layout.as_deref(),
                                             payload,
                                         )
                                         .map_err(Self::artifact_error)?;
+                                    // Direct named family exports are persistent
+                                    // session artifacts.  Scratch/staged families
+                                    // deliberately remain uncommitted until they
+                                    // are either removed or copied into a named
+                                    // persistent output during finalization.
+                                    if persistent && self.session.is_some() {
+                                        self.artifact_store
+                                            .commit_artifact(&ArtifactHandle {
+                                                key,
+                                                artifact_type: descriptor.artifact_type.clone(),
+                                                layout: descriptor.layout.clone(),
+                                            })
+                                            .map_err(Self::artifact_error)?;
+                                    }
                                 } else {
                                     let value = if let Some(declarations) = member_exports[port]
                                         .as_ref()
@@ -4525,11 +4499,7 @@ where
                     for (port, family) in families.into_iter().enumerate() {
                         let value = match &staged[port] {
                             Some((name, descriptor)) => {
-                                let mut descriptor = descriptor.clone();
                                 let direct = descriptor.layout.is_none();
-                                if let Some(hasher) = export_hashers[port].take() {
-                                    descriptor.content_hash = Some(hasher.finalize().into());
-                                }
                                 RuntimeValue::StagedArtifactFamily {
                                     lifetime: if direct {
                                         Arc::new(())
@@ -4550,7 +4520,7 @@ where
                                             .clone()
                                     },
                                     name: name.clone(),
-                                    descriptor,
+                                    descriptor: descriptor.clone(),
                                 }
                             }
                             None => RuntimeValue::IndexedFamily(family),
@@ -6823,7 +6793,7 @@ mod tests {
     use mxx_dsl::{DslContext, Family, HashTag, Int, MatType, Ring, Subgraph, iterate, parallel};
     use mxx_ir_core::{
         Graph, GraphOutput, IntExpr, NodeHandle, RealExpr, ValueHandle, WireType,
-        artifact::{ArtifactConfidentiality, Manifest},
+        artifact::Manifest,
         node::{IntBinaryOp, IntCompareOp, NodeKind, RealBinaryOp},
     };
     use mxx_primitives::{
@@ -6836,7 +6806,11 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
 
     #[test]
     fn wave_admission_staging_is_per_output_port() {
@@ -6930,7 +6904,7 @@ mod tests {
         // Produce one scalar integer artifact to broadcast into the loop.
         let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
         let producer = DslContext::new("lazy-broadcast-producer")
-            .public_output("bias", Int::constant(7))
+            .artifact_output("bias", Int::constant(7))
             .expect("bias output")
             .build()
             .expect("build")
@@ -6956,9 +6930,7 @@ mod tests {
         // so it must not reload the artifact.
         let context = DslContext::new("lazy-broadcast-admission");
         let values = context.int_family_input("values", 3);
-        let bias = IntType
-            .artifact_input(production.clone(), "bias", ArtifactConfidentiality::Public)
-            .expect("bias artifact input");
+        let bias = IntType.artifact_input(production.clone(), "bias").expect("bias artifact input");
         let sums = parallel(3, |index| {
             Ok(values.at(index.clone()).add(values.at(index)).add(bias.clone()))
         })
@@ -7113,7 +7085,7 @@ mod tests {
         );
 
         let producer = DslContext::new("broadcast-capture-producer")
-            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .artifact_output("matrix", ring.input("matrix", (1, 3)))
             .expect("matrix output")
             .build()
             .expect("build")
@@ -7131,12 +7103,7 @@ mod tests {
         let production = produced.production_id.clone().expect("artifact production");
         let manifest = producer_store.manifest(&production).expect("manifest").clone();
 
-        let input = ring.artifact_input(
-            production.clone(),
-            "matrix",
-            (1, 3),
-            ArtifactConfidentiality::Public,
-        );
+        let input = ring.artifact_input(production.clone(), "matrix", (1, 3));
         let negated = parallel(3, |_| Ok(-input.clone())).expect("broadcast body");
         let built = DslContext::new("broadcast-capture-consumer")
             .output("negated", negated)
@@ -7199,7 +7166,7 @@ mod tests {
             (1u8..=3).map(|value| DCRTPoly::from_biguints(&parameters, &[value.into()])).collect(),
         );
         let producer = DslContext::new("subgraph-capture-producer")
-            .public_output("matrix", ring.input("matrix", (1, 3)))
+            .artifact_output("matrix", ring.input("matrix", (1, 3)))
             .expect("matrix output")
             .build()
             .expect("build")
@@ -7219,12 +7186,7 @@ mod tests {
         let ty = MatType(ring.matrix_type((1, 3)));
         let negate = Subgraph::define("negate-single-argument", ty, |value: Mat| Ok(-value))
             .expect("subgraph definition");
-        let input = ring.artifact_input(
-            production.clone(),
-            "matrix",
-            (1, 3),
-            ArtifactConfidentiality::Public,
-        );
+        let input = ring.artifact_input(production.clone(), "matrix", (1, 3));
         let called = negate.call(input).expect("subgraph call");
         let built = DslContext::new("subgraph-capture-consumer")
             .output("negated", called)
@@ -7938,6 +7900,15 @@ mod tests {
         active_admission: Option<Arc<AtomicUsize>>,
         active_at_load: Vec<usize>,
         active_at_store: Vec<usize>,
+        publication_events: Rc<RefCell<Vec<PublicationEvent>>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub(super) enum PublicationEvent {
+        Store(ArtifactKey),
+        Commit(ArtifactKey),
+        Remove(ArtifactKey),
+        Finalize(ProductionId),
     }
 
     impl LoadObservingStore {
@@ -7957,6 +7928,10 @@ mod tests {
 
         pub(super) fn load_count(&self, key: &ArtifactKey) -> usize {
             self.inner.load_count(key)
+        }
+
+        pub(super) fn publication_events(&self) -> Vec<PublicationEvent> {
+            self.publication_events.borrow().clone()
         }
     }
 
@@ -7983,14 +7958,14 @@ mod tests {
             &mut self,
             key: ArtifactKey,
             artifact_type: &ArtifactType,
-            confidentiality: ArtifactConfidentiality,
             layout: Option<&str>,
             payload: ArtifactPayload,
         ) -> Result<(), Self::Error> {
             if let Some(active) = &self.active_admission {
                 self.active_at_store.push(active.load(Ordering::SeqCst));
             }
-            self.inner.store(key, artifact_type, confidentiality, layout, payload)
+            self.publication_events.borrow_mut().push(PublicationEvent::Store(key.clone()));
+            self.inner.store(key, artifact_type, layout, payload)
         }
 
         fn load_staged(
@@ -8003,6 +7978,7 @@ mod tests {
         }
 
         fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+            self.publication_events.borrow_mut().push(PublicationEvent::Remove(key.clone()));
             self.inner.remove_staged(key)
         }
 
@@ -8012,6 +7988,13 @@ mod tests {
     }
 
     impl SessionStore for LoadObservingStore {
+        fn load_finalized_manifest(
+            &mut self,
+            production: &ProductionId,
+        ) -> Result<Manifest, Self::Error> {
+            self.inner.load_finalized_manifest(production)
+        }
+
         fn resolve_session_nonce(
             &mut self,
             descriptor: &SessionAliasDescriptor,
@@ -8047,10 +8030,14 @@ mod tests {
         }
 
         fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+            self.publication_events.borrow_mut().push(PublicationEvent::Commit(handle.key.clone()));
             self.inner.commit_artifact(handle)
         }
 
         fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+            self.publication_events
+                .borrow_mut()
+                .push(PublicationEvent::Finalize(manifest.production_id.clone()));
             self.inner.finalize_session(manifest)
         }
     }
@@ -8909,13 +8896,13 @@ mod tests {
         .call(())
         .unwrap();
         let graph = DslContext::new("direct-family-export")
-            .public_output("values", family)
+            .artifact_output("values", family)
             .unwrap()
-            .public_output("nested-0", nested.at(0))
+            .artifact_output("nested-0", nested.at(0))
             .unwrap()
-            .private_output("nested-1", nested.at(1))
+            .artifact_output("nested-1", nested.at(1))
             .unwrap()
-            .public_output("nested-2", nested.at(2))
+            .artifact_output("nested-2", nested.at(2))
             .unwrap()
             .build()
             .unwrap()
@@ -8939,6 +8926,178 @@ mod tests {
             store.load(&handle.key, &manifest.artifacts[&handle.key.name]).unwrap();
         }
         result.materialize_output("values", &mut backend, &mut store).unwrap();
+    }
+
+    #[test]
+    fn session_family_commits_each_wave_before_the_next_wave_and_finalization() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 8);
+        let family =
+            parallel(3, |index| Ok(index.lift_to_constant_polynomial(ring.matrix_type((1, 1)))))
+                .expect("family");
+        let graph = DslContext::new("session-family-publication-order")
+            .artifact_output("values", family)
+            .expect("family output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut store = LoadObservingStore::default();
+        let mut backend = cpu_backend([parameters]);
+        execute_in_session_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            [0x61; 32],
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("session execution");
+
+        let events = store.publication_events();
+        let family_events = events
+            .iter()
+            .filter_map(|event| match event {
+                PublicationEvent::Store(key) | PublicationEvent::Commit(key)
+                    if key.name == "values" =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(family_events.len(), 6, "each persistent member stores and commits once");
+        for pair in family_events.chunks_exact(2) {
+            let PublicationEvent::Store(store_key) = pair[0] else { panic!("store first") };
+            let PublicationEvent::Commit(commit_key) = pair[1] else { panic!("commit second") };
+            assert_eq!(store_key, commit_key);
+        }
+        let finalize = events
+            .iter()
+            .position(|event| matches!(event, PublicationEvent::Finalize(_)))
+            .expect("finalization event");
+        let last_commit = events
+            .iter()
+            .rposition(
+                |event| matches!(event, PublicationEvent::Commit(key) if key.name == "values"),
+            )
+            .expect("family commit");
+        assert!(last_commit < finalize, "manifest finalization remains last");
+        assert!(
+            events[finalize + 1..].iter().all(
+                |event| !matches!(event, PublicationEvent::Commit(key) if key.name == "values")
+            )
+        );
+    }
+
+    #[test]
+    fn session_scalar_commits_before_replacing_the_resident_export() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let ring = Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), 8);
+        let graph = DslContext::new("session-scalar-publication-order")
+            .artifact_output("value", ring.gaussian((1, 1), 3, 19))
+            .expect("scalar output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut store = LoadObservingStore::default();
+        execute_in_session(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            [0x60; 32],
+        )
+        .expect("session execution");
+
+        let events = store.publication_events();
+        let value_events = events
+            .iter()
+            .filter_map(|event| match event {
+                PublicationEvent::Store(key) | PublicationEvent::Commit(key)
+                    if key.name == "value" =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(value_events.len(), 2, "scalar payload has one store and one commit");
+        assert!(matches!(value_events[0], PublicationEvent::Store(_)));
+        assert!(matches!(value_events[1], PublicationEvent::Commit(_)));
+        let finalize = events
+            .iter()
+            .position(|event| matches!(event, PublicationEvent::Finalize(_)))
+            .expect("finalization event");
+        let commit = events
+            .iter()
+            .position(|event| matches!(event, PublicationEvent::Commit(key) if key.name == "value"))
+            .expect("scalar commit");
+        assert!(commit < finalize);
+    }
+
+    #[test]
+    fn session_scratch_family_members_are_stored_without_commit() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8);
+        let source = ring.small_matrix_input_family("source", 2, (1, 1), 1);
+        let produced = parallel(2, |index| Ok(source.at(index))).expect("produced family");
+        let graph = DslContext::new("session-scratch-publication-order")
+            .artifact_output("selected", produced.at(0))
+            .expect("selected output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let compact =
+            CpuSmallMatrix::new(DCRTPolyMatrix::identity(&parameters, 1, None), 1u8.into())
+                .expect("compact source");
+        let inputs = BTreeMap::from([(
+            "source".to_owned(),
+            RuntimeValue::IndexedFamily(vec![
+                RuntimeValue::small_matrix(compact.clone()),
+                RuntimeValue::small_matrix(compact),
+            ]),
+        )]);
+        let mut store = LoadObservingStore::default();
+        let mut backend = cpu_backend([parameters]);
+        execute_in_session_with_config(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            [0x62; 32],
+            ExecutionConfig {
+                max_parallel_instances: NonZeroUsize::new(1).expect("nonzero"),
+                ..ExecutionConfig::default()
+            },
+        )
+        .expect("session execution");
+
+        let events = store.publication_events();
+        let scratch_keys = events
+            .iter()
+            .filter_map(|event| match event {
+                PublicationEvent::Store(key) if key.name.starts_with("runtime-staged-") => {
+                    Some(key.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!scratch_keys.is_empty(), "the unexported family member uses scratch staging");
+        for key in scratch_keys {
+            assert!(!events.iter().any(|event| {
+                matches!(event, PublicationEvent::Commit(committed) if committed == &key)
+            }));
+            assert!(events.iter().any(|event| {
+                matches!(event, PublicationEvent::Remove(removed) if removed == &key)
+            }));
+        }
     }
 
     #[test]
@@ -9080,7 +9239,7 @@ mod tests {
             )
             .output(0)
             .unwrap();
-            (name.to_owned(), GraphOutput { value, confidentiality: None })
+            (name.to_owned(), GraphOutput { artifact_output: false, value })
         })
         .collect();
         let graph =
@@ -9163,7 +9322,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (index.to_string(), GraphOutput { value: sample, confidentiality: None })
+                (index.to_string(), GraphOutput { artifact_output: false, value: sample })
             })
             .collect();
         let graph = Graph::freeze("hash-framing", vec![], outputs, vec![], vec![], BTreeMap::new())
@@ -9315,7 +9474,7 @@ mod tests {
             .mul_small_rhs(gadget)
             .reduce_modulus(BigInt::from(low.modulus().as_ref().clone()));
         let graph = DslContext::new("bounded-digit-extension")
-            .private_output("digits", bounded)
+            .artifact_output("digits", bounded)
             .unwrap()
             .output("product", product)
             .unwrap()
@@ -9347,7 +9506,7 @@ mod tests {
         let lhs = ring.input("lhs", (1, 1));
         let rhs = ring.small_matrix_input("rhs", (1, 1), 1);
         let validated = DslContext::new("runtime-generic-small-rhs-input")
-            .private_output("rhs", rhs.clone())
+            .artifact_output("rhs", rhs.clone())
             .expect("small RHS output")
             .output("product", lhs.mul_small_rhs(rhs))
             .expect("product output")
@@ -9375,13 +9534,7 @@ mod tests {
 
         let production = result.production_id.expect("artifact production");
         let manifest = store.manifest(&production).expect("manifest").clone();
-        let imported = ring.small_matrix_artifact_input(
-            production.clone(),
-            "rhs",
-            (1, 1),
-            1,
-            ArtifactConfidentiality::Private,
-        );
+        let imported = ring.small_matrix_artifact_input(production.clone(), "rhs", (1, 1), 1);
         let imported_graph = DslContext::new("runtime-imported-generic-small-rhs")
             .output("product", ring.identity(1).mul_small_rhs(imported))
             .expect("imported product")
@@ -9490,11 +9643,11 @@ mod tests {
             .sample_preimage(dynamic_target.clone(), (digit_count + 2, 1))
             .mul_small_rhs(dynamic_public.clone());
         let validated = DslContext::new("runtime-trapdoor-family")
-            .public_output("public", trapdoors.public_matrices())
+            .artifact_output("public", trapdoors.public_matrices())
             .expect("public family output")
-            .public_output("public-swapped", swapped_public)
+            .artifact_output("public-swapped", swapped_public)
             .expect("swapped public family output")
-            .private_trapdoor_family_output("trapdoors", trapdoors)
+            .artifact_output("trapdoors", trapdoors)
             .expect("private trapdoor family output")
             .output("product-0", products.at(0))
             .expect("first product")
@@ -9544,7 +9697,10 @@ mod tests {
 
         assert_eq!(result.artifact_handles["public"].len(), 2);
         assert_eq!(result.artifact_handles["public-swapped"].len(), 2);
-        assert_eq!(result.artifact_handles["trapdoors"].len(), 2);
+        // Trapdoor is a two-field graph value. The neutral artifact API
+        // exports its public and secret family fields under flattened names;
+        // the secret family is the artifact consumed by trapdoor imports.
+        assert_eq!(result.artifact_handles["trapdoors.1"].len(), 2);
         assert_eq!(matrix_output(&result, "product-0"), matrix_output(&result, "target-0"));
         assert_eq!(matrix_output(&result, "product-1"), matrix_output(&result, "target-1"));
         assert_eq!(
@@ -9571,17 +9727,12 @@ mod tests {
 
         let production = result.production_id.expect("artifact production");
         let manifest = store.manifest(&production).expect("artifact manifest").clone();
-        assert_eq!(manifest.artifacts["public"].confidentiality, ArtifactConfidentiality::Public);
-        assert!(manifest.artifacts["public"].content_hash.is_some());
-        assert_eq!(
-            manifest.artifacts["trapdoors"].confidentiality,
-            ArtifactConfidentiality::Private
-        );
-        assert!(manifest.artifacts["trapdoors"].content_hash.is_none());
+        assert_eq!(manifest.artifacts["public"].family_count, Some(2));
+        assert_eq!(manifest.artifacts["trapdoors.1"].family_count, Some(2));
         let imported = ring.trapdoor_family_artifact_input(
             production.clone(),
             "public",
-            "trapdoors",
+            "trapdoors.1",
             2,
             1,
             5,
@@ -9640,7 +9791,7 @@ mod tests {
         let mismatched = ring.trapdoor_family_artifact_input(
             production.clone(),
             "public-swapped",
-            "trapdoors",
+            "trapdoors.1",
             2,
             1,
             5,
@@ -10292,7 +10443,7 @@ mod tests {
         let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let sampled = DslContext::new("runtime-resumable-sample")
-            .private_output("sample", ring.gaussian((1, 1), 3, 19))
+            .artifact_output("sample", ring.gaussian((1, 1), 3, 19))
             .expect("private sample")
             .build()
             .expect("build")
@@ -10324,7 +10475,7 @@ mod tests {
 
         let input = ring.input("input", (1, 1));
         let input_graph = DslContext::new("runtime-session-input-identity")
-            .private_output("output", input)
+            .artifact_output("output", input)
             .expect("private output")
             .build()
             .expect("build")
@@ -10362,6 +10513,39 @@ mod tests {
     }
 
     #[test]
+    fn mixed_resident_and_artifact_aliases_preserve_the_plain_value() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let sample = ring.gaussian((1, 1), 3, 19);
+        let graph = DslContext::new("mixed-resident-artifact-aliases")
+            .output("plain", sample.clone())
+            .expect("plain output")
+            .artifact_output("saved", sample)
+            .expect("artifact output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .expect("execution");
+
+        let plain = matrix_output(&result, "plain").clone();
+        assert!(matches!(result.outputs["saved"], RuntimeValue::LazyArtifact { .. }));
+        let production = result.production_id.clone().expect("artifact production");
+        let saved_key = ArtifactKey { production, name: "saved".to_owned(), index: None };
+        let saved =
+            result.materialize_output("saved", &mut backend, &mut store).expect("saved artifact");
+        let RuntimeValue::Matrix(saved) = saved else { panic!("saved output is not a matrix") };
+        assert_eq!(saved.as_ref(), &plain, "persisted alias must equal resident alias");
+        assert_eq!(store.load_count(&saved_key), 1, "saved alias loads lazily once");
+        assert_eq!(matrix_output(&result, "plain"), &plain, "plain alias remains usable");
+    }
+
+    #[test]
     fn exported_integer_remains_available_to_downstream_arithmetic() {
         let integer = BigInt::from(rand::random::<i64>());
         let value =
@@ -10377,11 +10561,8 @@ mod tests {
             "exported-integer-consumer",
             Vec::new(),
             BTreeMap::from([
-                (
-                    "value".to_owned(),
-                    GraphOutput { value, confidentiality: Some(ArtifactConfidentiality::Public) },
-                ),
-                ("successor".to_owned(), GraphOutput { value: successor, confidentiality: None }),
+                ("value".to_owned(), GraphOutput { artifact_output: false, value }),
+                ("successor".to_owned(), GraphOutput { artifact_output: false, value: successor }),
             ]),
             Vec::new(),
             Vec::new(),
@@ -10455,11 +10636,11 @@ mod tests {
             "runtime-scalar-contracts",
             Vec::new(),
             BTreeMap::from([
-                ("quotient".to_owned(), GraphOutput { value: quotient, confidentiality: None }),
-                ("remainder".to_owned(), GraphOutput { value: remainder, confidentiality: None }),
-                ("less".to_owned(), GraphOutput { value: less, confidentiality: None }),
-                ("sqrt".to_owned(), GraphOutput { value: square_root, confidentiality: None }),
-                ("product".to_owned(), GraphOutput { value: real_product, confidentiality: None }),
+                ("quotient".to_owned(), GraphOutput { artifact_output: false, value: quotient }),
+                ("remainder".to_owned(), GraphOutput { artifact_output: false, value: remainder }),
+                ("less".to_owned(), GraphOutput { artifact_output: false, value: less }),
+                ("sqrt".to_owned(), GraphOutput { artifact_output: false, value: square_root }),
+                ("product".to_owned(), GraphOutput { artifact_output: false, value: real_product }),
             ]),
             Vec::new(),
             Vec::new(),
@@ -10506,14 +10687,8 @@ mod tests {
             "failed-eager-export",
             Vec::new(),
             BTreeMap::from([
-                (
-                    "exported".into(),
-                    GraphOutput {
-                        value: one,
-                        confidentiality: Some(ArtifactConfidentiality::Public),
-                    },
-                ),
-                ("failure".into(), GraphOutput { value: quotient, confidentiality: None }),
+                ("exported".into(), GraphOutput { artifact_output: true, value: one }),
+                ("failure".into(), GraphOutput { artifact_output: true, value: quotient }),
             ]),
             Vec::new(),
             Vec::new(),
@@ -10571,7 +10746,7 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { value: quotient, confidentiality: None },
+                GraphOutput { artifact_output: false, value: quotient },
             )]),
             Vec::new(),
             Vec::new(),

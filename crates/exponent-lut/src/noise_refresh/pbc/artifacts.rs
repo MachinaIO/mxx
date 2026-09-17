@@ -2,15 +2,15 @@
 //!
 //! This module owns public artifact names and transport; backends supply binding metadata.
 //! Names bind layout/key identities and canonical active order only;
-//! manifests bind production, type, family shape, confidentiality, and
-//! content hash before a family handle crosses into evaluation. Selector bits
-//! and sampled packages remain runtime/key-provider data, never public names.
+//! manifests bind production, type, family shape, and layout before a family
+//! handle crosses into evaluation. Selector bits and sampled packages remain
+//! runtime/key-provider data, never public names.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use mxx_ir_core::{
     ParamEnv,
-    artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId},
+    artifact::{ArtifactType, Manifest, ProductionId},
     node::ConstantMatrix,
     types::ConcreteMatrixType,
 };
@@ -91,11 +91,19 @@ impl<M> PbcSelectorFamilyMetadata<M> {
         key_instance_id: [u8; 32],
         count: usize,
     ) -> Result<(), PbcError> {
-        // Construction fixes canonical order; the layout digest binds that order.
-        // Metadata is not deserialized or mutated after construction.
+        // Construction fixes canonical order; the layout digest alone is not
+        // sufficient here because callers may deserialize a metadata value
+        // before importing it.  Recompute the order from the trusted layout
+        // and reject a forged list even when its length is unchanged.
+        let expected_order = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)?
+            .iter()
+            .map(|(bucket, slot, _)| PbcLocation { bucket, slot })
+            .collect::<Vec<_>>();
         if self.layout_id != layout.layout_id ||
             self.key_instance_id != key_instance_id ||
-            self.family_shape != [count]
+            self.family_shape != [count] ||
+            self.canonical_order != expected_order ||
+            self.canonical_order.len() != count
         {
             return Err(PbcError::ArtifactIdentityMismatch);
         }
@@ -236,7 +244,7 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
             return Err(PbcError::ArtifactIdentityMismatch);
         }
         context
-            .public_output(selector_family_artifact_name(self, role), families)
+            .artifact_output(selector_family_artifact_name(self, role), families)
             .map_err(|_| PbcError::ArtifactIdentityMismatch)
     }
 
@@ -261,25 +269,15 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
             &name,
             ArtifactType::Matrix(self.family_metadata.element_type.clone()),
             self.package_count,
-            ArtifactConfidentiality::Public,
-            true,
+            None,
         )?;
-        let descriptor = manifest.artifacts.get(&name).ok_or(PbcError::ArtifactIdentityMismatch)?;
-        if descriptor.artifact_type !=
-            ArtifactType::Matrix(self.family_metadata.element_type.clone())
-        {
-            return Err(PbcError::ArtifactIdentityMismatch);
-        }
-        if descriptor.layout.is_some() {
-            return Err(PbcError::ArtifactIdentityMismatch);
-        }
         Ok(())
     }
 
-    /// Imports the fixed selector family for the backend-declared role.  Import is fail-closed for
-    /// the production identity, semantic IR version, artifact names, family
-    /// shape, ordering, and public confidentiality.  It does not inspect
-    /// hidden selector plaintexts.
+    /// Imports the fixed selector family for the backend-declared role. Import
+    /// is fail-closed for the production identity, semantic IR version,
+    /// artifact names, family shape, ordering, type, and layout. It does not
+    /// inspect hidden selector plaintexts.
     pub fn import(
         production_id: ProductionId,
         layout: &PbcPublicLayout,
@@ -318,18 +316,8 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
             &family_name,
             ArtifactType::Matrix(expected_metadata.element_type.clone()),
             names.selector_packages.len(),
-            ArtifactConfidentiality::Public,
-            true,
+            None,
         )?;
-        let descriptor =
-            manifest.artifacts.get(&family_name).ok_or(PbcError::ArtifactIdentityMismatch)?;
-        if descriptor.layout.is_some() {
-            return Err(PbcError::ArtifactIdentityMismatch);
-        }
-        if descriptor.artifact_type != ArtifactType::Matrix(expected_metadata.element_type.clone())
-        {
-            return Err(PbcError::ArtifactIdentityMismatch);
-        }
         Ok(Self {
             production_id: Some(production_id),
             layout_id: layout.layout_id,
@@ -341,12 +329,6 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
         })
     }
 
-    pub(crate) fn package_count(&self) -> usize {
-        self.package_count
-    }
-    pub(crate) fn production_id(&self) -> Option<&ProductionId> {
-        self.production_id.as_ref()
-    }
     pub(crate) fn key_instance_id(&self) -> [u8; 32] {
         self.key_instance_id
     }
@@ -356,23 +338,6 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
     pub(crate) fn metadata_digest(&self) -> [u8; 32] {
         metadata_digest(&self.family_metadata)
     }
-    pub(crate) fn validated_manifest(&self) -> Option<&Manifest> {
-        self.manifest.as_ref()
-    }
-
-    /// Revalidates the family provenance expected by an importing compiler.
-    /// The check completes before the compiler can expose an artifact-backed
-    /// `Family<Mat>` to lowering; selector plaintexts are intentionally not
-    /// examined under the trusted key-provider model.
-    pub(crate) fn validate_family_binding(
-        &self,
-        expected: &PbcSelectorFamilyMetadata<M>,
-    ) -> Result<(), PbcError> {
-        if self.family_metadata != *expected || self.manifest.is_none() {
-            return Err(PbcError::ArtifactIdentityMismatch);
-        }
-        Ok(())
-    }
 }
 
 pub(crate) fn require_family_descriptor(
@@ -380,17 +345,14 @@ pub(crate) fn require_family_descriptor(
     name: &str,
     expected_type: ArtifactType,
     expected_count: usize,
-    confidentiality: ArtifactConfidentiality,
-    require_content_hash: bool,
+    expected_layout: Option<&str>,
 ) -> Result<(), PbcError> {
     let Some(descriptor) = manifest.artifacts.get(name) else {
         return Err(PbcError::ArtifactIdentityMismatch);
     };
     if descriptor.artifact_type != expected_type ||
         descriptor.family_count != Some(expected_count) ||
-        descriptor.confidentiality != confidentiality ||
-        (require_content_hash && descriptor.content_hash.is_none()) ||
-        (!require_content_hash && descriptor.content_hash.is_some())
+        descriptor.layout.as_deref() != expected_layout
     {
         return Err(PbcError::ArtifactIdentityMismatch);
     }
@@ -428,13 +390,16 @@ pub fn canonical_component_name(
     slot: usize,
 ) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"mxx-exponent-lut/pbc/fixed-rhs/v1");
+    // Selector packages are structural family members, not pre-combined RHS
+    // values. Keep the existing version namespace so persisted artifact
+    // identities remain stable across this implementation cleanup.
+    hasher.update(b"mxx-exponent-lut/pbc/selector-package/v1");
     hasher.update(layout_id.0);
     hasher.update(key_instance_id);
     hasher.update((bucket as u64).to_le_bytes());
     hasher.update((slot as u64).to_le_bytes());
     let digest = hasher.finalize();
-    let mut name = String::from("pbc-fixed-rhs-");
+    let mut name = String::from("pbc-selector-package-");
     for byte in digest {
         name.push_str(&format!("{byte:02x}"));
     }
@@ -464,6 +429,8 @@ pub struct PbcTrustedSelectorBits {
 /// request is assembled, never as one DSL node per active selector.
 #[derive(Clone, Debug)]
 pub struct PbcSelectorRuntimeBinding {
+    layout_id: PbcLayoutId,
+    key_instance_id: [u8; 32],
     input_name: String,
     matrix_type: ConcreteMatrixType,
     bits: Vec<u8>,
@@ -610,6 +577,8 @@ impl PbcTrustedSelectorBits {
 
     pub fn runtime_binding(&self, ring: &Ring) -> Result<PbcSelectorRuntimeBinding, PbcError> {
         Ok(PbcSelectorRuntimeBinding {
+            layout_id: self.layout_id,
+            key_instance_id: self.key_instance_id,
             input_name: self.input_name.clone(),
             matrix_type: concrete_matrix_type(ring, (1, 1))?,
             bits: self.runtime_bits.clone(),
@@ -618,6 +587,22 @@ impl PbcTrustedSelectorBits {
 }
 
 impl PbcSelectorRuntimeBinding {
+    /// Canonical runtime family input name.
+    pub fn input_name(&self) -> &str {
+        &self.input_name
+    }
+
+    /// Public shape identity of the selector family.  The binding has no
+    /// access to selector plaintexts or the private support schedule.
+    pub fn layout_id(&self) -> PbcLayoutId {
+        self.layout_id
+    }
+
+    /// Key-provider namespace used to keep selector families distinct.
+    pub fn key_instance_id(&self) -> [u8; 32] {
+        self.key_instance_id
+    }
+
     pub(crate) fn materialize_members<T: Clone, E>(
         &self,
         mut materialize_constant: impl FnMut(u8) -> Result<T, E>,

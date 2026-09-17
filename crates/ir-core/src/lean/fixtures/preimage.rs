@@ -127,9 +127,9 @@ fn render(selected: Geometry) -> String {
         format!("stage-a-consumption-{}", selected.name),
         Vec::<CompileParameter>::new(),
         BTreeMap::from([
-            ("c".into(), GraphOutput { value: consumed, confidentiality: None }),
-            ("k".into(), GraphOutput { value: preimage, confidentiality: None }),
-            ("target".into(), GraphOutput { value: target, confidentiality: None }),
+            ("c".into(), GraphOutput { artifact_output: false, value: consumed }),
+            ("k".into(), GraphOutput { artifact_output: false, value: preimage }),
+            ("target".into(), GraphOutput { artifact_output: false, value: target }),
         ]),
         vec![],
         vec![],

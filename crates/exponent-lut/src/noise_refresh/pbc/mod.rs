@@ -15,8 +15,8 @@
 pub(crate) mod artifacts;
 mod schedule;
 
-use mxx_dsl::{DslContext, Family, Mat, Ring};
-use mxx_ir_core::artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId};
+use mxx_dsl::{Family, Mat, Ring};
+use mxx_ir_core::artifact::{ArtifactType, Manifest, ProductionId};
 use thiserror::Error;
 
 /// Semantic version of the serialized public layout schema.
@@ -130,10 +130,9 @@ pub use artifacts::{
     canonical_component_name, public_family_artifact_name, selector_bit_family_name,
     selector_family_artifact_name, selector_family_artifact_name_from_names,
 };
-pub(crate) use schedule::generate_key_layout_from_layout_seed;
 pub use schedule::{
-    PbcGeneratedKeyLayout, PbcPrivateSchedule, canonical_decode, clear_pbc_inner_product,
-    dense_binary_support, generate_key_layout, support_from_dense,
+    BinaryTransformMatrix, PbcGeneratedKeyLayout, PbcPrivateSchedule, canonical_decode,
+    clear_pbc_inner_product, dense_binary_support, generate_key_layout, support_from_dense,
 };
 
 #[cfg(test)]
@@ -198,6 +197,41 @@ mod tests {
         ] {
             assert!(parameters.validate().is_err());
         }
+    }
+
+    #[test]
+    fn balanced_product_schedule_handles_identity_singleton_and_odd_levels() {
+        let empty = BalancedProductSchedule::new(0).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.level_count(), 0);
+        assert!(empty.children(1, 0).is_none());
+
+        let singleton = BalancedProductSchedule::new(1).unwrap();
+        assert_eq!(singleton.level_count(), 1);
+        assert_eq!(singleton.level_width(0), Some(1));
+        assert!(singleton.children(1, 0).is_none());
+
+        let odd = BalancedProductSchedule::new(5).unwrap();
+        assert_eq!(odd.level_count(), 4);
+        assert_eq!(odd.level_width(0), Some(5));
+        assert_eq!(odd.level_width(1), Some(3));
+        assert_eq!(odd.level_width(2), Some(2));
+        assert_eq!(odd.level_width(3), Some(1));
+        assert_eq!(odd.children(1, 0), Some((0, Some(1))));
+        assert_eq!(odd.children(1, 2), Some((4, None)));
+        assert_eq!(odd.children(2, 1), Some((2, None)));
+        assert!(odd.children(4, 0).is_none());
+        assert!(odd.validate().is_ok());
+    }
+
+    #[test]
+    fn balanced_product_schedule_rejects_noncanonical_serialized_levels() {
+        let mut schedule = BalancedProductSchedule::new(3).unwrap();
+        schedule.level_widths[1] = 3;
+        assert!(schedule.validate().is_err());
+        let encoded = serde_json::json!({"leaf_count": 3, "level_widths": [3, 3, 1]});
+        let decoded = serde_json::from_value::<BalancedProductSchedule>(encoded).unwrap();
+        assert!(decoded.validate().is_err());
     }
 
     #[test]
@@ -540,6 +574,16 @@ mod tests {
             derive_lwr_vector(PbcLayoutId([9; 32]), b"label-a", 7, 17).unwrap()
         );
         assert!(a.values.iter().flatten().all(|&value| value < 17));
+        assert_ne!(a.identity(), b.identity());
+        let a_binding = PbcPublicVectorFamilyBinding::from_encoded(&layout, &a).unwrap();
+        let b_binding = PbcPublicVectorFamilyBinding::from_encoded(&layout, &b).unwrap();
+        assert_ne!(a_binding.identity(), b_binding.identity());
+        // Selector/setup names are D0-independent, while encrypt-stage
+        // public-factor names are content-bound to the supplied D0.
+        let selector_a = PbcSelectorArtifactNames::canonicalize_schema(&layout, [3; 32]).unwrap();
+        let selector_b = PbcSelectorArtifactNames::canonicalize_schema(&layout, [3; 32]).unwrap();
+        assert_eq!(selector_a, selector_b);
+        assert_ne!(public_family_artifact_name(&a, "d0"), public_family_artifact_name(&b, "d0"));
     }
 
     #[test]
@@ -706,7 +750,7 @@ mod tests {
         assert_eq!(materialization_count.get(), 2);
         assert_eq!(oracle_members, trusted.runtime_bits());
         let graph = DslContext::new("trusted-selector-runtime-binding")
-            .private_output("bits", trusted.family().clone())
+            .artifact_output("bits", trusted.family().clone())
             .unwrap()
             .build()
             .unwrap()
@@ -1278,6 +1322,52 @@ impl PbcPublicLayout {
         Ok(())
     }
 
+    /// Commits the public `T_l` label-transform order together with the
+    /// balanced product shape used to lower it.  The matrices themselves are
+    /// runtime public-family material and are intentionally not copied into
+    /// setup metadata; the layout identity commits their canonical cell and
+    /// replica order.
+    pub fn label_transform_commitment(
+        &self,
+        schedule: &BalancedProductSchedule,
+    ) -> Result<[u8; 32], PbcError> {
+        self.validate()?;
+        schedule.validate()?;
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/sparse-lwr/t-l-commitment/v1");
+        digest.update(self.layout_id.0);
+        digest.update(serde_json::to_vec(schedule).map_err(|_| {
+            PbcError::InvalidLayout("balanced product schedule is not serializable".into())
+        })?);
+        Ok(digest.finalize().into())
+    }
+
+    /// Commits caller-supplied preprocessing transforms together with their
+    /// balanced product shape.  This is the identity used when a setup uses
+    /// nontrivial binary `T_l` matrices instead of the canonical one-hot PBC
+    /// projections.
+    pub fn label_transform_commitment_with_matrices(
+        &self,
+        schedule: &BalancedProductSchedule,
+        transforms: &[BinaryTransformMatrix],
+    ) -> Result<[u8; 32], PbcError> {
+        self.validate()?;
+        schedule.validate()?;
+        if transforms.is_empty() {
+            return Err(PbcError::InvalidLayout("label transform schedule is empty".into()));
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/sparse-lwr/t-l-matrices/v1");
+        digest.update(self.layout_id.0);
+        digest.update(serde_json::to_vec(schedule).map_err(|_| {
+            PbcError::InvalidLayout("balanced product schedule is not serializable".into())
+        })?);
+        for transform in transforms {
+            digest.update(transform.commitment());
+        }
+        Ok(digest.finalize().into())
+    }
+
     fn compute_id(&self) -> Result<PbcLayoutId, PbcError> {
         let mut encoding = Vec::new();
         encoding.extend(u64::from(self.semantic_version).to_le_bytes());
@@ -1314,6 +1404,97 @@ pub struct PbcActiveCellIndex {
     entries: Vec<(usize, usize, usize)>,
     /// Half-open entry ranges for each bucket, with one final total offset.
     bucket_offsets: Vec<usize>,
+}
+
+/// Shape of a balanced product reduction.
+///
+/// This is deliberately only a compact description of the reduction shape;
+/// it does not contain one node (or one host value) per member.  Evaluators
+/// use the widths and [`Self::children`] while lowering their one structural
+/// family body.  In particular, an odd level carries its final singleton to
+/// the next level instead of multiplying it by an identity value.  An empty
+/// product is represented by a zero-leaf schedule and is handled by the
+/// evaluator's identity wire.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BalancedProductSchedule {
+    leaf_count: usize,
+    level_widths: Vec<usize>,
+}
+
+impl BalancedProductSchedule {
+    /// Builds a schedule in `O(log(leaf_count))` host work.
+    pub fn new(leaf_count: usize) -> Result<Self, PbcError> {
+        let mut level_widths = Vec::new();
+        let mut width = leaf_count;
+        while width != 0 {
+            level_widths.push(width);
+            if width == 1 {
+                break;
+            }
+            width = width.div_ceil(2);
+        }
+        // Keep the public representation canonical even if this type is later
+        // constructed from a deserialized manifest.
+        if leaf_count != 0 && level_widths.last() != Some(&1) {
+            return Err(PbcError::InvalidLayout("balanced product root is missing".into()));
+        }
+        Ok(Self { leaf_count, level_widths })
+    }
+
+    /// Number of leaves in the input product. Zero denotes the identity.
+    pub const fn leaf_count(&self) -> usize {
+        self.leaf_count
+    }
+
+    /// Returns true when the product is the empty identity product.
+    pub const fn is_empty(&self) -> bool {
+        self.leaf_count == 0
+    }
+
+    /// Returns the number of reduction levels, including the leaf level.
+    pub fn level_count(&self) -> usize {
+        self.level_widths.len()
+    }
+
+    /// Returns the number of values present at `level` (`0` is the leaf
+    /// level). An out-of-range level is rejected instead of silently creating
+    /// a malformed family range.
+    pub fn level_width(&self, level: usize) -> Option<usize> {
+        self.level_widths.get(level).copied()
+    }
+
+    /// Returns the input positions consumed by one parent at `level`.
+    ///
+    /// `level` names the parent level, so `level == 1` consumes leaves. The
+    /// right child is `None` for a carried singleton. A singleton schedule
+    /// has no parent level and therefore returns `None`.
+    pub fn children(&self, level: usize, parent: usize) -> Option<(usize, Option<usize>)> {
+        let parent_width = *self.level_widths.get(level)?;
+        if level == 0 || parent >= parent_width {
+            return None;
+        }
+        let child_width = self.level_widths[level - 1];
+        let left = parent.checked_mul(2)?;
+        if left >= child_width {
+            return None;
+        }
+        let right = (left + 1 < child_width).then_some(left + 1);
+        Some((left, right))
+    }
+
+    /// Returns the canonical leaf count for a serialized schedule.
+    ///
+    /// This check is intentionally strict: stage identities must not accept a
+    /// hand-edited level vector that changes singleton reuse or tree depth.
+    pub fn validate(&self) -> Result<(), PbcError> {
+        let expected = Self::new(self.leaf_count)?;
+        if self.level_widths != expected.level_widths {
+            return Err(PbcError::InvalidLayout(
+                "balanced product schedule levels are not canonical".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl PbcActiveCellIndex {
@@ -1888,6 +2069,15 @@ pub struct PbcEncodedPublicVector {
 }
 
 impl PbcEncodedPublicVector {
+    /// Stable content identity for the encryptor-supplied public vector.
+    ///
+    /// The layout and modulus are part of the identity, so two encryptions
+    /// under one setup may use different `D0` values without colliding, while
+    /// setup artifacts (which do not contain this value) remain reusable.
+    pub fn identity(&self) -> [u8; 32] {
+        artifacts::public_vector_id(self)
+    }
+
     /// Routes a `u64` vector through real cells and zeroes dummy/padding cells.
     pub fn route(
         layout: &PbcPublicLayout,
@@ -2010,7 +2200,7 @@ impl PbcEncodedPublicVector {
 /// monomial factor `X^a` consumed by the native selector binding; the declared `(1, 1)` describes
 /// the matrix shape only, not a scalar-output encoding. This is a declaration
 /// and runtime-binding boundary: [`Self::input_family`] and
-/// [`Self::artifact_input_family`] create one structural family input, while
+/// [`Self::artifact_input_family`] creates one structural family input, while
 /// [`Self::values_u64`] supplies its host residue values. They do not pack one
 /// DSL node per cell.
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2026,6 +2216,21 @@ pub struct PbcPublicVectorFamilyBinding {
 }
 
 impl PbcPublicVectorFamilyBinding {
+    /// Stable identity of the routed family payload and its public schema.
+    /// This identity is intentionally distinct from the setup/layout ID and
+    /// must be included in encrypt-stage artifact descriptors.
+    pub fn identity(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/pbc/public-family-binding/v1");
+        digest.update(self.layout_id.0);
+        digest.update((self.modulus as u64).to_le_bytes());
+        digest.update((self.family_count as u64).to_le_bytes());
+        for value in &self.values {
+            digest.update(value.to_le_bytes());
+        }
+        digest.finalize().into()
+    }
+
     /// Creates a binding from an already routed public vector.
     ///
     /// The resulting flat order is the active-cell order shared by PBC
@@ -2059,6 +2264,21 @@ impl PbcPublicVectorFamilyBinding {
         Ok(binding)
     }
 
+    /// Creates an encryptor-supplied D0 family with an explicit transform
+    /// column count. D0 is not the routed PBC cell family: its cardinality is
+    /// `r = v * log2(Q_exp)` and must match the frozen PRF profile.
+    pub fn from_d0_values(
+        layout: &PbcPublicLayout,
+        values: Vec<u64>,
+        modulus: usize,
+        expected_count: usize,
+    ) -> Result<Self, PbcError> {
+        let binding =
+            Self { layout_id: layout.layout_id, modulus, family_count: values.len(), values };
+        binding.validate_d0(layout, expected_count)?;
+        Ok(binding)
+    }
+
     /// Validates layout identity, modulus, count, and value bounds.
     ///
     /// Call this after importing serialized binding metadata and before using
@@ -2074,6 +2294,24 @@ impl PbcPublicVectorFamilyBinding {
             .checked_mul(layout.parameters.hash_count)
             .and_then(|real| real.checked_add(layout.parameters.bucket_count))
             .ok_or(PbcError::SizeOverflow)?;
+        self.validate_count_and_values(expected_count)?;
+        Ok(())
+    }
+
+    /// Validates a D0 family against the exact transform column count.
+    pub fn validate_d0(
+        &self,
+        layout: &PbcPublicLayout,
+        expected_count: usize,
+    ) -> Result<(), PbcError> {
+        layout.validate()?;
+        if self.layout_id != layout.layout_id {
+            return Err(PbcError::LayoutIdentityMismatch);
+        }
+        self.validate_count_and_values(expected_count)
+    }
+
+    fn validate_count_and_values(&self, expected_count: usize) -> Result<(), PbcError> {
         if self.modulus == 0 ||
             self.family_count != expected_count ||
             self.values.len() != self.family_count
@@ -2125,15 +2363,8 @@ impl PbcPublicVectorFamilyBinding {
         ring: &Ring,
         production_id: ProductionId,
         artifact_name: impl Into<String>,
-        confidentiality: ArtifactConfidentiality,
     ) -> Family<Mat> {
-        ring.family_artifact_input(
-            production_id,
-            artifact_name,
-            self.family_count,
-            (1, 1),
-            confidentiality,
-        )
+        ring.family_artifact_input(production_id, artifact_name, self.family_count, (1, 1))
     }
 }
 
@@ -2188,6 +2419,8 @@ pub fn derive_lwr_vector(
 
 #[cfg(test)]
 pub(crate) mod routing_tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::noise_refresh::pbc::{PbcActiveCellIndex, PbcLayoutSeed, PbcParameters};
 
@@ -2249,8 +2482,61 @@ pub(crate) mod routing_tests {
             PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
         let ring = Ring::new(257, 8);
         let family: Family<Mat> = binding.input_family(&ring, "pbc-values");
-        assert_eq!(binding.family_count, PbcActiveCellIndex::build(&layout).unwrap().len());
-        let _ = family;
+        let active_count = PbcActiveCellIndex::build(&layout).unwrap().len();
+        assert_eq!(binding.family_count, active_count);
+        assert_eq!(family.count(), &mxx_ir_core::IntExpr::constant(active_count));
+    }
+
+    #[test]
+    fn neutral_scalar_and_family_artifact_inputs_remain_lazy_and_typed() {
+        use mxx_dsl::DslContext;
+        use mxx_ir_core::artifact::{Manifest, ManifestArtifact, SpecHash};
+
+        let layout = layout_with_padding();
+        let vector = PbcEncodedPublicVector::route_usize(&layout, &[11, 22, 33, 44], 17)
+            .expect("route toy vector");
+        let binding =
+            PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
+        let ring = Ring::new(257, 8);
+        let production = ProductionId { spec_hash: SpecHash([31; 32]), execution_nonce: [32; 32] };
+        let scalar = ring.artifact_input(production.clone(), "pbc-scalar", (1, 1));
+        let family = binding.artifact_input_family(&ring, production.clone(), "pbc-family");
+        let graph = DslContext::new("pbc-neutral-artifact-inputs")
+            .artifact_output("scalar", scalar)
+            .unwrap()
+            .artifact_output("family", family)
+            .unwrap()
+            .build()
+            .unwrap();
+        let matrix_type = artifacts::concrete_matrix_type(&ring, (1, 1)).unwrap();
+        let manifest = Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([
+                (
+                    "pbc-scalar".into(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix_type.clone()),
+                        family_count: None,
+                        layout: None,
+                    },
+                ),
+                (
+                    "pbc-family".into(),
+                    ManifestArtifact {
+                        artifact_type: ArtifactType::Matrix(matrix_type),
+                        family_count: Some(binding.family_count),
+                        layout: None,
+                    },
+                ),
+            ]),
+        };
+        graph
+            .validate_with_manifests(
+                &mxx_ir_core::ParamEnv::default(),
+                &BTreeMap::from([(production, manifest)]),
+            )
+            .expect("neutral artifact inputs validate against typed manifest");
     }
 
     #[test]
@@ -2292,7 +2578,6 @@ impl PbcLayoutFamilies {
     /// Shape and identity are derived from the validated layout/vector; callers
     /// cannot inject arbitrary index, mask, or shift families.
     pub(crate) fn from_layout(
-        _context: &DslContext,
         ring: &Ring,
         layout: &PbcPublicLayout,
         encoded: &PbcEncodedPublicVector,
@@ -2330,14 +2615,13 @@ impl PbcLayoutFamilies {
     /// the latter uses a 1x1 matrix whose constant coefficient is extracted
     /// inside the structural loop before dynamic selector-family indexing.
     pub fn from_layout_artifacts(
-        context: &DslContext,
         ring: &Ring,
         layout: &PbcPublicLayout,
         encoded: &PbcEncodedPublicVector,
         production_id: ProductionId,
         manifest: &Manifest,
     ) -> Result<Self, PbcError> {
-        let mut families = Self::from_layout(context, ring, layout, encoded)?;
+        let mut families = Self::from_layout(ring, layout, encoded)?;
         artifacts::validate_manifest_identity(manifest, &production_id)?;
         let rectangular_count = families.rectangular_count;
         let package_count = crate::noise_refresh::pbc::PbcActiveCellIndex::build(layout)
@@ -2352,8 +2636,7 @@ impl PbcLayoutFamilies {
             &package_index_name,
             scalar_type.clone(),
             rectangular_count,
-            ArtifactConfidentiality::Public,
-            true,
+            None,
         )
         .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
         artifacts::require_family_descriptor(
@@ -2361,8 +2644,7 @@ impl PbcLayoutFamilies {
             &mask_name,
             scalar_type.clone(),
             rectangular_count,
-            ArtifactConfidentiality::Public,
-            true,
+            None,
         )
         .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
         artifacts::require_family_descriptor(
@@ -2370,8 +2652,7 @@ impl PbcLayoutFamilies {
             &shift_name,
             ArtifactType::Matrix(artifacts::concrete_matrix_type(ring, (1, 1))?),
             package_count,
-            ArtifactConfidentiality::Public,
-            true,
+            None,
         )
         .map_err(|_| PbcError::ArtifactIdentityMismatch)?;
         families.package_indices = ring.family_artifact_input(
@@ -2379,22 +2660,11 @@ impl PbcLayoutFamilies {
             package_index_name,
             rectangular_count,
             (1, 1),
-            ArtifactConfidentiality::Public,
         );
-        families.active_masks = ring.family_artifact_input(
-            production_id.clone(),
-            mask_name,
-            rectangular_count,
-            (1, 1),
-            ArtifactConfidentiality::Public,
-        );
-        families.shifts = ring.family_artifact_input(
-            production_id,
-            shift_name,
-            package_count,
-            (1, 1),
-            ArtifactConfidentiality::Public,
-        );
+        families.active_masks =
+            ring.family_artifact_input(production_id.clone(), mask_name, rectangular_count, (1, 1));
+        families.shifts =
+            ring.family_artifact_input(production_id, shift_name, package_count, (1, 1));
         Ok(families)
     }
 

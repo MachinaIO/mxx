@@ -2,17 +2,23 @@
 //! Descriptor interpretation remains application-owned. Reading a stored expected
 //! identity is not authentication: reopening requires an independently trusted value.
 
-use crate::{Backend, ExecutionResult, FileArtifactStore, RuntimeValue};
+use crate::{Backend, ExecutionResult, FileArtifactStore, RuntimeValue, session::SessionStore};
 use mxx_ir_core::{
     artifact::{ArtifactCatalog, ArtifactCatalogError, Manifest, ManifestArtifact, ProductionId},
     encoding::hash_canonical,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeSet, fs::OpenOptions, io::Write, path::Path};
+use std::{
+    collections::BTreeSet,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use thiserror::Error;
 
-const CHECKPOINT_VERSION: u32 = 2;
+const CHECKPOINT_VERSION: u32 = 1;
 
 fn descriptor_hash(descriptor: &impl Serialize) -> Result<[u8; 32], serde_json::Error> {
     // Sort object keys recursively so HashMap iteration order is not an identity.
@@ -49,14 +55,21 @@ pub enum CheckpointError {
     InvalidArtifactResult(String),
     #[error(transparent)]
     Catalog(#[from] ArtifactCatalogError),
-    #[error(transparent)]
-    Store(#[from] crate::FileArtifactError),
+    #[error("artifact store error: {0}")]
+    Store(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("checkpoint canonical encoding failed: {0}")]
     CanonicalEncoding(String),
     #[error(transparent)]
     Encoding(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+fn store_error<E>(error: E) -> CheckpointError
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    CheckpointError::Store(Box::new(error))
 }
 
 #[derive(Serialize, Deserialize)]
@@ -173,7 +186,6 @@ pub fn validate_artifact_execution<B: Backend>(
                 handle.key.name != *name ||
                 handle.key.index != expected_index ||
                 handle.artifact_type != descriptor.artifact_type ||
-                handle.confidentiality != descriptor.confidentiality ||
                 handle.layout != descriptor.layout
             {
                 return Err(invalid_result(format!(
@@ -195,9 +207,9 @@ pub struct ArtifactCheckpoint<D, I> {
 impl<D, I> ArtifactCheckpoint<D, I> {
     /// Borrow the result so resident outputs and staged leases remain explicitly
     /// owned by the caller. Only artifact-only results may become checkpoints.
-    pub fn from_execution<B: Backend>(
+    pub fn from_execution<B: Backend, S: SessionStore>(
         result: &ExecutionResult<B>,
-        store: &mut FileArtifactStore,
+        store: &mut S,
         descriptor: D,
         expected_identity: I,
     ) -> Result<Self, CheckpointError>
@@ -206,7 +218,7 @@ impl<D, I> ArtifactCheckpoint<D, I> {
     {
         let production =
             result.production_id.clone().ok_or(CheckpointError::NotArtifactProduction)?;
-        let manifest = store.load_finalized_manifest(&production)?;
+        let manifest = store.load_finalized_manifest(&production).map_err(store_error)?;
         let mut catalog = ArtifactCatalog::default();
         catalog.insert(production.clone(), manifest)?;
         validate_artifact_execution(result, &catalog.manifests()[&production])?;
@@ -251,19 +263,75 @@ impl<D: Serialize, I: Serialize> ArtifactCheckpoint<D, I> {
     pub fn write(&self, path: impl AsRef<Path>) -> Result<(), CheckpointError> {
         let path = path.as_ref();
         let bytes = serde_json::to_vec(&self.metadata)?;
-        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
-        let parent = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        std::fs::File::open(parent)?.sync_all()?;
+        write_checkpoint_atomic_new(path, &bytes)?;
         Ok(())
     }
 }
 
 impl<D: DeserializeOwned + Serialize, I: DeserializeOwned + PartialEq> ArtifactCheckpoint<D, I> {
+    /// Revalidate this checkpoint against a finalized production in any
+    /// [`SessionStore`].  The store is queried for metadata only; artifact
+    /// payloads remain lazy and are not loaded.
+    pub fn reopen_in_store<S: SessionStore>(&self, store: &mut S) -> Result<Self, CheckpointError>
+    where
+        D: Clone,
+        I: Clone,
+    {
+        let manifest = store.load_finalized_manifest(self.production()).map_err(store_error)?;
+        let mut catalog = ArtifactCatalog::default();
+        catalog.insert(self.production().clone(), manifest)?;
+        if catalog_digest(&catalog)? != self.catalog_digest() {
+            return Err(CheckpointError::CatalogDigestMismatch);
+        }
+        Ok(Self {
+            metadata: Metadata {
+                version: CHECKPOINT_VERSION,
+                production: self.production().clone(),
+                descriptor: self.descriptor().clone(),
+                descriptor_digest: self.descriptor_digest(),
+                catalog_digest: self.catalog_digest(),
+                expected_identity: self.expected_identity().clone(),
+            },
+            catalog,
+        })
+    }
+
+    /// Read checkpoint metadata from `path` and validate it against any
+    /// finalized [`SessionStore`].  This is the generic counterpart to the
+    /// filesystem convenience [`Self::open`] method.
+    pub fn open_in_store<S: SessionStore>(
+        store: &mut S,
+        path: impl AsRef<Path>,
+        expected_production: &ProductionId,
+        expected_identity: &I,
+        expected_descriptor_digest: [u8; 32],
+        expected_catalog_digest: [u8; 32],
+    ) -> Result<Self, CheckpointError> {
+        let metadata: Metadata<D, I> = serde_json::from_slice(&std::fs::read(path)?)?;
+        if metadata.version != CHECKPOINT_VERSION {
+            return Err(CheckpointError::VersionMismatch);
+        }
+        if &metadata.production != expected_production ||
+            &metadata.expected_identity != expected_identity
+        {
+            return Err(CheckpointError::IdentityMismatch);
+        }
+        let digest = descriptor_hash(&metadata.descriptor)?;
+        if metadata.descriptor_digest != expected_descriptor_digest ||
+            digest != expected_descriptor_digest
+        {
+            return Err(CheckpointError::IdentityMismatch);
+        }
+        let manifest = store.load_finalized_manifest(&metadata.production).map_err(store_error)?;
+        let mut catalog = ArtifactCatalog::default();
+        catalog.insert(metadata.production.clone(), manifest)?;
+        let digest = catalog_digest(&catalog)?;
+        if metadata.catalog_digest != expected_catalog_digest || digest != expected_catalog_digest {
+            return Err(CheckpointError::CatalogDigestMismatch);
+        }
+        Ok(Self { metadata, catalog })
+    }
+
     /// Read back metadata using this in-memory checkpoint as the trusted anchor.
     pub fn reopen(
         &self,
@@ -293,36 +361,50 @@ impl<D: DeserializeOwned + Serialize, I: DeserializeOwned + PartialEq> ArtifactC
         expected_descriptor_digest: [u8; 32],
         expected_catalog_digest: [u8; 32],
     ) -> Result<(FileArtifactStore, Self), CheckpointError> {
-        let metadata: Metadata<D, I> = serde_json::from_slice(&std::fs::read(path)?)?;
-        if metadata.version != CHECKPOINT_VERSION {
-            return Err(CheckpointError::VersionMismatch);
-        }
-        if &metadata.production != expected_production ||
-            &metadata.expected_identity != expected_identity
-        {
-            return Err(CheckpointError::IdentityMismatch);
-        }
-        let digest = descriptor_hash(&metadata.descriptor)?;
-        if metadata.descriptor_digest != expected_descriptor_digest ||
-            digest != expected_descriptor_digest
-        {
-            return Err(CheckpointError::IdentityMismatch);
-        }
         // Avoid FileArtifactStore::open's directory-creation behavior for a
         // missing checkpoint location.
         if !directory.as_ref().is_dir() {
             return Err(CheckpointError::NotArtifactProduction);
         }
-        let mut store = FileArtifactStore::open(directory.as_ref())?;
-        let manifest = store.load_finalized_manifest(&metadata.production)?;
-        let mut catalog = ArtifactCatalog::default();
-        catalog.insert(metadata.production.clone(), manifest)?;
-        let digest = catalog_digest(&catalog)?;
-        if metadata.catalog_digest != expected_catalog_digest || digest != expected_catalog_digest {
-            return Err(CheckpointError::CatalogDigestMismatch);
-        }
-        Ok((store, Self { metadata, catalog }))
+        let mut store = FileArtifactStore::open(directory.as_ref()).map_err(store_error)?;
+        let checkpoint = Self::open_in_store(
+            &mut store,
+            path,
+            expected_production,
+            expected_identity,
+            expected_descriptor_digest,
+            expected_catalog_digest,
+        )?;
+        Ok((store, checkpoint))
     }
+}
+
+/// Publish one complete metadata file without exposing a partially written
+/// target and without ever replacing an existing checkpoint.  The hard-link
+/// step is the non-overwriting commit point used by the artifact store too.
+fn write_checkpoint_atomic_new(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temporary = path.with_extension(format!("tmp-checkpoint-{}-{stamp}", std::process::id()));
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&temporary)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::hard_link(&temporary, path)?;
+        fs::remove_file(&temporary)?;
+        fs::File::open(parent)?.sync_all()
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -337,9 +419,9 @@ mod tests {
         let ring = mxx_dsl::Ring::new(17, 8);
         let value = ring.bytes_input("input", 1);
         let graph = mxx_dsl::DslContext::new("checkpoint-aliases")
-            .public_output("a", value.clone())
+            .artifact_output("a", value.clone())
             .unwrap()
-            .private_output("b", value)
+            .artifact_output("b", value)
             .unwrap()
             .build()
             .unwrap()
@@ -375,11 +457,11 @@ mod tests {
         let value = ring.identity(1);
         let family = mxx_dsl::parallel(2, |_| Ok(ring.identity(1))).unwrap();
         let graph = mxx_dsl::DslContext::new("checkpoint-reimport")
-            .public_output("a", value.clone())
+            .artifact_output("a", value.clone())
             .unwrap()
-            .public_output("b", value.clone() + value)
+            .artifact_output("b", value.clone() + value)
             .unwrap()
-            .public_output("family", family)
+            .artifact_output("family", family)
             .unwrap()
             .build()
             .unwrap()
@@ -405,7 +487,7 @@ mod tests {
         SessionDescriptor, SessionStore, backend::poly::CpuDcrtBackend,
     };
     use mxx_ir_core::{
-        artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, SpecHash},
+        artifact::{ArtifactType, Manifest, ManifestArtifact, SpecHash},
         encoding::IR_VERSION,
     };
     use std::collections::BTreeMap;
@@ -438,24 +520,15 @@ mod tests {
         let manifest_artifact = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Private,
-            content_hash: None,
             layout: None,
         };
         let handle = ArtifactHandle {
             key: ArtifactKey { production: production.clone(), name: "value".into(), index: None },
             artifact_type: artifact_type.clone(),
-            confidentiality: ArtifactConfidentiality::Private,
             layout: None,
         };
         store
-            .store(
-                handle.key.clone(),
-                &artifact_type,
-                handle.confidentiality,
-                None,
-                ArtifactPayload::Bytes(vec![7]),
-            )
+            .store(handle.key.clone(), &artifact_type, None, ArtifactPayload::Bytes(vec![7]))
             .unwrap();
         store.commit_artifact(&handle).unwrap();
         let mut result = ExecutionResult::<CpuDcrtBackend> {
@@ -606,6 +679,8 @@ mod tests {
         std::fs::write(&manifest_path, original_manifest).unwrap();
         let mut store = FileArtifactStore::open(directory.path()).unwrap();
         let original = std::fs::read(&path).unwrap();
+        let original_metadata: serde_json::Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(original_metadata["version"], serde_json::json!(1));
         for field in ["version", "descriptor", "production", "catalog_digest", "expected_identity"]
         {
             let mut value: serde_json::Value = serde_json::from_slice(&original).unwrap();
@@ -632,6 +707,116 @@ mod tests {
     }
 
     #[test]
+    fn generic_checkpoint_supports_memory_store_and_two_consumers() {
+        let ring = mxx_dsl::Ring::new(17, 8);
+        let value = ring.bytes_input("input", 1);
+        let graph = mxx_dsl::DslContext::new("checkpoint-memory")
+            .artifact_output("encrypt", value.clone())
+            .unwrap()
+            .artifact_output("online", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&mxx_ir_core::ParamEnv::default())
+            .unwrap();
+        let mut backend = crate::backend::poly::cpu_backend([]);
+        let mut store = crate::MemoryArtifactStore::default();
+        let result = crate::execute_in_session_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::from([("input".into(), RuntimeValue::Bytes(vec![7]))]),
+            &mut store,
+            rand::random(),
+            crate::ExecutionConfig::default(),
+        )
+        .unwrap();
+        let encrypt = ArtifactCheckpoint::from_execution(
+            &result,
+            &mut store,
+            "encrypt-preparation".to_owned(),
+            [1u8; 32],
+        )
+        .unwrap();
+        let online = ArtifactCheckpoint::from_execution(
+            &result,
+            &mut store,
+            "online-preparation".to_owned(),
+            [2u8; 32],
+        )
+        .unwrap();
+        assert_eq!(encrypt.production(), online.production());
+        assert_eq!(encrypt.catalog_digest(), online.catalog_digest());
+        assert_ne!(encrypt.descriptor(), online.descriptor());
+
+        let directory = tempfile::tempdir_in("test_data").unwrap();
+        let path = directory.path().join("memory-checkpoint.json");
+        encrypt.write(&path).unwrap();
+        let reopened = ArtifactCheckpoint::<String, [u8; 32]>::open_in_store(
+            &mut store,
+            &path,
+            encrypt.production(),
+            encrypt.expected_identity(),
+            encrypt.descriptor_digest(),
+            encrypt.catalog_digest(),
+        )
+        .unwrap();
+        assert_eq!(reopened.descriptor(), encrypt.descriptor());
+        let revalidated = online.reopen_in_store(&mut store).unwrap();
+        assert_eq!(revalidated.production(), online.production());
+    }
+
+    #[test]
+    fn generic_checkpoint_supports_multi_store_manifest_validation() {
+        let root = tempfile::tempdir().unwrap();
+        let first = FileArtifactStore::new(root.path().join("first")).unwrap();
+        let second = FileArtifactStore::new(root.path().join("second")).unwrap();
+        let mut store = crate::FileArtifactStoreRouter::new(
+            vec![first, second],
+            BTreeMap::from([("a".to_owned(), 0), ("b".to_owned(), 1)]),
+            0,
+            root.path().join("markers"),
+        )
+        .unwrap();
+        let ring = mxx_dsl::Ring::new(17, 8);
+        let value = ring.bytes_input("input", 1);
+        let graph = mxx_dsl::DslContext::new("checkpoint-router")
+            .artifact_output("a", value.clone())
+            .unwrap()
+            .artifact_output("b", value)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&mxx_ir_core::ParamEnv::default())
+            .unwrap();
+        let mut backend = crate::backend::poly::cpu_backend([]);
+        let result = crate::execute_in_session_with_config(
+            &graph,
+            &mut backend,
+            BTreeMap::from([("input".into(), RuntimeValue::Bytes(vec![9]))]),
+            &mut store,
+            rand::random(),
+            crate::ExecutionConfig::default(),
+        )
+        .unwrap();
+        let first_consumer = ArtifactCheckpoint::from_execution(
+            &result,
+            &mut store,
+            "first-consumer".to_owned(),
+            [3u8; 32],
+        )
+        .unwrap();
+        let second_consumer = ArtifactCheckpoint::from_execution(
+            &result,
+            &mut store,
+            "second-consumer".to_owned(),
+            [4u8; 32],
+        )
+        .unwrap();
+        assert_eq!(first_consumer.production(), second_consumer.production());
+        assert_eq!(first_consumer.catalog_digest(), second_consumer.catalog_digest());
+    }
+
+    #[test]
     fn test_checkpoint_accepts_zero_length_lazy_family_without_handles() {
         std::fs::create_dir_all("test_data").unwrap();
         let directory = tempfile::tempdir_in("test_data").unwrap();
@@ -644,8 +829,6 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 0 },
             family_count: Some(0),
-            confidentiality: ArtifactConfidentiality::Private,
-            content_hash: None,
             layout: None,
         };
         store

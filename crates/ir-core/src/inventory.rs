@@ -216,17 +216,17 @@ mod tests {
             BTreeMap::from([
                 (
                     "first-integer".to_owned(),
-                    GraphOutput { value: first_integer, confidentiality: None },
+                    GraphOutput { artifact_output: false, value: first_integer },
                 ),
                 (
                     "first-boolean".to_owned(),
-                    GraphOutput { value: first_boolean, confidentiality: None },
+                    GraphOutput { artifact_output: false, value: first_boolean },
                 ),
                 (
                     "second-integer".to_owned(),
-                    GraphOutput { value: second_integer, confidentiality: None },
+                    GraphOutput { artifact_output: false, value: second_integer },
                 ),
-                ("loop".to_owned(), GraphOutput { value: loop_output, confidentiality: None }),
+                ("loop".to_owned(), GraphOutput { artifact_output: false, value: loop_output }),
             ]),
             Vec::new(),
             vec![second_boolean],

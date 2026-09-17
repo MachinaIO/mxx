@@ -325,6 +325,13 @@ impl<S: GraphValueSchema> GraphValueSchema for FamilyType<S> {
     }
 }
 
+impl<S: GraphValueSchema> FamilyType<S> {
+    /// Number of members represented by this family schema.
+    pub fn count(&self) -> &IntExpr {
+        &self.count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

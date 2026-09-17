@@ -13,10 +13,7 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 use mxx_ir_core::{
-    artifact::{
-        ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-        validate_manifest,
-    },
+    artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, validate_manifest},
     encoding::IR_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -25,6 +22,58 @@ use std::{collections::BTreeMap, fs, path::PathBuf};
 use thiserror::Error;
 
 const COMPLETION_VERSION: u32 = 1;
+
+fn publish_completion_marker(
+    path: &std::path::Path,
+    marker: &CompletionMarker,
+) -> Result<(), MultiStoreError> {
+    let bytes =
+        serde_json::to_vec(marker).map_err(|error| MultiStoreError::Encode(error.to_string()))?;
+    let temporary = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|source| MultiStoreError::Io { path: temporary.clone(), source })?;
+    use std::io::Write;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|source| MultiStoreError::Io { path: temporary.clone(), source })?;
+
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            fs::remove_file(&temporary)
+                .map_err(|source| MultiStoreError::Io { path: temporary, source })?;
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(path)
+                .map_err(|source| MultiStoreError::Io { path: path.to_owned(), source })
+                .and_then(|bytes| {
+                    serde_json::from_slice::<CompletionMarker>(&bytes)
+                        .map_err(|error| MultiStoreError::InvalidMarker(error.to_string()))
+                });
+            let remove_error = fs::remove_file(&temporary)
+                .err()
+                .map(|source| MultiStoreError::Io { path: temporary.clone(), source });
+            if let Some(error) = remove_error {
+                return Err(error);
+            }
+            let existing = existing?;
+            if existing != *marker {
+                return Err(MultiStoreError::InvalidMarker("completion marker conflict".into()));
+            }
+        }
+        Err(source) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(MultiStoreError::Io { path: path.to_owned(), source });
+        }
+    }
+
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| MultiStoreError::Io { path: path.to_owned(), source })
+}
 
 /// Trusted facts extracted from a finalized multi-store router marker.
 /// Consumers compare all fields with their independently retained output
@@ -279,7 +328,7 @@ impl FileArtifactStoreRouter {
     }
 
     /// Loads one finalized subset for diagnostics or an explicitly trusted
-    /// store-local consumer. Normal consumers should use [`load_manifest`]
+    /// store-local consumer. Normal consumers should use `load_manifest`
     /// so the completion marker and disjoint union are checked first.
     pub fn load_store_manifest(
         &mut self,
@@ -393,7 +442,7 @@ impl FileArtifactStoreRouter {
                 continue;
             }
             let subset = store
-                .load_manifest(production)
+                .load_finalized_manifest(production)
                 .map_err(|source| Self::store_error(index, source))?;
             for (name, descriptor) in subset.artifacts {
                 if artifacts.insert(name.clone(), descriptor).is_some() {
@@ -461,14 +510,13 @@ impl ArtifactStore for FileArtifactStoreRouter {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error> {
         let staged = layout == Some(crate::artifact::STAGED_FAMILY_LAYOUT);
         let store = self.route(&key, staged)?;
         self.stores[store]
-            .store(key, artifact_type, confidentiality, layout, payload)
+            .store(key, artifact_type, layout, payload)
             .map_err(|source| Self::store_error(store, source))
     }
 
@@ -508,6 +556,13 @@ impl ArtifactStore for FileArtifactStoreRouter {
 }
 
 impl SessionStore for FileArtifactStoreRouter {
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        self.load_union_manifest(production)
+    }
+
     fn resolve_session_nonce(
         &mut self,
         descriptor: &SessionAliasDescriptor,
@@ -636,38 +691,7 @@ impl SessionStore for FileArtifactStoreRouter {
                 .collect(),
         };
         let path = self.marker_path(&manifest.production_id);
-        let bytes = serde_json::to_vec(&marker)
-            .map_err(|error| MultiStoreError::Encode(error.to_string()))?;
-        if path.exists() {
-            let existing: CompletionMarker = serde_json::from_slice(
-                &fs::read(&path)
-                    .map_err(|source| MultiStoreError::Io { path: path.clone(), source })?,
-            )
-            .map_err(|error| MultiStoreError::InvalidMarker(error.to_string()))?;
-            if existing != marker {
-                return Err(MultiStoreError::InvalidMarker("completion marker conflict".into()));
-            }
-            return Ok(());
-        }
-        let temporary = path.with_extension(format!("tmp-{:032x}", rand::random::<u128>()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(|source| MultiStoreError::Io { path: temporary.clone(), source })?;
-        use std::io::Write;
-        file.write_all(&bytes)
-            .and_then(|_| file.sync_all())
-            .map_err(|source| MultiStoreError::Io { path: temporary.clone(), source })?;
-        if path.exists() {
-            return Err(MultiStoreError::InvalidMarker("completion marker conflict".into()));
-        }
-        fs::rename(&temporary, &path)
-            .map_err(|source| MultiStoreError::Io { path: path.clone(), source })?;
-        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-        fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|source| MultiStoreError::Io { path, source })
+        publish_completion_marker(&path, &marker)
     }
 }
 
@@ -675,9 +699,7 @@ impl SessionStore for FileArtifactStoreRouter {
 mod tests {
     use super::*;
     use crate::artifact::ArtifactStore;
-    use mxx_ir_core::artifact::{
-        ArtifactConfidentiality, ArtifactType, ManifestArtifact, SpecHash,
-    };
+    use mxx_ir_core::artifact::{ArtifactType, ManifestArtifact, SpecHash};
 
     fn production() -> ProductionId {
         ProductionId { spec_hash: SpecHash([7; 32]), execution_nonce: [8; 32] }
@@ -687,10 +709,71 @@ mod tests {
         ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
             layout: None,
         }
+    }
+
+    fn marker(digest: [u8; 32]) -> CompletionMarker {
+        CompletionMarker {
+            version: COMPLETION_VERSION,
+            production: production(),
+            manifest_digest: digest,
+            store_count: 1,
+            writable_stores: vec![0],
+        }
+    }
+
+    #[test]
+    fn concurrent_same_completion_marker_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("completion.router");
+        let marker = marker([1; 32]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let marker = marker.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    publish_completion_marker(&path, &marker)
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let stored: CompletionMarker = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(stored, marker);
+    }
+
+    #[test]
+    fn concurrent_different_completion_markers_reject_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("completion.router");
+        let first = marker([1; 32]);
+        let second = marker([2; 32]);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles = [first, second]
+            .into_iter()
+            .map(|marker| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    publish_completion_marker(&path, &marker)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = handles.into_iter().map(|handle| handle.join().unwrap()).collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(MultiStoreError::InvalidMarker(_))))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -715,7 +798,6 @@ mod tests {
                 .store(
                     key.clone(),
                     &descriptor().artifact_type,
-                    ArtifactConfidentiality::Public,
                     None,
                     ArtifactPayload::Bytes(vec![1]),
                 )
@@ -724,7 +806,6 @@ mod tests {
                 .commit_artifact(&ArtifactHandle {
                     key,
                     artifact_type: descriptor().artifact_type.clone(),
-                    confidentiality: ArtifactConfidentiality::Public,
                     layout: None,
                 })
                 .unwrap();
@@ -785,7 +866,6 @@ mod tests {
                                 index: None,
                             },
                             artifact_type: descriptor().artifact_type.clone(),
-                            confidentiality: descriptor().confidentiality,
                             layout: descriptor().layout.clone(),
                         }],
                     )

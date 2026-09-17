@@ -37,6 +37,8 @@ mod root_refresh_state_source;
 mod root_seeded_keys;
 mod scopes;
 
+use self::{root_online_readout as root_online_lut_output, root_readout as root_lut_output};
+
 use std::{collections::BTreeMap, fs, path::Path};
 
 use mxx_ir_core::{
@@ -102,7 +104,8 @@ pub fn export_refresh_graphs(
         root_readout_public::root_readout_public(&preprocessing, &preprocessing_artifact)?;
     let readout_function_proofs =
         root_readout_function::root_readout_function(&preprocessing, &preprocessing_artifact)?;
-    let (readout_proofs, _) = root_readout::root_readout(&preprocessing, &preprocessing_artifact)?;
+    let (readout_proofs, _) =
+        root_lut_output::root_readout(&preprocessing, &preprocessing_artifact)?;
     if setup_scope_count == 0 {
         return Err("refresh implementation has no recognized selector-setup scope".into());
     }
@@ -228,7 +231,7 @@ pub fn export_refresh_graphs(
         &bundle.noise_snapshot,
     )?;
     let preprocessing = preprocessing_artifact;
-    let online_readout_proofs = root_online_readout::root_online_readout(
+    let online_readout_proofs = root_online_lut_output::root_online_readout(
         &verification,
         &verification_artifact,
         &online_dependencies,
@@ -275,7 +278,7 @@ pub fn export_refresh_graphs(
     let zero = mxx_dsl::Ring::new(matrix.modulus.clone(), matrix.ring_dimension)
         .zero((matrix.rows, matrix.columns));
     let ideal_graph =
-        mxx_dsl::DslContext::new("refresh-zero-residual").public_output("zero", zero)?.build()?;
+        mxx_dsl::DslContext::new("refresh-zero-residual").artifact_output("zero", zero)?.build()?;
     let ideal =
         export(&mxx_ir_core::validate(&ideal_graph.graph, bindings)?, &options("RefreshIdeal"))?;
     let producer_graph = &bundle.preprocessing_graph().graph;
@@ -522,7 +525,7 @@ pub fn export_refresh_graphs(
 
 fn trace_indices_data(layout: &crate::ExpLayout, n: usize) -> Result<String, String> {
     layout.validate(n).map_err(|error| error.to_string())?;
-    // Match readout::full_trace_layout: operation width is replaced by the
+    // Match the full native trace layout: operation width is replaced by the
     // complete native subgroup width while the exponent stride is retained.
     let full = crate::ExpLayout {
         stride_log2: layout.stride_log2,
@@ -601,7 +604,7 @@ mod tests {
         );
         let mut setup = parameters_for_numeric_refresh(&parameters);
         let profile = SparseLwrPrfProfile::new(
-            crate::layout::ExpLayout {
+            crate::ExpLayout {
                 stride_log2: 1,
                 width_log2: parameters.ring_dimension().ilog2() - 1,
             },
@@ -622,6 +625,11 @@ mod tests {
                 profile,
                 generated.public_layout.bucket_width,
                 generated.public_layout.parameters.bucket_count,
+                b"lean-refresh-test-hash-key",
+                &[crate::noise_refresh::prf::PrfLabel::from_components(
+                    &[b"lean-refresh-test"],
+                )
+                .unwrap()],
             )
             .expect("PRF Program"),
             generated,
@@ -821,7 +829,7 @@ mod tests {
         let bits = parameter("MXX_PRIMITIVE_TEST_CRT_BITS", 40) as usize;
         let base_bits = parameter("MXX_PRIMITIVE_TEST_BASE_BITS", 4);
         let profile = SparseLwrPrfProfile::new(
-            crate::layout::ExpLayout { stride_log2: 1, width_log2: n.ilog2() - 1 },
+            crate::ExpLayout { stride_log2: 1, width_log2: n.ilog2() - 1 },
             2,
         )
         .unwrap();
@@ -864,6 +872,11 @@ mod tests {
                         profile,
                         generated.public_layout.bucket_width,
                         generated.public_layout.parameters.bucket_count,
+                        b"lean-refresh-snapshot-hash-key",
+                        &[crate::noise_refresh::prf::PrfLabel::from_components(
+                            &[b"lean-refresh-snapshot"],
+                        )
+                        .unwrap()],
                     )
                     .expect("PRF Program"),
                     generated.clone(),
@@ -891,6 +904,11 @@ mod tests {
                 profile,
                 generated.public_layout.bucket_width,
                 generated.public_layout.parameters.bucket_count,
+                b"lean-refresh-report-hash-key",
+                &[crate::noise_refresh::prf::PrfLabel::from_components(
+                    &[b"lean-refresh-report"],
+                )
+                .unwrap()],
             )
             .expect("PRF Program"),
             generated,

@@ -1,12 +1,8 @@
 use mxx_ir_core::{
-    artifact::{
-        ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-        validate_manifest,
-    },
+    artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId, validate_manifest},
     encoding::IR_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::{
@@ -44,9 +40,8 @@ pub enum ArtifactPayload {
     TypedBlob(Vec<u8>),
 }
 
-/// Supplies intact payloads from the matching backend codec and schema. Private artifacts
-/// have no manifest content hash; the caller/storage layer must establish integrity before
-/// execution. Corrupt compact matrix payloads can panic during decoding.
+/// Supplies intact payloads from the matching backend codec and schema.
+/// Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -60,7 +55,6 @@ pub trait ArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error>;
@@ -78,15 +72,14 @@ pub trait ArtifactStore {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct FileStoredArtifact {
     artifact_type: ArtifactType,
-    confidentiality: ArtifactConfidentiality,
     layout: Option<String>,
     payload: ArtifactPayload,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FileStoredHeader {
     artifact_type: ArtifactType,
-    confidentiality: ArtifactConfidentiality,
     layout: Option<String>,
     payload_kind: u8,
 }
@@ -96,8 +89,7 @@ struct FileSession {
     descriptor: SessionDescriptor,
     status: SessionStatus,
     transcript: Vec<(DrawSite, RecordedValue)>,
-    committed_artifacts:
-        Vec<(ArtifactKey, (ArtifactType, ArtifactConfidentiality, Option<String>))>,
+    committed_artifacts: Vec<(ArtifactKey, (ArtifactType, Option<String>))>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -150,8 +142,6 @@ pub enum FileArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
-    #[error("artifact content hash does not match its manifest: {0:?}")]
-    ContentHashMismatch(ArtifactKey),
 }
 
 /// Durable artifact storage for production runs.
@@ -165,8 +155,6 @@ pub struct FileArtifactStore {
     active_sessions: BTreeSet<ProductionId>,
     locks: BTreeMap<ProductionId, fs::File>,
     loads: BTreeMap<ArtifactKey, usize>,
-    verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
-    family_hash_verifications: usize,
     staged_memory: BTreeMap<ArtifactKey, FileStoredArtifact>,
 }
 
@@ -204,8 +192,6 @@ impl FileArtifactStore {
             active_sessions: BTreeSet::new(),
             locks: BTreeMap::new(),
             loads: BTreeMap::new(),
-            verified_families: BTreeSet::new(),
-            family_hash_verifications: 0,
             staged_memory: BTreeMap::new(),
         })
     }
@@ -233,10 +219,6 @@ impl FileArtifactStore {
             ));
         }
         self.load_manifest(production)
-    }
-
-    pub fn family_hash_verification_count(&self) -> usize {
-        self.family_hash_verifications
     }
 
     pub fn load_count(&self, key: &ArtifactKey) -> usize {
@@ -338,83 +320,12 @@ impl FileArtifactStore {
         descriptor: &ManifestArtifact,
         stored: &FileStoredArtifact,
     ) -> Result<(), FileArtifactError> {
-        if stored.artifact_type != descriptor.artifact_type ||
-            stored.confidentiality != descriptor.confidentiality ||
-            stored.layout != descriptor.layout
-        {
+        if stored.artifact_type != descriptor.artifact_type || stored.layout != descriptor.layout {
             return Err(FileArtifactError::DescriptorMismatch(key.clone()));
         }
         if !payload_matches(&stored.artifact_type, &stored.payload) {
             return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
         }
-        Ok(())
-    }
-
-    fn verify_content_hash(
-        &mut self,
-        key: &ArtifactKey,
-        descriptor: &ManifestArtifact,
-        payload: &ArtifactPayload,
-    ) -> Result<(), FileArtifactError> {
-        // A family hash covers the ordered collection and therefore cannot be
-        // checked without reading sibling members. Keep that audit explicit;
-        // ordinary member loads remain bounded to the requested file.
-        if descriptor.family_count.is_some() {
-            return Ok(());
-        }
-        let Some(expected) = descriptor.content_hash else { return Ok(()) };
-        let verification_key = (key.production.clone(), key.name.clone(), expected);
-        if self.verified_families.contains(&verification_key) {
-            return Ok(());
-        }
-        let actual: [u8; 32] = Sha256::digest(payload_bytes(payload)).into();
-        if actual != expected {
-            return Err(FileArtifactError::ContentHashMismatch(key.clone()));
-        }
-        self.family_hash_verifications += 1;
-        self.verified_families.insert(verification_key);
-        Ok(())
-    }
-
-    /// Verifies a public family content hash by streaming its members one at a
-    /// time. This is intentionally separate from [`ArtifactStore::load`],
-    /// whose contract is a lazy single-member load.
-    pub fn verify_family(
-        &mut self,
-        key: &ArtifactKey,
-        descriptor: &ManifestArtifact,
-    ) -> Result<(), FileArtifactError> {
-        let Some(count) = descriptor.family_count else {
-            return Err(FileArtifactError::FamilyIndexMismatch(key.clone()));
-        };
-        let Some(expected) = descriptor.content_hash else { return Ok(()) };
-        let manifest = self.load_manifest(&key.production)?;
-        if manifest.artifacts.get(&key.name) != Some(descriptor) {
-            return Err(FileArtifactError::DescriptorMismatch(key.clone()));
-        }
-        let verification_key = (key.production.clone(), key.name.clone(), expected);
-        if self.verified_families.contains(&verification_key) {
-            return Ok(());
-        }
-        let mut hasher = Sha256::new();
-        for index in 0..count {
-            let member_key = ArtifactKey {
-                production: key.production.clone(),
-                name: key.name.clone(),
-                index: Some(index),
-            };
-            let member = self.read_stored(&member_key)?;
-            Self::validate_stored(&member_key, descriptor, &member)?;
-            let bytes = payload_bytes(&member.payload);
-            hasher.update((index as u64).to_le_bytes());
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        if <[u8; 32]>::from(hasher.finalize()) != expected {
-            return Err(FileArtifactError::ContentHashMismatch(key.clone()));
-        }
-        self.family_hash_verifications += 1;
-        self.verified_families.insert(verification_key);
         Ok(())
     }
 }
@@ -454,7 +365,6 @@ impl ArtifactStore for FileArtifactStore {
         Self::validate_key_index(key, descriptor)?;
         let stored = self.read_stored(key)?;
         Self::validate_stored(key, descriptor, &stored)?;
-        self.verify_content_hash(key, descriptor, &stored.payload)?;
         *self.loads.entry(key.clone()).or_default() += 1;
         Ok(stored.payload)
     }
@@ -463,7 +373,6 @@ impl ArtifactStore for FileArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error> {
@@ -472,7 +381,6 @@ impl ArtifactStore for FileArtifactStore {
         }
         let stored = FileStoredArtifact {
             artifact_type: artifact_type.clone(),
-            confidentiality,
             layout: layout.map(str::to_owned),
             payload,
         };
@@ -508,8 +416,6 @@ impl ArtifactStore for FileArtifactStore {
             }
             Err(error) => return Err(error),
         }
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -535,8 +441,6 @@ impl ArtifactStore for FileArtifactStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(FileArtifactError::Io { path, source }),
         }
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -571,6 +475,13 @@ impl ArtifactStore for FileArtifactStore {
 }
 
 impl SessionStore for FileArtifactStore {
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        FileArtifactStore::load_finalized_manifest(self, production)
+    }
+
     fn resolve_session_nonce(
         &mut self,
         descriptor: &SessionAliasDescriptor,
@@ -720,15 +631,11 @@ impl SessionStore for FileArtifactStore {
 
     fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
         let stored = self.read_stored(&handle.key)?;
-        if stored.artifact_type != handle.artifact_type ||
-            stored.confidentiality != handle.confidentiality ||
-            stored.layout != handle.layout
-        {
+        if stored.artifact_type != handle.artifact_type || stored.layout != handle.layout {
             return Err(FileArtifactError::DescriptorMismatch(handle.key.clone()));
         }
         let mut session = self.session(&handle.key.production)?;
-        let expected =
-            (handle.artifact_type.clone(), handle.confidentiality, handle.layout.clone());
+        let expected = (handle.artifact_type.clone(), handle.layout.clone());
         match session.committed_artifacts.iter().position(|(key, _)| key == &handle.key) {
             None => session.committed_artifacts.push((handle.key.clone(), expected)),
             Some(position) if session.committed_artifacts[position].1 == expected => return Ok(()),
@@ -743,11 +650,7 @@ impl SessionStore for FileArtifactStore {
         for (name, artifact) in &manifest.artifacts {
             let check_index = |index| {
                 let key = ArtifactKey { production: production.clone(), name: name.clone(), index };
-                let expected = (
-                    artifact.artifact_type.clone(),
-                    artifact.confidentiality,
-                    artifact.layout.clone(),
-                );
+                let expected = (artifact.artifact_type.clone(), artifact.layout.clone());
                 if session
                     .committed_artifacts
                     .iter()
@@ -856,7 +759,6 @@ fn decode_stored_payload(kind: u8, bytes: &[u8]) -> Result<ArtifactPayload, Stri
 fn write_stored_file(path: &Path, stored: &FileStoredArtifact) -> Result<(), FileArtifactError> {
     let header = FileStoredHeader {
         artifact_type: stored.artifact_type.clone(),
-        confidentiality: stored.confidentiality,
         layout: stored.layout.clone(),
         payload_kind: payload_kind(&stored.payload),
     };
@@ -906,12 +808,7 @@ fn read_stored_file(path: &Path) -> Result<FileStoredArtifact, FileArtifactError
         })?;
     let payload = decode_stored_payload(header.payload_kind, &bytes[payload_start..])
         .map_err(|message| FileArtifactError::Decode { path: path.to_owned(), message })?;
-    Ok(FileStoredArtifact {
-        artifact_type: header.artifact_type,
-        confidentiality: header.confidentiality,
-        layout: header.layout,
-        payload,
-    })
+    Ok(FileStoredArtifact { artifact_type: header.artifact_type, layout: header.layout, payload })
 }
 
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), FileArtifactError> {
@@ -1021,17 +918,12 @@ fn unlock(_file: &fs::File) -> io::Result<()> {
 pub struct MemoryArtifactStore {
     #[cfg(test)]
     pub(crate) peak_entries: usize,
-    entries: BTreeMap<
-        ArtifactKey,
-        (ArtifactType, ArtifactConfidentiality, Option<String>, ArtifactPayload),
-    >,
+    entries: BTreeMap<ArtifactKey, (ArtifactType, Option<String>, ArtifactPayload)>,
     loads: BTreeMap<ArtifactKey, usize>,
     manifests: BTreeMap<ProductionId, Manifest>,
     sessions: BTreeMap<ProductionId, MemorySession>,
     session_aliases: BTreeMap<String, (SessionAliasDescriptor, [u8; 32])>,
     active_sessions: BTreeSet<ProductionId>,
-    verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
-    family_hash_verifications: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1039,8 +931,7 @@ struct MemorySession {
     descriptor: SessionDescriptor,
     status: SessionStatus,
     transcript: BTreeMap<DrawSite, RecordedValue>,
-    committed_artifacts:
-        BTreeMap<ArtifactKey, (ArtifactType, ArtifactConfidentiality, Option<String>)>,
+    committed_artifacts: BTreeMap<ArtifactKey, (ArtifactType, Option<String>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -1077,8 +968,6 @@ pub enum MemoryArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
-    #[error("artifact content hash does not match its manifest: {0:?}")]
-    ContentHashMismatch(ArtifactKey),
 }
 
 impl MemoryArtifactStore {
@@ -1086,21 +975,19 @@ impl MemoryArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         payload: ArtifactPayload,
     ) -> Result<(), MemoryArtifactError> {
-        self.store(key, &artifact_type, confidentiality, None, payload)
+        self.store(key, &artifact_type, None, payload)
     }
 
     pub fn insert_with_layout(
         &mut self,
         key: ArtifactKey,
         artifact_type: ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), MemoryArtifactError> {
-        self.store(key, &artifact_type, confidentiality, layout, payload)
+        self.store(key, &artifact_type, layout, payload)
     }
 
     pub fn load_count(&self, key: &ArtifactKey) -> usize {
@@ -1135,12 +1022,11 @@ impl MemoryArtifactStore {
                     name: name.clone(),
                     index,
                 };
-                let (artifact_type, confidentiality, layout, payload) = self
+                let (artifact_type, layout, payload) = self
                     .entries
                     .get(&key)
                     .ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
                 if artifact_type != &descriptor.artifact_type ||
-                    confidentiality != &descriptor.confidentiality ||
                     layout != &descriptor.layout ||
                     !payload_matches(artifact_type, payload)
                 {
@@ -1158,10 +1044,6 @@ impl MemoryArtifactStore {
 
     pub fn transcript_len(&self, production: &ProductionId) -> Option<usize> {
         self.sessions.get(production).map(|session| session.transcript.len())
-    }
-
-    pub fn family_hash_verification_count(&self) -> usize {
-        self.family_hash_verifications
     }
 }
 
@@ -1208,50 +1090,13 @@ impl ArtifactStore for MemoryArtifactStore {
             (Some(count), Some(index)) if index < count => {}
             _ => return Err(MemoryArtifactError::FamilyIndexMismatch(key.clone())),
         }
-        let (artifact_type, confidentiality, layout, payload) =
+        let (artifact_type, layout, payload) =
             self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-        if artifact_type != &descriptor.artifact_type ||
-            confidentiality != &descriptor.confidentiality ||
-            layout != &descriptor.layout
-        {
+        if artifact_type != &descriptor.artifact_type || layout != &descriptor.layout {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
         if !payload_matches(artifact_type, payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
-        }
-        if let Some(expected) = manifest_artifact.content_hash {
-            let verification_key = (key.production.clone(), key.name.clone(), expected);
-            if self.verified_families.contains(&verification_key) {
-                *self.loads.entry(key.clone()).or_default() += 1;
-                return Ok(payload.clone());
-            }
-            self.family_hash_verifications += 1;
-            let actual: [u8; 32] = match manifest_artifact.family_count {
-                None => Sha256::digest(payload_bytes(payload)).into(),
-                Some(count) => {
-                    let mut hasher = Sha256::new();
-                    for index in 0..count {
-                        let member_key = ArtifactKey {
-                            production: key.production.clone(),
-                            name: key.name.clone(),
-                            index: Some(index),
-                        };
-                        let (_, _, _, member) = self
-                            .entries
-                            .get(&member_key)
-                            .ok_or_else(|| MemoryArtifactError::Missing(member_key.clone()))?;
-                        let bytes = payload_bytes(member);
-                        hasher.update((index as u64).to_le_bytes());
-                        hasher.update((bytes.len() as u64).to_le_bytes());
-                        hasher.update(bytes);
-                    }
-                    hasher.finalize().into()
-                }
-            };
-            if actual != expected {
-                return Err(MemoryArtifactError::ContentHashMismatch(key.clone()));
-            }
-            self.verified_families.insert(verification_key);
         }
         *self.loads.entry(key.clone()).or_default() += 1;
         Ok(payload.clone())
@@ -1261,7 +1106,6 @@ impl ArtifactStore for MemoryArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error> {
@@ -1270,12 +1114,7 @@ impl ArtifactStore for MemoryArtifactStore {
         }
         match self.entries.entry(key.clone()) {
             Entry::Vacant(entry) => {
-                entry.insert((
-                    artifact_type.clone(),
-                    confidentiality,
-                    layout.map(str::to_owned),
-                    payload,
-                ));
+                entry.insert((artifact_type.clone(), layout.map(str::to_owned), payload));
                 #[cfg(test)]
                 {
                     self.peak_entries = self.peak_entries.max(self.entries.len());
@@ -1283,13 +1122,7 @@ impl ArtifactStore for MemoryArtifactStore {
                 Ok(())
             }
             Entry::Occupied(entry)
-                if entry.get() ==
-                    &(
-                        artifact_type.clone(),
-                        confidentiality,
-                        layout.map(str::to_owned),
-                        payload,
-                    ) =>
+                if entry.get() == &(artifact_type.clone(), layout.map(str::to_owned), payload) =>
             {
                 Ok(())
             }
@@ -1302,12 +1135,9 @@ impl ArtifactStore for MemoryArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error> {
-        let (stored_type, stored_confidentiality, stored_layout, payload) =
+        let (stored_type, stored_layout, payload) =
             self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
-        if stored_type != &descriptor.artifact_type ||
-            *stored_confidentiality != descriptor.confidentiality ||
-            stored_layout != &descriptor.layout
-        {
+        if stored_type != &descriptor.artifact_type || stored_layout != &descriptor.layout {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
         if !payload_matches(&descriptor.artifact_type, payload) {
@@ -1319,8 +1149,6 @@ impl ArtifactStore for MemoryArtifactStore {
 
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
         self.entries.remove(key);
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -1341,6 +1169,25 @@ impl ArtifactStore for MemoryArtifactStore {
 }
 
 impl SessionStore for MemoryArtifactStore {
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        let session = self
+            .sessions
+            .get(production)
+            .ok_or_else(|| MemoryArtifactError::MissingManifest(production.clone()))?;
+        if session.descriptor.production_id != *production ||
+            session.descriptor.ir_version != IR_VERSION ||
+            session.status != SessionStatus::Finalized
+        {
+            return Err(MemoryArtifactError::InvalidManifest(
+                "checkpoint production is not finalized".into(),
+            ));
+        }
+        self.load_manifest(production)
+    }
+
     fn resolve_session_nonce(
         &mut self,
         descriptor: &SessionAliasDescriptor,
@@ -1441,29 +1288,17 @@ impl SessionStore for MemoryArtifactStore {
             .entries
             .get(&handle.key)
             .ok_or_else(|| MemoryArtifactError::UnstoredArtifact(handle.key.clone()))?;
-        if stored.0 != handle.artifact_type ||
-            stored.1 != handle.confidentiality ||
-            stored.2 != handle.layout
-        {
+        if stored.0 != handle.artifact_type || stored.1 != handle.layout {
             return Err(MemoryArtifactError::DescriptorMismatch(handle.key.clone()));
         }
         let session = self.open_session_record(&handle.key.production)?;
         match session.committed_artifacts.entry(handle.key.clone()) {
             Entry::Vacant(entry) => {
-                entry.insert((
-                    handle.artifact_type.clone(),
-                    handle.confidentiality,
-                    handle.layout.clone(),
-                ));
+                entry.insert((handle.artifact_type.clone(), handle.layout.clone()));
                 Ok(())
             }
             Entry::Occupied(entry)
-                if entry.get() ==
-                    &(
-                        handle.artifact_type.clone(),
-                        handle.confidentiality,
-                        handle.layout.clone(),
-                    ) =>
+                if entry.get() == &(handle.artifact_type.clone(), handle.layout.clone()) =>
             {
                 Ok(())
             }
@@ -1479,11 +1314,7 @@ impl SessionStore for MemoryArtifactStore {
                 let check_index = |index| {
                     let key =
                         ArtifactKey { production: production.clone(), name: name.clone(), index };
-                    let expected = (
-                        artifact.artifact_type.clone(),
-                        artifact.confidentiality,
-                        artifact.layout.clone(),
-                    );
+                    let expected = (artifact.artifact_type.clone(), artifact.layout.clone());
                     if session.committed_artifacts.get(&key) != Some(&expected) {
                         Err(MemoryArtifactError::UncommittedArtifact(key))
                     } else {
@@ -1533,25 +1364,6 @@ fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> b
         (ArtifactType::TypedBlob { .. }, ArtifactPayload::TypedBlob(_)) => true,
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes)) => bytes.len() == *length,
         _ => false,
-    }
-}
-
-pub(crate) fn payload_bytes(payload: &ArtifactPayload) -> Vec<u8> {
-    match payload {
-        ArtifactPayload::Matrix(bytes) |
-        ArtifactPayload::SmallMatrix(bytes) |
-        ArtifactPayload::Bytes(bytes) |
-        ArtifactPayload::TypedBlob(bytes) => bytes.clone(),
-        ArtifactPayload::Trapdoor { public_bytes, secret_bytes } => {
-            let mut canonical = Vec::with_capacity(
-                16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
-            );
-            canonical.extend_from_slice(&(public_bytes.len() as u64).to_le_bytes());
-            canonical.extend_from_slice(public_bytes);
-            canonical.extend_from_slice(&(secret_bytes.len() as u64).to_le_bytes());
-            canonical.extend_from_slice(secret_bytes);
-            canonical
-        }
     }
 }
 
@@ -1606,8 +1418,6 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: ty.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Private,
-            content_hash: None,
             layout: Some(STAGED_FAMILY_LAYOUT.to_owned()),
         };
         let ram = key();
@@ -1620,7 +1430,6 @@ mod tests {
                 .store(
                     item.clone(),
                     &ty,
-                    descriptor.confidentiality,
                     descriptor.layout.as_deref(),
                     ArtifactPayload::Bytes(vec![7; 4]),
                 )
@@ -1638,21 +1447,12 @@ mod tests {
             .store(
                 ram.clone(),
                 &ty,
-                descriptor.confidentiality,
                 descriptor.layout.as_deref(),
                 ArtifactPayload::Bytes(vec![8; 4]),
             )
             .unwrap();
         assert!(!store.artifact_path(&ram).exists());
-        store
-            .store(
-                exported.clone(),
-                &ty,
-                descriptor.confidentiality,
-                None,
-                ArtifactPayload::Bytes(vec![9; 4]),
-            )
-            .unwrap();
+        store.store(exported.clone(), &ty, None, ArtifactPayload::Bytes(vec![9; 4])).unwrap();
         store.remove_staged(&ram).unwrap();
         store.remove_staged(&spill).unwrap();
         assert!(!store.artifact_path(&spill).exists());
@@ -1680,8 +1480,6 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
             layout: None,
         };
         let manifest = Manifest {
@@ -1699,7 +1497,6 @@ mod tests {
                         index: Some(index),
                     },
                     &artifact_type,
-                    ArtifactConfidentiality::Public,
                     None,
                     ArtifactPayload::Bytes(vec![index as u8]),
                 )
@@ -1719,70 +1516,6 @@ mod tests {
         );
         assert_eq!(store.load_count(&member_zero), 1);
         assert_eq!(store.load_count(&member_one), 0);
-    }
-
-    #[test]
-    fn file_store_explicitly_verifies_family_hash_and_detects_corruption() {
-        let directory = tempdir().expect("temporary artifact directory");
-        let production = production(35);
-        let artifact_type = ArtifactType::Bytes { length: 1 };
-        let mut hasher = Sha256::new();
-        for index in 0..2u8 {
-            let bytes = [index];
-            hasher.update((index as u64).to_le_bytes());
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        let descriptor = ManifestArtifact {
-            artifact_type: artifact_type.clone(),
-            family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: Some(hasher.finalize().into()),
-            layout: None,
-        };
-        let manifest = Manifest {
-            ir_version: IR_VERSION,
-            production_id: production.clone(),
-            artifacts: BTreeMap::from([(String::from("family"), descriptor.clone())]),
-        };
-        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
-        for index in 0..2 {
-            store
-                .store(
-                    ArtifactKey {
-                        production: production.clone(),
-                        name: String::from("family"),
-                        index: Some(index),
-                    },
-                    &artifact_type,
-                    ArtifactConfidentiality::Public,
-                    None,
-                    ArtifactPayload::Bytes(vec![index as u8]),
-                )
-                .expect("store family member");
-        }
-        store.store_manifest(manifest).expect("store manifest");
-        let member_zero = ArtifactKey {
-            production: production.clone(),
-            name: String::from("family"),
-            index: Some(0),
-        };
-        let member_one = ArtifactKey { production, name: String::from("family"), index: Some(1) };
-        store.verify_family(&member_zero, &descriptor).expect("verify intact family");
-
-        let member_path = store.artifact_path(&member_one);
-        let mut corrupted = fs::read(&member_path).expect("read member file");
-        *corrupted.last_mut().expect("member payload") = 42;
-        fs::write(member_path, corrupted).expect("corrupt member file");
-        let mut reopened = FileArtifactStore::new(directory.path()).expect("reopen store");
-        assert!(matches!(
-            reopened.verify_family(&member_zero, &descriptor),
-            Err(FileArtifactError::ContentHashMismatch(actual)) if actual == member_zero
-        ));
-        assert_eq!(
-            reopened.load(&member_zero, &descriptor).expect("load requested intact member"),
-            ArtifactPayload::Bytes(vec![0])
-        );
     }
 
     #[test]
@@ -1807,8 +1540,6 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: Some(Sha256::digest(&bytes).into()),
             layout: None,
         };
         let manifest = Manifest {
@@ -1819,13 +1550,7 @@ mod tests {
         let key = ArtifactKey { production, name: String::from("preimage"), index: None };
         let mut store = FileArtifactStore::new(directory.path()).expect("create store");
         store
-            .store(
-                key.clone(),
-                &artifact_type,
-                ArtifactConfidentiality::Public,
-                None,
-                ArtifactPayload::SmallMatrix(bytes.clone()),
-            )
+            .store(key.clone(), &artifact_type, None, ArtifactPayload::SmallMatrix(bytes.clone()))
             .expect("store preimage");
         store.store_manifest(manifest).expect("store manifest");
         assert_eq!(
@@ -1842,41 +1567,22 @@ mod tests {
         let key = ArtifactKey { production, name: String::from("value"), index: None };
         let mut store = FileArtifactStore::new(directory.path()).expect("create store");
         store
-            .store(
-                key.clone(),
-                &artifact_type,
-                ArtifactConfidentiality::Public,
-                None,
-                ArtifactPayload::Bytes(vec![1]),
-            )
+            .store(key.clone(), &artifact_type, None, ArtifactPayload::Bytes(vec![1]))
             .expect("store initial payload");
         let mut reopened = FileArtifactStore::new(directory.path()).expect("open second store");
         reopened
-            .store(
-                key.clone(),
-                &artifact_type,
-                ArtifactConfidentiality::Public,
-                None,
-                ArtifactPayload::Bytes(vec![1]),
-            )
+            .store(key.clone(), &artifact_type, None, ArtifactPayload::Bytes(vec![1]))
             .expect("idempotent immutable install");
         assert!(matches!(
             store.store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
                 None,
                 ArtifactPayload::Bytes(vec![2]),
             ),
             Err(FileArtifactError::ArtifactConflict(actual)) if actual == key
         ));
-        let descriptor = ManifestArtifact {
-            artifact_type,
-            family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
-            layout: None,
-        };
+        let descriptor = ManifestArtifact { artifact_type, family_count: None, layout: None };
         store
             .store_manifest(Manifest {
                 ir_version: IR_VERSION,
@@ -1939,8 +1645,6 @@ mod tests {
         let artifact_descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
             layout: None,
         };
         let key =
@@ -1976,21 +1680,10 @@ mod tests {
             .record_transcript_batch(&production, &[(site.clone(), value.clone())])
             .expect("record");
         store
-            .store(
-                key.clone(),
-                &artifact_type,
-                ArtifactConfidentiality::Public,
-                None,
-                ArtifactPayload::Bytes(vec![7]),
-            )
+            .store(key.clone(), &artifact_type, None, ArtifactPayload::Bytes(vec![7]))
             .expect("store output");
         store
-            .commit_artifact(&ArtifactHandle {
-                key: key.clone(),
-                artifact_type,
-                confidentiality: ArtifactConfidentiality::Public,
-                layout: None,
-            })
+            .commit_artifact(&ArtifactHandle { key: key.clone(), artifact_type, layout: None })
             .expect("commit output");
         store.finalize_session(manifest).expect("finalize");
         drop(store);
@@ -2015,7 +1708,6 @@ mod tests {
             .store(
                 key(),
                 &ArtifactType::Bytes { length: 3 },
-                ArtifactConfidentiality::Public,
                 None,
                 ArtifactPayload::Bytes(vec![1, 2]),
             )
@@ -2029,13 +1721,7 @@ mod tests {
             columns: 1,
         });
         let error = store
-            .store(
-                key(),
-                &matrix_type,
-                ArtifactConfidentiality::Private,
-                None,
-                ArtifactPayload::TypedBlob(vec![0]),
-            )
+            .store(key(), &matrix_type, None, ArtifactPayload::TypedBlob(vec![0]))
             .expect_err("wrong payload variant must be rejected");
         assert!(matches!(error, MemoryArtifactError::PayloadTypeMismatch(_)));
 
@@ -2180,15 +1866,13 @@ mod tests {
     }
 
     #[test]
-    fn artifact_load_verifies_manifest_hash_and_session_finalization_order() {
+    fn artifact_load_validates_manifest_and_session_finalization_order() {
         let production = ProductionId { spec_hash: SpecHash([12; 32]), execution_nonce: [13; 32] };
         let key =
             ArtifactKey { production: production.clone(), name: "bytes".to_owned(), index: None };
         let descriptor = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 3 },
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: Some([0; 32]),
             layout: None,
         };
         let manifest = Manifest {
@@ -2201,15 +1885,14 @@ mod tests {
             .insert(
                 key.clone(),
                 ArtifactType::Bytes { length: 3 },
-                ArtifactConfidentiality::Public,
                 ArtifactPayload::Bytes(vec![1, 2, 3]),
             )
             .expect("payload");
         store.store_manifest(manifest).expect("manifest");
-        assert!(matches!(
-            store.load(&key, &descriptor),
-            Err(MemoryArtifactError::ContentHashMismatch(actual)) if actual == key
-        ));
+        assert_eq!(
+            store.load(&key, &descriptor).expect("descriptor validation"),
+            ArtifactPayload::Bytes(vec![1, 2, 3])
+        );
 
         let session_production =
             ProductionId { spec_hash: SpecHash([14; 32]), execution_nonce: [15; 32] };
@@ -2224,8 +1907,6 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 3 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
@@ -2239,45 +1920,16 @@ mod tests {
     }
 
     #[test]
-    fn memory_store_rejects_private_manifest_content_hashes() {
-        let production = ProductionId { spec_hash: SpecHash([17; 32]), execution_nonce: [18; 32] };
-        let manifest = Manifest {
-            ir_version: mxx_ir_core::encoding::IR_VERSION,
-            production_id: production,
-            artifacts: BTreeMap::from([(
-                "private".to_owned(),
-                ManifestArtifact {
-                    artifact_type: ArtifactType::Bytes { length: 1 },
-                    family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: Some([19; 32]),
-                    layout: None,
-                },
-            )]),
-        };
-        let mut store = MemoryArtifactStore::default();
-
-        assert!(matches!(
-            store.store_manifest(manifest),
-            Err(MemoryArtifactError::InvalidManifest(_))
-        ));
-    }
-
-    #[test]
     fn manifest_snapshot_contains_every_scalar_and_family_payload() {
         let production = ProductionId { spec_hash: SpecHash([20; 32]), execution_nonce: [21; 32] };
         let scalar = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Private,
-            content_hash: None,
             layout: None,
         };
         let family = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
             layout: Some("lane".to_owned()),
         };
         let manifest = Manifest {
@@ -2297,7 +1949,6 @@ mod tests {
                     index: None,
                 },
                 &scalar.artifact_type,
-                scalar.confidentiality,
                 scalar.layout.as_deref(),
                 ArtifactPayload::Bytes(vec![1]),
             )
@@ -2311,7 +1962,6 @@ mod tests {
                         index: Some(index),
                     },
                     &family.artifact_type,
-                    family.confidentiality,
                     family.layout.as_deref(),
                     ArtifactPayload::Bytes(vec![index as u8]),
                 )

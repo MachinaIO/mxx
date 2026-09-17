@@ -74,7 +74,7 @@ fn modular_product(moduli: &[u64], modulus: u64) -> u64 {
 }
 
 /// Upper-bound the total quotient contribution introduced by the explicit `full_reduce()` calls
-/// inside [`NestedRnsPoly::conv_between_levels`].
+/// inside `NestedRnsPoly::conv_between_levels`.
 pub fn full_reduce_error_quotient_by_conv(
     source_moduli: &[u64],
     full_reduce_max_plaintexts: &[BigUint],
@@ -94,7 +94,7 @@ pub fn full_reduce_error_quotient_by_conv(
         .sum::<BigUint>()
 }
 
-/// Upper-bound the total quotient error contributed by [`NestedRnsPoly::conv_between_levels`].
+/// Upper-bound the total quotient error contributed by `NestedRnsPoly::conv_between_levels`.
 ///
 /// This adds the explicit `full_reduce()` quotient term and the unsigned Conv carry term, one per
 /// source modulus.

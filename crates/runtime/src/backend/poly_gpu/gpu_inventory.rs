@@ -1563,6 +1563,12 @@ impl GpuContextDemand {
         mut layout: GpuPreparedWorkspaceLayout,
         shared: bool,
     ) {
+        // Compact payloads are value owners, not sibling-batch scratch.  A
+        // parallel child owns one payload per live member, and an ImportCompact
+        // destination is live together with its decode scratch.  Keep this
+        // invariant at the typed-demand boundary so an accidental caller-side
+        // shared flag cannot collapse simultaneous payload slots.
+        let shared = shared && layout.kind != GpuPreparedSlotKind::CompactPayload;
         let requested_layout = layout;
         use super::gpu_prepare::capacity_class;
         let matches = |previous: &GpuPreparedWorkspaceLayout| {
@@ -5462,7 +5468,7 @@ mod tests {
         let context = DslContext::new("admission-streamed-private-input");
         let input = ring.input("input", (2, 3));
         let graph = context
-            .private_output("output", input)
+            .artifact_output("output", input)
             .unwrap()
             .build()
             .unwrap()
@@ -5552,7 +5558,7 @@ mod tests {
         let right = ring.input("right", (1, 1));
         let selected = mxx_dsl::select(index, vec![left, right]).unwrap();
         let graph = context
-            .private_output("selected", selected)
+            .artifact_output("selected", selected)
             .unwrap()
             .build()
             .unwrap()
@@ -5617,8 +5623,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_graph_admission_artifact_input_reexport_includes_import_and_readback() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
 
         let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
@@ -5656,20 +5661,13 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(ty.clone()),
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
         };
-        let input = ring.artifact_input(
-            production.clone(),
-            "input",
-            (2, 3),
-            ArtifactConfidentiality::Private,
-        );
+        let input = ring.artifact_input(production.clone(), "input", (2, 3));
         let graph = DslContext::new("admission-artifact-input-reexport")
-            .private_output("output", input)
+            .artifact_output("output", input)
             .unwrap()
             .build()
             .unwrap()
@@ -5725,8 +5723,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_graph_admission_static_staged_family_reexport_includes_import_and_readback() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
 
         let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
@@ -5764,21 +5761,13 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(ty.clone()),
                     family_count: Some(2),
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
         };
-        let family = ring.family_artifact_input(
-            production.clone(),
-            "members",
-            2,
-            (1, 1),
-            ArtifactConfidentiality::Private,
-        );
+        let family = ring.family_artifact_input(production.clone(), "members", 2, (1, 1));
         let graph = DslContext::new("admission-static-staged-family-reexport")
-            .private_output("selected", family.at(0))
+            .artifact_output("selected", family.at(0))
             .unwrap()
             .build()
             .unwrap()
@@ -5828,8 +5817,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_graph_admission_lazy_bounded_reexport_keeps_import_and_destination_payloads() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
 
         let Some(&device) = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids().first()
@@ -5872,25 +5860,13 @@ mod tests {
                 production_id: production.clone(),
                 artifacts: BTreeMap::from([(
                     "compact".into(),
-                    ManifestArtifact {
-                        artifact_type,
-                        family_count: None,
-                        confidentiality: ArtifactConfidentiality::Private,
-                        content_hash: None,
-                        layout: None,
-                    },
+                    ManifestArtifact { artifact_type, family_count: None, layout: None },
                 )]),
             };
             let graph = if preimage {
-                let input = ring.preimage_artifact_input(
-                    production.clone(),
-                    "compact",
-                    (2, 1),
-                    7,
-                    ArtifactConfidentiality::Private,
-                );
+                let input = ring.preimage_artifact_input(production.clone(), "compact", (2, 1), 7);
                 DslContext::new("admission-lazy-preimage-reexport")
-                    .private_output("output", input)
+                    .artifact_output("output", input)
                     .unwrap()
                     .build()
                     .unwrap()
@@ -5900,15 +5876,10 @@ mod tests {
                     )
                     .unwrap()
             } else {
-                let input = ring.small_matrix_artifact_input(
-                    production.clone(),
-                    "compact",
-                    (2, 1),
-                    7,
-                    ArtifactConfidentiality::Private,
-                );
+                let input =
+                    ring.small_matrix_artifact_input(production.clone(), "compact", (2, 1), 7);
                 DslContext::new("admission-lazy-small-matrix-reexport")
-                    .private_output("output", input)
+                    .artifact_output("output", input)
                     .unwrap()
                     .build()
                     .unwrap()
@@ -6085,7 +6056,7 @@ mod tests {
         let matrix = ring.input("matrix", (2, 2 * digits));
         let product = matrix.mul_small_rhs(bounded.clone());
         let graph = context
-            .private_output("bounded", bounded)
+            .artifact_output("bounded", bounded)
             .unwrap()
             .output("product", product)
             .unwrap()
@@ -6205,7 +6176,7 @@ mod tests {
         let child_value = child.call(ring.input("child_input", (1, 1))).unwrap();
         let product = child_value.clone() * ring.input("factor", (1, 1));
         let graph = context
-            .private_output("child", child_value)
+            .artifact_output("child", child_value)
             .unwrap()
             .output("product", product)
             .unwrap()
@@ -6291,7 +6262,7 @@ mod tests {
         let ring = Ring::new(params.modulus().as_ref().clone(), n as usize);
         let family = mxx_dsl::parallel(2, |_| Ok(ring.input("input", (2, 3)))).unwrap();
         let graph = DslContext::new("cached-admission-invariant")
-            .private_output("output", family)
+            .artifact_output("output", family)
             .unwrap()
             .build()
             .unwrap()
@@ -6406,7 +6377,7 @@ mod tests {
         })
         .unwrap();
         let graph = DslContext::new("recipe-nested-bindings")
-            .private_output("family", family.clone())
+            .artifact_output("family", family.clone())
             .unwrap()
             .output("selected", -family.at(1))
             .unwrap()
@@ -7679,6 +7650,31 @@ mod tests {
             2,
             "escaping resources cannot alias a later transient resource"
         );
+
+        // Compact payloads are per-value owners even if a caller accidentally
+        // marks them as shared.  This is the typed inventory shape used by an
+        // ImportCompact destination/scratch pair and by parallel-body members:
+        // one retained root payload plus four simultaneously live child
+        // payloads must produce five native slots.
+        let compact = GpuPreparedWorkspaceLayout {
+            kind: GpuPreparedSlotKind::CompactPayload,
+            bytes: 4096,
+            alignment: 256,
+        };
+        let mut root_owner = GpuContextDemand::default();
+        root_owner.workspace(0, 4, compact, true);
+        let child = (0..4).map(|_| {
+            let mut demand = GpuContextDemand::default();
+            demand.workspace(2, 2, compact, true);
+            demand
+        });
+        let merged = GpuContextDemand::simultaneous(std::iter::once(root_owner).chain(child));
+        assert_eq!(
+            merged.layouts.len(),
+            5,
+            "compact payload owners cannot share a slot at an overlapping IR position"
+        );
+        assert!(merged.layout_shared.iter().all(|shared| !shared));
     }
 
     #[test]
@@ -7775,7 +7771,7 @@ mod tests {
                 }],
                 BTreeMap::from([(
                     "public".into(),
-                    mxx_ir_core::GraphOutput { value: outputs, confidentiality: None },
+                    mxx_ir_core::GraphOutput { artifact_output: false, value: outputs },
                 )]),
                 vec![],
                 vec![],
@@ -8129,8 +8125,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_gpu_inventory_lazy_family_demand_depends_on_selected_members() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|value| value.parse::<u32>().unwrap())
@@ -8167,19 +8162,11 @@ mod tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(ty.clone()),
                         family_count: Some(count),
-                        confidentiality: ArtifactConfidentiality::Private,
-                        content_hash: None,
                         layout: None,
                     },
                 )]),
             };
-            let members = ring.family_artifact_input(
-                production.clone(),
-                "members",
-                count,
-                (2, 3),
-                ArtifactConfidentiality::Private,
-            );
+            let members = ring.family_artifact_input(production.clone(), "members", count, (2, 3));
             let graph = DslContext::new("lazy-family-inventory")
                 .output("selected", -members.at(0))
                 .unwrap()
@@ -8218,8 +8205,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_gpu_inventory_lazy_scalar_packs_match_lazy_families() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|v| v.parse::<u32>().unwrap())
@@ -8280,8 +8266,6 @@ mod tests {
                                     ManifestArtifact {
                                         artifact_type: artifact_type.clone(),
                                         family_count: (!packed).then_some(count),
-                                        confidentiality: ArtifactConfidentiality::Private,
-                                        content_hash: None,
                                         layout: None,
                                     },
                                 )
@@ -8299,7 +8283,6 @@ mod tests {
                                             name.clone(),
                                             (2, 3),
                                             7,
-                                            ArtifactConfidentiality::Private,
                                         )
                                     })
                                     .collect(),
@@ -8312,7 +8295,6 @@ mod tests {
                                 count,
                                 (2, 3),
                                 7,
-                                ArtifactConfidentiality::Private,
                             )
                         };
                         let selected = if select_candidates {
@@ -8332,20 +8314,13 @@ mod tests {
                                             production.clone(),
                                             name.clone(),
                                             (2, 3),
-                                            ArtifactConfidentiality::Private,
                                         )
                                     })
                                     .collect(),
                             )
                             .unwrap()
                         } else {
-                            ring.family_artifact_input(
-                                production.clone(),
-                                "members",
-                                count,
-                                (2, 3),
-                                ArtifactConfidentiality::Private,
-                            )
+                            ring.family_artifact_input(production.clone(), "members", count, (2, 3))
                         };
                         let selected = if select_candidates {
                             mxx_dsl::select(0, (0..count).map(|index| members.at(index)).collect())
@@ -8401,8 +8376,6 @@ mod tests {
                                 ManifestArtifact {
                                     artifact_type: ArtifactType::Matrix(ty.clone()),
                                     family_count: None,
-                                    confidentiality: ArtifactConfidentiality::Private,
-                                    content_hash: None,
                                     layout: None,
                                 },
                             )
@@ -8412,12 +8385,7 @@ mod tests {
                 let members = mxx_dsl::Family::pack(
                     std::iter::once(ring.input("eager", (2, 3)))
                         .chain(names.iter().map(|name| {
-                            ring.artifact_input(
-                                production.clone(),
-                                name.clone(),
-                                (2, 3),
-                                ArtifactConfidentiality::Private,
-                            )
+                            ring.artifact_input(production.clone(), name.clone(), (2, 3))
                         }))
                         .collect(),
                 )
@@ -8482,8 +8450,7 @@ mod tests {
     fn test_gpu_broadcast_staged_family_dynamic_selection_has_import_capacity() {
         use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|v| v.parse::<u32>().unwrap())
@@ -8521,8 +8488,6 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(ty.clone()),
                     family_count: Some(count),
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
@@ -8541,19 +8506,12 @@ mod tests {
                         index: Some(index),
                     },
                     &ArtifactType::Matrix(ty.clone()),
-                    ArtifactConfidentiality::Private,
                     None,
                     ArtifactPayload::Matrix(bytes.clone()),
                 )
                 .unwrap();
         }
-        let family = ring.family_artifact_input(
-            production.clone(),
-            "members",
-            count,
-            (2, 1),
-            ArtifactConfidentiality::Private,
-        );
+        let family = ring.family_artifact_input(production.clone(), "members", count, (2, 1));
         // Modulo prevents Zip lowering; no arithmetic consumer can hide a
         // missing import by lending its own scratch to this selected output.
         let output = mxx_dsl::parallel(2, |i| Ok(family.at(i % count))).unwrap();
@@ -8799,8 +8757,8 @@ mod tests {
     fn test_gpu_zip_compact_inputs_are_owned_before_body_execution() {
         use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, ConcreteBoundedMatrixSchema, Manifest,
-            ManifestArtifact, ProductionId, SmallMatrixSemanticKind, SpecHash,
+            ArtifactType, ConcreteBoundedMatrixSchema, Manifest, ManifestArtifact, ProductionId,
+            SmallMatrixSemanticKind, SpecHash,
         };
         use mxx_primitives::matrix::{
             PolyMatrixSmallRhs, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix,
@@ -8886,8 +8844,6 @@ mod tests {
                             ManifestArtifact {
                                 artifact_type: artifact_type.clone(),
                                 family_count: Some(count),
-                                confidentiality: ArtifactConfidentiality::Private,
-                                content_hash: None,
                                 layout: None,
                             },
                         )
@@ -8906,7 +8862,6 @@ mod tests {
                                 index: Some(index),
                             },
                             &artifact_type,
-                            ArtifactConfidentiality::Private,
                             None,
                             ArtifactPayload::SmallMatrix(bytes.clone()),
                         )
@@ -8924,7 +8879,6 @@ mod tests {
                             count,
                             (2, 1),
                             7,
-                            ArtifactConfidentiality::Private,
                         );
                         mxx_dsl::parallel(count, |i| Ok(input.at(i))).unwrap()
                     })
@@ -8947,7 +8901,6 @@ mod tests {
                             count,
                             (2, 1),
                             7,
-                            ArtifactConfidentiality::Private,
                         );
                         mxx_dsl::parallel(count, |i| Ok(input.at(i))).unwrap()
                     })
@@ -9011,8 +8964,7 @@ mod tests {
     fn test_gpu_loop_broadcast_of_a_lazy_input_loads_once() {
         use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|v| v.parse::<u32>().unwrap())
@@ -9049,7 +9001,6 @@ mod tests {
             .store(
                 ArtifactKey { production: production.clone(), name: "input".into(), index: None },
                 &ArtifactType::Matrix(ty.clone()),
-                ArtifactConfidentiality::Private,
                 None,
                 ArtifactPayload::Matrix(
                     GpuDCRTPolyMatrix::from_cpu_matrix(&params, &original).to_compact_bytes(),
@@ -9064,19 +9015,12 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(ty),
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
         };
         store.store_manifest(manifest.clone()).unwrap();
-        let input = ring.artifact_input(
-            production.clone(),
-            "input",
-            (2, 3),
-            ArtifactConfidentiality::Private,
-        );
+        let input = ring.artifact_input(production.clone(), "input", (2, 3));
         let negated = mxx_dsl::parallel(count, |_| Ok(-input.clone())).unwrap();
         let graph = DslContext::new("gpu-loop-broadcast-import-once")
             .output("negated", negated)
@@ -9142,8 +9086,7 @@ mod tests {
     fn test_gpu_inventory_lazy_input_cached_across_intervening_operations() {
         use crate::artifact::{ArtifactKey, ArtifactPayload, ArtifactStore};
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|v| v.parse::<u32>().unwrap())
@@ -9177,7 +9120,6 @@ mod tests {
             .store(
                 ArtifactKey { production: production.clone(), name: "input".into(), index: None },
                 &ArtifactType::Matrix(ty.clone()),
-                ArtifactConfidentiality::Private,
                 None,
                 ArtifactPayload::Matrix(bytes.clone()),
             )
@@ -9190,19 +9132,12 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Matrix(ty),
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
         };
         store.store_manifest(manifest.clone()).unwrap();
-        let input = ring.artifact_input(
-            production.clone(),
-            "input",
-            (2, 3),
-            ArtifactConfidentiality::Private,
-        );
+        let input = ring.artifact_input(production.clone(), "input", (2, 3));
         let mut intermediate = -mxx_dsl::select(0, vec![input.clone(), input.clone()]).unwrap();
         let count = std::env::var("MXX_PRIMITIVE_TEST_MATRIX_SIZE")
             .map(|v| v.parse::<usize>().unwrap())
@@ -9246,12 +9181,7 @@ mod tests {
 
         // Returned lazy descriptors must also be importable when the caller
         // requests the whole output family after graph execution.
-        let input = ring.artifact_input(
-            production.clone(),
-            "input",
-            (2, 3),
-            ArtifactConfidentiality::Private,
-        );
+        let input = ring.artifact_input(production.clone(), "input", (2, 3));
         let family = mxx_dsl::Family::pack(vec![input; count]).unwrap();
         let graph = DslContext::new("retained-lazy-output-family")
             .output("result", family)
@@ -10257,8 +10187,7 @@ mod tests {
     #[serial_test::serial(gpu_context)]
     fn test_gpu_eager_selection_reuses_existing_owner_inventory() {
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         let production =
             ProductionId { spec_hash: SpecHash(rand::random()), execution_nonce: rand::random() };
@@ -10290,12 +10219,7 @@ mod tests {
                 2 => mxx_dsl::select(0, vec![input_wire.clone(), input_wire.clone()]).unwrap(),
                 _ => mxx_dsl::Family::pack(vec![
                     input_wire.clone(),
-                    ring.artifact_input(
-                        production.clone(),
-                        "unused",
-                        (2, 5),
-                        ArtifactConfidentiality::Private,
-                    ),
+                    ring.artifact_input(production.clone(), "unused", (2, 5)),
                 ])
                 .unwrap()
                 .at(0),
@@ -10313,8 +10237,6 @@ mod tests {
                             modulus: params.modulus().as_ref().clone().into(),
                         }),
                         family_count: None,
-                        confidentiality: ArtifactConfidentiality::Private,
-                        content_hash: None,
                         layout: None,
                     },
                 )]),
@@ -10722,8 +10644,7 @@ mod tests {
             gpu_measurement::GpuAdmittedMeasurement,
         };
         use mxx_ir_core::artifact::{
-            ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
-            SpecHash,
+            ArtifactType, Manifest, ManifestArtifact, ProductionId, SpecHash,
         };
         use std::{collections::BTreeSet, num::NonZeroUsize, time::Instant};
         // Explicit benchmark capture boundaries exclude class discovery and
@@ -10793,8 +10714,6 @@ mod tests {
             let descriptor = ManifestArtifact {
                 artifact_type: ArtifactType::Matrix(ty.clone()),
                 family_count: None,
-                confidentiality: ArtifactConfidentiality::Private,
-                content_hash: None,
                 layout: None,
             };
             let manifest = Manifest {
@@ -10803,12 +10722,7 @@ mod tests {
                 artifacts: BTreeMap::from([("input".into(), descriptor)]),
             };
             let input = if case == "lazy_checkpoint" {
-                ring.artifact_input(
-                    production.clone(),
-                    "input",
-                    (rows, columns),
-                    ArtifactConfidentiality::Private,
-                )
+                ring.artifact_input(production.clone(), "input", (rows, columns))
             } else {
                 ring.input("input", (rows, columns))
             };
@@ -10862,7 +10776,6 @@ mod tests {
                             .store(
                                 key.clone(),
                                 &ArtifactType::Matrix(ty.clone()),
-                                ArtifactConfidentiality::Private,
                                 None,
                                 ArtifactPayload::Matrix(input_bytes.clone()),
                             )

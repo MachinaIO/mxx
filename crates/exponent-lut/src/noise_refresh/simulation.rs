@@ -6,7 +6,7 @@
 
 use crate::noise_utils::{NoiseMoments, NonnegativeRational, RightActionNoiseGain};
 use mxx_ir_core::{
-    artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId},
+    artifact::{ArtifactType, Manifest, ManifestArtifact, ProductionId},
     types::ConcreteMatrixType,
     validate::ValidatedGraph,
 };
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-pub const AVERAGE_CASE_REPORT_SCHEMA_VERSION: u32 = 3;
+pub const AVERAGE_CASE_REPORT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum NoiseModelKind {
@@ -93,7 +93,7 @@ impl AverageCaseConfig {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ValueReadoutNoiseGains {
+pub struct LutOutputNoiseGains {
     pub target: RightActionNoiseGain,
     pub identity_trace: RightActionNoiseGain,
     pub nonidentity_trace: Vec<TraceNoiseGains>,
@@ -148,27 +148,28 @@ pub struct RefreshTranscriptTopology {
 }
 
 impl RefreshTranscriptTopology {
-    /// Size PRF labels from the selected scheme's actual encoding carrier.
+    /// Size PRF labels from the selected concrete encoding carrier.
     /// Mask digits are slot-specific; fresh-error digits form one shared group.
-    pub fn new<S: crate::scheme::ExponentLUTEncodingScheme>(
-        scheme: &S,
-        key: &S::PublicKey,
-        env: &mxx_ir_core::ParamEnv,
+    pub fn new(
+        component_columns: usize,
+        coefficient_count: usize,
         mask_digit_counts: Vec<usize>,
         fresh_digit_count: usize,
     ) -> Result<Self, NoiseSimulationError> {
-        let (polynomials, coefficients) = scheme.encoding_dimensions(key);
-        let concrete = |value: mxx_ir_core::IntExpr| {
-            value
-                .evaluate(env)
-                .ok()
-                .and_then(|value| value.to_usize())
-                .ok_or(NoiseSimulationError::IntegerConversion)
-        };
+        if component_columns == 0 ||
+            coefficient_count == 0 ||
+            mask_digit_counts.is_empty() ||
+            mask_digit_counts.iter().any(|count| *count == 0) ||
+            fresh_digit_count == 0
+        {
+            return Err(NoiseSimulationError::InvalidRefresh(
+                "encoding topology dimensions and digit counts must be positive",
+            ));
+        }
         Ok(Self {
             crt_slot_count: mask_digit_counts.len(),
-            component_columns: concrete(polynomials)?,
-            coefficient_count: concrete(coefficients)?,
+            component_columns,
+            coefficient_count,
             mask_digit_counts,
             fresh_digit_count,
         })
@@ -197,18 +198,6 @@ impl RefreshTranscriptTopology {
             .and_then(|value| value.checked_mul(self.fresh_digit_count))
             .ok_or(NoiseSimulationError::IntegerConversion)?;
         mask_events.checked_add(fresh_events).ok_or(NoiseSimulationError::IntegerConversion)
-    }
-
-    /// Number `D` of mask transcript coordinates used by the smudging bound:
-    /// `mask_slot_count * component_columns * coefficient_count`.
-    pub(crate) fn mask_smudging_coordinates(&self) -> Result<usize, NoiseSimulationError> {
-        if self.crt_slot_count == 0 || self.component_columns == 0 || self.coefficient_count == 0 {
-            return Err(NoiseSimulationError::InvalidRefresh("invalid transcript topology"));
-        }
-        self.crt_slot_count
-            .checked_mul(self.component_columns)
-            .and_then(|value| value.checked_mul(self.coefficient_count))
-            .ok_or(NoiseSimulationError::IntegerConversion)
     }
 }
 
@@ -496,7 +485,8 @@ pub struct AverageVarianceBreakdown {
     pub decoder: NonnegativeRational,
     pub state: NonnegativeRational,
     /// Conditional nominal payload moments in physical coordinates. Other
-    /// fields above are operational variances in BGG's doubled coordinates.
+    /// fields above are operational variances in the selected adapter's
+    /// coordinate convention.
     pub mask_uniform_moments: NoiseMoments,
     pub fresh_uniform_moments: NoiseMoments,
 }
@@ -723,20 +713,6 @@ fn integer_sqrt_floor(value: &BigUint) -> BigUint {
     low
 }
 
-/// Exact hard operational budget shared by reports and numeric diagnostics.
-pub(crate) fn switched_error_bound(
-    pre_switch: &BigUint,
-    lift: &BigUint,
-    ring_dimension: usize,
-    decoder: &BigUint,
-) -> Result<BigUint, NoiseSimulationError> {
-    if lift.is_zero() {
-        return Err(NoiseSimulationError::InvalidRefresh("zero switching lift"));
-    }
-    let rounding = (lift - 1u8) * (BigUint::from(ring_dimension) + 2u8);
-    Ok(ceil_div(&(pre_switch * 2u8 + rounding), &(lift * 2u8))? + decoder)
-}
-
 pub(crate) fn ceil_div(
     numerator: &BigUint,
     denominator: &BigUint,
@@ -912,8 +888,6 @@ mod tests {
         };
         // Mask routes are slot-specific; fresh routes are one shared group.
         assert_eq!(config.joint_event_count(&topology).unwrap(), BigUint::from(36u8));
-        // Smudging uses only mask coordinates: 2 slots * 4 columns * 3 coefficients.
-        assert_eq!(topology.mask_smudging_coordinates().unwrap(), 24);
         assert_eq!(
             config.z_squared(&topology).unwrap(),
             NonnegativeRational::new(
@@ -925,6 +899,23 @@ mod tests {
     }
 
     #[test]
+    fn transcript_topology_rejects_missing_digit_groups() {
+        for (mask_digits, fresh_digits) in [(Vec::new(), 1), (vec![0], 1), (vec![1], 0)] {
+            assert!(RefreshTranscriptTopology::new(1, 1, mask_digits, fresh_digits).is_err());
+        }
+    }
+
+    #[test]
+    fn transcript_topology_keeps_only_concrete_encoding_dimensions() {
+        let topology = RefreshTranscriptTopology::new(2, 8, vec![3, 4], 2).unwrap();
+        assert_eq!(topology.crt_slot_count, 2);
+        assert_eq!(topology.component_columns, 2);
+        assert_eq!(topology.coefficient_count, 8);
+        assert_eq!(topology.mask_digit_counts, vec![3, 4]);
+        assert_eq!(topology.fresh_digit_count, 2);
+    }
+
+    #[test]
     fn average_favg_uses_exact_ceil_sqrt_after_division_by_four() {
         let z_squared = NonnegativeRational::new(BigUint::one(), BigUint::one()).unwrap();
         let variance = NonnegativeRational::new(BigUint::from(16u8), BigUint::one()).unwrap();
@@ -933,12 +924,12 @@ mod tests {
     }
 }
 
-/// Storage accounting separates protocol public material from deterministic
+/// Storage accounting separates canonical protocol material from deterministic
 /// decomposition acceleration data and from bounded resident waves.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExponentLutStorageReport {
-    pub canonical_public_artifact_bytes: u128,
-    pub private_label_input_bytes: u128,
+    pub canonical_artifact_bytes: u128,
+    pub artifact_input_bytes: u128,
     pub decoder_preimage_bytes: u128,
     pub decomposition_cache_artifact_bytes: u128,
     pub peak_loaded_host_bytes: u64,
@@ -946,13 +937,11 @@ pub struct ExponentLutStorageReport {
     pub peak_workspace_bytes_per_gpu: u64,
 }
 
-/// Storage accounting separates protocol artifacts from deterministic
+/// Storage accounting separates canonical protocol artifacts from deterministic
 /// decomposition artifacts without introducing an application-specific store
-/// format.  The producer contract reserves public relation-bearing
-/// `Preimage` artifacts for deterministic gadget decompositions; private
-/// relation-bearing artifacts are decoder preimages.  Consequently a public
-/// matrix is always protocol material, never cache material, even when its
-/// name happens to contain a cache-related word.
+/// format.  The artifact type identifies relation-bearing preimages; their
+/// layout metadata identifies whether they are decomposition cache material or
+/// decoder material.  Other artifact types are canonical artifacts.
 impl ExponentLutStorageReport {
     /// Computes storage accounting from the producer manifests and validated
     /// graph metadata.  Manifest entries are deduplicated by production and
@@ -980,32 +969,29 @@ impl ExponentLutStorageReport {
                 let member = artifact_member_bytes(artifact);
                 report.peak_loaded_host_bytes =
                     report.peak_loaded_host_bytes.saturating_add(member);
-                match (&artifact.artifact_type, artifact.confidentiality) {
-                    (ArtifactType::Preimage { .. }, ArtifactConfidentiality::Public) => {
+                match artifact_storage_purpose(artifact) {
+                    ArtifactStoragePurpose::DecompositionCache => {
                         report.decomposition_cache_artifact_bytes += persistent;
                     }
-                    (ArtifactType::Preimage { .. }, ArtifactConfidentiality::Private) => {
+                    ArtifactStoragePurpose::DecoderPreimage => {
                         report.decoder_preimage_bytes += persistent;
                     }
-                    (_, ArtifactConfidentiality::Public) => {
-                        report.canonical_public_artifact_bytes += persistent;
+                    ArtifactStoragePurpose::Canonical => {
+                        report.canonical_artifact_bytes += persistent;
                     }
-                    (_, ArtifactConfidentiality::Private) => {}
                 }
             }
         }
 
-        // Inputs that are private and not relation-bearing are the online
-        // label/input material.  They are not manifest outputs and therefore
-        // must be collected from the validated graph's artifact metadata.
+        // Non-relation-bearing artifact inputs are online label/input material.
+        // They are not manifest outputs and therefore must be collected from
+        // the validated graph's artifact metadata.
         for graph in graphs {
             for scope in graph.scopes.values() {
                 for artifact in scope.artifact_inputs.values() {
-                    if artifact.confidentiality == ArtifactConfidentiality::Private &&
-                        !matches!(artifact.artifact_type, ArtifactType::Preimage { .. })
-                    {
-                        report.private_label_input_bytes =
-                            report.private_label_input_bytes + artifact_persistent_bytes(artifact);
+                    if !matches!(artifact.artifact_type, ArtifactType::Preimage { .. }) {
+                        report.artifact_input_bytes =
+                            report.artifact_input_bytes + artifact_persistent_bytes(artifact);
                     }
                 }
             }
@@ -1026,6 +1012,26 @@ impl ExponentLutStorageReport {
         self.peak_loaded_device_bytes_per_gpu = peak_loaded_device_bytes_per_gpu;
         self.peak_workspace_bytes_per_gpu = peak_workspace_bytes_per_gpu;
         self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtifactStoragePurpose {
+    Canonical,
+    DecompositionCache,
+    DecoderPreimage,
+}
+
+/// Derives the accounting purpose from frozen artifact metadata.  Producers
+/// that publish a deterministic preimage decomposition set the explicit
+/// layout token; an unlabelled preimage remains decoder material by default.
+fn artifact_storage_purpose(artifact: &ManifestArtifact) -> ArtifactStoragePurpose {
+    if !matches!(artifact.artifact_type, ArtifactType::Preimage { .. }) {
+        return ArtifactStoragePurpose::Canonical;
+    }
+    match artifact.layout.as_deref() {
+        Some("decomposition-cache") => ArtifactStoragePurpose::DecompositionCache,
+        _ => ArtifactStoragePurpose::DecoderPreimage,
     }
 }
 
@@ -1095,15 +1101,13 @@ mod storage_report_tests {
             rows: 2,
             columns: 3,
         };
-        let compact = |confidentiality, family_count| ManifestArtifact {
+        let compact = |layout, family_count| ManifestArtifact {
             artifact_type: ArtifactType::Preimage {
                 matrix: matrix.clone(),
                 max_coefficient_bound: BigInt::from(7),
             },
             family_count,
-            confidentiality,
-            content_hash: None,
-            layout: None,
+            layout,
         };
         let manifest = Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,
@@ -1114,18 +1118,16 @@ mod storage_report_tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix.clone()),
                         family_count: None,
-                        confidentiality: ArtifactConfidentiality::Public,
-                        content_hash: None,
                         layout: None,
                     },
                 ),
-                ("cache".to_owned(), compact(ArtifactConfidentiality::Public, Some(4))),
-                ("decoder".to_owned(), compact(ArtifactConfidentiality::Private, Some(4))),
+                ("cache".to_owned(), compact(Some("decomposition-cache".to_owned()), Some(4))),
+                ("decoder".to_owned(), compact(Some("decoder-preimage".to_owned()), Some(4))),
             ]),
         };
         let report = ExponentLutStorageReport::from_metadata([&manifest], std::iter::empty());
         assert_eq!(
-            report.canonical_public_artifact_bytes,
+            report.canonical_artifact_bytes,
             u128::from(artifact_member_bytes(manifest.artifacts.get("public-matrix").unwrap()))
         );
         assert_eq!(
@@ -1140,7 +1142,7 @@ mod storage_report_tests {
             report.peak_loaded_host_bytes,
             manifest.artifacts.values().map(artifact_member_bytes).sum::<u64>()
         );
-        assert_eq!(report.private_label_input_bytes, 0);
+        assert_eq!(report.artifact_input_bytes, 0);
     }
 
     #[test]
@@ -1155,8 +1157,6 @@ mod storage_report_tests {
                 max_coefficient_bound: BigInt::from(7),
             },
             family_count: Some(usize::MAX),
-            confidentiality: ArtifactConfidentiality::Public,
-            content_hash: None,
             layout: None,
         };
         let manifest = Manifest {
@@ -1165,9 +1165,9 @@ mod storage_report_tests {
             artifacts: BTreeMap::from([("huge-family".to_owned(), artifact)]),
         };
         let report = ExponentLutStorageReport::from_metadata([&manifest], std::iter::empty());
-        assert!(report.decomposition_cache_artifact_bytes > u128::from(u64::MAX));
+        assert!(report.decoder_preimage_bytes > u128::from(u64::MAX));
         assert_eq!(
-            report.decomposition_cache_artifact_bytes,
+            report.decoder_preimage_bytes,
             artifact_persistent_bytes(manifest.artifacts.get("huge-family").unwrap())
         );
     }

@@ -7,7 +7,6 @@ use mxx_runtime::{
     artifact::{ArtifactKey, ArtifactStore, FileArtifactStore},
     executor::{decode_artifact, encode_artifact},
 };
-use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, time::Instant};
 
 #[derive(Default)]
@@ -270,11 +269,9 @@ impl TransferMeasurements {
                 name: "transfer".into(),
                 index: None,
             };
-            let mut descriptor = ManifestArtifact {
+            let descriptor = ManifestArtifact {
                 artifact_type: artifact_type.clone(),
                 family_count: None,
-                confidentiality: ArtifactConfidentiality::Public,
-                content_hash: None,
                 layout: None,
             };
             let raw = if matches!(kind, TransferKind::Load) {
@@ -284,18 +281,9 @@ impl TransferMeasurements {
                 None
             };
             if matches!(kind, TransferKind::Import) {
-                let (payload, bytes) =
+                let (payload, _bytes) =
                     encode_artifact(&backend, &value, &artifact_type).map_err(error)?;
-                descriptor.content_hash = Some(Sha256::digest(&bytes).into());
-                store
-                    .store(
-                        artifact_key.clone(),
-                        &artifact_type,
-                        descriptor.confidentiality,
-                        None,
-                        payload,
-                    )
-                    .map_err(error)?;
+                store.store(artifact_key.clone(), &artifact_type, None, payload).map_err(error)?;
                 store
                     .store_manifest(mxx_ir_core::artifact::Manifest {
                         ir_version: encoding::IR_VERSION,
@@ -314,9 +302,8 @@ impl TransferMeasurements {
                 let mut restored_value = None;
                 let mut staged_value = None;
                 let mut canonical_bytes = None;
-                // Each logical import may be a distinct public artifact. Start
-                // with an empty verification cache so warmup cannot remove its
-                // content-hash check from the measured production load.
+                // Each logical import may be a distinct artifact. Start with
+                // an empty store so warmup cannot affect the measured load.
                 if matches!(kind, TransferKind::Import) {
                     store = FileArtifactStore::new(directory.path()).map_err(error)?;
                 }
@@ -337,15 +324,9 @@ impl TransferMeasurements {
                     TransferKind::Export => {
                         let (payload, bytes) =
                             encode_artifact(&backend, &value, &artifact_type).map_err(error)?;
-                        std::hint::black_box(Sha256::digest(&bytes));
+                        std::hint::black_box(&bytes);
                         store
-                            .store(
-                                artifact_key.clone(),
-                                &artifact_type,
-                                descriptor.confidentiality,
-                                None,
-                                payload,
-                            )
+                            .store(artifact_key.clone(), &artifact_type, None, payload)
                             .map_err(error)?;
                         canonical_bytes = Some(bytes);
                     }

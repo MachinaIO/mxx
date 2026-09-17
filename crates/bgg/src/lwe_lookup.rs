@@ -17,11 +17,7 @@ use mxx_gadgets::{
         lower_circuit,
     },
 };
-use mxx_ir_core::{
-    IntExpr,
-    artifact::{ArtifactConfidentiality, ProductionId},
-    types::MatrixType,
-};
+use mxx_ir_core::{IntExpr, artifact::ProductionId, types::MatrixType};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
 use rayon::prelude::*;
@@ -692,10 +688,10 @@ impl LweLookupCompiler {
         names: &LweLookupArtifactNames,
     ) -> Result<DslContext, LweLookupCompileError> {
         Ok(context
-            .public_output(names.output_public_key.clone(), wires.output_public_key)?
-            .public_output(names.low_matrices.clone(), wires.low_matrices)?
-            .public_output(names.high_matrices.clone(), wires.high_matrices)?
-            .public_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
+            .artifact_output(names.output_public_key.clone(), wires.output_public_key)?
+            .artifact_output(names.low_matrices.clone(), wires.low_matrices)?
+            .artifact_output(names.high_matrices.clone(), wires.high_matrices)?
+            .artifact_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
     }
 
     pub fn import_artifacts(
@@ -714,7 +710,6 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.low_matrix_type),
                 balanced_bound(self.gadget_base.clone()),
-                ArtifactConfidentiality::Public,
             ),
             high_matrices: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
@@ -722,14 +717,12 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.high_matrix_type),
                 self.preimage_max_coefficient_bound.clone(),
-                ArtifactConfidentiality::Public,
             ),
             output_plaintexts: ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 names.output_plaintexts,
                 artifacts.table_length,
                 shape(&ring.matrix_type((1, 1))),
-                ArtifactConfidentiality::Public,
             ),
         })
     }
@@ -739,7 +732,6 @@ impl LweLookupCompiler {
             artifacts.production_id.clone(),
             LweLookupArtifactNames::for_compiler(self).output_public_key,
             shape(&self.public_key_type),
-            ArtifactConfidentiality::Public,
         )
     }
 
@@ -1746,7 +1738,7 @@ mod tests {
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
-        artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+        artifact::{ProductionId, SpecHash},
         node::{IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
         types::WireType,
     };
@@ -1988,7 +1980,7 @@ mod tests {
         })
         .unwrap();
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
-            .public_output("low", wires.low_matrices)
+            .artifact_output("low", wires.low_matrices)
             .unwrap()
             .output("residual", residuals)
             .unwrap()
@@ -2448,17 +2440,17 @@ mod tests {
         let (other_rows, other_plaintexts) = third.call(third_inputs).unwrap();
         let context = DslContext::new("tall-lookup-kernel-cache");
         let built = context
-            .public_output("rows", rows)
+            .artifact_output("rows", rows)
             .unwrap()
-            .public_output("plaintexts", plaintexts)
+            .artifact_output("plaintexts", plaintexts)
             .unwrap()
-            .public_output("second-rows", second_rows)
+            .artifact_output("second-rows", second_rows)
             .unwrap()
-            .public_output("second-plaintexts", second_plaintexts)
+            .artifact_output("second-plaintexts", second_plaintexts)
             .unwrap()
-            .public_output("other-rows", other_rows)
+            .artifact_output("other-rows", other_rows)
             .unwrap()
-            .public_output("other-plaintexts", other_plaintexts)
+            .artifact_output("other-plaintexts", other_plaintexts)
             .unwrap()
             .build()
             .unwrap();
@@ -3076,7 +3068,6 @@ mod tests {
         };
         assert_eq!(artifact.production_id, production_id);
         assert_eq!(artifact.artifact_name, output_public_key_artifact);
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
 
         let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
             panic!("lookup signal right side must end with a gadget multiplication")
@@ -3108,7 +3099,6 @@ mod tests {
             artifact.artifact_name,
             LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
         );
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
         let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
             panic!("lookup output plaintext selector must be the input coefficient")
         };

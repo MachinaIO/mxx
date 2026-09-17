@@ -1243,8 +1243,11 @@ mod tests {
                 "interval",
                 Vec::new(),
                 BTreeMap::from([
-                    ("residual".to_owned(), GraphOutput { value: residual, confidentiality: None }),
-                    ("decoded".to_owned(), GraphOutput { value: decoded, confidentiality: None }),
+                    (
+                        "residual".to_owned(),
+                        GraphOutput { artifact_output: false, value: residual },
+                    ),
+                    ("decoded".to_owned(), GraphOutput { artifact_output: false, value: decoded }),
                 ]),
                 Vec::new(),
                 Vec::new(),

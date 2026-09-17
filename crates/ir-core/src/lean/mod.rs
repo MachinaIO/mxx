@@ -2661,7 +2661,7 @@ mod tests {
             let (graph, _) = Graph::freeze(
                 "supported-expression",
                 vec![],
-                BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+                BTreeMap::from([("value".into(), GraphOutput { artifact_output: false, value })]),
                 vec![],
                 vec![],
                 BTreeMap::new(),
@@ -2684,8 +2684,8 @@ mod tests {
             "boundary",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: x.clone(), confidentiality: None }),
-                ("alias".into(), GraphOutput { value: x, confidentiality: None }),
+                ("first".into(), GraphOutput { artifact_output: false, value: x.clone() }),
+                ("alias".into(), GraphOutput { artifact_output: false, value: x }),
             ]),
             vec![retained],
             vec![],
@@ -2770,7 +2770,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "refresh_transforms",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2827,7 +2827,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "rns_conversions",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2868,7 +2868,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "constants",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2894,7 +2894,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "ssa",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: y })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2943,7 +2943,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "matrix",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: y })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2999,7 +2999,7 @@ mod tests {
             vec![],
             BTreeMap::from([(
                 "out".into(),
-                GraphOutput { value: parallel, confidentiality: None },
+                GraphOutput { artifact_output: false, value: parallel },
             )]),
             vec![],
             vec![],
@@ -3058,7 +3058,7 @@ mod tests {
                 vec![],
                 BTreeMap::from([(
                     "out".into(),
-                    GraphOutput { value: output, confidentiality: None },
+                    GraphOutput { artifact_output: false, value: output },
                 )]),
                 vec![],
                 vec![],
@@ -3103,7 +3103,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "root-child-inputs",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: call })]),
             vec![],
             vec![root_input],
             BTreeMap::new(),
@@ -3139,7 +3139,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "lazy_select",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3191,7 +3191,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "formal-order",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: call })]),
             vec![],
             vec![first, second],
             BTreeMap::new(),
@@ -3255,8 +3255,8 @@ mod tests {
             "hash-binders",
             vec![],
             BTreeMap::from([
-                ("plain".into(), GraphOutput { value: call, confidentiality: None }),
-                ("sampled".into(), GraphOutput { value: sampled, confidentiality: None }),
+                ("plain".into(), GraphOutput { artifact_output: false, value: call }),
+                ("sampled".into(), GraphOutput { artifact_output: false, value: sampled }),
             ]),
             vec![],
             vec![],
@@ -3303,8 +3303,8 @@ mod tests {
             "two-bindings",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                ("first".into(), GraphOutput { artifact_output: false, value: first }),
+                ("second".into(), GraphOutput { artifact_output: false, value: second }),
             ]),
             vec![],
             vec![],
@@ -3365,8 +3365,8 @@ mod tests {
                     kind: crate::graph::CompileParameterKind::Integer,
                 }],
                 BTreeMap::from([
-                    ("gadget".into(), GraphOutput { value, confidentiality: None }),
-                    ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                    ("gadget".into(), GraphOutput { artifact_output: false, value }),
+                    ("second".into(), GraphOutput { artifact_output: false, value: second }),
                 ]),
                 vec![],
                 vec![],
@@ -3438,7 +3438,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index}"), GraphOutput { artifact_output: false, value })
             })
             .collect();
         let (graph, _) =
@@ -3465,7 +3465,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index:02}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index:02}"), GraphOutput { artifact_output: false, value })
             })
             .collect();
         let (graph, _) = Graph::freeze(
@@ -3509,7 +3509,7 @@ mod tests {
                 name: "den".into(),
                 kind: crate::graph::CompileParameterKind::Integer,
             }],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3543,7 +3543,7 @@ mod tests {
                 });
                 let value =
                     NodeHandle::subgraph_call(child, vec![], vec![], vec![]).output(0).unwrap();
-                (name.to_owned(), GraphOutput { value, confidentiality: None })
+                (name.to_owned(), GraphOutput { artifact_output: false, value })
             })
             .collect();
         let (graph, _) =
@@ -3592,7 +3592,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "slice_projections",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: result, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: result })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3717,7 +3717,7 @@ mod tests {
             vec![],
             BTreeMap::from([(
                 "out".into(),
-                GraphOutput { value: parallel, confidentiality: None },
+                GraphOutput { artifact_output: false, value: parallel },
             )]),
             vec![],
             vec![],
@@ -3842,7 +3842,7 @@ example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : N
         let (graph, _) = Graph::freeze(
             "invalid-slice",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: slice, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: slice })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3886,8 +3886,8 @@ example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : N
             "sequential",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first_output, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second_output, confidentiality: None }),
+                ("first".into(), GraphOutput { artifact_output: false, value: first_output }),
+                ("second".into(), GraphOutput { artifact_output: false, value: second_output }),
             ]),
             vec![],
             vec![],
@@ -3973,7 +3973,7 @@ example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : N
             vec![],
             BTreeMap::from([(
                 "out".into(),
-                GraphOutput { value: preimage, confidentiality: None },
+                GraphOutput { artifact_output: false, value: preimage },
             )]),
             vec![],
             vec![],
@@ -4084,7 +4084,7 @@ example (backend : MxxRuntime.BackendContext) (params : Generated.Params) (i : N
         let (graph, _) = Graph::freeze(
             "mismatched-preimage",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: out, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { artifact_output: false, value: out })]),
             vec![],
             vec![],
             BTreeMap::new(),

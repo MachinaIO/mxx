@@ -87,8 +87,8 @@ fn export_sampler_fixture() {
         "stage-a-sampled-trapdoor",
         Vec::<CompileParameter>::new(),
         BTreeMap::from([
-            ("preimage".into(), GraphOutput { value: preimage, confidentiality: None }),
-            ("second".into(), GraphOutput { value: second, confidentiality: None }),
+            ("preimage".into(), GraphOutput { artifact_output: false, value: preimage }),
+            ("second".into(), GraphOutput { artifact_output: false, value: second }),
         ]),
         vec![],
         vec![],

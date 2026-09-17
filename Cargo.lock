@@ -500,7 +500,6 @@ version = "0.1.0"
 dependencies = [
  "bigdecimal",
  "mxx-bench-estimator",
- "mxx-bgg",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",

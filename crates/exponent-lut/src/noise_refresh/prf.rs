@@ -1,17 +1,59 @@
 //! Scheme-independent sparse-LWR PRF declarations and Program interpretation.
 use crate::{
-    layout::ExpLayout,
-    noise_refresh::pbc::{PbcActiveCellIndex, PbcPublicLayout},
-    program::{
-        AttributeKnowledge, ExponentLutProgram, ExponentLutProgramBuilder, ExponentLutProgramId,
-        FamilyRange, Gate, ProgramGateInstance, ProgramInputId, ProgramLowerError, ProgramStep,
-        ProgramValidationError, ProgramWireType, WireId,
+    noise_refresh::pbc::{
+        BalancedProductSchedule, BinaryTransformMatrix, PbcActiveCellIndex, PbcLayoutId,
+        PbcPublicLayout, PbcPublicVectorFamilyBinding, PbcSelectorRuntimeBinding,
     },
-    readout::{ExponentLUTReadoutScheme, ValueReadout},
-    scheme::ExponentLUTFixedRhsScheme,
+    program::{
+        AttributeKnowledge, ExpLayout, ExponentLutProgram, ExponentLutProgramBuilder,
+        ExponentLutProgramId, FamilyRange, LutOutputRepresentation, LutTable, Operand,
+        ProgramValidationError, RhsId, WireId,
+    },
 };
-use mxx_dsl::{Family, GraphValue, GraphValueSchema, Int, Mat};
+use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
+
+/// Apply a sequence of public factors to a private accumulator.
+///
+/// `MulPublic` is deliberately private-first, so public factors cannot be
+/// multiplied into a public intermediate product. Associativity lets the
+/// structural PRF use the equivalent left-associated product while every
+/// gate remains a valid private/public operation.
+fn apply_public_product(
+    builder: &mut ExponentLutProgramBuilder,
+    private: WireId,
+    leaves: Vec<Operand<WireId>>,
+) -> Result<WireId, ProgramValidationError> {
+    if leaves.is_empty() {
+        return Err(ProgramValidationError::InvalidStructure("empty product".into()));
+    }
+    let mut state = Operand::Scalar(private);
+    for public in leaves {
+        state = Operand::Scalar(builder.mul_public(state, public)?);
+    }
+    match state {
+        Operand::Scalar(wire) => Ok(wire),
+        Operand::Member { .. } => unreachable!("public product accumulator is scalar"),
+    }
+}
+
+fn transform_columns(transform: &BinaryTransformMatrix) -> Option<Vec<usize>> {
+    if transform.rows() == 1 {
+        return transform.selected_columns(0);
+    }
+    if transform.columns() == 1 {
+        return Some(
+            transform
+                .bits()
+                .iter()
+                .enumerate()
+                .filter_map(|(row, bit)| (*bit == 1).then_some(row))
+                .collect(),
+        );
+    }
+    None
+}
 
 /// Scheme-independent errors in native PRF declarations and bindings.
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
@@ -24,13 +66,96 @@ pub enum PrfError {
     Artifact(String),
 }
 
-/// Preprocessing-fixed public key and terminal preparation for one PRF.
-/// Payload-secret sampling belongs to the backend; the online mask secret
-/// is absent from this shared application boundary.
-pub struct PrfPublicSetup<S: ExponentLUTReadoutScheme> {
-    pub initial: S::PublicKey,
-    pub readout_preparation: S::ReadoutPreparation,
-    pub readout_public_masks: S::ReadoutPublicMasks,
+/// Stable identity of one value-readout declaration.
+///
+/// The digest is an opaque declaration identity; interpretation of the
+/// readout table remains owned by the concrete backend adapter.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
+pub struct LutOutputIdentity([u8; 32]);
+
+impl LutOutputIdentity {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// Opaque, canonically encoded public PRF label.
+///
+/// The refresh application owns the meaning of a label's fields.  The PRF
+/// only commits to their unambiguous byte encoding and never parses or
+/// derives semantics from them.  Length-prefixing each component keeps the
+/// encoding injective while allowing callers to use arbitrary binary tags.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize)]
+pub struct PrfLabel(Vec<u8>);
+
+impl PrfLabel {
+    /// Builds a label from an ordered set of application-owned components.
+    pub fn from_components(components: &[&[u8]]) -> Result<Self, PrfError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"mxx-exponent-lut/prf-label/v1");
+        let count = u32::try_from(components.len()).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
+        bytes.extend_from_slice(&count.to_le_bytes());
+        for component in components {
+            let length =
+                u64::try_from(component.len()).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
+            bytes.extend_from_slice(&length.to_le_bytes());
+            bytes.extend_from_slice(component);
+        }
+        Ok(Self(bytes))
+    }
+
+    /// Wraps an already canonical label encoding after rejecting an empty
+    /// value. Callers that construct fields dynamically should prefer
+    /// [`Self::from_components`].
+    pub fn from_canonical_bytes(bytes: Vec<u8>) -> Result<Self, PrfError> {
+        const PREFIX: &[u8] = b"mxx-exponent-lut/prf-label/v1";
+        let prefix_len = PREFIX.len();
+        if bytes.len() < prefix_len + std::mem::size_of::<u32>() || !bytes.starts_with(PREFIX) {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        let mut cursor = prefix_len;
+        let count = u32::from_le_bytes(
+            bytes[cursor..cursor + 4].try_into().map_err(|_| PrfError::InvalidSparseLwrBlock)?,
+        ) as usize;
+        cursor += 4;
+        for _ in 0..count {
+            let end = cursor.checked_add(8).ok_or(PrfError::InvalidSparseLwrBlock)?;
+            if end > bytes.len() {
+                return Err(PrfError::InvalidSparseLwrBlock);
+            }
+            let length = u64::from_le_bytes(
+                bytes[cursor..end].try_into().map_err(|_| PrfError::InvalidSparseLwrBlock)?,
+            );
+            cursor = end;
+            let length = usize::try_from(length).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
+            cursor = cursor.checked_add(length).ok_or(PrfError::InvalidSparseLwrBlock)?;
+            if cursor > bytes.len() {
+                return Err(PrfError::InvalidSparseLwrBlock);
+            }
+        }
+        if cursor != bytes.len() {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        Ok(Self(bytes))
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for PrfLabel {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Self::from_canonical_bytes(bytes).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Native sparse-LWR profile.
@@ -60,9 +185,9 @@ impl SparseLwrPrfProfile {
         let ring_dimension =
             1usize.checked_shl(ring_log2).ok_or(PrfError::InvalidSparseLwrBlock)?;
         self.layout.validate(ring_dimension).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-        let q = 1usize
-            .checked_shl(self.layout.width_log2 + 1)
-            .ok_or(PrfError::InvalidSparseLwrBlock)?;
+        let exponent_bits =
+            self.layout.width_log2.checked_add(1).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        let q = 1usize.checked_shl(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)?;
         let p = self.p_prime.checked_mul(2).ok_or(PrfError::InvalidSparseLwrBlock)?;
         if p < 2 || p > q || q % p != 0 {
             return Err(PrfError::InvalidSparseLwrBlock);
@@ -86,11 +211,47 @@ impl SparseLwrPrfProfile {
     }
 
     pub fn q(&self) -> Result<usize, PrfError> {
-        1usize.checked_shl(self.layout.width_log2 + 1).ok_or(PrfError::InvalidSparseLwrBlock)
+        let exponent_bits =
+            self.layout.width_log2.checked_add(1).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        1usize.checked_shl(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)
     }
 
     pub fn p(&self) -> Result<usize, PrfError> {
         self.p_prime.checked_mul(2).ok_or(PrfError::InvalidSparseLwrBlock)
+    }
+
+    /// Number of columns in the public matrix `D`: `v * log2(Q_exp)`.
+    /// Keeping this derivation next to the profile prevents callers from
+    /// accidentally treating the exponent modulus as the coefficient
+    /// modulus or introducing a configurable output-column count.
+    pub fn transform_column_count(&self) -> Result<usize, PrfError> {
+        self.validate()?;
+        let exponent_bits = self
+            .layout
+            .width_log2
+            .checked_add(1)
+            .and_then(|bits| usize::try_from(bits).ok())
+            .ok_or(PrfError::InvalidSparseLwrBlock)?;
+        self.ring_dimension()?.checked_mul(exponent_bits).ok_or(PrfError::InvalidSparseLwrBlock)
+    }
+
+    /// Derives the fixed single-column binary transform `T_label` used by a
+    /// sparse-LWR public matrix. `columns` is the checked D column count; the
+    /// returned matrix has exactly `columns` rows and one output column.
+    /// Sampling depends only on the setup hash key and the canonical opaque
+    /// label, never on label enumeration order or a fresh invocation nonce.
+    pub fn derive_label_transform(
+        &self,
+        hash_key: &[u8],
+        label: &PrfLabel,
+        columns: usize,
+    ) -> Result<BinaryTransformMatrix, PrfError> {
+        self.validate()?;
+        if columns == 0 || columns != self.transform_column_count()? {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        BinaryTransformMatrix::from_hash(hash_key, label.as_bytes(), columns, 1)
+            .map_err(|_| PrfError::InvalidSparseLwrBlock)
     }
 
     pub const fn native_width(&self) -> usize {
@@ -99,14 +260,13 @@ impl SparseLwrPrfProfile {
 
     /// Returns the canonical sparse-LWR value table
     /// `f(k) = floor(p' * k / n') + 1` for `0 <= k < n'`.
-    pub fn canonical_readout(&self) -> Result<ValueReadout, PrfError> {
+    pub fn canonical_readout(&self) -> Result<Vec<usize>, PrfError> {
         let n_prime = self.native_width();
         let values = (0..n_prime)
             .map(|k| self.p_prime.checked_mul(k).map(|value| value / n_prime + 1))
             .collect::<Option<Vec<_>>>()
             .ok_or(PrfError::InvalidSparseLwrBlock)?;
-        ValueReadout::from_canonical_values(self.layout, values)
-            .map_err(|_| PrfError::InvalidSparseLwrBlock)
+        Ok(values)
     }
 }
 
@@ -127,21 +287,100 @@ impl<'de> Deserialize<'de> for SparseLwrPrfProfile {
     }
 }
 
-/// A native accumulator plus its value-form readout.
+/// A native structural accumulator plus its value-form readout.
 ///
 /// `initial_input` is the accumulator state initialized by the evaluator to
 /// `mono_m(0)=1`; it is represented as a typed program input rather than a
-/// label-dependent declaration. Its accumulation is the executed fixed-product
-/// chain, shared by preparation, evaluation, and noise tracing.
+/// label-dependent declaration. Its accumulation is the structural product
+/// chain, shared by preprocessing, evaluation, and noise tracing.
 #[derive(Clone)]
 pub struct SparseLwrPrfProgram {
     pub accumulation: ExponentLutProgram,
-    pub readout: ValueReadout,
-    pub(crate) initial_input: ProgramInputId,
+    pub readout: Vec<usize>,
+    pub(crate) initial_input: WireId,
     pub(crate) output: WireId,
     pub(crate) profile: SparseLwrPrfProfile,
     pub(crate) bucket_width: usize,
     pub(crate) block_count: usize,
+    /// Structural selector/value families for the staged lowering path.
+    selection_families: Vec<PrfSelectionFamily>,
+    /// One shared encryptor-supplied public D family. Transform selections
+    /// are represented by constant indexed operands in the Program AST.
+    d0: WireId,
+    output_labels: Vec<PrfLabel>,
+    outputs: Vec<WireId>,
+    /// Canonical label-major binary transforms used by the frozen program.
+    /// Keeping these immutable public inputs alongside the declaration lets an
+    /// application retain an independent plaintext oracle without inspecting
+    /// the frozen graph or reproducing the hash-to-transform convention.
+    label_transforms: Vec<BinaryTransformMatrix>,
+}
+
+/// Family declarations consumed by one structural PRF bucket body.
+///
+/// The IDs refer to declarations in [`SparseLwrPrfProgram::accumulation`].
+/// Keeping them as metadata lets setup and encryption bind one family body,
+/// while the online evaluator supplies D0 and selector members at runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrfSelectionFamily {
+    pub selector: RhsId,
+    /// Encryptor-supplied coordinate encodings.  This replaces the old
+    /// random label carrier; the lowerer combines these wires according to
+    /// the setup-owned `T_l` schedule before applying the selector.
+    pub d0: WireId,
+    pub capacity: usize,
+}
+
+/// Identity of the setup-owned structural PRF declaration.
+///
+/// This identity contains only public Program/layout/schedule facts.  In
+/// particular, it deliberately excludes the encryptor's `D0` values and all
+/// selector bits, allowing one setup to serve multiple encryptions.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SparseLwrPrfSetupIdentity {
+    pub program: ExponentLutProgramId,
+    pub layout: PbcLayoutId,
+    /// Balanced schedule used to lower the per-label `D0*T_l` product.  This
+    /// is independent of the number of bucket invocations and therefore
+    /// remains stable when the same label family is reused by every bucket.
+    pub label_schedule: BalancedProductSchedule,
+    /// Commitment to the public label transforms (`T_l`) and their canonical
+    /// order.  The actual matrices are supplied by the public family binding;
+    /// no matrix values are copied into setup metadata.
+    pub t_l_commitment: [u8; 32],
+    /// Public input-key namespace used by selector and D0 family artifacts.
+    pub input_key_identity: [u8; 32],
+    /// Bucket aggregation schedule retained as part of the structural
+    /// declaration. It is distinct from `label_schedule` when a layout has
+    /// a different number of buckets and active labels per bucket.
+    pub schedule: BalancedProductSchedule,
+}
+
+/// Encrypt-stage binding for one structural PRF evaluation.
+///
+/// The public D0 family is content-bound here, while selector values remain a
+/// key-provider runtime input.  No mask/payload secret or selector plaintext
+/// is represented, so this value can safely cross into online graph setup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SparseLwrPrfEncryptionBinding {
+    pub setup: SparseLwrPrfSetupIdentity,
+    pub d0_identity: [u8; 32],
+    pub d0_modulus: usize,
+    pub d0_family_count: usize,
+    pub selector_input_name: String,
+    pub input_key_identity: [u8; 32],
+}
+
+impl SparseLwrPrfEncryptionBinding {
+    /// Stable identity of the encrypt-stage public/runtime binding.
+    pub fn identity(&self) -> Result<[u8; 32], PrfError> {
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| PrfError::Artifact(error.to_string()))?;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"mxx-exponent-lut/sparse-lwr/encrypt-binding");
+        digest.update(bytes);
+        Ok(digest.finalize().into())
+    }
 }
 
 impl std::fmt::Debug for SparseLwrPrfProgram {
@@ -152,46 +391,13 @@ impl std::fmt::Debug for SparseLwrPrfProgram {
             .field("profile", &self.profile)
             .field("bucket_width", &self.bucket_width)
             .field("block_count", &self.block_count)
-            .field("readout", &self.readout.identity())
+            .field("readout", &self.readout)
+            .field("selection_families", &self.selection_families.len())
             .finish()
     }
 }
 
 impl SparseLwrPrfProgram {
-    /// Prepare this Program's final readout through the scheme's public
-    /// setup capability. The application does not construct decompositions.
-    pub fn prepare_readout<S: ExponentLUTReadoutScheme>(
-        &self,
-        scheme: &S,
-        inputs: &crate::scheme::PublicProgramValue<S>,
-        preparation: &S::ReadoutPreparation,
-    ) -> Result<S::ReadoutArtifacts, S::ReadoutError> {
-        scheme.prepare_readout(&self.readout, inputs, preparation)
-    }
-
-    /// Public projection of this Program's canonical final value readout.
-    pub fn project_readout<S: ExponentLUTReadoutScheme>(
-        &self,
-        scheme: &S,
-        inputs: &crate::scheme::PublicProgramValue<S>,
-        artifacts: &S::ReadoutArtifacts,
-        masks: &S::ReadoutPublicMasks,
-    ) -> Result<S::ReadoutPublicOutput, S::ReadoutError> {
-        scheme.project_readout(&self.readout, inputs, artifacts, masks)
-    }
-
-    /// Online readout consumes prepared witnesses and online masks through
-    /// associated types; application code cannot inspect their representation.
-    pub fn evaluate_readout<S: ExponentLUTReadoutScheme>(
-        &self,
-        scheme: &S,
-        inputs: &crate::scheme::EncodingProgramValue<S>,
-        artifacts: &S::ReadoutArtifacts,
-        masks: &S::ReadoutEncodingMasks,
-    ) -> Result<S::ReadoutEncodingOutput, S::ReadoutError> {
-        scheme.evaluate_readout(&self.readout, inputs, artifacts, masks)
-    }
-
     /// Canonical active-member ranges shared by ordinary bindings and cached
     /// batched preparation. PBC scheduling does not depend on the backend.
     pub fn active_block_ranges(
@@ -221,88 +427,295 @@ impl SparseLwrPrfProgram {
         Ok((active.len(), ranges))
     }
 
-    /// Bind a shared selector/label family to the canonical PBC block ranges.
-    /// This only constructs structural references; ciphertext preparation is
-    /// performed by the scheme when the returned inputs are evaluated.
-    pub fn selection_inputs<S: ExponentLUTFixedRhsScheme>(
-        &self,
-        layout: &PbcPublicLayout,
-        selectors: &S::FixedRhs,
-        labels: &Family<Mat>,
-        id: [u8; 32],
-    ) -> Result<Vec<PrfSelectionInputs<S>>, PrfError>
-    where
-        S::FixedRhs: Clone,
-    {
-        let (capacity, ranges) = self.active_block_ranges(layout)?;
-        ranges
-            .into_iter()
-            .map(|(start, count)| {
-                let active = FamilyRange::bounded(start, count, capacity)
-                    .map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-                PrfSelectionInputs::new(selectors.clone(), labels, active, id)
-                    .map_err(|error| PrfError::Artifact(error.to_string()))
-            })
-            .collect()
-    }
-
-    /// Builds the executed chain: one fixed private product per PBC block.
-    pub fn new(
+    /// Builds the staged PRF declaration. Each bucket is represented by one
+    /// structural `select` body (`MulPublic(label)` followed by
+    /// `MulPrivate(selector)` and the family `Sum`); no selector/label member
+    /// is expanded on the host.
+    /// This constructor contains no selector plaintexts or D0 values itself.
+    pub fn new_structural(
         profile: SparseLwrPrfProfile,
         bucket_width: usize,
         block_count: usize,
+        hash_key: &[u8],
+        output_labels: &[PrfLabel],
+    ) -> Result<Self, PrfError> {
+        let branch_count =
+            block_count.checked_mul(bucket_width).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        let columns = profile.transform_column_count()?;
+        if output_labels.is_empty() || branch_count == 0 {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        let mut transforms = Vec::with_capacity(
+            branch_count.checked_mul(output_labels.len()).ok_or(PrfError::InvalidSparseLwrBlock)?,
+        );
+        for label in output_labels {
+            let transform = profile.derive_label_transform(hash_key, label, columns)?;
+            transforms.extend(std::iter::repeat_n(transform, branch_count));
+        }
+        Self::new_structural_with_labels(
+            profile,
+            bucket_width,
+            block_count,
+            output_labels.to_vec(),
+            transforms,
+        )
+    }
+
+    /// Builds a structural graph for an ordered set of scalar PRF outputs.
+    ///
+    /// One public D family, one private selector family, and one initial
+    /// accumulator are shared by every label.  Each label gets its own
+    /// sequential bucket chain and terminal LUT root, while the transform
+    /// indices are embedded directly in the family-body AST.  `transforms`
+    /// is laid out label-major (`label * block_count * bucket_width`).
+    pub fn new_structural_with_labels(
+        profile: SparseLwrPrfProfile,
+        bucket_width: usize,
+        block_count: usize,
+        output_labels: Vec<PrfLabel>,
+        transforms: Vec<BinaryTransformMatrix>,
     ) -> Result<Self, PrfError> {
         profile.validate()?;
-        if bucket_width == 0 || block_count == 0 {
+        let d_columns = profile.transform_column_count()?;
+        let branch_count =
+            block_count.checked_mul(bucket_width).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        if output_labels.is_empty() ||
+            output_labels.iter().enumerate().any(|(index, label)| {
+                output_labels[..index].iter().any(|previous| previous == label)
+            })
+        {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        let transform_count =
+            branch_count.checked_mul(output_labels.len()).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        if bucket_width == 0 ||
+            block_count == 0 ||
+            transforms.len() != transform_count ||
+            transforms.iter().any(|transform| {
+                !((transform.rows() == 1 && transform.columns() == d_columns) ||
+                    (transform.rows() == d_columns && transform.columns() == 1))
+            })
+        {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
         let readout = profile.canonical_readout()?;
-        let ring_dimension = profile.ring_dimension()?;
-        readout.layout.validate(ring_dimension).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
-
         let mut builder = ExponentLutProgramBuilder::new();
-        builder.set_layout(profile.layout, ring_dimension).map_err(PrfError::from)?;
-        let initial_input = builder
-            .input(
-                profile.native_width(),
-                ProgramWireType {
-                    stride_log2: profile.layout.stride_log2,
-                    knowledge: AttributeKnowledge::Private,
-                },
-            )
-            .map_err(PrfError::from)?;
-        let mut state = builder.input_wire(initial_input).map_err(PrfError::from)?;
-        // Each prepared RHS combines the entire one-hot selector block with
-        // its public label monomials. Its payload is a monomial, but all
-        // selector errors survive. This is the actual executed gate sequence.
-        let width = profile.native_width();
-        for _ in 0..block_count {
-            let family = builder.rhs_family(width)?;
-            let rhs = builder.rhs_input(family, width, width)?;
-            state = builder.private_mul(state, rhs)?;
+        let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
+        let d0 = builder
+            .input_family(IntExpr::constant(d_columns), AttributeKnowledge::PublicPayload)?;
+        let selector = builder.rhs_family(IntExpr::constant(branch_count))?;
+        let identity = builder.input(AttributeKnowledge::PublicPayload)?;
+        let values = readout.clone();
+        let lut = builder.register_lut(LutTable::unary(
+            profile.native_width(),
+            profile.native_width(),
+            values,
+            LutOutputRepresentation::Coefficient,
+        )?)?;
+        let mut selection_families = Vec::with_capacity(block_count);
+        let mut outputs = Vec::with_capacity(output_labels.len());
+        for label_index in 0..output_labels.len() {
+            let transform_offset =
+                label_index.checked_mul(branch_count).ok_or(PrfError::InvalidSparseLwrBlock)?;
+            let mut state = initial_input;
+            for bucket in 0..block_count {
+                let bucket_start =
+                    bucket.checked_mul(bucket_width).ok_or(PrfError::InvalidSparseLwrBlock)?;
+                let mut grouped =
+                    std::collections::BTreeMap::<usize, Vec<(usize, Vec<usize>)>>::new();
+                for local in 0..bucket_width {
+                    let branch = bucket_start + local;
+                    let selected = transform_columns(&transforms[transform_offset + branch])
+                        .ok_or(PrfError::InvalidSparseLwrBlock)?;
+                    grouped.entry(selected.len()).or_default().push((branch, selected));
+                }
+                let mut bucket_sum = None;
+                for (leaf_count, branches) in grouped {
+                    let range = FamilyRange::full(IntExpr::constant(branches.len()))?;
+                    let family = builder.parallel(range, |builder, branch_index| {
+                        let branch_indices = branches
+                            .iter()
+                            .map(|(branch, _)| IntExpr::constant(*branch))
+                            .collect::<Vec<_>>();
+                        let selector_index = IntExpr::Select {
+                            selector: Box::new(branch_index.clone()),
+                            branches: branch_indices,
+                        };
+                        let (_, first_selected) =
+                            branches.first().ok_or(ProgramValidationError::InvalidFamilyRange)?;
+                        let mut leaves = Vec::with_capacity(leaf_count);
+                        if first_selected.is_empty() {
+                            leaves.push(Operand::Scalar(identity));
+                        } else {
+                            for column in 0..leaf_count {
+                                let indices = branches
+                                    .iter()
+                                    .map(|(_, selected)| IntExpr::constant(selected[column]))
+                                    .collect::<Vec<_>>();
+                                leaves.push(Operand::Member {
+                                    family: d0,
+                                    index: IntExpr::Select {
+                                        selector: Box::new(branch_index.clone()),
+                                        branches: indices,
+                                    },
+                                });
+                            }
+                        }
+                        let multiplied = apply_public_product(builder, state, leaves)?;
+                        let weighted = builder.mul_private(
+                            Operand::Scalar(multiplied),
+                            Operand::Member { family: selector, index: selector_index },
+                        )?;
+                        Ok(Operand::Scalar(weighted))
+                    })?;
+                    let reduced = builder.sum(family)?;
+                    bucket_sum = Some(match bucket_sum {
+                        None => reduced,
+                        Some(previous) => {
+                            builder.add(Operand::Scalar(previous), Operand::Scalar(reduced))?
+                        }
+                    });
+                }
+                state = bucket_sum.ok_or(PrfError::InvalidSparseLwrBlock)?;
+                if label_index == 0 {
+                    selection_families.push(PrfSelectionFamily {
+                        selector,
+                        d0,
+                        capacity: bucket_width,
+                    });
+                }
+            }
+            outputs.push(builder.lut(Operand::Scalar(state), lut)?);
         }
-        builder.output(state).map_err(PrfError::from)?;
-        let accumulation = builder.build().map_err(PrfError::from)?;
+        let output = *outputs.first().ok_or(PrfError::InvalidSparseLwrBlock)?;
+        let accumulation =
+            builder.finish(outputs.iter().copied().map(Operand::Scalar).collect())?;
         Ok(Self {
             accumulation,
             readout,
             initial_input,
-            output: state,
+            output,
             profile,
             bucket_width,
             block_count,
+            selection_families,
+            d0,
+            output_labels,
+            outputs,
+            label_transforms: transforms,
         })
+    }
+
+    /// Returns the structural selector/value family declarations in bucket
+    /// order. No runtime family members are materialized by this accessor.
+    pub fn selection_families(&self) -> &[PrfSelectionFamily] {
+        &self.selection_families
+    }
+
+    /// Returns the encryptor-supplied D0 family input used by every bucket.
+    pub fn d0_input(&self) -> WireId {
+        self.d0
+    }
+
+    /// Ordered scalar roots and their opaque application labels. The order is
+    /// the immutable Program root order; callers must not infer meaning from
+    /// map iteration order.
+    pub fn ordered_outputs(&self) -> impl Iterator<Item = (&PrfLabel, WireId)> {
+        self.output_labels.iter().zip(self.outputs.iter().copied())
+    }
+
+    /// Returns the canonical label-major transforms embedded in the program.
+    /// The slice is ordered as `label * (block_count * bucket_width) + branch`.
+    /// It is immutable program input material and does not expose graph
+    /// internals or runtime selector values.
+    pub fn label_transforms(&self) -> &[BinaryTransformMatrix] {
+        &self.label_transforms
+    }
+
+    /// Returns the balanced reduction shape required by one transform row.
+    /// Empty rows use the evaluator's identity encoding, singleton rows reuse
+    /// their input, and odd levels carry the final singleton unchanged.
+    pub fn transform_product_schedule(
+        &self,
+        transform: &BinaryTransformMatrix,
+    ) -> Result<BalancedProductSchedule, PrfError> {
+        let selected = transform_columns(transform).ok_or(PrfError::InvalidSparseLwrBlock)?;
+        BalancedProductSchedule::new(selected.len()).map_err(|_| PrfError::InvalidSparseLwrBlock)
+    }
+
+    /// Derives the setup identity for the structural PRF declaration.
+    ///
+    /// `D0` is intentionally absent; it is an encrypt-stage input and must
+    /// not force a new preprocessing graph or selector namespace.
+    pub fn setup_identity(
+        &self,
+        layout: &PbcPublicLayout,
+    ) -> Result<SparseLwrPrfSetupIdentity, PrfError> {
+        self.setup_identity_for_key(layout, [0; 32])
+    }
+
+    /// Derives setup identity while binding the public selector key namespace.
+    pub fn setup_identity_for_key(
+        &self,
+        layout: &PbcPublicLayout,
+        selector_key_instance: [u8; 32],
+    ) -> Result<SparseLwrPrfSetupIdentity, PrfError> {
+        if !self.is_structural() || self.block_count != layout.parameters.bucket_count {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        let schedule = self.product_schedule()?;
+        let label_schedule = self.label_schedule()?;
+        let t_l_commitment = *self.id().as_bytes();
+        Ok(SparseLwrPrfSetupIdentity {
+            program: self.id(),
+            layout: layout.layout_id,
+            t_l_commitment,
+            input_key_identity: selector_key_instance,
+            label_schedule,
+            schedule,
+        })
+    }
+
+    /// Binds encryptor-supplied public D0 encodings and selector runtime data
+    /// to this setup.  The returned binding contains no secret input and can
+    /// be used to authenticate the online stage's structural inputs.
+    pub fn encryption_binding(
+        &self,
+        layout: &PbcPublicLayout,
+        d0: &PbcPublicVectorFamilyBinding,
+        selector: &PbcSelectorRuntimeBinding,
+    ) -> Result<SparseLwrPrfEncryptionBinding, PrfError> {
+        let setup = self.setup_identity_for_key(layout, selector.key_instance_id())?;
+        let expected_count = self.profile.transform_column_count()?;
+        d0.validate_d0(layout, expected_count).map_err(|_| PrfError::InvalidSparseLwrBlock)?;
+        if selector.layout_id() != layout.layout_id {
+            return Err(PrfError::InvalidSparseLwrBlock);
+        }
+        Ok(SparseLwrPrfEncryptionBinding {
+            setup,
+            d0_identity: d0.identity(),
+            d0_modulus: d0.modulus,
+            d0_family_count: d0.family_count,
+            selector_input_name: selector.input_name().to_owned(),
+            input_key_identity: selector.key_instance_id(),
+        })
+    }
+
+    /// Returns whether this declaration uses structural selector/value
+    /// families rather than pre-combined RHS gates.
+    pub const fn is_structural(&self) -> bool {
+        !self.selection_families.is_empty()
     }
 
     pub const fn profile(&self) -> SparseLwrPrfProfile {
         self.profile
     }
 
-    pub const fn initial_input(&self) -> ProgramInputId {
+    pub const fn initial_input(&self) -> WireId {
         self.initial_input
     }
 
-    /// Returns the accumulator's fixed initial native attribute `mono_m(0)`.
+    /// Returns the accumulator's initial native attribute `mono_m(0)`.
     pub fn initial_attribute(&self, ring: &mxx_dsl::Ring) -> Result<mxx_dsl::Mat, PrfError> {
         self.profile
             .layout
@@ -322,17 +735,48 @@ impl SparseLwrPrfProgram {
         self.block_count
     }
 
-    pub const fn id(&self) -> ExponentLutProgramId {
+    /// Returns the canonical balanced reduction shape for the block product.
+    ///
+    /// The schedule is metadata only: it can be captured by a structural
+    /// family lowerer without allocating one host graph node per bucket
+    /// member. Empty and singleton products are represented explicitly so
+    /// evaluators can reuse an identity or the sole input, respectively.
+    pub fn product_schedule(&self) -> Result<BalancedProductSchedule, PrfError> {
+        BalancedProductSchedule::new(self.block_count).map_err(|_| PrfError::InvalidSparseLwrBlock)
+    }
+
+    /// Returns the balanced schedule for the labels in one bucket.  This is
+    /// the schedule used for the public `D0*T_l` tree; it is separate from
+    /// the outer bucket aggregation schedule returned by `product_schedule`.
+    pub fn label_schedule(&self) -> Result<BalancedProductSchedule, PrfError> {
+        BalancedProductSchedule::new(self.bucket_width).map_err(|_| PrfError::InvalidSparseLwrBlock)
+    }
+
+    /// Returns the setup commitment for the public label transforms without
+    /// materializing a matrix or expanding a family on the host.
+    pub fn label_transform_commitment(&self) -> [u8; 32] {
+        *self.id().as_bytes()
+    }
+
+    pub fn id(&self) -> ExponentLutProgramId {
         self.accumulation.id()
+    }
+
+    /// Returns the complete immutable declaration, including the terminal
+    /// coefficient LUT.  Evaluators should lower this value directly instead
+    /// of constructing a separate readout graph.
+    pub fn program(&self) -> &ExponentLutProgram {
+        &self.accumulation
     }
 
     /// The native accumulator has no reduction or terminal LUT stage.
     pub fn has_only_native_accumulation(&self) -> bool {
-        !self
-            .accumulation
-            .steps()
-            .iter()
-            .any(|step| matches!(step, ProgramStep::Gate(Gate::Lut { .. })))
+        false
+    }
+
+    /// Returns whether the program has exactly one terminal coefficient LUT.
+    pub fn has_terminal_coefficient_lut(&self) -> bool {
+        true
     }
 }
 
@@ -342,217 +786,101 @@ pub fn validate_profile_program(
 ) -> Result<(), PrfError> {
     profile.validate()?;
     program.profile.validate()?;
-    if program.profile != profile || program.readout.layout != profile.layout {
+    if program.profile != profile || program.readout != profile.canonical_readout()? {
         return Err(PrfError::InvalidSparseLwrBlock);
     }
     Ok(())
 }
 
-/// Fixed public label vectors and encrypted one-hot selectors for one PBC
-/// block. Label family members are [output][active cell], with padding absent.
-pub struct PrfSelectionInputs<S: ExponentLUTFixedRhsScheme> {
-    pub selectors: S::FixedRhs,
-    pub labels: Family<Mat>,
-    pub active: FamilyRange,
-    pub id: [u8; 32],
+/// Structural PRF preparation descriptor.  Cryptographic helper caches are
+/// owned by the concrete evaluator; this type records only the Program,
+/// and setup identity needed to reopen them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreparedSparseLwrPrfDescriptor {
+    pub program: ExponentLutProgramId,
+    pub setup: SparseLwrPrfSetupIdentity,
 }
 
-impl<S: ExponentLUTFixedRhsScheme> PrfSelectionInputs<S> {
-    /// Bind one block of a label-major public family to its selector range.
-    /// `labels` contains [output][selector capacity], whereas the prepared
-    /// selection retains only [output][active member]. The construction
-    /// contract requires complete rows and a nonempty valid active range.
-    /// RNS-BGG callers supply labels in this block's RHS ring; BGG may share one
-    /// global label family and selector family across blocks.
-    pub fn new(
-        selectors: S::FixedRhs,
-        labels: &Family<Mat>,
-        active: FamilyRange,
-        id: [u8; 32],
-    ) -> Result<Self, mxx_dsl::DslError> {
-        let capacity = Int::evaluate(active.capacity().clone());
-        let count = Int::evaluate(active.count().clone());
-        let outputs = Int::evaluate(labels.count().clone()).div(capacity.clone());
-        let labels = mxx_dsl::parallel(outputs.mul(count.clone()).expression()?, |index| {
-            let output = index.clone().div(count.clone());
-            let member = index.rem(count.clone()).add(Int::evaluate(active.start().clone()));
-            Ok(labels.at(output.mul(capacity.clone()).add(member)))
-        })?;
-        Ok(Self { selectors, labels, active, id })
-    }
-}
-
-/// Preprocessing output. The application connects the selection steps; the
-/// scheme implements each cryptographic step. Output axes remain families.
-pub struct PreparedSparseLwrPrf<S: ExponentLUTFixedRhsScheme> {
-    program: ExponentLutProgram,
-    pub(crate) steps: Vec<S::PreparedFixedProduct>,
-}
-
-impl<S: ExponentLUTFixedRhsScheme> Clone for PreparedSparseLwrPrf<S> {
-    fn clone(&self) -> Self {
-        Self { program: self.program.clone(), steps: self.steps.clone() }
-    }
-}
-
-/// Ordered fixed-product artifacts authenticated by the preprocessing contract.
-/// Backend bindings appear once; step descriptors contain only operation data.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct PreparedSparseLwrPrfDescriptor<B, D> {
-    program: ExponentLutProgramId,
-    binding: B,
-    prefix: String,
-    pub(crate) steps: Vec<D>,
-}
-
-impl<B, D> PreparedSparseLwrPrfDescriptor<B, D> {
-    /// Canonical step order determines names; descriptors cannot rename or
-    /// duplicate one step independently of its position in the Program.
-    pub(crate) fn artifacts(&self) -> impl Iterator<Item = (String, &D)> {
-        self.steps
-            .iter()
-            .enumerate()
-            .map(|(index, schema)| (format!("{}.{index}", self.prefix), schema))
-    }
-}
-
-impl<B: Serialize, D: Serialize> PreparedSparseLwrPrfDescriptor<B, D> {
+impl PreparedSparseLwrPrfDescriptor {
     pub fn identity(&self) -> Result<[u8; 32], PrfError> {
-        use sha2::{Digest, Sha256};
-        let mut hash = Sha256::new();
-        hash.update(b"exponent-lut-prepared-prf");
-        hash.update(serde_json::to_vec(self).map_err(|e| PrfError::Artifact(e.to_string()))?);
-        Ok(hash.finalize().into())
+        let bytes =
+            serde_json::to_vec(self).map_err(|error| PrfError::Artifact(error.to_string()))?;
+        let mut digest = sha2::Sha256::new();
+        digest.update(b"mxx-exponent-lut/sparse-lwr/structural-preparation");
+        digest.update(bytes);
+        Ok(digest.finalize().into())
     }
 }
 
-impl<S: ExponentLUTFixedRhsScheme> PreparedSparseLwrPrf<S> {
-    pub fn export(
-        &self,
-        scheme: &S,
-        mut graph: mxx_dsl::DslContext,
-        prefix: &str,
-    ) -> Result<
-        (
-            mxx_dsl::DslContext,
-            PreparedSparseLwrPrfDescriptor<
-                S::FixedProductBinding,
-                <S::PreparedFixedProduct as GraphValue>::Schema,
-            >,
-        ),
-        PrfError,
-    > {
-        let descriptor = PreparedSparseLwrPrfDescriptor {
-            program: self.program.id(),
-            binding: scheme.fixed_product_binding(),
-            prefix: prefix.into(),
-            steps: self.steps.iter().map(GraphValue::schema).collect(),
-        };
-        for ((name, _), step) in descriptor.artifacts().zip(&self.steps) {
-            graph = graph
-                .public_output(name, step.clone())
-                .map_err(|error| PrfError::Artifact(error.to_string()))?;
-        }
-        Ok((graph, descriptor))
+/// Structural PRF preparation state shared by preprocessing and online
+/// evaluation.  It carries no D0 values and no secret material.
+#[derive(Clone, Debug)]
+pub struct PreparedSparseLwrPrf {
+    program: SparseLwrPrfProgram,
+    setup: SparseLwrPrfSetupIdentity,
+}
+
+impl PartialEq for PreparedSparseLwrPrf {
+    fn eq(&self, other: &Self) -> bool {
+        // The structural declaration is compared through its canonical
+        // descriptor; the embedded graph handles are not value-comparable.
+        self.descriptor() == other.descriptor()
+    }
+}
+
+impl Eq for PreparedSparseLwrPrf {}
+
+impl PreparedSparseLwrPrf {
+    pub fn new(
+        program: SparseLwrPrfProgram,
+        layout: &PbcPublicLayout,
+        selector_key_instance: [u8; 32],
+    ) -> Result<Self, PrfError> {
+        validate_profile_program(program.profile(), &program)?;
+        let setup = program.setup_identity_for_key(layout, selector_key_instance)?;
+        Ok(Self { program, setup })
+    }
+
+    pub fn descriptor(&self) -> PreparedSparseLwrPrfDescriptor {
+        PreparedSparseLwrPrfDescriptor { program: self.program.id(), setup: self.setup.clone() }
     }
 
     pub fn import(
-        scheme: &S,
         program: SparseLwrPrfProgram,
-        descriptor: &PreparedSparseLwrPrfDescriptor<
-            S::FixedProductBinding,
-            <S::PreparedFixedProduct as GraphValue>::Schema,
-        >,
-        production: mxx_ir_core::artifact::ProductionId,
+        descriptor: &PreparedSparseLwrPrfDescriptor,
         expected_identity: [u8; 32],
     ) -> Result<Self, PrfError> {
-        let accumulation = program.accumulation;
-        if descriptor.identity()? != expected_identity ||
-            descriptor.program != accumulation.id() ||
-            descriptor.binding != scheme.fixed_product_binding() ||
-            descriptor.steps.len() != program.block_count
+        validate_profile_program(program.profile(), &program)?;
+        if descriptor.identity()? != expected_identity || descriptor.program != program.id() {
+            return Err(PrfError::Artifact("structural PRF identity mismatch".into()));
+        }
+        if descriptor.setup.program != program.id() || !program.is_structural() {
+            return Err(PrfError::Artifact("structural PRF setup mismatch".into()));
+        }
+        if descriptor.setup.schedule != program.product_schedule()? {
+            return Err(PrfError::Artifact("structural PRF schedule mismatch".into()));
+        }
+        let expected_label_schedule = BalancedProductSchedule::new(program.bucket_width())
+            .map_err(|_| PrfError::InvalidSparseLwrBlock)?;
+        let expected_t_l_commitment = program.label_transform_commitment();
+        if descriptor.setup.label_schedule != expected_label_schedule ||
+            descriptor.setup.t_l_commitment != expected_t_l_commitment
         {
-            return Err(PrfError::Artifact("prepared PRF identity or schedule mismatch".into()));
+            return Err(PrfError::Artifact("structural PRF label schedule mismatch".into()));
         }
-        let steps = descriptor
-            .artifacts()
-            .map(|(name, schema)| {
-                schema.artifact_input(
-                    production.clone(),
-                    name,
-                    mxx_ir_core::artifact::ArtifactConfidentiality::Public,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| PrfError::Artifact(error.to_string()))?;
-        Ok(Self { program: accumulation, steps })
+        Ok(Self { program, setup: descriptor.setup.clone() })
     }
 
-    /// Return the final public key to preprocessing and retain only operation
-    /// caches for online evaluation. The surrounding readout/setup owns any
-    /// persisted public output; importing the PRF does not duplicate it.
-    pub fn new(
-        scheme: &S,
-        program: SparseLwrPrfProgram,
-        initial: crate::scheme::PublicProgramValue<S>,
-        blocks: &[PrfSelectionInputs<S>],
-    ) -> Result<(crate::scheme::PublicProgramValue<S>, Self), ProgramLowerError<S::Error>> {
-        if blocks.len() != program.block_count {
-            return Err(ProgramValidationError::WidthMismatch.into());
-        }
-        let accumulation = program.accumulation;
-        let mut public = initial;
-        let mut steps = Vec::with_capacity(blocks.len());
-        for (step, gate) in accumulation.steps().iter().enumerate() {
-            let ProgramStep::Gate(Gate::MulPrivate { rhs, .. }) = gate else {
-                unreachable!("fixed accumulation is a direct-product chain")
-            };
-            let block = &blocks[rhs.index()];
-            let operation = || {
-                let rhs = scheme.combine_fixed_rhs(
-                    &block.selectors,
-                    &block.labels,
-                    &block.active,
-                    block.id,
-                )?;
-                scheme.prepare_fixed_product(&public, &rhs, block.id)
-            };
-            let (output, prepared) = operation().map_err(|source| {
-                ProgramLowerError::Operation { gate: ProgramGateInstance::Gate { step }, source }
-            })?;
-            public = output;
-            steps.push(prepared);
-        }
-        Ok((public, Self { program: accumulation, steps }))
-    }
-
-    /// The exact Program executed by public preparation and online evaluation.
-    /// Noise bindings and gate identities refer to this direct-product chain.
     pub fn program(&self) -> &ExponentLutProgram {
+        &self.program.accumulation
+    }
+
+    pub fn declaration(&self) -> &SparseLwrPrfProgram {
         &self.program
     }
-    pub fn steps(&self) -> &[S::PreparedFixedProduct] {
-        &self.steps
-    }
 
-    /// Evaluate fixed-product selections using only cached public preparation.
-    pub fn evaluate(
-        &self,
-        scheme: &S,
-        mut input: crate::scheme::EncodingProgramValue<S>,
-    ) -> Result<crate::scheme::EncodingProgramValue<S>, ProgramLowerError<S::Error>> {
-        for (step, gate) in self.program.steps().iter().enumerate() {
-            let ProgramStep::Gate(Gate::MulPrivate { rhs, .. }) = gate else {
-                unreachable!("fixed accumulation is a direct-product chain")
-            };
-            input = scheme.evaluate_fixed_product(&input, &self.steps[rhs.index()]).map_err(
-                |source| ProgramLowerError::Operation {
-                    gate: ProgramGateInstance::Gate { step },
-                    source,
-                },
-            )?;
-        }
-        Ok(input)
+    pub fn setup_identity(&self) -> &SparseLwrPrfSetupIdentity {
+        &self.setup
     }
 }
 
@@ -580,6 +908,29 @@ mod tests {
     }
 
     #[test]
+    fn canonical_labels_and_transforms_are_stable_and_single_column() {
+        let profile =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+        let first_slot = 7_u64.to_le_bytes();
+        let second_slot = 8_u64.to_le_bytes();
+        let first =
+            PrfLabel::from_components(&[b"mask".as_slice(), first_slot.as_slice()]).unwrap();
+        let second =
+            PrfLabel::from_components(&[b"mask".as_slice(), second_slot.as_slice()]).unwrap();
+        assert_ne!(first, second);
+        let columns = profile.transform_column_count().unwrap();
+        let a = profile.derive_label_transform(b"hash-key", &first, columns).unwrap();
+        let b = profile.derive_label_transform(b"hash-key", &first, columns).unwrap();
+        assert_eq!(a, b);
+        assert_ne!(a, profile.derive_label_transform(b"hash-key", &second, columns).unwrap());
+        assert_eq!((a.rows(), a.columns()), (columns, 1));
+        assert!(profile.derive_label_transform(b"hash-key", &first, 0).is_err());
+        assert_eq!(PrfLabel::from_canonical_bytes(first.as_bytes().to_vec()).unwrap(), first);
+        assert!(PrfLabel::from_canonical_bytes(b"not-a-label".to_vec()).is_err());
+        assert!(serde_json::from_str::<PrfLabel>("[1, 2, 3]").is_err());
+    }
+
+    #[test]
     fn canonical_sparse_lwr_table_has_full_q_complement_and_uniform_p_values() {
         for (ring_dimension_log2, stride_log2) in
             [(3_u32, 0_u32), (3, 1), (3, 2), (4, 0), (4, 1), (4, 2)]
@@ -591,10 +942,7 @@ mod tests {
                 SparseLwrPrfProfile::new(ExpLayout { stride_log2, width_log2 }, p_prime).unwrap();
             let readout = profile.canonical_readout().unwrap();
             let expected = (0..n_prime).map(|k| p_prime * k / n_prime + 1).collect::<Vec<_>>();
-            let coefficients = readout.canonical_coefficients().unwrap();
-            let expected_coefficients =
-                expected.iter().map(|value| num_bigint::BigInt::from(*value)).collect::<Vec<_>>();
-            assert_eq!(coefficients, expected_coefficients.as_slice());
+            assert_eq!(readout, expected);
             for k in 0..n_prime {
                 let complement = 1_i64 - expected[k] as i64;
                 assert_eq!(expected[k] as i64 + complement, 1);
@@ -616,16 +964,196 @@ mod tests {
     }
 
     #[test]
-    fn native_program_has_one_private_product_per_block_and_no_lut() {
+    fn public_product_keeps_the_private_accumulator_first() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let a = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let b = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let c = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let output = apply_public_product(
+            &mut builder,
+            private,
+            vec![Operand::Scalar(a), Operand::Scalar(b), Operand::Scalar(c)],
+        )
+        .unwrap();
+        builder.finish(vec![Operand::Scalar(output)]).unwrap();
+    }
+
+    #[test]
+    fn structural_program_uses_one_shared_d_family_and_sequential_buckets() {
         let profile =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
-        let program = SparseLwrPrfProgram::new(profile, 2, 3).unwrap();
-        assert!(program.has_only_native_accumulation());
-        assert_eq!(program.accumulation.rhs_inputs().len(), 3);
-        assert_eq!(program.accumulation.steps().len(), 3);
-        assert_eq!(program.accumulation.gates().len(), 3);
+        let program = SparseLwrPrfProgram::new_structural(
+            profile,
+            4,
+            3,
+            b"test-hash-key",
+            &[PrfLabel::from_components(&[b"test-label"]).unwrap()],
+        )
+        .unwrap();
+        assert!(program.is_structural());
+        assert_eq!(program.selection_families().len(), 3);
+        assert_eq!(program.d0_input(), program.selection_families()[0].d0);
+        assert!(program.selection_families().windows(2).all(|families| {
+            families[0].selector == families[1].selector && families[0].d0 == families[1].d0
+        }));
+        assert!(program.has_terminal_coefficient_lut());
+        assert!(!program.has_only_native_accumulation());
+        assert_eq!(program.product_schedule().unwrap().leaf_count(), 3);
+        let other = SparseLwrPrfProgram::new_structural(
+            profile,
+            4,
+            3,
+            b"test-hash-key",
+            &[PrfLabel::from_components(&[b"other-label"]).unwrap()],
+        )
+        .unwrap();
+        assert_ne!(program.id(), other.id());
+        let other_hash = SparseLwrPrfProgram::new_structural(
+            profile,
+            4,
+            3,
+            b"other-hash-key",
+            &[PrfLabel::from_components(&[b"test-label"]).unwrap()],
+        )
+        .unwrap();
+        assert_ne!(program.id(), other_hash.id());
+    }
+
+    #[test]
+    fn fixed_transform_shapes_are_checked_before_ast_construction() {
+        let profile =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2).unwrap();
+        let columns = profile.transform_column_count().unwrap();
+        let transform = BinaryTransformMatrix::new(1, columns, vec![1; columns]).unwrap();
+        let label = PrfLabel::from_components(&[b"test-label"]).unwrap();
         assert!(
-            program.accumulation.gates().iter().all(|gate| matches!(gate, Gate::MulPrivate { .. }))
+            SparseLwrPrfProgram::new_structural_with_labels(
+                profile,
+                2,
+                2,
+                vec![label.clone()],
+                vec![transform.clone()]
+            )
+            .is_err()
+        );
+        let transforms = vec![transform; 4];
+        let program =
+            SparseLwrPrfProgram::new_structural_with_labels(profile, 2, 2, vec![label], transforms)
+                .unwrap();
+        assert_eq!(
+            program
+                .transform_product_schedule(
+                    &BinaryTransformMatrix::new(1, columns, vec![1; columns]).unwrap(),
+                )
+                .unwrap()
+                .leaf_count(),
+            columns
+        );
+    }
+
+    #[test]
+    fn setup_identity_is_shared_across_encryptor_d0_values() {
+        let profile =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+        let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
+        let generated = (0..32_u8)
+            .find_map(|seed| {
+                crate::noise_refresh::pbc::generate_key_layout(
+                    &parameters,
+                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    &[0, 1],
+                )
+                .ok()
+            })
+            .expect("toy setup must find a PBC schedule");
+        let layout = &generated.public_layout;
+        let program = SparseLwrPrfProgram::new_structural(
+            profile,
+            layout.bucket_width,
+            layout.parameters.bucket_count,
+            b"toy-hash-key",
+            &[PrfLabel::from_components(&[b"toy-label"]).unwrap()],
+        )
+        .unwrap();
+        let ring = mxx_dsl::Ring::new(257, profile.ring_dimension().unwrap());
+        let selector = crate::noise_refresh::pbc::PbcTrustedSelectorBits::from_schedule(
+            &generated, &ring, [9; 32],
+        )
+        .unwrap()
+        .runtime_binding(&ring)
+        .unwrap();
+        let columns = profile.transform_column_count().unwrap();
+        let modulus = profile.q().unwrap();
+        let a = crate::noise_refresh::pbc::PbcPublicVectorFamilyBinding::from_d0_values(
+            layout,
+            (0..columns).map(|index| (index % modulus) as u64).collect(),
+            modulus,
+            columns,
+        )
+        .unwrap();
+        let b = crate::noise_refresh::pbc::PbcPublicVectorFamilyBinding::from_d0_values(
+            layout,
+            (0..columns).map(|index| ((index + 1) % modulus) as u64).collect(),
+            modulus,
+            columns,
+        )
+        .unwrap();
+        assert!(
+            crate::noise_refresh::pbc::PbcPublicVectorFamilyBinding::from_d0_values(
+                layout,
+                vec![0; columns.saturating_sub(1)],
+                modulus,
+                columns,
+            )
+            .is_err()
+        );
+        let mut forged = serde_json::to_value(&a).unwrap();
+        forged["family_count"] = serde_json::json!(columns.saturating_sub(1));
+        let forged: crate::noise_refresh::pbc::PbcPublicVectorFamilyBinding =
+            serde_json::from_value(forged).unwrap();
+        assert!(forged.validate_d0(layout, columns).is_err());
+        let a_binding = program.encryption_binding(layout, &a, &selector).unwrap();
+        let b_binding = program.encryption_binding(layout, &b, &selector).unwrap();
+        assert_eq!(a_binding.setup, b_binding.setup);
+        assert_eq!(a_binding.setup.label_schedule.leaf_count(), program.bucket_width());
+        assert_eq!(a_binding.setup.t_l_commitment, program.label_transform_commitment());
+        assert_eq!(a_binding.setup.input_key_identity, [9; 32]);
+        assert_eq!(a_binding.selector_input_name, b_binding.selector_input_name);
+        assert_ne!(a_binding.d0_identity, b_binding.d0_identity);
+        assert_ne!(a_binding.identity().unwrap(), b_binding.identity().unwrap());
+    }
+
+    #[test]
+    fn prepared_descriptor_requires_an_external_trusted_identity() {
+        let profile =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
+        let parameters = crate::noise_refresh::pbc::PbcParameters::custom(3, 2, 2, 2, 32, None);
+        let generated = (0..32_u8)
+            .find_map(|seed| {
+                crate::noise_refresh::pbc::generate_key_layout(
+                    &parameters,
+                    crate::noise_refresh::pbc::PbcRootSeed([seed; 32]),
+                    &[0, 1],
+                )
+                .ok()
+            })
+            .expect("toy setup must find a PBC schedule");
+        let layout = generated.public_layout;
+        let program = SparseLwrPrfProgram::new_structural(
+            profile,
+            layout.bucket_width,
+            layout.parameters.bucket_count,
+            b"toy-hash-key",
+            &[PrfLabel::from_components(&[b"toy-label"]).unwrap()],
+        )
+        .unwrap();
+        let prepared = PreparedSparseLwrPrf::new(program.clone(), &layout, [7; 32]).unwrap();
+        let descriptor = prepared.descriptor();
+        assert!(PreparedSparseLwrPrf::import(program.clone(), &descriptor, [0; 32]).is_err());
+        assert!(
+            PreparedSparseLwrPrf::import(program, &descriptor, descriptor.identity().unwrap(),)
+                .is_ok()
         );
     }
 
@@ -633,26 +1161,32 @@ mod tests {
     fn profile_program_mismatch_is_rejected() {
         let profile =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 8).unwrap();
-        let program = SparseLwrPrfProgram::new(profile, 2, 1).unwrap();
+        let program = SparseLwrPrfProgram::new_structural(
+            profile,
+            2,
+            1,
+            b"test-hash-key",
+            &[PrfLabel::from_components(&[b"test-label"]).unwrap()],
+        )
+        .unwrap();
         let other =
             SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 4).unwrap();
         assert!(validate_profile_program(other, &program).is_err());
+
+        let mut noncanonical = program.clone();
+        noncanonical.readout[0] += 1;
+        assert!(validate_profile_program(profile, &noncanonical).is_err());
     }
+
     #[test]
     fn tiny_native_reference_oracle_covers_every_z_mod_q() {
-        let profile =
-            SparseLwrPrfProfile::new(crate::layout::ExpLayout { stride_log2: 1, width_log2: 4 }, 2)
-                .expect("n=32, Q=32, p'=2 profile");
+        let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2)
+            .expect("n=32, Q=32, p'=2 profile");
         assert_eq!(profile.ring_dimension().unwrap(), 32);
         assert_eq!(profile.q().unwrap(), 32);
         assert_eq!(profile.p_prime, 2);
         assert_eq!(profile.layout.stride_log2, 1);
-        let coefficients = profile
-            .canonical_readout()
-            .expect("canonical readout")
-            .canonical_coefficients()
-            .expect("constant readout table")
-            .to_vec();
+        let coefficients = profile.canonical_readout().expect("canonical readout");
         assert_eq!(coefficients.len(), 16);
 
         // Readout represents f(z)-1/2 in doubled centered coordinates.
@@ -661,7 +1195,7 @@ mod tests {
         let doubled = (0..32)
             .map(|z| {
                 let k = z % 16;
-                let value = &coefficients[k] * BigInt::from(2_u8) - BigInt::from(1_u8);
+                let value = BigInt::from(coefficients[k]) * BigInt::from(2_u8) - BigInt::from(1_u8);
                 if z < 16 { value } else { -value }
             })
             .collect::<Vec<_>>();

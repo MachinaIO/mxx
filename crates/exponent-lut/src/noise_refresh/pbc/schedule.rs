@@ -9,6 +9,130 @@ use super::{
     PbcCell, PbcError, PbcLayoutId, PbcParameters, PbcPublicLayout, PbcRetryCause,
     PbcRetryDiagnostics, PbcRootSeed, derive_attempt_seed,
 };
+use sha2::{Digest, Sha256};
+
+/// A public binary transform used to derive one label from the encryptor's
+/// coordinate encoding family.
+///
+/// The matrix is preprocessing metadata, not a runtime family.  Keeping it
+/// as packed bits lets a lowerer choose the non-zero columns and construct a
+/// balanced `MulPublic` tree without expanding one graph member per label on
+/// the host.  `rows` and `columns` are explicit because a rectangular matrix
+/// is useful for the public-key and encoding stages even though the common
+/// sparse-LWR profile currently uses square transforms.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct BinaryTransformMatrix {
+    rows: usize,
+    columns: usize,
+    bits: Vec<u8>,
+}
+
+impl BinaryTransformMatrix {
+    /// Creates a row-major binary matrix after checking its shape and values.
+    pub fn new(rows: usize, columns: usize, bits: Vec<u8>) -> Result<Self, PbcError> {
+        let length = rows.checked_mul(columns).ok_or(PbcError::SizeOverflow)?;
+        if rows == 0 || columns == 0 || bits.len() != length || bits.iter().any(|bit| *bit > 1) {
+            return Err(PbcError::InvalidLayout(
+                "binary transform has an invalid shape or non-binary entry".into(),
+            ));
+        }
+        Ok(Self { rows, columns, bits })
+    }
+
+    /// Constructs the identity transform of the requested square dimension.
+    pub fn identity_matrix(dimension: usize) -> Result<Self, PbcError> {
+        let mut bits = vec![0; dimension.checked_mul(dimension).ok_or(PbcError::SizeOverflow)?];
+        for index in 0..dimension {
+            bits[index * dimension + index] = 1;
+        }
+        Self::new(dimension, dimension, bits)
+    }
+
+    /// Derives a deterministic binary transform from the setup hash key and
+    /// one canonical opaque label.  The transform is public setup metadata;
+    /// no enumeration order or random nonce participates in its identity.
+    ///
+    /// Each entry is sampled from an independent domain-separated SHA-256
+    /// digest.  Encoding the key and label with explicit lengths prevents
+    /// concatenation ambiguities (for example `ab || c` versus `a || bc`).
+    /// The requested shape and row/column coordinates are included in the
+    /// digest, so changing the fixed public dimensions changes the transform
+    /// identity instead of silently reusing an incompatible schedule.
+    pub fn from_hash(
+        hash_key: &[u8],
+        canonical_label: &[u8],
+        rows: usize,
+        columns: usize,
+    ) -> Result<Self, PbcError> {
+        if rows == 0 || columns == 0 {
+            return Err(PbcError::InvalidLayout("binary transform has an empty shape".into()));
+        }
+        let length = rows.checked_mul(columns).ok_or(PbcError::SizeOverflow)?;
+        let key_len = u64::try_from(hash_key.len()).map_err(|_| PbcError::SizeOverflow)?;
+        let label_len = u64::try_from(canonical_label.len()).map_err(|_| PbcError::SizeOverflow)?;
+        let rows_u64 = u64::try_from(rows).map_err(|_| PbcError::SizeOverflow)?;
+        let columns_u64 = u64::try_from(columns).map_err(|_| PbcError::SizeOverflow)?;
+        let mut bits = Vec::with_capacity(length);
+        for row in 0..rows {
+            let row = u64::try_from(row).map_err(|_| PbcError::SizeOverflow)?;
+            for column in 0..columns {
+                let column = u64::try_from(column).map_err(|_| PbcError::SizeOverflow)?;
+                let mut digest = Sha256::new();
+                digest.update(b"mxx-exponent-lut/sparse-lwr/transform/v1");
+                digest.update(key_len.to_le_bytes());
+                digest.update(hash_key);
+                digest.update(label_len.to_le_bytes());
+                digest.update(canonical_label);
+                digest.update(rows_u64.to_le_bytes());
+                digest.update(columns_u64.to_le_bytes());
+                digest.update(row.to_le_bytes());
+                digest.update(column.to_le_bytes());
+                bits.push(digest.finalize()[0] & 1);
+            }
+        }
+        Self::new(rows, columns, bits)
+    }
+
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub const fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn bits(&self) -> &[u8] {
+        &self.bits
+    }
+
+    /// Returns the selected source columns for one output row.
+    pub fn selected_columns(&self, row: usize) -> Option<Vec<usize>> {
+        (row < self.rows).then(|| {
+            let start = row * self.columns;
+            self.bits[start..start + self.columns]
+                .iter()
+                .enumerate()
+                .filter_map(|(column, bit)| (*bit == 1).then_some(column))
+                .collect()
+        })
+    }
+
+    /// Returns the number of non-zero entries, useful for workload estimates.
+    pub fn nonzero_count(&self) -> usize {
+        self.bits.iter().filter(|bit| **bit == 1).count()
+    }
+
+    /// Stable digest of the complete public transform.
+    pub fn commitment(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"mxx-exponent-lut/pbc/binary-transform/v1");
+        digest.update((self.rows as u64).to_le_bytes());
+        digest.update((self.columns as u64).to_le_bytes());
+        digest.update(&self.bits);
+        digest.finalize().into()
+    }
+}
 
 pub(crate) fn deterministic_matching(
     layout: &PbcPublicLayout,
@@ -296,23 +420,6 @@ pub fn generate_key_layout(
     )
 }
 
-/// Reconstruct one previously accepted public layout and its private schedule
-/// from the serialized layout seed.  This is crate-visible because durable
-/// reviewed reports store the accepted attempt seed rather than the root seed;
-/// callers must still validate the resulting public layout identity.
-pub(crate) fn generate_key_layout_from_layout_seed(
-    parameters: &PbcParameters,
-    layout_seed: super::PbcLayoutSeed,
-    accepted_attempt: u32,
-    sparse_support: &[usize],
-) -> Result<PbcGeneratedKeyLayout, PbcError> {
-    parameters.validate()?;
-    let support = ValidatedSupport::new(parameters, sparse_support)?;
-    let layout = PbcPublicLayout::build(parameters, layout_seed, accepted_attempt)?;
-    let private_schedule = schedule(&layout, &support)?;
-    Ok(PbcGeneratedKeyLayout { public_layout: layout, private_schedule })
-}
-
 pub(super) fn retry_layout(
     parameters: &PbcParameters,
     root_seed: PbcRootSeed,
@@ -430,4 +537,27 @@ pub fn support_from_dense(
         return Err(PbcError::SupportSize);
     }
     Ok(support)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BinaryTransformMatrix;
+
+    #[test]
+    fn hashed_transform_is_deterministic_and_label_order_independent() {
+        let first = BinaryTransformMatrix::from_hash(b"key", b"label-a", 3, 5).unwrap();
+        let second = BinaryTransformMatrix::from_hash(b"key", b"label-a", 3, 5).unwrap();
+        assert_eq!(first, second);
+        assert_ne!(first, BinaryTransformMatrix::from_hash(b"key", b"label-b", 3, 5).unwrap());
+        assert_ne!(first, BinaryTransformMatrix::from_hash(b"other", b"label-a", 3, 5).unwrap());
+        assert_eq!(first.rows(), 3);
+        assert_eq!(first.columns(), 5);
+        assert!(first.bits().iter().all(|bit| *bit <= 1));
+    }
+
+    #[test]
+    fn hashed_transform_rejects_empty_shapes_and_checks_overflow() {
+        assert!(BinaryTransformMatrix::from_hash(b"key", b"label", 0, 1).is_err());
+        assert!(BinaryTransformMatrix::from_hash(b"key", b"label", 1, 0).is_err());
+    }
 }

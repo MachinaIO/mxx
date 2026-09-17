@@ -94,8 +94,51 @@ impl ChildNodeResult {
             }
             // Exact typed envelopes supplement ordinary capacity shapes just
             // as in the full evaluator; they are not an alternative branch.
+            //
+            // Keep the envelope's exact occurrences associated with the
+            // projected claim indices.  The old child path appended every
+            // exact claim at the child node only, which made an escaping
+            // output look as though its level/format owner had already been
+            // released.  That is especially visible when a child output is
+            // consumed by a later GPU node: the ordinary shape survived to
+            // `output_end`, but its exact typed claim did not.
+            let mut exact_indices = child
+                .projection
+                .claims
+                .iter()
+                .enumerate()
+                .filter_map(|(index, _)| {
+                    matches!(
+                        child.projection.provenance[index],
+                        ClaimProvenance::SlotExact |
+                            ClaimProvenance::RequiredExact |
+                            ClaimProvenance::AlternativeEnvelopeIncrement
+                    )
+                    .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            let mut escaping_exact = std::collections::BTreeSet::new();
+            for (index, end) in child.demand.matrix_until.iter().enumerate() {
+                if *end == usize::MAX {
+                    escaping_exact.extend(child.projection.matrix_indices[index].iter().copied());
+                }
+            }
             for &claim in &child.typed_claims {
-                context.matrix_claim(self.position, self.position, claim);
+                let exact_index = exact_indices
+                    .iter()
+                    .position(|&index| {
+                        claim_key(child.projection.claims[index]) == claim_key(claim)
+                    })
+                    .map(|offset| exact_indices.remove(offset));
+                let escapes = exact_index.map_or(false, |index| escaping_exact.contains(&index));
+                let parent_end = if escapes { self.output_end } else { self.position };
+                context.matrix_claim(self.position, parent_end, claim);
+                if escapes {
+                    let owner_index =
+                        exact_index.expect("escaping exact claim must have a projected index");
+                    context.matrix_demands.last_mut().unwrap().owners =
+                        escaping(std::slice::from_ref(&owner_index));
+                }
             }
             for (index, ((layout, end), shared)) in child
                 .demand

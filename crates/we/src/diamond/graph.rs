@@ -18,7 +18,7 @@ use mxx_gadgets::{
 };
 use mxx_ir_core::{
     IntExpr, ParamEnv,
-    artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+    artifact::{ProductionId, SpecHash},
     node::{ConcatAxis, IndexRange},
     protocol::{
         ArtifactBinding, ArtifactName, ClosedProtocolBundle, ComparatorEndpointBinding,
@@ -415,14 +415,17 @@ impl DiamondWeProtocolFamily {
         let decoder_preimage = decoder_trapdoor.sample_preimage(decoder_target, (state_columns, 1));
 
         let graph = context
-            .public_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.p)?
-            .public_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
-            .public_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
-            .public_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
-            .public_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposed)?
-            .public_output(DiamondArtifactNames::PUBLIC_KEYS, public_keys.field(|key| key.matrix)?)?
-            .public_output(DiamondArtifactNames::TRANSITIONS, input_preprocessing.transitions)?
-            .public_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
+            .artifact_output(DiamondArtifactNames::INITIAL_STATE, input_preprocessing.p)?
+            .artifact_output(DiamondArtifactNames::ONE_PREIMAGE, one_preimage)?
+            .artifact_output(DiamondArtifactNames::K_PREIMAGE, k_preimage)?
+            .artifact_output(DiamondArtifactNames::DECODER_PREIMAGE, decoder_preimage)?
+            .artifact_output(DiamondArtifactNames::R_DECOMPOSED, r_decomposed)?
+            .artifact_output(
+                DiamondArtifactNames::PUBLIC_KEYS,
+                public_keys.field(|key| key.matrix)?,
+            )?
+            .artifact_output(DiamondArtifactNames::TRANSITIONS, input_preprocessing.transitions)?
+            .artifact_output(DiamondArtifactNames::WITNESS_PREIMAGES, witness_preimages)?
             .build()?;
         Ok(DiamondEncryptionBuild { graph: DiamondEncryptionGraph { graph } })
     }
@@ -445,7 +448,6 @@ impl DiamondWeProtocolFamily {
             encryption.clone(),
             DiamondArtifactNames::INITIAL_STATE,
             (1, state_columns.clone()),
-            ArtifactConfidentiality::Public,
         );
         let witness =
             context.int_family_input(BOOLEAN_WITNESS_INPUT, circuit_params.max_layer_width.clone());
@@ -471,7 +473,6 @@ impl DiamondWeProtocolFamily {
             transition_count,
             (state_columns.clone(), state_columns.clone()),
             preimage_bound.clone(),
-            ArtifactConfidentiality::Public,
         );
         let input_evaluation = DiamondInputInjector::parameterized(graph_params.input.clone())
             .evaluate(initial_state, witness_digits, transitions)?;
@@ -483,7 +484,6 @@ impl DiamondWeProtocolFamily {
             DiamondArtifactNames::PUBLIC_KEYS,
             (&witness_size + IntExpr::constant(1)).canonicalize(),
             (1, public_columns.clone()),
-            ArtifactConfidentiality::Public,
         );
         let public_keys = public_key_matrices
             .field(|matrix| BggPublicKeyWire { matrix, reveal_plaintext: true })?;
@@ -492,21 +492,18 @@ impl DiamondWeProtocolFamily {
             DiamondArtifactNames::ONE_PREIMAGE,
             (state_columns.clone(), public_columns.clone()),
             preimage_bound.clone(),
-            ArtifactConfidentiality::Public,
         );
         let k_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::K_PREIMAGE,
             (state_columns.clone(), 1),
             preimage_bound.clone(),
-            ArtifactConfidentiality::Public,
         );
         let decoder_preimage = ring.preimage_artifact_input(
             encryption.clone(),
             DiamondArtifactNames::DECODER_PREIMAGE,
             (state_columns.clone(), 1),
             preimage_bound.clone(),
-            ArtifactConfidentiality::Public,
         );
         let initial_projection_state = states.at(0);
         let one_vector = one_preimage.mul_small_rhs(initial_projection_state.clone());
@@ -523,7 +520,6 @@ impl DiamondWeProtocolFamily {
             witness_size.clone(),
             (state_columns.clone(), public_columns.clone()),
             preimage_bound,
-            ArtifactConfidentiality::Public,
         );
         let witness_encodings = parallel(witness_size.clone(), |bit| {
             Ok(CircuitEncoding {
@@ -575,7 +571,6 @@ impl DiamondWeProtocolFamily {
                 Box::new(IntExpr::constant(2)),
             )
             .canonicalize(),
-            ArtifactConfidentiality::Public,
         );
         let one_minus_circuit = one_encoding.vector - circuit_vector;
         let projected_difference = r_decomposed.mul_small_rhs(one_minus_circuit);

@@ -5,8 +5,10 @@ use crate::{
     backend::{
         Backend, BackendStorageContract, BackendStorageDescriptor, FixedGadgetDecomposeRequest,
         FixedGenerationOutput, FixedGenerationRequest, FixedOperationBatchRequest,
-        FusedBatchOutput, FusedBatchRequest, IndexRange, MatrixMulAccumulateRequest,
-        PlannedNodeBatchRequest, RuntimeValue, SampleRange, validate_backend_storage_contract,
+        FusedBatchOutput, FusedBatchRequest, GpuWarmupProfile, GpuWarmupProfileError,
+        GpuWarmupProfileProvider, GpuWarmupProfileRequest, IndexRange, MatrixMulAccumulateRequest,
+        PlannedNodeBatchRequest, PlannedOperandMetadata, RuntimeValue, SampleRange,
+        validate_backend_storage_contract,
     },
     gpu_calibration::{
         FrozenGpuCalibrationRegistry, GpuCalibrationError, GpuCalibrationKey,
@@ -461,6 +463,60 @@ fn validate_shards<T>(
     assert_eq!(next, columns, "fleet shards must cover every logical column exactly once");
 }
 
+/// Return the physical compact-shard pieces intersecting a logical range.
+/// Each tuple is `(shard index, local start, local end)` and the result is
+/// ordered by logical position.  Keeping this pure makes the producer/consumer
+/// partition contract testable without constructing CUDA matrices.
+fn compact_shard_overlaps(
+    shards: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> Result<Vec<(usize, usize, usize)>, PolyBackendError> {
+    if start >= end {
+        return Err(PolyBackendError::InvalidConstantShape);
+    }
+    let mut ordered = shards.iter().copied().enumerate().collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, (shard_start, _))| *shard_start);
+    let mut cursor = start;
+    let mut pieces = Vec::new();
+    for (index, (shard_start, shard_columns)) in ordered {
+        let shard_end =
+            shard_start.checked_add(shard_columns).ok_or(PolyBackendError::InvalidInteger)?;
+        let overlap_start = cursor.max(shard_start);
+        let overlap_end = end.min(shard_end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        if overlap_start != cursor {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        pieces.push((index, overlap_start - shard_start, overlap_end - shard_start));
+        cursor = overlap_end;
+        if cursor == end {
+            break;
+        }
+    }
+    if cursor != end {
+        return Err(PolyBackendError::UnsupportedPlacement);
+    }
+    Ok(pieces)
+}
+
+fn active_device_indices<'a>(
+    device_count: usize,
+    schedules: impl IntoIterator<Item = &'a GpuColumnSchedule>,
+) -> Vec<usize> {
+    let mut active = vec![false; device_count];
+    for schedule in schedules {
+        for interval in schedule.intervals() {
+            if interval.device < active.len() {
+                active[interval.device] = true;
+            }
+        }
+    }
+    active.into_iter().enumerate().filter_map(|(device, active)| active.then_some(device)).collect()
+}
+
 impl fmt::Display for GpuFleetTrapdoor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "GPU trapdoor replicated on {} device(s)", self.values.len())
@@ -472,6 +528,7 @@ pub struct GpuDcrtBackend {
     operation_widths: HashMap<[u8; 32], GpuColumnWidths>,
     manual_widths: HashSet<[u8; 32]>,
     operation_profiles: HashMap<[u8; 32], GpuCalibrationProfile>,
+    warmup_profiles: HashMap<GpuWarmupProfileRequest, GpuWarmupProfile>,
     calibration_misses: HashSet<[u8; 32]>,
     pending_profile: Option<([u8; 32], GpuCalibrationProfile)>,
     pending_pilot: Option<RuntimePilot>,
@@ -482,11 +539,13 @@ pub struct GpuDcrtBackend {
     /// A frozen plan is deliberately kept separate from calibration state.
     /// Installing one never turns a cache miss into a runtime pilot; fixed
     /// dispatch consumes only its value-only metadata.
-    frozen_plan: Option<FrozenGpuPlan>,
+    frozen_plan: Option<Arc<FrozenGpuPlan>>,
     fixed_node: Option<GpuNodeChoice>,
     fixed_instance_slots: Vec<usize>,
     execution_identity: u64,
     plan_budgets: Option<Vec<GpuDeviceBudget>>,
+    #[cfg(test)]
+    warmup_profile_provider_calls: usize,
 }
 
 struct RuntimePilot {
@@ -521,6 +580,7 @@ impl GpuDcrtBackend {
             operation_widths: HashMap::new(),
             manual_widths: HashSet::new(),
             operation_profiles: HashMap::new(),
+            warmup_profiles: HashMap::new(),
             calibration_misses: HashSet::new(),
             pending_profile: None,
             pending_pilot: None,
@@ -536,7 +596,25 @@ impl GpuDcrtBackend {
                 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
                 NEXT_BACKEND.fetch_add(1, Ordering::Relaxed)
             },
+            #[cfg(test)]
+            warmup_profile_provider_calls: 0,
         }
+    }
+
+    #[cfg(test)]
+    fn warmup_profile_provider_calls(&self) -> usize {
+        self.warmup_profile_provider_calls
+    }
+
+    /// Installs a setup-time profile collected by the device-local production
+    /// range adapter. Fixed execution never consumes this cache.
+    pub fn register_warmup_profile(
+        &mut self,
+        request: GpuWarmupProfileRequest,
+        profile: GpuWarmupProfile,
+    ) -> Result<(), GpuWarmupProfileError> {
+        self.warmup_profiles.insert(request, profile.validate()?);
+        Ok(())
     }
 
     /// Install the value-only plan used by fixed production dispatch.
@@ -555,7 +633,7 @@ impl GpuDcrtBackend {
         if mapped != self.devices.iter().map(|(device, _)| *device).collect::<Vec<_>>() {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
-        self.frozen_plan = Some(plan);
+        self.frozen_plan = Some(Arc::new(plan));
         self.fixed_node = None;
         self.pending_profile = None;
         self.pending_pilot = None;
@@ -568,7 +646,7 @@ impl GpuDcrtBackend {
     }
 
     pub fn frozen_plan(&self) -> Option<&FrozenGpuPlan> {
-        self.frozen_plan.as_ref()
+        self.frozen_plan.as_deref()
     }
 
     pub fn fixed_dispatch_enabled(&self) -> bool {
@@ -1279,21 +1357,183 @@ impl GpuDcrtBackend {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         for (value, declared) in values.iter().zip(&metadata.source_layouts) {
-            let ring_dimension = value
-                .shards
-                .first()
-                .map(|shard| shard.value.params().ring_dimension() as usize)
-                .unwrap_or(0);
-            let (rows, columns, representation) =
-                (value.rows, value.columns, format!("{:?}", Self::policy_matrix_type(value)?));
+            if !self.fixed_value_matches_layout(value, declared)? {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            }
+        }
+        Ok(())
+    }
+
+    fn fixed_value_matches_layout(
+        &self,
+        value: &GpuFleetMatrix,
+        declared: &crate::backend::PlannedLayoutMetadata,
+    ) -> Result<bool, PolyBackendError> {
+        let ring_dimension = value
+            .shards
+            .first()
+            .map(|shard| shard.value.params().ring_dimension() as usize)
+            .unwrap_or(0);
+        let representation = format!("{:?}", Self::policy_matrix_type(value)?);
+        Ok(declared.layout_id.is_none() &&
+            declared.rows == value.rows &&
+            declared.columns == value.columns &&
+            declared.ring_dimension == ring_dimension &&
+            declared.representation == representation)
+    }
+
+    /// Validate the complete typed source vector carried by a fused request.
+    /// Compact RHS values are real source operands too; keeping this check
+    /// typed avoids silently accepting a matrix-only prefix of `source_layouts`.
+    fn validate_fixed_typed_source_metadata_at(
+        &self,
+        metadata: Option<&PlannedNodeBatchRequest>,
+        offset: usize,
+        values: &[ConcreteWireType],
+    ) -> Result<(), PolyBackendError> {
+        let Some(metadata) = metadata else { return Ok(()) };
+        let end = offset.checked_add(values.len()).ok_or(PolyBackendError::InvalidInteger)?;
+        if metadata.source_layouts.len() < end {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        for (value, declared) in values.iter().zip(&metadata.source_layouts[offset..end]) {
+            let matrix = value.matrix_type().ok_or(PolyBackendError::UnsupportedPlacement)?;
             if declared.layout_id.is_some() ||
-                declared.rows != rows ||
-                declared.columns != columns ||
-                declared.ring_dimension != ring_dimension ||
-                declared.representation != representation
+                declared.rows != matrix.rows ||
+                declared.columns != matrix.columns ||
+                declared.ring_dimension != matrix.ring_dimension ||
+                declared.representation != format!("{value:?}")
             {
                 return Err(PolyBackendError::UnsupportedPlacement);
             }
+        }
+        Ok(())
+    }
+
+    /// The executor metadata describes the logical concat operand.  Fixed
+    /// fused dispatch lowers that operand into row blocks, so comparing the
+    /// metadata vector length with the lowered block count is incorrect.  The
+    /// blocks are instead checked as an ordered, gap-free row decomposition of
+    /// the one logical source layout.
+    fn validate_fixed_concat_blocks_metadata(
+        &self,
+        metadata: Option<&PlannedNodeBatchRequest>,
+        blocks: &[&GpuFleetMatrix],
+        source_index: usize,
+    ) -> Result<(), PolyBackendError> {
+        let Some(metadata) = metadata else { return Ok(()) };
+        let declared = metadata
+            .source_layouts
+            .get(source_index)
+            .ok_or(PolyBackendError::InvalidConstantShape)?;
+        if declared.layout_id.is_some() || blocks.is_empty() {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let first = blocks.first().ok_or(PolyBackendError::InvalidConstantShape)?;
+        let ring_dimension = first
+            .shards
+            .first()
+            .map(|shard| shard.value.params().ring_dimension() as usize)
+            .ok_or(PolyBackendError::InvalidConstantShape)?;
+        let columns = first.columns;
+        let rows = blocks.iter().try_fold(0usize, |rows, block| {
+            if block.columns != columns {
+                return Err(PolyBackendError::InvalidConstantShape);
+            }
+            let block_ring = block
+                .shards
+                .first()
+                .map(|shard| shard.value.params().ring_dimension() as usize)
+                .ok_or(PolyBackendError::InvalidConstantShape)?;
+            if block_ring != ring_dimension {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            }
+            rows.checked_add(block.rows).ok_or(PolyBackendError::InvalidInteger)
+        })?;
+        let ConcreteWireType::Matrix(matrix) = Self::policy_matrix_type(first)? else {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        };
+        let logical = ConcreteWireType::Matrix(ConcreteMatrixType { rows, columns, ..matrix });
+        if declared.rows != rows ||
+            declared.columns != columns ||
+            declared.ring_dimension != ring_dimension ||
+            declared.representation != format!("{logical:?}")
+        {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        Ok(())
+    }
+
+    fn validate_fixed_effective_small_product_metadata(
+        &self,
+        metadata: &PlannedNodeBatchRequest,
+        blocks: &[&GpuFleetMatrix],
+        rhs: &GpuFleetSmallMatrix,
+    ) -> Result<(), PolyBackendError> {
+        let mut row_blocks = metadata
+            .effective_operands
+            .iter()
+            .filter_map(|operand| match operand {
+                PlannedOperandMetadata::RowBlock { .. } => Some(operand),
+                PlannedOperandMetadata::CompactRhs { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let compact_rhs = metadata
+            .effective_operands
+            .iter()
+            .find_map(|operand| match operand {
+                PlannedOperandMetadata::CompactRhs { .. } => Some(operand),
+                PlannedOperandMetadata::RowBlock { .. } => None,
+            })
+            .ok_or(PolyBackendError::InvalidConstantShape)?;
+        let compact_count = metadata
+            .effective_operands
+            .iter()
+            .filter(|operand| matches!(operand, PlannedOperandMetadata::CompactRhs { .. }))
+            .count();
+        if row_blocks.len() != blocks.len() ||
+            compact_count != 1 ||
+            metadata.effective_operands.len() != blocks.len() + 1 ||
+            metadata.source_layouts.len() != blocks.len()
+        {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        row_blocks.sort_by_key(|operand| match operand {
+            PlannedOperandMetadata::RowBlock { block_index, .. } => *block_index,
+            PlannedOperandMetadata::CompactRhs { .. } => usize::MAX,
+        });
+        let mut origins = HashSet::new();
+        for (index, (block, operand)) in blocks.iter().zip(row_blocks).enumerate() {
+            let PlannedOperandMetadata::RowBlock { logical_operand, block_index, origin, layout } =
+                operand
+            else {
+                return Err(PolyBackendError::InvalidConstantShape);
+            };
+            if *logical_operand != 0 ||
+                *block_index != index ||
+                !origins.insert(*origin) ||
+                !self.fixed_value_matches_layout(block, layout)? ||
+                !self.fixed_value_matches_layout(block, &metadata.source_layouts[index])?
+            {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            }
+        }
+        let PlannedOperandMetadata::CompactRhs { logical_operand, origin: _, layout } = compact_rhs
+        else {
+            unreachable!();
+        };
+        if *logical_operand != 1 {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let rhs_type = Self::policy_small_matrix_type(rhs)?;
+        if layout.layout_id.is_some() ||
+            layout.rows != rhs.rows ||
+            layout.columns != rhs.columns ||
+            layout.ring_dimension !=
+                rhs_type.matrix_type().map(|matrix| matrix.ring_dimension).unwrap_or(0) ||
+            layout.representation != format!("{rhs_type:?}")
+        {
+            return Err(PolyBackendError::UnsupportedPlacement);
         }
         Ok(())
     }
@@ -1349,22 +1589,38 @@ impl GpuDcrtBackend {
 
     fn physical_storage_contract(
         &self,
-        types: &[ConcreteMatrixType],
+        types: &[ConcreteWireType],
     ) -> Result<BackendStorageContract, PolyBackendError> {
         if types.is_empty() {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         let mut descriptors = std::collections::BTreeMap::new();
-        for ty in types {
+        for wire in types {
+            let ty = wire.matrix_type().ok_or(PolyBackendError::UnsupportedPlacement)?;
             let parameters = self.devices[0].1.parameters(ty)?;
             let (ordered_crt_basis, _, crt_depth) = parameters.to_crt();
             if ordered_crt_basis.is_empty() || crt_depth == 0 {
                 return Err(PolyBackendError::UnsupportedPlacement);
             }
             descriptors.insert(
-                ty.clone(),
+                wire.clone(),
                 BackendStorageDescriptor {
-                    representation: "full_dcrt".into(),
+                    representation: match wire {
+                        ConcreteWireType::SmallMatrix { .. } |
+                        ConcreteWireType::Preimage { .. } => "compact_bounded".into(),
+                        ConcreteWireType::IndexedFamily { element, .. } => {
+                            if matches!(
+                                element.as_ref(),
+                                ConcreteWireType::SmallMatrix { .. } |
+                                    ConcreteWireType::Preimage { .. }
+                            ) {
+                                "compact_bounded".into()
+                            } else {
+                                "full_dcrt".into()
+                            }
+                        }
+                        _ => "full_dcrt".into(),
+                    },
                     ordered_crt_basis,
                     level: crt_depth - 1,
                     limb_bytes: std::mem::size_of::<u64>(),
@@ -1712,22 +1968,34 @@ impl GpuDcrtBackend {
         value: &GpuFleetSmallMatrix,
         start: usize,
         end: usize,
-    ) -> Result<GpuSmallMatrix, PolyBackendError> {
+    ) -> Result<Vec<GpuSmallMatrix>, PolyBackendError> {
         if start >= end || end > value.columns {
             return Err(PolyBackendError::InvalidConstantShape);
         }
-        let shard = value
-            .shards
-            .iter()
-            .find(|shard| {
-                shard.global_column_start <= start &&
-                    end <= shard.global_column_start + shard.value.columns()
-            })
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let local_start = start - shard.global_column_start;
-        let local_end = end - shard.global_column_start;
-        let view = shard.value.column_view(local_start, local_end);
-        backend.small_matrix_to_active_placement(view.as_ref())
+        // A compact RHS is allowed to have a physical partition different
+        // from the producer's output schedule.  In particular, one consumer
+        // tile may cross several producer shards (including a tail shard).
+        // Transfer every intersecting piece and concatenate in logical column
+        // order instead of assuming that one physical shard encloses the
+        // complete requested range.
+        let ranges = compact_shard_overlaps(
+            &value
+                .shards
+                .iter()
+                .map(|shard| (shard.global_column_start, shard.value.columns()))
+                .collect::<Vec<_>>(),
+            start,
+            end,
+        )?;
+        let mut pieces = Vec::with_capacity(ranges.len());
+        for (shard_index, local_start, local_end) in ranges {
+            let view = value.shards[shard_index].value.column_view(local_start, local_end);
+            pieces.push(backend.small_matrix_to_active_placement(view.as_ref())?);
+        }
+        if pieces.is_empty() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        Ok(pieces)
     }
 
     fn full_matrix_on_device(
@@ -1748,6 +2016,13 @@ impl GpuDcrtBackend {
         self.matrix_replicas.retain(|_, value| value.strong_count() > 0);
         self.matrix_replicas.insert((value.id, device), Arc::downgrade(&replica));
         Ok(replica)
+    }
+
+    fn active_devices_for_schedules<'a>(
+        &self,
+        schedules: impl IntoIterator<Item = &'a GpuColumnSchedule>,
+    ) -> Vec<usize> {
+        active_device_indices(self.devices.len(), schedules)
     }
 
     fn gather_matrix(
@@ -2284,7 +2559,11 @@ impl GpuDcrtBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_execution_plan::{build_fused_union_jobs, fused_union_waves};
+    use crate::{
+        backend::PlannedLayoutMetadata,
+        gpu_column_policy::{ColumnCapability, EffectiveGpuOperation},
+        gpu_execution_plan::{GpuLayout, build_fused_union_jobs, fused_union_waves},
+    };
     use mxx_ir_core::IntExpr;
     use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
     use num_bigint::BigInt;
@@ -2357,6 +2636,409 @@ mod tests {
     fn assert_profile_created(backend: &GpuDcrtBackend, operation: &[u8; 32]) {
         assert!(backend.operation_profiles.contains_key(operation));
         assert!(backend.column_widths(operation).is_some());
+    }
+
+    fn install_test_small_product_plan(
+        backend: &mut GpuDcrtBackend,
+        operation: [u8; 32],
+        output_rows: &[usize],
+        columns: usize,
+        width: usize,
+        owner_device: usize,
+    ) -> GpuExecutionSiteKey {
+        let key = GpuExecutionSiteKey { site: 901, shape_class: 902, instance_class: 903 };
+        let representations = output_rows
+            .iter()
+            .map(|&rows| {
+                format!(
+                    "{:?}",
+                    ConcreteWireType::Matrix(ConcreteMatrixType {
+                        modulus: BigInt::from(131_009u64) * BigInt::from(130_817u64),
+                        ring_dimension: 32,
+                        rows,
+                        columns,
+                    })
+                )
+            })
+            .collect::<Vec<_>>();
+        let layouts = output_rows
+            .iter()
+            .enumerate()
+            .map(|(index, &rows)| GpuLayout {
+                id: (index + 1) as u32,
+                columns,
+                rows,
+                ring_dimension: 32,
+                representation: representations[index].clone(),
+                instance_device_stride: 0,
+                owner_intervals: vec![GpuColumnInterval {
+                    device: owner_device,
+                    start: 0,
+                    end: columns,
+                }],
+            })
+            .collect::<Vec<_>>();
+        let node = GpuNodeChoice {
+            key,
+            loop_site: None,
+            operation_identity: operation,
+            effective_operation: EffectiveGpuOperation::MatrixMulSmallRhs,
+            column_capability: ColumnCapability::FixedOperandColumns,
+            output_layouts: layouts.iter().map(|layout| layout.id).collect(),
+            columns_per_job: vec![width; backend.devices.len()],
+            implementation_variant: "fleet-test-fixed-small-product".into(),
+            preimage_max_attempts: None,
+        };
+        let contract = GpuPlanContract {
+            graph_specification_hash: [0; 32],
+            backend_identity: backend.runtime_backend_identity().unwrap(),
+            logical_to_physical_devices: backend
+                .devices
+                .iter()
+                .map(|(device, _)| *device as usize)
+                .collect(),
+            device_budgets: backend.runtime_device_budgets().unwrap(),
+            shape_contract_hash: [1; 32],
+            backend_revision: "fleet-test".into(),
+        };
+        let plan = FrozenGpuPlan::new(contract, layouts, Vec::new(), vec![node]).unwrap();
+        backend.install_frozen_plan(plan).unwrap();
+        backend.bind_fixed_node(key).unwrap();
+        key
+    }
+
+    fn small_product_metadata(
+        operation: [u8; 32],
+        key: GpuExecutionSiteKey,
+        blocks: &[Arc<GpuFleetMatrix>],
+        rhs: &GpuFleetSmallMatrix,
+        output_layouts: &[u32],
+        columns_per_job: &[usize],
+        slot: usize,
+    ) -> PlannedNodeBatchRequest {
+        let block_layouts = blocks
+            .iter()
+            .map(|block| PlannedLayoutMetadata {
+                layout_id: None,
+                rows: block.rows,
+                columns: block.columns,
+                ring_dimension: 32,
+                representation: format!("{:?}", GpuDcrtBackend::policy_matrix_type(block).unwrap()),
+            })
+            .collect::<Vec<_>>();
+        let rhs_type = GpuDcrtBackend::policy_small_matrix_type(rhs).unwrap();
+        let rhs_layout = PlannedLayoutMetadata {
+            layout_id: None,
+            rows: rhs.rows,
+            columns: rhs.columns,
+            ring_dimension: 32,
+            representation: format!("{rhs_type:?}"),
+        };
+        let effective_operands = block_layouts
+            .iter()
+            .enumerate()
+            .map(|(block_index, layout)| PlannedOperandMetadata::RowBlock {
+                logical_operand: 0,
+                block_index,
+                origin: mxx_ir_core::types::WireRef {
+                    node: mxx_ir_core::types::NodeId(100 + block_index as u64),
+                    port: mxx_ir_core::types::Port(0),
+                },
+                layout: layout.clone(),
+            })
+            .chain(std::iter::once(PlannedOperandMetadata::CompactRhs {
+                logical_operand: 1,
+                origin: mxx_ir_core::types::WireRef {
+                    node: mxx_ir_core::types::NodeId(200),
+                    port: mxx_ir_core::types::Port(0),
+                },
+                layout: rhs_layout,
+            }))
+            .collect();
+        let output_port_layouts = output_layouts.iter().copied().enumerate().collect();
+        let output_layout_metadata = blocks
+            .iter()
+            .zip(output_layouts)
+            .map(|(block, &layout_id)| PlannedLayoutMetadata {
+                layout_id: Some(layout_id),
+                rows: block.rows,
+                columns: block.columns,
+                ring_dimension: 32,
+                representation: format!("{:?}", GpuDcrtBackend::policy_matrix_type(block).unwrap()),
+            })
+            .collect::<Vec<_>>();
+        PlannedNodeBatchRequest {
+            site: key.site,
+            shape_class: key.shape_class,
+            instance_class: key.instance_class,
+            operation_identity: operation,
+            implementation_variant: "fleet-test-fixed-small-product".into(),
+            output_layouts: output_layouts.to_vec(),
+            output_port_layouts,
+            source_layouts: block_layouts,
+            effective_operands,
+            output_layout_metadata,
+            columns_per_job: columns_per_job.to_vec(),
+            instance_slots: vec![slot],
+            instance_paths: vec![Vec::new()],
+            draw_sites: vec![None],
+            randomness_seeds: vec![None],
+            output_ports: output_layouts.len(),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fixed_fused_small_product_uses_typed_row_blocks_and_compact_shards() {
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let device = detected_gpu_device_ids()[0];
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let source_type = ConcreteMatrixType {
+            modulus: modulus.clone(),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 8,
+        };
+        let source = Arc::new(GpuFleetMatrix::from_matrix(
+            backend.devices[0]
+                .1
+                .sample_hash(&source_type, rand::random(), b"fixed-blocks")
+                .unwrap(),
+        ));
+        let blocks = vec![
+            Arc::new(
+                backend
+                    .slice(source.as_ref(), Some(&IndexRange { start: 0, end: 1 }), None)
+                    .unwrap(),
+            ),
+            Arc::new(
+                backend
+                    .slice(source.as_ref(), Some(&IndexRange { start: 1, end: 2 }), None)
+                    .unwrap(),
+            ),
+        ];
+        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+        let rhs_seed = backend.devices[0]
+            .1
+            .sample_hash(&rhs_seed_type, rand::random(), b"fixed-compact-rhs")
+            .unwrap();
+        let rhs_full = GpuFleetSmallMatrix::from_matrix(
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+        );
+        assert_eq!(rhs_full.size(), (8, 8));
+        let expected = backend.devices[0]
+            .1
+            .multiply_small_rhs_row_blocks(
+                &blocks.iter().map(|block| &block.shards[0].value).collect::<Vec<_>>(),
+                &rhs_full.shards[0].value,
+            )
+            .unwrap();
+        let rhs = GpuFleetSmallMatrix::new(
+            rhs_full.rows,
+            rhs_full.columns,
+            vec![
+                GpuColumnShard {
+                    device_id: device,
+                    global_column_start: 0,
+                    value: rhs_full.shards[0].value.slice_columns(0, 4),
+                },
+                GpuColumnShard {
+                    device_id: device,
+                    global_column_start: 4,
+                    value: rhs_full.shards[0].value.slice_columns(4, 8),
+                },
+            ],
+        );
+        let operation = [91; 32];
+        let key = install_test_small_product_plan(&mut backend, operation, &[1, 1], 8, 4, 0);
+        let metadata = small_product_metadata(operation, key, &blocks, &rhs, &[1, 2], &[4], 0);
+        let output = backend
+            .fused_batch(vec![FusedBatchRequest::SmallProduct {
+                metadata: Some(metadata),
+                blocks: blocks.clone(),
+                rhs: Arc::new(rhs),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let FusedBatchOutput::Matrices(output) = output else {
+            panic!("fixed small-product batch returned a non-matrix output");
+        };
+        assert_eq!(output.len(), expected.len());
+        for (actual, expected) in output.iter().zip(expected) {
+            assert_eq!(
+                backend.matrix_to_bytes(actual),
+                backend.devices[0].1.matrix_to_bytes(&expected)
+            );
+        }
+        assert!(backend.fixed_instance_slots.is_empty(), "completion must release request slots");
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fixed_compact_rhs_crosses_producer_boundaries_in_both_directions() {
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let device = detected_gpu_device_ids()[0];
+        for (producer_width, consumer_width) in [(4, 8), (8, 4)] {
+            let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
+            let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+            let lhs_type = ConcreteMatrixType {
+                modulus: modulus.clone(),
+                ring_dimension: 32,
+                rows: 1,
+                columns: 8,
+            };
+            let lhs = Arc::new(GpuFleetMatrix::from_matrix(
+                backend.devices[0]
+                    .1
+                    .sample_hash(&lhs_type, rand::random(), b"cross-boundary-lhs")
+                    .unwrap(),
+            ));
+            let seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+            let seed = backend.devices[0]
+                .1
+                .sample_hash(&seed_type, rand::random(), b"cross-boundary-rhs")
+                .unwrap();
+            let rhs_full = GpuFleetSmallMatrix::from_matrix(
+                backend.devices[0].1.gadget_decompose(&seed, false, Some(2)).unwrap(),
+            );
+            let expected = backend.devices[0]
+                .1
+                .multiply_small_rhs(&lhs.shards[0].value, &rhs_full.shards[0].value)
+                .unwrap();
+            let producer_shards = if producer_width == 8 {
+                vec![GpuColumnShard {
+                    device_id: device,
+                    global_column_start: 0,
+                    value: rhs_full.shards[0].value.slice_columns(0, 8),
+                }]
+            } else {
+                vec![
+                    GpuColumnShard {
+                        device_id: device,
+                        global_column_start: 0,
+                        value: rhs_full.shards[0].value.slice_columns(0, producer_width),
+                    },
+                    GpuColumnShard {
+                        device_id: device,
+                        global_column_start: producer_width,
+                        value: rhs_full.shards[0].value.slice_columns(producer_width, 8),
+                    },
+                ]
+            };
+            let rhs = GpuFleetSmallMatrix::new(rhs_full.rows, rhs_full.columns, producer_shards);
+            let operation = [92; 32];
+            let key = install_test_small_product_plan(
+                &mut backend,
+                operation,
+                &[1],
+                8,
+                consumer_width,
+                0,
+            );
+            let metadata = small_product_metadata(
+                operation,
+                key,
+                std::slice::from_ref(&lhs),
+                &rhs,
+                &[1],
+                &[consumer_width],
+                0,
+            );
+            let output = backend
+                .fused_batch(vec![FusedBatchRequest::SmallProduct {
+                    metadata: Some(metadata),
+                    blocks: vec![lhs],
+                    rhs: Arc::new(rhs),
+                }])
+                .unwrap()
+                .pop()
+                .unwrap();
+            let FusedBatchOutput::Matrices(output) = output else {
+                panic!("fixed compact product returned a non-matrix output");
+            };
+            assert_eq!(output.len(), 1);
+            assert_eq!(
+                backend.matrix_to_bytes(&output[0]),
+                backend.devices[0].1.matrix_to_bytes(&expected)
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fixed_fused_active_owner_subset_replicates_only_participating_gpu() {
+        let detected = detected_gpu_device_ids();
+        let Some([source_device, owner_device]) = first_bidirectional_peer_pair(
+            &detected,
+            &GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None),
+        ) else {
+            return;
+        };
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend =
+            super::super::gpu_backend_on([parameters.clone()], [source_device, owner_device]);
+        let lhs_type = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 8,
+        };
+        let lhs = Arc::new(GpuFleetMatrix::from_matrix(
+            backend.devices[0]
+                .1
+                .sample_hash(&lhs_type, rand::random(), b"active-owner-lhs")
+                .unwrap(),
+        ));
+        let rhs_seed_type = ConcreteMatrixType { rows: 4, ..lhs_type.clone() };
+        let rhs_seed = backend.devices[0]
+            .1
+            .sample_hash(&rhs_seed_type, rand::random(), b"active-owner-rhs")
+            .unwrap();
+        let rhs = Arc::new(GpuFleetSmallMatrix::from_matrix(
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+        ));
+        let expected = backend.devices[0]
+            .1
+            .multiply_small_rhs(&lhs.shards[0].value, &rhs.shards[0].value)
+            .unwrap();
+        let operation = [93; 32];
+        let key = install_test_small_product_plan(&mut backend, operation, &[1], 8, 4, 1);
+        let metadata = small_product_metadata(
+            operation,
+            key,
+            std::slice::from_ref(&lhs),
+            &rhs,
+            &[1],
+            &[4, 4],
+            0,
+        );
+        let output = backend
+            .fused_batch(vec![FusedBatchRequest::SmallProduct {
+                metadata: Some(metadata),
+                blocks: vec![lhs.clone()],
+                rhs: rhs.clone(),
+            }])
+            .unwrap()
+            .pop()
+            .unwrap();
+        let FusedBatchOutput::Matrices(output) = output else {
+            panic!("fixed active-owner product returned a non-matrix output");
+        };
+        assert_eq!(output.len(), 1);
+        assert_eq!(
+            backend.matrix_to_bytes(&output[0]),
+            backend.devices[0].1.matrix_to_bytes(&expected)
+        );
+        let lhs_entries = backend
+            .matrix_replicas
+            .keys()
+            .filter(|(value, _)| *value == lhs.id)
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(lhs_entries, vec![(lhs.id, 1)]);
+        assert!(backend.matrix_replicas.keys().all(|(_, device)| *device != 0));
     }
 
     #[test]
@@ -2947,6 +3629,42 @@ mod tests {
     }
 
     #[test]
+    fn compact_rhs_piece_mapping_covers_crossed_producer_partitions_and_tails() {
+        // A b4 producer consumed by a b8 tile must retain every physical
+        // piece, including the partial first/last overlaps.
+        assert_eq!(
+            compact_shard_overlaps(&[(0, 4), (4, 4), (8, 4), (12, 4)], 3, 13).unwrap(),
+            vec![(0, 3, 4), (1, 0, 4), (2, 0, 4), (3, 0, 1)]
+        );
+        // Conversely a b8 producer consumed by b4 tiles must not force the
+        // consumer to adopt the producer width.
+        assert_eq!(
+            compact_shard_overlaps(&[(0, 8), (8, 8)], 6, 14).unwrap(),
+            vec![(0, 6, 8), (1, 0, 6)]
+        );
+        assert!(compact_shard_overlaps(&[(0, 4), (8, 4)], 0, 12).is_err());
+    }
+
+    #[test]
+    fn fixed_replica_selection_uses_only_schedule_owners() {
+        let schedule = GpuColumnSchedule::new(
+            13,
+            vec![4, 4, 4, 4],
+            vec![
+                GpuColumnInterval { device: 1, start: 0, end: 8 },
+                GpuColumnInterval { device: 3, start: 8, end: 13 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(active_device_indices(4, std::iter::once(&schedule)), vec![1, 3]);
+        assert!(
+            !active_device_indices(4, std::iter::once(&schedule)).contains(&0),
+            "non-participating GPU0 must not receive a fixed operand replica"
+        );
+        assert_eq!(schedule.local_job_counts(), &[0, 2, 0, 2]);
+    }
+
+    #[test]
     fn pilot_retry_rejects_every_observed_memory_release() {
         assert!(pilot_interval_was_contaminated(&[186_440], &[95_512]));
         assert!(pilot_interval_was_contaminated(&[186_440, 50], &[186_440, 49]));
@@ -2965,6 +3683,7 @@ mod tests {
             operation_widths: HashMap::new(),
             manual_widths: HashSet::new(),
             operation_profiles: HashMap::new(),
+            warmup_profiles: HashMap::new(),
             calibration_misses: HashSet::new(),
             pending_profile: None,
             pending_pilot: None,
@@ -2972,7 +3691,7 @@ mod tests {
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent: 100,
             matrix_replicas: HashMap::new(),
-            frozen_plan: Some(FrozenGpuPlan {
+            frozen_plan: Some(Arc::new(FrozenGpuPlan {
                 contract: GpuPlanContract {
                     graph_specification_hash: [0; 32],
                     backend_identity: "guard-test".into(),
@@ -2989,13 +3708,21 @@ mod tests {
                 layouts: Vec::new(),
                 loops: Vec::new(),
                 nodes: Vec::new(),
-            }),
+            })),
             fixed_node: None,
             fixed_instance_slots: Vec::new(),
             execution_identity: 0,
             plan_budgets: None,
+            warmup_profile_provider_calls: 0,
         };
         assert!(backend.fixed_plan_active());
+        let plan_before = backend.frozen_plan.as_ref().unwrap().clone();
+        let strong_before = Arc::strong_count(&plan_before);
+        assert!(Arc::ptr_eq(&plan_before, backend.frozen_plan.as_ref().unwrap()));
+        assert!(backend.fixed_plan_active());
+        let plan_after = backend.frozen_plan.as_ref().unwrap().clone();
+        assert!(Arc::ptr_eq(&plan_before, &plan_after));
+        assert_eq!(Arc::strong_count(&plan_before), strong_before + 1);
         assert!(backend.select_operation([1; 32]).unwrap_err().to_string().contains("NotPrepared"));
         assert!(backend.begin_runtime_pilot([1; 32]).is_err());
         assert!(backend.reset_runtime_pilot_baseline().is_err());
@@ -3004,6 +3731,135 @@ mod tests {
         );
         assert!(backend.operation_widths.is_empty());
         assert!(backend.pending_pilot.is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn backend_warmup_provider_is_strict_and_fixed_batches_do_not_lookup_profiles() {
+        let Some(device) = detected_gpu_device_ids().first().copied() else {
+            return;
+        };
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
+        let request = GpuWarmupProfileRequest {
+            signature: crate::backend::GpuWarmupOperationSignature {
+                operation: [0x42; 32],
+                shape_class: 7,
+                instance_class: 3,
+            },
+            device: 0,
+            tile_width: 4,
+            range: IndexRange { start: 8, end: 12 },
+        };
+
+        // This is the same provider obtained by the backend-backed automatic
+        // warmup entry point.  An empty cache must fail closed.
+        let missing = {
+            let provider = Backend::gpu_warmup_profile_provider(&mut backend).unwrap();
+            provider.measure(&request)
+        };
+        assert!(matches!(
+            missing,
+            Err(GpuWarmupProfileError::MissingProfile(ref actual)) if actual == &request
+        ));
+        assert_eq!(backend.warmup_profile_provider_calls(), 1);
+
+        let profile = GpuWarmupProfile::measured(0.25, 128).unwrap();
+        backend.register_warmup_profile(request.clone(), profile).unwrap();
+        let returned = {
+            let provider = Backend::gpu_warmup_profile_provider(&mut backend).unwrap();
+            provider.measure(&request).unwrap()
+        };
+        assert_eq!(returned, profile);
+        assert_eq!(backend.warmup_profile_provider_calls(), 2);
+
+        // A non-empty fixed fused request must execute the production fixed
+        // dispatcher without consulting the setup-time provider, even when a
+        // profile is registered. This guards against accidentally hiding the
+        // provider lookup behind an empty-batch early return.
+        let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let source_type = ConcreteMatrixType {
+            modulus: modulus.clone(),
+            ring_dimension: 32,
+            rows: 1,
+            columns: 8,
+        };
+        let block = Arc::new(GpuFleetMatrix::from_matrix(
+            backend.devices[0]
+                .1
+                .sample_hash(&source_type, rand::random(), b"provider-fixed-block")
+                .unwrap(),
+        ));
+        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+        let rhs_seed = backend.devices[0]
+            .1
+            .sample_hash(&rhs_seed_type, rand::random(), b"provider-fixed-rhs")
+            .unwrap();
+        let rhs = Arc::new(GpuFleetSmallMatrix::from_matrix(
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+        ));
+        let operation = [0x43; 32];
+        let key = install_test_small_product_plan(&mut backend, operation, &[1], 8, 4, 0);
+        let metadata = small_product_metadata(
+            operation,
+            key,
+            std::slice::from_ref(&block),
+            &rhs,
+            &[1],
+            &[4],
+            0,
+        );
+        let outputs = backend
+            .fused_batch(vec![FusedBatchRequest::SmallProduct {
+                metadata: Some(metadata),
+                blocks: vec![block],
+                rhs,
+            }])
+            .unwrap();
+        assert!(
+            matches!(outputs.as_slice(), [FusedBatchOutput::Matrices(values)] if values.len() == 1)
+        );
+        assert_eq!(backend.warmup_profile_provider_calls(), 2);
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn physical_storage_contract_distinguishes_full_and_compact_same_matrix_shapes() {
+        let device = detected_gpu_device_ids()[0];
+        super::super::wait_for_gpu_test_context_quiescence(device);
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from(parameters.modulus().as_ref().clone()),
+            ring_dimension: 32,
+            rows: 2,
+            columns: 3,
+        };
+        let wires = vec![
+            ConcreteWireType::Matrix(matrix.clone()),
+            ConcreteWireType::SmallMatrix {
+                matrix: matrix.clone(),
+                max_coefficient_bound: BigInt::from(7u8),
+            },
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound: BigInt::from(7u8) },
+        ];
+        let backend = super::super::gpu_backend_on([parameters], [device]);
+        let contract = Backend::gpu_physical_storage_contract(&backend, &wires)
+            .unwrap()
+            .expect("GPU fleet must expose native storage facts");
+        let full = contract.descriptors.get(&wires[0]).unwrap();
+        let compact = contract.descriptors.get(&wires[1]).unwrap();
+        let preimage = contract.descriptors.get(&wires[2]).unwrap();
+        assert_eq!(full.representation, "full_dcrt");
+        assert_eq!(compact.representation, "compact_bounded");
+        assert_eq!(preimage.representation, "compact_bounded");
+        assert_eq!(full.ordered_crt_basis, compact.ordered_crt_basis);
+        assert_eq!(compact.ordered_crt_basis, preimage.ordered_crt_basis);
+
+        let full_bytes = 2 * 3 * 32 * (full.level + 1) * full.limb_bytes;
+        let compact_bytes = 2 * 3 * 32 * (1 + 1);
+        assert_eq!(full_bytes, 3_072);
+        assert_eq!(compact_bytes, 384);
+        assert_ne!(full_bytes, compact_bytes);
     }
 
     #[test]
@@ -3700,24 +4556,25 @@ impl GpuDcrtBackend {
         let slots = self.fixed_slots(inputs.len())?;
         let schedules_owned = self.fixed_batch_schedules_checked(output_columns[0], &slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
+        let active_devices = self.active_devices_for_schedules(schedules.iter().copied());
         let mut left_replicas = Vec::with_capacity(inputs.len());
         let mut right_replicas = Vec::with_capacity(inputs.len());
         for (left, right) in &inputs {
             left_replicas.push(if left.size() == (1, 1) || right.size() != (1, 1) {
-                Some(
-                    (0..self.devices.len())
-                        .map(|device| self.full_matrix_on_device(device, left))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                for &device in &active_devices {
+                    replicas[device] = Some(self.full_matrix_on_device(device, left)?);
+                }
+                Some(replicas)
             } else {
                 None
             });
             right_replicas.push(if right.size() == (1, 1) {
-                Some(
-                    (0..self.devices.len())
-                        .map(|device| self.full_matrix_on_device(device, right))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
+                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                for &device in &active_devices {
+                    replicas[device] = Some(self.full_matrix_on_device(device, right)?);
+                }
+                Some(replicas)
             } else {
                 None
             });
@@ -3743,7 +4600,11 @@ impl GpuDcrtBackend {
                 .ok_or(PolyBackendError::UnsupportedPlacement)?;
             let (left, right) = if left.size() == (1, 1) {
                 (
-                    left_replicas[instance].as_ref().unwrap()[job.device].as_ref().clone(),
+                    left_replicas[instance].as_ref().unwrap()[job.device]
+                        .as_ref()
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?
+                        .as_ref()
+                        .clone(),
                     Self::matrix_piece_on_device(
                         backend,
                         right,
@@ -3754,11 +4615,19 @@ impl GpuDcrtBackend {
             } else if right.size() == (1, 1) {
                 (
                     Self::matrix_piece_on_device(backend, left, left_range.start, left_range.end)?,
-                    right_replicas[instance].as_ref().unwrap()[job.device].as_ref().clone(),
+                    right_replicas[instance].as_ref().unwrap()[job.device]
+                        .as_ref()
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?
+                        .as_ref()
+                        .clone(),
                 )
             } else {
                 (
-                    left_replicas[instance].as_ref().unwrap()[job.device].as_ref().clone(),
+                    left_replicas[instance].as_ref().unwrap()[job.device]
+                        .as_ref()
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?
+                        .as_ref()
+                        .clone(),
                     Self::matrix_piece_on_device(
                         backend,
                         right,
@@ -3829,26 +4698,29 @@ impl GpuDcrtBackend {
         let slots = self.fixed_slots(requests.len())?;
         let schedules_owned = self.fixed_batch_schedules_checked(output_columns[0], &slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
+        let active_devices = self.active_devices_for_schedules(schedules.iter().copied());
         let mut replicas = Vec::with_capacity(requests.len());
         for request in &requests {
             let mut request_replicas = Vec::new();
             for (_, left, right) in &request.products {
                 request_replicas.push((
                     if left.size() == (1, 1) || right.size() != (1, 1) {
-                        Some(
-                            (0..self.devices.len())
-                                .map(|device| self.full_matrix_on_device(device, left))
-                                .collect::<Result<Vec<_>, _>>()?,
-                        )
+                        let mut replicas =
+                            (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                        for &device in &active_devices {
+                            replicas[device] = Some(self.full_matrix_on_device(device, left)?);
+                        }
+                        Some(replicas)
                     } else {
                         None
                     },
                     if right.size() == (1, 1) {
-                        Some(
-                            (0..self.devices.len())
-                                .map(|device| self.full_matrix_on_device(device, right))
-                                .collect::<Result<Vec<_>, _>>()?,
-                        )
+                        let mut replicas =
+                            (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                        for &device in &active_devices {
+                            replicas[device] = Some(self.full_matrix_on_device(device, right)?);
+                        }
+                        Some(replicas)
                     } else {
                         None
                     },
@@ -3856,9 +4728,11 @@ impl GpuDcrtBackend {
             }
             let bias_replica = request.bias.as_ref().and_then(|bias| {
                 (bias.size() == (1, 1)).then(|| {
-                    (0..self.devices.len())
-                        .map(|device| self.full_matrix_on_device(device, bias))
-                        .collect::<Result<Vec<_>, _>>()
+                    let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                    for &device in &active_devices {
+                        replicas[device] = Some(self.full_matrix_on_device(device, bias)?);
+                    }
+                    Ok::<_, PolyBackendError>(replicas)
                 })
             });
             let bias_replica = match bias_replica {
@@ -3906,7 +4780,11 @@ impl GpuDcrtBackend {
                 let right_range = range(2 * product + 1)?;
                 let (left, right) = if left.size() == (1, 1) {
                     (
-                        request_replicas[product].0.as_ref().unwrap()[job.device].as_ref().clone(),
+                        request_replicas[product].0.as_ref().unwrap()[job.device]
+                            .as_ref()
+                            .ok_or(PolyBackendError::UnsupportedPlacement)?
+                            .as_ref()
+                            .clone(),
                         Self::matrix_piece_on_device(
                             backend,
                             right,
@@ -3922,11 +4800,19 @@ impl GpuDcrtBackend {
                             left_range.start,
                             left_range.end,
                         )?,
-                        request_replicas[product].1.as_ref().unwrap()[job.device].as_ref().clone(),
+                        request_replicas[product].1.as_ref().unwrap()[job.device]
+                            .as_ref()
+                            .ok_or(PolyBackendError::UnsupportedPlacement)?
+                            .as_ref()
+                            .clone(),
                     )
                 } else {
                     (
-                        request_replicas[product].0.as_ref().unwrap()[job.device].as_ref().clone(),
+                        request_replicas[product].0.as_ref().unwrap()[job.device]
+                            .as_ref()
+                            .ok_or(PolyBackendError::UnsupportedPlacement)?
+                            .as_ref()
+                            .clone(),
                         Self::matrix_piece_on_device(
                             backend,
                             right,
@@ -3947,7 +4833,11 @@ impl GpuDcrtBackend {
             if let Some(bias) = &request.bias {
                 let bias_range = range(request.products.len() * 2)?;
                 let bias = if bias.size() == (1, 1) {
-                    bias_replica.as_ref().unwrap()[job.device].as_ref().clone()
+                    bias_replica.as_ref().unwrap()[job.device]
+                        .as_ref()
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?
+                        .as_ref()
+                        .clone()
                 } else {
                     Self::matrix_piece_on_device(backend, bias, bias_range.start, bias_range.end)?
                 };
@@ -4014,20 +4904,22 @@ impl GpuDcrtBackend {
         let slots = self.fixed_slots(inputs.len())?;
         let schedules_owned = self.fixed_batch_schedules_checked(output_columns, &slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
+        let active_devices = self.active_devices_for_schedules(schedules.iter().copied());
         let mut lhs_replicas = Vec::with_capacity(inputs.len());
         for (lhs, _) in &inputs {
-            lhs_replicas.push(
-                (0..self.devices.len())
-                    .map(|device| {
-                        Self::matrix_operand_on_device(
-                            &mut self.devices[device].1,
-                            lhs,
-                            0,
-                            lhs.columns,
-                        )
-                    })
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
+            let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+            for &device in &active_devices {
+                replicas[device] = Some(
+                    Self::matrix_operand_on_device(
+                        &mut self.devices[device].1,
+                        lhs,
+                        0,
+                        lhs.columns,
+                    )?
+                    .into_owned(),
+                );
+            }
+            lhs_replicas.push(replicas);
         }
         let jobs = match self.launch_fixed_column_batch(&schedules, |backend, instance, job| {
             let (lhs, rhs) = &inputs[instance];
@@ -4044,9 +4936,17 @@ impl GpuDcrtBackend {
                 .find(|range| range.operand == 1)
                 .map(|range| range.range)
                 .ok_or(PolyBackendError::UnsupportedPlacement)?;
-            let rhs =
+            let rhs_pieces =
                 Self::small_matrix_piece_on_device(backend, rhs, rhs_range.start, rhs_range.end)?;
-            backend.multiply_small_rhs(&lhs_replicas[instance][job.device], &rhs)
+            let lhs = lhs_replicas[instance][job.device]
+                .as_ref()
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let mut outputs = rhs_pieces
+                .iter()
+                .map(|rhs| backend.multiply_small_rhs(lhs, rhs))
+                .collect::<Result<Vec<_>, _>>()?;
+            let first = outputs.drain(..1).next().ok_or(PolyBackendError::InvalidConstantShape)?;
+            Ok(first.concat_columns_owned(outputs))
         }) {
             Ok(jobs) => jobs,
             Err(error) => {
@@ -4635,23 +5535,24 @@ impl GpuDcrtBackend {
         let schedule = self
             .fixed_schedule_for_columns(output_columns)
             .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let active_devices = self.active_devices_for_schedules(std::iter::once(&schedule));
         let left_scalar = left.size() == (1, 1);
         let right_scalar = right.size() == (1, 1);
         let left_replicas = if left_scalar || !right_scalar {
-            Some(
-                (0..self.devices.len())
-                    .map(|device| self.full_matrix_on_device(device, left))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+            for &device in &active_devices {
+                replicas[device] = Some(self.full_matrix_on_device(device, left)?);
+            }
+            Some(replicas)
         } else {
             None
         };
         let right_replicas = if right_scalar {
-            Some(
-                (0..self.devices.len())
-                    .map(|device| self.full_matrix_on_device(device, right))
-                    .collect::<Result<Vec<_>, _>>()?,
-            )
+            let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+            for &device in &active_devices {
+                replicas[device] = Some(self.full_matrix_on_device(device, right)?);
+            }
+            Some(replicas)
         } else {
             None
         };
@@ -4683,7 +5584,11 @@ impl GpuDcrtBackend {
                             .range;
                         let (local_left, local_right) = if left_scalar {
                             (
-                                left_replicas.as_ref().unwrap()[device].as_ref().clone(),
+                                left_replicas.as_ref().unwrap()[device]
+                                    .as_ref()
+                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                    .as_ref()
+                                    .clone(),
                                 Self::matrix_piece_on_device(
                                     backend,
                                     right,
@@ -4699,11 +5604,19 @@ impl GpuDcrtBackend {
                                     left_range.start,
                                     left_range.end,
                                 )?,
-                                right_replicas.as_ref().unwrap()[device].as_ref().clone(),
+                                right_replicas.as_ref().unwrap()[device]
+                                    .as_ref()
+                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                    .as_ref()
+                                    .clone(),
                             )
                         } else {
                             (
-                                left_replicas.as_ref().unwrap()[device].as_ref().clone(),
+                                left_replicas.as_ref().unwrap()[device]
+                                    .as_ref()
+                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                    .as_ref()
+                                    .clone(),
                                 Self::matrix_piece_on_device(
                                     backend,
                                     right,
@@ -4732,12 +5645,15 @@ impl GpuDcrtBackend {
         lhs: &GpuFleetMatrix,
         rhs: &GpuFleetSmallMatrix,
     ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        let lhs_replicas = (0..self.devices.len())
-            .map(|device| {
-                Self::matrix_operand_on_device(&mut self.devices[device].1, lhs, 0, lhs.columns)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let schedule = self.small_value_schedule(rhs)?;
+        let active_devices = self.active_devices_for_schedules(std::iter::once(&schedule));
+        let mut lhs_replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+        for &device in &active_devices {
+            lhs_replicas[device] = Some(
+                Self::matrix_operand_on_device(&mut self.devices[device].1, lhs, 0, lhs.columns)?
+                    .into_owned(),
+            );
+        }
         let mut shards = Vec::new();
         for wave in schedule.waves() {
             let launched = self
@@ -4767,7 +5683,7 @@ impl GpuDcrtBackend {
                         },
                         Err(error) => return Some(Err(error)),
                     };
-                    let view = match Self::small_matrix_piece_on_device(
+                    let views = match Self::small_matrix_piece_on_device(
                         backend,
                         rhs,
                         rhs_range.start,
@@ -4776,12 +5692,26 @@ impl GpuDcrtBackend {
                         Ok(view) => view,
                         Err(error) => return Some(Err(error)),
                     };
-                    Some(backend.multiply_small_rhs(&lhs_replicas[device], &view).map(|value| {
-                        GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: job.start,
-                            value,
-                        }
+                    let lhs = match lhs_replicas[device].as_ref() {
+                        Some(lhs) => lhs,
+                        None => return Some(Err(PolyBackendError::UnsupportedPlacement)),
+                    };
+                    let mut values = match views
+                        .iter()
+                        .map(|view| backend.multiply_small_rhs(lhs, view))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(values) => values,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    let first = match values.drain(..1).next() {
+                        Some(value) => value,
+                        None => return Some(Err(PolyBackendError::InvalidConstantShape)),
+                    };
+                    Some(Ok(GpuColumnShard {
+                        device_id: *device_id,
+                        global_column_start: job.start,
+                        value: first.concat_columns_owned(values),
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -4820,9 +5750,11 @@ impl GpuDcrtBackend {
         let schedule = self
             .fixed_schedule_for_columns(target.col_size())
             .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let public_replicas = (0..self.devices.len())
-            .map(|device| self.full_matrix_on_device(device, public))
-            .collect::<Result<Vec<_>, _>>()?;
+        let active_devices = self.active_devices_for_schedules(std::iter::once(&schedule));
+        let mut public_replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+        for &device in &active_devices {
+            public_replicas[device] = Some(self.full_matrix_on_device(device, public)?);
+        }
         let attempts = self
             .fixed_node
             .as_ref()
@@ -4876,7 +5808,9 @@ impl GpuDcrtBackend {
                             .bounded_preimage_with_config(
                                 &params,
                                 &trapdoor.values[device],
-                                &public_replicas[device],
+                                public_replicas[device]
+                                    .as_ref()
+                                    .ok_or(PolyBackendError::UnsupportedPlacement)?,
                                 &target,
                                 bound,
                                 config,
@@ -4896,6 +5830,22 @@ impl GpuDcrtBackend {
         shards.sort_by_key(|shard| shard.global_column_start);
         let rows = shards.first().map(|shard| shard.value.rows()).unwrap_or(ty.rows);
         Ok(GpuFleetSmallMatrix::new(rows, target.col_size(), shards))
+    }
+}
+
+impl GpuWarmupProfileProvider for GpuDcrtBackend {
+    fn measure(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        #[cfg(test)]
+        {
+            self.warmup_profile_provider_calls += 1;
+        }
+        self.warmup_profiles
+            .get(request)
+            .copied()
+            .ok_or_else(|| GpuWarmupProfileError::MissingProfile(request.clone()))
     }
 }
 
@@ -4938,6 +5888,10 @@ impl Backend for GpuDcrtBackend {
         self.select_operation(operation)
     }
 
+    fn gpu_warmup_profile_provider(&mut self) -> Option<&mut dyn GpuWarmupProfileProvider> {
+        Some(self)
+    }
+
     fn validate_frozen_gpu_plan(&self, plan: &FrozenGpuPlan) -> Result<(), Self::Error> {
         plan.validate().map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
         let mapped = plan
@@ -4961,14 +5915,14 @@ impl Backend for GpuDcrtBackend {
 
     fn gpu_physical_storage_contract(
         &self,
-        types: &[ConcreteMatrixType],
+        types: &[ConcreteWireType],
     ) -> Result<Option<BackendStorageContract>, Self::Error> {
         self.physical_storage_contract(types).map(Some)
     }
 
     fn validate_gpu_physical_storage_contract(
         &self,
-        types: &[ConcreteMatrixType],
+        types: &[ConcreteWireType],
         supplied: &BackendStorageContract,
     ) -> Result<(), Self::Error> {
         validate_backend_storage_contract(types, supplied)
@@ -5203,9 +6157,10 @@ impl Backend for GpuDcrtBackend {
                     }
                 }
                 FusedBatchRequest::Decompose { blocks, .. } => {
-                    if let Err(error) = self.validate_fixed_source_metadata(
+                    if let Err(error) = self.validate_fixed_concat_blocks_metadata(
                         request_metadata,
                         &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
+                        0,
                     ) {
                         self.clear_fixed_batch_state();
                         return Err(error);
@@ -5213,38 +6168,30 @@ impl Backend for GpuDcrtBackend {
                 }
                 FusedBatchRequest::SmallProduct { blocks, rhs, .. } => {
                     let sources = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
-                    if let Err(error) =
-                        self.validate_fixed_source_metadata(request_metadata, &sources)
-                    {
-                        self.clear_fixed_batch_state();
-                        return Err(error);
-                    }
                     if let Some(metadata) = request_metadata {
-                        let declared = metadata
-                            .source_layouts
-                            .get(sources.len())
-                            .ok_or(PolyBackendError::InvalidConstantShape)?;
-                        let (rows, columns) = rhs.size();
-                        let ring = rhs
-                            .shards()
-                            .first()
-                            .map(|shard| shard.value.params().ring_dimension() as usize)
-                            .unwrap_or(0);
-                        let rhs_repr = match Self::policy_small_matrix_type(rhs) {
-                            Ok(ty) => format!("{ty:?}"),
-                            Err(error) => {
-                                self.clear_fixed_batch_state();
-                                return Err(error);
-                            }
+                        let result = if metadata.effective_operands.is_empty() {
+                            // Compatibility for metadata produced before the
+                            // effective-operand contract: the logical concat
+                            // is still validated separately from the RHS.
+                            self.validate_fixed_concat_blocks_metadata(
+                                Some(metadata),
+                                &sources,
+                                0,
+                            )?;
+                            let rhs_type = Self::policy_small_matrix_type(rhs)?;
+                            self.validate_fixed_typed_source_metadata_at(
+                                Some(metadata),
+                                sources.len(),
+                                std::slice::from_ref(&rhs_type),
+                            )
+                        } else {
+                            self.validate_fixed_effective_small_product_metadata(
+                                metadata, &sources, rhs,
+                            )
                         };
-                        if declared.layout_id.is_some() ||
-                            declared.rows != rows ||
-                            declared.columns != columns ||
-                            declared.ring_dimension != ring ||
-                            declared.representation != rhs_repr
-                        {
+                        if let Err(error) = result {
                             self.clear_fixed_batch_state();
-                            return Err(PolyBackendError::UnsupportedPlacement);
+                            return Err(error);
                         }
                     }
                 }
@@ -5318,17 +6265,20 @@ impl Backend for GpuDcrtBackend {
             }
         }
         // Keep fixed block replicas alive across every tile of this stage.
+        let active_devices = self
+            .active_devices_for_schedules(schedules_by_port.iter().flat_map(|port| port.iter()));
         let mut replicas = Vec::with_capacity(requests.len());
         for request in &requests {
             let mut by_device = Vec::new();
             if let FusedBatchRequest::SmallProduct { blocks, .. } = request {
-                for device in 0..self.devices.len() {
+                by_device = (0..self.devices.len()).map(|_| None).collect();
+                for &device in &active_devices {
                     let replica = blocks
                         .iter()
                         .map(|block| self.full_matrix_on_device(device, block))
                         .collect::<Result<Vec<_>, _>>();
                     match replica {
-                        Ok(replica) => by_device.push(replica),
+                        Ok(replica) => by_device[device] = Some(replica),
                         Err(error) => {
                             self.clear_fixed_batch_state();
                             return Err(error);
@@ -5522,21 +6472,35 @@ impl Backend for GpuDcrtBackend {
                             [Self::policy_matrix_type(lhs)?, Self::policy_small_matrix_type(rhs)?];
                         let mapped = map_binding_wires(&NodeKind::MatrixMulSmallRhs, &types)?;
                         let range = read(&mapped, 1)?;
-                        let rhs = Self::small_matrix_piece_on_device(
+                        let rhs_pieces = Self::small_matrix_piece_on_device(
                             backend,
                             rhs,
                             range.start,
                             range.end,
                         )?;
-                        backend
-                            .multiply_small_rhs_row_blocks(
-                                &replicas[instance][job.device]
-                                    .iter()
-                                    .map(Arc::as_ref)
-                                    .collect::<Vec<_>>(),
-                                &rhs,
-                            )
-                            .map(FusedBatchOutput::Matrices)
+                        let references = replicas[instance][job.device]
+                            .as_ref()
+                            .ok_or(PolyBackendError::UnsupportedPlacement)?
+                            .iter()
+                            .map(Arc::as_ref)
+                            .collect::<Vec<_>>();
+                        let mut outputs = rhs_pieces
+                            .iter()
+                            .map(|rhs| backend.multiply_small_rhs_row_blocks(&references, rhs))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let mut values = outputs
+                            .drain(..1)
+                            .next()
+                            .ok_or(PolyBackendError::InvalidConstantShape)?;
+                        for output in outputs {
+                            if output.len() != values.len() {
+                                return Err(PolyBackendError::InvalidConstantShape);
+                            }
+                            for (value, piece) in values.iter_mut().zip(output) {
+                                *value = value.clone().concat_columns_owned(vec![piece]);
+                            }
+                        }
+                        Ok(FusedBatchOutput::Matrices(values))
                     }
                     FusedBatchRequest::Add { blocks, right, metadata: _ } => {
                         let mut refs = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
@@ -8013,12 +8977,16 @@ impl Backend for GpuDcrtBackend {
         }
         let schedules_owned = self.fixed_batch_schedules_checked(columns, &request_slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
+        let active_devices = self.active_devices_for_schedules(schedules.iter().copied());
         let public_replicas = match requests
             .iter()
             .map(|request| {
-                (0..self.devices.len())
-                    .map(|device| self.full_matrix_on_device(device, request.public.as_ref()))
-                    .collect::<Result<Vec<_>, _>>()
+                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+                for &device in &active_devices {
+                    replicas[device] =
+                        Some(self.full_matrix_on_device(device, request.public.as_ref())?);
+                }
+                Ok(replicas)
             })
             .collect::<Result<Vec<_>, _>>()
         {
@@ -8077,7 +9045,9 @@ impl Backend for GpuDcrtBackend {
                 .bounded_preimage_with_config(
                     &params,
                     &requests[instance].trapdoor.values[job.device],
-                    &public_replicas[instance][job.device],
+                    public_replicas[instance][job.device]
+                        .as_ref()
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?,
                     &target,
                     bound,
                     config,
@@ -8297,18 +9267,28 @@ impl Backend for GpuDcrtBackend {
                 .enumerate()
                 .filter_map(|(device, (device_id, backend))| {
                     let job = wave.iter().find(|job| job.device == device)?;
-                    let view = match Self::small_matrix_piece_on_device(
+                    let views = match Self::small_matrix_piece_on_device(
                         backend, rhs, job.start, job.end,
                     ) {
-                        Ok(view) => view,
+                        Ok(views) => views,
                         Err(error) => return Some(Err(error)),
                     };
-                    Some(backend.multiply_small_rhs(&lhs_replicas[device], &view).map(|value| {
-                        GpuColumnShard {
-                            device_id: *device_id,
-                            global_column_start: job.start,
-                            value,
-                        }
+                    let mut values = match views
+                        .iter()
+                        .map(|view| backend.multiply_small_rhs(&lhs_replicas[device], view))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(values) => values,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    let first = match values.drain(..1).next() {
+                        Some(value) => value,
+                        None => return Some(Err(PolyBackendError::InvalidConstantShape)),
+                    };
+                    Some(Ok(GpuColumnShard {
+                        device_id: *device_id,
+                        global_column_start: job.start,
+                        value: first.concat_columns_owned(values),
                     }))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -8386,24 +9366,42 @@ impl Backend for GpuDcrtBackend {
                 .enumerate()
                 .filter_map(|(device, (device_id, backend))| {
                     let job = wave.iter().find(|job| job.device == device)?;
-                    let view = match Self::small_matrix_piece_on_device(
+                    let views = match Self::small_matrix_piece_on_device(
                         backend, rhs, job.start, job.end,
                     ) {
-                        Ok(view) => view,
+                        Ok(views) => views,
                         Err(error) => return Some(Err(error)),
                     };
                     let references =
                         replicas[device].iter().map(|piece| piece.as_ref()).collect::<Vec<_>>();
-                    Some(backend.multiply_small_rhs_row_blocks(&references, &view).map(|values| {
-                        values
-                            .into_iter()
-                            .map(|value| GpuColumnShard {
-                                device_id: *device_id,
-                                global_column_start: job.start,
-                                value,
-                            })
-                            .collect::<Vec<_>>()
-                    }))
+                    let mut outputs = match views
+                        .iter()
+                        .map(|view| backend.multiply_small_rhs_row_blocks(&references, view))
+                        .collect::<Result<Vec<_>, _>>()
+                    {
+                        Ok(outputs) => outputs,
+                        Err(error) => return Some(Err(error)),
+                    };
+                    let mut values = match outputs.drain(..1).next() {
+                        Some(values) => values,
+                        None => return Some(Err(PolyBackendError::InvalidConstantShape)),
+                    };
+                    for output in outputs {
+                        if output.len() != values.len() {
+                            return Some(Err(PolyBackendError::InvalidConstantShape));
+                        }
+                        for (value, piece) in values.iter_mut().zip(output) {
+                            *value = value.clone().concat_columns_owned(vec![piece]);
+                        }
+                    }
+                    Some(Ok(values
+                        .into_iter()
+                        .map(|value| GpuColumnShard {
+                            device_id: *device_id,
+                            global_column_start: job.start,
+                            value,
+                        })
+                        .collect::<Vec<_>>()))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for shards in launched {

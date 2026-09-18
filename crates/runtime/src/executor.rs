@@ -4,7 +4,7 @@ use crate::{
         Backend, FixedGadgetDecomposeRequest, FixedGenerationOutput, FixedGenerationRequest,
         FixedOperationBatchRequest, FixedUnaryOperation, FusedBatchOutput, FusedBatchRequest,
         IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest, PlannedNodeBatchRequest,
-        PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange,
+        PlannedOperandMetadata, PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange,
     },
     gpu_column_policy::{
         ColumnCapability, EffectiveGpuOperation, column_capability, effective_gpu_operation,
@@ -1277,6 +1277,55 @@ pub(crate) fn gpu_effective_site_metadata(
     Ok((outputs, identity))
 }
 
+/// Return the operation identity used by GPU warmup for a concrete site.
+///
+/// Fused row-block and row-sum sites are intentionally identified from the
+/// effective operation metadata.  Falling back to the ordinary calibration
+/// identity is only valid when the alias analysis has no effective identity.
+/// Keeping this calculation here makes fixed execution use the same source as
+/// warmup instead of comparing a fused site with its logical `NodeKind`.
+pub(crate) fn gpu_effective_site_operation_identity(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Result<Option<[u8; 32]>, String> {
+    #[cfg(feature = "gpu")]
+    let (output_types, effective_identity) =
+        gpu_effective_site_metadata(validated, scope_id, node)?;
+    #[cfg(not(feature = "gpu"))]
+    let effective_identity = gpu_effective_site_metadata(validated, scope_id, node)?.1;
+    #[cfg(feature = "gpu")]
+    {
+        let checked = validated.scope(scope_id).ok_or_else(|| "missing GPU scope".to_owned())?;
+        let scope =
+            validated.source.scope(scope_id).ok_or_else(|| "missing GPU graph scope".to_owned())?;
+        let handle = scope.node(node).ok_or_else(|| "missing GPU node".to_owned())?;
+        let arguments =
+            scope.arguments(handle).ok_or_else(|| "missing GPU node arguments".to_owned())?;
+        let argument_types = arguments
+            .iter()
+            .map(|wire| {
+                checked
+                    .wire_types
+                    .get(wire)
+                    .cloned()
+                    .ok_or_else(|| "missing GPU argument type".to_owned())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let ordinary_identity = crate::gpu_calibration::gpu_calibration_operation_identity(
+            handle.kind(),
+            &argument_types,
+            &output_types,
+            &validated.bindings,
+        )?;
+        Ok(effective_identity.or(Some(ordinary_identity)))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Ok(effective_identity)
+    }
+}
+
 impl<B, S> Executor<'_, B, S>
 where
     B: Backend,
@@ -1422,6 +1471,17 @@ where
         let effective_types = gpu_effective_site_metadata(self.validated, scope_id, node)
             .map_err(ExecutionError::InvalidGpuPlan)?
             .0;
+        let effective_identity = gpu_effective_site_metadata(self.validated, scope_id, node)
+            .map_err(ExecutionError::InvalidGpuPlan)?
+            .1;
+        let warmup_identity = gpu_effective_site_operation_identity(self.validated, scope_id, node)
+            .map_err(ExecutionError::InvalidGpuPlan)?;
+        if effective_identity.is_some() &&
+            (warmup_identity != effective_identity ||
+                warmup_identity != Some(choice.operation_identity))
+        {
+            return Err(ExecutionError::GpuPlanOperationMismatch { site: key });
+        }
         let effective_ports = effective_types.len();
         if effective_ports != choice.output_layouts.len() {
             return Err(ExecutionError::InvalidGpuPlan("fused output port count mismatch".into()));
@@ -1462,42 +1522,75 @@ where
                 });
             }
         }
-        let source_layouts = scope
-            .arguments(handle)
-            .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing node arguments".into()))?
-            .iter()
-            .map(|wire| {
-                let declared = scope
-                    .node(wire.node)
-                    .and_then(|producer| producer.output_types().get(wire.port.0 as usize))
-                    .ok_or_else(|| {
-                        ExecutionError::InvalidGpuPlan("missing argument declaration".into())
-                    })?;
-                let actual = mxx_ir_core::concretize_wire_type(
-                    declared,
-                    &instance_envs[*instance_slots.first().unwrap_or(&0)],
-                    scope_id,
-                    node,
-                )
-                .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
-                let Some(matrix) = actual.matrix_type() else {
-                    return Ok(crate::backend::PlannedLayoutMetadata {
-                        layout_id: None,
-                        rows: 0,
-                        columns: 0,
-                        ring_dimension: 0,
-                        representation: format!("{actual:?}"),
-                    });
-                };
-                Ok(crate::backend::PlannedLayoutMetadata {
+        let source_layout_for_wire = |wire: &WireRef| {
+            let declared = scope
+                .node(wire.node)
+                .and_then(|producer| producer.output_types().get(wire.port.0 as usize))
+                .ok_or_else(|| {
+                    ExecutionError::InvalidGpuPlan("missing argument declaration".into())
+                })?;
+            let actual = mxx_ir_core::concretize_wire_type(
+                declared,
+                &instance_envs[*instance_slots.first().unwrap_or(&0)],
+                scope_id,
+                node,
+            )
+            .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
+            let Some(matrix) = actual.matrix_type() else {
+                return Ok(crate::backend::PlannedLayoutMetadata {
                     layout_id: None,
-                    rows: matrix.rows,
-                    columns: matrix.columns,
-                    ring_dimension: matrix.ring_dimension,
+                    rows: 0,
+                    columns: 0,
+                    ring_dimension: 0,
                     representation: format!("{actual:?}"),
-                })
+                });
+            };
+            Ok(crate::backend::PlannedLayoutMetadata {
+                layout_id: None,
+                rows: matrix.rows,
+                columns: matrix.columns,
+                ring_dimension: matrix.ring_dimension,
+                representation: format!("{actual:?}"),
             })
-            .collect::<Result<Vec<_>, ExecutionError>>()?;
+        };
+        let default_source_wires = scope
+            .arguments(handle)
+            .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing node arguments".into()))?;
+        let aliases = root_block_aliases(self.validated, scope_id, false);
+        let compact_product = aliases.compact_products.get(&node);
+        let (source_layouts, effective_operands) = if let Some((concat, rhs, _)) = compact_product {
+            let concat_handle = scope
+                .node(*concat)
+                .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing compact concat".into()))?;
+            let origins = scope
+                .arguments(concat_handle)
+                .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing compact blocks".into()))?;
+            let mut effective_operands = Vec::with_capacity(origins.len() + 1);
+            let mut block_layouts = Vec::with_capacity(origins.len());
+            for (block_index, origin) in origins.iter().enumerate() {
+                let layout = source_layout_for_wire(origin)?;
+                block_layouts.push(layout.clone());
+                effective_operands.push(PlannedOperandMetadata::RowBlock {
+                    logical_operand: 0,
+                    block_index,
+                    origin: *origin,
+                    layout,
+                });
+            }
+            let rhs_layout = source_layout_for_wire(rhs)?;
+            effective_operands.push(PlannedOperandMetadata::CompactRhs {
+                logical_operand: 1,
+                origin: *rhs,
+                layout: rhs_layout,
+            });
+            (block_layouts, effective_operands)
+        } else {
+            let source_layouts = default_source_wires
+                .iter()
+                .map(source_layout_for_wire)
+                .collect::<Result<Vec<_>, ExecutionError>>()?;
+            (source_layouts, Vec::new())
+        };
         let output_ports = if effective_ports == 0 { output_ports } else { effective_ports };
         let request = PlannedNodeBatchRequest {
             site: key.site,
@@ -1513,6 +1606,7 @@ where
                 .map(|(port, layout)| (port, *layout))
                 .collect(),
             source_layouts,
+            effective_operands,
             output_layout_metadata,
             columns_per_job: choice.columns_per_job.clone(),
             instance_slots: instance_slots.to_vec(),
@@ -1611,19 +1705,7 @@ where
                         block_aliases.calibration[node].clone().map_err(ExecutionError::Backend)?
                     {
                         if self.gpu_plan.is_some() {
-                            let planned = self.prepare_fixed_node_batch(
-                                scope_id,
-                                *node,
-                                &[0],
-                                paths,
-                                envs,
-                                1,
-                            )?;
-                            if planned != Some(operation) {
-                                return Err(ExecutionError::GpuPlanOperationMismatch {
-                                    site: self.fixed_execution_site_key(scope_id, *node)?,
-                                });
-                            }
+                            self.prepare_fixed_node_batch(scope_id, *node, &[0], paths, envs, 1)?;
                         } else {
                             self.backend
                                 .select_gpu_operation(operation)
@@ -1833,32 +1915,10 @@ where
                 all_instances(None)
             } else if self.gpu_plan.is_some() {
                 // Fixed dispatch classification comes exclusively from the
-                // pure column policy.  Calibration identity is only a
-                // profile label; it never decides whether this node is a
-                // fixed operation.
-                if matches!(fixed_capability, Some(ColumnCapability::SingleDevice)) {
-                    all_instances(None)
-                } else {
-                    let argument_types = node
-                        .args
-                        .iter()
-                        .map(|wire| validated_scope.wire_types[wire].clone())
-                        .collect::<Vec<_>>();
-                    let output_types = (0..handle.output_types().len())
-                        .map(|port| {
-                            let wire = WireRef { node: node.id, port: Port(port as u32) };
-                            validated_scope.wire_types[&wire].clone()
-                        })
-                        .collect::<Vec<_>>();
-                    let operation = crate::gpu_calibration::gpu_calibration_operation_identity(
-                        node.kind,
-                        &argument_types,
-                        &output_types,
-                        &self.validated.bindings,
-                    )
-                    .map_err(ExecutionError::Backend)?;
-                    all_instances(Some(operation))
-                }
+                // pure column policy.  The frozen choice carries the warmup
+                // identity; selecting by ordinary NodeKind identity here
+                // would reject backend-supplied effective identities.
+                all_instances(None)
             } else if self.gpu_plan.is_none() &&
                 scope_id == &FrozenGraphScopeId::Root &&
                 self.trace.is_none()
@@ -1947,7 +2007,7 @@ where
             {
                 if let Some(operation) = operation {
                     if self.gpu_plan.is_some() {
-                        let planned = self.prepare_fixed_node_batch(
+                        self.prepare_fixed_node_batch(
                             scope_id,
                             node.id,
                             indices,
@@ -1955,11 +2015,6 @@ where
                             envs,
                             handle.output_types().len(),
                         )?;
-                        if planned != Some(operation) {
-                            return Err(ExecutionError::GpuPlanOperationMismatch {
-                                site: self.fixed_execution_site_key(scope_id, node.id)?,
-                            });
-                        }
                     } else {
                         self.backend
                             .select_gpu_operation(operation)
@@ -6823,6 +6878,357 @@ mod tests {
                     matrix_output(&reference, "joined")
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn execute_warmup_fixed_cpu_case(
+        graph: &ValidatedGraph,
+        parameters: DCRTPolyParams,
+        inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
+        output_names: &[&str],
+    ) {
+        use crate::{
+            gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
+            gpu_warmup::{
+                GpuProfileProvenance, GpuStageCostModel, GpuValidatedNodeProfile,
+                GpuValidatedWarmupConfig,
+            },
+        };
+        let mut matrices = BTreeMap::<ConcreteMatrixType, LayoutId>::new();
+        for checked in graph.scopes.values() {
+            for ty in checked.wire_types.values() {
+                if let Some(matrix) = ty.matrix_type() {
+                    let next = matrices.len() as LayoutId + 1;
+                    matrices.entry(matrix.clone()).or_insert(next);
+                }
+            }
+        }
+        let layouts = matrices
+            .iter()
+            .map(|(matrix, id)| GpuLayout {
+                id: *id,
+                columns: matrix.columns,
+                rows: matrix.rows,
+                ring_dimension: matrix.ring_dimension,
+                representation: format!("{:?}", ConcreteWireType::Matrix(matrix.clone())),
+                instance_device_stride: 0,
+                owner_intervals: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        let fallback_layout = layouts.first().expect("matrix layout").id;
+        let cost = vec![GpuStageCostModel::default()];
+        let mut profiles = BTreeMap::new();
+        for (scope_id, checked) in &graph.scopes {
+            for position in 0..checked.execution_order.len() {
+                let node = NodeId(position as u64);
+                let identity = gpu_effective_site_operation_identity(graph, scope_id, node)
+                    .expect("site identity")
+                    .expect("GPU identity");
+                let output_types =
+                    gpu_effective_site_metadata(graph, scope_id, node).expect("site metadata").0;
+                let output_layout = output_types
+                    .iter()
+                    .find_map(|ty| ty.matrix_type().and_then(|matrix| matrices.get(matrix)))
+                    .copied()
+                    .unwrap_or(fallback_layout);
+                profiles.entry(identity).or_insert_with(|| GpuValidatedNodeProfile {
+                    tile_widths: vec![1, 2, 4, 8],
+                    cost: cost.clone(),
+                    implementation_variant: "r01-test".into(),
+                    output_layout,
+                    provenance: GpuProfileProvenance::ConservativeEstimate,
+                    preimage_max_attempts: None,
+                    preimage_footprint: None,
+                });
+            }
+        }
+        let config = GpuValidatedWarmupConfig {
+            contract: GpuPlanContract {
+                graph_specification_hash: [0; 32],
+                backend_identity: "r01-test".into(),
+                logical_to_physical_devices: vec![0],
+                device_budgets: vec![GpuDeviceBudget {
+                    device: 0,
+                    device_bytes: u64::MAX,
+                    pinned_host_bytes: u64::MAX,
+                    host_bytes: u64::MAX,
+                }],
+                shape_contract_hash: [0; 32],
+                backend_revision: "r01-test".into(),
+            },
+            layouts,
+            default_tile_widths: vec![1, 2, 4, 8],
+            default_cost: cost,
+            default_implementation_variant: "r01-test".into(),
+            profiles,
+            effective_operation_identities: BTreeMap::new(),
+            effective_operations: BTreeMap::new(),
+            storage_descriptors: BTreeMap::new(),
+            active_crt_towers: 1,
+            crt_limb_bytes: 8,
+            max_parallel_instances: NonZeroUsize::new(64).unwrap(),
+        };
+        let plan = crate::gpu_warmup::warmup_gpu_from_validated(graph, &config)
+            .expect("validated DSL graph warmup")
+            .plan;
+        let mut fixed_backend = cpu_backend([parameters.clone()]);
+        let mut fixed_store = MemoryArtifactStore::default();
+        let fixed = execute_with_gpu_plan(
+            graph,
+            &plan,
+            &mut fixed_backend,
+            inputs.clone(),
+            &mut fixed_store,
+            SamplingMode::Fresh,
+        )
+        .expect("fixed execution");
+        let mut trace_backend = cpu_backend([parameters]);
+        let mut trace_store = MemoryArtifactStore::default();
+        let (trace, _) = execute_with_trace(
+            graph,
+            &mut trace_backend,
+            inputs,
+            &mut trace_store,
+            SamplingMode::Fresh,
+        )
+        .expect("trace execution");
+        for name in output_names {
+            assert_eq!(matrix_output(&fixed, name), matrix_output(&trace, name));
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn warmup_fixed_dsl_fused_sites_match_cpu_trace() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, 8usize);
+        let left = ring.input("left", (1, 1));
+        let right = ring.input("right", (2, 1));
+        let blocks = Mat::concat(ConcatAxis::Rows, vec![left.clone(), right.clone()]);
+        let reversed = Mat::concat(ConcatAxis::Rows, vec![right, left]);
+        let add_graph = DslContext::new("r01-warmup-row-block-add")
+            .output("out", blocks.clone() + reversed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let first = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguints(&parameters, &[7u8.into()])],
+        );
+        let second = DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguints(&parameters, &[11u8.into()])],
+        )
+        .concat_rows(&[&first]);
+        execute_warmup_fixed_cpu_case(
+            &add_graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("left".into(), RuntimeValue::matrix(first)),
+                ("right".into(), RuntimeValue::matrix(second)),
+            ]),
+            &["out"],
+        );
+
+        let source = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("first", (1, 1)), ring.input("rest", (3, 1))],
+        );
+        let row = |index: usize| {
+            source
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let row_graph = DslContext::new("r01-warmup-row-sum")
+            .output("out", Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]))
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let row_values = [1u8, 3, 5, 7].map(|value| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        });
+        execute_warmup_fixed_cpu_case(
+            &row_graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("first".into(), RuntimeValue::matrix(row_values[0].clone())),
+                (
+                    "rest".into(),
+                    RuntimeValue::matrix(
+                        row_values[1].concat_rows(&[&row_values[2], &row_values[3]]),
+                    ),
+                ),
+            ]),
+            &["out"],
+        );
+
+        let tensor = ring.input("tensor-left", (2, 1)).tensor(ring.input("tensor-right", (2, 1)));
+        let tensor_row = |index: usize| {
+            tensor
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let tensor_graph = DslContext::new("r01-warmup-tensor-row-sum")
+            .output(
+                "out",
+                Mat::concat(
+                    ConcatAxis::Rows,
+                    vec![tensor_row(0), tensor_row(1) + tensor_row(2), tensor_row(3)],
+                ),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let tensor_left = row_values[0].concat_rows(&[&row_values[1]]);
+        let tensor_right = row_values[2].concat_rows(&[&row_values[3]]);
+        execute_warmup_fixed_cpu_case(
+            &tensor_graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("tensor-left".into(), RuntimeValue::matrix(tensor_left)),
+                ("tensor-right".into(), RuntimeValue::matrix(tensor_right)),
+            ]),
+            &["out"],
+        );
+
+        // Exercise the actual executor -> fixed fused_batch path for a
+        // compact product.  The logical concat has two row blocks, while the
+        // request metadata carries physical RowBlock operands plus a distinct
+        // CompactRhs operand; this must not be validated as one positional
+        // source vector of equal length.
+        let digits = parameters.modulus_digits();
+        let compact_input = Mat::concat(
+            ConcatAxis::Rows,
+            vec![ring.input("compact-a", (1, 2)), ring.input("compact-b", (2, 2))],
+        );
+        let compact_left = Mat::concat(
+            ConcatAxis::Rows,
+            vec![
+                ring.input("compact-x", (1, 3 * digits)),
+                ring.input("compact-y", (1, 3 * digits)),
+            ],
+        );
+        let compact_product = compact_input.decompose(16, digits).mul_small_rhs(compact_left);
+        let compact_graph = DslContext::new("r02-fixed-compact-product")
+            .output(
+                "compact-first",
+                compact_product
+                    .clone()
+                    .slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None),
+            )
+            .unwrap()
+            .output(
+                "compact-tail",
+                compact_product.slice(Some(IndexRange { start: 1.into(), end: 2.into() }), None),
+            )
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let matrix = |rows: usize, columns: usize, seed: u8| {
+            DCRTPolyMatrix::from_poly_vec(
+                &parameters,
+                (0..rows)
+                    .map(|row| {
+                        (0..columns)
+                            .map(|column| {
+                                DCRTPoly::from_biguints(
+                                    &parameters,
+                                    &[u8::wrapping_add(seed, (row * columns + column) as u8)
+                                        .into()],
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
+        execute_warmup_fixed_cpu_case(
+            &compact_graph,
+            parameters.clone(),
+            BTreeMap::from([
+                ("compact-a".into(), RuntimeValue::matrix(matrix(1, 2, 3))),
+                ("compact-b".into(), RuntimeValue::matrix(matrix(2, 2, 17))),
+                ("compact-x".into(), RuntimeValue::matrix(matrix(1, 3 * digits, 31))),
+                ("compact-y".into(), RuntimeValue::matrix(matrix(1, 3 * digits, 47))),
+            ]),
+            &["compact-first", "compact-tail"],
+        );
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn effective_site_identity_matches_warmup_for_fused_dsl_sites() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::ConcatAxis;
+
+        let ring = Ring::new(97, 8usize);
+        let left = ring.input("left", (1, 2));
+        let right = ring.input("right", (2, 2));
+        let blocks = Mat::concat(ConcatAxis::Rows, vec![left.clone(), right.clone()]);
+        let reversed = Mat::concat(ConcatAxis::Rows, vec![right, left]);
+        let add_graph = DslContext::new("identity-row-block-add")
+            .output("out", blocks.clone() + reversed)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let add_aliases = root_block_aliases(&add_graph, &FrozenGraphScopeId::Root, false);
+        let add_node = *add_aliases.adds.keys().next().expect("row block add site");
+        assert_eq!(
+            gpu_effective_site_operation_identity(&add_graph, &FrozenGraphScopeId::Root, add_node,)
+                .unwrap(),
+            add_aliases.calibration[&add_node].as_ref().unwrap().clone()
+        );
+
+        let row = |source: &mxx_dsl::Mat, index: usize| {
+            source.clone().slice(
+                Some(mxx_ir_core::node::IndexRange {
+                    start: index.into(),
+                    end: (index + 1).into(),
+                }),
+                None,
+            )
+        };
+        let tensor = ring.input("tensor-left", (2, 1)).tensor(ring.input("tensor-right", (2, 1)));
+        let output = Mat::concat(
+            ConcatAxis::Rows,
+            vec![row(&tensor, 0), row(&tensor, 1) + row(&tensor, 2), row(&tensor, 3)],
+        );
+        let row_graph = DslContext::new("identity-tensor-row-sum")
+            .output("out", output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let row_aliases = root_block_aliases(&row_graph, &FrozenGraphScopeId::Root, false);
+        for node in row_aliases.row_sums.keys() {
+            assert_eq!(
+                gpu_effective_site_operation_identity(
+                    &row_graph,
+                    &FrozenGraphScopeId::Root,
+                    *node,
+                )
+                .unwrap(),
+                row_aliases.calibration[node].as_ref().unwrap().clone()
+            );
         }
     }
 

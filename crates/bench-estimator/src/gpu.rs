@@ -28,6 +28,7 @@ use mxx_primitives::{
 use mxx_runtime::{
     Backend,
     backend::{
+        GpuWarmupProfile, GpuWarmupProfileError, GpuWarmupProfileProvider, GpuWarmupProfileRequest,
         IndexRange, MatrixMulAccumulateRequest, PreimageRequest, SampleRange,
         poly_gpu::{GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor},
     },
@@ -375,6 +376,10 @@ pub struct GpuNodeMeasurementBackend {
     vram_percent: u32,
     calibration_registry: GpuCalibrationRegistry,
     measurements: HashMap<[u8; 32], NodeMeasurement>,
+    /// Profiles collected for the warmup planner. The complete range request
+    /// is the key so a point measured for one candidate `b` is never reused
+    /// for another candidate.
+    warmup_profiles: HashMap<GpuWarmupProfileRequest, GpuWarmupProfile>,
     pending: HashMap<[u8; 32], PendingMeasurement>,
     collecting: bool,
 }
@@ -406,6 +411,7 @@ impl GpuNodeMeasurementBackend {
             vram_percent,
             calibration_registry: GpuCalibrationRegistry::new(),
             measurements: HashMap::new(),
+            warmup_profiles: HashMap::new(),
             pending: HashMap::new(),
             collecting: true,
         }
@@ -415,6 +421,58 @@ impl GpuNodeMeasurementBackend {
     /// same registry and recompute widths from its then-current GPU residency.
     pub fn calibration_registry(&self) -> GpuCalibrationRegistry {
         self.calibration_registry.clone()
+    }
+
+    /// Register one result from the device-local production range path.
+    /// Warmup callers must register every candidate they want to consider;
+    /// lookup never synthesizes a default profile.
+    pub fn register_warmup_measurement(
+        &mut self,
+        request: GpuWarmupProfileRequest,
+        measurement: &NodeMeasurement,
+    ) -> Result<(), GpuMeasurementError> {
+        let profile = GpuWarmupProfile::measured(
+            measurement.cumulative_wave_seconds,
+            measurement.measured_wave_workspace_bytes,
+        )
+        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        self.warmup_profiles.insert(request, profile);
+        Ok(())
+    }
+
+    /// Register a measured preimage point together with the sampler metadata
+    /// required by warmup admission. Generic operation measurements must not
+    /// be promoted to preimage footprints without these explicit facts.
+    pub fn register_warmup_preimage_measurement(
+        &mut self,
+        request: GpuWarmupProfileRequest,
+        measurement: &NodeMeasurement,
+        max_attempts: usize,
+        certified_tile_width: usize,
+    ) -> Result<(), GpuMeasurementError> {
+        let profile = GpuWarmupProfile::measured_preimage(
+            measurement.cumulative_wave_seconds,
+            measurement.measured_wave_workspace_bytes,
+            max_attempts,
+            certified_tile_width,
+        )
+        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        self.warmup_profiles.insert(request, profile);
+        Ok(())
+    }
+
+    /// Register an analytically exact size-only operation. It is intentionally
+    /// distinct from a measured zero-time result.
+    pub fn register_warmup_size_only(
+        &mut self,
+        request: GpuWarmupProfileRequest,
+        workspace_bytes: u64,
+    ) {
+        self.warmup_profiles.insert(request, GpuWarmupProfile::analytic_size_only(workspace_bytes));
+    }
+
+    pub fn warmup_profile_count(&self) -> usize {
+        self.warmup_profiles.len()
     }
 
     /// Read the widths frozen by a runtime plan. Plan-aware estimation never
@@ -2948,6 +3006,18 @@ impl GpuNodeMeasurementBackend {
             NodeKind::FamilyGetDynamic |
             NodeKind::Select { .. } => Ok(Vec::new()),
         }
+    }
+}
+
+impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
+    fn measure(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        self.warmup_profiles
+            .get(request)
+            .copied()
+            .ok_or_else(|| GpuWarmupProfileError::MissingProfile(request.clone()))
     }
 }
 

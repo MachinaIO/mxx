@@ -3,12 +3,12 @@ use mxx_ir_core::{
     ParamEnv,
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp},
-    types::{ConcreteMatrixType, InstantiationFrame},
+    types::{ConcreteMatrixType, ConcreteWireType, InstantiationFrame, WireRef},
 };
 use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
 use num_bigint::BigInt;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -55,6 +55,12 @@ pub struct PlannedNodeBatchRequest {
     /// Concrete source layouts checked at submit time.  `layout_id` is absent
     /// when a source is a runtime value rather than a planned output.
     pub source_layouts: Vec<PlannedLayoutMetadata>,
+    /// Effective operands after lowering fused nodes.  A compact product's
+    /// logical concat is represented by its origin wires and lowered row
+    /// blocks, while its compact RHS remains a distinct typed operand.
+    /// `source_layouts` therefore describes only the physical block sources
+    /// for that operation, never an ambiguous logical `(concat, rhs)` pair.
+    pub effective_operands: Vec<PlannedOperandMetadata>,
     pub output_layout_metadata: Vec<PlannedLayoutMetadata>,
     pub columns_per_job: Vec<usize>,
     pub instance_slots: Vec<usize>,
@@ -62,6 +68,21 @@ pub struct PlannedNodeBatchRequest {
     pub draw_sites: Vec<Option<DrawSite>>,
     pub randomness_seeds: Vec<Option<[u8; 32]>>,
     pub output_ports: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlannedOperandMetadata {
+    RowBlock {
+        logical_operand: usize,
+        block_index: usize,
+        origin: WireRef,
+        layout: PlannedLayoutMetadata,
+    },
+    CompactRhs {
+        logical_operand: usize,
+        origin: WireRef,
+        layout: PlannedLayoutMetadata,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +108,10 @@ pub struct BackendStorageDescriptor {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BackendStorageContract {
-    pub descriptors: BTreeMap<ConcreteMatrixType, BackendStorageDescriptor>,
+    /// Keyed by the complete concrete wire type, not just its matrix shape.
+    /// This keeps full-DCRT matrices distinct from compact bounded RHS and
+    /// preimage values that happen to share rows/columns/modulus.
+    pub descriptors: BTreeMap<ConcreteWireType, BackendStorageDescriptor>,
     pub active_crt_towers: usize,
     pub crt_limb_bytes: usize,
 }
@@ -97,7 +121,7 @@ pub struct BackendStorageContract {
 /// concrete matrix types may not be represented by an empty descriptor map or
 /// by a fabricated one-tower summary of a deeper CRT basis.
 pub fn validate_backend_storage_contract(
-    types: &[ConcreteMatrixType],
+    types: &[ConcreteWireType],
     contract: &BackendStorageContract,
 ) -> Result<(), String> {
     if contract.active_crt_towers == 0 || contract.crt_limb_bytes == 0 {
@@ -370,7 +394,7 @@ pub struct MatrixMulAccumulateRequest<M> {
     pub bias: Option<Arc<M>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct IndexRange {
     pub start: usize,
     pub end: usize,
@@ -380,6 +404,250 @@ pub struct IndexRange {
 pub struct SampleRange {
     pub minimum: BigInt,
     pub maximum: BigInt,
+}
+
+/// The identity of an operation whose setup-time GPU profile is being
+/// collected.  Shape and instance classes are part of the key because the
+/// same operation can use different kernels (and therefore different
+/// workspaces) for different concrete shapes or loop bindings.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub struct GpuWarmupOperationSignature {
+    pub operation: [u8; 32],
+    pub shape_class: u64,
+    pub instance_class: u64,
+}
+
+/// One exact production range candidate requested by warmup.  `tile_width`
+/// is the candidate `b`; `range` identifies the output columns exercised by
+/// the device-local production path.  A provider must measure this candidate
+/// or return [`GpuWarmupProfileError::MissingProfile`].
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct GpuWarmupProfileRequest {
+    pub signature: GpuWarmupOperationSignature,
+    /// Logical device whose device-local production range is measured.
+    pub device: usize,
+    pub tile_width: usize,
+    pub range: IndexRange,
+}
+
+/// Whether a profile came from a timed production-range execution or from an
+/// operation whose storage size is analytically exact.  Size-only operations
+/// are explicit so they cannot accidentally be treated as measured GPU time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuWarmupProfileKind {
+    Measured,
+    AnalyticSizeOnly,
+}
+
+/// Time and workspace for one operation signature and tile-width candidate.
+/// `time_seconds` is absent only for an [`GpuWarmupProfileKind::AnalyticSizeOnly`]
+/// profile; such operations must not be admitted using an implicit zero-time
+/// default.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuWarmupProfile {
+    pub kind: GpuWarmupProfileKind,
+    pub time_seconds: Option<f64>,
+    pub workspace_bytes: u64,
+    /// Optional sampler metadata carried by a preimage provider. These are
+    /// absent for ordinary operations and must never be inferred by the
+    /// planner from a generic workspace measurement.
+    pub preimage_max_attempts: Option<usize>,
+    pub preimage_certified_tile_width: Option<usize>,
+}
+
+impl GpuWarmupProfile {
+    pub fn measured(
+        time_seconds: f64,
+        workspace_bytes: u64,
+    ) -> Result<Self, GpuWarmupProfileError> {
+        if !time_seconds.is_finite() || time_seconds < 0.0 {
+            return Err(GpuWarmupProfileError::InvalidMeasurement(
+                "measured GPU time must be finite and non-negative".into(),
+            ));
+        }
+        Ok(Self {
+            kind: GpuWarmupProfileKind::Measured,
+            time_seconds: Some(time_seconds),
+            workspace_bytes,
+            preimage_max_attempts: None,
+            preimage_certified_tile_width: None,
+        })
+    }
+
+    pub fn measured_preimage(
+        time_seconds: f64,
+        workspace_bytes: u64,
+        max_attempts: usize,
+        certified_tile_width: usize,
+    ) -> Result<Self, GpuWarmupProfileError> {
+        if !time_seconds.is_finite() || time_seconds < 0.0 {
+            return Err(GpuWarmupProfileError::InvalidMeasurement(
+                "measured GPU time must be finite and non-negative".into(),
+            ));
+        }
+        Ok(Self {
+            kind: GpuWarmupProfileKind::Measured,
+            time_seconds: Some(time_seconds),
+            workspace_bytes,
+            preimage_max_attempts: Some(max_attempts),
+            preimage_certified_tile_width: Some(certified_tile_width),
+        })
+    }
+
+    pub const fn analytic_size_only(workspace_bytes: u64) -> Self {
+        Self {
+            kind: GpuWarmupProfileKind::AnalyticSizeOnly,
+            time_seconds: None,
+            workspace_bytes,
+            preimage_max_attempts: None,
+            preimage_certified_tile_width: None,
+        }
+    }
+
+    pub fn validate(self) -> Result<Self, GpuWarmupProfileError> {
+        match (self.kind, self.time_seconds) {
+            (GpuWarmupProfileKind::Measured, Some(time)) if time.is_finite() && time >= 0.0 => {
+                Ok(self)
+            }
+            (GpuWarmupProfileKind::AnalyticSizeOnly, None) => Ok(self),
+            (GpuWarmupProfileKind::Measured, _) => Err(GpuWarmupProfileError::InvalidMeasurement(
+                "measured GPU profile is missing a finite time".into(),
+            )),
+            (GpuWarmupProfileKind::AnalyticSizeOnly, Some(_)) => {
+                Err(GpuWarmupProfileError::InvalidMeasurement(
+                    "size-only GPU profile must not contain measured time".into(),
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum GpuWarmupProfileError {
+    MissingProfile(GpuWarmupProfileRequest),
+    InvalidMeasurement(String),
+    Measurement(String),
+}
+
+impl fmt::Display for GpuWarmupProfileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingProfile(request) => write!(
+                formatter,
+                "missing GPU warmup profile for operation {:?}, device {}, tile width {}, range [{}, {})",
+                request.signature,
+                request.device,
+                request.tile_width,
+                request.range.start,
+                request.range.end
+            ),
+            Self::InvalidMeasurement(message) => formatter.write_str(message),
+            Self::Measurement(message) => {
+                write!(formatter, "GPU warmup measurement failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GpuWarmupProfileError {}
+
+/// Setup-time source of warmup profiles. Implementations must use the same
+/// device-local production range operation that fixed execution will submit;
+/// this trait is intentionally unavailable as a production-operation fallback.
+pub trait GpuWarmupProfileProvider {
+    fn measure(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError>;
+}
+
+impl<P> GpuWarmupProfileProvider for &mut P
+where
+    P: GpuWarmupProfileProvider + ?Sized,
+{
+    fn measure(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        (**self).measure(request)
+    }
+}
+
+/// Strict cache used by warmup. A cache hit never invokes the provider, while
+/// a miss invokes it exactly once and stores only a validated profile. The
+/// production planner should call [`Self::profile`] only during warmup and
+/// use [`Self::cached_profile`] during fixed execution.
+pub struct GpuWarmupProfileCache<P> {
+    provider: P,
+    profiles: HashMap<GpuWarmupProfileRequest, GpuWarmupProfile>,
+}
+
+impl<P> GpuWarmupProfileCache<P>
+where
+    P: GpuWarmupProfileProvider,
+{
+    pub fn new(provider: P) -> Self {
+        Self { provider, profiles: HashMap::new() }
+    }
+
+    pub fn cached_profile(
+        &self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        self.profiles
+            .get(request)
+            .copied()
+            .ok_or_else(|| GpuWarmupProfileError::MissingProfile(request.clone()))
+    }
+
+    pub fn profile(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        if let Some(profile) = self.profiles.get(request).copied() {
+            return Ok(profile);
+        }
+        let profile = self.provider.measure(request)?.validate()?;
+        self.profiles.insert(request.clone(), profile);
+        Ok(profile)
+    }
+
+    pub fn insert(
+        &mut self,
+        request: GpuWarmupProfileRequest,
+        profile: GpuWarmupProfile,
+    ) -> Result<(), GpuWarmupProfileError> {
+        self.profiles.insert(request, profile.validate()?);
+        Ok(())
+    }
+
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+
+    pub fn provider(&self) -> &P {
+        &self.provider
+    }
+
+    pub fn provider_mut(&mut self) -> &mut P {
+        &mut self.provider
+    }
+}
+
+impl<P> GpuWarmupProfileProvider for GpuWarmupProfileCache<P>
+where
+    P: GpuWarmupProfileProvider,
+{
+    fn measure(
+        &mut self,
+        request: &GpuWarmupProfileRequest,
+    ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+        self.profile(request)
+    }
 }
 
 pub trait Backend {
@@ -632,7 +900,7 @@ pub trait Backend {
     /// tower count or leave the descriptor map empty.
     fn gpu_physical_storage_contract(
         &self,
-        _types: &[ConcreteMatrixType],
+        _types: &[ConcreteWireType],
     ) -> Result<Option<BackendStorageContract>, Self::Error>
     where
         Self: Sized,
@@ -646,7 +914,7 @@ pub trait Backend {
     /// `active_crt_towers` and descriptor maps before planning.
     fn validate_gpu_physical_storage_contract(
         &self,
-        types: &[ConcreteMatrixType],
+        types: &[ConcreteWireType],
         supplied: &BackendStorageContract,
     ) -> Result<(), Self::Error>
     where
@@ -663,6 +931,14 @@ pub trait Backend {
         _budgets: &[crate::gpu_execution_plan::GpuDeviceBudget],
     ) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Returns the setup-only provider used by backend-backed automatic
+    /// warmup. Production fixed execution must not call this hook or perform
+    /// profile collection; backends without a measurement path return `None`
+    /// and automatic warmup fails rather than using zero defaults.
+    fn gpu_warmup_profile_provider(&mut self) -> Option<&mut dyn GpuWarmupProfileProvider> {
+        None
     }
 
     /// Installs the value-only plan into a backend's fixed-dispatch state.
@@ -1400,29 +1676,102 @@ mod storage_contract_tests {
     #[test]
     fn storage_contract_rejects_empty_map_and_fabricated_one_tower_depth() {
         let ty = matrix_type();
+        let wire = ConcreteWireType::Matrix(ty.clone());
         let empty = BackendStorageContract {
             descriptors: BTreeMap::new(),
             active_crt_towers: 1,
             crt_limb_bytes: 8,
         };
-        assert!(validate_backend_storage_contract(std::slice::from_ref(&ty), &empty).is_err());
+        assert!(validate_backend_storage_contract(std::slice::from_ref(&wire), &empty).is_err());
 
         let four_tower = BackendStorageContract {
-            descriptors: BTreeMap::from([(ty.clone(), descriptor(3))]),
+            descriptors: BTreeMap::from([(wire.clone(), descriptor(3))]),
             active_crt_towers: 1,
             crt_limb_bytes: 8,
         };
-        assert!(validate_backend_storage_contract(&[ty], &four_tower).is_err());
+        assert!(validate_backend_storage_contract(&[wire], &four_tower).is_err());
     }
 
     #[test]
     fn storage_contract_accepts_ordered_native_descriptor() {
         let ty = matrix_type();
+        let wire = ConcreteWireType::Matrix(ty.clone());
         let contract = BackendStorageContract {
-            descriptors: BTreeMap::from([(ty.clone(), descriptor(3))]),
+            descriptors: BTreeMap::from([(wire.clone(), descriptor(3))]),
             active_crt_towers: 4,
             crt_limb_bytes: 8,
         };
-        validate_backend_storage_contract(&[ty], &contract).unwrap();
+        validate_backend_storage_contract(&[wire], &contract).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod warmup_profile_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct FakeProvider {
+        calls: Cell<usize>,
+    }
+
+    impl GpuWarmupProfileProvider for FakeProvider {
+        fn measure(
+            &mut self,
+            request: &GpuWarmupProfileRequest,
+        ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+            self.calls.set(self.calls.get() + 1);
+            // Deliberately nonlinear: the planner must be able to select a
+            // smaller candidate after it has collected both points.
+            let time = if request.tile_width == 2 { 1.0 } else { 4.0 };
+            GpuWarmupProfile::measured(time, request.tile_width as u64 * 10)
+        }
+    }
+
+    fn request(tile_width: usize) -> GpuWarmupProfileRequest {
+        GpuWarmupProfileRequest {
+            signature: GpuWarmupOperationSignature {
+                operation: [7; 32],
+                shape_class: 3,
+                instance_class: 1,
+            },
+            device: 0,
+            tile_width,
+            range: IndexRange { start: 4, end: 4 + tile_width },
+        }
+    }
+
+    #[test]
+    fn empty_cache_measures_each_candidate_once_and_is_strict_on_production_lookup() {
+        let provider = FakeProvider::default();
+        let mut cache = GpuWarmupProfileCache::new(provider);
+        let narrow = request(2);
+        let wide = request(8);
+
+        assert_eq!(cache.profile(&narrow).unwrap().time_seconds, Some(1.0));
+        assert_eq!(cache.profile(&wide).unwrap().time_seconds, Some(4.0));
+        assert_eq!(cache.profile(&narrow).unwrap().time_seconds, Some(1.0));
+        assert_eq!(cache.provider().calls.get(), 2);
+        assert_eq!(cache.len(), 2);
+
+        // Fixed execution uses only cached values. A missing candidate is a
+        // hard error rather than a zero-time/default model.
+        assert!(matches!(
+            cache.cached_profile(&request(4)),
+            Err(GpuWarmupProfileError::MissingProfile(_))
+        ));
+        assert_eq!(cache.provider().calls.get(), 2);
+    }
+
+    #[test]
+    fn analytic_size_only_profile_is_explicit_and_has_no_time() {
+        let request = request(1);
+        let mut cache = GpuWarmupProfileCache::new(FakeProvider::default());
+        cache.insert(request.clone(), GpuWarmupProfile::analytic_size_only(64)).unwrap();
+        let profile = cache.cached_profile(&request).unwrap();
+        assert_eq!(profile.kind, GpuWarmupProfileKind::AnalyticSizeOnly);
+        assert_eq!(profile.time_seconds, None);
+        assert_eq!(profile.workspace_bytes, 64);
+        assert_eq!(cache.provider().calls.get(), 0);
     }
 }

@@ -1,12 +1,14 @@
+use crate::{gpu_execution_plan::FrozenGpuPlan, transcript::DrawSite};
 use mxx_ir_core::{
     ParamEnv,
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
-    node::{ConcatAxis, ConstantMatrix},
-    types::ConcreteMatrixType,
+    node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp},
+    types::{ConcreteMatrixType, InstantiationFrame},
 };
 use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
 use num_bigint::BigInt;
 use std::{
+    collections::BTreeMap,
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -17,6 +19,10 @@ pub mod poly_gpu;
 
 #[derive(Clone, Debug)]
 pub struct PreimageRequest<M, T> {
+    pub instance_slot: usize,
+    /// Fixed-plan site/layout contract for the sampled instance.  Legacy
+    /// callers leave this absent; fixed executor paths always populate it.
+    pub fixed_metadata: Option<PlannedNodeBatchRequest>,
     pub matrix_type: ConcreteMatrixType,
     pub sigma: f64,
     pub gadget_base: BigInt,
@@ -27,6 +33,268 @@ pub struct PreimageRequest<M, T> {
     pub target: Arc<dyn PolyMatrixColumnSource<M>>,
     /// Seed for deterministic GPU sampling with a fixed column schedule.
     pub randomness_seed: [u8; 32],
+}
+
+/// Metadata passed to a backend immediately before a fixed node batch is
+/// submitted.  It deliberately contains no matrix owner or native pointer;
+/// those are bound by the backend to the current runtime values.  The
+/// executor keeps the original instance slots so a backend cannot accidentally
+/// use a compressed batch index as a sampling or output coordinate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedNodeBatchRequest {
+    pub site: u64,
+    pub shape_class: u64,
+    pub instance_class: u64,
+    pub operation_identity: [u8; 32],
+    pub implementation_variant: String,
+    pub output_layouts: Vec<crate::gpu_execution_plan::LayoutId>,
+    /// Explicit port-to-layout bindings. `output_layouts` is retained as the
+    /// compact plan representation, while this field prevents a backend from
+    /// accidentally treating a reordered fused output as positional-only.
+    pub output_port_layouts: Vec<(usize, crate::gpu_execution_plan::LayoutId)>,
+    /// Concrete source layouts checked at submit time.  `layout_id` is absent
+    /// when a source is a runtime value rather than a planned output.
+    pub source_layouts: Vec<PlannedLayoutMetadata>,
+    pub output_layout_metadata: Vec<PlannedLayoutMetadata>,
+    pub columns_per_job: Vec<usize>,
+    pub instance_slots: Vec<usize>,
+    pub instance_paths: Vec<Vec<InstantiationFrame>>,
+    pub draw_sites: Vec<Option<DrawSite>>,
+    pub randomness_seeds: Vec<Option<[u8; 32]>>,
+    pub output_ports: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlannedLayoutMetadata {
+    pub layout_id: Option<crate::gpu_execution_plan::LayoutId>,
+    pub rows: usize,
+    pub columns: usize,
+    pub ring_dimension: usize,
+    pub representation: String,
+}
+
+/// Concrete storage facts supplied by a backend to the warmup planner.  This
+/// is intentionally keyed by the concrete matrix type rather than by a
+/// caller-provided tower count: the backend is the authority for the ordered
+/// CRT basis, active level, representation, and native limb width.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct BackendStorageDescriptor {
+    pub representation: String,
+    pub ordered_crt_basis: Vec<u64>,
+    pub level: usize,
+    pub limb_bytes: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendStorageContract {
+    pub descriptors: BTreeMap<ConcreteMatrixType, BackendStorageDescriptor>,
+    pub active_crt_towers: usize,
+    pub crt_limb_bytes: usize,
+}
+
+/// Validate the structural part of a backend storage contract before a
+/// backend-specific equality check.  In particular, a nonempty set of
+/// concrete matrix types may not be represented by an empty descriptor map or
+/// by a fabricated one-tower summary of a deeper CRT basis.
+pub fn validate_backend_storage_contract(
+    types: &[ConcreteMatrixType],
+    contract: &BackendStorageContract,
+) -> Result<(), String> {
+    if contract.active_crt_towers == 0 || contract.crt_limb_bytes == 0 {
+        return Err("GPU storage contract has no active CRT towers or limb width".into());
+    }
+    let mut expected = types.to_vec();
+    expected.sort_unstable();
+    expected.dedup();
+    let actual = contract.descriptors.keys().cloned().collect::<Vec<_>>();
+    if actual != expected {
+        return Err("GPU storage contract descriptor types do not match concrete inputs".into());
+    }
+    let deepest = contract
+        .descriptors
+        .values()
+        .map(|descriptor| descriptor.level.saturating_add(1))
+        .max()
+        .unwrap_or(0);
+    if deepest != contract.active_crt_towers {
+        return Err("GPU storage contract active CRT depth disagrees with its descriptors".into());
+    }
+    if contract.descriptors.values().any(|descriptor| {
+        descriptor.representation.is_empty() ||
+            descriptor.ordered_crt_basis.is_empty() ||
+            descriptor.level >= descriptor.ordered_crt_basis.len() ||
+            descriptor.limb_bytes != contract.crt_limb_bytes
+    }) {
+        return Err("GPU storage contract contains an invalid physical descriptor".into());
+    }
+    Ok(())
+}
+
+/// Existing fused primitives grouped across sibling instances. These are
+/// short-lived operands, never part of the frozen metadata plan.
+pub enum FusedBatchRequest<M, S> {
+    RowSum {
+        metadata: Option<PlannedNodeBatchRequest>,
+        source: Arc<M>,
+        right: Option<Arc<M>>,
+        rows: Vec<Vec<usize>>,
+    },
+    Decompose {
+        metadata: Option<PlannedNodeBatchRequest>,
+        blocks: Vec<Arc<M>>,
+        small: bool,
+        digits: usize,
+    },
+    SmallProduct {
+        metadata: Option<PlannedNodeBatchRequest>,
+        blocks: Vec<Arc<M>>,
+        rhs: Arc<S>,
+    },
+    Add {
+        metadata: Option<PlannedNodeBatchRequest>,
+        blocks: Vec<Arc<M>>,
+        right: Arc<M>,
+    },
+}
+
+pub enum FusedBatchOutput<M, S> {
+    Matrices(Vec<M>),
+    Small(S),
+}
+
+/// A sibling batch for ordinary fixed-plan operations.  The metadata is
+/// carried per original instance rather than per compressed batch position;
+/// a fleet backend can therefore rotate owners using the frozen slot/path
+/// without rediscovering a pilot or selecting a different implementation.
+pub enum FixedOperationBatchRequest<M, S> {
+    GeneratedConstant {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        value: ConstantMatrix,
+        env: ParamEnv,
+    },
+    MatrixBinary {
+        metadata: PlannedNodeBatchRequest,
+        operation: MatrixBinaryOp,
+        left: Arc<M>,
+        right: Arc<M>,
+    },
+    MatrixMulSmallRhs {
+        metadata: PlannedNodeBatchRequest,
+        left: Arc<M>,
+        right: Arc<S>,
+    },
+    MatrixMulAccumulate {
+        metadata: PlannedNodeBatchRequest,
+        request: MatrixMulAccumulateRequest<M>,
+    },
+    Negate {
+        metadata: PlannedNodeBatchRequest,
+        value: Arc<M>,
+    },
+    Scale {
+        metadata: PlannedNodeBatchRequest,
+        value: Arc<M>,
+        scalar: BigInt,
+    },
+    UnaryTransform {
+        metadata: PlannedNodeBatchRequest,
+        operation: FixedUnaryOperation,
+        value: Arc<M>,
+    },
+    Tensor {
+        metadata: PlannedNodeBatchRequest,
+        left: Arc<M>,
+        right: Arc<M>,
+    },
+    Concat {
+        metadata: PlannedNodeBatchRequest,
+        inputs: Vec<Arc<M>>,
+        axis: ConcatAxis,
+    },
+    CrtRecompose {
+        metadata: PlannedNodeBatchRequest,
+        levels: Vec<M>,
+        plaintext_moduli: Vec<BigInt>,
+        reconstruction_coefficients: Vec<BigInt>,
+        destination: ConcreteMatrixType,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum FixedUnaryOperation {
+    RingAutomorphism {
+        index: usize,
+    },
+    ModulusSwitch {
+        destination: ConcreteMatrixType,
+    },
+    ReduceModulus {
+        destination: ConcreteMatrixType,
+    },
+    CenteredRebase {
+        destination: ConcreteMatrixType,
+    },
+    RnsModUp {
+        destination: ConcreteMatrixType,
+        source_moduli: Vec<u64>,
+        digit_size: usize,
+        normalize: bool,
+    },
+    RnsModDown {
+        destination: ConcreteMatrixType,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: u64,
+    },
+    Transpose,
+    Slice {
+        rows: Option<IndexRange>,
+        columns: Option<IndexRange>,
+    },
+}
+
+/// Fixed-plan generated-column requests.  Sampling backends receive one
+/// request per original instance, so owner rotation never depends on a
+/// compressed batch ordinal.
+pub enum FixedGenerationRequest {
+    Uniform {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        range: SampleRange,
+    },
+    Gaussian {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        sigma: f64,
+        max_coefficient_bound: BigInt,
+    },
+    Hash {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        key: [u8; 32],
+        tag: Vec<u8>,
+    },
+    HashDecomposed {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        key: [u8; 32],
+        tag: Vec<u8>,
+        gadget_base: BigInt,
+        digit_count: usize,
+        small: bool,
+    },
+}
+
+pub enum FixedGenerationOutput<M, S> {
+    Matrix(M),
+    Small(S),
+}
+
+pub struct FixedGadgetDecomposeRequest<M> {
+    pub metadata: PlannedNodeBatchRequest,
+    pub input: Arc<M>,
+    pub small: bool,
+    pub digits: usize,
 }
 
 /// Full logical preimage target whose expanded columns are loaded on demand.
@@ -120,6 +388,199 @@ pub trait Backend {
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
+    fn fused_batch(
+        &mut self,
+        requests: Vec<FusedBatchRequest<Self::Matrix, Self::SmallMatrix>>,
+    ) -> Result<Vec<FusedBatchOutput<Self::Matrix, Self::SmallMatrix>>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| match request {
+                FusedBatchRequest::RowSum { source, right, rows, metadata: _ } => {
+                    let output = match right {
+                        Some(right) => self.tensor_sum_rows(&source, &right, &rows),
+                        None => self.sum_rows(&source, &rows),
+                    }?;
+                    Ok(FusedBatchOutput::Matrices(vec![output]))
+                }
+                FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => self
+                    .gadget_decompose_row_blocks(
+                        &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
+                        small,
+                        Some(digits),
+                    )
+                    .map(FusedBatchOutput::Small),
+                FusedBatchRequest::SmallProduct { blocks, rhs, metadata: _ } => self
+                    .multiply_small_rhs_row_blocks(
+                        &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
+                        &rhs,
+                    )
+                    .map(FusedBatchOutput::Matrices),
+                FusedBatchRequest::Add { blocks, right, metadata: _ } => self
+                    .add_row_blocks(&blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(), &right)
+                    .map(|value| FusedBatchOutput::Matrices(vec![value])),
+            })
+            .collect()
+    }
+
+    /// Dispatches one fixed-plan sibling batch.  The default implementation
+    /// preserves CPU semantics, while GPU fleets override this hook to submit
+    /// the complete wave as one owner-rotated batch.  In particular, callers
+    /// must not replace this with `select_gpu_operation` or a pilot-derived
+    /// single-instance dispatch when a frozen plan is active.
+    fn fixed_operation_batch(
+        &mut self,
+        requests: Vec<FixedOperationBatchRequest<Self::Matrix, Self::SmallMatrix>>,
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| match request {
+                FixedOperationBatchRequest::GeneratedConstant { ty, value, env, metadata: _ } => {
+                    self.constant_matrix(&ty, &value, &env)
+                }
+                FixedOperationBatchRequest::MatrixBinary {
+                    operation,
+                    left,
+                    right,
+                    metadata: _,
+                } => match operation {
+                    MatrixBinaryOp::Add => self.add(&left, &right),
+                    MatrixBinaryOp::Subtract => self.sub(&left, &right),
+                    MatrixBinaryOp::Multiply => self.multiply(&left, &right),
+                },
+                FixedOperationBatchRequest::MatrixMulSmallRhs { left, right, metadata: _ } => {
+                    self.multiply_small_rhs(&left, &right)
+                }
+                FixedOperationBatchRequest::MatrixMulAccumulate { request, metadata: _ } => {
+                    self.matrix_mul_accumulate(request)
+                }
+                FixedOperationBatchRequest::Negate { value, metadata: _ } => self.negate(&value),
+                FixedOperationBatchRequest::Scale { value, scalar, metadata: _ } => {
+                    self.scale_integer(&value, &scalar)
+                }
+                FixedOperationBatchRequest::UnaryTransform { operation, value, metadata: _ } => {
+                    match operation {
+                        FixedUnaryOperation::RingAutomorphism { index } => {
+                            self.ring_automorphism(&value, index)
+                        }
+                        FixedUnaryOperation::ModulusSwitch { destination } => {
+                            self.modulus_switch(&value, &destination)
+                        }
+                        FixedUnaryOperation::ReduceModulus { destination } => {
+                            self.reduce_modulus(&value, &destination)
+                        }
+                        FixedUnaryOperation::CenteredRebase { destination } => {
+                            self.centered_rebase(&value, &destination)
+                        }
+                        FixedUnaryOperation::RnsModUp {
+                            destination,
+                            source_moduli,
+                            digit_size,
+                            normalize,
+                        } => self.rns_mod_up(
+                            &value,
+                            &destination,
+                            &source_moduli,
+                            digit_size,
+                            normalize,
+                        ),
+                        FixedUnaryOperation::RnsModDown {
+                            destination,
+                            source_moduli,
+                            plaintext_modulus,
+                        } => self.rns_mod_down(
+                            &value,
+                            &destination,
+                            &source_moduli,
+                            plaintext_modulus,
+                        ),
+                        FixedUnaryOperation::Transpose => self.transpose(&value),
+                        FixedUnaryOperation::Slice { rows, columns } => {
+                            self.slice(&value, rows.as_ref(), columns.as_ref())
+                        }
+                    }
+                }
+                FixedOperationBatchRequest::Tensor { left, right, metadata: _ } => {
+                    self.tensor(&left, &right)
+                }
+                FixedOperationBatchRequest::Concat { inputs, axis, metadata: _ } => {
+                    let refs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                    self.concat(&refs, axis)
+                }
+                FixedOperationBatchRequest::CrtRecompose {
+                    levels,
+                    plaintext_moduli,
+                    reconstruction_coefficients,
+                    destination,
+                    metadata: _,
+                } => self.crt_recompose(
+                    &levels,
+                    &plaintext_moduli,
+                    &reconstruction_coefficients,
+                    &destination,
+                ),
+            })
+            .collect()
+    }
+
+    fn fixed_generation_batch(
+        &mut self,
+        requests: Vec<FixedGenerationRequest>,
+    ) -> Result<Vec<FixedGenerationOutput<Self::Matrix, Self::SmallMatrix>>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| match request {
+                FixedGenerationRequest::Uniform { ty, range, metadata: _ } => {
+                    self.sample_uniform(&ty, &range).map(FixedGenerationOutput::Matrix)
+                }
+                FixedGenerationRequest::Gaussian {
+                    ty,
+                    sigma,
+                    max_coefficient_bound,
+                    metadata: _,
+                } => self
+                    .sample_gaussian(&ty, sigma, &max_coefficient_bound)
+                    .map(FixedGenerationOutput::Matrix),
+                FixedGenerationRequest::Hash { ty, key, tag, metadata: _ } => {
+                    self.sample_hash(&ty, key, &tag).map(FixedGenerationOutput::Matrix)
+                }
+                FixedGenerationRequest::HashDecomposed {
+                    ty,
+                    key,
+                    tag,
+                    gadget_base,
+                    digit_count,
+                    small,
+                    metadata: _,
+                } => {
+                    let output = if small {
+                        self.sample_hash_small_decomposed(
+                            &ty,
+                            key,
+                            &tag,
+                            &gadget_base,
+                            digit_count,
+                        )?
+                    } else {
+                        self.sample_hash_decomposed(&ty, key, &tag, &gadget_base, digit_count)?
+                    };
+                    Ok(FixedGenerationOutput::Small(output))
+                }
+            })
+            .collect()
+    }
+
+    fn fixed_gadget_decompose_batch(
+        &mut self,
+        requests: Vec<FixedGadgetDecomposeRequest<Self::Matrix>>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| {
+                self.gadget_decompose(&request.input, request.small, Some(request.digits))
+            })
+            .collect()
+    }
+
     /// Imports one polynomial from coefficient or native evaluation values.
     fn polynomial_from_values(
         &mut self,
@@ -139,6 +600,94 @@ pub trait Backend {
     /// non-fleet backends ignore this hook.
     fn select_gpu_operation(&mut self, _operation: [u8; 32]) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Validates backend-specific parts of a frozen plan before the first
+    /// dispatch.  CPU backends intentionally accept the metadata and retain
+    /// their existing execution semantics.  GPU fleet backends may compare
+    /// device identity, representation, and revision here.
+    fn validate_frozen_gpu_plan(&self, _plan: &FrozenGpuPlan) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Returns the backend's current runtime contract when it can describe
+    /// one. The executor compares it with the frozen contract before any
+    /// input materialization or submit, covering backend identity/revision,
+    /// logical-to-physical mapping, budgets, and shape/representation/source
+    /// layout metadata. Backends without a fleet contract return `None`.
+    fn gpu_runtime_contract(
+        &self,
+        _validated: &mxx_ir_core::ValidatedGraph,
+        _inputs: &BTreeMap<String, RuntimeValue<Self>>,
+    ) -> Result<Option<crate::gpu_execution_plan::GpuPlanContract>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Returns backend-authoritative physical storage facts for the concrete
+    /// matrix types used by warmup.  GPU implementations must derive these
+    /// from their registered native parameters; callers must not synthesize a
+    /// tower count or leave the descriptor map empty.
+    fn gpu_physical_storage_contract(
+        &self,
+        _types: &[ConcreteMatrixType],
+    ) -> Result<Option<BackendStorageContract>, Self::Error>
+    where
+        Self: Sized,
+    {
+        Ok(None)
+    }
+
+    /// Compares caller-provided warmup storage metadata with the backend's
+    /// native descriptor.  The default is intentionally a no-op for CPU
+    /// backends; fleet backends override it to reject stale or fabricated
+    /// `active_crt_towers` and descriptor maps before planning.
+    fn validate_gpu_physical_storage_contract(
+        &self,
+        types: &[ConcreteMatrixType],
+        supplied: &BackendStorageContract,
+    ) -> Result<(), Self::Error>
+    where
+        Self: Sized,
+    {
+        let _ = (types, supplied);
+        Ok(())
+    }
+
+    /// Freeze public resource limits before warmup. CPU backends have no GPU
+    /// contract; fleet backends validate device limits against their contexts.
+    fn configure_gpu_plan_budgets(
+        &mut self,
+        _budgets: &[crate::gpu_execution_plan::GpuDeviceBudget],
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Installs the value-only plan into a backend's fixed-dispatch state.
+    /// The default CPU implementation has no state to install.  GPU fleet
+    /// implementations should bind the plan without allocating or profiling.
+    fn install_frozen_gpu_plan(&mut self, _plan: &FrozenGpuPlan) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Receives the fixed node choice before any primitive is submitted.
+    /// Implementations must not use this hook to discover a different width,
+    /// owner, device, or pilot result.  The default is the CPU boundary and
+    /// leaves the ordinary operation methods untouched.
+    fn prepare_fixed_node_batch(
+        &mut self,
+        _request: &PlannedNodeBatchRequest,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Whether the backend has installed a fixed production plan. This is
+    /// separate from `placement_count`: a fleet may expose one executor
+    /// placement while dispatching fixed jobs across several logical GPUs.
+    fn fixed_plan_active(&self) -> bool {
+        false
     }
 
     fn placement_count(&self) -> usize {
@@ -513,6 +1062,34 @@ pub trait Backend {
         randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error>;
 
+    /// Fixed-plan preimage entry point. GPU fleet implementations consume the
+    /// already selected owner intervals and tile widths here. CPU and legacy
+    /// backends retain their ordinary sampler semantics through the default.
+    fn fixed_sample_preimage(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        sigma: f64,
+        gadget_base: &BigInt,
+        digit_count: usize,
+        max_coefficient_bound: &BigInt,
+        trapdoor: &Self::Trapdoor,
+        public: &Self::Matrix,
+        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
+        randomness_seed: [u8; 32],
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        self.sample_preimage(
+            ty,
+            sigma,
+            gadget_base,
+            digit_count,
+            max_coefficient_bound,
+            trapdoor,
+            public,
+            target,
+            randomness_seed,
+        )
+    }
+
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<PreimageRequest<Self::Matrix, Self::Trapdoor>>,
@@ -520,7 +1097,13 @@ pub trait Backend {
         requests
             .into_iter()
             .map(|request| {
-                self.sample_preimage(
+                let sample = if self.fixed_plan_active() {
+                    Self::fixed_sample_preimage
+                } else {
+                    Self::sample_preimage
+                };
+                sample(
+                    self,
                     &request.matrix_type,
                     request.sigma,
                     &request.gadget_base,
@@ -794,5 +1377,52 @@ impl<B: Backend> RuntimeValue<B> {
 
     pub fn small_matrix(value: B::SmallMatrix) -> Self {
         Self::SmallMatrix(Arc::new(value))
+    }
+}
+
+#[cfg(test)]
+mod storage_contract_tests {
+    use super::*;
+
+    fn matrix_type() -> ConcreteMatrixType {
+        ConcreteMatrixType { modulus: BigInt::from(17u8), ring_dimension: 8, rows: 1, columns: 2 }
+    }
+
+    fn descriptor(level: usize) -> BackendStorageDescriptor {
+        BackendStorageDescriptor {
+            representation: "full_dcrt".into(),
+            ordered_crt_basis: vec![17, 19, 23, 29],
+            level,
+            limb_bytes: 8,
+        }
+    }
+
+    #[test]
+    fn storage_contract_rejects_empty_map_and_fabricated_one_tower_depth() {
+        let ty = matrix_type();
+        let empty = BackendStorageContract {
+            descriptors: BTreeMap::new(),
+            active_crt_towers: 1,
+            crt_limb_bytes: 8,
+        };
+        assert!(validate_backend_storage_contract(std::slice::from_ref(&ty), &empty).is_err());
+
+        let four_tower = BackendStorageContract {
+            descriptors: BTreeMap::from([(ty.clone(), descriptor(3))]),
+            active_crt_towers: 1,
+            crt_limb_bytes: 8,
+        };
+        assert!(validate_backend_storage_contract(&[ty], &four_tower).is_err());
+    }
+
+    #[test]
+    fn storage_contract_accepts_ordered_native_descriptor() {
+        let ty = matrix_type();
+        let contract = BackendStorageContract {
+            descriptors: BTreeMap::from([(ty.clone(), descriptor(3))]),
+            active_crt_towers: 4,
+            crt_limb_bytes: 8,
+        };
+        validate_backend_storage_contract(&[ty], &contract).unwrap();
     }
 }

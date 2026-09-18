@@ -35,8 +35,11 @@ use mxx_runtime::{
         GpuCalibrationKey, GpuCalibrationProfile, GpuCalibrationRegistry, GpuColumnWidths,
         GpuDeviceCalibration, GpuDeviceMemory, gpu_calibration_environment,
         gpu_calibration_operation_identity, gpu_capped_waterfill_columns,
-        gpu_matrix_multiply_scales_left, gpu_operation_is_column_separable_for_types,
+        gpu_matrix_multiply_scales_left,
     },
+    gpu_column_policy::{ColumnCapability, column_capability},
+    gpu_execution_plan::{FrozenGpuPlan, GpuExecutionSiteKey},
+    gpu_warmup::{GpuTimeModel, gpu_non_column_batch_wave_time},
 };
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
@@ -414,6 +417,82 @@ impl GpuNodeMeasurementBackend {
         self.calibration_registry.clone()
     }
 
+    /// Read the widths frozen by a runtime plan. Plan-aware estimation never
+    /// derives a new width from current allocator residency.
+    pub fn fixed_plan_widths(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<GpuColumnWidths, GpuMeasurementError> {
+        GpuCalibrationProfile::fixed_widths_for_plan(plan, site)
+            .map_err(|error| GpuMeasurementError(error.to_string()))
+    }
+
+    /// Heterogeneous-fleet form of [`Self::fixed_plan_widths`].
+    pub fn fixed_plan_columns(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<Vec<usize>, GpuMeasurementError> {
+        GpuCalibrationProfile::fixed_columns_for_plan(plan, site)
+            .map_err(|error| GpuMeasurementError(error.to_string()))
+    }
+
+    /// Compute one fixed-plan wave using the same schedule/batch-wave time
+    /// model consumed by runtime warmup. No width or owner is re-selected.
+    pub fn fixed_plan_wave_seconds(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+        model: &[GpuTimeModel],
+    ) -> Result<f64, GpuMeasurementError> {
+        let node = plan
+            .node_choice(site)
+            .ok_or_else(|| GpuMeasurementError(format!("missing fixed plan site {site:?}")))?;
+        let layout_id = *node
+            .output_layouts
+            .first()
+            .ok_or_else(|| GpuMeasurementError("fixed plan site has no output layout".into()))?;
+        let layout = plan
+            .layout(layout_id)
+            .ok_or_else(|| GpuMeasurementError(format!("missing fixed plan layout {layout_id}")))?;
+        let instances = node
+            .loop_site
+            .map(|key| {
+                plan.loop_choice(key)
+                    .map(|choice| choice.wave_instances.min(choice.loop_count))
+                    .ok_or_else(|| GpuMeasurementError("missing loop choice".into()))
+            })
+            .transpose()?
+            .unwrap_or(1);
+        if matches!(
+            node.column_capability,
+            ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+        ) {
+            let columns = if node.column_capability == ColumnCapability::SingleDevice {
+                layout.columns
+            } else {
+                0
+            };
+            return gpu_non_column_batch_wave_time(instances, columns, 0, model)
+                .map_err(|error| GpuMeasurementError(error.to_string()));
+        }
+        let schedules = (0..instances)
+            .map(|instance| {
+                node.output_layouts
+                    .iter()
+                    .map(|id| {
+                        let layout = plan.layout(*id).ok_or_else(|| {
+                            GpuMeasurementError("missing output port layout".into())
+                        })?;
+                        layout
+                            .schedule(&node.columns_per_job, instance)
+                            .map_err(|error| GpuMeasurementError(error.to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        mxx_runtime::gpu_warmup::gpu_multi_output_batch_wave_time(&schedules, model)
+            .map_err(|error| GpuMeasurementError(error.to_string()))
+    }
+
     /// Measures every collected shape as one fleet operation. Column-separable nodes use all
     /// workers for the same primitive instead of assigning unrelated primitives to different GPUs.
     pub fn measure_collected(&mut self) -> Result<(), GpuMeasurementError> {
@@ -630,10 +709,8 @@ impl GpuNodeMeasurementBackend {
     }
 
     fn request_columns(request: &PendingMeasurement) -> Option<usize> {
-        if !gpu_operation_is_column_separable_for_types(
-            &request.kind,
-            &request.concrete_argument_types,
-        ) {
+        let capability = column_capability(&request.kind, &request.concrete_argument_types);
+        if matches!(capability, ColumnCapability::HostOrControl | ColumnCapability::SingleDevice) {
             return None;
         }
         let columns = request
@@ -2682,6 +2759,8 @@ impl GpuNodeMeasurementBackend {
                                     randomness_seed[..size_of::<usize>()]
                                         .copy_from_slice(&index.to_le_bytes());
                                     PreimageRequest {
+                                        fixed_metadata: None,
+                                        instance_slot: index,
                                         matrix_type: ty.clone(),
                                         sigma: *sigma,
                                         gadget_base: gadget_base.clone(),
@@ -3077,6 +3156,12 @@ mod tests {
     use mxx_runtime::{
         backend::{poly::PolyBackendError, poly_gpu::gpu_backend},
         gpu_calibration::GpuColumnWidths,
+        gpu_execution_plan::{
+            FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout, GpuLoopChoice,
+            GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract,
+        },
+        gpu_schedule::GpuColumnInterval,
+        gpu_warmup::GpuTimeModel,
     };
     use num_bigint::BigInt;
 
@@ -3100,6 +3185,152 @@ mod tests {
         }
 
         assert_eq!(captured, 37);
+    }
+
+    #[test]
+    fn fixed_plan_widths_are_consumed_without_recalibration() {
+        let site = GpuExecutionSiteKey { site: 8, shape_class: 0, instance_class: 0 };
+        let plan = FrozenGpuPlan::new(
+            GpuPlanContract {
+                graph_specification_hash: [1; 32],
+                backend_identity: "bench".into(),
+                logical_to_physical_devices: vec![0, 1],
+                device_budgets: vec![
+                    GpuDeviceBudget {
+                        device: 0,
+                        device_bytes: 100,
+                        pinned_host_bytes: 100,
+                        host_bytes: 100,
+                    },
+                    GpuDeviceBudget {
+                        device: 1,
+                        device_bytes: 100,
+                        pinned_host_bytes: 100,
+                        host_bytes: 100,
+                    },
+                ],
+                shape_contract_hash: [2; 32],
+                backend_revision: "test".into(),
+            },
+            vec![GpuLayout {
+                id: 1,
+                columns: 2,
+                rows: 1,
+                ring_dimension: 1,
+                representation: "matrix".into(),
+                instance_device_stride: 0,
+                owner_intervals: vec![
+                    GpuColumnInterval { device: 0, start: 0, end: 1 },
+                    GpuColumnInterval { device: 1, start: 1, end: 2 },
+                ],
+            }],
+            vec![],
+            vec![GpuNodeChoice {
+                key: site,
+                loop_site: None,
+                operation_identity: [3; 32],
+                effective_operation:
+                    mxx_runtime::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: mxx_runtime::gpu_column_policy::ColumnCapability::SameColumns,
+                output_layouts: vec![1],
+                columns_per_job: vec![2, 4],
+                implementation_variant: "test".into(),
+                preimage_max_attempts: None,
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            GpuNodeMeasurementBackend::fixed_plan_widths(&plan, site).unwrap(),
+            GpuColumnWidths { gpu0: 2, nonzero: Some(4) }
+        );
+        assert_eq!(
+            GpuNodeMeasurementBackend::fixed_plan_wave_seconds(
+                &plan,
+                site,
+                &[mxx_runtime::gpu_warmup::GpuTimeModel::default(); 2],
+            )
+            .unwrap(),
+            0.0
+        );
+    }
+
+    #[test]
+    fn fixed_plan_multi_output_ports_are_one_primitive_with_sibling_batch() {
+        let site = GpuExecutionSiteKey { site: 9, shape_class: 0, instance_class: 0 };
+        let contract = GpuPlanContract {
+            graph_specification_hash: [1; 32],
+            backend_identity: "bench".into(),
+            logical_to_physical_devices: vec![0, 1],
+            device_budgets: vec![
+                GpuDeviceBudget {
+                    device: 0,
+                    device_bytes: 1000,
+                    pinned_host_bytes: 1000,
+                    host_bytes: 1000,
+                },
+                GpuDeviceBudget {
+                    device: 1,
+                    device_bytes: 1000,
+                    pinned_host_bytes: 1000,
+                    host_bytes: 1000,
+                },
+            ],
+            shape_contract_hash: [2; 32],
+            backend_revision: "test".into(),
+        };
+        let interval = |device, start, end| GpuColumnInterval { device, start, end };
+        let plan = FrozenGpuPlan::new(
+            contract,
+            vec![
+                GpuLayout {
+                    id: 1,
+                    columns: 4,
+                    rows: 1,
+                    ring_dimension: 1,
+                    representation: "left".into(),
+                    instance_device_stride: 0,
+                    owner_intervals: vec![interval(0, 0, 2), interval(1, 2, 4)],
+                },
+                GpuLayout {
+                    id: 2,
+                    columns: 3,
+                    rows: 1,
+                    ring_dimension: 1,
+                    representation: "right".into(),
+                    instance_device_stride: 0,
+                    owner_intervals: vec![interval(0, 0, 1), interval(1, 1, 3)],
+                },
+            ],
+            vec![GpuLoopChoice {
+                key: GpuLoopSiteKey { site: 7, shape_class: 0 },
+                loop_count: 2,
+                wave_instances: 2,
+                tail_instances: 0,
+            }],
+            vec![GpuNodeChoice {
+                key: site,
+                loop_site: Some(GpuLoopSiteKey { site: 7, shape_class: 0 }),
+                operation_identity: [3; 32],
+                effective_operation:
+                    mxx_runtime::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: mxx_runtime::gpu_column_policy::ColumnCapability::SameColumns,
+                output_layouts: vec![1, 2],
+                columns_per_job: vec![2, 2],
+                implementation_variant: "test".into(),
+                preimage_max_attempts: None,
+            }],
+        )
+        .unwrap();
+        let model =
+            [GpuTimeModel { fixed_seconds: 1.0, per_column_seconds: 1.0, ..Default::default() }; 2];
+        // The shared union preserves the source logical-wave boundaries of
+        // both ports.  The differing owner partitions therefore produce two
+        // four-second waves for the sibling batch, rather than independently
+        // summing one schedule per output port.
+        assert_eq!(
+            GpuNodeMeasurementBackend::fixed_plan_wave_seconds(&plan, site, &model).unwrap(),
+            8.0
+        );
     }
 
     #[test]

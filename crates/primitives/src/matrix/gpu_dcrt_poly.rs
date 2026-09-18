@@ -1383,11 +1383,13 @@ impl GpuDCRTPolyMatrix {
         Ok(out)
     }
 
-    pub(crate) fn level(&self) -> usize {
+    /// Number of dropped CRT towers in this matrix's current representation.
+    pub fn level(&self) -> usize {
         self.level
     }
 
-    pub(crate) fn is_ntt(&self) -> bool {
+    /// Whether the resident coefficients are in the evaluation domain.
+    pub fn is_ntt(&self) -> bool {
         self.is_ntt
     }
 

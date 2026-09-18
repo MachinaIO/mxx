@@ -1,8 +1,10 @@
 use super::RootBlockAliases;
-use crate::gpu_calibration::{
-    gpu_calibration_operation_identity, gpu_operation_is_column_separable,
-    gpu_operation_is_column_separable_for_types, gpu_row_block_add_operation_identity,
-    gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
+use crate::{
+    gpu_calibration::{
+        gpu_calibration_operation_identity, gpu_row_block_add_operation_identity,
+        gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
+    },
+    gpu_column_policy::{ColumnCapability, column_capability},
 };
 use mxx_ir_core::{
     ValidatedGraph,
@@ -28,27 +30,24 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
         // Store failures instead of returning them here: dispatch must observe
         // an identity error at its original node, after preceding graph effects.
         let operation = (|| {
-            let operation = if gpu_operation_is_column_separable(handle.kind()) {
-                let arguments = scope.arguments(handle).expect("validated node arguments");
-                let argument_types = arguments
-                    .iter()
-                    .map(|wire| checked.wire_types[wire].clone())
-                    .collect::<Vec<_>>();
+            let arguments = scope.arguments(handle).expect("validated node arguments");
+            let argument_types =
+                arguments.iter().map(|wire| checked.wire_types[wire].clone()).collect::<Vec<_>>();
+            let operation = if !matches!(
+                column_capability(handle.kind(), &argument_types),
+                ColumnCapability::HostOrControl
+            ) {
                 let output_types = (0..handle.output_types().len())
                     .map(|port| {
                         checked.wire_types[&WireRef { node: id, port: Port(port as u32) }].clone()
                     })
                     .collect::<Vec<_>>();
-                gpu_operation_is_column_separable_for_types(handle.kind(), &argument_types)
-                    .then(|| {
-                        gpu_calibration_operation_identity(
-                            handle.kind(),
-                            &argument_types,
-                            &output_types,
-                            &validated.bindings,
-                        )
-                    })
-                    .transpose()?
+                Some(gpu_calibration_operation_identity(
+                    handle.kind(),
+                    &argument_types,
+                    &output_types,
+                    &validated.bindings,
+                )?)
             } else {
                 None
             };
@@ -234,9 +233,10 @@ mod tests {
                     checked.wire_types[&WireRef { node: *id, port: Port(port as u32) }].clone()
                 })
                 .collect::<Vec<_>>();
-            let mut expected = if gpu_operation_is_column_separable(node.kind()) &&
-                gpu_operation_is_column_separable_for_types(node.kind(), &inputs)
-            {
+            let mut expected = if !matches!(
+                column_capability(node.kind(), &inputs),
+                ColumnCapability::HostOrControl
+            ) {
                 Some(
                     gpu_calibration_operation_identity(
                         node.kind(),

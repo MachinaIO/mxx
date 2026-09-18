@@ -6,6 +6,7 @@
 //! separate because it may own setup data that is absent from the other,
 //! otherwise-identical GPUs.
 
+use crate::gpu_execution_plan::{FrozenGpuPlan, GpuExecutionSiteKey};
 use mxx_ir_core::{
     FrozenGraphScopeId, IntExpr, ParamEnv, concretize_wire_type, encoding,
     node::{ConcatAxis, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind},
@@ -616,6 +617,46 @@ pub struct GpuCalibrationProfile {
 }
 
 impl GpuCalibrationProfile {
+    /// Return every per-device width frozen for a site. This is the preferred
+    /// adapter for heterogeneous fleets; unlike calibration it never queries
+    /// current resident memory.
+    pub fn fixed_columns_for_plan(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<Vec<usize>, GpuCalibrationError> {
+        plan.validate()
+            .map_err(|error| GpuCalibrationError::InvalidFrozenPlan(error.to_string()))?;
+        let choice = plan.node_choice(site).ok_or(GpuCalibrationError::MissingPlanSite(site))?;
+        if choice.columns_per_job.is_empty() ||
+            choice.columns_per_job.iter().all(|width| *width == 0)
+        {
+            return Err(GpuCalibrationError::ZeroPlanWidth(site));
+        }
+        Ok(choice.columns_per_job.clone())
+    }
+
+    /// Return the widths already frozen in a plan.  Production callers must
+    /// use this adapter instead of applying the calibration slope to current
+    /// allocator residency; residency-dependent [`Self::derive_widths`] is a
+    /// warmup/measurement operation only.
+    pub fn fixed_widths_for_plan(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<GpuColumnWidths, GpuCalibrationError> {
+        let columns = Self::fixed_columns_for_plan(plan, site)?;
+        let gpu0 = columns[0];
+        let nonzero = columns.get(1).copied();
+        if let Some(expected) = nonzero {
+            if columns[1..].iter().any(|width| *width != expected) {
+                return Err(GpuCalibrationError::PlanNonzeroWidthMismatch(site));
+            }
+        }
+        if gpu0 == 0 && nonzero.is_none_or(|width| width == 0) {
+            return Err(GpuCalibrationError::ZeroPlanWidth(site));
+        }
+        Ok(GpuColumnWidths { gpu0, nonzero })
+    }
+
     pub fn derive_widths(
         &self,
         gpu0_memory: GpuDeviceMemory,
@@ -780,6 +821,14 @@ pub enum GpuCalibrationError {
     InvalidOperationIdentityLength(usize),
     #[error("GPU calibration registry is frozen")]
     RegistryFrozen,
+    #[error("frozen GPU plan has no node site {0:?}")]
+    MissingPlanSite(GpuExecutionSiteKey),
+    #[error("frozen GPU plan has no active column width at node site {0:?}")]
+    ZeroPlanWidth(GpuExecutionSiteKey),
+    #[error("frozen GPU plan has different nonzero widths at node site {0:?}")]
+    PlanNonzeroWidthMismatch(GpuExecutionSiteKey),
+    #[error("frozen GPU plan is invalid: {0}")]
+    InvalidFrozenPlan(String),
 }
 
 #[derive(Default)]
@@ -866,6 +915,13 @@ impl FrozenGpuCalibrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        gpu_execution_plan::{
+            FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout, GpuNodeChoice,
+            GpuPlanContract,
+        },
+        gpu_schedule::GpuColumnInterval,
+    };
     use mxx_ir_core::types::ConcreteMatrixType;
     use num_bigint::BigInt;
 
@@ -913,6 +969,62 @@ mod tests {
             gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &[vec![2, 0]]).unwrap()
         );
         assert_ne!(identity, gpu_sum_rows_operation_identity(&source, &output, &rows).unwrap());
+    }
+
+    #[test]
+    fn fixed_plan_widths_never_read_current_residency() {
+        let contract = GpuPlanContract {
+            graph_specification_hash: [1; 32],
+            backend_identity: "test".into(),
+            logical_to_physical_devices: vec![0, 1],
+            device_budgets: vec![
+                GpuDeviceBudget {
+                    device: 0,
+                    device_bytes: 100,
+                    pinned_host_bytes: 100,
+                    host_bytes: 100,
+                },
+                GpuDeviceBudget {
+                    device: 1,
+                    device_bytes: 100,
+                    pinned_host_bytes: 100,
+                    host_bytes: 100,
+                },
+            ],
+            shape_contract_hash: [2; 32],
+            backend_revision: "test".into(),
+        };
+        let site = GpuExecutionSiteKey { site: 4, shape_class: 0, instance_class: 0 };
+        let plan = FrozenGpuPlan::new(
+            contract,
+            vec![GpuLayout {
+                id: 1,
+                columns: 8,
+                rows: 1,
+                ring_dimension: 1,
+                representation: "matrix".into(),
+                instance_device_stride: 0,
+                owner_intervals: vec![
+                    GpuColumnInterval { device: 0, start: 0, end: 4 },
+                    GpuColumnInterval { device: 1, start: 4, end: 8 },
+                ],
+            }],
+            vec![],
+            vec![GpuNodeChoice {
+                loop_site: None,
+                key: site,
+                operation_identity: [3; 32],
+                effective_operation: crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: crate::gpu_column_policy::ColumnCapability::SameColumns,
+                output_layouts: vec![1],
+                columns_per_job: vec![3, 5],
+                implementation_variant: "test".into(),
+                preimage_max_attempts: None,
+            }],
+        )
+        .unwrap();
+        let widths = GpuCalibrationProfile::fixed_widths_for_plan(&plan, site).unwrap();
+        assert_eq!(widths, GpuColumnWidths { gpu0: 3, nonzero: Some(5) });
     }
 
     #[test]

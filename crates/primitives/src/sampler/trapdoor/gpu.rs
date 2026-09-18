@@ -20,6 +20,7 @@ use crate::{
 use digest::Digest;
 use num_bigint::BigUint;
 use std::{
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -253,9 +254,56 @@ enum RetryFailure {
     Exhausted(usize),
 }
 
-#[inline]
-fn residency_fits(required_bytes: usize, budget_bytes: usize) -> bool {
-    required_bytes <= budget_bytes
+/// The resource choices made by the fleet planner for one preimage job.
+///
+/// A fixed sampler never changes either value in response to an allocation
+/// failure.  In particular, `tile_columns` is not a hint for another search;
+/// it is the upper bound of every tile submitted by the job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedPreimageConfig {
+    pub tile_columns: NonZeroUsize,
+    pub max_attempts: NonZeroUsize,
+}
+
+impl FixedPreimageConfig {
+    pub fn new(tile_columns: usize, max_attempts: usize) -> Option<Self> {
+        Some(Self {
+            tile_columns: NonZeroUsize::new(tile_columns)?,
+            max_attempts: NonZeroUsize::new(max_attempts)?,
+        })
+    }
+}
+
+/// Pure accounting for one fixed preimage job.  This query performs no GPU
+/// allocation or submission and deliberately includes the full trapdoor,
+/// public matrix, resident target, compact destination, cutoff, packing and
+/// control/event owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreimageFootprint {
+    pub persistent_bytes: usize,
+    pub compact_output_bytes: usize,
+    pub scratch_bytes: usize,
+    pub device_control_bytes: usize,
+    pub pinned_control_bytes: usize,
+    pub hard_cutoff_plan_bytes: usize,
+    pub packed_staging_bytes: usize,
+    pub sampler_event_bytes: usize,
+    /// Workspace allocated only while the cold covariance cache is built.
+    /// It is released after the precompute event and must not inflate the
+    /// warm steady-state sampler report.
+    pub cold_transient_workspace_bytes: usize,
+    pub sampler_peak_bytes: usize,
+    /// Peak required while creating the cache, including the retained cache
+    /// and the cold transient workspace.
+    pub cold_sampler_peak_bytes: usize,
+    pub tile_columns: usize,
+    pub max_attempts: usize,
+}
+
+impl PreimageFootprint {
+    pub fn fits_budget(&self, budget_bytes: usize) -> bool {
+        self.cold_sampler_peak_bytes <= budget_bytes
+    }
 }
 
 fn bounded_retry<T, F>(attempts: usize, mut attempt: F) -> Result<T, RetryFailure>
@@ -271,27 +319,23 @@ where
 }
 
 impl GpuDCRTPolyTrapdoorSampler {
-    /// Produce the bounded preimage directly in compact GPU storage. Each
-    /// retry expands only one complete K-by-C_s candidate tile.
-    fn bounded_preimage(
-        &self,
+    fn validate_preimage_inputs(
         params: &GpuDCRTPolyParams,
         trapdoor: &GpuDCRTTrapdoor,
         public_matrix: &GpuDCRTPolyMatrix,
         target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
-        max_coefficient_bound: BigUint,
-        randomness_seed: [u8; 32],
-    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        max_coefficient_bound: &BigUint,
+    ) -> Result<(usize, usize, usize, usize), SmallMatrixError> {
         let d = public_matrix.row_size();
         let k = public_matrix.col_size();
         let columns = target.col_size();
         if target.row_size() != d || k == 0 || columns == 0 {
             return Err(SmallMatrixError::ShapeMismatch);
         }
-        if public_matrix.params != *params {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
-        if trapdoor.r.params != *params || trapdoor.e.params != *params {
+        if public_matrix.params != *params ||
+            trapdoor.r.params != *params ||
+            trapdoor.e.params != *params
+        {
             return Err(SmallMatrixError::ParameterMismatch);
         }
         if public_matrix.params.gpu_ids() != params.gpu_ids() ||
@@ -300,14 +344,47 @@ impl GpuDCRTPolyTrapdoorSampler {
         {
             return Err(SmallMatrixError::DeviceMismatch);
         }
-        let budget = params.vram_budget_bytes();
         let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
             .map_err(|_| SmallMatrixError::WidthOverflow)?
             .max(1);
-        let attempts = crate::env::gpu_preimage_max_tile_attempts()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let mut tile_columns = columns;
-        let persistent_bytes = [
+        Ok((d, k, columns, magnitude_bytes))
+    }
+
+    fn covariance_cache_footprint(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+    ) -> Result<(usize, usize), SmallMatrixError> {
+        let n = params.ring_dimension() as usize;
+        let cache_rows = trapdoor
+            .a_mat_coeff
+            .row_size()
+            .checked_mul(2)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let factor = n.checked_mul(cache_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let update = factor.checked_mul(cache_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let factor_bytes = factor
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let update_bytes = update
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let retained = factor_bytes
+            .checked_add(update_bytes)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<usize>()))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        // MatrixTrapdoor.cu allocates a covariance workspace with the same
+        // size as update_coeff while sqrt_var and update_coeff are already
+        // live. It is freed after the precompute event, so this is cold-only.
+        Ok((retained, update_bytes))
+    }
+
+    fn fixed_persistent_bytes(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+    ) -> Result<usize, SmallMatrixError> {
+        let persistent = [
             public_matrix,
             &trapdoor.r,
             &trapdoor.e,
@@ -321,13 +398,66 @@ impl GpuDCRTPolyTrapdoorSampler {
             let bytes = bytes?;
             sum.checked_add(bytes).ok_or(SmallMatrixError::DimensionOverflow)
         })?;
-        let resident_target_bytes = target.resident_matrix().map_or(Ok(0), |matrix| {
+        let resident_target = target.resident_matrix().map_or(Ok(0), |matrix| {
             dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size())
         })?;
-        let persistent_bytes = persistent_bytes
-            .checked_add(resident_target_bytes)
+        // The covariance cache is lazily created on the first candidate and
+        // remains owned by the trapdoor. Charge only its retained buffers to
+        // the persistent/warm footprint; the cold-only workspace is returned
+        // separately by `covariance_cache_footprint`.
+        let (covariance_cache_bytes, _) = Self::covariance_cache_footprint(params, trapdoor)?;
+        persistent
+            .checked_add(resident_target)
+            .and_then(|bytes| bytes.checked_add(covariance_cache_bytes))
+            .ok_or(SmallMatrixError::DimensionOverflow)
+    }
+
+    fn tile_workspace_bytes(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        d: usize,
+        k: usize,
+        tile_columns: usize,
+        magnitude_bytes: usize,
+    ) -> Result<(usize, usize, usize, usize, usize, usize), SmallMatrixError> {
+        let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
+        let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
+            .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
             .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let compact_bytes = k
+        let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
+        let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
+        let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
+        let packed_staging = k
+            .checked_mul(tile_columns)
+            .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+            .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        Ok((candidate, perturbation, residual, z_hat, target_tile, packed_staging))
+    }
+
+    /// Query the fixed job's complete sampler footprint without allocating or
+    /// submitting any GPU work.  The caller owns the choice of tile width.
+    pub fn preimage_footprint(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: &BigUint,
+        config: FixedPreimageConfig,
+    ) -> Result<PreimageFootprint, SmallMatrixError> {
+        let (d, k, columns, magnitude_bytes) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            max_coefficient_bound,
+        )?;
+        let persistent_bytes =
+            Self::fixed_persistent_bytes(params, trapdoor, public_matrix, target)?;
+        let (_, cold_transient_workspace_bytes) =
+            Self::covariance_cache_footprint(params, trapdoor)?;
+        let compact_output_bytes = k
             .checked_mul(columns)
             .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
             .and_then(|value| value.checked_mul(1 + magnitude_bytes))
@@ -350,49 +480,112 @@ impl GpuDCRTPolyTrapdoorSampler {
                     .and_then(|subset| bytes.checked_add(subset))
             })
             .ok_or(SmallMatrixError::DimensionOverflow)?;
-        // The device decision word and its pinned host mirror are explicit;
-        // Device and host control words remain explicit in the allocation
-        // report rather than approximating opaque implementation overhead.
-        let device_acceptance_control_bytes = std::mem::size_of::<i32>();
-        let pinned_host_acceptance_control_bytes = std::mem::size_of::<i32>();
+        let device_control_bytes = std::mem::size_of::<i32>();
+        let pinned_control_bytes = std::mem::size_of::<i32>();
         let sampler_event_bytes = 2 * std::mem::size_of::<usize>();
-        while tile_columns > 0 {
-            let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
-            let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
-                .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
-            let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
-            let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
-            let packed_staging = k
-                .checked_mul(tile_columns)
-                .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
-                .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            let live = persistent_bytes
-                .checked_add(compact_bytes)
-                .and_then(|v| v.checked_add(candidate))
-                .and_then(|v| v.checked_add(perturbation))
-                .and_then(|v| v.checked_add(residual))
-                .and_then(|v| v.checked_add(z_hat))
-                .and_then(|v| v.checked_add(target_tile))
-                .and_then(|v| v.checked_add(hard_cutoff_plan_bytes))
-                .and_then(|v| v.checked_add(packed_staging))
-                .and_then(|v| v.checked_add(device_acceptance_control_bytes))
-                .and_then(|v| v.checked_add(pinned_host_acceptance_control_bytes))
-                .and_then(|v| v.checked_add(sampler_event_bytes))
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            if residency_fits(live, budget) {
-                break;
-            }
-            tile_columns -= 1;
-        }
-        if tile_columns == 0 {
+        let (candidate, perturbation, residual, z_hat, target_tile, packed_staging) =
+            Self::tile_workspace_bytes(
+                params,
+                trapdoor,
+                d,
+                k,
+                config.tile_columns.get(),
+                magnitude_bytes,
+            )?;
+        let scratch_bytes =
+            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let sampler_peak_bytes = persistent_bytes
+            .checked_add(compact_output_bytes)
+            .and_then(|value| value.checked_add(candidate))
+            .and_then(|value| value.checked_add(perturbation))
+            .and_then(|value| value.checked_add(scratch_bytes))
+            .and_then(|value| value.checked_add(target_tile))
+            .and_then(|value| value.checked_add(hard_cutoff_plan_bytes))
+            .and_then(|value| value.checked_add(packed_staging))
+            .and_then(|value| value.checked_add(sampler_event_bytes))
+            .and_then(|value| value.checked_add(device_control_bytes))
+            .and_then(|value| value.checked_add(pinned_control_bytes))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let cold_sampler_peak_bytes = sampler_peak_bytes
+            .checked_add(cold_transient_workspace_bytes)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        Ok(PreimageFootprint {
+            persistent_bytes,
+            compact_output_bytes,
+            scratch_bytes,
+            device_control_bytes,
+            pinned_control_bytes,
+            hard_cutoff_plan_bytes,
+            packed_staging_bytes: packed_staging,
+            sampler_event_bytes,
+            cold_transient_workspace_bytes,
+            sampler_peak_bytes,
+            cold_sampler_peak_bytes,
+            tile_columns: config.tile_columns.get(),
+            max_attempts: config.max_attempts.get(),
+        })
+    }
+
+    /// Execute one previously planned preimage job.  Allocation pressure is a
+    /// hard error; this path never searches for another width or device.
+    pub fn bounded_preimage_with_config(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        config: FixedPreimageConfig,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let footprint = self.preimage_footprint(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+            config,
+        )?;
+        self.execute_preimage_with_config(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            max_coefficient_bound,
+            config,
+            footprint,
+            randomness_seed,
+        )
+    }
+
+    fn execute_preimage_with_config(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        config: FixedPreimageConfig,
+        footprint: PreimageFootprint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let (d, k, columns, magnitude_bytes) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+        )?;
+        let budget = params.vram_budget_bytes();
+        if !footprint.fits_budget(budget) {
             return Err(SmallMatrixError::ResourceExhausted {
-                requested_bytes: budget.saturating_add(1),
+                requested_bytes: footprint.cold_sampler_peak_bytes,
                 budget_bytes: budget,
             });
         }
+        let tile_columns = config.tile_columns.get();
+        let (candidate, perturbation, _residual, _z_hat, target_tile, _packed_staging) =
+            Self::tile_workspace_bytes(params, trapdoor, d, k, tile_columns, magnitude_bytes)?;
         let mut destination = GpuSmallMatrix::new_empty_checked(
             params,
             k,
@@ -402,38 +595,22 @@ impl GpuDCRTPolyTrapdoorSampler {
             budget,
         )?;
         destination.prepare_preimage_hard_cutoff();
-        let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
-        let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
-            .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
-        let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
-        let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
-        let packed_staging = k
-            .checked_mul(tile_columns)
-            .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
-            .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let check_scratch =
-            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
         let report = destination.sampler_allocation_report(
-            persistent_bytes.checked_add(target_tile).ok_or(SmallMatrixError::DimensionOverflow)?,
+            footprint
+                .persistent_bytes
+                .checked_add(target_tile)
+                .ok_or(SmallMatrixError::DimensionOverflow)?,
             candidate,
             perturbation,
-            check_scratch,
-            hard_cutoff_plan_bytes,
-            packed_staging,
-            // Full-matrix queries include their deterministic handles. These
-            // are the compact owner and decision-event handles only.
-            sampler_event_bytes,
-            device_acceptance_control_bytes,
-            pinned_host_acceptance_control_bytes,
+            footprint.scratch_bytes,
+            footprint.hard_cutoff_plan_bytes,
+            footprint.packed_staging_bytes,
+            footprint.sampler_event_bytes,
+            footprint.device_control_bytes,
+            footprint.pinned_control_bytes,
         )?;
-        if !residency_fits(report.sampler_peak_bytes, budget) {
-            return Err(SmallMatrixError::ResourceExhausted {
-                requested_bytes: report.sampler_peak_bytes,
-                budget_bytes: budget,
-            });
+        if report.sampler_peak_bytes != footprint.sampler_peak_bytes {
+            return Err(SmallMatrixError::InvalidConfig);
         }
         tracing::debug!(
             persistent_bytes = report.persistent_bytes,
@@ -461,7 +638,7 @@ impl GpuDCRTPolyTrapdoorSampler {
                 .checked_add(column_start)
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
             let mut attempt = 0usize;
-            let outcome = bounded_retry(attempts, || {
+            let outcome = bounded_retry(config.max_attempts.get(), || {
                 let candidate = expanded_preimage_candidate(
                     self,
                     params,
@@ -481,8 +658,6 @@ impl GpuDCRTPolyTrapdoorSampler {
                 )?;
                 drop(candidate);
                 Ok(accepted.then_some(()))
-                // Drop only after the flag decision; the GPU owner releases
-                // rejected storage in stream order before the next attempt.
             });
             match outcome {
                 Ok(()) => {}
@@ -497,6 +672,59 @@ impl GpuDCRTPolyTrapdoorSampler {
             }
         }
         Ok(destination)
+    }
+
+    /// Legacy/benchmark entry point.  Its resource search is intentionally
+    /// kept here; production callers use `bounded_preimage_with_config`.
+    fn bounded_preimage(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let (_, _, columns, _) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+        )?;
+        let attempts = crate::env::gpu_preimage_max_tile_attempts()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        let mut tile_columns = columns;
+        let budget = params.vram_budget_bytes();
+        while tile_columns > 0 {
+            let config = FixedPreimageConfig::new(tile_columns, attempts)
+                .ok_or(SmallMatrixError::InvalidConfig)?;
+            let footprint = self.preimage_footprint(
+                params,
+                trapdoor,
+                public_matrix,
+                target,
+                &max_coefficient_bound,
+                config,
+            )?;
+            if footprint.fits_budget(budget) {
+                return self.execute_preimage_with_config(
+                    params,
+                    trapdoor,
+                    public_matrix,
+                    target,
+                    max_coefficient_bound,
+                    config,
+                    footprint,
+                    randomness_seed,
+                );
+            }
+            tile_columns -= 1;
+        }
+        Err(SmallMatrixError::ResourceExhausted {
+            requested_bytes: budget.saturating_add(1),
+            budget_bytes: budget,
+        })
     }
 }
 
@@ -767,6 +995,38 @@ mod tests {
     use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
+
+    #[test]
+    fn fixed_preimage_config_requires_nonzero_choices() {
+        assert_eq!(FixedPreimageConfig::new(0, 1), None);
+        assert_eq!(FixedPreimageConfig::new(1, 0), None);
+        let config = FixedPreimageConfig::new(3, 7).expect("positive fixed choices");
+        assert_eq!(config.tile_columns.get(), 3);
+        assert_eq!(config.max_attempts.get(), 7);
+    }
+
+    #[test]
+    fn preimage_footprint_separates_cold_covariance_workspace_from_warm_peak() {
+        let footprint = PreimageFootprint {
+            persistent_bytes: 40,
+            compact_output_bytes: 10,
+            scratch_bytes: 20,
+            device_control_bytes: 1,
+            pinned_control_bytes: 1,
+            hard_cutoff_plan_bytes: 2,
+            packed_staging_bytes: 3,
+            sampler_event_bytes: 1,
+            cold_transient_workspace_bytes: 17,
+            sampler_peak_bytes: 78,
+            cold_sampler_peak_bytes: 95,
+            tile_columns: 1,
+            max_attempts: 1,
+        };
+        assert_eq!(footprint.cold_sampler_peak_bytes, footprint.sampler_peak_bytes + 17);
+        assert!(!footprint.fits_budget(94));
+        assert!(footprint.fits_budget(95));
+        assert_eq!(footprint.sampler_peak_bytes, 78);
+    }
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8, None, None)

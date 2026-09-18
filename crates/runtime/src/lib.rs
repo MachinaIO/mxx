@@ -5,6 +5,10 @@ pub mod backend;
 pub mod executor;
 #[cfg(feature = "gpu")]
 pub mod gpu_calibration;
+pub mod gpu_column_policy;
+pub mod gpu_execution_plan;
+pub mod gpu_schedule;
+pub mod gpu_warmup;
 pub mod lean;
 pub mod session;
 pub mod transcript;

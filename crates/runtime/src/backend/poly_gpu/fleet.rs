@@ -2759,12 +2759,24 @@ mod tests {
         let output_layout_metadata = blocks
             .iter()
             .zip(output_layouts)
-            .map(|(block, &layout_id)| PlannedLayoutMetadata {
-                layout_id: Some(layout_id),
-                rows: block.rows,
-                columns: block.columns,
-                ring_dimension: 32,
-                representation: format!("{:?}", GpuDcrtBackend::policy_matrix_type(block).unwrap()),
+            .map(|(block, &layout_id)| {
+                let ConcreteWireType::Matrix(matrix) =
+                    GpuDcrtBackend::policy_matrix_type(block).unwrap()
+                else {
+                    unreachable!("fleet matrix policy type is always a Matrix");
+                };
+                let output_type = ConcreteWireType::Matrix(ConcreteMatrixType {
+                    rows: block.rows,
+                    columns: rhs.columns,
+                    ..matrix
+                });
+                PlannedLayoutMetadata {
+                    layout_id: Some(layout_id),
+                    rows: block.rows,
+                    columns: rhs.columns,
+                    ring_dimension: 32,
+                    representation: format!("{output_type:?}"),
+                }
             })
             .collect::<Vec<_>>();
         PlannedNodeBatchRequest {
@@ -2794,39 +2806,36 @@ mod tests {
         let device = detected_gpu_device_ids()[0];
         let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let rhs_rows = parameters.modulus_digits();
         let source_type = ConcreteMatrixType {
             modulus: modulus.clone(),
             ring_dimension: 32,
-            rows: 2,
-            columns: 8,
+            rows: 1,
+            columns: rhs_rows,
         };
-        let source = Arc::new(GpuFleetMatrix::from_matrix(
-            backend.devices[0]
-                .1
-                .sample_hash(&source_type, rand::random(), b"fixed-blocks")
-                .unwrap(),
-        ));
         let blocks = vec![
-            Arc::new(
-                backend
-                    .slice(source.as_ref(), Some(&IndexRange { start: 0, end: 1 }), None)
+            Arc::new(GpuFleetMatrix::from_matrix(
+                backend.devices[0]
+                    .1
+                    .sample_hash(&source_type, rand::random(), b"fixed-block-0")
                     .unwrap(),
-            ),
-            Arc::new(
-                backend
-                    .slice(source.as_ref(), Some(&IndexRange { start: 1, end: 2 }), None)
+            )),
+            Arc::new(GpuFleetMatrix::from_matrix(
+                backend.devices[0]
+                    .1
+                    .sample_hash(&source_type, rand::random(), b"fixed-block-1")
                     .unwrap(),
-            ),
+            )),
         ];
-        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 1, columns: 8 };
         let rhs_seed = backend.devices[0]
             .1
             .sample_hash(&rhs_seed_type, rand::random(), b"fixed-compact-rhs")
             .unwrap();
         let rhs_full = GpuFleetSmallMatrix::from_matrix(
-            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, None).unwrap(),
         );
-        assert_eq!(rhs_full.size(), (8, 8));
+        assert_eq!(rhs_full.size(), (rhs_rows, 8));
         let expected = backend.devices[0]
             .1
             .multiply_small_rhs_row_blocks(
@@ -2883,11 +2892,12 @@ mod tests {
         for (producer_width, consumer_width) in [(4, 8), (8, 4)] {
             let mut backend = super::super::gpu_backend_on([parameters.clone()], [device]);
             let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+            let rhs_rows = parameters.modulus_digits();
             let lhs_type = ConcreteMatrixType {
                 modulus: modulus.clone(),
                 ring_dimension: 32,
                 rows: 1,
-                columns: 8,
+                columns: rhs_rows,
             };
             let lhs = Arc::new(GpuFleetMatrix::from_matrix(
                 backend.devices[0]
@@ -2895,13 +2905,13 @@ mod tests {
                     .sample_hash(&lhs_type, rand::random(), b"cross-boundary-lhs")
                     .unwrap(),
             ));
-            let seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+            let seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 1, columns: 8 };
             let seed = backend.devices[0]
                 .1
                 .sample_hash(&seed_type, rand::random(), b"cross-boundary-rhs")
                 .unwrap();
             let rhs_full = GpuFleetSmallMatrix::from_matrix(
-                backend.devices[0].1.gadget_decompose(&seed, false, Some(2)).unwrap(),
+                backend.devices[0].1.gadget_decompose(&seed, false, None).unwrap(),
             );
             let expected = backend.devices[0]
                 .1
@@ -2979,11 +2989,12 @@ mod tests {
         let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let mut backend =
             super::super::gpu_backend_on([parameters.clone()], [source_device, owner_device]);
+        let rhs_rows = parameters.modulus_digits();
         let lhs_type = ConcreteMatrixType {
             modulus: BigInt::from(parameters.modulus().as_ref().clone()),
             ring_dimension: 32,
             rows: 1,
-            columns: 8,
+            columns: rhs_rows,
         };
         let lhs = Arc::new(GpuFleetMatrix::from_matrix(
             backend.devices[0]
@@ -2991,13 +3002,13 @@ mod tests {
                 .sample_hash(&lhs_type, rand::random(), b"active-owner-lhs")
                 .unwrap(),
         ));
-        let rhs_seed_type = ConcreteMatrixType { rows: 4, ..lhs_type.clone() };
+        let rhs_seed_type = ConcreteMatrixType { rows: 1, columns: 8, ..lhs_type.clone() };
         let rhs_seed = backend.devices[0]
             .1
             .sample_hash(&rhs_seed_type, rand::random(), b"active-owner-rhs")
             .unwrap();
         let rhs = Arc::new(GpuFleetSmallMatrix::from_matrix(
-            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, None).unwrap(),
         ));
         let expected = backend.devices[0]
             .1
@@ -3778,11 +3789,12 @@ mod tests {
         // profile is registered. This guards against accidentally hiding the
         // provider lookup behind an empty-batch early return.
         let modulus = BigInt::from(parameters.modulus().as_ref().clone());
+        let rhs_rows = parameters.modulus_digits();
         let source_type = ConcreteMatrixType {
             modulus: modulus.clone(),
             ring_dimension: 32,
             rows: 1,
-            columns: 8,
+            columns: rhs_rows,
         };
         let block = Arc::new(GpuFleetMatrix::from_matrix(
             backend.devices[0]
@@ -3790,13 +3802,13 @@ mod tests {
                 .sample_hash(&source_type, rand::random(), b"provider-fixed-block")
                 .unwrap(),
         ));
-        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 4, columns: 8 };
+        let rhs_seed_type = ConcreteMatrixType { modulus, ring_dimension: 32, rows: 1, columns: 8 };
         let rhs_seed = backend.devices[0]
             .1
             .sample_hash(&rhs_seed_type, rand::random(), b"provider-fixed-rhs")
             .unwrap();
         let rhs = Arc::new(GpuFleetSmallMatrix::from_matrix(
-            backend.devices[0].1.gadget_decompose(&rhs_seed, false, Some(2)).unwrap(),
+            backend.devices[0].1.gadget_decompose(&rhs_seed, false, None).unwrap(),
         ));
         let operation = [0x43; 32];
         let key = install_test_small_product_plan(&mut backend, operation, &[1], 8, 4, 0);

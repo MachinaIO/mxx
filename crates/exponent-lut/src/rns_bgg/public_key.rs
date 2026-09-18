@@ -91,8 +91,11 @@ fn matrix_entries(matrix: &RnsBggMatrix) -> [Mat; 4] {
     [matrix.0.0.clone(), matrix.0.1.clone(), matrix.1.0.clone(), matrix.1.1.clone()]
 }
 
-fn public_lut_branch(public_data: RnsBggMatrix, e_sigma: RnsBggDecomposition) -> RnsBggMatrix {
-    multiply_public_action(public_data, e_sigma)
+fn public_lut_branch(
+    public_data: RnsBggMatrix,
+    switched_key_decomposition: RnsBggDecomposition,
+) -> RnsBggMatrix {
+    multiply_public_action(public_data, switched_key_decomposition)
 }
 
 fn matrix_from_hash(
@@ -132,10 +135,16 @@ fn decompose_matrix(
     let base = 1u64
         .checked_shl(p.base_bits())
         .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
-    let digits = p.modulus_digits();
+    let decomposition_count = p.modulus_digits();
     Ok((
-        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
-        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
+        (
+            matrix.0.0.decompose(base, decomposition_count),
+            matrix.0.1.decompose(base, decomposition_count),
+        ),
+        (
+            matrix.1.0.decompose(base, decomposition_count),
+            matrix.1.1.decompose(base, decomposition_count),
+        ),
     ))
 }
 
@@ -159,10 +168,16 @@ fn decompose_refresh_matrix(
     let base = 1u64
         .checked_shl(decomposition.base_bits())
         .ok_or(RnsBggError::Parameters("refresh decomposition base overflow"))?;
-    let digits = decomposition.modulus_digits();
+    let decomposition_count = decomposition.modulus_digits();
     let value = (
-        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
-        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
+        (
+            matrix.0.0.decompose(base, decomposition_count),
+            matrix.0.1.decompose(base, decomposition_count),
+        ),
+        (
+            matrix.1.0.decompose(base, decomposition_count),
+            matrix.1.1.decompose(base, decomposition_count),
+        ),
     );
     let evaluation_modulus =
         BigInt::from(parameters.level(evaluation_level)?.modulus().as_ref().clone());
@@ -406,7 +421,7 @@ impl<'a> PublicKeyLowering<'a> {
     /// Materialize setup-fixed compact `B_sigma` switching ciphertexts for a
     /// complete LUT/layout identity.  Gadget decomposition is deferred until
     /// the branch is consumed.
-    pub(crate) fn prepare_lut_actions(
+    pub(crate) fn prepare_lut_switching_ciphertexts(
         &mut self,
         input: &RnsBggPublicKey,
         lut_id: LutId,
@@ -422,14 +437,14 @@ impl<'a> PublicKeyLowering<'a> {
             .validate(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
         let key = (level, next_level, lut_id, layout);
-        if let Some(actions) = self.lut_material.get(&key) {
-            return Ok(actions.clone());
+        if let Some(switching_ciphertexts) = self.lut_material.get(&key) {
+            return Ok(switching_ciphertexts.clone());
         }
         let count = IntExpr::constant(table.values().len());
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
-        let actions = mxx_dsl::parallel(count, |index| {
+        let switching_ciphertexts = mxx_dsl::parallel(count, |index| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
@@ -444,7 +459,7 @@ impl<'a> PublicKeyLowering<'a> {
             )
             .map_err(|_| DslError::Schema)?;
             // B_sigma is sampled in the next ring and constrained by the
-            // payload secret.  D_sigma is its signed decomposition, with
+            // payload secret. Its signed switching decomposition has
             // each compact digit centered-extended to the source ring; the
             // full B matrix is never extended as a dense matrix.
             let payload = checked_modulus_convert_row(
@@ -486,8 +501,8 @@ impl<'a> PublicKeyLowering<'a> {
             Ok(b_sigma)
         })
         .map_err(graph)?;
-        self.lut_material.insert(key, actions.clone());
-        Ok(actions)
+        self.lut_material.insert(key, switching_ciphertexts.clone());
+        Ok(switching_ciphertexts)
     }
 
     /// ModDown declared coefficient outputs once after graph aggregation.
@@ -543,8 +558,8 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             .program
             .wire_knowledge(rhs.wire)
             .map_err(|_| RnsBggError::Binding("MulPublic RHS metadata"))?;
-        if rhs_knowledge != AttributeKnowledge::PublicPayload {
-            return Err(RnsBggError::Binding("MulPublic RHS must be public"));
+        if lhs_knowledge != AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Binding("MulPublic LHS must be public"));
         }
         if self
             .program
@@ -559,38 +574,46 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         let lhs_level = self.workload.level(lhs.wire)?;
         let rhs_level = self.workload.level(rhs.wire)?;
         let target_level =
-            self.parameters.mul_public_target_level(lhs_level, lhs_knowledge, rhs_level)?;
+            self.parameters.mul_public_target_level(lhs_level, rhs_level, rhs_knowledge)?;
 
-        // A private LHS owns the computation level and already uses the
-        // state-gadget width at that level.  A public LHS uses the public
-        // gadget width and can therefore be aligned just like the RHS.  In
-        // either case, convert each public matrix once before decomposing the
-        // LHS action; equal physical levels are handled as a graph no-op by
-        // `apply_public_alignment_matrix`.
-        let lhs_matrix = if matches!(lhs_knowledge, AttributeKnowledge::PublicPayload) {
+        // The public LHS is aligned to the RHS-owned target level. A public
+        // RHS is aligned as well when public/public selects the lower
+        // modulus; equal physical levels are a graph no-op.
+        let lhs_matrix = apply_public_alignment_matrix(
+            self.parameters,
+            lhs_level,
+            target_level,
+            lhs.matrix.clone(),
+        )?;
+        let rhs_matrix = if rhs_knowledge == AttributeKnowledge::PublicPayload {
             apply_public_alignment_matrix(
                 self.parameters,
-                lhs_level,
+                rhs_level,
                 target_level,
-                lhs.matrix.clone(),
+                rhs.matrix.clone(),
             )?
         } else {
-            lhs.matrix.clone()
+            rhs.matrix.clone()
         };
-        let rhs_matrix = apply_public_alignment_matrix(
-            self.parameters,
-            rhs_level,
-            target_level,
-            rhs.matrix.clone(),
-        )?;
-        let action = decompose_matrix(self.parameters, target_level, lhs_matrix)?;
-        Ok(RnsBggPublicKey::new(self.output()?, super::multiply_public_action(rhs_matrix, action)))
+        let rhs_decomposition = decompose_matrix(self.parameters, target_level, rhs_matrix)?;
+        Ok(RnsBggPublicKey::new(
+            self.output()?,
+            super::multiply_public_action(lhs_matrix, rhs_decomposition),
+        ))
     }
     fn mul_private(
         &mut self,
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.wire)
+            .map_err(|_| RnsBggError::Binding("MulPrivate input metadata"))? ==
+            AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
+        }
         let compact = match self.rhs_material.get(&rhs.id) {
             Some(InputBinding::Scalar(value)) => value.clone(),
             Some(InputBinding::Family(values)) => {
@@ -632,10 +655,18 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.wire)
+            .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
+            AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
+        }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let source_level = self.workload.level(input.wire)?;
         let data = self.lut_public_data_for(source_level, table)?;
-        let actions = self.prepare_lut_actions(input, lut_id, table)?;
+        let switching_ciphertexts = self.prepare_lut_switching_ciphertexts(input, lut_id, table)?;
         let next_level =
             source_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
         let source_modulus =
@@ -646,32 +677,40 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         let sigmas = layout
             .automorphism_indices(self.parameters.level(source_level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
-        let mut result = None;
-        for index in 0..table.values().len() {
-            let sigma = IntExpr::constant(sigmas[index]);
-            let d_sigma = centered_extend_decomposition(
-                decompose_matrix(self.parameters, next_level, actions.at(Int::constant(index)))?,
-                source_modulus.clone(),
-            );
-            let routed = super::map_matrix(input.matrix.clone(), |entry| {
-                entry.ring_automorphism(sigma.clone())
-            });
-            let u_sigma = super::mod_down_public(
-                super::multiply_public_action(routed, d_sigma),
-                target_modulus.clone(),
-            );
-            let e_sigma = centered_extend_decomposition(
-                decompose_matrix(self.parameters, next_level, u_sigma)?,
-                source_modulus.clone(),
-            );
-            let branch = public_lut_branch(data.at(Int::constant(index)), e_sigma);
-            result = Some(match result {
-                None => branch,
-                Some(previous) => super::add_public_matrices(previous, branch),
-            });
-        }
+        let branch_decompositions =
+            mxx_dsl::parallel(IntExpr::constant(table.values().len()), |index| {
+                let sigma = IntExpr::Select {
+                    selector: Box::new(index.expression()?),
+                    branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
+                };
+                let switching_decomposition = centered_extend_decomposition(
+                    decompose_matrix(
+                        self.parameters,
+                        next_level,
+                        switching_ciphertexts.at(index.clone()),
+                    )
+                    .map_err(|_| DslError::Schema)?,
+                    source_modulus.clone(),
+                );
+                let routed = super::map_matrix(input.matrix.clone(), |entry| {
+                    entry.ring_automorphism(sigma.clone())
+                });
+                let switched_public_key = super::mod_down_public(
+                    super::multiply_public_action(routed, switching_decomposition),
+                    target_modulus.clone(),
+                );
+                let switched_key_decomposition = centered_extend_decomposition(
+                    decompose_matrix(self.parameters, next_level, switched_public_key)
+                        .map_err(|_| DslError::Schema)?,
+                    source_modulus.clone(),
+                );
+                Ok(public_lut_branch(data.at(index), switched_key_decomposition))
+            })
+            .map_err(graph)?;
         let output = self.output()?;
-        let result = result.ok_or(RnsBggError::Lut)?;
+        let result =
+            crate::utils::balanced_sum_family(branch_decompositions, super::add_public_matrices)
+                .map_err(graph)?;
         if !self
             .program
             .wire_is_coefficient_output(output)
@@ -1881,6 +1920,10 @@ impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::api::execute_graph;
+    use mxx_runtime::{
+        ExecutionConfig, MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend,
+    };
 
     #[test]
     fn cloned_program_lowers_equal_lut_registrations_by_instruction_identity() {
@@ -2033,12 +2076,12 @@ mod test {
     }
 
     #[test]
-    fn mul_public_aligns_public_rhs_to_private_lhs_level() {
+    fn mul_public_aligns_public_lhs_to_private_rhs_level() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let private_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_input().unwrap();
-        let lhs = builder
+        let private_rhs = builder
             .mul_private(
                 crate::program::Operand::Scalar(private_input),
                 crate::program::Operand::Scalar(rhs),
@@ -2046,8 +2089,8 @@ mod test {
             .unwrap();
         let output = builder
             .mul_public(
-                crate::program::Operand::Scalar(lhs),
                 crate::program::Operand::Scalar(public_input),
+                crate::program::Operand::Scalar(private_rhs),
             )
             .unwrap();
         let program =
@@ -2056,10 +2099,10 @@ mod test {
         let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
         let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
-        assert_eq!(workload.level(lhs).unwrap(), 1);
+        assert_eq!(workload.level(private_rhs).unwrap(), 1);
         assert_eq!(workload.level(public_input).unwrap(), 0);
         assert_eq!(
-            parameters.mul_public_target_level(1, AttributeKnowledge::PrivatePayload, 0).unwrap(),
+            parameters.mul_public_target_level(0, 1, AttributeKnowledge::PrivatePayload).unwrap(),
             1
         );
         let low_ring = parameters.ring(1).unwrap();
@@ -2075,26 +2118,26 @@ mod test {
         );
         lowering.current_site =
             Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() });
-        let lhs_key = RnsBggPublicKey::new(
-            lhs,
-            input_key_matrix(
-                &low_ring,
-                "mul-public-private-lhs",
-                parameters.key_component_columns(1, AttributeKnowledge::PrivatePayload).unwrap(),
-            ),
-        );
-        let rhs_key = RnsBggPublicKey::new(
+        let public_key = RnsBggPublicKey::new(
             public_input,
             input_key_matrix(
                 &high_ring,
-                "mul-public-private-rhs",
+                "mul-public-public-lhs",
                 parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap(),
+            ),
+        );
+        let private_key = RnsBggPublicKey::new(
+            private_rhs,
+            input_key_matrix(
+                &low_ring,
+                "mul-public-private-rhs",
+                parameters.key_component_columns(1, AttributeKnowledge::PrivatePayload).unwrap(),
             ),
         );
         let result = <PublicKeyLowering<'_> as ExponentLUTProgramLowering>::mul_public(
             &mut lowering,
-            &lhs_key,
-            &rhs_key,
+            &public_key,
+            &private_key,
         )
         .unwrap();
         assert_eq!(
@@ -2104,6 +2147,167 @@ mod test {
                 parameters.key_component_columns(1, AttributeKnowledge::PrivatePayload).unwrap(),
             ))
         );
+    }
+
+    #[test]
+    fn mul_public_numeric_relation_matches_independent_action_and_rejects_wrong_key() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public_rhs_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_output = builder
+            .mul_public(
+                crate::program::Operand::Scalar(public_input),
+                crate::program::Operand::Scalar(private_input),
+            )
+            .unwrap();
+        let public_output = builder
+            .mul_public(
+                crate::program::Operand::Scalar(public_input),
+                crate::program::Operand::Scalar(public_rhs_input),
+            )
+            .unwrap();
+        let program = Arc::new(
+            builder
+                .finish(vec![
+                    crate::program::Operand::Scalar(private_output),
+                    crate::program::Operand::Scalar(public_output),
+                ])
+                .unwrap(),
+        );
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let rhs_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PrivatePayload).unwrap();
+        let lhs_entry =
+            ring.constant((1, columns), ConstantMatrix::UnitRow { index: IntExpr::constant(0) });
+        let rhs_entry = ring
+            .constant((1, rhs_columns), ConstantMatrix::UnitRow { index: IntExpr::constant(0) });
+        let rhs_entry_alt = rhs_entry.clone() * IntExpr::constant(2);
+        let public_rhs_entry =
+            ring.constant((1, columns), ConstantMatrix::UnitRow { index: IntExpr::constant(1) });
+        let lhs_matrix = ((lhs_entry.clone(), lhs_entry.clone()), (lhs_entry.clone(), lhs_entry));
+        let rhs_matrix =
+            ((rhs_entry.clone(), rhs_entry_alt.clone()), (rhs_entry_alt.clone(), rhs_entry));
+        let public_rhs_matrix = (
+            (public_rhs_entry.clone(), public_rhs_entry.clone()),
+            (public_rhs_entry.clone(), public_rhs_entry),
+        );
+        let mut lowering = PublicKeyLowering::new(
+            &parameters,
+            program,
+            workload,
+            RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)) },
+            ring.bytes_input("mul-public-numeric-key", 32),
+        );
+        lowering.current_site =
+            Some(LoweringSite { output: private_output, indices: Vec::new(), ranges: Vec::new() });
+        let actual_private = <PublicKeyLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut lowering,
+            &RnsBggPublicKey::new(public_input, lhs_matrix.clone()),
+            &RnsBggPublicKey::new(private_input, rhs_matrix.clone()),
+        )
+        .unwrap();
+        lowering.current_site =
+            Some(LoweringSite { output: public_output, indices: Vec::new(), ranges: Vec::new() });
+        let actual_public = <PublicKeyLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut lowering,
+            &RnsBggPublicKey::new(public_input, lhs_matrix.clone()),
+            &RnsBggPublicKey::new(public_rhs_input, public_rhs_matrix.clone()),
+        )
+        .unwrap();
+        let base = 1u64 << level.base_bits();
+        let columns = level.modulus_digits();
+        let direct_decompose = |matrix: RnsBggMatrix| {
+            (
+                (matrix.0.0.decompose(base, columns), matrix.0.1.decompose(base, columns)),
+                (matrix.1.0.decompose(base, columns), matrix.1.1.decompose(base, columns)),
+            )
+        };
+        let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDecomposition| {
+            (
+                (
+                    rhs.0.0.clone().mul_small_rhs(lhs.0.0.clone()) +
+                        rhs.1.0.clone().mul_small_rhs(lhs.0.1.clone()),
+                    rhs.0.1.clone().mul_small_rhs(lhs.0.0) + rhs.1.1.clone().mul_small_rhs(lhs.0.1),
+                ),
+                (
+                    rhs.0.0.mul_small_rhs(lhs.1.0.clone()) + rhs.1.0.mul_small_rhs(lhs.1.1.clone()),
+                    rhs.0.1.mul_small_rhs(lhs.1.0) + rhs.1.1.mul_small_rhs(lhs.1.1),
+                ),
+            )
+        };
+        let expected_private =
+            direct_action(lhs_matrix.clone(), direct_decompose(rhs_matrix.clone()));
+        let expected_public =
+            direct_action(lhs_matrix.clone(), direct_decompose(public_rhs_matrix));
+        let wrong_rhs = (
+            (rhs_entry_alt.clone(), rhs_entry_alt.clone()),
+            (rhs_entry_alt.clone(), rhs_entry_alt),
+        );
+        let wrong_key = direct_action(lhs_matrix, direct_decompose(wrong_rhs));
+        let mut graph = DslContext::new("mul-public-numeric-relation");
+        for (index, (actual_entry, expected_entry)) in matrix_entries(&actual_private.matrix)
+            .into_iter()
+            .zip(matrix_entries(&expected_private).into_iter())
+            .enumerate()
+        {
+            graph = graph
+                .output(format!("private-difference-{index}"), actual_entry - expected_entry)
+                .unwrap();
+        }
+        for (index, (actual_entry, expected_entry)) in matrix_entries(&actual_public.matrix)
+            .into_iter()
+            .zip(matrix_entries(&expected_public).into_iter())
+            .enumerate()
+        {
+            graph = graph
+                .output(format!("public-difference-{index}"), actual_entry - expected_entry)
+                .unwrap();
+        }
+        graph = graph.output("wrong-key", actual_private.matrix.0.0 - wrong_key.0.0).unwrap();
+        let graph = graph.build().unwrap();
+        let mut backend = cpu_backend([level]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_graph(
+            StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+            &ParamEnv::default(),
+            &mut backend,
+            &mut store,
+            ExecutionConfig::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        for index in 0..4 {
+            let RuntimeValue::Matrix(matrix) = result
+                .materialize_output(
+                    &format!("private-difference-{index}"),
+                    &mut backend,
+                    &mut store,
+                )
+                .unwrap()
+            else {
+                panic!("private MulPublic difference is not a matrix");
+            };
+            assert!(matrix.entry(0, 0).coeffs_biguints().iter().all(|value| value.is_zero()));
+            let RuntimeValue::Matrix(matrix) = result
+                .materialize_output(&format!("public-difference-{index}"), &mut backend, &mut store)
+                .unwrap()
+            else {
+                panic!("public MulPublic difference is not a matrix");
+            };
+            assert!(matrix.entry(0, 0).coeffs_biguints().iter().all(|value| value.is_zero()));
+        }
+        let RuntimeValue::Matrix(wrong) =
+            result.materialize_output("wrong-key", &mut backend, &mut store).unwrap()
+        else {
+            panic!("wrong key difference is not a matrix");
+        };
+        assert!(wrong.entry(0, 0).coeffs_biguints().iter().any(|value| !value.is_zero()));
     }
 
     #[test]
@@ -2753,18 +2957,18 @@ mod test {
             (ring.input("lut-data-00", (1, 1)), ring.input("lut-data-01", (1, 1))),
             (ring.input("lut-data-10", (1, 1)), ring.input("lut-data-11", (1, 1))),
         );
-        let e = (
+        let switching_decomposition = (
             (
-                ring.preimage_input("lut-e-00", (1, 1), 17),
-                ring.preimage_input("lut-e-01", (1, 1), 17),
+                ring.preimage_input("lut-switching-decomposition-00", (1, 1), 17),
+                ring.preimage_input("lut-switching-decomposition-01", (1, 1), 17),
             ),
             (
-                ring.preimage_input("lut-e-10", (1, 1), 17),
-                ring.preimage_input("lut-e-11", (1, 1), 17),
+                ring.preimage_input("lut-switching-decomposition-10", (1, 1), 17),
+                ring.preimage_input("lut-switching-decomposition-11", (1, 1), 17),
             ),
         );
-        let branch = public_lut_branch(data.clone(), e.clone());
-        let expected = multiply_public_action(data, e);
+        let branch = public_lut_branch(data.clone(), switching_decomposition.clone());
+        let expected = multiply_public_action(data, switching_decomposition);
         assert_eq!(branch.0.0.matrix_type(), expected.0.0.matrix_type());
         let graph = DslContext::new("public-lut-branch")
             .artifact_output("branch", branch)
@@ -2785,9 +2989,9 @@ mod test {
     }
 
     #[test]
-    fn lut_e_sigma_is_centered_extended_into_the_source_ring() {
+    fn switching_decomposition_is_centered_extended_into_the_source_ring() {
         let next = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
-        let compact = next.preimage_input("lut-e-next", (1, 1), 17);
+        let compact = next.preimage_input("lut-switching-decomposition-next", (1, 1), 17);
         let decomposition = ((compact.clone(), compact.clone()), (compact.clone(), compact));
         let extended = centered_extend_decomposition(decomposition, BigInt::from(257u16));
         assert_eq!(extended.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));

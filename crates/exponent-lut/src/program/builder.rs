@@ -10,9 +10,9 @@ use super::*;
 /// use mxx_exponent_lut::program::{AttributeKnowledge, ExponentLutProgramBuilder, Operand};
 ///
 /// let mut builder = ExponentLutProgramBuilder::new();
-/// let private = builder.input(AttributeKnowledge::PrivatePayload)?;
 /// let public = builder.input(AttributeKnowledge::PublicPayload)?;
-/// let output = builder.mul_public(Operand::Scalar(private), Operand::Scalar(public))?;
+/// let private = builder.input(AttributeKnowledge::PrivatePayload)?;
+/// let output = builder.mul_public(Operand::Scalar(public), Operand::Scalar(private))?;
 /// let program = builder.finish(vec![Operand::Scalar(output)])?;
 /// assert_eq!(program.outputs(), &[Operand::Scalar(output)]);
 /// # Ok::<(), mxx_exponent_lut::program::ProgramValidationError>(())
@@ -24,6 +24,7 @@ pub struct ExponentLutProgramBuilder {
     pub(crate) bodies: Vec<Body>,
     pub(crate) wire_kinds: BTreeMap<WireId, bool>,
     pub(crate) rhs_kinds: BTreeMap<RhsId, bool>,
+    wire_knowledge: BTreeMap<WireId, AttributeKnowledge>,
     pub(crate) next_wire: u32,
     pub(crate) next_rhs: u32,
 }
@@ -37,6 +38,7 @@ impl ExponentLutProgramBuilder {
             bodies: vec![Body { steps: Vec::new(), outputs: Vec::new() }],
             wire_kinds: BTreeMap::new(),
             rhs_kinds: BTreeMap::new(),
+            wire_knowledge: BTreeMap::new(),
             next_wire: 0,
             next_rhs: 0,
         }
@@ -71,6 +73,7 @@ impl ExponentLutProgramBuilder {
         let id = self.wire()?;
         self.inputs
             .insert(id, ProgramInputDeclaration { shape: InputBinding::Scalar(()), knowledge });
+        self.wire_knowledge.insert(id, knowledge);
         Ok(id)
     }
 
@@ -87,6 +90,7 @@ impl ExponentLutProgramBuilder {
         self.wire_kinds.insert(id, true);
         self.inputs
             .insert(id, ProgramInputDeclaration { shape: InputBinding::Family(count), knowledge });
+        self.wire_knowledge.insert(id, knowledge);
         Ok(id)
     }
 
@@ -171,7 +175,22 @@ impl ExponentLutProgramBuilder {
         }
     }
 
-    fn output(&mut self, kind: bool, step: Step) -> Result<WireId, ProgramValidationError> {
+    fn operand_knowledge(
+        &self,
+        operand: &Operand<WireId>,
+    ) -> Result<AttributeKnowledge, ProgramValidationError> {
+        let wire = match operand {
+            Operand::Scalar(wire) | Operand::Member { family: wire, .. } => wire,
+        };
+        self.wire_knowledge.get(wire).copied().ok_or(ProgramValidationError::UndefinedWire(*wire))
+    }
+
+    fn output(
+        &mut self,
+        kind: bool,
+        knowledge: AttributeKnowledge,
+        step: Step,
+    ) -> Result<WireId, ProgramValidationError> {
         let id = match &step {
             Step::Add { output, .. } |
             Step::MulPublic { output, .. } |
@@ -184,6 +203,7 @@ impl ExponentLutProgramBuilder {
             return Err(ProgramValidationError::UndefinedWire(id));
         }
         self.wire_kinds.insert(id, kind);
+        self.wire_knowledge.insert(id, knowledge);
         self.bodies.last_mut().expect("root body").steps.push(step);
         Ok(id)
     }
@@ -196,22 +216,35 @@ impl ExponentLutProgramBuilder {
         if self.operand_wire(&lhs)? || self.operand_wire(&rhs)? {
             return Err(ProgramValidationError::ExpectedScalarWire(WireId(0)));
         }
+        let lhs_knowledge = self.operand_knowledge(&lhs)?;
+        if lhs_knowledge != self.operand_knowledge(&rhs)? {
+            return Err(ProgramValidationError::InvalidStructure(
+                "Add operands must have matching knowledge".into(),
+            ));
+        }
         let output = self.wire()?;
-        self.output(false, Step::Add { lhs, rhs, output })
+        self.output(false, lhs_knowledge, Step::Add { lhs, rhs, output })
     }
 
-    /// Append a public multiplication.  The right operand must be public;
-    /// the left operand may have either knowledge class.
+    /// Append a public-left multiplication. The left operand must be public;
+    /// the right operand may be public or private, and determines the output
+    /// knowledge.
     pub fn mul_public(
         &mut self,
         lhs: Operand<WireId>,
-        public: Operand<WireId>,
+        rhs: Operand<WireId>,
     ) -> Result<WireId, ProgramValidationError> {
-        if self.operand_wire(&lhs)? || self.operand_wire(&public)? {
+        if self.operand_wire(&lhs)? || self.operand_wire(&rhs)? {
             return Err(ProgramValidationError::ExpectedScalarWire(WireId(0)));
         }
+        if self.operand_knowledge(&lhs)? != AttributeKnowledge::PublicPayload {
+            return Err(ProgramValidationError::InvalidStructure(
+                "MulPublic requires a public exponent LHS".into(),
+            ));
+        }
+        let rhs_knowledge = self.operand_knowledge(&rhs)?;
         let output = self.wire()?;
-        self.output(false, Step::MulPublic { private: lhs, public, output })
+        self.output(false, rhs_knowledge, Step::MulPublic { lhs, rhs, output })
     }
 
     pub fn mul_private(
@@ -226,7 +259,11 @@ impl ExponentLutProgramBuilder {
             return Err(ProgramValidationError::ExpectedScalarRhs(RhsId(0)));
         }
         let output = self.wire()?;
-        self.output(false, Step::MulPrivate { input, rhs, output })
+        self.output(
+            false,
+            AttributeKnowledge::PrivatePayload,
+            Step::MulPrivate { input, rhs, output },
+        )
     }
 
     pub fn lut(
@@ -240,8 +277,9 @@ impl ExponentLutProgramBuilder {
         if table.0 as usize >= self.luts.len() {
             return Err(ProgramValidationError::InvalidLutId(table));
         }
+        let input_knowledge = self.operand_knowledge(&input)?;
         let output = self.wire()?;
-        self.output(false, Step::Lut { input, table, output })
+        self.output(false, input_knowledge, Step::Lut { input, table, output })
     }
 
     pub fn parallel(
@@ -257,6 +295,7 @@ impl ExponentLutProgramBuilder {
             self.bodies.len(),
             self.wire_kinds.clone(),
             self.rhs_kinds.clone(),
+            self.wire_knowledge.clone(),
         );
         self.bodies.push(Body { steps: Vec::new(), outputs: Vec::new() });
         let depth = (self.bodies.len() - 2) as u32;
@@ -274,9 +313,11 @@ impl ExponentLutProgramBuilder {
         };
         let mut child = self.bodies.pop().expect("child body");
         child.outputs = vec![Operand::Scalar(result)];
+        let child_knowledge = self.operand_knowledge(&Operand::Scalar(result))?;
         // Child-local wires are lexical temporaries. Their IDs remain in the
         // child body, but cannot be captured by a later parent operation.
         self.wire_kinds = snapshot.4.clone();
+        self.wire_knowledge = snapshot.6.clone();
         let output = match self.wire() {
             Ok(output) => output,
             Err(error) => {
@@ -285,6 +326,7 @@ impl ExponentLutProgramBuilder {
             }
         };
         self.wire_kinds.insert(output, true);
+        self.wire_knowledge.insert(output, child_knowledge);
         self.bodies.last_mut().expect("parent body").steps.push(Step::Parallel {
             range,
             body: Box::new(child),
@@ -295,7 +337,15 @@ impl ExponentLutProgramBuilder {
 
     fn rollback(
         &mut self,
-        snapshot: (usize, u32, u32, usize, BTreeMap<WireId, bool>, BTreeMap<RhsId, bool>),
+        snapshot: (
+            usize,
+            u32,
+            u32,
+            usize,
+            BTreeMap<WireId, bool>,
+            BTreeMap<RhsId, bool>,
+            BTreeMap<WireId, AttributeKnowledge>,
+        ),
     ) {
         self.luts.truncate(snapshot.0);
         self.next_wire = snapshot.1;
@@ -303,14 +353,20 @@ impl ExponentLutProgramBuilder {
         self.bodies.truncate(snapshot.3);
         self.wire_kinds = snapshot.4;
         self.rhs_kinds = snapshot.5;
+        self.wire_knowledge = snapshot.6;
     }
 
     pub fn sum(&mut self, family: WireId) -> Result<WireId, ProgramValidationError> {
         if self.wire_kinds.get(&family) != Some(&true) {
             return Err(ProgramValidationError::ExpectedFamilyWire(family));
         }
+        let knowledge = self
+            .wire_knowledge
+            .get(&family)
+            .copied()
+            .ok_or(ProgramValidationError::UndefinedWire(family))?;
         let output = self.wire()?;
-        self.output(false, Step::Sum { family, output })
+        self.output(false, knowledge, Step::Sum { family, output })
     }
 
     pub fn finish(

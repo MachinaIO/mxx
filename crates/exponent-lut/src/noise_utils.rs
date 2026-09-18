@@ -681,8 +681,8 @@ pub enum NoiseDependencyNode {
     },
     MulPublic {
         gate: Option<WireId>,
-        private: NoiseNodeId,
-        public: NoiseNodeId,
+        lhs: NoiseNodeId,
+        rhs: NoiseNodeId,
     },
     MulPrivate {
         gate: Option<WireId>,

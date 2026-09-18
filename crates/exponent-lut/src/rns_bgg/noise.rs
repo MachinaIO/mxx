@@ -470,18 +470,18 @@ impl RnsBggParameters {
     /// the parameter-bound signed decomposition used for a level-preserving
     /// `MulPublic`.
     ///
-    /// `prepare_digits(level, ...)` decomposes into the next level's CRT
-    /// digits and then lifts those digits back to the current modulus.  Each
+    /// The current-level key decomposition uses the current ring's CRT
+    /// decomposition base and modulus digits. Each
     /// coefficient of a balanced digit is bounded by `B / 2`; summing the
     /// digit columns and the ring convolution gives `N * D * B` as an L1
     /// bound.  Keeping this derivation here makes the noise recurrence use
     /// the same decomposition contract as the public-key evaluator.
     fn mul_public_action_gain(&self, level: usize) -> Result<RightActionNoiseGain, RnsBggError> {
-        let next = self.level(level + 1)?;
-        let ring_dimension = BigUint::from(next.ring_dimension());
-        let digits = BigUint::from(next.modulus_digits());
-        let base = BigUint::one() << next.base_bits();
-        let l1 = ring_dimension * digits * base;
+        let current = self.level(level)?;
+        let ring_dimension = BigUint::from(current.ring_dimension());
+        let decomposition_columns = BigUint::from(current.modulus_digits());
+        let base = BigUint::one() << current.base_bits();
+        let l1 = ring_dimension * decomposition_columns * base;
         Ok(RightActionNoiseGain { l2_squared: l1.pow(2), l1 })
     }
 
@@ -965,23 +965,23 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
     }
     fn mul_public(
         &mut self,
-        private: &Self::Wire,
-        public: &Self::Wire,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
     ) -> Result<Self::Wire, Self::Error> {
         let output = self.site()?.output;
         let lhs_knowledge = self
             .program
-            .wire_knowledge(private.0)
+            .wire_knowledge(lhs.0)
             .map_err(|_| RnsBggError::Graph("invalid MulPublic lhs".into()))?;
         let rhs_knowledge = self
             .program
-            .wire_knowledge(public.0)
+            .wire_knowledge(rhs.0)
             .map_err(|_| RnsBggError::Graph("invalid MulPublic rhs".into()))?;
-        if rhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
-            return Err(RnsBggError::Parameters("MulPublic requires a public payload"));
+        if lhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Parameters("MulPublic LHS must be public"));
         }
-        let target = self.parameters.map_or(Ok(private.1), |parameters| {
-            parameters.mul_public_target_level(private.1, lhs_knowledge, public.1)
+        let target = self.parameters.map_or(Ok(rhs.1), |parameters| {
+            parameters.mul_public_target_level(lhs.1, rhs.1, rhs_knowledge)
         })?;
         self.levels.insert(output, target);
         Ok((output, target))
@@ -991,6 +991,14 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPrivate input metadata".into()))? ==
+            crate::program::AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Parameters("RNS-BGG MulPrivate requires a private input"));
+        }
         let output = self.site()?.output;
         let level = input.1;
         if let Some(&rhs_level) = self.rhs_levels.get(rhs) {
@@ -1009,6 +1017,14 @@ impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
         Ok((output, next))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.0)
+            .map_err(|_| RnsBggError::Graph("invalid LUT input metadata".into()))? ==
+            crate::program::AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Parameters("RNS-BGG LUT requires a private input"));
+        }
         let output = self.site()?.output;
         let next = if matches!(
             table.output_representation(),
@@ -1671,11 +1687,11 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                         rhs: shift(*rhs),
                     }
                 }
-                crate::noise_utils::NoiseDependencyNode::MulPublic { gate, private, public } => {
+                crate::noise_utils::NoiseDependencyNode::MulPublic { gate, lhs, rhs } => {
                     crate::noise_utils::NoiseDependencyNode::MulPublic {
                         gate: *gate,
-                        private: shift(*private),
-                        public: shift(*public),
+                        lhs: shift(*lhs),
+                        rhs: shift(*rhs),
                     }
                 }
                 crate::noise_utils::NoiseDependencyNode::MulPrivate {
@@ -2501,40 +2517,40 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             .program
             .wire_knowledge(rhs.0)
             .map_err(|_| RnsBggError::Graph("invalid MulPublic rhs".into()))?;
-        if rhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
-            return Err(RnsBggError::Parameters("MulPublic requires a public payload"));
+        if lhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Parameters("MulPublic LHS must be public"));
         }
         let target_level =
-            self.parameters.mul_public_target_level(lhs_level, lhs_knowledge, rhs_level)?;
-        let lhs_value = if lhs_knowledge == crate::program::AttributeKnowledge::PublicPayload {
-            self.align_public_operand(&lhs.1, lhs_level, target_level)?
+            self.parameters.mul_public_target_level(lhs_level, rhs_level, rhs_knowledge)?;
+        let lhs_value = self.align_public_operand(&lhs.1, lhs_level, target_level)?;
+        let rhs_value = if rhs_knowledge == crate::program::AttributeKnowledge::PublicPayload {
+            self.align_public_operand(&rhs.1, rhs_level, target_level)?
         } else {
-            lhs.1.clone()
+            rhs.1.clone()
         };
-        let rhs_value = self.align_public_operand(&rhs.1, rhs_level, target_level)?;
         let gain = self.parameters.mul_public_action_gain(target_level)?;
         let wire = self.site()?.output;
-        let plaintext_gain = rhs_value.bound.payload_l1.clone();
+        let plaintext_gain = lhs_value.bound.payload_l1.clone();
         let moments = match (lhs_value.moments.as_ref(), rhs_value.moments.as_ref()) {
             (Some(lhs_moments), Some(rhs_moments)) => {
-                let lhs_term = lhs_moments.linear_image(
+                let rhs_term = rhs_moments.linear_image(
                     &NonnegativeRational::new(plaintext_gain.clone(), BigUint::one())
                         .expect("positive plaintext gain"),
-                    lhs_moments.variance.scaled(&plaintext_gain.pow(2)),
+                    rhs_moments.variance.scaled(&plaintext_gain.pow(2)),
                 );
-                let rhs_term = rhs_moments.linear_image(
+                let lhs_term = lhs_moments.linear_image(
                     &NonnegativeRational::new(gain.l1.clone(), BigUint::one())
                         .expect("positive decomposition gain"),
-                    rhs_moments.variance.scaled(&gain.l2_squared),
+                    lhs_moments.variance.scaled(&gain.l2_squared),
                 );
-                Some(lhs_term.add_with_covariance(&rhs_term, NoiseCorrelation::Unknown))
+                Some(rhs_term.add_with_covariance(&lhs_term, NoiseCorrelation::Unknown))
             }
             _ => None,
         };
         let value = self.carry_provenance(
             RnsBggNoiseValue {
-                bound: lhs_value.bound.mul_public_with_action(
-                    &rhs_value.bound,
+                bound: rhs_value.bound.mul_public_with_action(
+                    &lhs_value.bound,
                     &plaintext_gain,
                     &gain,
                 ),
@@ -2547,8 +2563,8 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         );
         let node = crate::noise_utils::NoiseDependencyNode::MulPublic {
             gate: Some(wire),
-            private: self.node_for_wire(lhs.0)?,
-            public: self.node_for_wire(rhs.0)?,
+            lhs: self.node_for_wire(lhs.0)?,
+            rhs: self.node_for_wire(rhs.0)?,
         };
         Ok(self.operation_node(wire, value, node))
     }
@@ -2557,6 +2573,14 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPrivate input metadata".into()))? ==
+            crate::program::AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Parameters("RNS-BGG MulPrivate requires a private input"));
+        }
         let logical_level = self.level(input.0)?;
         let level = logical_level;
         let contract = match self
@@ -2619,6 +2643,14 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         Ok(self.operation_node(wire, value, node))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.0)
+            .map_err(|_| RnsBggError::Graph("invalid LUT input metadata".into()))? ==
+            crate::program::AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Parameters("RNS-BGG LUT requires a private input"));
+        }
         let lut = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let level = self.level(input.0)?;
         let fresh_error_gain = self.fresh_gain(level)?;
@@ -3662,6 +3694,68 @@ mod test {
     }
 
     #[test]
+    fn workload_rejects_public_mul_private_and_lut_inputs() {
+        let mut public_mul_builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_input =
+            public_mul_builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = public_mul_builder.rhs_input().unwrap();
+        let output = public_mul_builder
+            .mul_private(
+                crate::program::Operand::Scalar(public_input),
+                crate::program::Operand::Scalar(rhs),
+            )
+            .unwrap();
+        let public_mul_program =
+            public_mul_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        assert!(RnsBggDerivedWorkload::from_program(&public_mul_program).is_err());
+
+        let mut private_mul_builder = crate::program::ExponentLutProgramBuilder::new();
+        let private_input =
+            private_mul_builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = private_mul_builder.rhs_input().unwrap();
+        let output = private_mul_builder
+            .mul_private(
+                crate::program::Operand::Scalar(private_input),
+                crate::program::Operand::Scalar(rhs),
+            )
+            .unwrap();
+        let private_mul_program =
+            private_mul_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        assert!(RnsBggDerivedWorkload::from_program(&private_mul_program).is_ok());
+
+        let table = LutTable::unary(
+            2,
+            crate::program::ExpLayout { stride_log2: 0, width_log2: 1 },
+            2,
+            vec![0, 1],
+            crate::program::LutOutputRepresentation::Exponent(crate::program::ExpLayout {
+                stride_log2: 0,
+                width_log2: 1,
+            }),
+        )
+        .unwrap();
+        let mut public_lut_builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_input =
+            public_lut_builder.input(crate::program::AttributeKnowledge::PublicPayload).unwrap();
+        let lut = public_lut_builder.register_lut(table.clone()).unwrap();
+        let output =
+            public_lut_builder.lut(crate::program::Operand::Scalar(public_input), lut).unwrap();
+        let public_lut_program =
+            public_lut_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        assert!(RnsBggDerivedWorkload::from_program(&public_lut_program).is_err());
+
+        let mut private_lut_builder = crate::program::ExponentLutProgramBuilder::new();
+        let private_input =
+            private_lut_builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let lut = private_lut_builder.register_lut(table).unwrap();
+        let output =
+            private_lut_builder.lut(crate::program::Operand::Scalar(private_input), lut).unwrap();
+        let private_lut_program =
+            private_lut_builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        assert!(RnsBggDerivedWorkload::from_program(&private_lut_program).is_ok());
+    }
+
+    #[test]
     fn lut_payload_norms_follow_output_representation_through_private_mul() {
         fn trace_lut(table: LutTable, follow_private_mul: bool) -> RnsBggNoiseTrace {
             let mut builder = crate::program::ExponentLutProgramBuilder::new();
@@ -3898,7 +3992,7 @@ mod test {
         assert!(alignment.ratio() > &BigUint::one());
         assert_eq!(
             parameters
-                .mul_public_target_level(1, crate::program::AttributeKnowledge::PrivatePayload, 0,)
+                .mul_public_target_level(0, 1, crate::program::AttributeKnowledge::PrivatePayload)
                 .unwrap(),
             1
         );

@@ -302,21 +302,20 @@ impl RnsBggParameters {
 
     /// Select the target level for `MulPublic`.
     ///
-    /// A private left operand owns the computation level, so the public RHS
-    /// must be reducible from its source level to `lhs_level` (or already be
-    /// physically compatible).  A public left operand has no private level
-    /// owner; the lower-modulus compatible level is selected for both public
-    /// operands.  No upward public conversion is accepted in either case.
+    /// The public LHS is aligned to the RHS-owned level when the RHS is
+    /// private. For a public RHS, both carriers are aligned to the compatible
+    /// lower physical modulus (and the larger logical index when equal).
+    /// No upward conversion is accepted in either case.
     pub fn mul_public_target_level(
         &self,
         lhs_level: usize,
-        lhs_knowledge: crate::program::AttributeKnowledge,
         rhs_level: usize,
+        rhs_knowledge: crate::program::AttributeKnowledge,
     ) -> Result<usize, RnsBggError> {
-        match lhs_knowledge {
+        match rhs_knowledge {
             crate::program::AttributeKnowledge::PrivatePayload => {
-                self.public_alignment(rhs_level, lhs_level)?;
-                Ok(lhs_level)
+                self.public_alignment(lhs_level, rhs_level)?;
+                Ok(rhs_level)
             }
             crate::program::AttributeKnowledge::PublicPayload => {
                 let lhs = self.level(lhs_level)?;
@@ -864,10 +863,16 @@ pub(crate) fn compact_decompose_matrix(
     let base = 1u64
         .checked_shl(decomposition.base_bits())
         .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
-    let digits = decomposition.modulus_digits();
+    let decomposition_count = decomposition.modulus_digits();
     let value = (
-        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
-        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
+        (
+            matrix.0.0.decompose(base, decomposition_count),
+            matrix.0.1.decompose(base, decomposition_count),
+        ),
+        (
+            matrix.1.0.decompose(base, decomposition_count),
+            matrix.1.1.decompose(base, decomposition_count),
+        ),
     );
     if evaluation_modulus == decomposition_modulus {
         Ok(value)
@@ -1173,25 +1178,25 @@ mod tests {
         assert!(parameters.public_alignment(2, 0).is_err());
         assert_eq!(
             parameters
-                .mul_public_target_level(0, crate::program::AttributeKnowledge::PublicPayload, 2,)
+                .mul_public_target_level(0, 2, crate::program::AttributeKnowledge::PublicPayload)
                 .unwrap(),
             2
         );
         assert_eq!(
             parameters
-                .mul_public_target_level(2, crate::program::AttributeKnowledge::PublicPayload, 1,)
+                .mul_public_target_level(2, 1, crate::program::AttributeKnowledge::PublicPayload)
                 .unwrap(),
             2
         );
         assert_eq!(
             parameters
-                .mul_public_target_level(1, crate::program::AttributeKnowledge::PrivatePayload, 0,)
+                .mul_public_target_level(0, 1, crate::program::AttributeKnowledge::PrivatePayload)
                 .unwrap(),
             1
         );
         assert!(
             parameters
-                .mul_public_target_level(0, crate::program::AttributeKnowledge::PrivatePayload, 1,)
+                .mul_public_target_level(1, 0, crate::program::AttributeKnowledge::PrivatePayload)
                 .is_err()
         );
     }

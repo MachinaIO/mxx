@@ -100,15 +100,15 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
             mask.0.clone() * self.public_key.matrix.0.1.clone() +
                 mask.1.clone() * self.public_key.matrix.1.1.clone(),
         );
-        let delta = parameters.scalar(level, parameters.scale(level)?.clone())?;
         let deterministic = if self.public_payload.is_some() {
             let gadget = parameters.public_gadget(level)?;
-            let scale = expected.clone() * gadget * delta;
+            let scale = expected.clone() * gadget;
             (mask.0.clone() * scale.clone(), mask.1.clone() * scale)
         } else {
             let payload = reduce_secret(parameters, &payload.row, level)?;
             let gadget = parameters.state_gadget(level)?;
             let target = (payload.0 * gadget.clone(), payload.1 * gadget);
+            let delta = parameters.scalar(level, parameters.scale(level)?.clone())?;
             let scale = delta * expected;
             (target.0 * scale.clone(), target.1 * scale)
         };
@@ -555,13 +555,12 @@ fn encode_public_inner(
     }
     let s = reduce_secret(parameters, &mask.row, level)?;
     let gadget = parameters.public_gadget(level)?;
-    let scale = parameters.scalar(level, parameters.scale(level)?.clone())?;
     let matrix = key.matrix.clone();
     let mask_matrix = (
         s.0.clone() * matrix.0.0 + s.1.clone() * matrix.1.0,
         s.0.clone() * matrix.0.1 + s.1.clone() * matrix.1.1,
     );
-    let public_scale = plaintext.clone() * gadget * scale;
+    let public_scale = plaintext.clone() * gadget;
     let error = fresh_error(parameters, level, parameters.level(level)?.modulus_digits())?;
     let row = (
         mask_matrix.0 - s.0 * public_scale.clone() + error.0,
@@ -849,7 +848,7 @@ impl EncodingLowering<'_> {
                 selector: Box::new(index.expression()?),
                 branches: sigma_indices.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let d_sigma = compact_decompose_matrix(
+            let switching_decomposition = compact_decompose_matrix(
                 self.parameters,
                 evaluation_level,
                 decomposition_level,
@@ -859,7 +858,7 @@ impl EncodingLowering<'_> {
             let routed = map_matrix(input.public_key.matrix.clone(), |entry| {
                 entry.ring_automorphism(sigma.clone())
             });
-            let u_sigma = mod_down_public(
+            let switched_public_key = mod_down_public(
                 compact_right_action_public(
                     self.parameters,
                     evaluation_level,
@@ -870,14 +869,14 @@ impl EncodingLowering<'_> {
                 .map_err(|_| DslError::Schema)?,
                 target_modulus,
             );
-            let e_sigma = compact_decompose_matrix(
+            let switched_key_decomposition = compact_decompose_matrix(
                 self.parameters,
                 evaluation_level,
                 decomposition_level,
-                u_sigma,
+                switched_public_key,
             )
             .map_err(|_| DslError::Schema)?;
-            Ok((d_sigma, e_sigma))
+            Ok((switching_decomposition, switched_key_decomposition))
         })
         .map_err(graph)
     }
@@ -1151,65 +1150,60 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
             .program
             .wire_knowledge(rhs.wire())
             .map_err(|_| RnsBggError::Binding("MulPublic RHS metadata"))?;
-        if rhs_knowledge != AttributeKnowledge::PublicPayload {
-            return Err(RnsBggError::Binding("MulPublic RHS must be public"));
+        if lhs_knowledge != AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Binding("MulPublic LHS must be public"));
         }
         let lhs_level = self.workload.level(lhs.wire())?;
         let rhs_level = self.workload.level(rhs.wire())?;
         let target_level =
-            self.parameters.mul_public_target_level(lhs_level, lhs_knowledge, rhs_level)?;
+            self.parameters.mul_public_target_level(lhs_level, rhs_level, rhs_knowledge)?;
         let target_modulus =
             BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
 
-        // Align the complete public carrier (key and row) through the same
-        // source-to-target route before doing any same-level arithmetic.  A
-        // private LHS owns the target level and is already at that level; its
-        // key and row are therefore intentionally left untouched.  Equal
-        // physical moduli are handled as a no-op by the alignment helpers.
-        let (lhs_matrix, lhs_row) = if lhs_knowledge == AttributeKnowledge::PublicPayload {
-            (
-                apply_public_alignment_matrix(
-                    self.parameters,
-                    lhs_level,
-                    target_level,
-                    lhs.public_key.matrix.clone(),
-                )?,
-                apply_public_alignment_row(
-                    self.parameters,
-                    lhs_level,
-                    target_level,
-                    lhs.row.clone(),
-                )?,
-            )
-        } else {
-            (lhs.public_key.matrix.clone(), lhs.row.clone())
-        };
-        let rhs_matrix = apply_public_alignment_matrix(
+        // The public LHS is aligned to the private RHS-owned level. The RHS
+        // remains untouched when private; public/public additionally aligns
+        // its public carrier to the selected lower modulus.
+        let lhs_matrix = apply_public_alignment_matrix(
             self.parameters,
-            rhs_level,
+            lhs_level,
             target_level,
-            rhs.public_key.matrix.clone(),
+            lhs.public_key.matrix.clone(),
         )?;
-        let rhs_row =
-            apply_public_alignment_row(self.parameters, rhs_level, target_level, rhs.row.clone())?;
-        let rhs_payload =
-            rhs.public_payload.clone().ok_or(RnsBggError::Binding("public RHS payload missing"))?;
-        let rhs_payload = checked_modulus_convert(rhs_payload, target_modulus.clone())?;
-        let lhs_payload = lhs
+        let lhs_row =
+            apply_public_alignment_row(self.parameters, lhs_level, target_level, lhs.row.clone())?;
+        let rhs_matrix = if rhs_knowledge == AttributeKnowledge::PublicPayload {
+            apply_public_alignment_matrix(
+                self.parameters,
+                rhs_level,
+                target_level,
+                rhs.public_key.matrix.clone(),
+            )?
+        } else {
+            rhs.public_key.matrix.clone()
+        };
+        let rhs_row = if rhs_knowledge == AttributeKnowledge::PublicPayload {
+            apply_public_alignment_row(self.parameters, rhs_level, target_level, rhs.row.clone())?
+        } else {
+            rhs.row.clone()
+        };
+        let lhs_payload = checked_modulus_convert(
+            lhs.public_payload.clone().ok_or(RnsBggError::Binding("public LHS payload missing"))?,
+            target_modulus.clone(),
+        )?;
+        let rhs_payload = rhs
             .public_payload
             .clone()
             .map(|payload| checked_modulus_convert(payload, target_modulus.clone()))
             .transpose()?;
-        let lhs_action = lhs_matrix.clone();
         let row = add_encoding_rows(
             compact_right_action_row(
                 self.parameters,
                 target_level,
                 target_level,
-                rhs_row,
-                lhs_action.clone(),
+                lhs_row,
+                rhs_matrix.clone(),
             )?,
-            (lhs_row.0.clone() * rhs_payload.clone(), lhs_row.1.clone() * rhs_payload.clone()),
+            (rhs_row.0.clone() * lhs_payload.clone(), rhs_row.1.clone() * lhs_payload.clone()),
         );
         let output = self.site()?.output;
         let public_key = RnsBggPublicKey::new(
@@ -1218,15 +1212,11 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 self.parameters,
                 target_level,
                 target_level,
+                lhs_matrix,
                 rhs_matrix,
-                lhs_action,
             )?,
         );
-        let output_payload = if let Some(lhs_payload) = lhs_payload {
-            Some(lhs_payload * rhs_payload)
-        } else {
-            None
-        };
+        let output_payload = rhs_payload.map(|rhs_payload| lhs_payload * rhs_payload);
         Ok(RnsBggEncoding::new(public_key, row, self.checked_payload(output, output_payload)?))
     }
     fn mul_private(
@@ -1234,6 +1224,14 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.wire())
+            .map_err(|_| RnsBggError::Binding("MulPrivate input metadata"))? ==
+            AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Binding("RNS-BGG MulPrivate requires a private input"));
+        }
         let evaluation_level = self.workload.level(input.wire())?;
         let action = self.rhs_decomposition_at(rhs, evaluation_level)?;
         let output = self.site()?.output;
@@ -1254,6 +1252,14 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        if self
+            .program
+            .wire_knowledge(input.wire())
+            .map_err(|_| RnsBggError::Binding("LUT input metadata"))? ==
+            AttributeKnowledge::PublicPayload
+        {
+            return Err(RnsBggError::Binding("RNS-BGG LUT requires a private input"));
+        }
         let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let count = IntExpr::constant(table.values().len());
         let level = self.workload.level(input.wire())?;
@@ -1279,17 +1285,18 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            let (d_sigma, e_sigma) = actions.at(index.clone());
+            let (switching_decomposition, switched_key_decomposition) = actions.at(index.clone());
             let mask = helper.at(index.clone());
             let routed_input = (
                 input.row.0.clone().ring_automorphism(sigma.clone()),
                 input.row.1.clone().ring_automorphism(sigma),
             );
             let row = add_encoding_rows(
-                multiply_encoding_action(mask, e_sigma.clone()),
-                multiply_encoding_action(routed_input, d_sigma),
+                multiply_encoding_action(mask, switched_key_decomposition.clone()),
+                multiply_encoding_action(routed_input, switching_decomposition),
             );
-            let public_key = multiply_public_action(public_data.at(index), e_sigma);
+            let public_key =
+                multiply_public_action(public_data.at(index), switched_key_decomposition);
             Ok((row, public_key))
         })
         .map_err(graph)?;
@@ -4384,10 +4391,10 @@ mod test {
     #[test]
     fn mul_public_uses_only_second_payload_and_propagates_public_product() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let private_wire = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let public_wire = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_wire = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let output = builder
-            .mul_public(Operand::Scalar(private_wire), Operand::Scalar(public_wire))
+            .mul_public(Operand::Scalar(public_wire), Operand::Scalar(private_wire))
             .unwrap();
         let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
@@ -4434,8 +4441,8 @@ mod test {
         );
         let result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
             &mut lowerer,
-            &private,
             &public,
+            &private,
         )
         .unwrap();
         assert!(result.public_payload.is_none());
@@ -4446,8 +4453,8 @@ mod test {
         );
         let other_result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
             &mut lowerer,
-            &private,
             &public_with_other_payload,
+            &private,
         )
         .unwrap();
         assert_ne!(result.row.flatten(), other_result.row.flatten());
@@ -4512,13 +4519,13 @@ mod test {
     #[test]
     fn mul_public_aligns_public_carrier_before_private_same_level_action() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let private_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_input().unwrap();
         let private_level_one =
             builder.mul_private(Operand::Scalar(private_input), Operand::Scalar(rhs)).unwrap();
-        let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let output = builder
-            .mul_public(Operand::Scalar(private_level_one), Operand::Scalar(public_input))
+            .mul_public(Operand::Scalar(public_input), Operand::Scalar(private_level_one))
             .unwrap();
         let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
         let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
@@ -4570,8 +4577,8 @@ mod test {
         );
         let result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
             &mut lowerer,
-            &private,
             &public,
+            &private,
         )
         .unwrap();
         let expected = low_ring.matrix_type((1, private_columns));
@@ -4586,6 +4593,263 @@ mod test {
             assert_eq!(entry.matrix_type(), &expected);
         }
         assert!(result.public_payload.is_none());
+    }
+
+    #[test]
+    fn mul_public_encoding_rows_match_independent_residual_oracle() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_lhs_wire = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_rhs_wire = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public_rhs_wire = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let private_output = builder
+            .mul_public(Operand::Scalar(public_lhs_wire), Operand::Scalar(private_rhs_wire))
+            .unwrap();
+        let public_output = builder
+            .mul_public(Operand::Scalar(public_lhs_wire), Operand::Scalar(public_rhs_wire))
+            .unwrap();
+        let program = Arc::new(
+            builder
+                .finish(vec![Operand::Scalar(private_output), Operand::Scalar(public_output)])
+                .unwrap(),
+        );
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let public_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let private_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PrivatePayload).unwrap();
+        let entry = |columns, index| {
+            ring.constant((1, columns), ConstantMatrix::UnitRow { index: IntExpr::constant(index) })
+        };
+        let lhs_entry = entry(public_columns, 0);
+        let private_entry = entry(private_columns, 0);
+        let private_entry_alt = private_entry.clone() * IntExpr::constant(2);
+        let public_rhs_entry = entry(public_columns, 1);
+        let lhs_key = ((lhs_entry.clone(), lhs_entry.clone()), (lhs_entry.clone(), lhs_entry));
+        let private_rhs_key = (
+            (private_entry.clone(), private_entry_alt.clone()),
+            (private_entry_alt.clone(), private_entry),
+        );
+        let public_rhs_key = (
+            (public_rhs_entry.clone(), public_rhs_entry.clone()),
+            (public_rhs_entry.clone(), public_rhs_entry),
+        );
+        let mask = (ring.identity(1), ring.zero((1, 1)));
+        let payload = (ring.identity(1), ring.zero((1, 1)));
+        let lhs_plaintext = ring.polynomial([IntExpr::constant(2)]);
+        let private_plaintext = ring.polynomial([IntExpr::constant(3)]);
+        let public_rhs_plaintext = ring.polynomial([IntExpr::constant(5)]);
+        let public_gadget = parameters.public_gadget(0).unwrap();
+        let state_gadget = parameters.state_gadget(0).unwrap();
+        let delta = parameters.scalar(0, parameters.scale(0).unwrap().clone()).unwrap();
+        let mask_times_key = |key: &RnsBggMatrix| {
+            (
+                mask.0.clone() * key.0.0.clone() + mask.1.clone() * key.1.0.clone(),
+                mask.0.clone() * key.0.1.clone() + mask.1.clone() * key.1.1.clone(),
+            )
+        };
+        let public_signal =
+            (mask.0.clone() * public_gadget.clone(), mask.1.clone() * public_gadget.clone());
+        let private_signal = (
+            payload.0.clone() * state_gadget.clone() * delta.clone() * private_plaintext.clone(),
+            payload.1.clone() * state_gadget * delta * private_plaintext,
+        );
+        let lhs_row = {
+            let carrier = mask_times_key(&lhs_key);
+            (
+                carrier.0 - public_signal.0.clone() * lhs_plaintext.clone(),
+                carrier.1 - public_signal.1.clone() * lhs_plaintext.clone(),
+            )
+        };
+        let private_rhs_row = {
+            let carrier = mask_times_key(&private_rhs_key);
+            (carrier.0 - private_signal.0.clone(), carrier.1 - private_signal.1.clone())
+        };
+        let public_rhs_row = {
+            let carrier = mask_times_key(&public_rhs_key);
+            (
+                carrier.0 - public_signal.0.clone() * public_rhs_plaintext.clone(),
+                carrier.1 - public_signal.1.clone() * public_rhs_plaintext.clone(),
+            )
+        };
+        let mut lowerer = EncodingLowering {
+            parameters: &parameters,
+            program,
+            workload,
+            preprocess: ProductionId {
+                spec_hash: mxx_ir_core::artifact::SpecHash([127; 32]),
+                execution_nonce: [129; 32],
+            },
+            encryption: ProductionId {
+                spec_hash: mxx_ir_core::artifact::SpecHash([127; 32]),
+                execution_nonce: [129; 32],
+            },
+            catalog: ArtifactCatalog::default(),
+            current_site: Some(LoweringSite {
+                output: private_output,
+                indices: Vec::new(),
+                ranges: Vec::new(),
+            }),
+        };
+        let private_result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut lowerer,
+            &RnsBggEncoding::new(
+                RnsBggPublicKey::new(public_lhs_wire, lhs_key.clone()),
+                lhs_row.clone(),
+                Some(lhs_plaintext.clone()),
+            ),
+            &RnsBggEncoding::new(
+                RnsBggPublicKey::new(private_rhs_wire, private_rhs_key.clone()),
+                private_rhs_row.clone(),
+                None,
+            ),
+        )
+        .unwrap();
+        lowerer.current_site =
+            Some(LoweringSite { output: public_output, indices: Vec::new(), ranges: Vec::new() });
+        let public_result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut lowerer,
+            &RnsBggEncoding::new(
+                RnsBggPublicKey::new(public_lhs_wire, lhs_key.clone()),
+                lhs_row,
+                Some(lhs_plaintext.clone()),
+            ),
+            &RnsBggEncoding::new(
+                RnsBggPublicKey::new(public_rhs_wire, public_rhs_key.clone()),
+                public_rhs_row,
+                Some(public_rhs_plaintext.clone()),
+            ),
+        )
+        .unwrap();
+        let base = 1u64 << level.base_bits();
+        let columns = level.modulus_digits();
+        let direct_decompose = |matrix: RnsBggMatrix| {
+            (
+                (matrix.0.0.decompose(base, columns), matrix.0.1.decompose(base, columns)),
+                (matrix.1.0.decompose(base, columns), matrix.1.1.decompose(base, columns)),
+            )
+        };
+        let direct_action = |lhs: RnsBggMatrix, rhs: RnsBggDecomposition| {
+            (
+                (
+                    rhs.0.0.clone().mul_small_rhs(lhs.0.0.clone()) +
+                        rhs.1.0.clone().mul_small_rhs(lhs.0.1.clone()),
+                    rhs.0.1.clone().mul_small_rhs(lhs.0.0) + rhs.1.1.clone().mul_small_rhs(lhs.0.1),
+                ),
+                (
+                    rhs.0.0.mul_small_rhs(lhs.1.0.clone()) + rhs.1.0.mul_small_rhs(lhs.1.1.clone()),
+                    rhs.0.1.mul_small_rhs(lhs.1.0) + rhs.1.1.mul_small_rhs(lhs.1.1),
+                ),
+            )
+        };
+        let expected_private_key =
+            direct_action(lhs_key.clone(), direct_decompose(private_rhs_key.clone()));
+        let expected_public_key =
+            direct_action(lhs_key.clone(), direct_decompose(public_rhs_key.clone()));
+        let direct_row_action = |row: RnsBggRow, key: RnsBggMatrix| {
+            let decomposition = direct_decompose(key);
+            (
+                decomposition.0.0.mul_small_rhs(row.0.clone()) +
+                    decomposition.1.0.mul_small_rhs(row.1.clone()),
+                decomposition.0.1.mul_small_rhs(row.0) + decomposition.1.1.mul_small_rhs(row.1),
+            )
+        };
+        let mask_of = |key: &RnsBggMatrix| mask_times_key(key);
+        let public_action_for_private =
+            direct_row_action(public_signal.clone(), private_rhs_key.clone());
+        let private_rhs_carrier = mask_of(&private_rhs_key);
+        let private_expected_signal = (
+            public_action_for_private.0 * lhs_plaintext.clone() +
+                private_rhs_carrier.0 * -lhs_plaintext.clone() +
+                private_signal.0.clone() * lhs_plaintext.clone(),
+            public_action_for_private.1 * lhs_plaintext.clone() +
+                private_rhs_carrier.1 * -lhs_plaintext.clone() +
+                private_signal.1.clone() * lhs_plaintext.clone(),
+        );
+        let private_residual = (
+            private_result.row.0.clone() -
+                mask.0.clone() * expected_private_key.0.0 -
+                mask.1.clone() * expected_private_key.1.0 +
+                private_expected_signal.0.clone(),
+            private_result.row.1.clone() -
+                mask.0.clone() * expected_private_key.0.1 -
+                mask.1.clone() * expected_private_key.1.1 +
+                private_expected_signal.1,
+        );
+        let public_action = direct_row_action(public_signal.clone(), public_rhs_key.clone());
+        let public_rhs_carrier = mask_of(&public_rhs_key);
+        let public_expected_signal = (
+            public_action.0 * lhs_plaintext.clone() - public_rhs_carrier.0 * lhs_plaintext.clone() +
+                public_signal.0.clone() * lhs_plaintext * public_rhs_plaintext.clone(),
+            public_action.1 * ring.polynomial([IntExpr::constant(2)]) -
+                public_rhs_carrier.1 * ring.polynomial([IntExpr::constant(2)]) +
+                public_signal.1 * ring.polynomial([IntExpr::constant(2)]) * public_rhs_plaintext,
+        );
+        let public_residual = (
+            public_result.row.0.clone() -
+                mask.0.clone() * expected_public_key.0.0 -
+                mask.1.clone() * expected_public_key.1.0 +
+                public_expected_signal.0,
+            public_result.row.1.clone() -
+                mask.0.clone() * expected_public_key.0.1 -
+                mask.1.clone() * expected_public_key.1.1 +
+                public_expected_signal.1,
+        );
+        let wrong_rhs_key = (
+            (private_entry_alt.clone(), private_entry_alt.clone()),
+            (private_entry_alt.clone(), private_entry_alt),
+        );
+        let wrong_key = direct_action(lhs_key, direct_decompose(wrong_rhs_key));
+        let wrong_residual = private_result.row.0 -
+            mask.0.clone() * wrong_key.0.0 -
+            mask.1.clone() * wrong_key.1.0 +
+            private_expected_signal.0.clone();
+        let graph = DslContext::new("mul-public-encoding-residual-oracle")
+            .output("private-residual-0", private_residual.0)
+            .unwrap()
+            .output("private-residual-1", private_residual.1)
+            .unwrap()
+            .output("public-residual-0", public_residual.0)
+            .unwrap()
+            .output("public-residual-1", public_residual.1)
+            .unwrap()
+            .output("wrong-residual", wrong_residual)
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut backend = cpu_backend([level]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_graph(
+            StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+            &ParamEnv::default(),
+            &mut backend,
+            &mut store,
+            ExecutionConfig::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        for name in
+            ["private-residual-0", "private-residual-1", "public-residual-0", "public-residual-1"]
+        {
+            let RuntimeValue::Matrix(matrix) =
+                result.materialize_output(name, &mut backend, &mut store).unwrap()
+            else {
+                panic!("residual is not a matrix");
+            };
+            assert!(
+                matrix.entry(0, 0).coeffs_biguints().iter().all(|value| value.is_zero()),
+                "{name} residual is nonzero: {:?}",
+                matrix.entry(0, 0).coeffs_biguints()
+            );
+        }
+        let RuntimeValue::Matrix(wrong) =
+            result.materialize_output("wrong-residual", &mut backend, &mut store).unwrap()
+        else {
+            panic!("wrong residual is not a matrix");
+        };
+        assert!(wrong.entry(0, 0).coeffs_biguints().iter().any(|value| !value.is_zero()));
     }
 
     #[test]
@@ -4646,10 +4910,7 @@ mod test {
     }
 
     #[test]
-    fn public_lut_payload_is_evaluated_and_finalized_at_target_modulus() {
-        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+    fn public_lut_input_is_rejected_before_payload_propagation() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let table = LutTable::unary(
@@ -4662,52 +4923,8 @@ mod test {
         .unwrap();
         let lut = builder.register_lut(table.clone()).unwrap();
         let output = builder.lut(Operand::Scalar(input), lut).unwrap();
-        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
-        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
-        let production = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([59; 32]),
-            execution_nonce: [61; 32],
-        };
-        let mut lowerer = EncodingLowering {
-            parameters: &parameters,
-            program,
-            workload,
-            preprocess: production.clone(),
-            encryption: production,
-            catalog: ArtifactCatalog::default(),
-            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
-        };
-        let ring = parameters.ring(0).unwrap();
-        let key_columns =
-            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
-        let row_columns = parameters.component_columns(0).unwrap();
-        let key_value = ring.input("public-lut-key", (1, key_columns));
-        let row_value = ring.input("public-lut-row", (1, row_columns));
-        let input = RnsBggEncoding::new(
-            RnsBggPublicKey::new(
-                input,
-                ((key_value.clone(), key_value.clone()), (key_value.clone(), key_value)),
-            ),
-            (row_value.clone(), row_value),
-            Some(ring.identity(1)),
-        );
-        let result =
-            <EncodingLowering<'_> as ExponentLUTProgramLowering>::lut(&mut lowerer, &input, &table)
-                .unwrap();
-        assert!(result.public_payload.is_some());
-        assert_eq!(
-            result.public_payload.as_ref().unwrap().matrix_type().modulus,
-            IntExpr::constant(BigInt::from(
-                parameters.level(0).unwrap().modulus().as_ref().clone()
-            ))
-        );
-        let finalized = lowerer.finish_outputs(vec![result]).unwrap().pop().unwrap();
-        assert_eq!(
-            finalized.public_payload.as_ref().unwrap().matrix_type().modulus,
-            IntExpr::constant(BigInt::from(
-                parameters.level(1).unwrap().modulus().as_ref().clone()
-            ))
-        );
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        assert!(RnsBggDerivedWorkload::from_program(&program).is_err());
     }
 
     #[test]

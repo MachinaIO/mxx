@@ -299,10 +299,10 @@ mod tests {
         }
         fn mul_public(
             &mut self,
-            private: &Self::Wire,
-            public: &Self::Wire,
+            lhs: &Self::Wire,
+            rhs: &Self::Wire,
         ) -> Result<Self::Wire, Self::Error> {
-            Ok(private.clone().add(public.clone()))
+            Ok(lhs.clone().add(rhs.clone()))
         }
         fn mul_private(
             &mut self,

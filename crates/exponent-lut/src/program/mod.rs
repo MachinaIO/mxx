@@ -445,7 +445,7 @@ impl LutTable {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) enum Step {
     Add { lhs: Operand<WireId>, rhs: Operand<WireId>, output: WireId },
-    MulPublic { private: Operand<WireId>, public: Operand<WireId>, output: WireId },
+    MulPublic { lhs: Operand<WireId>, rhs: Operand<WireId>, output: WireId },
     MulPrivate { input: Operand<WireId>, rhs: Operand<RhsId>, output: WireId },
     Lut { input: Operand<WireId>, table: LutId, output: WireId },
     Parallel { range: FamilyRange, body: Box<Body>, output: WireId },
@@ -714,25 +714,18 @@ fn derive_body_metadata(
                 }
                 lhs
             }
-            Step::MulPublic { private, public, .. } => {
-                let lhs = metadata_for_operand(private, metadata)?;
-                let rhs = metadata_for_operand(public, metadata)?;
-                if rhs.knowledge != AttributeKnowledge::PublicPayload ||
+            Step::MulPublic { lhs, rhs, .. } => {
+                let lhs = metadata_for_operand(lhs, metadata)?;
+                let rhs = metadata_for_operand(rhs, metadata)?;
+                if lhs.knowledge != AttributeKnowledge::PublicPayload ||
                     lhs.coefficient ||
                     rhs.coefficient
                 {
                     return Err(ProgramValidationError::InvalidStructure(
-                        "MulPublic requires a public exponent RHS and exponent operands".into(),
+                        "MulPublic requires a public exponent LHS and exponent operands".into(),
                     ));
                 }
-                WireMetadata {
-                    knowledge: if lhs.knowledge == AttributeKnowledge::PublicPayload {
-                        AttributeKnowledge::PublicPayload
-                    } else {
-                        AttributeKnowledge::PrivatePayload
-                    },
-                    coefficient: false,
-                }
+                WireMetadata { knowledge: rhs.knowledge, coefficient: false }
             }
             Step::MulPrivate { input, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
@@ -741,7 +734,7 @@ fn derive_body_metadata(
                         "MulPrivate cannot consume a coefficient output".into(),
                     ));
                 }
-                WireMetadata { knowledge: input.knowledge, coefficient: false }
+                WireMetadata { knowledge: AttributeKnowledge::PrivatePayload, coefficient: false }
             }
             Step::Lut { input, table, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
@@ -830,9 +823,9 @@ fn validate_body(
                 check_wire_operand(right, visible, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
-            Step::MulPublic { private, public, output } => {
-                check_wire_operand(private, visible, false, depth, loop_bounds)?;
-                check_wire_operand(public, visible, false, depth, loop_bounds)?;
+            Step::MulPublic { lhs, rhs, output } => {
+                check_wire_operand(lhs, visible, false, depth, loop_bounds)?;
+                check_wire_operand(rhs, visible, false, depth, loop_bounds)?;
                 (*output, VisibleKind::Scalar)
             }
             Step::MulPrivate { input, rhs: right, output } => {
@@ -1272,20 +1265,21 @@ mod tests {
     }
 
     #[test]
-    fn public_and_private_input_knowledge_is_preserved_through_public_multiplication() {
+    fn public_left_and_rhs_knowledge_are_preserved_through_public_multiplication() {
         let mut builder = ExponentLutProgramBuilder::new();
         let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let product =
-            builder.mul_public(Operand::Scalar(private), Operand::Scalar(public)).unwrap();
+            builder.mul_public(Operand::Scalar(public), Operand::Scalar(private)).unwrap();
         let program = builder.finish(vec![Operand::Scalar(product)]).unwrap();
 
         assert_eq!(program.inputs[&private].knowledge(), AttributeKnowledge::PrivatePayload);
         assert_eq!(program.inputs[&public].knowledge(), AttributeKnowledge::PublicPayload);
+        assert_eq!(program.wire_knowledge(product).unwrap(), AttributeKnowledge::PrivatePayload);
         assert!(matches!(
             program.body.steps.as_slice(),
-            [Step::MulPublic { private: Operand::Scalar(lhs), public: Operand::Scalar(rhs), .. }]
-                if *lhs == private && *rhs == public
+            [Step::MulPublic { lhs: Operand::Scalar(lhs), rhs: Operand::Scalar(rhs), .. }]
+                if *lhs == public && *rhs == private
         ));
     }
 
@@ -1300,19 +1294,54 @@ mod tests {
     }
 
     #[test]
-    fn public_multiplication_requires_exact_operand_knowledge() {
-        fn rejects(lhs_knowledge: AttributeKnowledge, rhs_knowledge: AttributeKnowledge) -> bool {
+    fn public_multiplication_requires_public_lhs_and_preserves_rhs_knowledge() {
+        fn accepts(lhs_knowledge: AttributeKnowledge, rhs_knowledge: AttributeKnowledge) -> bool {
             let mut builder = ExponentLutProgramBuilder::new();
             let lhs = builder.input(lhs_knowledge).unwrap();
             let rhs = builder.input(rhs_knowledge).unwrap();
-            let output = builder.mul_public(Operand::Scalar(lhs), Operand::Scalar(rhs)).unwrap();
-            builder.finish(vec![Operand::Scalar(output)]).is_err()
+            let Ok(output) = builder.mul_public(Operand::Scalar(lhs), Operand::Scalar(rhs)) else {
+                return false;
+            };
+            builder.finish(vec![Operand::Scalar(output)]).is_ok()
         }
 
-        assert!(rejects(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PrivatePayload));
-        assert!(rejects(AttributeKnowledge::PublicPayload, AttributeKnowledge::PrivatePayload));
-        assert!(!rejects(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PublicPayload));
-        assert!(!rejects(AttributeKnowledge::PublicPayload, AttributeKnowledge::PublicPayload));
+        assert!(!accepts(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PrivatePayload));
+        assert!(!accepts(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PublicPayload));
+        assert!(accepts(AttributeKnowledge::PublicPayload, AttributeKnowledge::PrivatePayload));
+        assert!(accepts(AttributeKnowledge::PublicPayload, AttributeKnowledge::PublicPayload));
+    }
+
+    #[test]
+    fn private_rhs_products_are_private_for_scalar_and_family_inputs() {
+        let mut builder = ExponentLutProgramBuilder::new();
+        let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let scalar_product =
+            builder.mul_private(Operand::Scalar(public_input), Operand::Scalar(rhs)).unwrap();
+
+        let public_family =
+            builder.input_family(IntExpr::constant(2), AttributeKnowledge::PublicPayload).unwrap();
+        let rhs_family = builder.rhs_family(IntExpr::constant(2)).unwrap();
+        let products = builder
+            .parallel(FamilyRange::full(IntExpr::constant(2)).unwrap(), |builder, index| {
+                builder
+                    .mul_private(
+                        Operand::Member { family: public_family, index: index.clone() },
+                        Operand::Member { family: rhs_family, index },
+                    )
+                    .map(Operand::Scalar)
+            })
+            .unwrap();
+        let family_sum = builder.sum(products).unwrap();
+        let program = builder
+            .finish(vec![Operand::Scalar(scalar_product), Operand::Scalar(family_sum)])
+            .unwrap();
+
+        assert_eq!(
+            program.wire_knowledge(scalar_product).unwrap(),
+            AttributeKnowledge::PrivatePayload
+        );
+        assert_eq!(program.wire_knowledge(family_sum).unwrap(), AttributeKnowledge::PrivatePayload);
     }
 
     #[test]
@@ -1390,9 +1419,8 @@ mod tests {
         let mut builder = ExponentLutProgramBuilder::new();
         let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let sum = builder.add(Operand::Scalar(private), Operand::Scalar(public)).unwrap();
         assert!(matches!(
-            builder.finish(vec![Operand::Scalar(sum)]),
+            builder.add(Operand::Scalar(private), Operand::Scalar(public)),
             Err(ProgramValidationError::InvalidStructure(_))
         ));
     }
@@ -1468,8 +1496,8 @@ mod tests {
             .parallel(public_range, |builder, index| {
                 builder
                     .mul_public(
-                        Operand::Member { family: wires, index: index.clone() },
-                        Operand::Member { family: public_wires, index },
+                        Operand::Member { family: public_wires, index: index.clone() },
+                        Operand::Member { family: wires, index },
                     )
                     .map(Operand::Scalar)
             })

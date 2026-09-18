@@ -14,23 +14,22 @@ use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-/// Apply a sequence of public factors to a private accumulator.
+/// Apply a sequence of public factors to an accumulator.
 ///
-/// `MulPublic` is deliberately private-first, so public factors cannot be
-/// multiplied into a public intermediate product. Associativity lets the
-/// structural PRF use the equivalent left-associated product while every
-/// gate remains a valid private/public operation.
+/// `MulPublic` is public-left: every factor is the public LHS and the running
+/// accumulator is the RHS. The first RHS may be private; subsequent gates
+/// preserve that RHS knowledge while remaining valid public-left operations.
 fn apply_public_product(
     builder: &mut ExponentLutProgramBuilder,
-    private: WireId,
+    rhs: WireId,
     leaves: Vec<Operand<WireId>>,
 ) -> Result<WireId, ProgramValidationError> {
     if leaves.is_empty() {
         return Err(ProgramValidationError::InvalidStructure("empty product".into()));
     }
-    let mut state = Operand::Scalar(private);
-    for public in leaves {
-        state = Operand::Scalar(builder.mul_public(state, public)?);
+    let mut state = Operand::Scalar(rhs);
+    for lhs in leaves {
+        state = Operand::Scalar(builder.mul_public(lhs, state)?);
     }
     match state {
         Operand::Scalar(wire) => Ok(wire),
@@ -987,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn public_product_keeps_the_private_accumulator_first() {
+    fn public_product_keeps_public_factors_on_the_left() {
         let mut builder = ExponentLutProgramBuilder::new();
         let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let a = builder.input(AttributeKnowledge::PublicPayload).unwrap();

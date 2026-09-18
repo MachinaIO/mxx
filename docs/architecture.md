@@ -288,8 +288,9 @@ The crate-facing facade exposes the concrete application constructors and the
 stage functions `api::preprocess`, `api::encrypt`, `api::online_eval`, and
 `api::noise_simulate`. `StageArtifacts` carries ordinary, consumer-specific
 artifact results, while `StageGraph` retains runtime-owned graph outputs and
-leases. Program builders, lowering sites, environments, and artifact namespace
-details are implementation concerns; there is no blanket `advanced` export or
+leases. `ExponentLutProgramBuilder` exposes only validated construction
+operations; lowering sites, environments, and artifact namespace details
+remain implementation concerns. There is no blanket `advanced` export or
 compatibility namespace for them.
 
 `program/mod.rs` owns the immutable Program, opaque identifiers, declarations,
@@ -297,10 +298,11 @@ LUT tables, explicit `ExpLayout`, and structural validation. `program/builder.rs
 owns construction and rollback of the validated instruction graph. The
 scheme-independent `program/lowering.rs` trait operates on one scalar wire per
 gate and keeps helper/material state in the evaluator implementation; the LUT
-operation receives its `LutId` and resolved table. `program/graph.rs` contains
-the DSL family projection and reduction adapter. Backend GraphValue schemas
-are defined by the concrete RNS-BGG carriers, not by a duplicate Program
-carrier hierarchy.
+operation receives its resolved table. `MulPublic` requires a public exponent
+LHS and permits either knowledge class on the exponent RHS, preserving the RHS
+knowledge in its output. `program/graph.rs` contains the DSL family projection
+and reduction adapter. Backend GraphValue schemas are defined by the concrete
+RNS-BGG carriers, not by a duplicate Program carrier hierarchy.
 
 Stage artifacts are bound lazily through the existing runtime catalog. Compact
 RNS-BGG matrices and paired public-key/encoding carriers are the persisted

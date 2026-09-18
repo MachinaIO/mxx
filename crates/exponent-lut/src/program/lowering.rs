@@ -7,15 +7,13 @@ pub trait ExponentLUTProgramLowering {
     type Error: Error + Send + Sync + 'static;
 
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error>;
-    /// Multiply the private/exponent left operand by the public/exponent right
-    /// operand. The argument order is part of the program contract and is
-    /// intentionally not commutative: prepared actions and noise accounting
-    /// attach to the private operand first.
-    fn mul_public(
-        &mut self,
-        private: &Self::Wire,
-        public: &Self::Wire,
-    ) -> Result<Self::Wire, Self::Error>;
+    /// Multiply the public exponent left operand by the exponent right
+    /// operand. The right operand may be public or private; the result keeps
+    /// the right operand's knowledge. The argument order is part of the
+    /// program contract and is intentionally not commutative because prepared
+    /// actions and noise accounting attach to the public left operand.
+    fn mul_public(&mut self, lhs: &Self::Wire, rhs: &Self::Wire)
+    -> Result<Self::Wire, Self::Error>;
     fn mul_private(
         &mut self,
         input: &Self::Wire,
@@ -199,11 +197,11 @@ where
                         evaluator.add(&lhs, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
-                Step::MulPublic { private, public, .. } => {
-                    let private = resolve_wire(private, families, environment, indices)?;
-                    let public = resolve_wire(public, families, environment, indices)?;
+                Step::MulPublic { lhs, rhs, .. } => {
+                    let lhs = resolve_wire(lhs, families, environment, indices)?;
+                    let rhs = resolve_wire(rhs, families, environment, indices)?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
-                        evaluator.mul_public(&private, &public).map_err(ProgramLowerError::Backend)
+                        evaluator.mul_public(&lhs, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
                 Step::MulPrivate { input, rhs, .. } => {
@@ -457,10 +455,10 @@ mod tests {
         }
         fn mul_public(
             &mut self,
-            private: &Self::Wire,
-            public: &Self::Wire,
+            lhs: &Self::Wire,
+            rhs: &Self::Wire,
         ) -> Result<Self::Wire, Self::Error> {
-            Ok(private * public)
+            Ok(lhs * rhs)
         }
         fn mul_private(
             &mut self,

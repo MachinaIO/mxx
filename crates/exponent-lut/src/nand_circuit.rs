@@ -416,10 +416,10 @@ mod tests {
 
         fn mul_public(
             &mut self,
-            private: &Self::Wire,
-            public: &Self::Wire,
+            lhs: &Self::Wire,
+            rhs: &Self::Wire,
         ) -> Result<Self::Wire, Self::Error> {
-            Ok(private.wrapping_mul(*public))
+            Ok(lhs.wrapping_mul(*rhs))
         }
 
         fn mul_private(

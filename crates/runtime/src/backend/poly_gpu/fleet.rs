@@ -1885,11 +1885,18 @@ impl GpuDcrtBackend {
             .ok_or(PolyBackendError::InvalidConstantShape)?;
         let modulus = BigInt::from(prototype.value.params().modulus().as_ref().clone());
         let ring_dimension = prototype.value.params().ring_dimension() as usize;
+        let mapped = Self::fixed_policy_ranges(
+            &NodeKind::Concat { axis: ConcatAxis::Diagonal },
+            inputs,
+            columns,
+            start,
+            end,
+        )?;
         let (device_id, backend) = &mut self.devices[0];
         let value = Self::diagonal_range_on_device(
             backend,
             inputs,
-            &[],
+            &mapped,
             &input_columns,
             rows,
             &modulus,
@@ -7480,11 +7487,21 @@ impl Backend for GpuDcrtBackend {
                     .filter_map(|(device, (device_id, backend))| {
                         let (_, start, end) =
                             *wave.iter().find(|(owner, _, _)| *owner == device)?;
+                        let mapped = match Self::fixed_policy_ranges(
+                            &NodeKind::Concat { axis: ConcatAxis::Diagonal },
+                            inputs,
+                            columns,
+                            start,
+                            end,
+                        ) {
+                            Ok(mapped) => mapped,
+                            Err(error) => return Some(Err(error)),
+                        };
                         Some(
                             Self::diagonal_range_on_device(
                                 backend,
                                 inputs,
-                                &[],
+                                &mapped,
                                 &input_columns,
                                 rows,
                                 &modulus,

@@ -59,13 +59,22 @@ pub(crate) struct GpuSmallMatrixAllocationReportRaw {
 }
 
 #[repr(C)]
+/// Exact allocation sizes returned by the native matrix allocator's size
+/// query.  The query includes the data slab, auxiliary descriptors and the
+/// event/lifetime bookkeeping owned by one matrix.  It does not include any
+/// input matrices or operation scratch; callers must account for those as
+/// separate live owners.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct GpuMatrixAllocationBytesRaw {
+pub struct GpuMatrixAllocationBytes {
     pub data_bytes: usize,
     pub aux_bytes: usize,
     pub event_bytes: usize,
     pub total_bytes: usize,
 }
+
+// Keep the CUDA FFI spelling private to the implementation while allowing
+// existing raw-report users in this module to continue compiling.
+type GpuMatrixAllocationBytesRaw = GpuMatrixAllocationBytes;
 
 #[allow(non_camel_case_types)]
 #[repr(C)]
@@ -142,9 +151,14 @@ unsafe extern "C" {
         device: c_int,
         out_name: *mut c_char,
         name_capacity: usize,
+        out_uuid: *mut c_char,
+        uuid_capacity: usize,
         out_compute_major: *mut c_int,
         out_compute_minor: *mut c_int,
         out_total_global_memory: *mut usize,
+        out_driver_version: *mut c_int,
+        out_runtime_version: *mut c_int,
+        out_context_generation: *mut u64,
     ) -> c_int;
     fn gpu_context_fence_releases(ctx: *const GpuContextOpaque) -> c_int;
 
@@ -175,6 +189,11 @@ unsafe extern "C" {
         dst: *mut GpuMatrixOpaque,
         src: *const GpuMatrixOpaque,
         out_copied: *mut c_int,
+    ) -> c_int;
+    pub(crate) fn gpu_matrix_copy_peer_query(
+        src: *const GpuMatrixOpaque,
+        dst_ctx: *const GpuContextOpaque,
+        out_compatible: *mut c_int,
     ) -> c_int;
     pub(crate) fn gpu_matrix_load_rns_batch(
         mat: *mut GpuMatrixOpaque,
@@ -484,6 +503,13 @@ unsafe extern "C" {
         bound_word_count: usize,
         out: *mut *mut GpuSmallMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_small_matrix_query_allocation_bytes(
+        ctx: *const GpuContextOpaque,
+        rows: usize,
+        cols: usize,
+        magnitude_bytes: usize,
+        out: *mut GpuMatrixAllocationBytesRaw,
+    ) -> c_int;
     pub(crate) fn gpu_small_matrix_destroy(mat: *mut GpuSmallMatrixOpaque);
     pub(crate) fn gpu_small_matrix_wait(mat: *const GpuSmallMatrixOpaque) -> c_int;
     pub(crate) fn gpu_small_matrix_copy(
@@ -570,9 +596,32 @@ pub(crate) fn last_error_string() -> String {
     }
 }
 
+const GPU_STATUS_OUT_OF_MEMORY: c_int = 2;
+
+/// A device allocation failed with CUDA's typed memory-allocation status.
+///
+/// Most legacy GPU owners expose infallible constructors and use
+/// `check_status` internally.  This payload lets setup-time callers catch
+/// that one expected resource failure and turn it into a normal `Result`
+/// without classifying arbitrary CUDA or host allocation errors as OOM.
+#[derive(Debug)]
+pub struct GpuOutOfMemory(String);
+
+impl std::fmt::Display for GpuOutOfMemory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for GpuOutOfMemory {}
+
 pub(crate) fn check_status(code: c_int, context: &str) {
     if code != 0 {
-        panic!("{context} failed: {}", last_error_string());
+        let message = format!("{context} failed: {}", last_error_string());
+        if code == GPU_STATUS_OUT_OF_MEMORY {
+            std::panic::panic_any(GpuOutOfMemory(message));
+        }
+        panic!("{message}");
     }
 }
 
@@ -627,21 +676,67 @@ pub struct GpuDeviceIdentity {
     pub total_global_memory: usize,
 }
 
+/// The complete physical/native identity used by setup-time warmup profile
+/// keys. Unlike the legacy calibration identity above, this includes the
+/// immutable CUDA UUID, driver/runtime ABI versions, the native kernel build
+/// revision, and the actual context lifecycle generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuDeviceRuntimeIdentity {
+    pub uuid: String,
+    pub name: String,
+    pub compute_major: i32,
+    pub compute_minor: i32,
+    pub total_global_memory: usize,
+    pub driver_version: i32,
+    pub runtime_version: i32,
+    pub native_kernel_revision: String,
+    pub context_generation: u64,
+}
+
+/// Stable, non-address identity for one backend-owned CUDA context.
+///
+/// A context may span several physical devices.  Device UUIDs and lifecycle
+/// generations are queried from the native runtime for every owner device;
+/// no raw pointer, allocator address, or secret/context contents cross this
+/// boundary.  The ordered device list is part of the identity because limb
+/// ownership is operation-visible for multi-GPU RNS execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuContextRuntimeIdentity {
+    pub devices: Vec<GpuDeviceRuntimeIdentity>,
+}
+
+/// Revision embedded by the primitives build script from the actual CUDA
+/// sources and compilation settings. It intentionally does not use the
+/// crate/package version: changing a native kernel must invalidate warmup
+/// profiles even when the package version is unchanged.
+pub fn gpu_native_kernel_build_revision() -> &'static str {
+    env!("MXX_NATIVE_KERNEL_BUILD_REVISION")
+}
+
 /// Returns stable hardware properties used to scope reusable calibration data.
 /// This CUDA runtime query does not synchronize device work.
 pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
     let mut name = [0 as c_char; 256];
+    let mut uuid = [0 as c_char; 64];
     let mut compute_major = 0;
     let mut compute_minor = 0;
     let mut total_global_memory = 0;
+    let mut driver_version = 0;
+    let mut runtime_version = 0;
+    let mut context_generation = 0;
     let status = unsafe {
         gpu_device_get_identity(
             device,
             name.as_mut_ptr(),
             name.len(),
+            uuid.as_mut_ptr(),
+            uuid.len(),
             &mut compute_major,
             &mut compute_minor,
             &mut total_global_memory,
+            &mut driver_version,
+            &mut runtime_version,
+            &mut context_generation,
         )
     };
     if status != 0 {
@@ -649,6 +744,52 @@ pub fn gpu_device_identity(device: i32) -> Result<GpuDeviceIdentity, String> {
     }
     let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
     Ok(GpuDeviceIdentity { name, compute_major, compute_minor, total_global_memory })
+}
+
+/// Queries all physical and native identity fields required to scope a GPU
+/// warmup profile. The context generation is read by the same native query
+/// as allocator accounting, so destroying/recreating a context invalidates
+/// the identity even when the physical CUDA device is unchanged.
+pub fn gpu_device_runtime_identity(device: i32) -> Result<GpuDeviceRuntimeIdentity, String> {
+    let mut name = [0 as c_char; 256];
+    let mut uuid = [0 as c_char; 64];
+    let mut compute_major = 0;
+    let mut compute_minor = 0;
+    let mut total_global_memory = 0;
+    let mut driver_version = 0;
+    let mut runtime_version = 0;
+    let mut context_generation = 0;
+    let status = unsafe {
+        gpu_device_get_identity(
+            device,
+            name.as_mut_ptr(),
+            name.len(),
+            uuid.as_mut_ptr(),
+            uuid.len(),
+            &mut compute_major,
+            &mut compute_minor,
+            &mut total_global_memory,
+            &mut driver_version,
+            &mut runtime_version,
+            &mut context_generation,
+        )
+    };
+    if status != 0 {
+        return Err(last_error_string());
+    }
+    let name = unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned();
+    let uuid = unsafe { CStr::from_ptr(uuid.as_ptr()) }.to_string_lossy().into_owned();
+    Ok(GpuDeviceRuntimeIdentity {
+        uuid,
+        name,
+        compute_major,
+        compute_minor,
+        total_global_memory,
+        driver_version,
+        runtime_version,
+        native_kernel_revision: gpu_native_kernel_build_revision().to_owned(),
+        context_generation,
+    })
 }
 
 /// Returns the CUDA allocator-visible memory counters for one detected device.
@@ -1160,6 +1301,26 @@ impl GpuDCRTPolyParams {
         self.ctx.raw_ptr()
     }
 
+    /// Opaque numeric execution token used only for in-process ownership
+    /// comparisons.  It is not an address and must not be persisted as a
+    /// profile key; use [`Self::context_runtime_identity`] for persistence.
+    pub fn context_execution_identity(&self) -> u64 {
+        self.ctx.execution_identity()
+    }
+
+    /// Return the physical/native identity of every device owned by this
+    /// parameter context.  The query is intentionally ordered by the context
+    /// device list so callers can validate multi-ring RNS ownership without
+    /// collapsing distinct contexts onto one device id.
+    pub fn context_runtime_identity(&self) -> Result<GpuContextRuntimeIdentity, String> {
+        self.gpu_ids
+            .iter()
+            .copied()
+            .map(gpu_device_runtime_identity)
+            .collect::<Result<Vec<_>, _>>()
+            .map(|devices| GpuContextRuntimeIdentity { devices })
+    }
+
     pub fn vram_budget_bytes(&self) -> usize {
         self.ctx.vram_budget_bytes
     }
@@ -1169,13 +1330,17 @@ impl GpuDCRTPolyParams {
         self.vram_percent
     }
 
-    pub(crate) fn matrix_allocation_bytes(
+    /// Query the exact native allocation envelope for a matrix shape.  This
+    /// is a side-effect-free size query: it does not allocate, enqueue work,
+    /// or change allocator residency.  `level` is inclusive and `is_ntt`
+    /// selects the same format used by the production matrix owner.
+    pub fn matrix_allocation_bytes(
         &self,
         level: usize,
         rows: usize,
         columns: usize,
         is_ntt: bool,
-    ) -> Result<GpuMatrixAllocationBytesRaw, String> {
+    ) -> Result<GpuMatrixAllocationBytes, String> {
         if level >= self.crt_depth {
             return Err("matrix allocation query level exceeds CRT depth".to_string());
         }
@@ -1853,6 +2018,19 @@ mod tests {
         sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
     };
     use rand::prelude::*;
+
+    #[test]
+    fn test_gpu_status_classifies_only_typed_out_of_memory() {
+        let out_of_memory = std::panic::catch_unwind(|| {
+            check_status(GPU_STATUS_OUT_OF_MEMORY, "matrix allocation")
+        })
+        .expect_err("typed CUDA OOM must be reported through the panic payload");
+        assert!(out_of_memory.downcast_ref::<GpuOutOfMemory>().is_some());
+
+        let other_error = std::panic::catch_unwind(|| check_status(1, "kernel launch"))
+            .expect_err("non-OOM CUDA errors must still fail");
+        assert!(other_error.downcast_ref::<GpuOutOfMemory>().is_none());
+    }
 
     #[test]
     #[sequential]

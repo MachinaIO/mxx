@@ -694,8 +694,32 @@ impl GpuLayout {
         }
         let offset = ((instance as u128 * self.instance_device_stride as u128) %
             widths.len() as u128) as usize;
-        let owners = self
-            .owner_intervals
+        // Layouts loaded from older/value-only plans may omit explicit
+        // ownership.  Production uses the deterministic balanced mapper for
+        // that representation; schedule construction must use the same map
+        // instead of handing an empty interval list to `GpuColumnSchedule`.
+        // Keeping this lowering here also makes every caller (warmup,
+        // fixed dispatch, and tests) observe identical owner geometry.
+        let owner_intervals = if self.owner_intervals.is_empty() && self.columns > 0 {
+            let base = self.columns / widths.len();
+            let remainder = self.columns % widths.len();
+            let mut start = 0usize;
+            (0..widths.len())
+                .filter_map(|device| {
+                    let length = base + usize::from(device < remainder);
+                    let interval = (length > 0).then_some(GpuColumnInterval {
+                        device,
+                        start,
+                        end: start + length,
+                    });
+                    start += length;
+                    interval
+                })
+                .collect::<Vec<_>>()
+        } else {
+            self.owner_intervals.clone()
+        };
+        let owners = owner_intervals
             .iter()
             .map(|interval| GpuColumnInterval {
                 device: (interval.device + offset) % widths.len(),
@@ -1203,6 +1227,27 @@ mod tests {
             instance_device_stride: 0,
             owner_intervals: vec![GpuColumnInterval { device: 0, start: 0, end: 3 }],
         }
+    }
+
+    #[test]
+    fn empty_layout_ownership_uses_the_balanced_production_mapper() {
+        let layout = GpuLayout {
+            id: 9,
+            columns: 5,
+            rows: 1,
+            ring_dimension: 1,
+            representation: "matrix".into(),
+            instance_device_stride: 0,
+            owner_intervals: Vec::new(),
+        };
+        let schedule = layout.schedule(&[2, 2], 0).unwrap();
+        assert_eq!(
+            schedule.intervals(),
+            &[
+                GpuColumnInterval { device: 0, start: 0, end: 3 },
+                GpuColumnInterval { device: 1, start: 3, end: 5 },
+            ]
+        );
     }
 
     #[test]

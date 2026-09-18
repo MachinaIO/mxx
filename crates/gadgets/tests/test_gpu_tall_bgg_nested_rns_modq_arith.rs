@@ -1302,11 +1302,14 @@ fn benchmark_estimation(
         measurement_workers = device_ids.len(),
         "fleet-wide benchmark estimator parallelism"
     );
-    let backends = device_ids
-        .iter()
-        .copied()
-        .map(|device_id| (gpu_backend_on([gpu_parameters.clone()], [device_id]), device_id))
-        .collect();
+    // Keep one production fleet owner for warmup.  Constructing one
+    // single-device backend per worker prevents the inclusive measurement
+    // boundary from materializing source shards on their real owners, so a
+    // cross-device range is incorrectly observed as resident on the
+    // destination.  The fleet backend retains every physical owner and lets
+    // the mapper select Peer/HostStaging exactly as fixed execution does.
+    let measurement_backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+    let backends = vec![(measurement_backend, device_ids[0])];
     let mut backend = GpuNodeMeasurementBackend::new(backends, harness);
     info!("collecting unique GPU measurement shapes");
     estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;

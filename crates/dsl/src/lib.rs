@@ -842,6 +842,51 @@ impl Ring {
         }
     }
 
+    /// Constructs a public gadget trapdoor whose fixed execution lowers to
+    /// gadget decomposition of the target.  Unlike [`Self::sample_trapdoor`],
+    /// this node has no secret sampling step and therefore is suitable for
+    /// protocols that expose the deterministic gadget relation directly.
+    #[track_caller]
+    pub fn gadget_trapdoor(
+        &self,
+        rows: impl Into<IntExpr>,
+        base: impl Into<IntExpr>,
+        digit_count: impl Into<IntExpr>,
+    ) -> Trapdoor {
+        let rows = rows.into();
+        let base = base.into();
+        let digit_count = digit_count.into();
+        let matrix_type = self.matrix_type(Shape {
+            rows: rows.clone(),
+            columns: (rows * digit_count.clone()).canonicalize(),
+        });
+        let node = NodeHandle::new(
+            NodeKind::GadgetTrapdoor { matrix_type: matrix_type.clone(), base: base.clone() },
+            Vec::new(),
+            vec![WireType::Trapdoor {
+                matrix: matrix_type.clone(),
+                sigma: RealExpr::FromInt(base.clone()),
+                gadget_base: base,
+                digit_count,
+                preimage_max_coefficient_bound: IntExpr::constant(0),
+            }],
+        );
+        let public_node = NodeHandle::new(
+            NodeKind::TrapdoorPublic,
+            vec![node.output(0).expect("gadget trapdoor output")],
+            vec![WireType::Matrix(matrix_type.clone())],
+        );
+        Trapdoor {
+            public: Mat {
+                value: public_node.output(0).expect("gadget trapdoor public output"),
+                matrix_type: matrix_type.clone(),
+            },
+            value: node.output(0).expect("gadget trapdoor output"),
+            matrix_type,
+            preimage_max_coefficient_bound: IntExpr::constant(0),
+        }
+    }
+
     pub fn bytes_input(&self, name: impl Into<String>, length: impl Into<IntExpr>) -> Bytes {
         let name = name.into();
         let ty = WireType::Bytes { length: length.into() };

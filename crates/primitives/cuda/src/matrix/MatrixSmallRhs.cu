@@ -961,6 +961,29 @@ extern "C" int gpu_small_matrix_create(
     return 0;
 }
 
+extern "C" int gpu_small_matrix_query_allocation_bytes(
+    const GpuContext *ctx,
+    size_t rows,
+    size_t cols,
+    size_t magnitude_bytes,
+    GpuMatrixAllocationBytes *out)
+{
+    if (!ctx || !out || rows == 0 || cols == 0 || magnitude_bytes == 0)
+        return set_error("invalid compact matrix allocation query arguments");
+    if (ctx->N <= 0 || magnitude_bytes > 255)
+        return set_error("invalid compact matrix allocation query context or width");
+    size_t payload_bytes = 0;
+    if (small_payload_size(
+            rows, cols, static_cast<size_t>(ctx->N), magnitude_bytes, &payload_bytes) != 0)
+        return 1;
+    // The compact owner has one device payload.  Its stream event and bound
+    // words are host-side lifetime state, matching GpuSmallMatrix::allocation_bytes.
+    *out = GpuMatrixAllocationBytes{};
+    out->data_bytes = payload_bytes;
+    out->total_bytes = payload_bytes;
+    return 0;
+}
+
 extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
 {
     if (!mat) return;

@@ -560,7 +560,8 @@ fn validate_node(
             let digit_count = matrix.columns / matrix.rows;
             vec![ConcreteWireType::Trapdoor {
                 matrix,
-                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone())),
+                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone()))
+                    .close(env)?,
                 gadget_base,
                 digit_count,
                 preimage_max_coefficient_bound: BigInt::zero(),
@@ -1704,11 +1705,22 @@ fn validate_constant(
     node: NodeId,
 ) -> Result<(), ValidationError> {
     match value {
+        ConstantMatrix::Zero => Ok(()),
+        ConstantMatrix::Identity if matrix.rows != matrix.columns => {
+            node_error(scope, node, "identity constant requires a square matrix")
+        }
+        ConstantMatrix::Identity => Ok(()),
+        ConstantMatrix::UnitRow { .. } if matrix.rows != 1 => {
+            node_error(scope, node, "unit-row constant requires exactly one row")
+        }
         ConstantMatrix::UnitRow { index }
             if nonnegative_usize(index.evaluate(env)?, "unit-row index", scope, node)? >=
                 matrix.columns =>
         {
             node_error(scope, node, "unit-row index is out of range")
+        }
+        ConstantMatrix::UnitColumn { .. } if matrix.columns != 1 => {
+            node_error(scope, node, "unit-column constant requires exactly one column")
         }
         ConstantMatrix::UnitColumn { index }
             if nonnegative_usize(index.evaluate(env)?, "unit-column index", scope, node)? >=
@@ -1716,19 +1728,34 @@ fn validate_constant(
         {
             node_error(scope, node, "unit-column index is out of range")
         }
+        ConstantMatrix::Gadget { .. } if !matrix.columns.is_multiple_of(matrix.rows) => {
+            node_error(scope, node, "gadget constant columns must be a multiple of rows")
+        }
         ConstantMatrix::Gadget { base, .. } if base.evaluate(env)?.abs() <= BigInt::one() => {
             node_error(scope, node, "gadget base must exceed one")
+        }
+        ConstantMatrix::Gadget { .. } => Ok(()),
+        ConstantMatrix::PowerOfBase { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "power-of-base constant requires a 1x1 matrix")
         }
         ConstantMatrix::PowerOfBase { base, exponent }
             if base.evaluate(env)?.is_zero() || exponent.evaluate(env)?.is_negative() =>
         {
             node_error(scope, node, "invalid power-of-base constant")
         }
+        ConstantMatrix::PowerOfBase { .. } => Ok(()),
+        ConstantMatrix::Rotation { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "rotation constant requires a 1x1 matrix")
+        }
         ConstantMatrix::Rotation { exponent }
             if nonnegative_usize(exponent.evaluate(env)?, "rotation exponent", scope, node)? >=
                 matrix.ring_dimension =>
         {
             node_error(scope, node, "rotation exponent is out of range")
+        }
+        ConstantMatrix::Rotation { .. } => Ok(()),
+        ConstantMatrix::Polynomial { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "polynomial constant requires a 1x1 matrix")
         }
         ConstantMatrix::Polynomial { coefficients }
             if coefficients.len() > matrix.ring_dimension =>
@@ -2088,6 +2115,117 @@ mod tests {
             ValidationError::Node { message, .. } => message,
             ValidationError::ParameterConstraint(message) => message,
             other => panic!("expected node validation error, got {other:?}"),
+        }
+    }
+
+    fn validate_constant_matrix(matrix: MatrixType, value: ConstantMatrix) -> Result<(), String> {
+        let output = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value },
+            Vec::new(),
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("constant matrix output");
+        validate(&graph("constant-shape", output), &ParamEnv::default())
+            .map(|_| ())
+            .map_err(node_message)
+    }
+
+    #[test]
+    fn every_constant_matrix_variant_accepts_its_production_shape() {
+        assert!(validate_constant_matrix(matrix_type(17, 2, 3), ConstantMatrix::Zero).is_ok());
+        assert!(validate_constant_matrix(matrix_type(17, 2, 2), ConstantMatrix::Identity).is_ok());
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 3),
+                ConstantMatrix::UnitRow { index: IntExpr::constant(2) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 3, 1),
+                ConstantMatrix::UnitColumn { index: IntExpr::constant(2) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 2, 4),
+                ConstantMatrix::Gadget { base: IntExpr::constant(2), small: false },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::PowerOfBase {
+                    base: IntExpr::constant(2),
+                    exponent: IntExpr::constant(3),
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::Rotation { exponent: IntExpr::constant(7) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(1)] },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn constant_matrix_variants_reject_shapes_the_backend_cannot_execute() {
+        let invalid = [
+            (
+                matrix_type(17, 1, 2),
+                ConstantMatrix::Identity,
+                "identity constant requires a square matrix",
+            ),
+            (
+                matrix_type(17, 2, 3),
+                ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                "unit-row constant requires exactly one row",
+            ),
+            (
+                matrix_type(17, 2, 2),
+                ConstantMatrix::UnitColumn { index: IntExpr::constant(0) },
+                "unit-column constant requires exactly one column",
+            ),
+            (
+                matrix_type(17, 2, 3),
+                ConstantMatrix::Gadget { base: IntExpr::constant(2), small: false },
+                "gadget constant columns must be a multiple of rows",
+            ),
+            (
+                matrix_type(17, 1, 2),
+                ConstantMatrix::PowerOfBase {
+                    base: IntExpr::constant(2),
+                    exponent: IntExpr::constant(1),
+                },
+                "power-of-base constant requires a 1x1 matrix",
+            ),
+            (
+                matrix_type(17, 2, 1),
+                ConstantMatrix::Rotation { exponent: IntExpr::constant(1) },
+                "rotation constant requires a 1x1 matrix",
+            ),
+            (
+                matrix_type(17, 2, 1),
+                ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(1)] },
+                "polynomial constant requires a 1x1 matrix",
+            ),
+        ];
+        for (matrix, value, expected) in invalid {
+            assert_eq!(validate_constant_matrix(matrix, value).unwrap_err(), expected);
         }
     }
 

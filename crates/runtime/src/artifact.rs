@@ -25,6 +25,8 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 
+const SUPPORTED_ARTIFACT_VERSIONS: &[u32] = &[IR_VERSION];
+
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ArtifactKey {
     pub production: ProductionId,
@@ -143,6 +145,10 @@ pub enum FileArtifactError {
     UncommittedArtifact(ArtifactKey),
     #[error("artifact manifest does not exist: {0:?}")]
     MissingManifest(ProductionId),
+    #[error(
+        "unsupported artifact IR version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedArtifactVersion { version: u32, supported_versions: &'static [u32] },
     #[error("artifact is absent from its manifest: {0:?}")]
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
@@ -398,7 +404,13 @@ impl ArtifactStore for FileArtifactStore {
             return Err(FileArtifactError::MissingManifest(production.clone()));
         }
         let manifest: Manifest = Self::read_encoded(&path)?;
-        if manifest.production_id != *production || manifest.ir_version != IR_VERSION {
+        if manifest.ir_version != IR_VERSION {
+            return Err(FileArtifactError::UnsupportedArtifactVersion {
+                version: manifest.ir_version,
+                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
+            });
+        }
+        if manifest.production_id != *production {
             return Err(FileArtifactError::InvalidManifest(format!(
                 "manifest identity/version mismatch for {production:?}"
             )));
@@ -1005,6 +1017,10 @@ pub enum MemoryArtifactError {
     UncommittedArtifact(ArtifactKey),
     #[error("artifact manifest does not exist: {0:?}")]
     MissingManifest(ProductionId),
+    #[error(
+        "unsupported artifact IR version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedArtifactVersion { version: u32, supported_versions: &'static [u32] },
     #[error("artifact is absent from its manifest: {0:?}")]
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
@@ -1106,7 +1122,13 @@ impl ArtifactStore for MemoryArtifactStore {
             .get(production)
             .cloned()
             .ok_or_else(|| MemoryArtifactError::MissingManifest(production.clone()))?;
-        if manifest.production_id != *production || manifest.ir_version != IR_VERSION {
+        if manifest.ir_version != IR_VERSION {
+            return Err(MemoryArtifactError::UnsupportedArtifactVersion {
+                version: manifest.ir_version,
+                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
+            });
+        }
+        if manifest.production_id != *production {
             return Err(MemoryArtifactError::InvalidManifest(format!(
                 "manifest identity/version mismatch for {production:?}"
             )));
@@ -1123,9 +1145,13 @@ impl ArtifactStore for MemoryArtifactStore {
             .manifests
             .get(&key.production)
             .ok_or_else(|| MemoryArtifactError::MissingManifest(key.production.clone()))?;
-        if manifest.production_id != key.production ||
-            manifest.ir_version != mxx_ir_core::encoding::IR_VERSION
-        {
+        if manifest.ir_version != mxx_ir_core::encoding::IR_VERSION {
+            return Err(MemoryArtifactError::UnsupportedArtifactVersion {
+                version: manifest.ir_version,
+                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
+            });
+        }
+        if manifest.production_id != key.production {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
         let manifest_artifact = manifest
@@ -1901,7 +1927,10 @@ mod tests {
         store.store_manifest(manifest).expect("structurally valid manifest");
         assert!(matches!(
             store.load_manifest(&production),
-            Err(MemoryArtifactError::InvalidManifest(_))
+            Err(MemoryArtifactError::UnsupportedArtifactVersion {
+                version,
+                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
+            }) if version == IR_VERSION + 1
         ));
     }
 

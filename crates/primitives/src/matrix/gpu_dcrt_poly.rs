@@ -8,12 +8,13 @@ use crate::{
             gpu::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
-                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
-                GpuRngSeed, GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixOpaque,
-                PinnedHostBuffer, check_status, gpu_event_set_destroy, gpu_event_set_wait,
-                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_add_row_blocks,
-                gpu_matrix_binary_batch, gpu_matrix_centered_rebase, gpu_matrix_convert_modulus,
-                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
+                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixAllocationBytes, GpuMatrixOpaque,
+                GpuP1CovarianceCacheOpaque, GpuRngSeed, GpuSmallMatrixAllocationReportRaw,
+                GpuSmallMatrixOpaque, PinnedHostBuffer, check_status, gpu_event_set_destroy,
+                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_centered_rebase,
+                gpu_matrix_convert_modulus, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_copy_peer, gpu_matrix_copy_peer_query, gpu_matrix_create,
                 gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
@@ -35,7 +36,7 @@ use crate::{
                 gpu_small_matrix_copy_columns, gpu_small_matrix_create,
                 gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
                 gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
-                gpu_small_matrix_store_coefficients,
+                gpu_small_matrix_query_allocation_bytes, gpu_small_matrix_store_coefficients,
                 gpu_small_matrix_try_pack_preimage_hard_cutoff_tile, gpu_small_matrix_view_columns,
                 gpu_small_matrix_wait,
             },
@@ -344,6 +345,61 @@ impl GpuSmallMatrix {
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_small_matrix_wait(self.raw) };
         check_status(status, "gpu_small_matrix_wait");
+    }
+
+    /// Return the exact device allocation owned by this compact matrix.
+    ///
+    /// Compact RHS values intentionally use a byte-stream allocation rather
+    /// than the regular matrix allocator.  The native owner has no auxiliary
+    /// device slab: its only device allocation is `resident_payload_bytes`;
+    /// CUDA event handles and the bound metadata are host-side state.  Keep
+    /// this query in the primitive owner so fleet resource accounting does
+    /// not approximate compact residency from a regular matrix shape.
+    pub fn allocation_bytes(&self) -> Result<GpuMatrixAllocationBytes, String> {
+        Ok(GpuMatrixAllocationBytes {
+            data_bytes: self.resident_payload_bytes,
+            aux_bytes: 0,
+            event_bytes: 0,
+            total_bytes: self.resident_payload_bytes,
+        })
+    }
+
+    /// Query the exact compact-owner allocation for a shape before creating
+    /// the owner. The native query shares the payload-size helper with
+    /// `gpu_small_matrix_create`, so callers do not mirror its byte layout.
+    pub(crate) fn allocation_bytes_for_shape(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        magnitude_bytes: usize,
+    ) -> Result<GpuMatrixAllocationBytes, String> {
+        let mut allocation = GpuMatrixAllocationBytes::default();
+        let status = unsafe {
+            gpu_small_matrix_query_allocation_bytes(
+                params.ctx_raw(),
+                rows,
+                columns,
+                magnitude_bytes,
+                &mut allocation,
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(allocation)
+    }
+
+    /// Return the exact canonical coefficient payload length without reading
+    /// the compact matrix back from the device.  This is the same descriptor
+    /// calculation used by the native compact owner and by
+    /// `to_canonical_coefficients` when it allocates its staging buffer.
+    pub fn canonical_payload_bytes(&self) -> Result<usize, SmallMatrixError> {
+        Self::payload_len(
+            self.rows,
+            self.columns,
+            self.params.ring_dimension(),
+            self.magnitude_bytes,
+        )
     }
 
     pub fn slice_columns(&self, start: usize, end: usize) -> Self {
@@ -1386,6 +1442,35 @@ impl GpuDCRTPolyMatrix {
     /// Number of dropped CRT towers in this matrix's current representation.
     pub fn level(&self) -> usize {
         self.level
+    }
+
+    /// Return the exact native allocation envelope for this matrix owner.
+    /// This delegates to the CUDA size query used by `new_empty_with_state`,
+    /// so callers do not need to duplicate data/auxiliary/event alignment
+    /// rules when constructing a warmup resource envelope.
+    pub fn allocation_bytes(
+        &self,
+    ) -> Result<crate::poly::dcrt::gpu::GpuMatrixAllocationBytes, String> {
+        self.params.matrix_allocation_bytes(self.level, self.nrow, self.ncol, self.is_ntt)
+    }
+
+    /// Check whether the production direct-copy route can target `params`
+    /// without allocating a destination or mutating CUDA state.  The native
+    /// query compares the complete matrix representation and allocation
+    /// descriptor, then checks peer capability for cross-device routes.  A
+    /// successful result is therefore safe for admission; the copy itself
+    /// remains the operation that creates and populates the destination.
+    pub fn can_copy_to_params_direct(&self, params: &GpuDCRTPolyParams) -> Result<bool, String> {
+        if self.params.ctx_raw() == params.ctx_raw() {
+            return Ok(true);
+        }
+        let mut compatible = 0i32;
+        let status =
+            unsafe { gpu_matrix_copy_peer_query(self.raw, params.ctx_raw(), &mut compatible) };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(compatible != 0)
     }
 
     /// Whether the resident coefficients are in the evaluation domain.
@@ -3308,6 +3393,30 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             .expect("Failed to serialize matrix to compact bytes")
     }
 
+    fn validate_compact_bytes(bytes: &[u8]) -> Result<(), crate::matrix::CompactMatrixDecodeError> {
+        let (
+            (version, _format_tag, _level, _rows, _columns, _max_bits, _bytes_per_coeff, _payload),
+            consumed,
+        ): ((u8, u8, u32, usize, usize, u16, u16, Vec<u8>), usize) =
+            bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+                crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                    "cannot decode compact matrix",
+                )
+            })?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing compact matrix bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        Ok(())
+    }
+
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         let (version, format_tag, level_u32, nrow, ncol, max_coeff_bits, bytes_per_coeff, payload): (
             u8,
@@ -3322,7 +3431,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             bincode::decode_from_slice(bytes, bincode::config::standard())
                 .expect("Failed to deserialize matrix from compact bytes")
                 .0;
-        assert_eq!(version, 1, "Unsupported compact matrix version: {version}");
+        debug_assert_eq!(version, 1, "validated compact matrix version");
         let format = match format_tag {
             x if x == GPU_POLY_FORMAT_COEFF as u8 => GPU_POLY_FORMAT_COEFF,
             x if x == GPU_POLY_FORMAT_EVAL as u8 => GPU_POLY_FORMAT_EVAL,

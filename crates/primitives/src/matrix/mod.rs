@@ -24,6 +24,19 @@ pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
     fn entry_size(&self) -> usize;
 }
 
+/// Typed errors for compact matrix headers. The legacy matrix trait retains
+/// its infallible decoder, while backend boundaries can validate versioned
+/// headers before invoking it.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CompactMatrixDecodeError {
+    #[error(
+        "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedVersion { version: u8, supported_versions: &'static [u8] },
+    #[error("invalid compact matrix header: {0}")]
+    InvalidHeader(&'static str),
+}
+
 /// A logical full matrix whose columns are materialized on demand.
 ///
 /// Implementations may be backed by host staging bytes or persistent storage;
@@ -322,6 +335,10 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    fn validate_compact_bytes(bytes: &[u8]) -> Result<(), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Ok(())
+    }
     fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_compact_bytes()).collect()
     }

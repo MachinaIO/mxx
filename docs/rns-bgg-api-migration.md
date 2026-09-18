@@ -1,125 +1,82 @@
-# RNS-BGG API migration notes
+# RNS-BGG exponent-LUT design notes
 
-## Stage 5-A contract
+This document records the current RNS-BGG exponent-LUT boundary. It is an
+incompatible simplification, not a compatibility layer. The authoritative
+details are in
+`docs/plans/exponent-lut-rns-bgg-simplification-spec.md`; this note is kept
+short so that it does not become a second API specification.
 
-Program setup now has one structural derivation path:
-`derive_program_requirements(program, input_levels, family_metadata, family_inputs)`. It
-records declaration-to-wire mappings, operation order and
-`ProgramGateInstance`, checked wire levels, RHS/LUT references, helper needs,
-and symbolic family capacity/range/body information. Verified external family
-levels are supplied separately as `family_inputs`; missing facts fail closed.
-It does not store or
-sample matrices, secrets, parameters, material, caches, seeds, or nonces.
+## Ownership
 
-`prepare_program` validates this contract before sampling. Private
-multiplication and LUT transfer from an input at level `L` require level
-`L + 1`; Add and public multiplication require equal operand levels and retain
-that level. Structural families are inspected as one local body with
-`FamilyProgram::bind_inputs`; root and local identifiers are resolved in
-separate maps, and members are not enumerated on the host. The
-existing scalar-only setup rejection remains deliberate until the family
-interpreter migration is completed.
+RNS-BGG is the only exponent-LUT backend. The common program traversal owns
+wire knowledge, RHS references, LUT identifiers, and exponent layouts. The
+RNS-BGG files own only backend arithmetic:
 
-The caller still owns plaintext values, secret values, parameter selection,
-seed/nonce domains, storage, and runtime settings. Sampling site labels,
-domain strings, tuple ordering, NAND packing, PRF modulus/stride/shared-secret
-contracts, and readout scale are unchanged.
+- `mod.rs` owns parameters, compact block aliases, shared operations, and the
+  `ExponentLUTProgramLowering` contracts;
+- `public_key.rs` owns public-key carriers and preprocessing;
+- `encoding.rs` owns input encryption, LUT helper generation, and online
+  evaluation;
+- `noise.rs` owns noise contracts and workload accounting;
+- `gpu.rs` contains GPU-only tests and support.
 
-Noise acceptance distinguishes the carrier roles. Intermediate program values
-retain the strict q/8 clearance needed for adjacent payload spacing. The final
-q/2 Boolean carrier is checked with strict error < q/4, matching the runtime
-centered residual check; its coefficient/range bound remains a separate
-condition. Average-case audits use the same q/4 limit at the last level and
-q/8 for intermediate levels.
+There is no RNS-BGG scheme facade, replacement executor, application-specific
+NAND backend, Lean change, or legacy adapter in this path. The common
+`noise_refresh` code has no dependency on either BGG implementation.
 
-## Serialization and trust boundaries
+## Carriers and plaintext boundaries
 
-Stage 5-A does not change `RnsBggProgramDescriptor` serialization or its
-expectation digest. Imported setup still requires an independently retained
-`RnsBggProgramExpectation`; metadata on disk is not trusted as its own
-expectation. Import validates the program identity, expected input set and
-levels, ordered RHS gate set, and prepared artifact identity before creating
-lazy artifact inputs.
+`RnsBggEncoding` carries its `RnsBggPublicKey` together with the row and, only
+for a public program wire, its public payload. The payload is not a parallel
+registry and is never inferred from matrix shape. Preprocessing receives no
+LHS plaintexts. During online evaluation RHS plaintexts are never public; the
+only plaintext available there is the public-LHS encoding value used by
+`MulPublic`.
 
-The Stage 4 terminal descriptor change is intentionally incompatible with old
-serialized descriptors: the public `finalize: bool`/caller-selectable option
-was replaced by the internal `TerminalFinalization::{Deferred, Finalize}`
-enum. The canonical terminal family stage identity includes mode,
-finalization, range, cache schema, and public schema. Existing old descriptors
-must be regenerated; they are not silently upgraded.
+RHS operands are references (`RhsRef`), not plaintext or matrix containers.
+The same RHS identifier has one consuming level throughout a Program. A
+different level requires a different identifier and input binding.
 
-The RNS-BGG parameter manifest keeps its historical
-`RnsBggParameterManifest::SCHEMA_VERSION` value of 2. This is not a promise of
-backward-compatible deserialization: serialized derived-workload fields such
-as `family_operand_bounds` may change, so stale manifests and dependent
-checkpoint or identity artifacts are outside the supported input contract and
-must be regenerated. This policy is independent of the program descriptor and
-terminal descriptor contracts.
+## Compact artifacts and on-demand decomposition
 
-## Migration checklist
+Preprocessing persists compact matrices and public-key carriers only. It does
+not persist deterministic gadget decompositions or expanded full-modulus
+matrices. The consuming operation recomputes the signed decomposition from the
+compact matrix at the point of use, then centered-extends it when the
+evaluation modulus is larger. Modulus reduction assumes source modulus is
+greater than destination modulus; equal moduli are a no-op.
 
-1. Keep callers passing input levels and caller-owned setup domains; do not
-   derive a level from the program step index.
-2. Treat `ProgramGateInstance::Gate`, `FamilyGate`, and `FamilyReduction` as
-   distinct identities when adding sampling or artifact domains.
-3. Use the requirements record for level/RHS/LUT validation before creating
-   material. Do not recreate an independent level walker in an API adapter.
-4. Preserve scalar-only family rejection in setup until the family preparation
-   path consumes symbolic body requirements. The body must remain one graph
-   scope rather than a host `Vec` of members.
-5. Regenerate Stage 4 terminal descriptors after the finalization enum change.
+The public material keys are deliberately shared:
 
-## Status
+| Material | Key |
+| --- | --- |
+| `A_sigma` mask-alignment matrix | `(evaluation_level, sigma)` |
+| `F_sigma` encrypted helper | `(evaluation_level, sigma)` |
+| `B_sigma` setup-fixed switching matrix | `(evaluation_level, decomposition_level, LutId, input_layout, sigma)` |
 
-The structural requirement record, shared online checks, native sparse audit
-boundary, and Stage 5-C documentation/visibility work are complete for the
-current scalar and symbolic-family contracts. Future family-preparation work
-must update the inventory rows without introducing a second structural
-derivation path.
+The lowering boundary passes the resolved `LutTable` for each scalar LUT gate.
+Evaluators that need an identifier resolve it against their validated,
+Program-owned table context; pointer identity preserves distinct IDs for
+equal-valued registrations, and ambiguous external table copies are rejected.
+The LUT's explicit `ExpLayout` remains part of the table. A binary-LUT
+convenience builder is normalized to the same single-LUT representation before
+artifact production; evaluators do not have a separate binary-LUT path.
 
-The application facade now consumes the requirements in generic online graph
-construction and validates ordered RHS/helper ports before evaluating an
-imported `PreparedProgram`. Generic preprocessing emits LUT helper ports in
-that same requirement order. Sparse-LWR keeps its native PBC selector and
-readout derivation, but validates the accumulation Program's ordered private
-gate chain and terminal level through the shared requirements before preparing
-the sparse chain and again before online readout. Sparse-specific block
-selection, public-vector routing, and digit-scale derivation remain native
-contracts rather than being replaced by generic gate metadata.
+`operations_per_drop` is part of parameter construction and controls the
+planned modulus-drop cadence. Output coefficients are finalized once after
+the complete accumulated expression, not once per branch or family member.
 
-Prepared-program artifacts use one stage-owned aggregate prefix. They do not
-define a program-derived port name for each gate. The requirements record keeps
-the ordered gate/helper/cache mapping used to assign aggregate tuple members;
-the runtime's `helper.<index>` names are only that stable ordinal within the
-aggregate export. Therefore no additional per-gate port abstraction should be
-introduced during migration, and no duplicate port naming contract exists
-outside the prepared artifact schema.
+## API and compatibility policy
 
-## Stage 5-C visibility migration
+The lowering trait is named `ExponentLUTProgramLowering`. It receives one
+scalar wire per gate. `lut` receives the input wire and its resolved
+`LutTable`; an evaluator that needs the `LutId` resolves it from its own
+validated Program context. Helper and multiplication material belongs to the
+lowerer implementation and is accessed through `self`. `Rhs` remains only to
+distinguish an RHS input from a wire in `mul_private`; `ProgramLoweringTypes`
+and `HelperSet` are not separate contracts.
 
-The ordinary application surface remains at the crate root. Applications use
-`ExponentLut::{preprocess, encrypt, online_eval}` and the typed artifact,
-secret, and output handles re-exported by `mxx-exponent-lut`. They do not need
-to name RNS-BGG graph builders, helper samplers, raw rows, or descriptor
-storage types.
-
-The RNS-BGG module remains public as an advanced backend surface, but its
-implementation children are no longer direct module paths:
-
-| Old path | New path | Reason |
-|---|---|---|
-| `rns_bgg::api::*` | crate-root facade types or `advanced::*` | API implementation is crate-internal; stable facade re-exports remain available |
-| `rns_bgg::encoding::*` | `rns_bgg::*` named advanced types/methods | Encoding implementation is private; public scheme methods remain reachable on `RnsBggScheme` |
-| `rns_bgg::public_key::*` | `rns_bgg::*` named advanced types/methods | Key preparation implementation is private; explicit core types remain reachable |
-| `rns_bgg::noise::*` | `rns_bgg::*` named noise reports and helpers | Noise implementation is private; only reports, the public-trait evaluator type, and source-identity helpers are re-exported |
-| `rns_bgg::program_setup::*` | crate-root facade setup/export types where supported | Setup implementation is internal; descriptor and expectation types remain explicit public contracts |
-
-This migration does not change program-descriptor serialization, sampling
-identity domains or labels, noise formulas, level semantics, or supported
-artifact contents. Parameter manifests may gain or change derived workload
-fields without a backward-compatibility guarantee; stale manifests are
-outside the supported input contract and must be regenerated. A private child
-module does not make an inherent public method private; methods that remain
-public are intentional advanced operations needed by the concrete backend or
-public trait signatures. Internal setup records and family index translators
-are crate-visible only.
+No version is bumped. Existing versioned runtime formats remain at version 1
+where they are still used, while new application descriptors do not add a
+version field. Old RNS-BGG descriptors and legacy BGG application paths are
+not supported and must be regenerated or removed.

@@ -38,8 +38,8 @@ pub enum RefreshSetupError {
     DecoderResidualMismatch,
 }
 
-/// Checks a manifest's typed public/private artifact ports against a backend
-/// supplied field list and a generic readout schema.
+/// Checks a manifest's typed artifact ports against a backend-supplied field
+/// list and a generic readout schema.
 
 /// Verification graph outputs and their exact threshold-decoder operands.
 /// Backend adapters supply the relation residual and scalar components; this

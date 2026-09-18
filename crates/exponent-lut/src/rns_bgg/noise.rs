@@ -20,9 +20,9 @@ use crate::{
         NoiseSourceProvenance, NonnegativeRational, RightActionNoiseGain,
     },
     program::{
-        Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
-        FamilyRange, InputBinding, LutId, LutTable, ProgramLowerError, ProgramLoweringContext,
-        RhsId, RhsRef, WireId,
+        Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution, FamilyRange,
+        InputBinding, LutId, LutTable, ProgramLowerError, ProgramLoweringContext, RhsId, RhsRef,
+        WireId,
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
@@ -31,7 +31,7 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 mod bigdecimal_string {
     use bigdecimal::BigDecimal;
@@ -238,7 +238,12 @@ impl RnsBggParameters {
         level: usize,
         noise: &RnsBggNoiseValue,
     ) -> Result<bool, RnsBggError> {
-        let modulus = self.level(level)?.modulus();
+        let modulus = self
+            .levels
+            .get(level + 1)
+            .or_else(|| self.levels.get(level))
+            .ok_or(RnsBggError::Parameters("level outside modulus chain"))?
+            .modulus();
         Ok(modulus.as_ref() > &(&noise.bound.error * 4u8))
     }
 
@@ -284,37 +289,6 @@ impl RnsBggParameters {
             (level + 1 == self.levels().len() ||
                 self.scale(level)? == &BigUint::one() ||
                 self.scale(level)? > &(&noise.error * 2u8)))
-    }
-
-    /// Return the exact source/target coefficient-modulus ratio used by
-    /// public alignment. Equal levels return one and therefore introduce no
-    /// artificial rounding; non-nested or upward conversions fail closed.
-    pub fn public_alignment_ratio(
-        &self,
-        source_level: usize,
-        target_level: usize,
-    ) -> Result<BigUint, RnsBggError> {
-        let source = self.level(source_level)?;
-        let target = self.level(target_level)?;
-        if source_level == target_level {
-            return Ok(BigUint::one());
-        }
-        if source.ring_dimension() != target.ring_dimension() ||
-            source.to_crt().0.iter().any(|prime| !target.to_crt().0.contains(prime))
-        {
-            return Err(RnsBggError::Parameters("incompatible public alignment levels"));
-        }
-        let source_modulus = source.modulus();
-        let target_modulus = target.modulus();
-        let source_modulus = source_modulus.as_ref();
-        let target_modulus = target_modulus.as_ref();
-        if target_modulus.is_zero() ||
-            source_modulus <= target_modulus ||
-            source_modulus % target_modulus != BigUint::zero()
-        {
-            return Err(RnsBggError::Parameters("public alignment requires a nested drop"));
-        }
-        Ok(source_modulus / target_modulus)
     }
 
     /// Deterministic public-key/encoding conversion transfer for
@@ -417,6 +391,12 @@ impl RnsBggParameters {
         mask_secret: &[RnsBggMaskSecretComponent],
         policy: &NoiseMomentPolicy,
     ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        // A physically equal source/target ring is an exact no-op.  In
+        // particular, do not require a synthetic action or attach rounding
+        // provenance merely because the caller is taking the alignment path.
+        if *alpha == BigUint::one() {
+            return Ok(source.clone());
+        }
         let bound = self.public_alignment_noise_bound(
             source,
             h,
@@ -451,7 +431,22 @@ impl RnsBggParameters {
                 )
             })
             .transpose()?;
-        let mut heuristics = NoiseHeuristicLedger::new();
+        let mut provenance = source.provenance.clone();
+        for rounding in [ciphertext_rounding, public_key_rounding] {
+            for (source_id, identity) in &rounding.provenance {
+                if let Some(existing) = provenance.get_mut(source_id) {
+                    existing.route.extend_from_slice(&identity.route);
+                } else {
+                    provenance.insert(*source_id, identity.clone());
+                }
+            }
+        }
+        let mut heuristics = source.heuristics.clone();
+        for rounding in [ciphertext_rounding, public_key_rounding] {
+            for id in rounding.heuristics.ids() {
+                heuristics.insert(*id);
+            }
+        }
         heuristics.insert(NoiseHeuristicId::H1StateUncorrelated);
         heuristics.insert(NoiseHeuristicId::UnknownCovarianceBound);
         match policy {
@@ -466,7 +461,7 @@ impl RnsBggParameters {
             bound: bound.bound,
             payload_l2_squared: source.payload_l2_squared.clone(),
             moments,
-            provenance: source.provenance.clone(),
+            provenance,
             heuristics,
         })
     }
@@ -838,101 +833,20 @@ impl RnsBggNoiseValue {
     }
 }
 
-/// The parts of a LUT site that determine whether its encrypted helper family
-/// can be shared with another site.  The branch automorphisms are determined
-/// by the table width, while the output representation carries the layout of
-/// the values written into those branches.  Keep both in the key: equal
-/// family shapes alone do not imply that the same helper is valid.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LutHelperCompatibility {
-    input_level: usize,
-    automorphism_layout: ExpLayout,
-    output_representation: crate::program::LutOutputRepresentation,
-    input_width: usize,
-    output_width: usize,
-}
-
-impl LutHelperCompatibility {
-    fn new(level: usize, table: &LutTable) -> Self {
-        Self {
-            input_level: level,
-            automorphism_layout: ExpLayout {
-                stride_log2: 0,
-                width_log2: table.values().len().trailing_zeros(),
-            },
-            output_representation: table.output_representation(),
-            input_width: table.input_width(),
-            output_width: table.output_width(),
-        }
-    }
-}
-
-/// Collects the derived logical level and helper-origin map for a Program.
-pub(crate) struct WorkloadCollector {
+/// Collects the derived logical level map for a Program.
+pub(crate) struct WorkloadCollector<'a> {
+    program: &'a ExponentLutProgram,
+    parameters: Option<&'a RnsBggParameters>,
     levels: BTreeMap<WireId, usize>,
     rhs_levels: BTreeMap<RhsId, usize>,
-    lut_helper_origins: BTreeMap<WireId, WireId>,
-    lut_helper_compatibility: BTreeMap<WireId, LutHelperCompatibility>,
-    lut_helper_groups: BTreeMap<WireId, Vec<(LutHelperCompatibility, WireId)>>,
-    next_helper_origin: u32,
     current_site: Option<crate::program::LoweringSite>,
 }
 
-impl WorkloadCollector {
+impl<'a> WorkloadCollector<'a> {
     fn site(&self) -> Result<&crate::program::LoweringSite, RnsBggError> {
         self.current_site
             .as_ref()
             .ok_or(RnsBggError::Graph("workload lowering site is missing".into()))
-    }
-
-    /// Allocate a metadata-only origin at `level` for an incompatible helper
-    /// site.  Origins are kept in the existing level map because consumers
-    /// already validate the helper ring through `RnsBggDerivedWorkload::level`.
-    fn fresh_helper_origin(&mut self, level: usize) -> Result<WireId, RnsBggError> {
-        loop {
-            let origin = WireId(self.next_helper_origin);
-            self.next_helper_origin = self
-                .next_helper_origin
-                .checked_sub(1)
-                .ok_or(RnsBggError::Parameters("LUT helper origin overflow"))?;
-            if let std::collections::btree_map::Entry::Vacant(entry) = self.levels.entry(origin) {
-                entry.insert(level);
-                return Ok(origin);
-            }
-        }
-    }
-
-    /// Choose or create the origin for one LUT site.  A source wire can have
-    /// several direct consumers, so the inherited output-wire annotation is
-    /// not enough by itself: retain all compatible groups rooted at that
-    /// source and use a distinct metadata origin for every incompatible one.
-    fn helper_origin(
-        &mut self,
-        input: &(WireId, usize),
-        compatibility: LutHelperCompatibility,
-    ) -> Result<WireId, RnsBggError> {
-        if let Some(origin) = self.lut_helper_origins.get(&input.0).copied() {
-            if self.lut_helper_compatibility.get(&input.0) == Some(&compatibility) {
-                return Ok(origin);
-            }
-        }
-        if let Some(origin) = self
-            .lut_helper_groups
-            .get(&input.0)
-            .and_then(|groups| groups.iter().find(|(key, _)| *key == compatibility))
-            .map(|(_, origin)| *origin)
-        {
-            return Ok(origin);
-        }
-        let origin = if self.lut_helper_groups.contains_key(&input.0) ||
-            self.lut_helper_origins.contains_key(&input.0)
-        {
-            self.fresh_helper_origin(input.1)?
-        } else {
-            input.0
-        };
-        self.lut_helper_groups.entry(input.0).or_default().push((compatibility, origin));
-        Ok(origin)
     }
 }
 
@@ -942,19 +856,33 @@ pub struct RnsBggDerivedWorkload {
     program: crate::program::ExponentLutProgramId,
     levels: BTreeMap<WireId, usize>,
     rhs_levels: BTreeMap<RhsId, usize>,
-    lut_helper_origins: BTreeMap<WireId, WireId>,
 }
 
 impl RnsBggDerivedWorkload {
-    /// Derive logical levels and helper origins by lowering the Program once.
+    /// Derive logical levels by lowering the Program once.
     pub fn from_program(program: &ExponentLutProgram) -> Result<Self, RnsBggError> {
+        Self::derive(program, None)
+    }
+
+    /// Derive logical levels while validating public operand routes against
+    /// the physical modulus chain. Scheme-independent callers can continue
+    /// using [`Self::from_program`]; RNS noise paths use this variant.
+    pub fn from_program_with_parameters(
+        parameters: &RnsBggParameters,
+        program: &ExponentLutProgram,
+    ) -> Result<Self, RnsBggError> {
+        Self::derive(program, Some(parameters))
+    }
+
+    fn derive<'a>(
+        program: &'a ExponentLutProgram,
+        parameters: Option<&'a RnsBggParameters>,
+    ) -> Result<Self, RnsBggError> {
         let mut collector = WorkloadCollector {
+            program,
+            parameters,
             levels: program.inputs().keys().map(|id| (*id, 0)).collect(),
             rhs_levels: BTreeMap::new(),
-            lut_helper_origins: BTreeMap::new(),
-            lut_helper_compatibility: BTreeMap::new(),
-            lut_helper_groups: BTreeMap::new(),
-            next_helper_origin: u32::MAX,
             current_site: None,
         };
         let mut environment = Environment::new();
@@ -1001,7 +929,6 @@ impl RnsBggDerivedWorkload {
             program: program.id(),
             levels: collector.levels,
             rhs_levels: collector.rhs_levels,
-            lut_helper_origins: collector.lut_helper_origins,
         })
     }
     /// Return the logical level of a wire.
@@ -1018,20 +945,13 @@ impl RnsBggDerivedWorkload {
             .copied()
             .ok_or(RnsBggError::Graph("RHS has no consuming level".into()))
     }
-    /// Return the deterministic LUT helper origin for a wire.
-    pub fn lut_helper_origin(&self, wire: WireId) -> Result<WireId, RnsBggError> {
-        self.lut_helper_origins
-            .get(&wire)
-            .copied()
-            .ok_or(RnsBggError::Graph("wire has no LUT helper origin".into()))
-    }
     /// Program identity committed by this workload.
     pub fn program(&self) -> crate::program::ExponentLutProgramId {
         self.program
     }
 }
 
-impl ExponentLUTProgramLowering for WorkloadCollector {
+impl<'a> ExponentLUTProgramLowering for WorkloadCollector<'a> {
     type Wire = (WireId, usize);
     type Rhs = RhsId;
     type Error = RnsBggError;
@@ -1048,12 +968,23 @@ impl ExponentLUTProgramLowering for WorkloadCollector {
         private: &Self::Wire,
         public: &Self::Wire,
     ) -> Result<Self::Wire, Self::Error> {
-        if private.1 != public.1 {
-            return Err(RnsBggError::Parameters("MulPublic operands have different logical levels"));
-        }
         let output = self.site()?.output;
-        self.levels.insert(output, private.1);
-        Ok((output, private.1))
+        let lhs_knowledge = self
+            .program
+            .wire_knowledge(private.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPublic lhs".into()))?;
+        let rhs_knowledge = self
+            .program
+            .wire_knowledge(public.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPublic rhs".into()))?;
+        if rhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Parameters("MulPublic requires a public payload"));
+        }
+        let target = self.parameters.map_or(Ok(private.1), |parameters| {
+            parameters.mul_public_target_level(private.1, lhs_knowledge, public.1)
+        })?;
+        self.levels.insert(output, target);
+        Ok((output, target))
     }
     fn mul_private(
         &mut self,
@@ -1062,18 +993,16 @@ impl ExponentLUTProgramLowering for WorkloadCollector {
     ) -> Result<Self::Wire, Self::Error> {
         let output = self.site()?.output;
         let level = input.1;
-        match self.rhs_levels.entry(*rhs) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(level);
-            }
-            std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != level => {
+        if let Some(&rhs_level) = self.rhs_levels.get(rhs) {
+            if rhs_level != level {
                 return Err(RnsBggError::RhsLevelMismatch {
                     rhs: *rhs,
-                    expected: *entry.get(),
-                    actual: level,
+                    expected: level,
+                    actual: rhs_level,
                 });
             }
-            _ => {}
+        } else {
+            self.rhs_levels.insert(*rhs, level);
         }
         let next = level.checked_add(1).ok_or(RnsBggError::Parameters("logical level overflow"))?;
         self.levels.insert(output, next);
@@ -1090,15 +1019,11 @@ impl ExponentLUTProgramLowering for WorkloadCollector {
             input.1.checked_add(1).ok_or(RnsBggError::Parameters("logical level overflow"))?
         };
         self.levels.insert(output, next);
-        let compatibility = LutHelperCompatibility::new(input.1, table);
-        let origin = self.helper_origin(input, compatibility)?;
-        self.lut_helper_origins.insert(output, origin);
-        self.lut_helper_compatibility.insert(output, compatibility);
         Ok((output, next))
     }
 }
 
-impl ProgramLoweringContext for WorkloadCollector {
+impl<'a> ProgramLoweringContext for WorkloadCollector<'a> {
     fn replace_site(
         &mut self,
         site: Option<crate::program::LoweringSite>,
@@ -1107,7 +1032,7 @@ impl ProgramLoweringContext for WorkloadCollector {
     }
 }
 
-impl FamilyExecution<WorkloadCollector> for RnsBggNoiseFamilies {
+impl<'a> FamilyExecution<WorkloadCollector<'a>> for RnsBggNoiseFamilies {
     type WireFamily = (WireId, usize, FamilyRange);
     type RhsFamily = (RhsId, FamilyRange);
 
@@ -1141,11 +1066,11 @@ impl FamilyExecution<WorkloadCollector> for RnsBggNoiseFamilies {
     }
     fn parallel(
         &mut self,
-        evaluator: &mut WorkloadCollector,
+        evaluator: &mut WorkloadCollector<'a>,
         range: &FamilyRange,
         body: impl FnOnce(
             &mut Self,
-            &mut WorkloadCollector,
+            &mut WorkloadCollector<'a>,
             IntExpr,
         ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>>,
     ) -> Result<Self::WireFamily, ProgramLowerError<RnsBggError>> {
@@ -1156,7 +1081,7 @@ impl FamilyExecution<WorkloadCollector> for RnsBggNoiseFamilies {
     }
     fn sum(
         &mut self,
-        evaluator: &mut WorkloadCollector,
+        evaluator: &mut WorkloadCollector<'a>,
         family: &Self::WireFamily,
     ) -> Result<(WireId, usize), ProgramLowerError<RnsBggError>> {
         let output = evaluator.site().map_err(ProgramLowerError::Backend)?.output;
@@ -1427,7 +1352,7 @@ pub struct RnsBggNoiseEvaluator<'a> {
     trace: RnsBggNoiseTrace,
     current_site: Option<crate::program::LoweringSite>,
     event_multiplier: BigUint,
-    finalized_coefficient_wires: BTreeSet<WireId>,
+    finalized_coefficient_wires: BTreeMap<WireId, RnsBggNoiseValue>,
     refresh_parameters: Option<RefreshNoiseParameters>,
 }
 
@@ -1446,7 +1371,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             trace: RnsBggNoiseTrace::default(),
             current_site: None,
             event_multiplier: BigUint::one(),
-            finalized_coefficient_wires: BTreeSet::new(),
+            finalized_coefficient_wires: BTreeMap::new(),
             refresh_parameters: None,
         }
     }
@@ -1508,12 +1433,9 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
     }
 
     fn node_for_wire(&self, wire: WireId) -> Result<crate::noise_utils::NoiseNodeId, RnsBggError> {
-        self.trace
-            .dependencies
-            .wires
-            .get(&wire)
-            .copied()
-            .ok_or(RnsBggError::Graph("noise dependency parent is missing".into()))
+        self.trace.dependencies.wires.get(&wire).copied().ok_or_else(|| {
+            RnsBggError::Graph(format!("noise dependency parent is missing for wire {wire:?}"))
+        })
     }
 
     fn refresh_binding_node(&mut self, wire: WireId) -> crate::noise_utils::NoiseNodeId {
@@ -1553,15 +1475,165 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         node
     }
 
-    fn lut_id(&self, table: &LutTable) -> Result<LutId, RnsBggError> {
-        self.program
-            .encryption_inputs()
-            .luts()
-            .iter()
-            .position(|candidate| candidate == table)
-            .and_then(|index| u32::try_from(index).ok())
-            .map(LutId)
-            .ok_or(RnsBggError::Graph("LUT table is not part of the Program".into()))
+    /// Derive the material source set for one LUT from the validated Program
+    /// contract.  A/F are automorphism helpers shared by evaluation level and
+    /// sigma across every LUT, layout, and site.  B is LUT-specific and also
+    /// commits to the evaluation/decomposition levels, its explicit input
+    /// layout, and sigma.  No site, family scope, input wire, or program
+    /// identity is part of these keys.
+    fn lut_material_provenance(
+        &self,
+        evaluation_level: usize,
+        lut: LutId,
+        table: &LutTable,
+    ) -> Result<BTreeMap<[u8; 32], NoiseSourceProvenance>, RnsBggError> {
+        let decomposition_level = evaluation_level
+            .checked_add(1)
+            .ok_or(RnsBggError::Parameters("LUT decomposition level overflow"))?;
+        self.parameters.level(decomposition_level)?;
+        let layout = table.input_layout();
+        let ring_dimension = self.parameters.level(evaluation_level)?.ring_dimension() as usize;
+        let sigmas = layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        let mut sources = BTreeMap::new();
+        for sigma in sigmas {
+            let a = stable_source_id(&(b"rns-bgg/lut/A", evaluation_level, sigma));
+            sources.entry(a).or_insert_with(|| NoiseSourceProvenance {
+                source: a,
+                route: vec![evaluation_level, sigma],
+            });
+            let f = stable_source_id(&(b"rns-bgg/lut/F", evaluation_level, sigma));
+            sources.entry(f).or_insert_with(|| NoiseSourceProvenance {
+                source: f,
+                route: vec![evaluation_level, sigma],
+            });
+            let b = stable_source_id(&(
+                b"rns-bgg/lut/B",
+                evaluation_level,
+                decomposition_level,
+                lut,
+                layout,
+                sigma,
+            ));
+            sources.entry(b).or_insert_with(|| NoiseSourceProvenance {
+                source: b,
+                route: vec![evaluation_level, decomposition_level, sigma],
+            });
+        }
+        Ok(sources)
+    }
+
+    /// Bound the fixed public action used to align one source ring with the
+    /// target ring.  The action is setup material, so this is a deterministic
+    /// norm envelope rather than a newly sampled noise source.
+    fn public_alignment_action_gain(
+        &self,
+        source_level: usize,
+        target_level: usize,
+    ) -> Result<RightActionNoiseGain, RnsBggError> {
+        let alignment = self.parameters.public_alignment(source_level, target_level)?;
+        if alignment.is_noop() {
+            return Ok(RightActionNoiseGain::unit());
+        }
+        let source = self.parameters.level(source_level)?;
+        let target = self.parameters.level(target_level)?;
+        let base = BigUint::one() << source.base_bits();
+        let l1 = BigUint::from(source.ring_dimension()) *
+            BigUint::from(source.modulus_digits()) *
+            BigUint::from(target.modulus_digits()) *
+            base;
+        Ok(RightActionNoiseGain { l2_squared: l1.pow(2u32), l1 })
+    }
+
+    /// Construct one shared rounding carrier for a source/key/target route.
+    /// The identity intentionally excludes the lowering site: repeated uses
+    /// of the same conversion share the same physical rounding sample.
+    fn public_alignment_rounding(
+        &self,
+        source_level: usize,
+        key_level: usize,
+        target_level: usize,
+        alpha: &BigUint,
+        role: &'static [u8],
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        if alpha.is_zero() {
+            return Err(RnsBggError::Parameters("invalid public alignment ratio"));
+        }
+        let source = stable_source_id(&(
+            b"rns-bgg/public-alignment/rounding".as_slice(),
+            role,
+            source_level,
+            key_level,
+            target_level,
+        ));
+        let moments = NoiseMoments::discrete_rounding_residue(alpha)
+            .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        let mut heuristics = NoiseHeuristicLedger::new();
+        heuristics.insert(NoiseHeuristicId::ExactDistribution);
+        let error = if *alpha == BigUint::one() { BigUint::zero() } else { BigUint::one() };
+        Ok(RnsBggNoiseValue {
+            bound: RnsBggNoiseBound { error, payload_l1: BigUint::zero() },
+            payload_l2_squared: BigUint::zero(),
+            moments: Some(moments),
+            provenance: BTreeMap::from([(
+                source,
+                NoiseSourceProvenance {
+                    source,
+                    route: vec![source_level, key_level, target_level],
+                },
+            )]),
+            heuristics,
+        })
+    }
+
+    /// Apply the exact public alignment selected by the parameter contract.
+    /// The alpha-one route returns the original carrier before constructing
+    /// any action, rounding source, or provenance entry.
+    fn align_public_operand(
+        &self,
+        value: &RnsBggNoiseValue,
+        source_level: usize,
+        target_level: usize,
+    ) -> Result<RnsBggNoiseValue, RnsBggError> {
+        let alignment = self.parameters.public_alignment(source_level, target_level)?;
+        if alignment.is_noop() {
+            return Ok(value.clone());
+        }
+        let alpha = alignment.ratio().clone();
+        let action = self.public_alignment_action_gain(source_level, target_level)?;
+        let ciphertext_rounding = self.public_alignment_rounding(
+            source_level,
+            source_level,
+            target_level,
+            &alpha,
+            b"ciphertext",
+        )?;
+        let public_key_rounding = self.public_alignment_rounding(
+            source_level,
+            source_level,
+            target_level,
+            &alpha,
+            b"key",
+        )?;
+        let ring_dimension = BigUint::from(self.parameters.level(target_level)?.ring_dimension());
+        // The public alignment error contains `s * rho_A`, where `s` is the
+        // two-component mask row.  Account for both components explicitly;
+        // omitting the second row underestimates both hard bounds and moments.
+        let mask_secret = [
+            RnsBggMaskSecretComponent::deterministic(
+                ring_dimension.clone(),
+                ring_dimension.clone(),
+            ),
+            RnsBggMaskSecretComponent::deterministic(ring_dimension.clone(), ring_dimension),
+        ];
+        value.align_public(
+            self.parameters,
+            &action,
+            &alpha,
+            &ciphertext_rounding,
+            &public_key_rounding,
+            &mask_secret,
+            &NoiseMomentPolicy::Discrete { alpha: alpha.clone() },
+        )
     }
 
     fn operation_node(
@@ -2248,14 +2320,16 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                 .wire_is_coefficient_output(wire)
                 .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
             {
-                if !self.finalized_coefficient_wires.insert(wire) {
-                    return Err(RnsBggError::Graph(
-                        "coefficient output was finalized more than once".into(),
-                    ));
+                if let Some(previous) = self.finalized_coefficient_wires.get(&wire) {
+                    finalized.push(previous.clone());
+                    continue;
                 }
+                let level = self.level(wire)?;
+                let ratio = self.parameters.scale(level)?.clone();
                 value.bound.error += self.parameters.encoding_error_bound();
+                value.bound.error = refresh_channel_mod_down_bound(&value.bound.error, &ratio)?;
                 if let Some(moments) = value.moments.take() {
-                    value.moments = Some(moments.add_with_covariance(
+                    let with_encoding = moments.add_with_covariance(
                         &NoiseMoments {
                             mean_numerator: BigInt::zero(),
                             mean_denominator: BigUint::one(),
@@ -2263,8 +2337,35 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                             variance: self.parameters.encoding_error_variance(),
                         },
                         NoiseCorrelation::Unknown,
-                    ));
+                    );
+                    let switched = with_encoding.linear_image(
+                        &NonnegativeRational::new(BigUint::one(), ratio.clone())
+                            .expect("positive coefficient modulus ratio"),
+                        with_encoding.variance.scaled_ratio(&BigUint::one(), &ratio.pow(2u32)),
+                    );
+                    value.moments = Some(if ratio == BigUint::one() {
+                        switched
+                    } else {
+                        switched.add_with_covariance(
+                            &NoiseMoments::discrete_rounding_residue(&ratio)
+                                .map_err(|error| RnsBggError::Graph(error.to_string()))?,
+                            NoiseCorrelation::Independent,
+                        )
+                    });
                 }
+                if ratio != BigUint::one() {
+                    let source = stable_source_id(&(
+                        b"rns-bgg/coefficient-final-mod-down".as_slice(),
+                        self.program.id(),
+                        wire,
+                        level,
+                    ));
+                    value
+                        .provenance
+                        .insert(source, NoiseSourceProvenance { source, route: vec![level] });
+                }
+                self.add_events(&BigUint::one());
+                self.finalized_coefficient_wires.insert(wire, value.clone());
             }
             finalized.push(value);
         }
@@ -2387,57 +2488,67 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
     }
     fn mul_public(
         &mut self,
-        private: &Self::Wire,
-        public: &Self::Wire,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
     ) -> Result<Self::Wire, Self::Error> {
-        let level = self.level(private.0)?;
-        if level != self.level(public.0)? ||
-            self.program
-                .wire_knowledge(public.0)
-                .map_err(|_| RnsBggError::Graph("invalid public operand".into()))? !=
-                crate::program::AttributeKnowledge::PublicPayload
-        {
-            return Err(RnsBggError::Parameters(
-                "MulPublic requires a public payload at the same level",
-            ));
+        let lhs_level = self.level(lhs.0)?;
+        let rhs_level = self.level(rhs.0)?;
+        let lhs_knowledge = self
+            .program
+            .wire_knowledge(lhs.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPublic lhs".into()))?;
+        let rhs_knowledge = self
+            .program
+            .wire_knowledge(rhs.0)
+            .map_err(|_| RnsBggError::Graph("invalid MulPublic rhs".into()))?;
+        if rhs_knowledge != crate::program::AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Parameters("MulPublic requires a public payload"));
         }
-        let gain = self.parameters.mul_public_action_gain(level)?;
+        let target_level =
+            self.parameters.mul_public_target_level(lhs_level, lhs_knowledge, rhs_level)?;
+        let lhs_value = if lhs_knowledge == crate::program::AttributeKnowledge::PublicPayload {
+            self.align_public_operand(&lhs.1, lhs_level, target_level)?
+        } else {
+            lhs.1.clone()
+        };
+        let rhs_value = self.align_public_operand(&rhs.1, rhs_level, target_level)?;
+        let gain = self.parameters.mul_public_action_gain(target_level)?;
         let wire = self.site()?.output;
-        let plaintext_gain = public.1.bound.payload_l1.clone();
-        let moments = match (private.1.moments.as_ref(), public.1.moments.as_ref()) {
-            (Some(private_moments), Some(public_moments)) => {
-                let private_term = private_moments.linear_image(
+        let plaintext_gain = rhs_value.bound.payload_l1.clone();
+        let moments = match (lhs_value.moments.as_ref(), rhs_value.moments.as_ref()) {
+            (Some(lhs_moments), Some(rhs_moments)) => {
+                let lhs_term = lhs_moments.linear_image(
                     &NonnegativeRational::new(plaintext_gain.clone(), BigUint::one())
                         .expect("positive plaintext gain"),
-                    private_moments.variance.scaled(&plaintext_gain.pow(2)),
+                    lhs_moments.variance.scaled(&plaintext_gain.pow(2)),
                 );
-                let public_term = public_moments.linear_image(
+                let rhs_term = rhs_moments.linear_image(
                     &NonnegativeRational::new(gain.l1.clone(), BigUint::one())
                         .expect("positive decomposition gain"),
-                    public_moments.variance.scaled(&gain.l2_squared),
+                    rhs_moments.variance.scaled(&gain.l2_squared),
                 );
-                Some(private_term.add_with_covariance(&public_term, NoiseCorrelation::Unknown))
+                Some(lhs_term.add_with_covariance(&rhs_term, NoiseCorrelation::Unknown))
             }
             _ => None,
         };
         let value = self.carry_provenance(
             RnsBggNoiseValue {
-                bound: private.1.bound.mul_public_with_action(
-                    &public.1.bound,
+                bound: lhs_value.bound.mul_public_with_action(
+                    &rhs_value.bound,
                     &plaintext_gain,
                     &gain,
                 ),
-                payload_l2_squared: &private.1.payload_l2_squared * &public.1.payload_l2_squared,
+                payload_l2_squared: &lhs_value.payload_l2_squared * &rhs_value.payload_l2_squared,
                 moments,
                 provenance: BTreeMap::new(),
-                heuristics: private.1.heuristics.clone(),
+                heuristics: lhs_value.heuristics.clone(),
             },
-            [private.1.provenance.clone(), public.1.provenance.clone()],
+            [lhs_value.provenance.clone(), rhs_value.provenance.clone()],
         );
         let node = crate::noise_utils::NoiseDependencyNode::MulPublic {
             gate: Some(wire),
-            private: self.node_for_wire(private.0)?,
-            public: self.node_for_wire(public.0)?,
+            private: self.node_for_wire(lhs.0)?,
+            public: self.node_for_wire(rhs.0)?,
         };
         Ok(self.operation_node(wire, value, node))
     }
@@ -2446,14 +2557,8 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
-        let level = self.level(input.0)?;
-        if self.workload.rhs_level(rhs.id)? != level {
-            return Err(RnsBggError::RhsLevelMismatch {
-                rhs: rhs.id,
-                expected: self.workload.rhs_level(rhs.id)?,
-                actual: level,
-            });
-        }
+        let logical_level = self.level(input.0)?;
+        let level = logical_level;
         let contract = match self
             .bindings
             .rhs
@@ -2514,16 +2619,23 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
         Ok(self.operation_node(wire, value, node))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        let lut = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let level = self.level(input.0)?;
         let fresh_error_gain = self.fresh_gain(level)?;
         let wire = self.site()?.output;
-        let output_payload_l1 = table
-            .values()
-            .iter()
-            .copied()
-            .max()
-            .map(BigUint::from)
-            .ok_or(RnsBggError::Parameters("LUT table has no output values"))?;
+        // Exponent outputs are signed monomials, irrespective of the
+        // numeric exponent stored in the table.  Coefficient outputs instead
+        // carry the table's integer coefficient bound.
+        let output_payload_l1 = match table.output_representation() {
+            crate::program::LutOutputRepresentation::Exponent(_) => BigUint::one(),
+            crate::program::LutOutputRepresentation::Coefficient => table
+                .values()
+                .iter()
+                .copied()
+                .max()
+                .map(BigUint::from)
+                .ok_or(RnsBggError::Parameters("LUT table has no output values"))?,
+        };
         let output_payload_l2_squared = output_payload_l1.pow(2u32);
         let coefficient_output = matches!(
             table.output_representation(),
@@ -2573,6 +2685,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 }
             })
             .transpose()?;
+        let material = self.lut_material_provenance(level, lut, table)?;
         let value = self.carry_provenance(
             RnsBggNoiseValue {
                 bound,
@@ -2581,11 +2694,11 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
                 provenance: BTreeMap::new(),
                 heuristics: input.1.heuristics.clone(),
             },
-            [input.1.provenance.clone()],
+            [input.1.provenance.clone(), material],
         );
         let node = crate::noise_utils::NoiseDependencyNode::Lut {
             gate: Some(wire),
-            table: self.lut_id(table)?,
+            table: lut,
             input: self.node_for_wire(input.0)?,
             helper: None,
         };
@@ -2637,8 +2750,8 @@ pub fn trace_program(
     program: &ExponentLutProgram,
     bindings: &RnsBggNoiseBindings,
 ) -> Result<RnsBggNoiseTrace, ProgramLowerError<RnsBggError>> {
-    let workload =
-        RnsBggDerivedWorkload::from_program(program).map_err(ProgramLowerError::Backend)?;
+    let workload = RnsBggDerivedWorkload::from_program_with_parameters(parameters, program)
+        .map_err(ProgramLowerError::Backend)?;
     let mut environment = Environment::new();
     for (id, declaration) in program.inputs() {
         let value = bindings.inputs.get(id).ok_or(ProgramLowerError::Backend(
@@ -2816,7 +2929,7 @@ impl RnsBggParameters {
             ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
             ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
         })?;
-        let workload = RnsBggDerivedWorkload::from_program(program)?;
+        let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
         for ((index, output), terminal_bound) in
             program.outputs().iter().enumerate().zip(terminal_value_bounds)
         {
@@ -2886,7 +2999,12 @@ impl RnsBggParameters {
         let primes = pool.to_crt().0;
         let mut levels = Vec::with_capacity(logical_count + 1);
         for index in 0..=logical_count {
-            let depth = request.max_crt_depth.saturating_sub(index).max(request.terminal_depth);
+            let depth = super::planned_crt_depth(
+                index,
+                request.operations_per_drop,
+                request.max_crt_depth,
+                request.terminal_depth,
+            )?;
             let modulus = primes[..depth].iter().copied().map(BigUint::from).product();
             levels.push(
                 pool.select_modulus(&modulus)
@@ -3122,8 +3240,23 @@ impl<'a> RnsNoiseBuild<'a> {
                 )
                 .map_err(|_| RnsBggError::Binding("invalid RHS binding"))?;
         }
+        let mut evaluator = RnsBggNoiseEvaluator::new(parameters, program, workload, bindings);
+        for (wire, binding) in &bindings.inputs {
+            let value = match binding {
+                InputBinding::Scalar(value) => value.clone(),
+                InputBinding::Family(family) => family.element.clone(),
+            };
+            evaluator.trace.wires.insert(*wire, value);
+            let node = crate::noise_utils::NoiseNodeId(evaluator.trace.dependencies.nodes.len());
+            evaluator.trace.dependencies.nodes.push(
+                crate::noise_utils::NoiseDependencyNode::Binding(
+                    crate::noise_utils::NoiseBinding::Input(*wire),
+                ),
+            );
+            evaluator.trace.dependencies.wires.insert(*wire, node);
+        }
         Ok(Self {
-            evaluator: Some(RnsBggNoiseEvaluator::new(parameters, program, workload, bindings)),
+            evaluator: Some(evaluator),
             families: RnsBggNoiseFamilies,
             environment,
             refresh_prf: None,
@@ -3373,12 +3506,49 @@ impl<'a> crate::api::NoiseBuild for RnsNoiseBuild<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::program::ExpLayout;
+    use std::collections::BTreeSet;
 
     fn value(payload: &[i64]) -> RnsBggNoiseValue {
         RnsBggNoiseValue::public(
             BigUint::zero(),
             &payload.iter().copied().map(BigInt::from).collect::<Vec<_>>(),
         )
+    }
+
+    fn nested_alignment_parameters() -> RnsBggParameters {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        RnsBggParameters::new(vec![high, low], 1, 1).unwrap()
+    }
+
+    fn alignment_rounding(
+        alpha: &BigUint,
+        source_level: usize,
+        key_level: usize,
+        target_level: usize,
+        role: &'static [u8],
+    ) -> RnsBggNoiseValue {
+        let source = stable_source_id(&(
+            b"rns-bgg/public-alignment/rounding".as_slice(),
+            role,
+            source_level,
+            key_level,
+            target_level,
+        ));
+        RnsBggNoiseValue {
+            bound: RnsBggNoiseBound { error: BigUint::one(), payload_l1: BigUint::zero() },
+            payload_l2_squared: BigUint::zero(),
+            moments: Some(NoiseMoments::discrete_rounding_residue(alpha).unwrap()),
+            provenance: BTreeMap::from([(
+                source,
+                NoiseSourceProvenance {
+                    source,
+                    route: vec![source_level, key_level, target_level],
+                },
+            )]),
+            heuristics: NoiseHeuristicLedger::new().with([NoiseHeuristicId::ExactDistribution]),
+        }
     }
 
     #[test]
@@ -3433,7 +3603,7 @@ mod test {
 
         assert!(matches!(
             RnsBggDerivedWorkload::from_program(&program),
-            Err(RnsBggError::RhsLevelMismatch { rhs: actual, expected: 0, actual: 1 })
+            Err(RnsBggError::RhsLevelMismatch { rhs: actual, expected: 1, actual: 0 })
                 if actual == rhs
         ));
     }
@@ -3489,6 +3659,77 @@ mod test {
             RnsBggDerivedWorkload::from_program(&program).unwrap().rhs_level(rhs).unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn lut_payload_norms_follow_output_representation_through_private_mul() {
+        fn trace_lut(table: LutTable, follow_private_mul: bool) -> RnsBggNoiseTrace {
+            let mut builder = crate::program::ExponentLutProgramBuilder::new();
+            let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+            let lut = builder.register_lut(table).unwrap();
+            let lut_output = builder.lut(crate::program::Operand::Scalar(input), lut).unwrap();
+            let output = if follow_private_mul {
+                let rhs = builder.rhs_input().unwrap();
+                builder
+                    .mul_private(
+                        crate::program::Operand::Scalar(lut_output),
+                        crate::program::Operand::Scalar(rhs),
+                    )
+                    .unwrap()
+            } else {
+                lut_output
+            };
+            let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+            let source = DCRTPolyParams::new(16, 3, 17, 4, None, None);
+            let moduli = source.to_crt().0;
+            let middle = source
+                .select_modulus(
+                    &moduli[..2]
+                        .iter()
+                        .fold(BigUint::one(), |product, prime| product * BigUint::from(*prime)),
+                )
+                .unwrap();
+            let terminal = source.select_modulus(&BigUint::from(moduli[0])).unwrap();
+            let parameters = RnsBggParameters::new(vec![source, middle, terminal], 1, 1).unwrap();
+            let rhs = follow_private_mul
+                .then_some(RnsBggNoiseRhs {
+                    payload_l1: BigUint::one(),
+                    payload_l2_squared: BigUint::one(),
+                })
+                .into_iter()
+                .collect::<Vec<_>>();
+            let bindings =
+                RnsBggNoiseBindings::from_inputs(&program, &[value(&[1])], &rhs).unwrap();
+            trace_program(&parameters, &program, &bindings).unwrap()
+        }
+
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let exponent = trace_lut(
+            LutTable::unary(
+                2,
+                layout,
+                2,
+                vec![0, 0],
+                crate::program::LutOutputRepresentation::Exponent(layout),
+            )
+            .unwrap(),
+            true,
+        );
+        let coefficient = trace_lut(
+            LutTable::unary(
+                2,
+                layout,
+                3,
+                vec![0, 2],
+                crate::program::LutOutputRepresentation::Coefficient,
+            )
+            .unwrap(),
+            false,
+        );
+        assert_eq!(exponent.outputs[0].bound.payload_l1, BigUint::one());
+        assert_eq!(exponent.outputs[0].payload_l2_squared, BigUint::one());
+        assert_eq!(coefficient.outputs[0].bound.payload_l1, BigUint::from(2u8));
+        assert_eq!(coefficient.outputs[0].payload_l2_squared, BigUint::from(4u8));
     }
 
     #[test]
@@ -3549,7 +3790,8 @@ mod test {
             .unwrap();
         let program = builder.finish(vec![crate::program::Operand::Scalar(second)]).unwrap();
         let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let parameters = RnsBggParameters::new(vec![level.clone(), level], 1, 1).unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![level.clone(), level.clone(), level], 1, 1).unwrap();
         assert_eq!(parameters.scale(0).unwrap(), &BigUint::from(1u8));
         let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
 
@@ -3569,134 +3811,246 @@ mod test {
     }
 
     #[test]
-    fn workload_starts_a_new_helper_group_after_consecutive_exponent_luts() {
+    fn lut_material_sources_reuse_a_and_f_but_split_lut_specific_b() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let first_table = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![0, 1],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let second_table = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![1, 0],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let output = builder
+            .add(crate::program::Operand::Scalar(input), crate::program::Operand::Scalar(input))
+            .unwrap();
+        let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
+        let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        // Material at evaluation level 1 also needs its decomposition level 2;
+        // keep that level in the fixture so the test exercises level-keyed
+        // sharing rather than failing parameter validation first.
+        let parameters =
+            RnsBggParameters::new(vec![level.clone(), level.clone(), level], 1, 1).unwrap();
+        let bindings = RnsBggNoiseBindings::default();
+        let evaluator = RnsBggNoiseEvaluator::new(&parameters, &program, &workload, &bindings);
+        let projection = program.encryption_inputs();
+        let first = evaluator
+            .lut_material_provenance(0, first_table, &projection.luts()[first_table.0 as usize])
+            .unwrap();
+        let same = evaluator
+            .lut_material_provenance(0, first_table, &projection.luts()[first_table.0 as usize])
+            .unwrap();
+        let different = evaluator
+            .lut_material_provenance(0, second_table, &projection.luts()[second_table.0 as usize])
+            .unwrap();
+        let different_level = evaluator
+            .lut_material_provenance(1, first_table, &projection.luts()[first_table.0 as usize])
+            .unwrap();
+
+        assert_eq!(first, same);
+        assert!(!first.is_empty());
+        assert!(first.keys().any(|source| !different.contains_key(source)));
+        assert!(
+            first.keys().filter(|source| different.contains_key(*source)).count() < first.len()
+        );
+        assert!(first.keys().all(|source| !different_level.contains_key(source)));
+    }
+
+    #[test]
+    fn cadence_maps_logical_levels_to_equal_modulus_windows() {
+        let depths = (0..=8)
+            .map(|level| crate::rns_bgg::planned_crt_depth(level, 3, 6, 2).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(depths, vec![6, 6, 6, 5, 5, 5, 4, 4, 4]);
+    }
+
+    #[test]
+    fn equal_modulus_finalization_adds_no_rounding_noise() {
+        assert_eq!(
+            refresh_channel_mod_down_bound(&BigUint::from(17u8), &BigUint::one()).unwrap(),
+            BigUint::from(17u8)
+        );
+    }
+
+    #[test]
+    fn public_alignment_uses_the_parameter_nested_drop() {
+        let parameters = nested_alignment_parameters();
+        let alignment = parameters.public_alignment(0, 1).unwrap();
+        assert!(alignment.ratio() > &BigUint::one());
+        assert_eq!(
+            parameters
+                .mul_public_target_level(1, crate::program::AttributeKnowledge::PrivatePayload, 0,)
+                .unwrap(),
+            1
+        );
+
+        let alpha = alignment.ratio().clone();
+        let ciphertext = alignment_rounding(&alpha, 0, 0, 1, b"ciphertext");
+        let key = alignment_rounding(&alpha, 0, 0, 1, b"key");
+        let mut source = value(&[1]);
+        source.bound.error = BigUint::one();
+        source.moments = Some(NoiseMoments {
+            mean_numerator: BigInt::zero(),
+            mean_denominator: BigUint::one(),
+            mean_radius: NonnegativeRational::zero(),
+            variance: NonnegativeRational::new(1u8.into(), 1u8.into()).unwrap(),
+        });
+        let result = parameters
+            .public_alignment_noise_transfer(
+                &source,
+                &RightActionNoiseGain::unit(),
+                &alpha,
+                &ciphertext,
+                &key,
+                &[RnsBggMaskSecretComponent::deterministic(1u8.into(), 1u8.into())],
+                &NoiseMomentPolicy::Discrete { alpha: alpha.clone() },
+            )
+            .unwrap();
+        assert!(result.bound.error > source.bound.error);
+        assert_eq!(result.provenance.len(), 2);
+        assert!(result.moments.is_some());
+    }
+
+    #[test]
+    fn public_alignment_accounts_for_both_mask_row_components() {
+        let parameters = nested_alignment_parameters();
+        let alpha = parameters.public_alignment(0, 1).unwrap().ratio().clone();
+        let ciphertext = alignment_rounding(&alpha, 0, 0, 1, b"ciphertext");
+        let key = alignment_rounding(&alpha, 0, 0, 1, b"key");
+        let source = value(&[1]);
+        let policy = NoiseMomentPolicy::Discrete { alpha: alpha.clone() };
+        let component = RnsBggMaskSecretComponent::deterministic(1u8.into(), 1u8.into());
+        let one = parameters
+            .public_alignment_noise_transfer(
+                &source,
+                &RightActionNoiseGain::unit(),
+                &alpha,
+                &ciphertext,
+                &key,
+                std::slice::from_ref(&component),
+                &policy,
+            )
+            .unwrap();
+        let two = parameters
+            .public_alignment_noise_transfer(
+                &source,
+                &RightActionNoiseGain::unit(),
+                &alpha,
+                &ciphertext,
+                &key,
+                &[component.clone(), component],
+                &policy,
+            )
+            .unwrap();
+        assert!(two.bound.error > one.bound.error);
+        let one_variance = &one.moments.as_ref().unwrap().variance;
+        let two_variance = &two.moments.as_ref().unwrap().variance;
+        assert!(
+            &two_variance.numerator * &one_variance.denominator >
+                &one_variance.numerator * &two_variance.denominator
+        );
+        assert_eq!(two.provenance, one.provenance);
+    }
+
+    #[test]
+    fn public_alignment_equal_physical_ring_is_an_exact_noop() {
+        let parameters = nested_alignment_parameters();
+        let mut source = value(&[1]);
+        let source_id = stable_source_id(&b"alignment-source".as_slice());
+        source.provenance = RnsBggNoiseValue::single_provenance(NoiseSourceProvenance {
+            source: source_id,
+            route: vec![7],
+        });
+        source.heuristics.insert(NoiseHeuristicId::H4RhsIndependence);
+        let result = parameters
+            .public_alignment_noise_transfer(
+                &source,
+                &RightActionNoiseGain { l1: BigUint::zero(), l2_squared: BigUint::zero() },
+                &BigUint::one(),
+                &RnsBggNoiseValue::public(BigUint::zero(), &[]),
+                &RnsBggNoiseValue::public(BigUint::zero(), &[]),
+                &[],
+                &NoiseMomentPolicy::Continuous,
+            )
+            .unwrap();
+        assert_eq!(result.bound, source.bound);
+        assert_eq!(result.provenance, source.provenance);
+        assert_eq!(result.heuristics, source.heuristics);
+    }
+
+    #[test]
+    fn public_alignment_reuses_rounding_sources_across_repeated_routes() {
+        let parameters = nested_alignment_parameters();
+        let alpha = parameters.public_alignment(0, 1).unwrap().ratio().clone();
+        let ciphertext = alignment_rounding(&alpha, 0, 0, 1, b"ciphertext");
+        let key = alignment_rounding(&alpha, 0, 0, 1, b"key");
+        let source = value(&[1]);
+        let policy = NoiseMomentPolicy::Discrete { alpha: alpha.clone() };
+        let mask = [RnsBggMaskSecretComponent::deterministic(1u8.into(), 1u8.into())];
+        let first = parameters
+            .public_alignment_noise_transfer(
+                &source,
+                &RightActionNoiseGain::unit(),
+                &alpha,
+                &ciphertext,
+                &key,
+                &mask,
+                &policy,
+            )
+            .unwrap();
+        let second = parameters
+            .public_alignment_noise_transfer(
+                &first,
+                &RightActionNoiseGain::unit(),
+                &alpha,
+                &ciphertext,
+                &key,
+                &mask,
+                &policy,
+            )
+            .unwrap();
+        assert_eq!(second.provenance.len(), first.provenance.len());
+        for source in ["ciphertext", "key"] {
+            let id = stable_source_id(&(
+                b"rns-bgg/public-alignment/rounding".as_slice(),
+                source.as_bytes(),
+                0usize,
+                0usize,
+                1usize,
+            ));
+            assert_eq!(second.provenance[&id].route.len(), 6);
+        }
+    }
+
+    #[test]
+    fn coefficient_output_finalizes_once_and_reuses_duplicate_declarations() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
         let table = builder
             .register_lut(
                 LutTable::unary(
                     2,
-                    2,
-                    vec![0, 1],
-                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
-                        stride_log2: 0,
-                        width_log2: 1,
-                    }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let first = builder.lut(crate::program::Operand::Scalar(input), table).unwrap();
-        let second = builder.lut(crate::program::Operand::Scalar(first), table).unwrap();
-        let program = builder.finish(vec![crate::program::Operand::Scalar(second)]).unwrap();
-        let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
-
-        assert_eq!(workload.level(first).unwrap(), 1);
-        assert_eq!(workload.level(second).unwrap(), 2);
-        assert_eq!(workload.lut_helper_origin(first).unwrap(), input);
-        let second_origin = workload.lut_helper_origin(second).unwrap();
-        assert_ne!(second_origin, first);
-        assert_eq!(workload.level(second_origin).unwrap(), 1);
-    }
-
-    #[test]
-    fn workload_reuses_helpers_only_for_compatible_lut_sites() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
-        let exponent = builder
-            .register_lut(
-                LutTable::unary(
-                    2,
-                    2,
-                    vec![0, 1],
-                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
-                        stride_log2: 0,
-                        width_log2: 1,
-                    }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let left = builder.lut(crate::program::Operand::Scalar(input), exponent).unwrap();
-        let right = builder.lut(crate::program::Operand::Scalar(input), exponent).unwrap();
-        let shared = builder
-            .add(crate::program::Operand::Scalar(left), crate::program::Operand::Scalar(right))
-            .unwrap();
-        let program = builder.finish(vec![crate::program::Operand::Scalar(shared)]).unwrap();
-        let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
-
-        assert_eq!(workload.lut_helper_origin(left).unwrap(), input);
-        assert_eq!(workload.lut_helper_origin(right).unwrap(), input);
-    }
-
-    #[test]
-    fn workload_separates_incompatible_direct_lut_sites_from_one_input() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
-        let exponent = builder
-            .register_lut(
-                LutTable::unary(
-                    2,
-                    2,
-                    vec![0, 1],
-                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
-                        stride_log2: 0,
-                        width_log2: 1,
-                    }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let coefficient = builder
-            .register_lut(
-                LutTable::unary(
-                    4,
-                    2,
-                    vec![0, 1, 1, 0],
-                    crate::program::LutOutputRepresentation::Coefficient,
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let first = builder.lut(crate::program::Operand::Scalar(input), exponent).unwrap();
-        let second = builder.lut(crate::program::Operand::Scalar(input), coefficient).unwrap();
-        let program = builder
-            .finish(vec![
-                crate::program::Operand::Scalar(first),
-                crate::program::Operand::Scalar(second),
-            ])
-            .unwrap();
-        let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
-        let first_origin = workload.lut_helper_origin(first).unwrap();
-        let second_origin = workload.lut_helper_origin(second).unwrap();
-
-        assert_eq!(first_origin, input);
-        assert_ne!(second_origin, first_origin);
-        assert_eq!(workload.level(second_origin).unwrap(), 0);
-    }
-
-    #[test]
-    fn workload_splits_helper_group_when_output_layout_changes() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
-        let exponent = builder
-            .register_lut(
-                LutTable::unary(
-                    2,
-                    2,
-                    vec![0, 1],
-                    crate::program::LutOutputRepresentation::Exponent(ExpLayout {
-                        stride_log2: 0,
-                        width_log2: 1,
-                    }),
-                )
-                .unwrap(),
-            )
-            .unwrap();
-        let coefficient = builder
-            .register_lut(
-                LutTable::unary(
-                    2,
+                    layout,
                     2,
                     vec![0, 1],
                     crate::program::LutOutputRepresentation::Coefficient,
@@ -3704,15 +4058,26 @@ mod test {
                 .unwrap(),
             )
             .unwrap();
-        let first = builder.lut(crate::program::Operand::Scalar(input), exponent).unwrap();
-        let second = builder.lut(crate::program::Operand::Scalar(first), coefficient).unwrap();
-        let program = builder.finish(vec![crate::program::Operand::Scalar(second)]).unwrap();
+        let output = builder.lut(crate::program::Operand::Scalar(input), table).unwrap();
+        let program = builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap();
         let workload = RnsBggDerivedWorkload::from_program(&program).unwrap();
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 2).unwrap();
+        let bindings = RnsBggNoiseBindings::default();
+        let mut evaluator = RnsBggNoiseEvaluator::new(&parameters, &program, &workload, &bindings);
+        let outputs =
+            evaluator.finish_outputs(vec![(output, value(&[1])), (output, value(&[1]))]).unwrap();
+        let ratio = parameters.scale(0).unwrap();
+        let expected =
+            refresh_channel_mod_down_bound(parameters.encoding_error_bound(), ratio).unwrap();
 
-        assert_eq!(workload.lut_helper_origin(first).unwrap(), input);
-        let second_origin = workload.lut_helper_origin(second).unwrap();
-        assert_ne!(second_origin, first);
-        assert_eq!(workload.level(second_origin).unwrap(), 1);
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].bound.error, expected);
+        assert_eq!(outputs[0].bound, outputs[1].bound);
+        assert_eq!(evaluator.trace.joint_event_count, BigUint::one());
+        assert_eq!(outputs[0].provenance.len(), 1);
+        assert_eq!(outputs[0].provenance, outputs[1].provenance);
     }
 
     #[test]

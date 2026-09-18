@@ -305,7 +305,7 @@ impl RefreshPrfLabelIndex {
 /// The declaration owns only protocol metadata and the structural PRF
 /// preparation.  It does not contain a scheme carrier, plaintext, sampled
 /// matrix, or runtime graph handle.  Concrete stages bind those values through
-/// their `NoiseRefresh` implementation when [`crate::api::apply_refresh`] is
+/// their `NoiseRefresh` implementation when the common refresh dispatch is
 /// called.
 #[derive(Clone, Debug)]
 pub struct RefreshDeclaration {

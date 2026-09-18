@@ -1,6 +1,9 @@
 #![cfg(feature = "gpu")]
 
-use mxx_dsl::{DslContext, GraphValue, GraphValueSchema, Ring};
+use mxx_bench_estimator::{
+    estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
+};
+use mxx_dsl::{GraphValue, GraphValueSchema, Ring};
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api,
     noise_refresh::{
@@ -14,31 +17,27 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseValue, RnsBggParameters, RnsEncryptBuild, RnsNoiseBuild, RnsOnlineBuild,
-        RnsPreprocessBuild,
+        RnsPreprocessBuild, checkpoint_refreshed_output, resume_refreshed_output,
+        verify_refreshed_output,
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
-use mxx_primitives::{
-    matrix::PolyMatrix,
-    poly::{
-        Poly, PolyParams,
-        dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
-    },
+use mxx_primitives::poly::{
+    Poly, PolyParams,
+    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
 };
 use mxx_runtime::{
-    Backend, ExecutionConfig, RuntimeValue,
-    artifact::FileArtifactStore,
-    backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
+    ExecutionConfig, artifact::FileArtifactStore, backend::poly::gpu::gpu_backend_on,
 };
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::{One, Zero};
 use serial_test::serial as sequential;
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::collections::BTreeMap;
 
 fn nested_rns_parameters() -> (DCRTPolyParams, RnsBggParameters) {
     let pool = DCRTPolyParams::new(32, 4, 10, 5, None, None);
     let primes = pool.to_crt().0;
-    let levels = [4usize, 3, 2]
+    let levels = [4usize, 3, 2, 1, 1, 1, 1, 1, 1]
         .into_iter()
         .map(|depth| {
             let modulus =
@@ -58,6 +57,11 @@ fn noise_value() -> RnsBggNoiseValue {
 #[test]
 #[sequential(dcrt_runtime)]
 fn noise_refresh_end_to_end() {
+    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+    if devices.is_empty() {
+        eprintln!("skipping RNS refresh round trip: no CUDA device detected");
+        return;
+    }
     let (poly_parameters, parameters) = nested_rns_parameters();
     let source = NandCircuit::new(2, vec![[0, 1]], 2)
         .expect("valid source circuit")
@@ -149,7 +153,7 @@ fn noise_refresh_end_to_end() {
         source_output,
         output_schema,
         slots,
-        RefreshDigitPlan { base: 2, mask_counts: vec![1; target_primes.len()], fresh_count: 1 },
+        RefreshDigitPlan { base: 4, mask_counts: vec![1; target_primes.len()], fresh_count: 1 },
         labels,
         prepared,
         2,
@@ -164,7 +168,9 @@ fn noise_refresh_end_to_end() {
     let zero = DCRTPoly::const_zero(&poly_parameters);
     let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
     let d_values = (0..d_width)
-        .map(|index| DCRTPoly::const_rotate_poly(&poly_parameters, index))
+        .map(|index| {
+            DCRTPoly::const_rotate_poly(&poly_parameters, index % profile.q().expect("Q exponent"))
+        })
         .collect::<Vec<_>>();
     let mut prf_lhs = BTreeMap::new();
     for (&wire, declaration) in prf_program.encryption_inputs().inputs() {
@@ -248,345 +254,21 @@ fn noise_refresh_end_to_end() {
     let prf_noise_bindings =
         RnsBggNoiseBindings::new(prf_noise_inputs, prf_noise_rhs).expect("PRF noise bindings");
 
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "RNS refresh requires a CUDA device");
-    let gpu_levels = parameters.levels().iter().map(|level| {
-        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
-    });
-    let mut backend = gpu_backend_on(gpu_levels, devices);
-    let source_lhs_rhs = source
-        .plaintext_inputs::<DCRTPoly>(&poly_parameters, &[false, false])
-        .expect("source plaintext bindings");
-    let source_lhs = source_lhs_rhs.0;
-    let source_rhs = source_lhs_rhs.1;
-    let mut preprocess_children = BTreeMap::new();
-    for slot in 0..declaration.slots().len() {
-        let mut child = RnsPreprocessBuild::new(&parameters, [0x51; 32]);
-        api::PreprocessBuild::bind_inputs(
-            &mut child,
-            prf_program,
-            &ParamEnv::default(),
-            &prf_rhs,
-            &payload,
-            &hash_key,
-        )
-        .expect("PRF preprocess child inputs");
-        child.bind_refresh_prf(&declaration, slot).expect("PRF preprocess child binding");
-        preprocess_children.insert(slot, child);
-    }
-
-    let directory = tempfile::tempdir().expect("artifact directory");
-    let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let preprocess_encrypt = directory.path().join("preprocess-encrypt.json");
-    let preprocess_online = directory.path().join("preprocess-online.json");
-    let encryption = directory.path().join("encryption.json");
-    let config = ExecutionConfig::default();
-    let preprocess_declaration = declaration.clone();
-    let (preprocess, online) = api::preprocess(
-        source_program,
-        &ParamEnv::default(),
-        &source_rhs,
-        &payload,
-        &hash_key,
-        RnsPreprocessBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
-        &mut store,
-        [&preprocess_encrypt, &preprocess_online],
-        config.clone(),
-        move |build, outputs| {
-            build
-                .bind_refresh_declaration(&preprocess_declaration)
-                .expect("source refresh declaration");
-            build
-                .apply_refresh(
-                    0,
-                    &preprocess_declaration,
-                    (0..preprocess_declaration.slots().len())
-                        .map(|slot| (slot, outputs[0].clone()))
-                        .collect(),
-                    preprocess_children,
-                )
-                .expect("source preprocess refresh");
-            Ok(outputs)
-        },
-        |_| Ok(()),
-    )
-    .expect("source preprocess");
-
-    let mut encrypt_children = BTreeMap::new();
-    for slot in 0..declaration.slots().len() {
-        let mut child = RnsEncryptBuild::new(&parameters, [0x51; 32]);
-        api::EncryptBuild::bind_inputs(
-            &mut child,
-            &prf_program.encryption_inputs(),
-            &prf_lhs,
-            &payload,
-            &mask,
-        )
-        .expect("PRF encryption child inputs");
-        <RnsEncryptBuild<'_, mxx_runtime::backend::poly::gpu::GpuDcrtBackend> as api::EncryptBuild<
-            mxx_runtime::backend::poly::gpu::GpuDcrtBackend,
-            DCRTPoly,
-        >>::bind_artifacts(&mut child, &preprocess)
-            .expect("PRF encryption child artifacts");
-        child
-            .bind_refresh_prf(&declaration, slot, prf_program)
-            .expect("PRF encryption child binding");
-        encrypt_children.insert(slot, child);
-    }
-    let encrypt_declaration = declaration.clone();
-    let encrypted = api::encrypt(
-        &source_program.encryption_inputs(),
-        &ParamEnv::default(),
-        &source_lhs,
-        &preprocess,
-        &payload,
-        &mask,
-        RnsEncryptBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
-        api::ArtifactDestination { store: &mut store, checkpoint: &encryption },
-        config.clone(),
-        move |build| {
-            build
-                .bind_refresh_declaration(&encrypt_declaration)
-                .expect("source encryption declaration");
-            build
-                .bind_refresh_prf_children(&encrypt_declaration, encrypt_children)
-                .expect("source encryption refresh children");
-            Ok(())
-        },
-        |_| Ok(()),
-    )
-    .expect("source encryption");
-
-    let mut online_children = BTreeMap::new();
-    for slot in 0..declaration.slots().len() {
-        let mut child = RnsOnlineBuild::new(&parameters, [0x51; 32]);
-        child
-            .bind_refresh_artifacts(&declaration, slot, &preprocess, &encrypted)
-            .expect("PRF online child artifacts");
-        child.bind_refresh_prf(&declaration, slot).expect("PRF online child binding");
-        online_children.insert(slot, child);
-    }
-    let online_declaration = declaration.clone();
-    let refreshed_carrier = Rc::new(RefCell::new(None));
-    let refreshed_carrier_slot = Rc::clone(&refreshed_carrier);
-    let refresh_checkpoint_graph = Rc::new(RefCell::new(None));
-    let refresh_checkpoint_graph_slot = Rc::clone(&refresh_checkpoint_graph);
-    let mut online_result = api::online_eval(
-        source_program,
-        &ParamEnv::default(),
-        &online,
-        &encrypted,
-        RnsOnlineBuild::new(&parameters, [0x51; 32]),
-        &mut backend,
-        &mut store,
-        config,
-        move |build, mut outputs| {
-            let refreshed = build
-                .compose_refresh(0, &online_declaration, online_children, &mut outputs)
-                .expect("source online refresh");
-            let target = build
-                .refreshed_public_key()
-                .cloned()
-                .expect("refresh must expose its matching target key");
-            let checkpoint_graph = build
-                .build_refresh_checkpoint_graph::<GpuDcrtBackend>(
-                    &online_declaration,
-                    refreshed.clone(),
-                    target,
-                )
-                .expect("refresh checkpoint graph");
-            *refreshed_carrier_slot.borrow_mut() = Some(refreshed);
-            *refresh_checkpoint_graph_slot.borrow_mut() = Some(checkpoint_graph);
-            Ok(outputs)
-        },
-        |_| Ok(()),
-    )
-    .expect("source online evaluation");
-    assert!(
-        refreshed_carrier.borrow().is_some(),
-        "online compose must return the refreshed encoding carrier"
-    );
-
-    let (checkpoint_graph, checkpoint_descriptor) = refresh_checkpoint_graph
-        .borrow_mut()
-        .take()
-        .expect("online compose must produce a refresh checkpoint graph");
-    let refresh_checkpoint_path = directory.path().join("refresh-checkpoint.json");
-    let refresh_checkpoint = api::execute_checkpoint(
-        checkpoint_graph,
-        &ParamEnv::default(),
-        checkpoint_descriptor,
-        *declaration.commitment(),
-        &mut backend,
-        &mut store,
-        &refresh_checkpoint_path,
-        ExecutionConfig::default(),
-        |_| Ok(()),
-    )
-    .expect("refresh checkpoint execution");
-    let reopened = refresh_checkpoint
-        .checkpoint()
-        .reopen_in_store(&mut store)
-        .expect("refresh checkpoint reopen");
-    assert_eq!(reopened.expected_identity(), refresh_checkpoint.checkpoint().expected_identity());
-
-    let continuation = NandCircuit::new(1, Vec::new(), 0)
-        .expect("identity continuation circuit")
-        .compile(ExpLayout { stride_log2: 0, width_log2: 4 }, 32, 4)
-        .expect("identity continuation program");
-    let continuation_parameters = RnsBggParameters::new(
-        vec![parameters.level(2).expect("target level").clone()],
-        bigdecimal::BigDecimal::from(1u8),
-        1,
-    )
-    .expect("target-chain parameters");
-    let mut resumed = RnsOnlineBuild::new(&continuation_parameters, [0x51; 32]);
-    resumed
-        .bind_refreshed_input(
-            continuation.program(),
-            continuation.state_input(),
-            &declaration,
-            &refresh_checkpoint,
-        )
-        .expect("bind refreshed input to identity continuation");
-    let imported_encoding = resumed
-        .refreshed_encoding()
-        .cloned()
-        .expect("resumption must import the refreshed encoding");
-    let public_key = resumed
-        .refreshed_public_key()
-        .cloned()
-        .expect("resumption must import the refreshed target");
-    let expected_plaintext = target_ring.polynomial([IntExpr::constant(BigInt::from(1u8))]);
-    let residual = imported_encoding
-        .verification_residual(
-            &continuation_parameters,
-            0,
-            &public_key,
-            &payload,
-            &mask,
-            expected_plaintext,
-        )
-        .expect("compute caller-owned verification residual");
-    let residual_graph = DslContext::new("rns-bgg-refresh-verification")
-        .artifact_output("verification-residual.0", residual.0)
-        .expect("verification residual graph port")
-        .artifact_output("verification-residual.1", residual.1)
-        .expect("verification residual graph port")
-        .build()
-        .expect("verification residual graph");
-    let residual_graph = api::StageGraph::new(
-        residual_graph,
-        BTreeMap::new(),
-        refresh_checkpoint.checkpoint().catalog().clone(),
-    );
-    let mut residual_result = api::execute_graph(
-        residual_graph,
-        &ParamEnv::default(),
-        &mut backend,
-        &mut store,
-        ExecutionConfig::default(),
-        |_| Ok(()),
-    )
-    .expect("verification residual execution");
-    let mut read_residual = |name: &str| {
-        let value = residual_result
-            .materialize_output(name, &mut backend, &mut store)
-            .expect("materialize verification residual");
-        let RuntimeValue::Matrix(matrix) = value else {
-            panic!("verification residual output must be a matrix");
-        };
-        let (rows, columns) = matrix.size();
-        let cpu_matrix =
-            backend.gather_matrix_for_host(&matrix).expect("read verification residual matrix");
-        let modulus = BigInt::from_biguint(Sign::Plus, target_modulus.clone());
-        let half_modulus = &modulus / 2u8;
-        let norms = (0..rows)
-            .flat_map(|row| (0..columns).map(move |column| (row, column)))
-            .flat_map(|(row, column)| {
-                cpu_matrix
-                    .entry(row, column)
-                    .coeffs_biguints()
-                    .into_iter()
-                    .map(|coefficient| {
-                        let coefficient = BigInt::from_biguint(Sign::Plus, coefficient);
-                        if coefficient > half_modulus {
-                            coefficient - &modulus
-                        } else {
-                            coefficient
-                        }
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(norms.len(), rows * columns * poly_parameters.ring_dimension() as usize);
-        let decoded = backend
-            .threshold_decode(
-                &matrix,
-                &BigInt::from(2u8),
-                poly_parameters.ring_dimension() as usize,
-            )
-            .expect("decode verification residual");
-        assert!(
-            decoded.iter().all(Zero::is_zero),
-            "verification residual decodes to a nonzero plaintext"
-        );
-        norms
-    };
-    let residual_norms =
-        [read_residual("verification-residual.0"), read_residual("verification-residual.1")];
-    let residual_norms = residual_norms.into_iter().flatten().collect::<Vec<_>>();
-    let resumed_graph = <RnsOnlineBuild<'_> as api::OnlineBuild<GpuDcrtBackend>>::build_graph(
-        resumed,
-        vec![imported_encoding],
-    )
-    .expect("identity continuation graph");
-    let mut continuation_result = api::execute_graph(
-        resumed_graph,
-        &ParamEnv::default(),
-        &mut backend,
-        &mut store,
-        ExecutionConfig::default(),
-        |_| Ok(()),
-    )
-    .expect("identity continuation execution");
-    let online_outputs = ["output-0.0", "output-0.1"].map(|name| {
-        let value = online_result
-            .materialize_output(name, &mut backend, &mut store)
-            .expect("materialize refreshed online output");
-        let RuntimeValue::Matrix(matrix) = value else {
-            panic!("refreshed online output must be a matrix");
-        };
-        backend.matrix_to_bytes(&matrix).expect("read refreshed online output")
-    });
-    let continuation_outputs = ["output-0.0", "output-0.1"].map(|name| {
-        let value = continuation_result
-            .materialize_output(name, &mut backend, &mut store)
-            .expect("materialize continuation output");
-        let RuntimeValue::Matrix(matrix) = value else {
-            panic!("continuation output must be a matrix");
-        };
-        backend.matrix_to_bytes(&matrix).expect("read continuation output")
-    });
-    assert_eq!(
-        continuation_outputs, online_outputs,
-        "identity continuation changed refreshed encoding"
-    );
-
+    // Simulation is the first phase.  It shares the immutable declarations
+    // with production but does not consume plaintexts, GPU state, or
+    // artifacts.
     let mut refresh_noise =
         mxx_exponent_lut::noise_refresh::simulation::RefreshNoiseParameters::new(
             target_primes.clone(),
             vec![p.clone(); target_primes.len()],
-            2u8.into(),
+            4u8.into(),
             vec![1; target_primes.len()],
             1,
         )
         .expect("refresh noise schema")
-        .with_global_modulus(q)
+        .with_global_modulus(q.clone())
         .expect("refresh global modulus")
-        .with_transcript_topology(topology)
+        .with_transcript_topology(topology.clone())
         .expect("refresh noise topology")
         .with_route_gains(RefreshRouteNoiseGains {
             state_scaling: vec![RightActionNoiseGain::unit(); target_primes.len()],
@@ -637,5 +319,237 @@ fn noise_refresh_end_to_end() {
         .bound
         .error
         .clone();
-    assert!(residual_norms.iter().all(|norm| norm.magnitude() <= &refreshed_bound));
+
+    let gpu_levels = parameters.levels().iter().map(|level| {
+        GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
+    });
+    let measurement_backends = devices
+        .iter()
+        .copied()
+        .map(|device| {
+            let levels = parameters.levels().iter().map(|level| {
+                GpuDCRTPolyParams::new(
+                    level.ring_dimension(),
+                    level.to_crt().0,
+                    level.base_bits(),
+                    None,
+                )
+            });
+            (gpu_backend_on(levels, [device]), device)
+        })
+        .collect();
+    let mut estimator = GpuNodeMeasurementBackend::new(
+        measurement_backends,
+        MeasurementHarnessConfig {
+            warm_up_iterations: 1,
+            measured_iterations: 1,
+            ..MeasurementHarnessConfig::default()
+        },
+    );
+    let mut backend = gpu_backend_on(gpu_levels, devices);
+    let source_lhs_rhs = source
+        .plaintext_inputs::<DCRTPoly>(&poly_parameters, &[false, false])
+        .expect("source plaintext bindings");
+    let source_lhs = source_lhs_rhs.0;
+    let source_rhs = source_lhs_rhs.1;
+    let mut preprocess_children = BTreeMap::new();
+    for slot in 0..declaration.slots().len() {
+        let mut child = RnsPreprocessBuild::new(&parameters, [0x51; 32]);
+        child
+            .bind_rhs_inputs(prf_program, &ParamEnv::default(), &prf_rhs, &payload, &hash_key)
+            .expect("PRF preprocess child inputs");
+        child.bind_refresh_prf(&declaration, slot).expect("PRF preprocess child binding");
+        preprocess_children.insert(slot, child);
+    }
+
+    let directory = tempfile::tempdir().expect("artifact directory");
+    let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
+    let preprocess_encrypt = directory.path().join("preprocess-encrypt.json");
+    let preprocess_online = directory.path().join("preprocess-online.json");
+    let encryption = directory.path().join("encryption.json");
+    let config = ExecutionConfig::default();
+    let preprocess_declaration = declaration.clone();
+    let (preprocess, online) = api::preprocess(
+        source_program,
+        &ParamEnv::default(),
+        &source_rhs,
+        &payload,
+        &hash_key,
+        RnsPreprocessBuild::new(&parameters, [0x51; 32]),
+        &mut backend,
+        &mut store,
+        [&preprocess_encrypt, &preprocess_online],
+        config.clone(),
+        move |build, outputs| {
+            build
+                .bind_refresh_declaration(&preprocess_declaration)
+                .expect("source refresh declaration");
+            build
+                .apply_refresh(
+                    0,
+                    &preprocess_declaration,
+                    (0..preprocess_declaration.slots().len())
+                        .map(|slot| (slot, outputs[0].clone()))
+                        .collect(),
+                    preprocess_children,
+                )
+                .expect("source preprocess refresh");
+            Ok(outputs)
+        },
+        |validated| {
+            estimate(validated, &mut estimator).expect("estimate preprocess graph");
+            estimator.measure_collected().expect("measure preprocess graph");
+            let report = estimate(validated, &mut estimator).expect("preprocess estimate");
+            assert!(report.total_work_seconds > 0.0);
+            Ok(())
+        },
+    )
+    .expect("source preprocess");
+
+    let mut encrypt_children = BTreeMap::new();
+    for slot in 0..declaration.slots().len() {
+        let mut child = RnsEncryptBuild::new(&parameters, [0x51; 32]);
+        child
+            .bind_lhs_inputs(
+                &prf_program.encryption_inputs(),
+                &ParamEnv::default(),
+                &prf_lhs,
+                &payload,
+                &mask,
+                &hash_key,
+            )
+            .expect("PRF encryption child inputs");
+        child.bind_preprocess_artifacts(&preprocess).expect("PRF encryption child artifacts");
+        child
+            .bind_refresh_prf(&declaration, slot, prf_program)
+            .expect("PRF encryption child binding");
+        encrypt_children.insert(slot, child);
+    }
+    let encrypt_declaration = declaration.clone();
+    let encrypted = api::encrypt(
+        &source_program.encryption_inputs(),
+        &ParamEnv::default(),
+        &source_lhs,
+        &preprocess,
+        &payload,
+        &mask,
+        &hash_key,
+        RnsEncryptBuild::new(&parameters, [0x51; 32]),
+        &mut backend,
+        api::ArtifactDestination { store: &mut store, checkpoint: &encryption },
+        config.clone(),
+        move |build| {
+            build
+                .bind_refresh_declaration(&encrypt_declaration)
+                .expect("source encryption declaration");
+            build
+                .bind_refresh_prf_children(&encrypt_declaration, encrypt_children)
+                .expect("source encryption refresh children");
+            Ok(())
+        },
+        |validated| {
+            estimate(validated, &mut estimator).expect("estimate encrypt graph");
+            estimator.measure_collected().expect("measure encrypt graph");
+            let report = estimate(validated, &mut estimator).expect("encrypt estimate");
+            assert!(report.total_work_seconds > 0.0);
+            Ok(())
+        },
+    )
+    .expect("source encryption");
+
+    let mut online_children = BTreeMap::new();
+    for slot in 0..declaration.slots().len() {
+        let mut child = RnsOnlineBuild::new(&parameters, [0x51; 32]);
+        child
+            .bind_refresh_artifacts(&declaration, slot, &online, &encrypted, &hash_key)
+            .expect("PRF online child artifacts");
+        child.bind_refresh_prf(&declaration, slot).expect("PRF online child binding");
+        online_children.insert(slot, child);
+    }
+    let online_declaration = declaration.clone();
+    let mut online_result = api::online_eval(
+        source_program,
+        &ParamEnv::default(),
+        &online,
+        &encrypted,
+        &hash_key,
+        RnsOnlineBuild::new(&parameters, [0x51; 32]),
+        &mut backend,
+        &mut store,
+        config.clone(),
+        move |build, outputs| {
+            build
+                .apply_refresh(0, &online_declaration, online_children)
+                .expect("source online refresh");
+            Ok(outputs)
+        },
+        |validated| {
+            estimate(validated, &mut estimator).expect("estimate online graph");
+            estimator.measure_collected().expect("measure online graph");
+            let report = estimate(validated, &mut estimator).expect("online estimate");
+            assert!(report.total_work_seconds > 0.0);
+            Ok(())
+        },
+    )
+    .expect("source online evaluation");
+    let expected = DCRTPoly::const_rotate_poly(&poly_parameters, 1);
+    verify_refreshed_output(
+        source_program,
+        &declaration,
+        &mut online_result,
+        0,
+        &expected,
+        &parameters,
+        &payload,
+        &mask,
+        &mut backend,
+        &mut store,
+        config,
+    )
+    .expect("RNS-BGG refresh application verification");
+    assert!(!online_result.outputs.is_empty(), "refresh online evaluation has no outputs");
+    assert!(refreshed_bound > 0u8.into(), "refresh simulation must produce a bound");
+
+    // The refresh result is already materialized by the online execution.
+    // Checkpointing imports those returned ports only; it does not lower or
+    // execute the refresh a second time.  Resumption then runs the built-in
+    // single-input identity continuation against the checkpointed carrier.
+    let refresh_checkpoint = directory.path().join("refresh-checkpoint.json");
+    let checkpointed = checkpoint_refreshed_output(
+        source_program,
+        &declaration,
+        &mut online_result,
+        0,
+        &online,
+        &encrypted,
+        &parameters,
+        &hash_key,
+        &mut backend,
+        &mut store,
+        &refresh_checkpoint,
+        ExecutionConfig::default(),
+    )
+    .expect("checkpoint refreshed output");
+    let resumed_parameters = RnsBggParameters::new(
+        vec![
+            parameters.level(declaration.target_level()).expect("target level").clone(),
+            parameters.level(declaration.target_level() + 1).expect("target gadget level").clone(),
+        ],
+        parameters.encoding_error_sigma().clone(),
+        parameters.operations_per_drop(),
+    )
+    .expect("resumed RNS parameters");
+    let resumed = resume_refreshed_output(
+        &declaration,
+        &checkpointed,
+        &resumed_parameters,
+        &mut backend,
+        &mut store,
+        ExecutionConfig::default(),
+    )
+    .expect("resume refreshed output");
+    assert!(
+        resumed.outputs.keys().any(|name| name.starts_with("output-0.")),
+        "identity continuation must return the checkpointed output"
+    );
 }

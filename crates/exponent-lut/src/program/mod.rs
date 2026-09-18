@@ -2,8 +2,8 @@
 //!
 //! This module deliberately contains no scheme-specific carrier types.  A
 //! program describes scalar operations, indexed bodies, and literal LUTs;
-//! [`lower_program`](lowering::lower_program) supplies the only execution
-//! path and delegates each scalar operation to a scheme evaluator.
+//! The internal program walker supplies the only execution path and delegates
+//! each scalar operation to a scheme evaluator.
 
 mod builder;
 mod graph;
@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-pub(crate) use builder::ExponentLutProgramBuilder;
+pub use builder::ExponentLutProgramBuilder;
 pub(crate) use graph::GraphParallelLowering;
 pub use graph::{GraphFamilyExecution, RhsRef};
 pub(crate) use lowering::lower_program;
@@ -396,6 +396,7 @@ pub enum LutOutputRepresentation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LutTable {
     input_width: usize,
+    input_layout: ExpLayout,
     output_width: usize,
     values: Vec<usize>,
     output_representation: LutOutputRepresentation,
@@ -404,26 +405,31 @@ pub struct LutTable {
 impl LutTable {
     pub fn unary(
         input_width: usize,
+        input_layout: ExpLayout,
         output_width: usize,
         values: Vec<usize>,
         output_representation: LutOutputRepresentation,
     ) -> Result<Self, ProgramValidationError> {
-        Self::new(input_width, output_width, values, output_representation)
+        Self::new(input_width, input_layout, output_width, values, output_representation)
     }
 
     fn new(
         input_width: usize,
+        input_layout: ExpLayout,
         output_width: usize,
         values: Vec<usize>,
         output_representation: LutOutputRepresentation,
     ) -> Result<Self, ProgramValidationError> {
-        let table = Self { input_width, output_width, values, output_representation };
+        let table = Self { input_width, input_layout, output_width, values, output_representation };
         validate_table(&table)?;
         Ok(table)
     }
 
     pub fn input_width(&self) -> usize {
         self.input_width
+    }
+    pub fn input_layout(&self) -> ExpLayout {
+        self.input_layout
     }
     pub fn output_width(&self) -> usize {
         self.output_width
@@ -532,9 +538,18 @@ impl ExponentLutProgram {
     pub(crate) fn rhs_inputs(&self) -> &BTreeMap<RhsId, InputShape> {
         &self.rhs_inputs
     }
-    #[cfg(test)]
-    pub(crate) fn luts(&self) -> &[LutTable] {
-        &self.luts
+    /// Resolve a LUT registration by its validated instruction output, including
+    /// instructions nested in parallel bodies. Identity is independent of table
+    /// contents and of the allocation containing a cloned Program.
+    pub(crate) fn lut_id_at(&self, output: WireId) -> Result<LutId, ProgramValidationError> {
+        fn find(body: &Body, output: WireId) -> Option<LutId> {
+            body.steps.iter().find_map(|step| match step {
+                Step::Lut { table, output: candidate, .. } if *candidate == output => Some(*table),
+                Step::Parallel { body, .. } => find(body, output),
+                _ => None,
+            })
+        }
+        find(&self.body, output).ok_or(ProgramValidationError::InvalidLut)
     }
     /// Returns the declared scalar output operands in program order.
     ///
@@ -591,7 +606,22 @@ struct WireMetadata {
 }
 
 pub(crate) fn validate_table(table: &LutTable) -> Result<(), ProgramValidationError> {
-    if table.input_width == 0 || table.output_width == 0 {
+    let layout_width = 1usize.checked_shl(table.input_layout.width_log2);
+    let valid_input_layout =
+        table.input_layout.stride_log2.checked_add(table.input_layout.width_log2).is_some();
+    let valid_output_layout = match table.output_representation {
+        LutOutputRepresentation::Exponent(layout) => {
+            layout.stride_log2.checked_add(layout.width_log2).is_some() &&
+                1usize.checked_shl(layout.width_log2).is_some()
+        }
+        LutOutputRepresentation::Coefficient => true,
+    };
+    if table.input_width == 0 ||
+        table.output_width == 0 ||
+        layout_width != Some(table.input_width) ||
+        !valid_input_layout ||
+        !valid_output_layout
+    {
         return Err(ProgramValidationError::InvalidLut);
     }
     if table.values.len() != table.input_width ||
@@ -687,16 +717,22 @@ fn derive_body_metadata(
             Step::MulPublic { private, public, .. } => {
                 let lhs = metadata_for_operand(private, metadata)?;
                 let rhs = metadata_for_operand(public, metadata)?;
-                if lhs.knowledge != AttributeKnowledge::PrivatePayload ||
-                    rhs.knowledge != AttributeKnowledge::PublicPayload ||
+                if rhs.knowledge != AttributeKnowledge::PublicPayload ||
                     lhs.coefficient ||
                     rhs.coefficient
                 {
                     return Err(ProgramValidationError::InvalidStructure(
-                        "MulPublic requires a private exponent LHS and public exponent RHS".into(),
+                        "MulPublic requires a public exponent RHS and exponent operands".into(),
                     ));
                 }
-                lhs
+                WireMetadata {
+                    knowledge: if lhs.knowledge == AttributeKnowledge::PublicPayload {
+                        AttributeKnowledge::PublicPayload
+                    } else {
+                        AttributeKnowledge::PrivatePayload
+                    },
+                    coefficient: false,
+                }
             }
             Step::MulPrivate { input, .. } => {
                 let input = metadata_for_operand(input, metadata)?;
@@ -1171,9 +1207,67 @@ mod tests {
     }
 
     #[test]
+    fn lut_input_layout_is_explicit_and_must_match_domain_width() {
+        let layout = ExpLayout { stride_log2: 1, width_log2: 1 };
+        let table = LutTable::unary(
+            2,
+            layout,
+            2,
+            vec![0, 1],
+            LutOutputRepresentation::Exponent(ExpLayout { stride_log2: 0, width_log2: 2 }),
+        )
+        .unwrap();
+        assert_eq!(table.input_layout(), layout);
+        assert!(
+            LutTable::unary(4, layout, 2, vec![0, 1, 0, 1], LutOutputRepresentation::Coefficient,)
+                .is_err()
+        );
+        assert!(
+            LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: usize::BITS },
+                2,
+                vec![0, 1],
+                LutOutputRepresentation::Coefficient,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn canonical_identity_commits_lut_input_layout() {
+        fn build(input_layout: ExpLayout) -> ExponentLutProgram {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+            let table = LutTable::unary(
+                2,
+                input_layout,
+                2,
+                vec![0, 1],
+                LutOutputRepresentation::Coefficient,
+            )
+            .unwrap();
+            let lut = builder.register_lut(table).unwrap();
+            let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+            builder.finish(vec![Operand::Scalar(output)]).unwrap()
+        }
+
+        assert_ne!(
+            build(ExpLayout { stride_log2: 0, width_log2: 1 }).id(),
+            build(ExpLayout { stride_log2: 1, width_log2: 1 }).id()
+        );
+    }
+
+    #[test]
     fn lut_representation_is_mandatory() {
-        let table =
-            LutTable::unary(2, 2, vec![0, 1], LutOutputRepresentation::Coefficient).unwrap();
+        let table = LutTable::unary(
+            2,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
+            2,
+            vec![0, 1],
+            LutOutputRepresentation::Coefficient,
+        )
+        .unwrap();
         assert_eq!(table.output_representation(), LutOutputRepresentation::Coefficient);
     }
 
@@ -1196,17 +1290,13 @@ mod tests {
     }
 
     #[test]
-    fn public_multiplication_rejects_public_first_ordering() {
+    fn public_multiplication_allows_public_first_ordering() {
         let mut builder = ExponentLutProgramBuilder::new();
-        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
-        let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let output = builder.mul_public(Operand::Scalar(public), Operand::Scalar(private)).unwrap();
-
-        assert!(matches!(
-            builder.finish(vec![Operand::Scalar(output)]),
-            Err(ProgramValidationError::InvalidStructure(message))
-                if message.contains("MulPublic requires a private exponent LHS")
-        ));
+        let lhs = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let rhs = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let output = builder.mul_public(Operand::Scalar(lhs), Operand::Scalar(rhs)).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        assert_eq!(program.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
     }
 
     #[test]
@@ -1219,10 +1309,10 @@ mod tests {
             builder.finish(vec![Operand::Scalar(output)]).is_err()
         }
 
-        assert!(rejects(AttributeKnowledge::PublicPayload, AttributeKnowledge::PublicPayload));
         assert!(rejects(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PrivatePayload));
         assert!(rejects(AttributeKnowledge::PublicPayload, AttributeKnowledge::PrivatePayload));
         assert!(!rejects(AttributeKnowledge::PrivatePayload, AttributeKnowledge::PublicPayload));
+        assert!(!rejects(AttributeKnowledge::PublicPayload, AttributeKnowledge::PublicPayload));
     }
 
     #[test]
@@ -1244,7 +1334,8 @@ mod tests {
             .unwrap();
         let output = builder.sum(products).unwrap();
 
-        assert!(builder.finish(vec![Operand::Scalar(output)]).is_err());
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        assert_eq!(program.wire_knowledge(output).unwrap(), AttributeKnowledge::PublicPayload);
     }
 
     #[test]
@@ -1272,7 +1363,14 @@ mod tests {
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let table = builder
             .register_lut(
-                LutTable::unary(2, 2, vec![0, 1], LutOutputRepresentation::Coefficient).unwrap(),
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    2,
+                    vec![0, 1],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
             )
             .unwrap();
         let output = builder.lut(Operand::Scalar(input), table).unwrap();
@@ -1325,7 +1423,13 @@ mod tests {
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let range = FamilyRange::full(IntExpr::constant(2)).unwrap();
         let error = builder.parallel(range, |builder, index| {
-            let table = LutTable::unary(1, 1, vec![0], LutOutputRepresentation::Coefficient)?;
+            let table = LutTable::unary(
+                1,
+                ExpLayout { stride_log2: 0, width_log2: 0 },
+                1,
+                vec![0],
+                LutOutputRepresentation::Coefficient,
+            )?;
             let lut = builder.register_lut(table)?;
             let value = builder.lut(Operand::Member { family: input, index }, lut)?;
             Err(ProgramValidationError::InvalidStructure(format!("discard {value:?}")))
@@ -1520,7 +1624,14 @@ mod tests {
         let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let rhs = builder.rhs_input().unwrap();
         let lut_id = builder
-            .register_binary_lut(2, 2, 2, vec![0, 1, 1, 0], LutOutputRepresentation::Coefficient)
+            .register_binary_lut(
+                2,
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 2 },
+                2,
+                vec![0, 1, 1, 0],
+                LutOutputRepresentation::Coefficient,
+            )
             .unwrap();
         let product = builder.mul_private(Operand::Scalar(input), Operand::Scalar(rhs)).unwrap();
         let output = builder.lut(Operand::Scalar(product), lut_id).unwrap();
@@ -1543,17 +1654,26 @@ mod tests {
         let lut = builder
             .register_binary_lut(
                 2,
-                3,
                 2,
-                vec![0, 1, 1, 0, 0, 1],
+                ExpLayout { stride_log2: 0, width_log2: 2 },
+                2,
+                vec![0, 1, 1, 0],
                 LutOutputRepresentation::Coefficient,
             )
             .unwrap();
-        assert_eq!(builder.luts[lut.0 as usize].input_width(), 6);
-        assert_eq!(builder.luts[lut.0 as usize].values(), &[0, 1, 1, 0, 0, 1]);
+        assert_eq!(builder.luts[lut.0 as usize].input_width(), 4);
+        assert_eq!(builder.luts[lut.0 as usize].input_layout().width(), 4);
+        assert_eq!(builder.luts[lut.0 as usize].values(), &[0, 1, 1, 0]);
         assert!(
             builder
-                .register_binary_lut(2, 3, 2, vec![0; 5], LutOutputRepresentation::Coefficient,)
+                .register_binary_lut(
+                    2,
+                    3,
+                    ExpLayout { stride_log2: 0, width_log2: 2 },
+                    2,
+                    vec![0; 6],
+                    LutOutputRepresentation::Coefficient,
+                )
                 .is_err()
         );
     }
@@ -1593,8 +1713,14 @@ mod tests {
         fn build(values: Vec<usize>) -> ExponentLutProgram {
             let mut builder = ExponentLutProgramBuilder::new();
             let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
-            let table =
-                LutTable::unary(2, 2, values, LutOutputRepresentation::Coefficient).unwrap();
+            let table = LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 1 },
+                2,
+                values,
+                LutOutputRepresentation::Coefficient,
+            )
+            .unwrap();
             let lut = builder.register_lut(table).unwrap();
             let output = builder.lut(Operand::Scalar(input), lut).unwrap();
             builder.finish(vec![Operand::Scalar(output)]).unwrap()
@@ -1606,6 +1732,37 @@ mod tests {
         assert_eq!(first.id(), same.id());
         assert_ne!(first.id(), changed.id());
         assert_eq!(first.body, same.body);
+    }
+
+    #[test]
+    fn canonical_identity_commits_lut_ids_when_equal_tables_are_registered() {
+        fn build(swapped: bool) -> ExponentLutProgram {
+            let mut builder = ExponentLutProgramBuilder::new();
+            let first_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+            let second_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+            let table = || {
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    2,
+                    vec![0, 1],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap()
+            };
+            let first_lut = builder.register_lut(table()).unwrap();
+            let second_lut = builder.register_lut(table()).unwrap();
+            assert_ne!(first_lut, second_lut);
+            let (first_lut, second_lut) =
+                if swapped { (second_lut, first_lut) } else { (first_lut, second_lut) };
+            let first_output = builder.lut(Operand::Scalar(first_input), first_lut).unwrap();
+            let second_output = builder.lut(Operand::Scalar(second_input), second_lut).unwrap();
+            builder
+                .finish(vec![Operand::Scalar(first_output), Operand::Scalar(second_output)])
+                .unwrap()
+        }
+
+        assert_ne!(build(false).id(), build(true).id());
     }
 
     #[test]

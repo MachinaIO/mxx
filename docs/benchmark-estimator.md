@@ -506,9 +506,9 @@ families should use static accesses or be normalized by the caller before
 estimation. The estimator uses the representative member's state and does not
 add a runtime validation pass for this contract.
 
-Public import calibration uses a fresh artifact-store verification cache for
+Artifact import calibration uses a fresh artifact-store validation cache for
 each iteration, including timed iterations after warmup, so each logical import
-includes its first-load content-hash verification.
+includes its first-load schema and production-identity validation.
 
 Packed families and artifact-family descriptors retain distinct placement semantics.
 Loop placement imports packed scalar artifacts once before the bodies, leaves host

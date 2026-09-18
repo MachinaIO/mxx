@@ -171,6 +171,25 @@ impl NandCircuit {
         self.output
     }
 
+    /// Evaluate the Boolean circuit independently of its Exponent-LUT
+    /// lowering.
+    ///
+    /// This small application-facing oracle is useful for checking a round
+    /// trip without deriving the expected value from the encrypted result.
+    pub fn evaluate(&self, inputs: &[bool]) -> Result<bool, NandCircuitError> {
+        if inputs.len() != self.input_count {
+            return Err(NandCircuitError::InputCountMismatch {
+                expected: self.input_count,
+                actual: inputs.len(),
+            });
+        }
+        let mut nodes = inputs.to_vec();
+        for [lhs, rhs] in &self.gates {
+            nodes.push(!(nodes[*lhs] && nodes[*rhs]));
+        }
+        Ok(nodes[self.output])
+    }
+
     /// Compile the reachable output using at most `max_lut_rounds` rounds.
     ///
     /// The layout's native domain may be wider than 16, but it must be wide
@@ -185,7 +204,7 @@ impl NandCircuit {
     /// // A single NAND expands to four binary LUT rounds: two input shears
     /// // for each operand and the two repeated operand routes.
     /// assert_eq!(compiled.rhs_ids().len(), 4);
-    /// assert_eq!(compiled.circuit_input_indices(), &[0, 1]);
+    /// assert_eq!(compiled.circuit_input_indices(), &[0, 1, 0, 1]);
     /// assert_ne!(compiled.program().id().as_bytes(), &[0; 32]);
     /// ```
     pub fn compile(
@@ -233,6 +252,7 @@ impl NandCircuit {
             let lut_id = builder.register_binary_lut(
                 STATE_WIDTH,
                 RHS_WIDTH,
+                layout,
                 output_width,
                 values,
                 LutOutputRepresentation::Exponent(layout),
@@ -434,46 +454,57 @@ mod tests {
 
         fn wire_at(
             &mut self,
-            _family: &Self::WireFamily,
-            _index: &IntExpr,
+            family: &Self::WireFamily,
+            index: &IntExpr,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
             Err(ProgramLowerError::UnsupportedStructure {
-                reason: "NAND test has no wire families".into(),
+                reason: format!(
+                    "NAND test has no wire families (family={family:?}, index={index:?})"
+                ),
             })
         }
 
         fn rhs_at(
             &mut self,
-            _family: &Self::RhsFamily,
-            _index: &IntExpr,
+            family: &Self::RhsFamily,
+            index: &IntExpr,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
             Err(ProgramLowerError::UnsupportedStructure {
-                reason: "NAND test has no RHS families".into(),
+                reason: format!(
+                    "NAND test has no RHS families (family={family:?}, index={index:?})"
+                ),
             })
         }
 
         fn parallel(
             &mut self,
-            _evaluator: &mut LogicalEvaluator,
-            _range: &super::super::program::FamilyRange,
-            _body: impl FnOnce(
+            evaluator: &mut LogicalEvaluator,
+            range: &super::super::program::FamilyRange,
+            body: impl FnOnce(
                 &mut Self,
                 &mut LogicalEvaluator,
                 IntExpr,
             ) -> Result<usize, ProgramLowerError<LogicalError>>,
         ) -> Result<Self::WireFamily, ProgramLowerError<LogicalError>> {
+            let site = evaluator.site.as_ref();
+            let callback = std::any::type_name_of_val(&body);
             Err(ProgramLowerError::UnsupportedStructure {
-                reason: "NAND test has no parallel bodies".into(),
+                reason: format!(
+                    "NAND test has no parallel bodies (range={range:?}, site={site:?}, callback={callback})"
+                ),
             })
         }
 
         fn sum(
             &mut self,
-            _evaluator: &mut LogicalEvaluator,
-            _family: &Self::WireFamily,
+            evaluator: &mut LogicalEvaluator,
+            family: &Self::WireFamily,
         ) -> Result<usize, ProgramLowerError<LogicalError>> {
+            let site = evaluator.site.as_ref();
             Err(ProgramLowerError::UnsupportedStructure {
-                reason: "NAND test has no family reductions".into(),
+                reason: format!(
+                    "NAND test has no family reductions (family={family:?}, site={site:?})"
+                ),
             })
         }
     }
@@ -500,13 +531,18 @@ mod tests {
         assert_eq!(compiled.rhs_ids().len(), 1);
         assert_eq!(compiled.circuit_input_indices(), &[0]);
         assert_eq!(compiled.program().outputs().len(), 1);
-        assert_eq!(compiled.program().luts().last().unwrap().output_width(), 2);
+        let projection = compiled.program().encryption_inputs();
+        assert_eq!(projection.luts().last().unwrap().output_width(), 2);
+        assert_eq!(
+            projection.luts().last().unwrap().input_layout(),
+            ExpLayout { stride_log2: 0, width_log2: 4 }
+        );
         assert_eq!(
             compiled.program().inputs()[&compiled.state_input()].shape(),
             &InputBinding::Scalar(())
         );
         assert_eq!(
-            compiled.program().luts().last().unwrap().output_representation(),
+            projection.luts().last().unwrap().output_representation(),
             LutOutputRepresentation::Exponent(ExpLayout { stride_log2: 0, width_log2: 4 })
         );
     }
@@ -553,7 +589,7 @@ mod tests {
                 assert_eq!(state, 1 ^ (a & b));
             }
         }
-        assert_eq!(compiled.program().luts().len(), instructions.len());
+        assert_eq!(compiled.program().encryption_inputs().luts().len(), instructions.len());
         assert_eq!(compiled.program().rhs_inputs().len(), instructions.len());
         for rhs in compiled.rhs_ids() {
             assert_eq!(compiled.program().rhs_inputs().get(rhs), Some(&InputBinding::Scalar(())));
@@ -570,7 +606,8 @@ mod tests {
         for (round, instruction) in instructions.iter().enumerate() {
             let rhs = compiled.rhs_ids()[round];
             assert_eq!(compiled.program().rhs_inputs().get(&rhs), Some(&InputBinding::Scalar(())));
-            let table = &compiled.program().luts()[round];
+            let projection = compiled.program().encryption_inputs();
+            let table = &projection.luts()[round];
             assert_eq!(table.input_width(), STATE_WIDTH * RHS_WIDTH);
             for bit in 0..2 {
                 for packed in 0..8 {

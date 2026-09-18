@@ -9,7 +9,8 @@ use super::*;
 use crate::{
     api::{
         ApiError, EncryptBuild, OnlineBuild, PlaintextInputs, RefreshApplicationError,
-        StageArtifacts, StageGraph, apply_refresh,
+        StageArtifacts, StageGraph, apply_refresh, domain_identity, execute_checkpoint,
+        execute_graph,
     },
     noise_refresh::{
         prf::PrfLabel,
@@ -17,8 +18,8 @@ use crate::{
     },
     program::{
         AttributeKnowledge, Environment, ExpLayout, ExponentLUTProgramLowering, ExponentLutProgram,
-        FamilyScope, GraphFamilyExecution, GraphParallelLowering, InputBinding, LoweringSite,
-        LutTable, Operand, ProgramLoweringContext, RhsRef, WireId,
+        ExponentLutProgramBuilder, GraphFamilyExecution, GraphParallelLowering, InputBinding,
+        LoweringSite, LutTable, Operand, ProgramLoweringContext, RhsRef, WireId,
     },
 };
 use mxx_dsl::{DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
@@ -29,36 +30,42 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, WireType},
 };
 use mxx_primitives::poly::Poly;
-use mxx_runtime::{Backend, RuntimeValue};
+use mxx_runtime::{Backend, ExecutionConfig, ExecutionResult, RuntimeValue, SessionStore};
 use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    path::Path,
     sync::Arc,
 };
 
-/// Encoded row paired with its Program wire and, for public wires, plaintext.
+/// Encoded row paired with the public key for its Program wire and, for
+/// public wires, plaintext.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggEncoding<R = RnsBggRow, A = Mat> {
-    pub(crate) wire: WireId,
+pub struct RnsBggEncoding<R = RnsBggRow, A = Mat, K = RnsBggPublicKey> {
+    pub(crate) public_key: K,
     pub(crate) row: R,
     pub(crate) public_payload: Option<A>,
 }
 
-impl<R, A> RnsBggEncoding<R, A> {
-    /// Construct an encoding carrier for `wire`.
+impl<R, A> RnsBggEncoding<R, A, RnsBggPublicKey> {
+    /// Construct an encoding carrier paired with its public key.
     ///
     /// Callers are responsible for preserving the Program wire identity,
     /// row schema, and public-payload presence implied by that wire's
     /// validated knowledge; stage builders validate these invariants when
     /// the carrier is consumed.
-    pub fn new(wire: WireId, row: R, public_payload: Option<A>) -> Self {
-        Self { wire, row, public_payload }
+    pub fn new(public_key: RnsBggPublicKey, row: R, public_payload: Option<A>) -> Self {
+        Self { public_key, row, public_payload }
     }
     /// Program wire represented by this encoding.
     pub fn wire(&self) -> WireId {
-        self.wire
+        self.public_key.wire
+    }
+    /// Public key paired with this encoding.
+    pub fn public_key(&self) -> &RnsBggPublicKey {
+        &self.public_key
     }
     /// Encoded row.
     pub fn row(&self) -> &R {
@@ -78,24 +85,20 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
         &self,
         parameters: &RnsBggParameters,
         level: usize,
-        public_key: &RnsBggPublicKey,
         payload: &RnsBggPayloadSecret,
         mask: &RnsBggMaskSecret,
         expected: Mat,
     ) -> Result<RnsBggRow, RnsBggError> {
-        if self.wire != public_key.wire {
-            return Err(RnsBggError::Binding("verification residual wire mismatch"));
-        }
         let ring = parameters.ring(level)?;
         if expected.matrix_type() != &ring.matrix_type((1, 1)) {
             return Err(RnsBggError::Binding("verification residual plaintext ring"));
         }
         let mask = reduce_secret(parameters, &mask.row, level)?;
         let mask_matrix = (
-            mask.0.clone() * public_key.matrix.0.0.clone() +
-                mask.1.clone() * public_key.matrix.1.0.clone(),
-            mask.0.clone() * public_key.matrix.0.1.clone() +
-                mask.1.clone() * public_key.matrix.1.1.clone(),
+            mask.0.clone() * self.public_key.matrix.0.0.clone() +
+                mask.1.clone() * self.public_key.matrix.1.0.clone(),
+            mask.0.clone() * self.public_key.matrix.0.1.clone() +
+                mask.1.clone() * self.public_key.matrix.1.1.clone(),
         );
         let delta = parameters.scalar(level, parameters.scale(level)?.clone())?;
         let deterministic = if self.public_payload.is_some() {
@@ -116,10 +119,284 @@ impl RnsBggEncoding<RnsBggRow, Mat> {
     }
 }
 
-impl<R: GraphValue, A: GraphValue> GraphValue for RnsBggEncoding<R, A> {
-    type Schema = RnsBggEncoding<R::Schema, A::Schema>;
+/// Verify one output returned by [`crate::api::online_eval`].
+///
+/// The output is a paired RNS-BGG carrier. Its public-key ports, encoded-row
+/// ports, and (for public outputs) public payload are consumed from the
+/// ordinary runtime result owner. The residual graph and its final decode are
+/// concrete RNS-BGG application operations; no generic runtime decoder or
+/// verification artifact is exposed. `payload` and `mask` remain
+/// caller-owned, and neither is passed to online evaluation.
+pub fn verify_output<B, S, P>(
+    program: &ExponentLutProgram,
+    result: &mut ExecutionResult<B>,
+    output_index: usize,
+    expected: &P,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: &RnsBggMaskSecret,
+    backend: &mut B,
+    store: &mut S,
+    config: ExecutionConfig,
+) -> Result<(), ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+    P: Poly,
+{
+    let wire = match program
+        .outputs()
+        .get(output_index)
+        .ok_or_else(|| ApiError::input("verification output index is out of range"))?
+    {
+        Operand::Scalar(wire) => *wire,
+        Operand::Member { .. } => {
+            return Err(ApiError::input("verification output must be scalar"));
+        }
+    };
+    let workload = RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?;
+    let source_level = workload.level(wire).map_err(ApiError::scheme)?;
+    let coefficient_output = program
+        .wire_is_coefficient_output(wire)
+        .map_err(|_| ApiError::input("verification output metadata is invalid"))?;
+    let output_level = source_level
+        .checked_add(usize::from(coefficient_output))
+        .ok_or_else(|| ApiError::input("verification output level overflow"))?;
+    verify_output_at_level(
+        program,
+        result,
+        output_index,
+        wire,
+        output_level,
+        expected,
+        parameters,
+        payload,
+        mask,
+        backend,
+        store,
+        config,
+    )
+}
+
+/// Verify one output after a declared RNS-BGG refresh.
+///
+/// A refresh changes the carrier modulus and public key, so the ordinary
+/// Program workload level is no longer the level of the returned carrier.
+/// The declaration supplies that target level while the rest of the
+/// verification remains the same application-facing operation as
+/// [`verify_output`].
+pub fn verify_refreshed_output<B, S, P>(
+    program: &ExponentLutProgram,
+    declaration: &RefreshDeclaration,
+    result: &mut ExecutionResult<B>,
+    output_index: usize,
+    expected: &P,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: &RnsBggMaskSecret,
+    backend: &mut B,
+    store: &mut S,
+    config: ExecutionConfig,
+) -> Result<(), ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+    P: Poly,
+{
+    let wire = declaration.source_output();
+    let output = program
+        .outputs()
+        .get(output_index)
+        .ok_or_else(|| ApiError::input("verification output index is out of range"))?;
+    if !matches!(output, Operand::Scalar(actual) if *actual == wire) {
+        return Err(ApiError::input("refreshed verification output does not match declaration"));
+    }
+    verify_output_at_level(
+        program,
+        result,
+        output_index,
+        wire,
+        declaration.target_level(),
+        expected,
+        parameters,
+        payload,
+        mask,
+        backend,
+        store,
+        config,
+    )
+}
+
+fn verify_output_at_level<B, S, P>(
+    program: &ExponentLutProgram,
+    result: &mut ExecutionResult<B>,
+    output_index: usize,
+    wire: WireId,
+    output_level: usize,
+    expected: &P,
+    parameters: &RnsBggParameters,
+    payload: &RnsBggPayloadSecret,
+    mask: &RnsBggMaskSecret,
+    backend: &mut B,
+    store: &mut S,
+    config: ExecutionConfig,
+) -> Result<(), ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+    P: Poly,
+{
+    let output_ring = parameters.ring(output_level).map_err(ApiError::scheme)?;
+    let knowledge = program.wire_knowledge(wire).map_err(ApiError::scheme)?;
+    let private_output = matches!(knowledge, AttributeKnowledge::PrivatePayload);
+    let columns =
+        parameters.key_component_columns(output_level, knowledge).map_err(ApiError::scheme)?;
+    let expected_ports = if private_output { 6 } else { 7 };
+    let prefix = format!("output-{output_index}.");
+    let mut ports = BTreeMap::new();
+    for name in result.outputs.keys().filter(|name| name.starts_with(&prefix)) {
+        let port = name
+            .strip_prefix(&prefix)
+            .and_then(|port| port.parse::<usize>().ok())
+            .ok_or_else(|| ApiError::input("verification output port is malformed"))?;
+        if port >= expected_ports || ports.insert(port, name.clone()).is_some() {
+            return Err(ApiError::input("verification output port is out of range"));
+        }
+    }
+    if ports.len() != expected_ports || ports.keys().copied().ne(0..expected_ports) {
+        return Err(ApiError::input(format!(
+            "verification output has {} ports, expected {expected_ports}",
+            ports.len()
+        )));
+    }
+
+    let mut runtime_inputs = BTreeMap::new();
+    for (port, name) in ports {
+        let value = result.materialize_output(&name, backend, store)?;
+        if !matches!(value, RuntimeValue::Matrix(_)) {
+            return Err(ApiError::input("verification output port is not a matrix"));
+        }
+        let input_name = match port {
+            0..=3 => format!("verification-key-{port}"),
+            4..=5 => format!("verification-row-{}", port - 4),
+            6 => "verification-payload".to_owned(),
+            _ => unreachable!("port range checked above"),
+        };
+        runtime_inputs.insert(input_name, value.clone());
+    }
+
+    let key_ports = (0..4)
+        .map(|port| output_ring.input(format!("verification-key-{port}"), (1, columns)))
+        .collect::<Vec<_>>();
+    let key = RnsBggPublicKey::new(
+        wire,
+        (
+            (key_ports[0].clone(), key_ports[1].clone()),
+            (key_ports[2].clone(), key_ports[3].clone()),
+        ),
+    );
+    let row = (
+        output_ring.input("verification-row-0", (1, columns)),
+        output_ring.input("verification-row-1", (1, columns)),
+    );
+    let public_payload =
+        if private_output { None } else { Some(output_ring.input("verification-payload", (1, 1))) };
+
+    // At source level l, the LUT switching target contributes
+    // Delta_l * Delta_(l+1) * mu * r * G_(l+2). The one production
+    // ModDown removes Delta_l. The finalized carrier therefore obeys the
+    // ordinary level-(l+1) relation, with its own scale and gadget width.
+    // Verify that target-ring relation directly; extending a finalized
+    // carrier cannot recover its pre-ModDown representative.
+    let expected = polynomial_input(&output_ring, expected);
+    let public_payload_residual =
+        public_payload.as_ref().map(|payload| payload.clone() - expected.clone());
+    let encoding = RnsBggEncoding::new(key, row, public_payload);
+    let residual = encoding
+        .verification_residual(parameters, output_level, payload, mask, expected)
+        .map_err(ApiError::scheme)?;
+    // The backend decoder consumes one polynomial (entry 0,0). Check every
+    // gadget column, including the high powers which distinguish plaintexts.
+    let mut graph = DslContext::new("rns-bgg-output-verification");
+    let mut residual_names = Vec::with_capacity(2 * columns);
+    for (component, row) in [residual.0, residual.1].into_iter().enumerate() {
+        for column in 0..columns {
+            let name = format!("verification-residual.{component}.{column}");
+            let value = row.clone().slice(
+                None,
+                Some(mxx_ir_core::node::IndexRange {
+                    start: IntExpr::constant(column),
+                    end: IntExpr::constant(column + 1),
+                }),
+            );
+            graph = graph.output(name.clone(), value).map_err(ApiError::scheme)?;
+            residual_names.push(name);
+        }
+    }
+    if let Some(payload_residual) = public_payload_residual {
+        graph = graph
+            .output("verification-payload-residual", payload_residual)
+            .map_err(ApiError::scheme)?;
+    }
+    let graph = graph.build().map_err(ApiError::scheme)?;
+    let mut verification = crate::api::execute_graph(
+        StageGraph::new(graph, runtime_inputs, ArtifactCatalog::default()),
+        &mxx_ir_core::ParamEnv::default(),
+        backend,
+        store,
+        config,
+        |_| Ok(()),
+    )?;
+    for name in residual_names {
+        let value = verification.materialize_output(&name, backend, store)?;
+        let RuntimeValue::Matrix(matrix) = value else {
+            return Err(ApiError::input("output verification residual is not a matrix"));
+        };
+        let decoded = backend
+            .threshold_decode(
+                matrix,
+                &BigInt::from(2u8),
+                parameters.level(output_level).map_err(ApiError::scheme)?.ring_dimension() as usize,
+            )
+            .map_err(ApiError::scheme)?;
+        if decoded.iter().any(|value| value != &BigInt::from(0u8)) {
+            return Err(ApiError::input("verification residual is nonzero"));
+        }
+    }
+    if !private_output {
+        let value =
+            verification.materialize_output("verification-payload-residual", backend, store)?;
+        let RuntimeValue::Matrix(matrix) = value else {
+            return Err(ApiError::input("verification payload residual is not a matrix"));
+        };
+        let output_parameters = parameters.level(output_level).map_err(ApiError::scheme)?;
+        let zero_type = ConcreteMatrixType {
+            modulus: output_parameters.modulus().as_ref().clone().into(),
+            ring_dimension: output_parameters.ring_dimension() as usize,
+            rows: 1,
+            columns: 1,
+        };
+        let zero = backend
+            .polynomial_from_values(
+                &zero_type,
+                &vec![BigInt::zero(); output_parameters.ring_dimension() as usize],
+                false,
+            )
+            .map_err(ApiError::scheme)?;
+        if backend.matrix_to_bytes(&matrix).map_err(ApiError::scheme)? !=
+            backend.matrix_to_bytes(&zero).map_err(ApiError::scheme)?
+        {
+            return Err(ApiError::input("public payload does not match expected plaintext"));
+        }
+    }
+    Ok(())
+}
+
+impl<R: GraphValue, A: GraphValue, K: GraphValue> GraphValue for RnsBggEncoding<R, A, K> {
+    type Schema = RnsBggEncoding<R::Schema, A::Schema, K::Schema>;
     fn flatten(&self) -> Vec<ValueHandle> {
-        let mut values = self.row.flatten();
+        let mut values = self.public_key.flatten();
+        values.extend(self.row.flatten());
         if let Some(payload) = &self.public_payload {
             values.extend(payload.flatten());
         }
@@ -127,37 +404,42 @@ impl<R: GraphValue, A: GraphValue> GraphValue for RnsBggEncoding<R, A> {
     }
     fn schema(&self) -> Self::Schema {
         RnsBggEncoding {
-            wire: self.wire,
+            public_key: self.public_key.schema(),
             row: self.row.schema(),
             public_payload: self.public_payload.as_ref().map(GraphValue::schema),
         }
     }
     fn from_values(schema: &Self::Schema, values: &[ValueHandle]) -> Result<Self, DslError> {
+        let key_len = schema.public_key.wire_types().len();
         let row_len = schema.row.wire_types().len();
-        if values.len() < row_len {
+        if values.len() < key_len + row_len {
             return Err(DslError::Schema);
         }
-        let row = R::from_values(&schema.row, &values[..row_len])?;
+        let public_key = K::from_values(&schema.public_key, &values[..key_len])?;
+        let row = R::from_values(&schema.row, &values[key_len..key_len + row_len])?;
         let public_payload = match &schema.public_payload {
-            Some(payload) => Some(A::from_values(payload, &values[row_len..])?),
-            None if values.len() == row_len => None,
+            Some(payload) => Some(A::from_values(payload, &values[key_len + row_len..])?),
+            None if values.len() == key_len + row_len => None,
             None => return Err(DslError::Schema),
         };
-        Ok(Self { wire: schema.wire, row, public_payload })
+        Ok(Self { public_key, row, public_payload })
     }
 }
 
-impl<R: GraphValueSchema, A: GraphValueSchema> GraphValueSchema for RnsBggEncoding<R, A> {
-    type Value = RnsBggEncoding<R::Value, A::Value>;
+impl<R: GraphValueSchema, A: GraphValueSchema, K: GraphValueSchema> GraphValueSchema
+    for RnsBggEncoding<R, A, K>
+{
+    type Value = RnsBggEncoding<R::Value, A::Value, K::Value>;
     fn placeholders_from(&self, next: &mut usize) -> Self::Value {
         RnsBggEncoding {
-            wire: self.wire,
+            public_key: self.public_key.placeholders_from(next),
             row: self.row.placeholders_from(next),
             public_payload: self.public_payload.as_ref().map(|p| p.placeholders_from(next)),
         }
     }
     fn wire_types(&self) -> Vec<WireType> {
-        let mut values = self.row.wire_types();
+        let mut values = self.public_key.wire_types();
+        values.extend(self.row.wire_types());
         if let Some(payload) = &self.public_payload {
             values.extend(payload.wire_types());
         }
@@ -257,7 +539,7 @@ fn encode_private_inner(
         mask_matrix.0 - target.0 * scale.clone() + error.0,
         mask_matrix.1 - target.1 * scale + error.1,
     );
-    Ok(RnsBggEncoding::new(key.wire, row, None))
+    Ok(RnsBggEncoding::new(key.clone(), row, None))
 }
 
 fn encode_public_inner(
@@ -285,7 +567,7 @@ fn encode_public_inner(
         mask_matrix.0 - s.0 * public_scale.clone() + error.0,
         mask_matrix.1 - s.1 * public_scale + error.1,
     );
-    Ok(RnsBggEncoding::new(key.wire, row, Some(plaintext)))
+    Ok(RnsBggEncoding::new(key.clone(), row, Some(plaintext)))
 }
 
 /// Online lowering state.  Its artifact fields are metadata and lazy handles,
@@ -307,6 +589,7 @@ impl EncodingLowering<'_> {
     pub(crate) fn lut_coefficient(
         parameters: &RnsBggParameters,
         level: usize,
+        input_layout: ExpLayout,
         representation: crate::program::LutOutputRepresentation,
         sigma: impl Into<IntExpr>,
         values: &[usize],
@@ -315,13 +598,13 @@ impl EncodingLowering<'_> {
         if width == 0 || !width.is_power_of_two() {
             return Err(RnsBggError::Lut);
         }
-        let layout = match representation {
-            crate::program::LutOutputRepresentation::Coefficient => {
-                ExpLayout { stride_log2: 0, width_log2: 0 }
-            }
-            crate::program::LutOutputRepresentation::Exponent(layout) => layout,
-        };
         let ring = parameters.ring(level)?;
+        input_layout
+            .validate(parameters.level(level)?.ring_dimension() as usize)
+            .map_err(|_| RnsBggError::Lut)?;
+        if input_layout.width() != width {
+            return Err(RnsBggError::Lut);
+        }
         let modulus = parameters.level(level)?.modulus().as_ref().clone();
         let inverse = mxx_primitives::utils::mod_inverse_biguints(
             &(BigUint::from(width) % &modulus),
@@ -334,9 +617,15 @@ impl EncodingLowering<'_> {
             .copied()
             .enumerate()
             .map(|(index, output)| {
-                let left =
-                    layout.mono(&ring, &BigInt::from(output)).map_err(|_| RnsBggError::Lut)?;
-                let right = layout
+                let left = match representation {
+                    crate::program::LutOutputRepresentation::Coefficient => {
+                        ring.polynomial([IntExpr::constant(BigInt::from(output))])
+                    }
+                    crate::program::LutOutputRepresentation::Exponent(layout) => {
+                        layout.mono(&ring, &BigInt::from(output)).map_err(|_| RnsBggError::Lut)?
+                    }
+                };
+                let right = input_layout
                     .mono(&ring, &-BigInt::from(index))
                     .map_err(|_| RnsBggError::Lut)?
                     .ring_automorphism(sigma.clone());
@@ -357,225 +646,241 @@ impl EncodingLowering<'_> {
         Ok(ring.polynomial([IntExpr::constant(BigInt::from(inverse))]) * terms.pop().unwrap())
     }
 
+    /// Evaluate a public LUT payload with the same Walsh/automorphism
+    /// coefficients used by the online encoding.  The payload is public, so
+    /// the complete evaluation can remain a graph expression; private and
+    /// unknown payloads never enter this path.
+    fn lut_public_payload(
+        &self,
+        level: usize,
+        payload: Mat,
+        table: &LutTable,
+    ) -> Result<Mat, RnsBggError> {
+        let ring_dimension = self.parameters.level(level)?.ring_dimension() as usize;
+        let input_layout = table.input_layout();
+        input_layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        let output_level = if matches!(
+            table.output_representation(),
+            crate::program::LutOutputRepresentation::Coefficient
+        ) {
+            level
+        } else {
+            level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?
+        };
+        let output_modulus =
+            BigInt::from(self.parameters.level(output_level)?.modulus().as_ref().clone());
+        let payload = checked_modulus_convert(payload, output_modulus)?;
+        let sigmas =
+            input_layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+        let terms = sigmas
+            .into_iter()
+            .map(|sigma| {
+                let coefficient = Self::lut_coefficient(
+                    self.parameters,
+                    output_level,
+                    input_layout,
+                    table.output_representation(),
+                    IntExpr::constant(sigma),
+                    table.values(),
+                )?;
+                Ok(coefficient * payload.clone().ring_automorphism(IntExpr::constant(sigma)))
+            })
+            .collect::<Result<Vec<_>, RnsBggError>>()?;
+        let terms = Family::pack(terms).map_err(graph)?;
+        crate::utils::balanced_sum_family(terms, |lhs, rhs| lhs + rhs).map_err(graph)
+    }
+
     fn site(&self) -> Result<&LoweringSite, RnsBggError> {
         self.current_site.as_ref().ok_or(RnsBggError::Binding("missing lowering site"))
     }
 
-    fn scope_extent(site: &LoweringSite) -> Result<Option<(IntExpr, IntExpr)>, RnsBggError> {
-        let scope = site
-            .family_scope()
-            .map_err(|_| RnsBggError::Binding("invalid lowering family scope"))?;
-        if scope.ranges().is_empty() {
-            return Ok(None);
-        }
-        let mut extent = IntExpr::constant(1);
-        for range in scope.ranges() {
-            extent = IntExpr::Mul(Box::new(extent), Box::new(range.count().clone())).canonicalize();
-        }
-        Ok(Some((
-            extent,
-            scope
-                .flattened_index()
-                .map_err(|_| RnsBggError::Binding("invalid lowering family index"))?,
-        )))
+    fn lut_helper(&self, level: usize, sigma: usize) -> Result<RnsBggRow, RnsBggError> {
+        let ring = self.parameters.ring(level)?;
+        let columns = self.parameters.component_columns(level)?;
+        Ok((
+            ring.artifact_input(
+                self.encryption.clone(),
+                format!("lut-helper/{level}/{sigma}.0"),
+                (1, columns),
+            ),
+            ring.artifact_input(
+                self.encryption.clone(),
+                format!("lut-helper/{level}/{sigma}.1"),
+                (1, columns),
+            ),
+        ))
     }
 
-    fn rhs_decomposition(&self, rhs: &RhsRef<Int>) -> Result<RnsBggDecomposition, RnsBggError> {
-        let level = self.workload.rhs_level(rhs.id)?;
-        let decomposition_level =
-            level.checked_add(1).ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
-        // RHS preprocessing samples and decomposes at the next modulus-chain
-        // level, then centered-extends the compact digits into the source
-        // evaluation ring.  Keep those concerns separate here: the imported
-        // matrices live in `level`, while their compact width and coefficient
-        // bound come from `decomposition_level`.
+    fn lut_public_data(&self, level: usize, sigma: usize) -> Result<RnsBggMatrix, RnsBggError> {
+        let ring = self.parameters.ring(level)?;
+        let columns = self.parameters.component_columns(level)?;
+        let input = |port: usize| {
+            ring.artifact_input(
+                self.preprocess.clone(),
+                format!("lut-public/{level}/{sigma}.{port}"),
+                (1, columns),
+            )
+        };
+        Ok(((input(0), input(1)), (input(2), input(3))))
+    }
+
+    fn rhs_compact_matrix_at(
+        &self,
+        rhs: &RhsRef<Int>,
+        evaluation_level: usize,
+    ) -> Result<RnsBggMatrix, RnsBggError> {
+        let decomposition_level = evaluation_level
+            .checked_add(1)
+            .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
+        // Preprocess publishes the compact RHS directly at the consumer's
+        // next modulus-chain level.  Online imports that compact C at q_(l+1)
+        // and decomposes it there; only the bounded digits are centered-
+        // extended to the evaluation ring q_l.  Never reduce or extend the
+        // dense compact matrix in the online path.
+        let columns = self.parameters.component_columns(decomposition_level)?;
         if let Some(index) = rhs.index.clone() {
             let count = match self.program.rhs_inputs().get(&rhs.id) {
                 Some(InputBinding::Family(count)) => count.clone(),
                 _ => return Err(RnsBggError::Binding("family RHS index")),
             };
-            let ring = self.parameters.ring(level)?;
-            let columns = self.parameters.component_columns(decomposition_level)?;
-            let bound =
-                BigInt::from(1u8) << self.parameters.level(decomposition_level)?.base_bits();
-            let preimage_family = |port: usize| {
-                ring.preimage_family_artifact_input(
+            let ring = self.parameters.ring(decomposition_level)?;
+            let family = |port: usize| {
+                ring.family_artifact_input(
                     self.preprocess.clone(),
                     format!("rhs/{:?}/family.{port}", rhs.id),
                     count.clone(),
                     (1, columns),
-                    bound.clone(),
                 )
             };
-            let first = preimage_family(0);
-            let second = preimage_family(1);
-            let third = preimage_family(2);
-            let fourth = preimage_family(3);
-            return Ok((
-                (first.at(index.clone()), second.at(index.clone())),
-                (third.at(index.clone()), fourth.at(index)),
-            ));
+            let matrix = (
+                (family(0).at(index.clone()), family(1).at(index.clone())),
+                (family(2).at(index.clone()), family(3).at(index)),
+            );
+            return Ok(matrix);
         }
-        self.decomposition_at(
-            &self.preprocess,
-            format!("rhs/{:?}", rhs.id),
-            level,
-            decomposition_level,
-        )
+        let ring = self.parameters.ring(decomposition_level)?;
+        let matrix = (
+            (
+                ring.artifact_input(
+                    self.preprocess.clone(),
+                    format!("rhs/{:?}.0", rhs.id),
+                    (1, columns),
+                ),
+                ring.artifact_input(
+                    self.preprocess.clone(),
+                    format!("rhs/{:?}.1", rhs.id),
+                    (1, columns),
+                ),
+            ),
+            (
+                ring.artifact_input(
+                    self.preprocess.clone(),
+                    format!("rhs/{:?}.2", rhs.id),
+                    (1, columns),
+                ),
+                ring.artifact_input(
+                    self.preprocess.clone(),
+                    format!("rhs/{:?}.3", rhs.id),
+                    (1, columns),
+                ),
+            ),
+        );
+        Ok(matrix)
     }
 
-    fn mul_public_action(&self) -> Result<RnsBggDecomposition, RnsBggError> {
-        let site = self.site()?;
-        let level = self.workload.level(site.output)?;
-        if let Some((extent, index)) = Self::scope_extent(site)? {
-            let ring = self.parameters.ring(level)?;
-            let columns = self.parameters.component_columns(level)?;
-            let bound = BigInt::from(1u8) << self.parameters.level(level)?.base_bits();
-            let families = (0..4)
-                .map(|port| {
-                    ring.preimage_family_artifact_input(
-                        self.preprocess.clone(),
-                        format!("public-action/{:?}.{port}", site.output),
-                        extent.clone(),
-                        (1, columns),
-                        bound.clone(),
-                    )
-                    .at(index.clone())
-                })
-                .collect::<Vec<_>>();
-            return Ok((
-                (families[0].clone(), families[1].clone()),
-                (families[2].clone(), families[3].clone()),
-            ));
-        }
-        self.decomposition(&self.preprocess, format!("public-action/{:?}", site.output), level)
+    fn rhs_decomposition_at(
+        &self,
+        rhs: &RhsRef<Int>,
+        evaluation_level: usize,
+    ) -> Result<RnsBggDecomposition, RnsBggError> {
+        // Decompose immediately before the RHS action consumes the compact
+        // artifact.  The resulting bounded digits are transported to the
+        // evaluation ring, but never persisted at the stage boundary.
+        let matrix = self.rhs_compact_matrix_at(rhs, evaluation_level)?;
+        let decomposition_level = evaluation_level
+            .checked_add(1)
+            .ok_or(RnsBggError::Parameters("RHS target level overflow"))?;
+        compact_decompose_matrix(self.parameters, evaluation_level, decomposition_level, matrix)
     }
+
     fn lut_actions(
         &self,
-        count: IntExpr,
-        evaluation_level: usize,
+        input: &RnsBggEncoding,
+        lut_id: crate::program::LutId,
+        table: &LutTable,
     ) -> Result<Family<(RnsBggDecomposition, RnsBggDecomposition)>, RnsBggError> {
-        let site = self.site()?;
+        let count = IntExpr::constant(table.values().len());
+        let evaluation_level = self.workload.level(input.wire())?;
         let decomposition_level =
             evaluation_level.checked_add(1).ok_or(RnsBggError::Parameters("LUT level overflow"))?;
-        let evaluation_ring = self.parameters.ring(evaluation_level)?;
-        let decomposition_parameters = self.parameters.level(decomposition_level)?;
-        // The producer decomposes B_sigma and U_sigma at the next level, then
-        // centered-extends each compact digit back into the input evaluation
-        // ring.  Thus the imported preimages use the evaluation modulus, the
-        // next-level radix/digit bound, and the next-level output width.
+        let decomposition_ring = self.parameters.ring(decomposition_level)?;
+        let input_layout = table.input_layout();
+        input_layout
+            .validate(self.parameters.level(evaluation_level)?.ring_dimension() as usize)
+            .map_err(|_| RnsBggError::Lut)?;
         let target_columns = self.parameters.component_columns(decomposition_level)?;
-        let bound = BigInt::from(1u8) << decomposition_parameters.base_bits();
-        let (family_count, scope_index) = match Self::scope_extent(site)? {
-            Some((extent, index)) => (
-                IntExpr::Mul(Box::new(extent), Box::new(count.clone())).canonicalize(),
-                Some(index),
-            ),
-            None => (count.clone(), None),
-        };
-        let families = (0..8)
+        let sigma_indices =
+            input_layout
+                .automorphism_indices(
+                    self.parameters.level(evaluation_level)?.ring_dimension() as usize
+                )
+                .map_err(|_| RnsBggError::Lut)?;
+        let target_modulus =
+            BigInt::from(self.parameters.level(decomposition_level)?.modulus().as_ref().clone());
+        let families = (0..4)
             .map(|port| {
-                evaluation_ring.preimage_family_artifact_input(
+                decomposition_ring.family_artifact_input(
                     self.preprocess.clone(),
-                    format!("lut-action/{:?}.{port}", site.output),
-                    family_count.clone(),
+                    format!(
+                        "lut-switching/{evaluation_level}/{decomposition_level}/{lut_id:?}/{input_layout:?}.{port}"
+                    ),
+                    count.clone(),
                     (1, target_columns),
-                    bound.clone(),
                 )
             })
             .collect::<Vec<_>>();
         let branch_count = count.clone();
         mxx_dsl::parallel(branch_count.clone(), |index| {
-            let index = match scope_index.clone() {
-                Some(scope_index) => Int::evaluate(scope_index)
-                    .mul(Int::evaluate(branch_count.clone()))
-                    .add(index.clone()),
-                None => index.clone(),
+            let b_sigma = (
+                (families[0].at(index.clone()), families[1].at(index.clone())),
+                (families[2].at(index.clone()), families[3].at(index.clone())),
+            );
+            let sigma = IntExpr::Select {
+                selector: Box::new(index.expression()?),
+                branches: sigma_indices.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
-            Ok((
-                (
-                    (families[0].at(index.clone()), families[1].at(index.clone())),
-                    (families[2].at(index.clone()), families[3].at(index.clone())),
-                ),
-                (
-                    (families[4].at(index.clone()), families[5].at(index.clone())),
-                    (families[6].at(index.clone()), families[7].at(index)),
-                ),
-            ))
-        })
-        .map_err(graph)
-    }
-    fn lut_helper(&self, count: IntExpr, origin: WireId) -> Result<RnsBggLutHelper, RnsBggError> {
-        let level = self.workload.level(origin)?;
-        let ring = self.parameters.ring(level)?;
-        let columns = self.parameters.component_columns(level)?;
-        let scope = self
-            .site()?
-            .family_scope()
-            .map_err(|_| RnsBggError::Binding("invalid LUT helper scope"))?;
-        let (family_count, scope_index) = match Self::scope_extent(self.site()?)? {
-            Some((extent, index)) => (
-                IntExpr::Mul(Box::new(extent), Box::new(count.clone())).canonicalize(),
-                Some(index),
-            ),
-            None => (count.clone(), None),
-        };
-        let first = ring.family_artifact_input(
-            self.encryption.clone(),
-            format!("{}.0", lut_helper_artifact_name(origin, &scope)),
-            family_count.clone(),
-            (1, columns),
-        );
-        let second = ring.family_artifact_input(
-            self.encryption.clone(),
-            format!("{}.1", lut_helper_artifact_name(origin, &scope)),
-            family_count.clone(),
-            (1, columns),
-        );
-        let branch_count = count.clone();
-        mxx_dsl::parallel(branch_count.clone(), |index| {
-            let index = match scope_index.clone() {
-                Some(scope_index) => Int::evaluate(scope_index)
-                    .mul(Int::evaluate(branch_count.clone()))
-                    .add(index.clone()),
-                None => index.clone(),
-            };
-            Ok((first.at(index.clone()), second.at(index)))
-        })
-        .map_err(graph)
-    }
-
-    fn decomposition(
-        &self,
-        production: &ProductionId,
-        prefix: String,
-        level: usize,
-    ) -> Result<RnsBggDecomposition, RnsBggError> {
-        self.decomposition_at(production, prefix, level, level)
-    }
-
-    fn decomposition_at(
-        &self,
-        production: &ProductionId,
-        prefix: String,
-        evaluation_level: usize,
-        decomposition_level: usize,
-    ) -> Result<RnsBggDecomposition, RnsBggError> {
-        let ring = self.parameters.ring(evaluation_level)?;
-        let columns = self.parameters.component_columns(decomposition_level)?;
-        let params = self.parameters.level(decomposition_level)?;
-        let bound = BigInt::from(1u8) << params.base_bits();
-        let preimage = |port: usize| {
-            ring.preimage_artifact_input(
-                production.clone(),
-                format!("{prefix}.{port}"),
-                (1, columns),
-                bound.clone(),
+            let d_sigma = compact_decompose_matrix(
+                self.parameters,
+                evaluation_level,
+                decomposition_level,
+                b_sigma.clone(),
             )
-        };
-        Ok(((preimage(0), preimage(1)), (preimage(2), preimage(3))))
+            .map_err(|_| DslError::Schema)?;
+            let routed = map_matrix(input.public_key.matrix.clone(), |entry| {
+                entry.ring_automorphism(sigma.clone())
+            });
+            let u_sigma = mod_down_public(
+                compact_right_action_public(
+                    self.parameters,
+                    evaluation_level,
+                    decomposition_level,
+                    routed,
+                    b_sigma,
+                )
+                .map_err(|_| DslError::Schema)?,
+                target_modulus,
+            );
+            let e_sigma = compact_decompose_matrix(
+                self.parameters,
+                evaluation_level,
+                decomposition_level,
+                u_sigma,
+            )
+            .map_err(|_| DslError::Schema)?;
+            Ok((d_sigma, e_sigma))
+        })
+        .map_err(graph)
     }
-
     fn refresh_action(
         &self,
         declaration: &RefreshDeclaration,
@@ -599,27 +904,22 @@ impl EncodingLowering<'_> {
             .get(slot)
             .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
         let ring = mxx_dsl::Ring::new(
-            metadata.q.clone(),
-            self.parameters.level(q_level)?.ring_dimension() as usize,
+            metadata.p.clone(),
+            self.parameters.level(p_level)?.ring_dimension() as usize,
         );
-        // Actions are evaluated against raw q carriers, but their compact
-        // decomposition uses the producer's p-level radix/digit count and
-        // the target output's column width.
+        // The preprocess stage stores the compact p-ring action matrix.  It
+        // is decomposed only at this consuming q-level; no decomposition is
+        // persisted in the stage boundary.
         let columns = self.parameters.component_columns(declaration.target_level())?;
-        let bound = BigInt::from(1u8) << self.parameters.level(p_level)?.base_bits();
         let prefix = match label {
             Some(label) => refresh_label_artifact_name(*declaration.commitment(), slot, label),
             None => refresh_artifact_name(*declaration.commitment(), slot, role),
         };
-        let preimage = |port: usize| {
-            ring.preimage_artifact_input(
-                self.preprocess.clone(),
-                format!("{prefix}.{port}"),
-                (1, columns),
-                bound.clone(),
-            )
+        let matrix = |port: usize| {
+            ring.artifact_input(self.preprocess.clone(), format!("{prefix}.{port}"), (1, columns))
         };
-        Ok(((preimage(0), preimage(1)), (preimage(2), preimage(3))))
+        let matrix = ((matrix(0), matrix(1)), (matrix(2), matrix(3)));
+        compact_decompose_matrix(self.parameters, q_level, p_level, matrix)
     }
 
     fn refresh_decoder(
@@ -769,16 +1069,27 @@ impl EncodingLowering<'_> {
             .map(|output| {
                 if self
                     .program
-                    .wire_is_coefficient_output(output.wire)
+                    .wire_is_coefficient_output(output.wire())
                     .map_err(|_| RnsBggError::Binding("invalid output wire metadata"))?
                 {
-                    let level = self.workload.level(output.wire)?;
+                    let level = self.workload.level(output.wire())?;
                     let target = level
                         .checked_add(1)
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
                     let modulus =
                         BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-                    Ok(RnsBggEncoding { row: mod_down_encoding(output.row, modulus), ..output })
+                    let public_key = RnsBggPublicKey::new(
+                        output.public_key.wire,
+                        mod_down_public(output.public_key.matrix, modulus.clone()),
+                    );
+                    Ok(RnsBggEncoding::new(
+                        public_key,
+                        mod_down_encoding(output.row, modulus.clone()),
+                        output
+                            .public_payload
+                            .map(|payload| checked_modulus_convert(payload, modulus.clone()))
+                            .transpose()?,
+                    ))
                 } else {
                     Ok(output)
                 }
@@ -807,96 +1118,186 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
     type Rhs = RhsRef<Int>;
     type Error = RnsBggError;
     fn add(&mut self, lhs: &Self::Wire, rhs: &Self::Wire) -> Result<Self::Wire, Self::Error> {
+        if self.workload.level(lhs.wire())? != self.workload.level(rhs.wire())? {
+            return Err(RnsBggError::Binding("Add key level mismatch"));
+        }
         let public_payload = match (&lhs.public_payload, &rhs.public_payload) {
             (Some(lhs), Some(rhs)) => Some(lhs.clone() + rhs.clone()),
             (None, None) => None,
             _ => return Err(RnsBggError::Binding("mixed public/private Add")),
         };
         let output = self.site()?.output;
+        let public_key = RnsBggPublicKey::new(
+            output,
+            add_public_matrices(lhs.public_key.matrix.clone(), rhs.public_key.matrix.clone()),
+        );
         let public_payload = self.checked_payload(output, public_payload)?;
         Ok(RnsBggEncoding::new(
-            output,
+            public_key,
             add_encoding_rows(lhs.row.clone(), rhs.row.clone()),
             public_payload,
         ))
     }
     fn mul_public(
         &mut self,
-        private: &Self::Wire,
-        public: &Self::Wire,
+        lhs: &Self::Wire,
+        rhs: &Self::Wire,
     ) -> Result<Self::Wire, Self::Error> {
-        let private_knowledge = self
+        let lhs_knowledge = self
             .program
-            .wire_knowledge(private.wire)
-            .map_err(|_| RnsBggError::Binding("private MulPublic metadata"))?;
-        let public_knowledge = self
+            .wire_knowledge(lhs.wire())
+            .map_err(|_| RnsBggError::Binding("MulPublic LHS metadata"))?;
+        let rhs_knowledge = self
             .program
-            .wire_knowledge(public.wire)
-            .map_err(|_| RnsBggError::Binding("public MulPublic metadata"))?;
-        if private_knowledge != AttributeKnowledge::PrivatePayload {
-            return Err(RnsBggError::Binding("MulPublic first operand must be private"));
+            .wire_knowledge(rhs.wire())
+            .map_err(|_| RnsBggError::Binding("MulPublic RHS metadata"))?;
+        if rhs_knowledge != AttributeKnowledge::PublicPayload {
+            return Err(RnsBggError::Binding("MulPublic RHS must be public"));
         }
-        if public_knowledge != AttributeKnowledge::PublicPayload {
-            return Err(RnsBggError::Binding("MulPublic second operand must be public"));
-        }
-        let payload =
-            public.public_payload.clone().ok_or(RnsBggError::Binding("public payload missing"))?;
-        let action = self.mul_public_action()?;
+        let lhs_level = self.workload.level(lhs.wire())?;
+        let rhs_level = self.workload.level(rhs.wire())?;
+        let target_level =
+            self.parameters.mul_public_target_level(lhs_level, lhs_knowledge, rhs_level)?;
+        let target_modulus =
+            BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+
+        // Align the complete public carrier (key and row) through the same
+        // source-to-target route before doing any same-level arithmetic.  A
+        // private LHS owns the target level and is already at that level; its
+        // key and row are therefore intentionally left untouched.  Equal
+        // physical moduli are handled as a no-op by the alignment helpers.
+        let (lhs_matrix, lhs_row) = if lhs_knowledge == AttributeKnowledge::PublicPayload {
+            (
+                apply_public_alignment_matrix(
+                    self.parameters,
+                    lhs_level,
+                    target_level,
+                    lhs.public_key.matrix.clone(),
+                )?,
+                apply_public_alignment_row(
+                    self.parameters,
+                    lhs_level,
+                    target_level,
+                    lhs.row.clone(),
+                )?,
+            )
+        } else {
+            (lhs.public_key.matrix.clone(), lhs.row.clone())
+        };
+        let rhs_matrix = apply_public_alignment_matrix(
+            self.parameters,
+            rhs_level,
+            target_level,
+            rhs.public_key.matrix.clone(),
+        )?;
+        let rhs_row =
+            apply_public_alignment_row(self.parameters, rhs_level, target_level, rhs.row.clone())?;
+        let rhs_payload =
+            rhs.public_payload.clone().ok_or(RnsBggError::Binding("public RHS payload missing"))?;
+        let rhs_payload = checked_modulus_convert(rhs_payload, target_modulus.clone())?;
+        let lhs_payload = lhs
+            .public_payload
+            .clone()
+            .map(|payload| checked_modulus_convert(payload, target_modulus.clone()))
+            .transpose()?;
+        let lhs_action = lhs_matrix.clone();
         let row = add_encoding_rows(
-            multiply_encoding_action(public.row.clone(), action),
-            (private.row.0.clone() * payload.clone(), private.row.1.clone() * payload.clone()),
+            compact_right_action_row(
+                self.parameters,
+                target_level,
+                target_level,
+                rhs_row,
+                lhs_action.clone(),
+            )?,
+            (lhs_row.0.clone() * rhs_payload.clone(), lhs_row.1.clone() * rhs_payload.clone()),
         );
         let output = self.site()?.output;
-        Ok(RnsBggEncoding::new(output, row, self.checked_payload(output, None)?))
+        let public_key = RnsBggPublicKey::new(
+            output,
+            compact_right_action_public(
+                self.parameters,
+                target_level,
+                target_level,
+                rhs_matrix,
+                lhs_action,
+            )?,
+        );
+        let output_payload = if let Some(lhs_payload) = lhs_payload {
+            Some(lhs_payload * rhs_payload)
+        } else {
+            None
+        };
+        Ok(RnsBggEncoding::new(public_key, row, self.checked_payload(output, output_payload)?))
     }
     fn mul_private(
         &mut self,
         input: &Self::Wire,
         rhs: &Self::Rhs,
     ) -> Result<Self::Wire, Self::Error> {
-        let action = self.rhs_decomposition(rhs)?;
+        let evaluation_level = self.workload.level(input.wire())?;
+        let action = self.rhs_decomposition_at(rhs, evaluation_level)?;
         let output = self.site()?.output;
         let target_level = self.workload.level(output)?;
         let target_modulus =
             BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
-        Ok(RnsBggEncoding::new(
+        let public_key = RnsBggPublicKey::new(
             output,
+            mod_down_public(
+                multiply_public_action(input.public_key.matrix.clone(), action.clone()),
+                target_modulus.clone(),
+            ),
+        );
+        Ok(RnsBggEncoding::new(
+            public_key,
             mod_down_encoding(multiply_encoding_action(input.row.clone(), action), target_modulus),
             self.checked_payload(output, None)?,
         ))
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
+        let lut_id = self.program.lut_id_at(self.site()?.output).map_err(|_| RnsBggError::Lut)?;
         let count = IntExpr::constant(table.values().len());
-        let level = self.workload.level(input.wire)?;
-        let actions = self.lut_actions(count.clone(), level)?;
-        // The workload records helper provenance on the LUT output wire.  A
-        // first LUT therefore has no entry for its input wire yet; subsequent
-        // LUTs inherit the output's original helper origin.
-        let origin = self.workload.lut_helper_origin(self.site()?.output)?;
-        let helper = self.lut_helper(count.clone(), origin)?;
+        let level = self.workload.level(input.wire())?;
+        let actions = self.lut_actions(input, lut_id, table)?;
         let output = self.site()?.output;
-        let layout =
-            ExpLayout { stride_log2: 0, width_log2: table.values().len().trailing_zeros() };
+        let layout = table.input_layout();
         let sigmas = layout
             .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
             .map_err(|_| RnsBggError::Lut)?;
+        let helper = Family::pack(
+            sigmas.iter().map(|sigma| self.lut_helper(level, *sigma)).collect::<Result<_, _>>()?,
+        )
+        .map_err(graph)?;
+        let public_data = Family::pack(
+            sigmas
+                .iter()
+                .map(|sigma| self.lut_public_data(level, *sigma))
+                .collect::<Result<_, _>>()?,
+        )
+        .map_err(graph)?;
         let terms = mxx_dsl::parallel(count, |index| {
             let sigma = IntExpr::Select {
                 selector: Box::new(index.expression()?),
                 branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
             };
             let (d_sigma, e_sigma) = actions.at(index.clone());
-            let mask = helper.at(index);
+            let mask = helper.at(index.clone());
             let routed_input = (
                 input.row.0.clone().ring_automorphism(sigma.clone()),
                 input.row.1.clone().ring_automorphism(sigma),
             );
-            Ok(add_encoding_rows(
-                multiply_encoding_action(mask, e_sigma),
+            let row = add_encoding_rows(
+                multiply_encoding_action(mask, e_sigma.clone()),
                 multiply_encoding_action(routed_input, d_sigma),
-            ))
+            );
+            let public_key = multiply_public_action(public_data.at(index), e_sigma);
+            Ok((row, public_key))
         })
         .map_err(graph)?;
+        let public_key_terms = terms.field(|(_, public_key)| public_key.clone()).map_err(graph)?;
+        let public_key = crate::utils::balanced_sum_family(public_key_terms, add_public_matrices)
+            .map_err(graph)?;
+        let mut public_key = RnsBggPublicKey::new(output, public_key);
+        let terms = terms.field(|(row, _)| row).map_err(graph)?;
         let mut row =
             crate::utils::balanced_sum_family(terms, |lhs, rhs| add_encoding_rows(lhs, rhs))
                 .map_err(graph)?;
@@ -907,9 +1308,29 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         {
             let target = self.workload.level(output)?;
             let modulus = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
+            public_key.matrix = mod_down_public(public_key.matrix, modulus.clone());
             row = mod_down_encoding(row, modulus);
         }
-        Ok(RnsBggEncoding::new(output, row, self.checked_payload(output, None)?))
+        let public_payload = if matches!(
+            self.program
+                .wire_knowledge(output)
+                .map_err(|_| RnsBggError::Binding("wire metadata"))?,
+            AttributeKnowledge::PublicPayload
+        ) {
+            let payload = input
+                .public_payload
+                .clone()
+                .ok_or(RnsBggError::Binding("public LUT input payload missing"))?;
+            let payload = self.lut_public_payload(level, payload, table)?;
+            let target_level = self.workload.level(output)?;
+            Some(checked_modulus_convert(
+                payload,
+                BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone()),
+            )?)
+        } else {
+            None
+        };
+        Ok(RnsBggEncoding::new(public_key, row, self.checked_payload(output, public_payload)?))
     }
 }
 
@@ -952,13 +1373,7 @@ impl GraphParallelLowering for EncodingLowering<'_> {
     fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
         Ok(())
     }
-    fn commit_graph_parallel(
-        &mut self,
-        outputs: Family<Self::SideOutput>,
-    ) -> Result<(), Self::Error> {
-        if !outputs.schema().wire_types().is_empty() {
-            return Err(RnsBggError::Binding("encoding parallel side output is not empty"));
-        }
+    fn commit_graph_parallel(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 }
@@ -967,7 +1382,9 @@ impl GraphParallelLowering for EncodingLowering<'_> {
 pub struct RnsEncryptBuild<'a, B: Backend> {
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
+    hash_key_commitment: [u8; 32],
     inputs: Option<crate::program::EncryptionInputs>,
+    projection_identity: Option<[u8; 32]>,
     payload_secret: Option<RnsBggPayloadSecret>,
     mask_secret: Option<RnsBggMaskSecret>,
     plaintexts: BTreeMap<WireId, InputBinding<Mat, Family<Mat>>>,
@@ -980,13 +1397,39 @@ pub struct RnsEncryptBuild<'a, B: Backend> {
     refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId)>,
 }
 
+fn validate_lut_public_artifacts(
+    catalog: &ArtifactCatalog,
+    production: &ProductionId,
+    parameters: &RnsBggParameters,
+    inputs: &crate::program::EncryptionInputs,
+) -> Result<(), ApiError> {
+    let helper_keys = canonical_lut_helper_keys(parameters, inputs).map_err(ApiError::scheme)?;
+    let manifest = catalog
+        .manifests()
+        .get(production)
+        .ok_or_else(|| ApiError::compatibility("preprocess manifest is not available"))?;
+    for (level, sigma) in helper_keys {
+        for port in 0..4 {
+            let name = format!("lut-public/{level}/{sigma}.{port}");
+            if !manifest.artifacts.contains_key(&name) {
+                return Err(ApiError::compatibility(format!(
+                    "preprocess is missing required LUT A artifact {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
     /// Creates an unbound encryption builder.
     pub fn new(parameters: &'a RnsBggParameters, context: [u8; 32]) -> Self {
         Self {
             parameters,
             context,
+            hash_key_commitment: [0; 32],
             inputs: None,
+            projection_identity: None,
             payload_secret: None,
             mask_secret: None,
             plaintexts: BTreeMap::new(),
@@ -998,6 +1441,61 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             refresh_prf_children: BTreeMap::new(),
             refresh_prf_binding: None,
         }
+    }
+
+    /// Bind public LHS plaintexts and secrets for a prepared PRF child.
+    /// This application-facing method keeps the generic stage trait out of
+    /// refresh child setup code.
+    pub fn bind_lhs_inputs<P: Poly>(
+        &mut self,
+        inputs: &crate::program::EncryptionInputs,
+        parameters: &mxx_ir_core::ParamEnv,
+        lhs: &PlaintextInputs<WireId, P>,
+        payload: &RnsBggPayloadSecret,
+        mask: &RnsBggMaskSecret,
+        hash_key: &[u8],
+    ) -> Result<(), ApiError> {
+        <Self as EncryptBuild<B, P>>::bind_inputs(
+            self, inputs, parameters, lhs, payload, mask, hash_key,
+        )
+    }
+
+    fn bind_preprocess_artifacts_inner(
+        &mut self,
+        preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
+    ) -> Result<(), ApiError> {
+        let binding = preprocess.checkpoint().descriptor().binding().clone();
+        if binding.context() != &self.context ||
+            binding.parameters() != &self.parameters.parameter_identity() ||
+            binding.hash_key_commitment() != &self.hash_key_commitment
+        {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess binding does not match encryption",
+            ));
+        }
+        let production = preprocess.checkpoint().production().clone();
+        if binding.sources().len() != 1 || !binding.sources().contains(&production) {
+            return Err(ApiError::compatibility(
+                "RNS-BGG preprocess production is not a declared source",
+            ));
+        }
+        self.preprocess = Some(production.clone());
+        self.catalog = preprocess.checkpoint().catalog().clone();
+        let inputs = self
+            .inputs
+            .as_ref()
+            .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
+        validate_lut_public_artifacts(&self.catalog, &production, self.parameters, inputs)?;
+        self.binding = Some(binding);
+        Ok(())
+    }
+
+    /// Bind the preprocess artifacts used by a prepared PRF child.
+    pub fn bind_preprocess_artifacts(
+        &mut self,
+        preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
+    ) -> Result<(), ApiError> {
+        self.bind_preprocess_artifacts_inner(preprocess)
     }
 
     /// Bind this encryption child to one slot of the prepared PRF Program.
@@ -1054,6 +1552,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                 .ok_or(RnsBggError::Binding("refresh PRF child artifacts are not bound"))?;
             if binding.context() != &self.context ||
                 binding.parameters() != &self.parameters.parameter_identity() ||
+                binding.hash_key_commitment() != &self.hash_key_commitment ||
                 binding.program() != declaration.source_program() ||
                 child.inputs.is_none() ||
                 child.payload_secret.is_none() ||
@@ -1107,9 +1606,12 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             .as_ref()
             .ok_or_else(|| ApiError::input("refresh PRF child mask is not bound"))?;
         let ring = child.parameters.ring(0).map_err(ApiError::scheme)?;
-        let columns = child.parameters.component_columns(0).map_err(ApiError::scheme)?;
         let commitment = *declaration.commitment();
         for (wire, declaration_input) in inputs.inputs() {
+            let columns = child
+                .parameters
+                .key_component_columns(0, declaration_input.knowledge())
+                .map_err(ApiError::scheme)?;
             let key = RnsBggPublicKey {
                 wire: *wire,
                 matrix: (
@@ -1158,30 +1660,31 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                     )
                     .map_err(ApiError::scheme)?,
                 InputBinding::Family(values) => {
+                    let key_parts = (0..4)
+                        .map(|port| {
+                            ring.family_artifact_input(
+                                production.clone(),
+                                format!("public-key/{wire:?}.{port}"),
+                                values.count().clone(),
+                                (1, columns),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let family = mxx_dsl::parallel(values.count().clone(), |index| {
-                        let member_key = key.clone();
+                        let member_key = RnsBggPublicKey::new(
+                            *wire,
+                            (
+                                (key_parts[0].at(index.clone()), key_parts[1].at(index.clone())),
+                                (key_parts[2].at(index.clone()), key_parts[3].at(index.clone())),
+                            ),
+                        );
                         encode(member_key, values.at(index)).map_err(|_| DslError::Schema)
                     })
                     .map_err(ApiError::scheme)?;
-                    let rows = family.field(|value| value.row.clone()).map_err(ApiError::scheme)?;
-                    let payloads = if matches!(
-                        declaration_input.knowledge(),
-                        AttributeKnowledge::PublicPayload
-                    ) {
-                        Some(
-                            family
-                                .field(|value| {
-                                    value.public_payload.clone().expect("public payload metadata")
-                                })
-                                .map_err(ApiError::scheme)?,
-                        )
-                    } else {
-                        None
-                    };
                     graph
                         .artifact_output(
                             refresh_prf_artifact_name(commitment, slot, &format!("input-{wire:?}")),
-                            RnsBggEncoding::new(*wire, rows, payloads),
+                            family,
                         )
                         .map_err(ApiError::scheme)?
                 }
@@ -1230,45 +1733,31 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
     ) -> Result<RnsBggEncoding, RnsBggError> {
         encode_public_inner(self.parameters, key, mask, plaintext, level)
     }
-    /// Encrypt one preprocess-provided public LUT family with the bound mask.
+    /// Encrypt one preprocess-provided public mask-alignment matrix with the
+    /// bound mask.  The `(level, sigma)` key is fixed by the Program and is
+    /// not inferred from a LUT width or a family scope.
     fn encrypt_lut_helper(
         &self,
         mask: &RnsBggMaskSecret,
-        public_data: &RnsBggLutPublicData,
+        public_data: RnsBggMatrix,
         level: usize,
-    ) -> Result<RnsBggLutHelper, RnsBggError> {
+        sigma: usize,
+    ) -> Result<RnsBggRow, RnsBggError> {
         let mask = reduce_secret(self.parameters, &mask.row, level)?;
-        let count = public_data
-            .count()
-            .evaluate(&ParamEnv::default())
-            .map_err(|_| RnsBggError::Lut)?
-            .to_usize()
-            .ok_or(RnsBggError::Lut)?;
-        let layout = ExpLayout { stride_log2: 0, width_log2: count.trailing_zeros() };
-        let sigmas = layout
-            .automorphism_indices(self.parameters.level(level)?.ring_dimension() as usize)
-            .map_err(|_| RnsBggError::Lut)?;
         let scale = self.parameters.scalar(level, self.parameters.scale(level)?.clone())?;
         let gadget = self.parameters.state_gadget(level)?;
         let columns = self.parameters.component_columns(level)?;
-        mxx_dsl::parallel(public_data.count().clone(), |index| {
-            let matrix = public_data.at(index.clone());
-            let sigma = IntExpr::Select {
-                selector: Box::new(index.expression()?),
-                branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
-            };
-            let correction = (
-                scale.clone() * mask.0.clone().ring_automorphism(sigma.clone()) * gadget.clone(),
-                scale.clone() * mask.1.clone().ring_automorphism(sigma) * gadget.clone(),
-            );
-            let error =
-                fresh_error(self.parameters, level, columns).map_err(|_| DslError::Schema)?;
-            Ok((
-                mask.0.clone() * matrix.0.0 + mask.1.clone() * matrix.1.0 - correction.0 + error.0,
-                mask.0.clone() * matrix.0.1 + mask.1.clone() * matrix.1.1 - correction.1 + error.1,
-            ))
-        })
-        .map_err(graph)
+        let sigma = IntExpr::constant(sigma);
+        let correction = (
+            scale.clone() * mask.0.clone().ring_automorphism(sigma.clone()) * gadget.clone(),
+            scale * mask.1.clone().ring_automorphism(sigma) * gadget,
+        );
+        let error = fresh_error(self.parameters, level, columns)?;
+        Ok((
+            mask.0.clone() * public_data.0.0 + mask.1.clone() * public_data.1.0 - correction.0 +
+                error.0,
+            mask.0 * public_data.0.1 + mask.1 * public_data.1.1 - correction.1 + error.1,
+        ))
     }
 
     fn refresh_decoder(
@@ -1485,33 +1974,69 @@ fn refresh_affine_offset_row(
 impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
     type PayloadSecret = RnsBggPayloadSecret;
     type MaskSecret = RnsBggMaskSecret;
-    type PreprocessDescriptor = RnsBggArtifactBinding;
-    type Descriptor = RnsBggArtifactBinding;
+    type PreprocessDescriptor = RnsBggPreprocessEncryptDescriptor;
+    type Descriptor = RnsBggEncryptionDescriptor;
 
     fn bind_inputs(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
+        parameters: &mxx_ir_core::ParamEnv,
         lhs: &PlaintextInputs<WireId, P>,
         payload: &Self::PayloadSecret,
         mask: &Self::MaskSecret,
+        hash_key: &[u8],
     ) -> Result<(), ApiError> {
+        if lhs.len() != inputs.inputs().len() ||
+            lhs.keys().any(|wire| !inputs.inputs().contains_key(wire))
+        {
+            return Err(ApiError::input("encryption inputs do not exactly match Program inputs"));
+        }
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        for wire in inputs.inputs().keys() {
+        for (wire, declaration) in inputs.inputs() {
             let value = lhs.get(wire).ok_or_else(|| ApiError::input("missing encryption input"))?;
             let converted = match value {
-                InputBinding::Scalar(value) => InputBinding::Scalar(polynomial_input(&ring, value)),
-                InputBinding::Family(values) => InputBinding::Family(
-                    Family::pack(
-                        values.iter().map(|value| polynomial_input(&ring, value)).collect(),
+                InputBinding::Scalar(value)
+                    if matches!(declaration.shape(), InputBinding::Scalar(())) =>
+                {
+                    InputBinding::Scalar(polynomial_input(&ring, value))
+                }
+                InputBinding::Family(values)
+                    if matches!(declaration.shape(), InputBinding::Family(_)) =>
+                {
+                    let expected = match declaration.shape() {
+                        InputBinding::Family(count) => count
+                            .evaluate(parameters)
+                            .ok()
+                            .and_then(|value| value.to_usize())
+                            .ok_or_else(|| {
+                                ApiError::input("encryption input family count is not concrete")
+                            })?,
+                        InputBinding::Scalar(()) => unreachable!(),
+                    };
+                    if values.len() != expected {
+                        return Err(ApiError::input(
+                            "encryption input family count does not match Program",
+                        ));
+                    }
+                    InputBinding::Family(
+                        Family::pack(
+                            values.iter().map(|value| polynomial_input(&ring, value)).collect(),
+                        )
+                        .map_err(|error| ApiError::input(error.to_string()))?,
                     )
-                    .map_err(|error| ApiError::input(error.to_string()))?,
-                ),
+                }
+                _ => return Err(ApiError::input("encryption input shape does not match Program")),
             };
             self.plaintexts.insert(*wire, converted);
         }
         self.inputs = Some(inputs.clone());
+        self.projection_identity = Some(
+            encryption_projection_identity(inputs, parameters, self.parameters)
+                .map_err(ApiError::scheme)?,
+        );
         self.payload_secret = Some(payload.clone());
         self.mask_secret = Some(mask.clone());
+        self.hash_key_commitment = hash_key_commitment(hash_key);
         Ok(())
     }
 
@@ -1519,24 +2044,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
         &mut self,
         preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
     ) -> Result<(), ApiError> {
-        let binding = preprocess.checkpoint().descriptor().clone();
-        if binding.context() != &self.context ||
-            binding.parameters() != &self.parameters.parameter_identity()
-        {
-            return Err(ApiError::compatibility(
-                "RNS-BGG preprocess binding does not match encryption",
-            ));
-        }
-        let production = preprocess.checkpoint().production().clone();
-        if binding.sources().len() != 1 || !binding.sources().contains(&production) {
-            return Err(ApiError::compatibility(
-                "RNS-BGG preprocess production is not a declared source",
-            ));
-        }
-        self.preprocess = Some(production);
-        self.binding = Some(binding);
-        self.catalog = preprocess.checkpoint().catalog().clone();
-        Ok(())
+        self.bind_preprocess_artifacts_inner(preprocess)
     }
 
     fn artifact_identity(&self) -> [u8; 32] {
@@ -1544,6 +2052,32 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
         digest.update(b"mxx-rns-bgg/encryption/v1");
         digest.update(self.context);
         digest.update(self.parameters.parameter_identity());
+        digest.update(self.hash_key_commitment);
+        if let Some(projection) = self.projection_identity {
+            digest.update(projection);
+        }
+        if let Some(production) = &self.preprocess {
+            digest.update(production.spec_hash.0);
+            digest.update(production.execution_nonce);
+        }
+        if let Some(inputs) = &self.inputs {
+            if let Ok(helper_keys) = canonical_lut_helper_keys(self.parameters, inputs) {
+                for (level, sigma) in helper_keys {
+                    for port in 0..4 {
+                        digest.update(format!("lut-public/{level}/{sigma}.{port}").as_bytes());
+                    }
+                }
+            }
+            for wire in inputs.inputs().keys() {
+                digest.update(format!("public-key/{wire:?}").as_bytes());
+            }
+        }
+        if let Some(binding) = &self.binding {
+            for source in binding.sources() {
+                digest.update(source.spec_hash.0);
+                digest.update(source.execution_nonce);
+            }
+        }
         digest.finalize().into()
     }
 
@@ -1571,41 +2105,36 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                 self.catalog.merge(child.catalog.clone()).map_err(ApiError::scheme)?;
             }
         }
-        if let Some(binding) = self.binding.as_ref() {
-            let root_scope = FamilyScope::new(Vec::new(), Vec::new())
-                .map_err(|_| ApiError::input("invalid root LUT helper scope"))?;
-            for (origin, level, count) in binding.lut_helpers() {
-                let helper_ring = self.parameters.ring(*level).map_err(ApiError::scheme)?;
-                let columns =
-                    self.parameters.component_columns(*level).map_err(ApiError::scheme)?;
-                let family_count = IntExpr::constant(*count);
-                let ports = (0..4)
-                    .map(|port| {
-                        helper_ring.family_artifact_input(
-                            production.clone(),
-                            format!("{}.{port}", lut_helper_artifact_name(*origin, &root_scope)),
-                            family_count.clone(),
-                            (1, columns),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let public_data = mxx_dsl::parallel(family_count, |index| {
-                    Ok((
-                        (ports[0].at(index.clone()), ports[1].at(index.clone())),
-                        (ports[2].at(index.clone()), ports[3].at(index)),
-                    ))
+        let helper_keys =
+            canonical_lut_helper_keys(self.parameters, &inputs).map_err(ApiError::scheme)?;
+        for (level, sigma) in helper_keys {
+            let helper_ring = self.parameters.ring(level).map_err(ApiError::scheme)?;
+            let columns = self.parameters.component_columns(level).map_err(ApiError::scheme)?;
+            let public_ports = (0..4)
+                .map(|port| {
+                    helper_ring.artifact_input(
+                        production.clone(),
+                        format!("lut-public/{level}/{sigma}.{port}"),
+                        (1, columns),
+                    )
                 })
+                .collect::<Vec<_>>();
+            let public_data = (
+                (public_ports[0].clone(), public_ports[1].clone()),
+                (public_ports[2].clone(), public_ports[3].clone()),
+            );
+            let helper = self
+                .encrypt_lut_helper(&mask, public_data, level, sigma)
                 .map_err(ApiError::scheme)?;
-                let helper = self
-                    .encrypt_lut_helper(&mask, &public_data, *level)
-                    .map_err(ApiError::scheme)?;
-                graph = graph
-                    .artifact_output(lut_helper_artifact_name(*origin, &root_scope), helper)
-                    .map_err(ApiError::scheme)?;
-            }
+            graph = graph
+                .artifact_output(format!("lut-helper/{level}/{sigma}"), helper)
+                .map_err(ApiError::scheme)?;
         }
         for (wire, declaration) in inputs.inputs() {
-            let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
+            let columns = self
+                .parameters
+                .key_component_columns(0, declaration.knowledge())
+                .map_err(ApiError::scheme)?;
             let scalar_key = || RnsBggPublicKey {
                 wire: *wire,
                 matrix: (
@@ -1676,21 +2205,8 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                         encode(key, values.at(member)).map_err(|_| DslError::Schema)
                     })
                     .map_err(ApiError::scheme)?;
-                    let rows =
-                        encodings.field(|value| value.row.clone()).map_err(ApiError::scheme)?;
-                    let output =
-                        if matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload) {
-                            let payloads = encodings
-                                .field(|value| {
-                                    value.public_payload.clone().expect("public payload metadata")
-                                })
-                                .map_err(ApiError::scheme)?;
-                            RnsBggEncoding::new(*wire, rows, Some(payloads))
-                        } else {
-                            RnsBggEncoding::new(*wire, rows, None)
-                        };
                     graph
-                        .artifact_output(format!("input-{wire:?}"), output)
+                        .artifact_output(format!("input-{wire:?}"), encodings)
                         .map_err(ApiError::scheme)?
                 }
             };
@@ -1714,7 +2230,10 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
         if let Some(declaration) = &self.refresh_declaration {
             descriptor = descriptor.with_refresh_declaration(declaration);
         }
-        Ok((StageGraph::new(graph, self.runtime, self.catalog), descriptor))
+        Ok((
+            StageGraph::new(graph, self.runtime, self.catalog),
+            RnsBggEncryptionDescriptor::from_binding(descriptor),
+        ))
     }
 }
 
@@ -1722,6 +2241,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
 pub struct RnsOnlineBuild<'a> {
     parameters: &'a RnsBggParameters,
     context: [u8; 32],
+    hash_key_commitment: [u8; 32],
     evaluator: Option<EncodingLowering<'a>>,
     families: GraphFamilyExecution,
     environment:
@@ -1729,7 +2249,6 @@ pub struct RnsOnlineBuild<'a> {
     pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineBuild<'a>>)>,
     refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
     refresh_prf: Option<(usize, crate::program::ExponentLutProgramId)>,
-    resumption_source: Option<ProductionId>,
     refreshed_public_key: Option<RnsBggPublicKey>,
 }
 
@@ -1739,13 +2258,13 @@ impl<'a> RnsOnlineBuild<'a> {
         Self {
             parameters,
             context,
+            hash_key_commitment: [0; 32],
             evaluator: None,
             families: GraphFamilyExecution,
             environment: Environment::new(),
             pending_refresh: None,
             refreshed_input: None,
             refresh_prf: None,
-            resumption_source: None,
             refreshed_public_key: None,
         }
     }
@@ -1759,13 +2278,15 @@ impl<'a> RnsOnlineBuild<'a> {
         &mut self,
         declaration: &RefreshDeclaration,
         slot: usize,
-        preprocess: &StageArtifacts<RnsBggArtifactBinding>,
-        encryption: &StageArtifacts<RnsBggArtifactBinding>,
+        preprocess: &StageArtifacts<RnsBggPreprocessOnlineDescriptor>,
+        encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
+        hash_key: &[u8],
     ) -> Result<(), ApiError> {
         let prepared = declaration.prepared().program();
         let expected_parameters = self.parameters.parameter_identity();
-        let preprocess_binding = preprocess.checkpoint().descriptor();
-        let encryption_binding = encryption.checkpoint().descriptor();
+        let preprocess_binding = preprocess.checkpoint().descriptor().binding();
+        let encryption_binding = encryption.checkpoint().descriptor().binding();
+        let expected_hash_key = hash_key_commitment(hash_key);
         if slot >= declaration.slots().len() || declaration.output_schema().is_empty() {
             return Err(ApiError::input("invalid refresh PRF slot or schema"));
         }
@@ -1773,6 +2294,7 @@ impl<'a> RnsOnlineBuild<'a> {
             if binding.context() != &self.context ||
                 binding.parameters() != &expected_parameters ||
                 binding.program() != declaration.source_program() ||
+                binding.hash_key_commitment() != &expected_hash_key ||
                 binding.refresh_commitment() != Some(declaration.commitment())
             {
                 return Err(ApiError::compatibility(
@@ -1798,26 +2320,74 @@ impl<'a> RnsOnlineBuild<'a> {
         catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
         let workload =
             Arc::new(RnsBggDerivedWorkload::from_program(prepared).map_err(ApiError::scheme)?);
+        self.hash_key_commitment = expected_hash_key;
         // The prepared PRF encryption stage publishes its coefficient rows at
         // the raw source (q) level (`append_refresh_prf_child` uses level 0).
         // Keep this child projection at that same level; the refresh route
         // applies the per-slot p-level action and performs q→p explicitly.
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
         let commitment = *declaration.commitment();
         self.environment = Environment::new();
         for (wire, input) in prepared.inputs() {
             let public = matches!(input.knowledge(), AttributeKnowledge::PublicPayload);
+            let columns = self
+                .parameters
+                .key_component_columns(0, input.knowledge())
+                .map_err(ApiError::scheme)?;
             let scalar = || {
                 RnsBggEncoding::new(
-                    *wire,
+                    RnsBggPublicKey::new(
+                        *wire,
+                        (
+                            (
+                                ring.artifact_input(
+                                    encryption_production.clone(),
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        slot,
+                                        &format!("input-{wire:?}.0"),
+                                    ),
+                                    (1, columns),
+                                ),
+                                ring.artifact_input(
+                                    encryption_production.clone(),
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        slot,
+                                        &format!("input-{wire:?}.1"),
+                                    ),
+                                    (1, columns),
+                                ),
+                            ),
+                            (
+                                ring.artifact_input(
+                                    encryption_production.clone(),
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        slot,
+                                        &format!("input-{wire:?}.2"),
+                                    ),
+                                    (1, columns),
+                                ),
+                                ring.artifact_input(
+                                    encryption_production.clone(),
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        slot,
+                                        &format!("input-{wire:?}.3"),
+                                    ),
+                                    (1, columns),
+                                ),
+                            ),
+                        ),
+                    ),
                     (
                         ring.artifact_input(
                             encryption_production.clone(),
                             refresh_prf_artifact_name(
                                 commitment,
                                 slot,
-                                &format!("input-{wire:?}.0"),
+                                &format!("input-{wire:?}.4"),
                             ),
                             (1, columns),
                         ),
@@ -1826,7 +2396,7 @@ impl<'a> RnsOnlineBuild<'a> {
                             refresh_prf_artifact_name(
                                 commitment,
                                 slot,
-                                &format!("input-{wire:?}.1"),
+                                &format!("input-{wire:?}.5"),
                             ),
                             (1, columns),
                         ),
@@ -1837,7 +2407,7 @@ impl<'a> RnsOnlineBuild<'a> {
                             refresh_prf_artifact_name(
                                 commitment,
                                 slot,
-                                &format!("input-{wire:?}.public"),
+                                &format!("input-{wire:?}.6"),
                             ),
                             (1, 1),
                         )
@@ -1847,7 +2417,7 @@ impl<'a> RnsOnlineBuild<'a> {
             let binding = match input.shape() {
                 InputBinding::Scalar(()) => InputBinding::Scalar(scalar()),
                 InputBinding::Family(count) => {
-                    let rows = (0..2)
+                    let key_parts = (0..4)
                         .map(|port| {
                             ring.family_artifact_input(
                                 encryption_production.clone(),
@@ -1861,13 +2431,27 @@ impl<'a> RnsOnlineBuild<'a> {
                             )
                         })
                         .collect::<Vec<_>>();
+                    let rows = (0..2)
+                        .map(|port| {
+                            ring.family_artifact_input(
+                                encryption_production.clone(),
+                                refresh_prf_artifact_name(
+                                    commitment,
+                                    slot,
+                                    &format!("input-{wire:?}.{}", port + 4),
+                                ),
+                                count.clone(),
+                                (1, columns),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let payload = public.then(|| {
                         ring.family_artifact_input(
                             encryption_production.clone(),
                             refresh_prf_artifact_name(
                                 commitment,
                                 slot,
-                                &format!("input-{wire:?}.public"),
+                                &format!("input-{wire:?}.6"),
                             ),
                             count.clone(),
                             (1, 1),
@@ -1876,7 +2460,19 @@ impl<'a> RnsOnlineBuild<'a> {
                     InputBinding::Family(
                         mxx_dsl::parallel(count.clone(), |index| {
                             Ok(RnsBggEncoding::new(
-                                *wire,
+                                RnsBggPublicKey::new(
+                                    *wire,
+                                    (
+                                        (
+                                            key_parts[0].at(index.clone()),
+                                            key_parts[1].at(index.clone()),
+                                        ),
+                                        (
+                                            key_parts[2].at(index.clone()),
+                                            key_parts[3].at(index.clone()),
+                                        ),
+                                    ),
+                                ),
                                 (rows[0].at(index.clone()), rows[1].at(index.clone())),
                                 payload.as_ref().map(|value| value.at(index)),
                             ))
@@ -1978,20 +2574,23 @@ impl<'a> RnsOnlineBuild<'a> {
         Ok(())
     }
 
-    /// Bind a checkpointed refresh as a checked input of a new Program.
-    ///
-    /// Only lazy artifact handles are created. The checkpoint's row and
-    /// matching target public-key ports are imported from its production;
-    /// caller code cannot substitute an unrelated carrier.
-    pub fn bind_refreshed_input(
+    /// Bind a checkpointed refresh as the sole input of an identity
+    /// continuation. Only lazy artifact handles are created. The checkpoint's
+    /// row and matching target public-key ports are imported from its
+    /// production; caller code cannot substitute an unrelated carrier.
+    fn bind_refreshed_input(
         &mut self,
         program: &ExponentLutProgram,
-        input_wire: WireId,
         declaration: &RefreshDeclaration,
-        artifacts: &StageArtifacts<RnsBggArtifactBinding>,
+        artifacts: &StageArtifacts<RnsBggRefreshCheckpointDescriptor>,
     ) -> Result<(), ApiError> {
+        let (&input_wire, declaration_input) = program
+            .inputs()
+            .iter()
+            .next()
+            .ok_or_else(|| ApiError::input("resumption Program has no input"))?;
         let checkpoint = artifacts.checkpoint();
-        let descriptor = checkpoint.descriptor();
+        let descriptor = checkpoint.descriptor().binding();
         if descriptor.context() != &self.context ||
             descriptor.program() != declaration.source_program() ||
             descriptor.refresh_commitment() != Some(declaration.commitment())
@@ -1999,14 +2598,6 @@ impl<'a> RnsOnlineBuild<'a> {
             return Err(ApiError::compatibility(
                 "refreshed input checkpoint does not match its declaration",
             ));
-        }
-        if descriptor.sources().is_empty() {
-            return Err(ApiError::compatibility(
-                "refreshed input checkpoint has no dependency sources",
-            ));
-        }
-        if input_wire == declaration.source_output() {
-            return Err(ApiError::input("resumption input must use the new Program wire"));
         }
         if declaration.output_schema().is_empty() {
             return Err(ApiError::input("refreshed input schema is empty"));
@@ -2016,8 +2607,22 @@ impl<'a> RnsOnlineBuild<'a> {
         // parameter digest intentionally does not identify this builder.
         let resumed_level = self.parameters.level(0).map_err(ApiError::scheme)?;
         let resumed_ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
-        let resumed_columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
-        let expected_port = resumed_ring.matrix_type((1, resumed_columns));
+        if program.inputs().len() != 1 ||
+            !program.inputs().contains_key(&input_wire) ||
+            program.outputs() != [Operand::Scalar(input_wire)]
+        {
+            return Err(ApiError::compatibility(
+                "only an identity continuation can resume from a refresh checkpoint without stage artifacts",
+            ));
+        }
+        if !matches!(declaration_input.shape(), InputBinding::Scalar(())) {
+            return Err(ApiError::input("refreshed input must be scalar"));
+        }
+        let knowledge = program.wire_knowledge(input_wire).map_err(ApiError::scheme)?;
+        let key_columns =
+            self.parameters.key_component_columns(0, knowledge).map_err(ApiError::scheme)?;
+        let row_columns = key_columns;
+        let expected_port = resumed_ring.matrix_type((1, key_columns));
         let schema_ports = declaration
             .output_schema()
             .iter()
@@ -2041,37 +2646,13 @@ impl<'a> RnsOnlineBuild<'a> {
                 "resumption builder must use the target modulus chain at level zero",
             ));
         }
-        if program.inputs().len() != 1 ||
-            !program.inputs().contains_key(&input_wire) ||
-            program.outputs() != [Operand::Scalar(input_wire)]
-        {
-            return Err(ApiError::compatibility(
-                "only an identity continuation can resume from a refresh checkpoint without stage artifacts",
-            ));
-        }
-        let declaration_input = program
-            .inputs()
-            .get(&input_wire)
-            .ok_or_else(|| ApiError::input("resumption wire is not a Program input"))?;
-        if !matches!(declaration_input.shape(), InputBinding::Scalar(())) {
-            return Err(ApiError::input("refreshed input must be scalar"));
-        }
-        let knowledge = program.wire_knowledge(input_wire).map_err(ApiError::scheme)?;
         let target_ring = resumed_ring;
-        let columns = resumed_columns;
         let production = checkpoint.production().clone();
         let manifest = checkpoint
             .catalog()
             .manifests()
             .get(&production)
             .ok_or_else(|| ApiError::compatibility("refresh checkpoint manifest is missing"))?;
-        for source in descriptor.sources() {
-            if !checkpoint.catalog().manifests().contains_key(source) {
-                return Err(ApiError::compatibility(
-                    "refresh checkpoint is missing a declared dependency source",
-                ));
-            }
-        }
         let checkpoint_name =
             |role: &str| refresh_checkpoint_artifact_name(*declaration.commitment(), role);
         let matrix_type = |columns| {
@@ -2093,14 +2674,25 @@ impl<'a> RnsOnlineBuild<'a> {
             }
             Ok(())
         };
-        require_artifact(&checkpoint_name("row.0"), matrix_type(columns))?;
-        require_artifact(&checkpoint_name("row.1"), matrix_type(columns))?;
+        require_artifact(&checkpoint_name("row.0"), matrix_type(row_columns))?;
+        require_artifact(&checkpoint_name("row.1"), matrix_type(row_columns))?;
         for port in 0..4 {
-            require_artifact(&checkpoint_name(&format!("target.{port}")), matrix_type(columns))?;
+            require_artifact(
+                &checkpoint_name(&format!("target.{port}")),
+                matrix_type(key_columns),
+            )?;
         }
         let row = (
-            target_ring.artifact_input(production.clone(), checkpoint_name("row.0"), (1, columns)),
-            target_ring.artifact_input(production.clone(), checkpoint_name("row.1"), (1, columns)),
+            target_ring.artifact_input(
+                production.clone(),
+                checkpoint_name("row.0"),
+                (1, row_columns),
+            ),
+            target_ring.artifact_input(
+                production.clone(),
+                checkpoint_name("row.1"),
+                (1, row_columns),
+            ),
         );
         let public_key = RnsBggPublicKey::new(
             input_wire,
@@ -2109,24 +2701,24 @@ impl<'a> RnsOnlineBuild<'a> {
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.0"),
-                        (1, columns),
+                        (1, key_columns),
                     ),
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.1"),
-                        (1, columns),
+                        (1, key_columns),
                     ),
                 ),
                 (
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.2"),
-                        (1, columns),
+                        (1, key_columns),
                     ),
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.3"),
-                        (1, columns),
+                        (1, key_columns),
                     ),
                 ),
             ),
@@ -2155,7 +2747,7 @@ impl<'a> RnsOnlineBuild<'a> {
             .bind_wire(
                 input_wire,
                 InputBinding::Scalar(RnsBggEncoding::new(
-                    input_wire,
+                    public_key.clone(),
                     row.clone(),
                     public_payload.clone(),
                 )),
@@ -2196,10 +2788,9 @@ impl<'a> RnsOnlineBuild<'a> {
             current_site: None,
         });
         self.environment = environment;
-        self.refreshed_public_key = Some(public_key);
-        self.resumption_source = Some(checkpoint.production().clone());
+        self.refreshed_public_key = Some(public_key.clone());
         self.refreshed_input =
-            Some((declaration.clone(), RnsBggEncoding::new(input_wire, row, public_payload)));
+            Some((declaration.clone(), RnsBggEncoding::new(public_key, row, public_payload)));
         Ok(())
     }
 
@@ -2283,7 +2874,7 @@ impl<'a> RnsOnlineBuild<'a> {
                 {
                     continue;
                 }
-                if value.wire != *wire {
+                if value.wire() != *wire {
                     return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
                 }
                 outputs.entry(label.clone()).or_default().insert(*slot, value);
@@ -2314,9 +2905,9 @@ impl<'a> RnsOnlineBuild<'a> {
         Ok(outputs)
     }
 
-    /// Compose a refresh against already-lowered outer outputs and return the
-    /// actual symbolic carrier before graph finalization.
-    pub fn compose_refresh(
+    /// Finalize the pending refresh against lowered outer outputs and return
+    /// the resulting symbolic carrier before graph finalization.
+    fn finalize_refresh(
         &mut self,
         output_index: usize,
         declaration: &RefreshDeclaration,
@@ -2358,7 +2949,7 @@ impl<'a> RnsOnlineBuild<'a> {
                 RnsBggError::Refresh(RefreshError::PrfOutputMismatch)
             }
         })?;
-        let refreshed_target = evaluator.refresh_public_target(declaration, source.wire)?;
+        let refreshed_target = evaluator.refresh_public_target(declaration, source.wire())?;
         for child in children.values() {
             if let Some(child_evaluator) = child.evaluator.as_ref() {
                 evaluator
@@ -2372,106 +2963,44 @@ impl<'a> RnsOnlineBuild<'a> {
         Ok(refreshed)
     }
 
-    /// Build a checkpointable graph for a composed refresh result.  The graph
-    /// publishes the refreshed row and its matching target public key under
-    /// one declaration namespace and returns the existing artifact binding.
-    pub fn build_refresh_checkpoint_graph<B: Backend>(
-        &mut self,
-        declaration: &RefreshDeclaration,
-        refreshed: RnsBggEncoding,
-        target: RnsBggPublicKey,
-    ) -> Result<(StageGraph<B>, RnsBggArtifactBinding), ApiError> {
-        let evaluator = self
-            .evaluator
-            .as_ref()
-            .ok_or_else(|| ApiError::input("online artifacts are not bound"))?;
-        if refreshed.wire != declaration.source_output() ||
-            target.wire != declaration.source_output()
-        {
-            return Err(ApiError::input("refresh checkpoint carrier wire mismatch"));
-        }
-        let target_ring =
-            self.parameters.ring(declaration.target_level()).map_err(ApiError::scheme)?;
-        let target_columns = self
-            .parameters
-            .component_columns(declaration.target_level())
-            .map_err(ApiError::scheme)?;
-        let expected_row = target_ring.matrix_type((1, target_columns));
-        if refreshed.row.0.matrix_type() != &expected_row ||
-            refreshed.row.1.matrix_type() != &expected_row
-        {
-            return Err(ApiError::input("refresh checkpoint row schema mismatch"));
-        }
-        let public = evaluator.program.wire_knowledge(refreshed.wire).map_err(ApiError::scheme)?;
-        if matches!(public, AttributeKnowledge::PublicPayload) != refreshed.public_payload.is_some()
-        {
-            return Err(ApiError::input("refresh checkpoint payload metadata mismatch"));
-        }
-        if let Some(payload) = &refreshed.public_payload {
-            if payload.matrix_type() != &target_ring.matrix_type((1, 1)) {
-                return Err(ApiError::input("refresh checkpoint payload schema mismatch"));
-            }
-        }
-        if target.schema().wire_types() != declaration.output_schema() {
-            return Err(ApiError::input("refresh checkpoint target schema mismatch"));
-        }
-        let mut sources = vec![evaluator.preprocess.clone(), evaluator.encryption.clone()];
-        sources.sort();
-        sources.dedup();
-        let descriptor = RnsBggArtifactBinding::new(
-            self.context,
-            evaluator.program.id(),
-            self.parameters.parameter_identity(),
-            sources,
-        )
-        .map_err(ApiError::scheme)?
-        .with_refresh_declaration(declaration);
-        let mut graph = DslContext::new("rns-bgg-refresh-checkpoint");
-        graph = graph
-            .artifact_output(
-                refresh_checkpoint_artifact_name(*declaration.commitment(), "row"),
-                refreshed,
-            )
-            .map_err(ApiError::scheme)?;
-        graph = graph
-            .artifact_output(
-                refresh_checkpoint_artifact_name(*declaration.commitment(), "target"),
-                target,
-            )
-            .map_err(ApiError::scheme)?;
-        Ok((
-            StageGraph::new(
-                graph.build().map_err(ApiError::scheme)?,
-                BTreeMap::new(),
-                evaluator.catalog.clone(),
-            ),
-            descriptor,
-        ))
-    }
-
     fn refresh_inputs_from_output(
         &self,
         declaration: &RefreshDeclaration,
         source: &RnsBggEncoding,
     ) -> Result<BTreeMap<usize, RnsBggEncoding>, RnsBggError> {
-        if source.wire != declaration.source_output() {
+        if source.wire() != declaration.source_output() {
             return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
         }
         let evaluator = self
             .evaluator
             .as_ref()
             .ok_or(RnsBggError::Binding("online artifacts are not bound"))?;
-        let level = evaluator.workload.level(source.wire)?;
+        let level = evaluator.workload.level(source.wire())?;
         let ring = self.parameters.ring(level)?;
-        let columns = self.parameters.component_columns(level)?;
-        let expected_row = ring.matrix_type((1, columns));
+        let expected_public =
+            matches!(self.program_knowledge(source.wire())?, AttributeKnowledge::PublicPayload);
+        let key_knowledge = if expected_public {
+            AttributeKnowledge::PublicPayload
+        } else {
+            AttributeKnowledge::PrivatePayload
+        };
+        let key_columns = self.parameters.key_component_columns(level, key_knowledge)?;
+        let row_columns = key_columns;
+        let expected_row = ring.matrix_type((1, row_columns));
+        let expected_key = ring.matrix_type((1, key_columns));
         if source.row.0.matrix_type() != &expected_row ||
             source.row.1.matrix_type() != &expected_row
         {
             return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
         }
-        let expected_public =
-            matches!(self.program_knowledge(source.wire)?, AttributeKnowledge::PublicPayload);
+        if source.public_key.wire != source.wire() ||
+            source.public_key.matrix.0.0.matrix_type() != &expected_key ||
+            source.public_key.matrix.0.1.matrix_type() != &expected_key ||
+            source.public_key.matrix.1.0.matrix_type() != &expected_key ||
+            source.public_key.matrix.1.1.matrix_type() != &expected_key
+        {
+            return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
+        }
         if expected_public != source.public_payload.is_some() {
             return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
         }
@@ -2490,7 +3019,7 @@ impl<'a> RnsOnlineBuild<'a> {
                 Ok((
                     slot.slot,
                     RnsBggEncoding::new(
-                        source.wire,
+                        source.public_key.clone(),
                         (source.row.0.clone(), source.row.1.clone()),
                         source.public_payload.clone(),
                     ),
@@ -2534,12 +3063,12 @@ impl<'a> RnsOnlineBuild<'a> {
             let input_declaration = evaluator
                 .program
                 .inputs()
-                .get(&input.wire)
+                .get(&input.wire())
                 .ok_or_else(|| ApiError::input("refreshed wire is not a Program input"))?;
             if !matches!(input_declaration.shape(), InputBinding::Scalar(())) {
                 return Err(ApiError::input("refreshed input must be scalar"));
             }
-            self.environment.wires.insert(input.wire, InputBinding::Scalar(input));
+            self.environment.wires.insert(input.wire(), InputBinding::Scalar(input));
         }
         Ok((
             self.evaluator
@@ -2551,11 +3080,280 @@ impl<'a> RnsOnlineBuild<'a> {
     }
 }
 
+/// Checkpoint a refresh output that has already been returned by
+/// [`crate::api::online_eval`].
+///
+/// This operation only imports the returned output ports into a small
+/// artifact graph. It does not lower or execute the refresh again. The
+/// checkpoint stores the row tuple, an optional public payload, and the
+/// matching target public key as separate outputs so that a resumed carrier
+/// cannot accidentally treat the whole paired encoding as its row.
+pub fn checkpoint_refreshed_output<B, S>(
+    program: &ExponentLutProgram,
+    declaration: &RefreshDeclaration,
+    result: &mut ExecutionResult<B>,
+    output_index: usize,
+    preprocess: &StageArtifacts<RnsBggPreprocessOnlineDescriptor>,
+    encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
+    parameters: &RnsBggParameters,
+    hash_key: &[u8],
+    backend: &mut B,
+    store: &mut S,
+    checkpoint: &Path,
+    config: ExecutionConfig,
+) -> Result<StageArtifacts<RnsBggRefreshCheckpointDescriptor>, ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let (graph, descriptor) = build_refresh_checkpoint_graph(
+        program,
+        declaration,
+        result,
+        output_index,
+        preprocess,
+        encryption,
+        parameters,
+        hash_key,
+        backend,
+        store,
+    )?;
+    execute_checkpoint(
+        graph,
+        &ParamEnv::default(),
+        descriptor,
+        domain_identity(*declaration.commitment(), b"refresh-checkpoint"),
+        backend,
+        store,
+        checkpoint,
+        config,
+        |_| Ok(()),
+    )
+}
+
+/// Resume a refresh through the built-in single-input identity continuation.
+///
+/// The continuation is deliberately outside the original estimated graph:
+/// it is created and executed only after the caller has checkpointed the
+/// already-returned refresh output. No refresh callback or intermediate
+/// carrier is accepted by this API.
+pub fn resume_refreshed_output<B, S>(
+    declaration: &RefreshDeclaration,
+    checkpoint: &StageArtifacts<RnsBggRefreshCheckpointDescriptor>,
+    parameters: &RnsBggParameters,
+    backend: &mut B,
+    store: &mut S,
+    config: ExecutionConfig,
+) -> Result<ExecutionResult<B>, ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let binding = checkpoint.checkpoint().descriptor().binding();
+    let manifest = checkpoint
+        .checkpoint()
+        .catalog()
+        .manifests()
+        .get(checkpoint.checkpoint().production())
+        .ok_or_else(|| ApiError::compatibility("refresh checkpoint manifest is missing"))?;
+    let public_payload = manifest
+        .artifacts
+        .contains_key(&refresh_checkpoint_artifact_name(*declaration.commitment(), "row.public"));
+    let knowledge = if public_payload {
+        AttributeKnowledge::PublicPayload
+    } else {
+        AttributeKnowledge::PrivatePayload
+    };
+    let mut builder = ExponentLutProgramBuilder::new();
+    let input = builder.input(knowledge).map_err(ApiError::scheme)?;
+    let program = builder.finish(vec![Operand::Scalar(input)]).map_err(ApiError::scheme)?;
+
+    let mut online = RnsOnlineBuild::new(parameters, *binding.context());
+    online.bind_refreshed_input(&program, declaration, checkpoint)?;
+    let outputs = {
+        let (evaluator, families, environment) = online.lowering_state_inner()?;
+        crate::program::lower_program(&program, evaluator, families, environment)
+            .map_err(ApiError::lowering)?
+    };
+    let graph = online.build_graph(outputs)?;
+    execute_graph(graph, &ParamEnv::default(), backend, store, config, |_| Ok(()))
+}
+
+fn build_refresh_checkpoint_graph<B, S>(
+    program: &ExponentLutProgram,
+    declaration: &RefreshDeclaration,
+    result: &mut ExecutionResult<B>,
+    output_index: usize,
+    preprocess: &StageArtifacts<RnsBggPreprocessOnlineDescriptor>,
+    encryption: &StageArtifacts<RnsBggEncryptionDescriptor>,
+    parameters: &RnsBggParameters,
+    hash_key: &[u8],
+    backend: &mut B,
+    store: &mut S,
+) -> Result<(StageGraph<B>, RnsBggRefreshCheckpointDescriptor), ApiError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let output = program
+        .outputs()
+        .get(output_index)
+        .ok_or_else(|| ApiError::input("refresh checkpoint output index is out of range"))?;
+    let source_wire = match output {
+        Operand::Scalar(wire) => *wire,
+        Operand::Member { .. } => {
+            return Err(ApiError::input("refresh checkpoint output must be scalar"));
+        }
+    };
+    if source_wire != declaration.source_output() {
+        return Err(ApiError::input("refresh checkpoint output does not match declaration"));
+    }
+    if declaration.output_schema().len() != 4 {
+        return Err(ApiError::input("refresh checkpoint target schema must contain four ports"));
+    }
+    let source_knowledge = program.wire_knowledge(source_wire).map_err(ApiError::scheme)?;
+    let expected_ports =
+        if matches!(source_knowledge, AttributeKnowledge::PrivatePayload) { 6 } else { 7 };
+    let prefix = format!("output-{output_index}.");
+    let mut ports = BTreeMap::new();
+    for name in result.outputs.keys().filter(|name| name.starts_with(&prefix)) {
+        let port = name
+            .strip_prefix(&prefix)
+            .and_then(|port| port.parse::<usize>().ok())
+            .ok_or_else(|| ApiError::input("refresh checkpoint output port is malformed"))?;
+        if port >= expected_ports || ports.insert(port, name.clone()).is_some() {
+            return Err(ApiError::input("refresh checkpoint output port is out of range"));
+        }
+    }
+    if ports.len() != expected_ports || ports.keys().copied().ne(0..expected_ports) {
+        return Err(ApiError::input("refresh checkpoint output port set is incomplete"));
+    }
+
+    let target_level = declaration.target_level();
+    let ring = parameters.ring(target_level).map_err(ApiError::scheme)?;
+    let columns = parameters
+        .key_component_columns(target_level, source_knowledge)
+        .map_err(ApiError::scheme)?;
+    let expected_port = ring.matrix_type((1, columns));
+    let mut runtime_inputs = BTreeMap::new();
+    let mut input = |port: usize, name: String| -> Result<Mat, ApiError> {
+        let output_name = ports
+            .get(&port)
+            .ok_or_else(|| ApiError::input("refresh checkpoint output port is missing"))?;
+        let value = result.materialize_output(output_name, backend, store)?.clone();
+        if !matches!(value, RuntimeValue::Matrix(_)) {
+            return Err(ApiError::input("refresh checkpoint output is not a matrix"));
+        }
+        runtime_inputs.insert(name.clone(), value);
+        Ok(ring.input(name, (1, columns)))
+    };
+    let key = (
+        (
+            input(0, "refresh-checkpoint-key-0".to_owned())?,
+            input(1, "refresh-checkpoint-key-1".to_owned())?,
+        ),
+        (
+            input(2, "refresh-checkpoint-key-2".to_owned())?,
+            input(3, "refresh-checkpoint-key-3".to_owned())?,
+        ),
+    );
+    let row = (
+        input(4, "refresh-checkpoint-row-0".to_owned())?,
+        input(5, "refresh-checkpoint-row-1".to_owned())?,
+    );
+    let schema_ports = declaration
+        .output_schema()
+        .iter()
+        .filter_map(|port| match port {
+            WireType::Matrix(matrix) => Some(matrix),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if schema_ports.len() != 4 || schema_ports.iter().any(|port| **port != expected_port) {
+        return Err(ApiError::input("refresh checkpoint target schema mismatch"));
+    }
+    if key.0.0.matrix_type() != &expected_port ||
+        key.0.1.matrix_type() != &expected_port ||
+        key.1.0.matrix_type() != &expected_port ||
+        key.1.1.matrix_type() != &expected_port ||
+        row.0.matrix_type() != &expected_port ||
+        row.1.matrix_type() != &expected_port
+    {
+        return Err(ApiError::input("refresh checkpoint carrier schema mismatch"));
+    }
+    let public_payload = if matches!(source_knowledge, AttributeKnowledge::PublicPayload) {
+        let output_name = ports
+            .get(&6)
+            .ok_or_else(|| ApiError::input("refresh checkpoint public payload is missing"))?;
+        let value = result.materialize_output(output_name, backend, store)?.clone();
+        if !matches!(value, RuntimeValue::Matrix(_)) {
+            return Err(ApiError::input("refresh checkpoint public payload is not a matrix"));
+        }
+        let name = "refresh-checkpoint-row-public".to_owned();
+        runtime_inputs.insert(name.clone(), value);
+        Some(ring.input(name, (1, 1)))
+    } else {
+        None
+    };
+
+    let preprocess_binding = preprocess.checkpoint().descriptor().binding();
+    let encryption_binding = encryption.checkpoint().descriptor().binding();
+    let expected_parameters = parameters.parameter_identity();
+    let expected_hash_key = hash_key_commitment(hash_key);
+    for binding in [preprocess_binding, encryption_binding] {
+        if binding.context() != encryption_binding.context() ||
+            binding.parameters() != &expected_parameters ||
+            binding.program() != declaration.source_program() ||
+            binding.hash_key_commitment() != &expected_hash_key ||
+            binding.refresh_commitment() != Some(declaration.commitment())
+        {
+            return Err(ApiError::compatibility("refresh checkpoint source binding mismatch"));
+        }
+    }
+    if !preprocess_binding.sources().is_empty() ||
+        encryption_binding.sources().len() != 1 ||
+        !encryption_binding.sources().contains(preprocess.checkpoint().production())
+    {
+        return Err(ApiError::compatibility("refresh checkpoint source artifacts are invalid"));
+    }
+    let descriptor = RnsBggArtifactBinding::new(
+        *encryption_binding.context(),
+        declaration.source_program(),
+        expected_parameters,
+        expected_hash_key,
+        Vec::new(),
+    )
+    .map_err(ApiError::scheme)?
+    .with_refresh_declaration(declaration);
+    let checkpoint_name =
+        |role: &str| refresh_checkpoint_artifact_name(*declaration.commitment(), role);
+    let mut graph = DslContext::new("rns-bgg-refresh-checkpoint")
+        .artifact_output(checkpoint_name("row"), row)
+        .map_err(ApiError::scheme)?;
+    if let Some(payload) = public_payload {
+        graph = graph
+            .artifact_output(checkpoint_name("row.public"), payload)
+            .map_err(ApiError::scheme)?;
+    }
+    graph = graph.artifact_output(checkpoint_name("target"), key).map_err(ApiError::scheme)?;
+    let mut catalog = preprocess.checkpoint().catalog().clone();
+    catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
+    for source in [preprocess.checkpoint().production(), encryption.checkpoint().production()] {
+        if !catalog.manifests().contains_key(source) {
+            return Err(ApiError::compatibility("refresh checkpoint source manifest is missing"));
+        }
+    }
+    Ok((
+        StageGraph::new(graph.build().map_err(ApiError::scheme)?, runtime_inputs, catalog),
+        RnsBggRefreshCheckpointDescriptor::from_binding(descriptor),
+    ))
+}
+
 impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
     type Evaluator = EncodingLowering<'a>;
     type Families = GraphFamilyExecution;
-    type PreprocessDescriptor = RnsBggArtifactBinding;
-    type EncryptDescriptor = RnsBggArtifactBinding;
+    type PreprocessDescriptor = RnsBggPreprocessOnlineDescriptor;
+    type EncryptDescriptor = RnsBggEncryptionDescriptor;
 
     fn lowering_state(
         &mut self,
@@ -2578,18 +3376,33 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
     fn bind_artifacts(
         &mut self,
         program: &ExponentLutProgram,
+        parameters: &mxx_ir_core::ParamEnv,
         preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
         encryption: &StageArtifacts<Self::EncryptDescriptor>,
+        hash_key: &[u8],
     ) -> Result<(), ApiError> {
-        let preprocess_binding = preprocess.checkpoint().descriptor();
-        let encryption_binding = encryption.checkpoint().descriptor();
+        for declaration in program.inputs().values() {
+            if let InputBinding::Family(count) = declaration.shape() {
+                let count =
+                    count.evaluate(parameters).ok().and_then(|value| value.to_usize()).ok_or_else(
+                        || ApiError::input("online input family count is not concrete"),
+                    )?;
+                if count == 0 {
+                    return Err(ApiError::input("online input family count is empty"));
+                }
+            }
+        }
+        let preprocess_binding = preprocess.checkpoint().descriptor().binding();
+        let encryption_binding = encryption.checkpoint().descriptor().binding();
         let expected_parameters = self.parameters.parameter_identity();
         let preprocess_production = preprocess.checkpoint().production().clone();
         let encryption_production = encryption.checkpoint().production().clone();
+        let expected_hash_key = hash_key_commitment(hash_key);
         for binding in [preprocess_binding, encryption_binding] {
             if binding.context() != &self.context ||
                 binding.parameters() != &expected_parameters ||
-                binding.program() != program.id()
+                binding.program() != program.id() ||
+                binding.hash_key_commitment() != &expected_hash_key
             {
                 return Err(ApiError::compatibility(
                     "RNS-BGG artifact binding does not match online Program",
@@ -2617,36 +3430,69 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
         catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
         let workload =
             Arc::new(RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?);
+        self.hash_key_commitment = expected_hash_key;
         let ring = self.parameters.ring(0).map_err(ApiError::scheme)?;
         for (wire, declaration) in program.inputs() {
-            let columns = self.parameters.component_columns(0).map_err(ApiError::scheme)?;
+            let columns = self
+                .parameters
+                .key_component_columns(0, declaration.knowledge())
+                .map_err(ApiError::scheme)?;
             let public = matches!(declaration.knowledge(), AttributeKnowledge::PublicPayload);
             let bind_scalar = |suffix: &str| {
+                let key = RnsBggPublicKey::new(
+                    *wire,
+                    (
+                        (
+                            ring.artifact_input(
+                                encryption_production.clone(),
+                                format!("input-{wire:?}.{suffix}0"),
+                                (1, columns),
+                            ),
+                            ring.artifact_input(
+                                encryption_production.clone(),
+                                format!("input-{wire:?}.{suffix}1"),
+                                (1, columns),
+                            ),
+                        ),
+                        (
+                            ring.artifact_input(
+                                encryption_production.clone(),
+                                format!("input-{wire:?}.{suffix}2"),
+                                (1, columns),
+                            ),
+                            ring.artifact_input(
+                                encryption_production.clone(),
+                                format!("input-{wire:?}.{suffix}3"),
+                                (1, columns),
+                            ),
+                        ),
+                    ),
+                );
                 let row = (
                     ring.artifact_input(
                         encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}0"),
+                        format!("input-{wire:?}.{suffix}4"),
                         (1, columns),
                     ),
                     ring.artifact_input(
                         encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}1"),
+                        format!("input-{wire:?}.{suffix}5"),
                         (1, columns),
                     ),
                 );
                 let payload = public.then(|| {
                     ring.artifact_input(
                         encryption_production.clone(),
-                        format!("input-{wire:?}.{suffix}public"),
+                        format!("input-{wire:?}.{suffix}6"),
                         (1, 1),
                     )
                 });
-                RnsBggEncoding::new(*wire, row, payload)
+                RnsBggEncoding::new(key, row, payload)
             };
             let binding = match declaration.shape() {
                 InputBinding::Scalar(()) => InputBinding::Scalar(bind_scalar("")),
                 InputBinding::Family(count) => {
-                    let rows = (0..2)
+                    let key_parts = (0..4)
                         .map(|port| {
                             ring.family_artifact_input(
                                 encryption_production.clone(),
@@ -2656,17 +3502,39 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                             )
                         })
                         .collect::<Vec<_>>();
+                    let rows = (0..2)
+                        .map(|port| {
+                            ring.family_artifact_input(
+                                encryption_production.clone(),
+                                format!("input-{wire:?}.{}", port + 4),
+                                count.clone(),
+                                (1, columns),
+                            )
+                        })
+                        .collect::<Vec<_>>();
                     let payload = public.then(|| {
                         ring.family_artifact_input(
                             encryption_production.clone(),
-                            format!("input-{wire:?}.public"),
+                            format!("input-{wire:?}.6"),
                             count.clone(),
                             (1, 1),
                         )
                     });
                     let family = mxx_dsl::parallel(count.clone(), |index| {
                         Ok(RnsBggEncoding::new(
-                            *wire,
+                            RnsBggPublicKey::new(
+                                *wire,
+                                (
+                                    (
+                                        key_parts[0].at(index.clone()),
+                                        key_parts[1].at(index.clone()),
+                                    ),
+                                    (
+                                        key_parts[2].at(index.clone()),
+                                        key_parts[3].at(index.clone()),
+                                    ),
+                                ),
+                            ),
                             (rows[0].at(index.clone()), rows[1].at(index.clone())),
                             payload.as_ref().map(|payload| payload.at(index)),
                         ))
@@ -2712,7 +3580,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
         let mut outputs = outputs;
         let pending = self.pending_refresh.take();
         if let Some((index, declaration, mut children)) = pending {
-            self.compose_refresh(index, &declaration, std::mem::take(&mut children), &mut outputs)
+            self.finalize_refresh(index, &declaration, std::mem::take(&mut children), &mut outputs)
                 .map_err(ApiError::scheme)?;
         }
         let evaluator = self
@@ -2759,7 +3627,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
             inputs.get(&0).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?.clone();
         let lowerer = self.lowerer();
         for input in inputs.values() {
-            if input.wire != declaration.source_output() {
+            if input.wire() != declaration.source_output() {
                 return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
             }
         }
@@ -2833,7 +3701,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 let value = channel_outputs
                     .get(&slot)
                     .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
-                if value.wire != expected_wire {
+                if value.wire() != expected_wire {
                     return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
                 }
                 if source.public_payload.is_some() != value.public_payload.is_some() {
@@ -2908,7 +3776,8 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
             )?),
             None => None,
         };
-        Ok(RnsBggEncoding::new(source.wire, result, public_payload))
+        let refreshed_public_key = lowerer.refresh_public_target(&declaration, source.wire())?;
+        Ok(RnsBggEncoding::new(refreshed_public_key, result, public_payload))
     }
 }
 
@@ -2934,22 +3803,347 @@ fn reduce_anchor_channel(
 #[cfg(test)]
 mod test {
     use super::*;
+    use mxx_primitives::poly::dcrt::poly::DCRTPoly;
+    use mxx_runtime::{MemoryArtifactStore, backend::poly::cpu_backend};
 
     #[test]
-    fn encryption_lut_helper_produces_one_lazy_family_member() {
+    fn lut_coefficients_evaluate_values_with_distinct_input_and_output_layouts() {
+        let level = DCRTPolyParams::new(16, 1, 17, 2, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let input_layout = ExpLayout { stride_log2: 1, width_log2: 2 };
+        let output_layout = ExpLayout { stride_log2: 2, width_log2: 2 };
+        let mut graph = DslContext::new("lut-layout-arithmetic");
+        let values = [0usize, 1, 3, 2];
+        for (role, representation) in [
+            crate::program::LutOutputRepresentation::Coefficient,
+            crate::program::LutOutputRepresentation::Exponent(output_layout),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for (input, expected) in values.iter().copied().enumerate() {
+                let monomial = input_layout.mono(&ring, &BigInt::from(input)).unwrap();
+                let mut actual = ring.zero((1, 1));
+                for sigma in input_layout.automorphism_indices(16).unwrap() {
+                    let coefficient = EncodingLowering::lut_coefficient(
+                        &parameters,
+                        0,
+                        input_layout,
+                        representation,
+                        IntExpr::constant(sigma),
+                        &values,
+                    )
+                    .unwrap();
+                    actual = actual + coefficient * monomial.clone().ring_automorphism(sigma);
+                }
+                let expected = match representation {
+                    crate::program::LutOutputRepresentation::Coefficient => {
+                        ring.polynomial([IntExpr::constant(expected)])
+                    }
+                    crate::program::LutOutputRepresentation::Exponent(layout) => {
+                        layout.mono(&ring, &BigInt::from(expected)).unwrap()
+                    }
+                };
+                graph =
+                    graph.output(format!("difference-{role}-{input}"), actual - expected).unwrap();
+            }
+        }
+        let mut backend = cpu_backend([level]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result = execute_graph(
+            StageGraph::new(graph.build().unwrap(), BTreeMap::new(), ArtifactCatalog::default()),
+            &ParamEnv::default(),
+            &mut backend,
+            &mut store,
+            ExecutionConfig::default(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        for name in result.outputs.keys().cloned().collect::<Vec<_>>() {
+            let RuntimeValue::Matrix(matrix) =
+                result.materialize_output(&name, &mut backend, &mut store).unwrap()
+            else {
+                panic!("LUT result is not a matrix");
+            };
+            assert!(
+                matrix
+                    .entry(0, 0)
+                    .coeffs_biguints()
+                    .iter()
+                    .all(|value| *value == BigUint::from(0u8)),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn finalized_coefficient_verification_accepts_correct_and_rejects_wrong_plaintext() {
+        let high = DCRTPolyParams::new(16, 3, 17, 1, None, None);
+        let primes = high.to_crt().0;
+        let middle =
+            high.select_modulus(&(BigUint::from(primes[0]) * BigUint::from(primes[1]))).unwrap();
+        let low = high.select_modulus(&BigUint::from(primes[0])).unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![high.clone(), middle.clone(), low], 1, 1).unwrap();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let lut = builder
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    ExpLayout { stride_log2: 0, width_log2: 1 },
+                    2,
+                    vec![0, 1],
+                    crate::program::LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash(rand::random()),
+            execution_nonce: rand::random(),
+        };
+        let mut lowerer = EncodingLowering {
+            parameters: &parameters,
+            workload: Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap()),
+            program: program.clone(),
+            preprocess: production.clone(),
+            encryption: production,
+            catalog: ArtifactCatalog::default(),
+            current_site: None,
+        };
+        let source_ring = parameters.ring(0).unwrap();
+        let payload =
+            RnsBggPayloadSecret { row: (source_ring.identity(1), source_ring.identity(1)) };
+        let mask = RnsBggMaskSecret { row: (source_ring.zero((1, 1)), source_ring.identity(1)) };
+        let columns = parameters.component_columns(1).unwrap();
+        assert_ne!(columns, parameters.component_columns(0).unwrap());
+        let zero = source_ring.zero((1, columns));
+        let key =
+            RnsBggPublicKey::new(output, ((zero.clone(), zero.clone()), (zero.clone(), zero)));
+        let target_gadget = parameters
+            .state_gadget(1)
+            .unwrap()
+            .centered_extend(BigInt::from(high.modulus().as_ref().clone()));
+        let scale = parameters.scale(0).unwrap() * parameters.scale(1).unwrap();
+        let raw_signal = target_gadget * parameters.scalar(0, scale).unwrap();
+        let mut backend = cpu_backend(parameters.levels().iter().cloned());
+        let mut store = MemoryArtifactStore::default();
+        for bit in [0usize, 1] {
+            let row = -raw_signal.clone() * source_ring.polynomial([IntExpr::constant(bit)]);
+            let raw = RnsBggEncoding::new(key.clone(), (row.clone(), row), None);
+            let finalized = lowerer.finish_outputs(vec![raw]).unwrap().pop().unwrap();
+            let graph = DslContext::new("coefficient-finalization-verification")
+                .output("output-0", finalized)
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut result = execute_graph(
+                StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+                &ParamEnv::default(),
+                &mut backend,
+                &mut store,
+                ExecutionConfig::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            verify_output(
+                &program,
+                &mut result,
+                0,
+                &DCRTPoly::from_usize_to_constant(&middle, bit),
+                &parameters,
+                &payload,
+                &mask,
+                &mut backend,
+                &mut store,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            assert!(
+                verify_output(
+                    &program,
+                    &mut result,
+                    0,
+                    &DCRTPoly::from_usize_to_constant(&middle, 1 - bit),
+                    &parameters,
+                    &payload,
+                    &mask,
+                    &mut backend,
+                    &mut store,
+                    ExecutionConfig::default(),
+                )
+                .is_err(),
+                "wrong coefficient plaintext must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn public_payload_verification_rejects_corruption() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone()], 1, 1).unwrap();
+        let mut builder = ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let program = Arc::new(builder.finish(vec![Operand::Scalar(input)]).unwrap());
+        let ring = parameters.ring(0).unwrap();
+        let columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let zero = ring.zero((1, columns));
+        let key = RnsBggPublicKey::new(
+            input,
+            ((zero.clone(), zero.clone()), (zero.clone(), zero.clone())),
+        );
+        let expected_poly = DCRTPoly::from_usize_to_constant(&level, 1);
+        let expected = polynomial_input(&ring, &expected_poly);
+        let mask = RnsBggMaskSecret { row: (ring.zero((1, 1)), ring.identity(1)) };
+        let delta = parameters.scalar(0, parameters.scale(0).unwrap().clone()).unwrap();
+        let deterministic =
+            mask.row.1.clone() * expected.clone() * parameters.public_gadget(0).unwrap() * delta;
+        let row = (ring.zero((1, columns)), -deterministic);
+        let payload = RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)) };
+
+        for (name, public_payload, expected_result) in [
+            ("public-payload-valid", expected.clone(), Ok(())),
+            ("public-payload-corrupt", expected + ring.identity(1), Err(())),
+        ] {
+            let graph = DslContext::new(name)
+                .output(
+                    "output-0",
+                    RnsBggEncoding::new(key.clone(), row.clone(), Some(public_payload)),
+                )
+                .unwrap()
+                .build()
+                .unwrap();
+            let mut backend = cpu_backend([level.clone()]);
+            let mut store = MemoryArtifactStore::default();
+            let mut result = execute_graph(
+                StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+                &ParamEnv::default(),
+                &mut backend,
+                &mut store,
+                ExecutionConfig::default(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let verified = verify_output(
+                &program,
+                &mut result,
+                0,
+                &expected_poly,
+                &parameters,
+                &payload,
+                &mask,
+                &mut backend,
+                &mut store,
+                ExecutionConfig::default(),
+            )
+            .map(|_| ());
+            assert_eq!(verified.is_ok(), expected_result.is_ok(), "{name}");
+        }
+    }
+
+    #[test]
+    fn encryption_lut_helper_produces_one_compact_member() {
         let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let parameters = RnsBggParameters::new(vec![level], 1, 1).unwrap();
         let ring = parameters.ring(0).unwrap();
         let one = ring.polynomial([IntExpr::constant(BigInt::from(1u8))]);
-        let public_data =
-            Family::pack(vec![(((one.clone(), one.clone()), (one.clone(), one.clone())))]).unwrap();
+        let public_data = ((one.clone(), one.clone()), (one.clone(), one.clone()));
         let builder = RnsEncryptBuild::<mxx_runtime::backend::poly::CpuDcrtBackend>::new(
             &parameters,
             [0; 32],
         );
         let mask = builder.sample_mask_secret().unwrap();
-        let helper = builder.encrypt_lut_helper(&mask, &public_data, 0).unwrap();
-        assert_eq!(helper.count(), &IntExpr::constant(1));
+        let helper = builder.encrypt_lut_helper(&mask, public_data, 0, 1).unwrap();
+        assert_eq!(helper.0.matrix_type().columns, IntExpr::constant(1));
+    }
+
+    #[test]
+    fn encryption_rejects_a_projection_with_missing_public_matrix() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let mut program = crate::program::ExponentLutProgramBuilder::new();
+        program.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        program
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![0, 1],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let projection = program.finish(vec![Operand::Scalar(crate::program::WireId(0))]).unwrap();
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([17; 32]),
+            execution_nonce: [19; 32],
+        };
+        let catalog = ArtifactCatalog::from_manifest(mxx_ir_core::artifact::Manifest {
+            ir_version: mxx_ir_core::encoding::IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::new(),
+        })
+        .unwrap();
+        let error = validate_lut_public_artifacts(
+            &catalog,
+            &production,
+            &parameters,
+            &projection.encryption_inputs(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, ApiError::Compatibility { .. }));
+    }
+
+    #[test]
+    fn encryption_projection_identity_is_sensitive_to_lut_semantics() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let layout = ExpLayout { stride_log2: 0, width_log2: 1 };
+        let mut first = crate::program::ExponentLutProgramBuilder::new();
+        let input = first.input(AttributeKnowledge::PrivatePayload).unwrap();
+        first
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![0, 1],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let first = first.finish(vec![Operand::Scalar(input)]).unwrap();
+        let mut second = crate::program::ExponentLutProgramBuilder::new();
+        let input = second.input(AttributeKnowledge::PrivatePayload).unwrap();
+        second
+            .register_lut(
+                LutTable::unary(
+                    2,
+                    layout,
+                    2,
+                    vec![1, 0],
+                    crate::program::LutOutputRepresentation::Exponent(layout),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let second = second.finish(vec![Operand::Scalar(input)]).unwrap();
+        let env = mxx_ir_core::ParamEnv::default();
+        assert_ne!(
+            encryption_projection_identity(&first.encryption_inputs(), &env, &parameters).unwrap(),
+            encryption_projection_identity(&second.encryption_inputs(), &env, &parameters).unwrap()
+        );
     }
 
     #[test]
@@ -2959,6 +4153,7 @@ mod test {
         let constant = EncodingLowering::lut_coefficient(
             &parameters,
             0,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
             crate::program::LutOutputRepresentation::Coefficient,
             IntExpr::constant(1),
             &[0, 0],
@@ -2967,6 +4162,7 @@ mod test {
         let identity = EncodingLowering::lut_coefficient(
             &parameters,
             0,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
             crate::program::LutOutputRepresentation::Coefficient,
             IntExpr::constant(1),
             &[0, 1],
@@ -2976,6 +4172,7 @@ mod test {
         let declared_layout = EncodingLowering::lut_coefficient(
             &parameters,
             0,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
             crate::program::LutOutputRepresentation::Exponent(ExpLayout {
                 stride_log2: 1,
                 width_log2: 1,
@@ -2993,7 +4190,14 @@ mod test {
             values: Vec<usize>,
             representation: crate::program::LutOutputRepresentation,
         ) -> RnsBggEncoding {
-            let table = LutTable::unary(2, 2, values, representation).unwrap();
+            let table = LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 1 },
+                2,
+                values,
+                representation,
+            )
+            .unwrap();
             let mut builder = crate::program::ExponentLutProgramBuilder::new();
             let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
             let lut = builder.register_lut(table.clone()).unwrap();
@@ -3023,7 +4227,11 @@ mod test {
             let ring = parameters.ring(0).unwrap();
             let columns = parameters.component_columns(0).unwrap();
             let value = ring.input("lut-lowering-input", (1, columns));
-            let input = RnsBggEncoding::new(input, (value.clone(), value), None);
+            let key = RnsBggPublicKey::new(
+                input,
+                ((value.clone(), value.clone()), (value.clone(), value.clone())),
+            );
+            let input = RnsBggEncoding::new(key, (value.clone(), value), None);
             <EncodingLowering<'_> as ExponentLUTProgramLowering>::lut(&mut lowerer, &input, &table)
                 .unwrap()
         }
@@ -3039,111 +4247,6 @@ mod test {
             }),
         );
         assert_ne!(identity.flatten(), exponent.flatten());
-    }
-
-    #[test]
-    fn lut_artifacts_use_next_level_columns_and_scoped_flattening() {
-        let mut builder = crate::program::ExponentLutProgramBuilder::new();
-        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
-        let table = LutTable::unary(
-            2,
-            2,
-            vec![0, 1],
-            crate::program::LutOutputRepresentation::Exponent(ExpLayout {
-                stride_log2: 0,
-                width_log2: 1,
-            }),
-        )
-        .unwrap();
-        let lut = builder.register_lut(table).unwrap();
-        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
-        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
-        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
-        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
-        let production = ProductionId {
-            spec_hash: mxx_ir_core::artifact::SpecHash([11; 32]),
-            execution_nonce: [13; 32],
-        };
-        let lowerer = EncodingLowering {
-            parameters: &parameters,
-            program,
-            workload,
-            preprocess: production.clone(),
-            encryption: production,
-            catalog: ArtifactCatalog::default(),
-            current_site: Some(LoweringSite {
-                output,
-                indices: vec![IntExpr::constant(3)],
-                ranges: vec![
-                    crate::program::FamilyRange::bounded(
-                        IntExpr::constant(2),
-                        IntExpr::constant(4),
-                        IntExpr::constant(8),
-                    )
-                    .unwrap(),
-                ],
-            }),
-        };
-
-        let branch_count = IntExpr::constant(2);
-        let actions = lowerer.lut_actions(branch_count.clone(), 0).unwrap();
-        assert_eq!(actions.count(), &branch_count);
-        let action = actions.at(Int::constant(0));
-        assert_eq!(
-            action.0.0.0.matrix_type().columns,
-            IntExpr::constant(parameters.component_columns(1).unwrap())
-        );
-        assert_eq!(
-            action.0.0.0.matrix_type().modulus,
-            IntExpr::constant(parameters.level(0).unwrap().modulus().as_ref().clone())
-        );
-
-        let unscoped = EncodingLowering {
-            parameters: lowerer.parameters,
-            program: lowerer.program.clone(),
-            workload: lowerer.workload.clone(),
-            preprocess: lowerer.preprocess.clone(),
-            encryption: lowerer.encryption.clone(),
-            catalog: ArtifactCatalog::default(),
-            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
-        };
-        let unscoped_action =
-            unscoped.lut_actions(IntExpr::constant(2), 0).unwrap().at(Int::constant(0));
-        assert_ne!(action.flatten(), unscoped_action.flatten());
-        let scoped = lowerer.site().unwrap().family_scope().unwrap();
-        let scoped_name = lut_helper_artifact_name(input, &scoped);
-        let root_name =
-            lut_helper_artifact_name(input, &FamilyScope::new(Vec::new(), Vec::new()).unwrap());
-        let alternate_scope = FamilyScope::new(
-            vec![
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(3),
-                    IntExpr::constant(4),
-                    IntExpr::constant(8),
-                )
-                .unwrap(),
-            ],
-            vec![IntExpr::constant(4)],
-        )
-        .unwrap();
-        let alternate_name = lut_helper_artifact_name(input, &alternate_scope);
-        assert_ne!(scoped_name, root_name);
-        assert_ne!(scoped_name, alternate_name);
-        assert!(scoped_name.contains("scope/start=Const(2),count=Const(4)"));
-
-        let helper = lowerer.lut_helper(branch_count, input).unwrap();
-        assert_eq!(helper.count(), &IntExpr::constant(2));
-        assert_eq!(
-            helper.at(Int::constant(3)).0.matrix_type().columns,
-            parameters.component_columns(0).unwrap().into()
-        );
-        let unscoped_helper = unscoped.lut_helper(IntExpr::constant(2), input).unwrap();
-        assert_ne!(
-            helper.at(Int::constant(0)).flatten(),
-            unscoped_helper.at(Int::constant(0)).flatten()
-        );
     }
 
     #[test]
@@ -3182,15 +4285,31 @@ mod test {
                 ranges: Vec::new(),
             }),
         };
+        let compact_ring = parameters.ring(1).unwrap();
+        let compact_type = compact_ring.matrix_type((1, compact_columns));
+        let scalar_compact = scalar_lowerer
+            .rhs_compact_matrix_at(&RhsRef { id: scalar_rhs, index: None::<Int> }, 0)
+            .unwrap();
+        for entry in
+            [&scalar_compact.0.0, &scalar_compact.0.1, &scalar_compact.1.0, &scalar_compact.1.1]
+        {
+            assert_eq!(entry.matrix_type(), &compact_type);
+        }
         let scalar_action = scalar_lowerer
-            .rhs_decomposition(&RhsRef { id: scalar_rhs, index: None::<Int> })
+            .rhs_decomposition_at(&RhsRef { id: scalar_rhs, index: None::<Int> }, 0)
             .unwrap();
         let source_ring = parameters.ring(0).unwrap();
-        assert_eq!(scalar_action.0.0.matrix_type(), &source_ring.matrix_type((1, compact_columns)));
-        assert_eq!(
-            scalar_action.0.0.max_coefficient_bound(),
-            &IntExpr::constant(BigInt::from(1u8) << parameters.level(1).unwrap().base_bits())
-        );
+        let decomposed_type = source_ring
+            .matrix_type((parameters.level(1).unwrap().modulus_digits(), compact_columns));
+        let decomposed_bound = IntExpr::RoundDiv(
+            Box::new(IntExpr::constant(
+                BigInt::from(1u8) << parameters.level(1).unwrap().base_bits(),
+            )),
+            Box::new(IntExpr::constant(BigInt::from(2u8))),
+        )
+        .canonicalize();
+        assert_eq!(scalar_action.0.0.matrix_type(), &decomposed_type);
+        assert_eq!(scalar_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let scalar_name = format!("rhs/{scalar_rhs:?}");
         let scalar_graph = DslContext::new("rhs-scalar-consumer-schema")
             .artifact_output(scalar_name.clone(), scalar_action)
@@ -3225,7 +4344,7 @@ mod test {
             program: family_program,
             workload: family_workload,
             preprocess: production.clone(),
-            encryption: production,
+            encryption: production.clone(),
             catalog: ArtifactCatalog::default(),
             current_site: Some(LoweringSite {
                 output: family_output,
@@ -3233,18 +4352,23 @@ mod test {
                 ranges: vec![crate::program::FamilyRange::full(IntExpr::constant(2)).unwrap()],
             }),
         };
-        let family_action = family_lowerer
-            .rhs_decomposition(&RhsRef { id: family_rhs, index: Some(Int::constant(1)) })
+        let family_compact = family_lowerer
+            .rhs_compact_matrix_at(&RhsRef { id: family_rhs, index: Some(Int::constant(1)) }, 0)
             .unwrap();
-        assert_eq!(family_action.0.0.matrix_type(), &source_ring.matrix_type((1, compact_columns)));
-        assert_eq!(
-            family_action.0.0.max_coefficient_bound(),
-            &IntExpr::constant(BigInt::from(1u8) << parameters.level(1).unwrap().base_bits())
-        );
+        for entry in
+            [&family_compact.0.0, &family_compact.0.1, &family_compact.1.0, &family_compact.1.1]
+        {
+            assert_eq!(entry.matrix_type(), &compact_type);
+        }
+        let family_action = family_lowerer
+            .rhs_decomposition_at(&RhsRef { id: family_rhs, index: Some(Int::constant(1)) }, 0)
+            .unwrap();
+        assert_eq!(family_action.0.0.matrix_type(), &decomposed_type);
+        assert_eq!(family_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let family_name = format!("rhs/{family_rhs:?}/family");
         let family_members = mxx_dsl::parallel(IntExpr::constant(2), |index| {
             let member = family_lowerer
-                .rhs_decomposition(&RhsRef { id: family_rhs, index: Some(index) })
+                .rhs_decomposition_at(&RhsRef { id: family_rhs, index: Some(index) }, 0)
                 .map_err(|_| DslError::Schema)?;
             Ok(member)
         })
@@ -3258,7 +4382,7 @@ mod test {
     }
 
     #[test]
-    fn mul_public_uses_only_second_payload_and_rejects_public_first_operand() {
+    fn mul_public_uses_only_second_payload_and_propagates_public_product() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let private_wire = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
         let public_wire = builder.input(AttributeKnowledge::PublicPayload).unwrap();
@@ -3278,20 +4402,35 @@ mod test {
             program,
             workload,
             preprocess: production.clone(),
-            encryption: production,
+            encryption: production.clone(),
             catalog: ArtifactCatalog::default(),
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
-        let columns = parameters.component_columns(0).unwrap();
-        let private_row = ring.input("mul-public-private-row", (1, columns));
-        let public_row = ring.input("mul-public-public-row", (1, columns));
+        let private_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PrivatePayload).unwrap();
+        let public_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let private_row = ring.input("mul-public-private-row", (1, private_columns));
+        let public_row = ring.input("mul-public-public-row", (1, public_columns));
         let public_payload = ring.input("mul-public-payload", (1, 1));
-        let private = RnsBggEncoding::new(private_wire, (private_row.clone(), private_row), None);
-        let public = RnsBggEncoding::new(
+        let private_key = RnsBggPublicKey::new(
+            private_wire,
+            (
+                (private_row.clone(), private_row.clone()),
+                (private_row.clone(), private_row.clone()),
+            ),
+        );
+        let public_key = RnsBggPublicKey::new(
             public_wire,
-            (public_row.clone(), public_row),
-            Some(public_payload),
+            ((public_row.clone(), public_row.clone()), (public_row.clone(), public_row.clone())),
+        );
+        let private =
+            RnsBggEncoding::new(private_key, (private_row.clone(), private_row.clone()), None);
+        let public = RnsBggEncoding::new(
+            public_key.clone(),
+            (public_row.clone(), public_row.clone()),
+            Some(public_payload.clone()),
         );
         let result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
             &mut lowerer,
@@ -3301,7 +4440,7 @@ mod test {
         .unwrap();
         assert!(result.public_payload.is_none());
         let public_with_other_payload = RnsBggEncoding::new(
-            public_wire,
+            public_key.clone(),
             (public.row.0.clone(), public.row.1.clone()),
             Some(ring.input("mul-public-other-payload", (1, 1))),
         );
@@ -3313,16 +4452,289 @@ mod test {
         .unwrap();
         assert_ne!(result.row.flatten(), other_result.row.flatten());
 
-        let public_as_first =
-            RnsBggEncoding::new(public_wire, (private.row.0.clone(), private.row.1.clone()), None);
-        assert!(matches!(
-            <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
-                &mut lowerer,
-                &public_as_first,
-                &public,
+        let mut public_builder = crate::program::ExponentLutProgramBuilder::new();
+        let public_lhs_wire = public_builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let public_rhs_wire = public_builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let public_output = public_builder
+            .mul_public(Operand::Scalar(public_lhs_wire), Operand::Scalar(public_rhs_wire))
+            .unwrap();
+        let public_program =
+            Arc::new(public_builder.finish(vec![Operand::Scalar(public_output)]).unwrap());
+        let public_workload =
+            Arc::new(RnsBggDerivedWorkload::from_program(&public_program).unwrap());
+        let mut public_lowerer = EncodingLowering {
+            parameters: &parameters,
+            program: public_program,
+            workload: public_workload,
+            preprocess: production.clone(),
+            encryption: production,
+            catalog: ArtifactCatalog::default(),
+            current_site: Some(LoweringSite {
+                output: public_output,
+                indices: Vec::new(),
+                ranges: Vec::new(),
+            }),
+        };
+        let lhs_payload = ring.input("mul-public-lhs-payload", (1, 1));
+        let rhs_payload = public_payload.clone();
+        let public_lhs = RnsBggEncoding::new(
+            RnsBggPublicKey::new(
+                public_lhs_wire,
+                (
+                    (public_row.clone(), public_row.clone()),
+                    (public_row.clone(), public_row.clone()),
+                ),
             ),
-            Err(RnsBggError::Binding("MulPublic first operand must be private"))
+            (public_row.clone(), public_row.clone()),
+            Some(lhs_payload.clone()),
+        );
+        let public_rhs = RnsBggEncoding::new(
+            RnsBggPublicKey::new(
+                public_rhs_wire,
+                (
+                    (public_row.clone(), public_row.clone()),
+                    (public_row.clone(), public_row.clone()),
+                ),
+            ),
+            (public_row.clone(), public_row),
+            Some(rhs_payload.clone()),
+        );
+        let public_result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut public_lowerer,
+            &public_lhs,
+            &public_rhs,
+        )
+        .unwrap();
+        let output_payload = public_result.public_payload.expect("public product payload");
+        assert_eq!(output_payload.matrix_type(), &ring.matrix_type((1, 1)));
+    }
+
+    #[test]
+    fn mul_public_aligns_public_carrier_before_private_same_level_action() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let private_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let private_level_one =
+            builder.mul_private(Operand::Scalar(private_input), Operand::Scalar(rhs)).unwrap();
+        let public_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let output = builder
+            .mul_public(Operand::Scalar(private_level_one), Operand::Scalar(public_input))
+            .unwrap();
+        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([41; 32]),
+            execution_nonce: [43; 32],
+        };
+        let mut lowerer = EncodingLowering {
+            parameters: &parameters,
+            program,
+            workload,
+            preprocess: production.clone(),
+            encryption: production,
+            catalog: ArtifactCatalog::default(),
+            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
+        };
+        let low_ring = parameters.ring(1).unwrap();
+        let high_ring = parameters.ring(0).unwrap();
+        let private_columns =
+            parameters.key_component_columns(1, AttributeKnowledge::PrivatePayload).unwrap();
+        let public_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let private_entry = low_ring.input("mul-public-private-level-one", (1, private_columns));
+        let public_entry = high_ring.input("mul-public-public-level-zero", (1, public_columns));
+        let private_key = RnsBggPublicKey::new(
+            private_level_one,
+            (
+                (private_entry.clone(), private_entry.clone()),
+                (private_entry.clone(), private_entry.clone()),
+            ),
+        );
+        let public_key = RnsBggPublicKey::new(
+            public_input,
+            (
+                (public_entry.clone(), public_entry.clone()),
+                (public_entry.clone(), public_entry.clone()),
+            ),
+        );
+        let private =
+            RnsBggEncoding::new(private_key, (private_entry.clone(), private_entry.clone()), None);
+        let public_payload = high_ring.input("mul-public-level-zero-payload", (1, 1));
+        let public = RnsBggEncoding::new(
+            public_key,
+            (public_entry.clone(), public_entry),
+            Some(public_payload),
+        );
+        let result = <EncodingLowering<'_> as ExponentLUTProgramLowering>::mul_public(
+            &mut lowerer,
+            &private,
+            &public,
+        )
+        .unwrap();
+        let expected = low_ring.matrix_type((1, private_columns));
+        assert_eq!(result.row.0.matrix_type(), &expected);
+        assert_eq!(result.row.1.matrix_type(), &expected);
+        for entry in [
+            &result.public_key.matrix.0.0,
+            &result.public_key.matrix.0.1,
+            &result.public_key.matrix.1.0,
+            &result.public_key.matrix.1.1,
+        ] {
+            assert_eq!(entry.matrix_type(), &expected);
+        }
+        assert!(result.public_payload.is_none());
+    }
+
+    #[test]
+    fn coefficient_finish_outputs_finalizes_the_paired_key_and_row_once() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let table = LutTable::unary(
+            2,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
+            2,
+            vec![0, 1],
+            crate::program::LutOutputRepresentation::Coefficient,
+        )
+        .unwrap();
+        let lut = builder.register_lut(table).unwrap();
+        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([47; 32]),
+            execution_nonce: [53; 32],
+        };
+        let mut lowerer = EncodingLowering {
+            parameters: &parameters,
+            program,
+            workload,
+            preprocess: production.clone(),
+            encryption: production,
+            catalog: ArtifactCatalog::default(),
+            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
+        };
+        assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());
+        let source_ring = parameters.ring(0).unwrap();
+        let columns = parameters.component_columns(0).unwrap();
+        let value = source_ring.input("coefficient-finish", (1, columns));
+        let key = RnsBggPublicKey::new(
+            output,
+            ((value.clone(), value.clone()), (value.clone(), value.clone())),
+        );
+        let encoding = RnsBggEncoding::new(key, (value.clone(), value), None);
+        let finalized = lowerer.finish_outputs(vec![encoding]).unwrap().pop().unwrap();
+        let target_modulus = IntExpr::constant(BigInt::from(
+            parameters.level(1).unwrap().modulus().as_ref().clone(),
         ));
+        assert_eq!(finalized.row.0.matrix_type().modulus, target_modulus);
+        assert_eq!(finalized.row.1.matrix_type().modulus, target_modulus);
+        for entry in [
+            &finalized.public_key.matrix.0.0,
+            &finalized.public_key.matrix.0.1,
+            &finalized.public_key.matrix.1.0,
+            &finalized.public_key.matrix.1.1,
+        ] {
+            assert_eq!(entry.matrix_type().modulus, target_modulus);
+        }
+    }
+
+    #[test]
+    fn public_lut_payload_is_evaluated_and_finalized_at_target_modulus() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let table = LutTable::unary(
+            2,
+            ExpLayout { stride_log2: 0, width_log2: 1 },
+            2,
+            vec![0, 1],
+            crate::program::LutOutputRepresentation::Coefficient,
+        )
+        .unwrap();
+        let lut = builder.register_lut(table.clone()).unwrap();
+        let output = builder.lut(Operand::Scalar(input), lut).unwrap();
+        let program = Arc::new(builder.finish(vec![Operand::Scalar(output)]).unwrap());
+        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
+        let production = ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([59; 32]),
+            execution_nonce: [61; 32],
+        };
+        let mut lowerer = EncodingLowering {
+            parameters: &parameters,
+            program,
+            workload,
+            preprocess: production.clone(),
+            encryption: production,
+            catalog: ArtifactCatalog::default(),
+            current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
+        };
+        let ring = parameters.ring(0).unwrap();
+        let key_columns =
+            parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap();
+        let row_columns = parameters.component_columns(0).unwrap();
+        let key_value = ring.input("public-lut-key", (1, key_columns));
+        let row_value = ring.input("public-lut-row", (1, row_columns));
+        let input = RnsBggEncoding::new(
+            RnsBggPublicKey::new(
+                input,
+                ((key_value.clone(), key_value.clone()), (key_value.clone(), key_value)),
+            ),
+            (row_value.clone(), row_value),
+            Some(ring.identity(1)),
+        );
+        let result =
+            <EncodingLowering<'_> as ExponentLUTProgramLowering>::lut(&mut lowerer, &input, &table)
+                .unwrap();
+        assert!(result.public_payload.is_some());
+        assert_eq!(
+            result.public_payload.as_ref().unwrap().matrix_type().modulus,
+            IntExpr::constant(BigInt::from(
+                parameters.level(0).unwrap().modulus().as_ref().clone()
+            ))
+        );
+        let finalized = lowerer.finish_outputs(vec![result]).unwrap().pop().unwrap();
+        assert_eq!(
+            finalized.public_payload.as_ref().unwrap().matrix_type().modulus,
+            IntExpr::constant(BigInt::from(
+                parameters.level(1).unwrap().modulus().as_ref().clone()
+            ))
+        );
+    }
+
+    #[test]
+    fn verification_residual_uses_the_paired_public_key() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level], 1, 1).unwrap();
+        let ring = parameters.ring(0).unwrap();
+        let a = ring.input("verification-paired-key-a", (1, 1));
+        let b = ring.input("verification-paired-key-b", (1, 1));
+        let key_a =
+            RnsBggPublicKey::new(WireId(0), ((a.clone(), a.clone()), (a.clone(), a.clone())));
+        let key_b =
+            RnsBggPublicKey::new(WireId(0), ((b.clone(), b.clone()), (b.clone(), b.clone())));
+        let row = (
+            ring.input("verification-paired-row-0", (1, 1)),
+            ring.input("verification-paired-row-1", (1, 1)),
+        );
+        let payload = RnsBggPayloadSecret { row: (ring.identity(1), ring.identity(1)) };
+        let mask = RnsBggMaskSecret { row: (ring.identity(1), ring.identity(1)) };
+        let expected = ring.polynomial([IntExpr::constant(BigInt::from(1u8))]);
+        let residual_a = RnsBggEncoding::new(key_a, row.clone(), None)
+            .verification_residual(&parameters, 0, &payload, &mask, expected.clone())
+            .unwrap();
+        let residual_b = RnsBggEncoding::new(key_b, row, None)
+            .verification_residual(&parameters, 0, &payload, &mask, expected)
+            .unwrap();
+        assert_ne!(residual_a.flatten(), residual_b.flatten());
     }
 
     #[test]

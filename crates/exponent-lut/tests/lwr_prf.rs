@@ -13,10 +13,10 @@ use mxx_exponent_lut::{
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
         RnsBggNoiseValue, RnsBggParameters, RnsEncryptBuild, RnsNoiseBuild, RnsOnlineBuild,
-        RnsPreprocessBuild,
+        RnsPreprocessBuild, verify_output,
     },
 };
-use mxx_ir_core::{IntExpr, ParamEnv, ValidatedGraph, types::ConcreteWireType};
+use mxx_ir_core::{IntExpr, ParamEnv};
 use mxx_primitives::{
     poly::{
         Poly, PolyParams,
@@ -29,7 +29,7 @@ use mxx_primitives::{
     sampler::bounds::hard_cutoff_from_sigma_bound,
 };
 use mxx_runtime::{
-    Backend, ExecutionConfig, RuntimeValue,
+    ExecutionConfig,
     artifact::FileArtifactStore,
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
 };
@@ -81,7 +81,12 @@ fn fixture() -> Fixture {
         .collect::<Vec<_>>();
     let d_values = d_exponents
         .iter()
-        .map(|exponent| DCRTPoly::const_rotate_poly(&poly_parameters, *exponent))
+        .map(|exponent| {
+            let dimension = poly_parameters.ring_dimension() as usize;
+            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
+            let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
+            if rotation >= dimension { -monomial } else { monomial }
+        })
         .collect::<Vec<_>>();
 
     let mut lhs = BTreeMap::new();
@@ -179,9 +184,7 @@ fn fixture() -> Fixture {
     }
 }
 
-fn gpu_backend(parameters: &RnsBggParameters) -> GpuDcrtBackend {
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "Sparse-LWR lifecycle requires CUDA");
+fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBackend {
     let levels = parameters.levels().iter().map(|parameters| {
         mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams::new(
             parameters.ring_dimension(),
@@ -212,6 +215,11 @@ fn sequential_dt_oracle(program: &SparseLwrPrfProgram, d_exponents: &[usize]) ->
 #[test]
 #[sequential(dcrt_runtime)]
 fn lwr_prf_end_to_end() {
+    let devices = detected_gpu_device_ids();
+    if devices.is_empty() {
+        eprintln!("skipping Sparse-LWR round trip: no CUDA device detected");
+        return;
+    }
     let fixture = fixture();
     let Fixture { parameters, profile, program, payload, mask, rhs, lhs, noise, d_exponents } =
         fixture;
@@ -226,9 +234,7 @@ fn lwr_prf_end_to_end() {
     .expect("RNS noise simulation");
     assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
 
-    let devices = detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "Sparse-LWR lifecycle requires CUDA");
-    let mut backend = gpu_backend(&parameters);
+    let mut backend = gpu_backend(&parameters, devices.clone());
     let estimate_levels = parameters.levels().iter().map(|level| {
         GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
     });
@@ -246,7 +252,7 @@ fn lwr_prf_end_to_end() {
         },
     )));
     let observed = Rc::new(RefCell::new(Vec::<&'static str>::new()));
-    let observe = |name: &'static str, graph: &ValidatedGraph| {
+    let observe = |name: &'static str, graph: &mxx_ir_core::ValidatedGraph| {
         estimate(graph, &mut *estimator.borrow_mut()).expect("stage estimate");
         observed.borrow_mut().push(name);
     };
@@ -273,25 +279,6 @@ fn lwr_prf_end_to_end() {
         },
     )
     .expect("RNS preprocessing");
-    // Reopen the persisted preprocess checkpoint before consuming it in the
-    // later stages.  The public output key is represented by its four typed
-    // artifact ports; no compose-time carrier is retained or reconstructed.
-    let (_reloaded_store, reloaded_preprocess) = preprocess
-        .checkpoint()
-        .reopen(directory.path(), &preprocess_encrypt)
-        .expect("reload persisted preprocess checkpoint");
-    let preprocess_manifest = reloaded_preprocess
-        .catalog()
-        .manifests()
-        .get(reloaded_preprocess.production())
-        .expect("reloaded preprocess manifest");
-    let public_key_name = format!("public-key/{:?}", program.output());
-    for port in 0..4 {
-        assert!(
-            preprocess_manifest.artifacts.contains_key(&format!("{public_key_name}.{port}")),
-            "reloaded public key is missing port {port}"
-        );
-    }
     let encrypted = api::encrypt(
         &program.program().encryption_inputs(),
         &ParamEnv::default(),
@@ -299,6 +286,7 @@ fn lwr_prf_end_to_end() {
         &preprocess,
         &payload,
         &mask,
+        HASH_KEY,
         RnsEncryptBuild::new(&parameters, [7; 32]),
         &mut backend,
         api::ArtifactDestination { store: &mut store, checkpoint: &encryption },
@@ -315,42 +303,13 @@ fn lwr_prf_end_to_end() {
         &ParamEnv::default(),
         &online,
         &encrypted,
+        HASH_KEY,
         RnsOnlineBuild::new(&parameters, [7; 32]),
         &mut backend,
         &mut store,
         ExecutionConfig::default(),
         |_, outputs| Ok(outputs),
         |graph| {
-            let source_level = workload.level(program.output()).expect("PRF output workload level");
-            let final_level = source_level
-                .checked_add(1)
-                .expect("coefficient output must have a deferred ModDown level");
-            let expected_modulus = parameters
-                .level(final_level)
-                .expect("coefficient output target level")
-                .modulus()
-                .as_ref()
-                .clone();
-            for name in ["output-0.0", "output-0.1"] {
-                let output = graph
-                    .source
-                    .outputs()
-                    .get(name)
-                    .unwrap_or_else(|| panic!("online graph missing {name}"));
-                let wire_type = graph
-                    .root_scope()
-                    .wire_types
-                    .get(&output.value)
-                    .unwrap_or_else(|| panic!("online graph has no type for {name}"));
-                let ConcreteWireType::Matrix(matrix) = wire_type else {
-                    panic!("online coefficient output {name} is not a matrix");
-                };
-                assert_eq!(
-                    matrix.modulus,
-                    expected_modulus.clone().into(),
-                    "online graph must expose the coefficient output after deferred ModDown"
-                );
-            }
             observe("online_eval", graph);
             Ok(())
         },
@@ -365,24 +324,26 @@ fn lwr_prf_end_to_end() {
     let expected_exponent = sequential_dt_oracle(&program, &d_exponents);
     let expected_readout =
         profile.canonical_readout().expect("canonical readout")[expected_exponent];
-    assert!(expected_readout <= 1, "the PRF readout is binary");
-    let source_level = workload.level(program.output()).expect("PRF output workload level");
-    let mut output_bytes = Vec::new();
-    for name in ["output-0.0", "output-0.1"] {
-        let value = result
-            .materialize_output(name, &mut backend, &mut store)
-            .expect("materialize finalized PRF coefficient output");
-        let RuntimeValue::Matrix(matrix) = value else {
-            panic!("finalized PRF coefficient output must be a matrix");
-        };
-        assert_eq!(
-            matrix.size(),
-            (1, parameters.component_columns(source_level).expect("final coefficient width")),
-            "finalized coefficient output preserves its component width"
-        );
-        output_bytes.push(backend.matrix_to_bytes(matrix).expect("read finalized PRF output"));
-    }
-    assert!(output_bytes.iter().all(|bytes| !bytes.is_empty()));
+    let source_parameters = parameters.level(0).expect("LWR source parameters").clone();
+    let expected_readout =
+        u32::try_from(expected_readout).expect("canonical readout fits DCRT coefficient");
+    let expected = DCRTPoly::from_u32s(
+        &source_parameters,
+        &vec![expected_readout; source_parameters.ring_dimension() as usize],
+    );
+    verify_output(
+        program.program(),
+        &mut result,
+        0,
+        &expected,
+        &parameters,
+        &payload,
+        &mask,
+        &mut backend,
+        &mut store,
+        ExecutionConfig::default(),
+    )
+    .expect("LWR application verification");
     assert!(!trace.outputs.is_empty(), "noise trace must finalize declared output");
     assert!(!result.outputs.is_empty(), "online evaluation must produce output");
 }

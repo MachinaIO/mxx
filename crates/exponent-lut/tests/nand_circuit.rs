@@ -6,30 +6,27 @@ use bigdecimal::BigDecimal;
 use mxx_bench_estimator::{
     estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
 };
-use mxx_dsl::DslContext;
 use mxx_exponent_lut::{
     ExpLayout, NandCircuit, api,
-    program::{AttributeKnowledge, InputBinding, Operand, RhsId},
+    program::{InputBinding, RhsId},
     rns_bgg::{
-        RnsBggDerivedWorkload, RnsBggEncoding, RnsBggNoiseBindings, RnsBggNoiseRhs,
-        RnsBggNoiseValue, RnsBggParameters, RnsBggPayloadSecret, RnsBggPublicKey, RnsEncryptBuild,
-        RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild,
+        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseRhs, RnsBggNoiseValue,
+        RnsBggParameters, RnsBggPayloadSecret, RnsEncryptBuild, RnsNoiseBuild, RnsOnlineBuild,
+        RnsPreprocessBuild, verify_output,
     },
 };
 use mxx_ir_core::ParamEnv;
 use mxx_primitives::poly::{
-    PolyParams,
-    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
+    Poly, PolyParams,
+    dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
 };
 use mxx_runtime::{
-    ArtifactKey, ArtifactStore, Backend, RuntimeValue,
     artifact::MemoryArtifactStore,
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
-    executor::decode_artifact,
 };
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
-use std::path::Path;
+use std::{env, path::Path, process::Command};
 
 const HASH_KEY: &[u8] = b"nand-rns-public-api-v1";
 
@@ -95,6 +92,50 @@ fn noise_bindings(
         .expect("NAND noise bindings match the public declarations")
 }
 
+fn lattice_security_check(parameters: &DCRTPolyParams, error_sigma: &BigDecimal) {
+    if env::var("MXX_EXPONENT_LUT_NAND_SKIP_SAGE").as_deref() == Ok("1") {
+        eprintln!("lattice_security_check=skipped");
+        return;
+    }
+
+    let required = env::var("MXX_EXPONENT_LUT_NAND_SECURITY_BITS")
+        .map(|value| {
+            value.parse::<u64>().unwrap_or_else(|_| {
+                panic!("MXX_EXPONENT_LUT_NAND_SECURITY_BITS must be an unsigned integer")
+            })
+        })
+        .unwrap_or(0);
+    let output = Command::new("lattice-estimator-cli")
+        .arg(parameters.ring_dimension().to_string())
+        .arg(parameters.modulus().to_string())
+        .arg("--s-dist")
+        .arg(r#"{"name":"Ternary"}"#)
+        .arg("--e-dist")
+        .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#))
+        .output()
+        .expect("lattice-estimator-cli is required unless MXX_EXPONENT_LUT_NAND_SKIP_SAGE=1");
+    assert!(
+        output.status.success(),
+        "lattice-estimator-cli failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bits = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("lattice-estimator-cli returned no security estimate")
+        .trim()
+        .parse::<u64>()
+        .expect("lattice-estimator-cli returned a non-integer security estimate");
+    assert!(
+        bits >= required,
+        "NAND parameters provide {bits} security bits, below the required {required}"
+    );
+    eprintln!(
+        "lattice_security_check=passed security_bits={bits} required_security_bits={required}"
+    );
+}
+
 fn checkpoint(path: &Path, name: &str) -> std::path::PathBuf {
     path.join(name)
 }
@@ -102,6 +143,11 @@ fn checkpoint(path: &Path, name: &str) -> std::path::PathBuf {
 #[test]
 #[sequential(dcrt_runtime)]
 fn nand_circuit_end_to_end() {
+    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+    if devices.is_empty() {
+        eprintln!("skipping NAND round trip: no CUDA device detected");
+        return;
+    }
     let circuit = NandCircuit::new(2, vec![[0, 1]], 2).expect("valid NAND circuit");
     let layout = ExpLayout { stride_log2: 0, width_log2: 4 };
     let compiled = circuit.compile(layout, 32, 4).expect("NAND program compiles");
@@ -110,11 +156,7 @@ fn nand_circuit_end_to_end() {
         RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32])
             .sample_payload_secret()
             .expect("payload secret");
-    let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32])
-        .sample_mask_secret()
-        .expect("mask secret");
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
-    assert!(!devices.is_empty(), "GPU required for NAND round trip");
+    lattice_security_check(&poly_parameters, parameters.encoding_error_sigma());
 
     for assignment in [[false, false], [false, true], [true, false], [true, true]] {
         let (lhs, rhs) = compiled
@@ -123,6 +165,9 @@ fn nand_circuit_end_to_end() {
                 &assignment,
             )
             .expect("NAND plaintext bindings");
+        let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, rand::random())
+            .sample_mask_secret()
+            .expect("fresh mask secret");
         let bindings = noise_bindings(&compiled, &parameters);
         let workload = RnsBggDerivedWorkload::from_program(compiled.program())
             .expect("NAND workload derivation");
@@ -190,6 +235,7 @@ fn nand_circuit_end_to_end() {
             &preprocess,
             &payload,
             &mask,
+            HASH_KEY,
             RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32]),
             &mut backend,
             api::ArtifactDestination { store: &mut store, checkpoint: &encrypted_checkpoint },
@@ -209,6 +255,7 @@ fn nand_circuit_end_to_end() {
             &ParamEnv::default(),
             &online,
             &encrypted,
+            HASH_KEY,
             RnsOnlineBuild::new(&parameters, [0x4e; 32]),
             &mut backend,
             &mut store,
@@ -224,147 +271,22 @@ fn nand_circuit_end_to_end() {
         )
         .expect("public online evaluation");
 
-        let expected_bit = usize::from(!(assignment[0] && assignment[1]));
-        let output_wire = match compiled.program().outputs().last().expect("NAND output") {
-            Operand::Scalar(wire) => *wire,
-            Operand::Member { .. } => panic!("NAND output must be scalar"),
-        };
-        let workload = RnsBggDerivedWorkload::from_program(compiled.program())
-            .expect("NAND workload derivation");
-        let output_level = workload.level(output_wire).expect("NAND output workload level");
-        let output_ring = parameters.ring(output_level).expect("NAND output ring");
-        let expected = layout
-            .mono(&output_ring, &BigInt::from(expected_bit))
-            .expect("NAND output exponent monomial");
-        assert_eq!(expected.matrix_type(), &output_ring.matrix_type((1, 1)));
-
-        let output_names = result
-            .outputs
-            .keys()
-            .filter(|name| name.starts_with("output-0."))
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(output_names.len(), 2, "online output must expose both encoded row ports");
-        let mut online_rows = Vec::new();
-        for name in output_names {
-            let value = result
-                .materialize_output(&name, &mut backend, &mut store)
-                .expect("materialize NAND evaluated encoding");
-            let RuntimeValue::Matrix(_) = value else {
-                panic!("NAND evaluated encoding output must be a matrix");
-            };
-            online_rows.push(value.clone());
-        }
-
-        let manifest = store
-            .load_manifest(preprocess.checkpoint().production())
-            .expect("load persisted preprocess manifest");
-        let public_prefix = format!("public-key/{output_wire:?}");
-        let mut public_ports = Vec::new();
-        for port in 0..4 {
-            let name = format!("{public_prefix}.{port}");
-            let descriptor =
-                manifest.artifacts.get(&name).expect("persisted public-key port").clone();
-            let payload = store
-                .load(
-                    &ArtifactKey {
-                        production: preprocess.checkpoint().production().clone(),
-                        name,
-                        index: None,
-                    },
-                    &descriptor,
-                )
-                .expect("load persisted public-key port");
-            let value = decode_artifact(&mut backend, descriptor.artifact_type, payload)
-                .expect("materialize persisted public-key port");
-            let RuntimeValue::Matrix(_) = value else {
-                panic!("persisted public-key port must be a matrix");
-            };
-            public_ports.push(value);
-        }
-
-        assert!(matches!(
-            compiled.program().wire_knowledge(output_wire).expect("NAND output knowledge"),
-            AttributeKnowledge::PrivatePayload
-        ));
-        let columns = parameters.component_columns(output_level).unwrap();
-        let public_graph_ports = (0..4)
-            .map(|port| output_ring.input(format!("executed-public-key-{port}"), (1, columns)))
-            .collect::<Vec<_>>();
-        let public_key = RnsBggPublicKey::new(
-            output_wire,
-            (
-                (public_graph_ports[0].clone(), public_graph_ports[1].clone()),
-                (public_graph_ports[2].clone(), public_graph_ports[3].clone()),
-            ),
-        );
-        let encoding = RnsBggEncoding::new(
-            output_wire,
-            (
-                output_ring.input("executed-encoding-0", (1, columns)),
-                output_ring.input("executed-encoding-1", (1, columns)),
-            ),
-            None,
-        );
-        let residual = encoding
-            .verification_residual(
-                &parameters,
-                output_level,
-                &public_key,
-                &payload,
-                &mask,
-                expected,
-            )
-            .expect("compute NAND verification residual from executed carriers");
-        let residual_graph = DslContext::new("nand-verification-residual")
-            .artifact_output("verification-residual.0", residual.0)
-            .expect("NAND residual graph port")
-            .artifact_output("verification-residual.1", residual.1)
-            .expect("NAND residual graph port")
-            .build()
-            .expect("NAND residual graph");
-        let mut residual_runtime = std::collections::BTreeMap::new();
-        for (port, value) in public_ports.into_iter().enumerate() {
-            residual_runtime.insert(format!("executed-public-key-{port}"), value);
-        }
-        for (port, value) in online_rows.into_iter().enumerate() {
-            residual_runtime.insert(format!("executed-encoding-{port}"), value);
-        }
-        let residual_graph = api::StageGraph::new(
-            residual_graph,
-            residual_runtime,
-            online.checkpoint().catalog().clone(),
-        );
-        let mut residual_result = api::execute_graph(
-            residual_graph,
-            &ParamEnv::default(),
+        let expected_bit = circuit.evaluate(&assignment).expect("NAND Boolean evaluation");
+        assert!(!result.outputs.is_empty(), "online evaluation must produce output");
+        let expected = DCRTPoly::const_rotate_poly(&poly_parameters, usize::from(expected_bit));
+        verify_output(
+            compiled.program(),
+            &mut result,
+            0,
+            &expected,
+            &parameters,
+            &payload,
+            &mask,
             &mut backend,
             &mut store,
-            config.clone(),
-            |_| Ok(()),
+            config,
         )
-        .expect("execute NAND verification residual");
-        for name in ["verification-residual.0", "verification-residual.1"] {
-            let value = residual_result
-                .materialize_output(name, &mut backend, &mut store)
-                .expect("materialize NAND residual");
-            let RuntimeValue::Matrix(matrix) = value else {
-                panic!("NAND residual output must be a matrix");
-            };
-            let decoded = backend
-                .threshold_decode(
-                    matrix,
-                    &BigInt::from(2u8),
-                    poly_parameters.ring_dimension() as usize,
-                )
-                .expect("decode NAND residual");
-            assert!(
-                decoded.iter().all(|value| value == &BigInt::from(0u8)),
-                "NAND assignment {assignment:?} residual decoded nonzero: {decoded:?}"
-            );
-        }
-        assert!(expected_bit <= 1);
+        .expect("NAND application verification");
         assert!(output_bound.error > 0u8.into());
-        assert!(!result.outputs.is_empty(), "online evaluation must produce output");
     }
 }

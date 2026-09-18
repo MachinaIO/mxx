@@ -66,10 +66,7 @@ pub(crate) trait GraphParallelLowering:
     type SideOutput: mxx_dsl::GraphValue;
     fn begin_graph_parallel(&mut self);
     fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error>;
-    fn commit_graph_parallel(
-        &mut self,
-        outputs: mxx_dsl::Family<Self::SideOutput>,
-    ) -> Result<(), Self::Error>;
+    fn commit_graph_parallel(&mut self) -> Result<(), Self::Error>;
 }
 
 impl<E> FamilyExecution<E> for GraphFamilyExecution
@@ -131,8 +128,7 @@ where
         }
         let combined = family.map_err(ProgramLowerError::Dsl)?;
         let wires = combined.field(|value| value.0).map_err(ProgramLowerError::Dsl)?;
-        let outputs = combined.field(|value| value.1).map_err(ProgramLowerError::Dsl)?;
-        evaluator.commit_graph_parallel(outputs).map_err(ProgramLowerError::Backend)?;
+        evaluator.commit_graph_parallel().map_err(ProgramLowerError::Backend)?;
         Ok(wires)
     }
 
@@ -232,7 +228,7 @@ mod tests {
         ExponentLUTProgramLowering, FamilyExecution, FamilyRange, LoweringSite,
         ProgramLoweringContext,
     };
-    use mxx_dsl::{GraphValue, GraphValueSchema, Int};
+    use mxx_dsl::Int;
     use mxx_ir_core::IntExpr;
     use num_bigint::BigInt;
 
@@ -337,13 +333,7 @@ mod tests {
         fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error> {
             Ok(())
         }
-        fn commit_graph_parallel(
-            &mut self,
-            outputs: mxx_dsl::Family<Self::SideOutput>,
-        ) -> Result<(), Self::Error> {
-            if !outputs.schema().wire_types().is_empty() {
-                return Err(GraphError);
-            }
+        fn commit_graph_parallel(&mut self) -> Result<(), Self::Error> {
             Ok(())
         }
     }

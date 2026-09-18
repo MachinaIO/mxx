@@ -508,6 +508,7 @@ impl SparseLwrPrfProgram {
         let values = readout.clone();
         let lut = builder.register_lut(LutTable::unary(
             profile.native_width(),
+            profile.layout,
             profile.native_width(),
             values,
             LutOutputRepresentation::Coefficient,
@@ -905,6 +906,28 @@ mod tests {
     #[test]
     fn profile_rejects_nondividing_digit_base() {
         assert!(SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 5 }, 12).is_err());
+    }
+
+    #[test]
+    fn profile_preserves_zero_and_nonzero_stride_input_layouts() {
+        let zero_stride =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 0, width_log2: 4 }, 2).unwrap();
+        let nonzero_stride =
+            SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 3 }, 2).unwrap();
+
+        assert_eq!(zero_stride.ring_dimension(), nonzero_stride.ring_dimension());
+        assert_ne!(
+            zero_stride.q(),
+            nonzero_stride.q(),
+            "the exponent modulus is selected by input width"
+        );
+        assert_ne!(
+            zero_stride.transform_column_count(),
+            nonzero_stride.transform_column_count(),
+            "the input layout, not only the native ring, selects the transform width"
+        );
+        assert_eq!(zero_stride.canonical_readout().unwrap().len(), 16);
+        assert_eq!(nonzero_stride.canonical_readout().unwrap().len(), 8);
     }
 
     #[test]

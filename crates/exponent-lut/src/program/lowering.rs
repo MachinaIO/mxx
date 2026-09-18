@@ -213,12 +213,12 @@ where
                         evaluator.mul_private(&input, &rhs).map_err(ProgramLowerError::Backend)
                     })?)
                 }
-                Step::Lut { input, table, .. } => {
+                Step::Lut { input, table: lut, .. } => {
                     let input = resolve_wire(input, families, environment, indices)?;
                     let table = program
                         .luts
-                        .get(table.0 as usize)
-                        .ok_or(ProgramValidationError::InvalidLutId(*table))?;
+                        .get(lut.0 as usize)
+                        .ok_or(ProgramValidationError::InvalidLutId(*lut))?;
                     LoweredValue::Scalar(with_site(evaluator, site, |evaluator| {
                         evaluator.lut(&input, table).map_err(ProgramLowerError::Backend)
                     })?)
@@ -586,8 +586,14 @@ mod tests {
         let rhs = builder.rhs_input().unwrap();
         let lut = builder
             .register_lut(
-                LutTable::unary(4, 2, vec![0, 1, 1, 0], LutOutputRepresentation::Coefficient)
-                    .unwrap(),
+                LutTable::unary(
+                    4,
+                    ExpLayout { stride_log2: 0, width_log2: 2 },
+                    2,
+                    vec![0, 1, 1, 0],
+                    LutOutputRepresentation::Coefficient,
+                )
+                .unwrap(),
             )
             .unwrap();
         let product = builder.mul_private(Operand::Scalar(input), Operand::Scalar(rhs)).unwrap();
@@ -606,5 +612,41 @@ mod tests {
         assert_eq!(evaluator.luts, [vec![0, 1, 1, 0]]);
         assert_eq!(outputs, vec![17]);
         assert!(evaluator.site.is_none());
+    }
+
+    #[test]
+    fn lower_program_delivers_each_equal_lut_table() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let first_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let second_input = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let table = || {
+            LutTable::unary(
+                2,
+                ExpLayout { stride_log2: 0, width_log2: 1 },
+                2,
+                vec![0, 1],
+                LutOutputRepresentation::Coefficient,
+            )
+            .unwrap()
+        };
+        let first_lut = builder.register_lut(table()).unwrap();
+        let second_lut = builder.register_lut(table()).unwrap();
+        assert_ne!(first_lut, second_lut);
+        let first_output = builder.lut(Operand::Scalar(first_input), first_lut).unwrap();
+        let second_output = builder.lut(Operand::Scalar(second_input), second_lut).unwrap();
+        let program = builder
+            .finish(vec![Operand::Scalar(first_output), Operand::Scalar(second_output)])
+            .unwrap();
+
+        let mut environment = Environment::<i32, i32, Vec<i32>, Vec<i32>>::new();
+        environment.bind_wire(first_input, InputBinding::Scalar(0)).unwrap();
+        environment.bind_wire(second_input, InputBinding::Scalar(1)).unwrap();
+        let mut evaluator = MockEvaluator::default();
+        let mut families = MockFamilies;
+        let outputs =
+            lower_program(&program, &mut evaluator, &mut families, &mut environment).unwrap();
+
+        assert_eq!(evaluator.luts, [vec![0, 1], vec![0, 1]]);
+        assert_eq!(outputs, vec![1, 2]);
     }
 }

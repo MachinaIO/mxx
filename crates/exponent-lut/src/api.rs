@@ -78,7 +78,7 @@ impl<D> StageArtifacts<D> {
         Self { checkpoint }
     }
 
-    pub fn checkpoint(&self) -> &ArtifactCheckpoint<D, [u8; 32]> {
+    pub(crate) fn checkpoint(&self) -> &ArtifactCheckpoint<D, [u8; 32]> {
         &self.checkpoint
     }
 }
@@ -209,9 +209,11 @@ pub trait EncryptBuild<B: Backend, P: Poly> {
     fn bind_inputs(
         &mut self,
         inputs: &crate::program::EncryptionInputs,
+        parameters: &ParamEnv,
         lhs: &PlaintextInputs<WireId, P>,
         payload: &Self::PayloadSecret,
         mask: &Self::MaskSecret,
+        hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
     fn bind_artifacts(
@@ -251,8 +253,10 @@ pub trait OnlineBuild<B: Backend> {
     fn bind_artifacts(
         &mut self,
         program: &ExponentLutProgram,
+        parameters: &ParamEnv,
         preprocess: &StageArtifacts<Self::PreprocessDescriptor>,
         encryption: &StageArtifacts<Self::EncryptDescriptor>,
+        hash_key: &[u8],
     ) -> Result<(), ApiError>;
 
     fn build_graph(
@@ -296,7 +300,7 @@ pub trait NoiseBuild {
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
 /// second executor or bypass graph validation, observers, or execution
 /// configuration.
-pub fn execute_checkpoint<B, S, D>(
+pub(crate) fn execute_checkpoint<B, S, D>(
     graph: StageGraph<B>,
     parameters: &ParamEnv,
     descriptor: D,
@@ -336,7 +340,7 @@ where
 /// execution, and the supplied execution configuration is preserved. The
 /// returned runtime result retains the leases needed by callers that
 /// materialize verification residuals or other outputs.
-pub fn execute_graph<B, S>(
+pub(crate) fn execute_graph<B, S>(
     graph: StageGraph<B>,
     parameters: &ParamEnv,
     backend: &mut B,
@@ -369,7 +373,7 @@ where
 /// labels. No plaintexts or scheme-specific carriers cross this API. The
 /// callback runs inside the one refresh dispatch, and its exact label set is
 /// checked before the concrete refresh implementation consumes the outputs.
-pub fn apply_refresh<R, F>(
+pub(crate) fn apply_refresh<R, F>(
     declaration: &RefreshDeclaration,
     refresh: &mut R,
     evaluate_prf: F,
@@ -519,6 +523,7 @@ pub fn encrypt<B, S, P, T>(
     preprocess: &StageArtifacts<T::PreprocessDescriptor>,
     payload: &T::PayloadSecret,
     mask: &T::MaskSecret,
+    hash_key: &[u8],
     mut build: T,
     backend: &mut B,
     destination: ArtifactDestination<'_, S>,
@@ -532,7 +537,7 @@ where
     P: Poly,
     T: EncryptBuild<B, P>,
 {
-    build.bind_inputs(inputs, lhs, payload, mask)?;
+    build.bind_inputs(inputs, parameters, lhs, payload, mask, hash_key)?;
     build.bind_artifacts(preprocess)?;
     compose(&mut build)?;
     let identity = build.artifact_identity();
@@ -557,6 +562,7 @@ pub fn online_eval<B, S, T>(
     parameters: &ParamEnv,
     preprocess: &StageArtifacts<T::PreprocessDescriptor>,
     encryption: &StageArtifacts<T::EncryptDescriptor>,
+    hash_key: &[u8],
     mut build: T,
     backend: &mut B,
     store: &mut S,
@@ -573,7 +579,7 @@ where
     S: SessionStore,
     T: OnlineBuild<B>,
 {
-    build.bind_artifacts(program, preprocess, encryption)?;
+    build.bind_artifacts(program, parameters, preprocess, encryption, hash_key)?;
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
         lower_program(program, evaluator, families, environment).map_err(ApiError::lowering)?

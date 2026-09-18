@@ -924,24 +924,22 @@ mod tests {
     }
 }
 
-/// Storage accounting separates canonical protocol material from deterministic
-/// decomposition acceleration data and from bounded resident waves.
+/// Storage accounting separates canonical protocol material from decoder
+/// preimages and from bounded resident waves.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExponentLutStorageReport {
     pub canonical_artifact_bytes: u128,
     pub artifact_input_bytes: u128,
     pub decoder_preimage_bytes: u128,
-    pub decomposition_cache_artifact_bytes: u128,
     pub peak_loaded_host_bytes: u64,
     pub peak_loaded_device_bytes_per_gpu: u64,
     pub peak_workspace_bytes_per_gpu: u64,
 }
 
-/// Storage accounting separates canonical protocol artifacts from deterministic
-/// decomposition artifacts without introducing an application-specific store
-/// format.  The artifact type identifies relation-bearing preimages; their
-/// layout metadata identifies whether they are decomposition cache material or
-/// decoder material.  Other artifact types are canonical artifacts.
+/// Storage accounting separates canonical protocol artifacts from decoder
+/// preimages without introducing an application-specific store format. Compact
+/// matrices remain the persisted representation; gadget decompositions are
+/// derived by consumers and never counted as stored artifacts.
 impl ExponentLutStorageReport {
     /// Computes storage accounting from the producer manifests and validated
     /// graph metadata.  Manifest entries are deduplicated by production and
@@ -970,9 +968,6 @@ impl ExponentLutStorageReport {
                 report.peak_loaded_host_bytes =
                     report.peak_loaded_host_bytes.saturating_add(member);
                 match artifact_storage_purpose(artifact) {
-                    ArtifactStoragePurpose::DecompositionCache => {
-                        report.decomposition_cache_artifact_bytes += persistent;
-                    }
                     ArtifactStoragePurpose::DecoderPreimage => {
                         report.decoder_preimage_bytes += persistent;
                     }
@@ -1018,21 +1013,17 @@ impl ExponentLutStorageReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtifactStoragePurpose {
     Canonical,
-    DecompositionCache,
     DecoderPreimage,
 }
 
-/// Derives the accounting purpose from frozen artifact metadata.  Producers
-/// that publish a deterministic preimage decomposition set the explicit
-/// layout token; an unlabelled preimage remains decoder material by default.
+/// Derives the accounting purpose from frozen artifact metadata. Relation
+/// bearing preimages are decoder material; compact matrix artifacts remain
+/// canonical regardless of their layout token.
 fn artifact_storage_purpose(artifact: &ManifestArtifact) -> ArtifactStoragePurpose {
     if !matches!(artifact.artifact_type, ArtifactType::Preimage { .. }) {
         return ArtifactStoragePurpose::Canonical;
     }
-    match artifact.layout.as_deref() {
-        Some("decomposition-cache") => ArtifactStoragePurpose::DecompositionCache,
-        _ => ArtifactStoragePurpose::DecoderPreimage,
-    }
+    ArtifactStoragePurpose::DecoderPreimage
 }
 
 fn matrix_coefficient_bytes(matrix: &ConcreteMatrixType) -> u64 {
@@ -1090,7 +1081,7 @@ mod storage_report_tests {
     use super::*;
 
     #[test]
-    fn storage_report_separates_protocol_cache_decoder_and_member_peak() {
+    fn storage_report_separates_canonical_decoder_and_member_peak() {
         let production_id = ProductionId {
             spec_hash: mxx_ir_core::artifact::SpecHash([21; 32]),
             execution_nonce: [22; 32],
@@ -1121,7 +1112,6 @@ mod storage_report_tests {
                         layout: None,
                     },
                 ),
-                ("cache".to_owned(), compact(Some("decomposition-cache".to_owned()), Some(4))),
                 ("decoder".to_owned(), compact(Some("decoder-preimage".to_owned()), Some(4))),
             ]),
         };
@@ -1129,10 +1119,6 @@ mod storage_report_tests {
         assert_eq!(
             report.canonical_artifact_bytes,
             u128::from(artifact_member_bytes(manifest.artifacts.get("public-matrix").unwrap()))
-        );
-        assert_eq!(
-            report.decomposition_cache_artifact_bytes,
-            artifact_persistent_bytes(manifest.artifacts.get("cache").unwrap())
         );
         assert_eq!(
             report.decoder_preimage_bytes,

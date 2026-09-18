@@ -15,7 +15,7 @@ use bigdecimal::BigDecimal;
 use mxx_dsl::{Family, Mat, Preimage, Ring};
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
-use num_traits::Zero;
+use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -28,12 +28,13 @@ use crate::{
             RefreshDeclaration, RefreshDigitPlan, RefreshError, RefreshPrfLabelIndex, RefreshSlot,
         },
     },
-    program::{ExponentLUTProgramLowering, ExponentLutProgramId, FamilyScope, WireId},
+    program::{ExponentLUTProgramLowering, ExponentLutProgramId},
 };
 
 pub use encoding::{
     EncodingLowering, RnsBggEncoding, RnsBggMaskSecret, RnsBggPayloadSecret, RnsEncryptBuild,
-    RnsOnlineBuild,
+    RnsOnlineBuild, checkpoint_refreshed_output, resume_refreshed_output, verify_output,
+    verify_refreshed_output,
 };
 pub use noise::{
     RnsBggDerivedWorkload, RnsBggMaskSecretComponent, RnsBggNoiseBindings, RnsBggNoiseBound,
@@ -47,12 +48,7 @@ pub type RnsBggRow = (Mat, Mat);
 /// A two-by-two polynomial block matrix.
 pub type RnsBggMatrix = ((Mat, Mat), (Mat, Mat));
 /// A two-by-two matrix of signed compact preimages.
-pub type RnsBggDecomposition = ((Preimage, Preimage), (Preimage, Preimage));
-/// Public LUT data indexed by the LUT helper family.
-pub type RnsBggLutPublicData = Family<RnsBggMatrix>;
-/// LUT helper rows indexed by the LUT helper family.
-pub type RnsBggLutHelper = Family<RnsBggRow>;
-
+pub(crate) type RnsBggDecomposition = ((Preimage, Preimage), (Preimage, Preimage));
 fn refresh_commitment_hex(commitment: [u8; 32]) -> String {
     commitment.iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -82,24 +78,6 @@ pub(crate) fn refresh_label_artifact_name(
 /// Build the canonical refresh-checkpoint artifact path.
 pub(crate) fn refresh_checkpoint_artifact_name(commitment: [u8; 32], role: &str) -> String {
     format!("refresh/{}/{role}", refresh_commitment_hex(commitment))
-}
-
-/// Build the canonical base name for a LUT helper artifact.
-///
-/// A root helper keeps the historical name.  A helper produced in a family
-/// scope carries every lexical range's start and count so nested scopes that
-/// happen to share an inner index remain distinct.
-pub(crate) fn lut_helper_artifact_name(origin: WireId, scope: &FamilyScope) -> String {
-    if scope.ranges().is_empty() {
-        return format!("lut-data/{origin:?}");
-    }
-    let ranges = scope
-        .ranges()
-        .iter()
-        .map(|range| format!("start={:?},count={:?}", range.start(), range.count()))
-        .collect::<Vec<_>>()
-        .join("/");
-    format!("lut-data/{origin:?}/scope/{ranges}")
 }
 
 /// Errors raised by the retained RNS-BGG contracts.
@@ -159,6 +137,29 @@ pub struct RnsBggParameters {
     operations_per_drop: usize,
 }
 
+/// Validated source-to-target route for a public operand.
+///
+/// `source_level` and `target_level` describe the physical rings, while
+/// `ratio` is the exact coefficient-modulus quotient used by scaled
+/// ModDown.  A ratio of one is a compatible physical no-op; it is not an
+/// instruction to insert a synthetic level transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RnsBggPublicAlignment {
+    source_level: usize,
+    target_level: usize,
+    ratio: BigUint,
+}
+
+impl RnsBggPublicAlignment {
+    pub(crate) fn ratio(&self) -> &BigUint {
+        &self.ratio
+    }
+
+    pub(crate) fn is_noop(&self) -> bool {
+        self.ratio == BigUint::one()
+    }
+}
+
 impl RnsBggParameters {
     /// Validates the ring chain and computes every modulus-drop scale once.
     pub fn new(
@@ -179,14 +180,21 @@ impl RnsBggParameters {
             return Err(RnsBggError::Parameters("partial modulus bases are not supported"));
         }
         if levels.iter().any(|level| {
-            level.ring_dimension() != first.ring_dimension() || level.dropped_moduli() != 0
+            level.ring_dimension() != first.ring_dimension() ||
+                level.base_bits() != first.base_bits() ||
+                level.dropped_moduli() != 0
         }) {
             return Err(RnsBggError::Parameters("incompatible ring or partial basis"));
         }
 
         let mut drops = Vec::with_capacity(levels.len());
         for pair in levels.windows(2) {
-            if pair[0] == pair[1] {
+            if pair[0].modulus() == pair[1].modulus() {
+                if !compatible_level_parameters(&pair[0], &pair[1]) {
+                    return Err(RnsBggError::Parameters(
+                        "equal modulus levels have incompatible ring or gadget parameters",
+                    ));
+                }
                 drops.push(BigUint::from(1u8));
                 continue;
             }
@@ -230,6 +238,126 @@ impl RnsBggParameters {
     pub fn component_columns(&self, level: usize) -> Result<usize, RnsBggError> {
         self.level(level)?;
         Ok(self.levels.get(level + 1).map_or(1, PolyParams::modulus_digits))
+    }
+
+    /// Return the number of key columns for a wire with the supplied
+    /// attribute knowledge.  Public attributes use the full gadget at their
+    /// current modulus; private payloads use the next-level state gadget.
+    /// Keeping this choice in the parameter contract prevents callers from
+    /// inferring cryptographic role from a matrix shape.
+    pub fn key_component_columns(
+        &self,
+        level: usize,
+        knowledge: crate::program::AttributeKnowledge,
+    ) -> Result<usize, RnsBggError> {
+        let parameters = self.level(level)?;
+        match knowledge {
+            crate::program::AttributeKnowledge::PublicPayload => Ok(parameters.modulus_digits()),
+            crate::program::AttributeKnowledge::PrivatePayload => self.component_columns(level),
+        }
+    }
+
+    /// Validate one public source-to-target route.
+    ///
+    /// The source may be at a strictly larger modulus than the target, or
+    /// both levels may describe the same compatible physical ring.  Upward
+    /// conversion and unrelated CRT bases are rejected before any graph node
+    /// is created.
+    pub(crate) fn public_alignment(
+        &self,
+        source_level: usize,
+        target_level: usize,
+    ) -> Result<RnsBggPublicAlignment, RnsBggError> {
+        let source = self.level(source_level)?;
+        let target = self.level(target_level)?;
+        if !compatible_level_parameters_except_basis(source, target) {
+            return Err(RnsBggError::Parameters("incompatible public alignment levels"));
+        }
+        let source_modulus = source.modulus();
+        let target_modulus = target.modulus();
+        if source_modulus == target_modulus {
+            if source.to_crt() != target.to_crt() {
+                return Err(RnsBggError::Parameters(
+                    "equal modulus levels have incompatible CRT bases",
+                ));
+            }
+            return Ok(RnsBggPublicAlignment { source_level, target_level, ratio: BigUint::one() });
+        }
+        if source_modulus < target_modulus {
+            return Err(RnsBggError::Parameters("public alignment cannot increase modulus"));
+        }
+        let source_basis = source.to_crt().0;
+        let target_basis = target.to_crt().0;
+        if target_basis.len() >= source_basis.len() ||
+            target_basis.iter().any(|prime| !source_basis.contains(prime))
+        {
+            return Err(RnsBggError::Parameters("public alignment requires a nested CRT drop"));
+        }
+        let ratio = source_modulus.as_ref() / target_modulus.as_ref();
+        if ratio.is_zero() || &ratio * target_modulus.as_ref() != *source_modulus.as_ref() {
+            return Err(RnsBggError::Parameters("public alignment modulus ratio is not exact"));
+        }
+        Ok(RnsBggPublicAlignment { source_level, target_level, ratio })
+    }
+
+    /// Select the target level for `MulPublic`.
+    ///
+    /// A private left operand owns the computation level, so the public RHS
+    /// must be reducible from its source level to `lhs_level` (or already be
+    /// physically compatible).  A public left operand has no private level
+    /// owner; the lower-modulus compatible level is selected for both public
+    /// operands.  No upward public conversion is accepted in either case.
+    pub fn mul_public_target_level(
+        &self,
+        lhs_level: usize,
+        lhs_knowledge: crate::program::AttributeKnowledge,
+        rhs_level: usize,
+    ) -> Result<usize, RnsBggError> {
+        match lhs_knowledge {
+            crate::program::AttributeKnowledge::PrivatePayload => {
+                self.public_alignment(rhs_level, lhs_level)?;
+                Ok(lhs_level)
+            }
+            crate::program::AttributeKnowledge::PublicPayload => {
+                let lhs = self.level(lhs_level)?;
+                let rhs = self.level(rhs_level)?;
+                let target_level = match lhs.modulus().cmp(&rhs.modulus()) {
+                    std::cmp::Ordering::Greater => rhs_level,
+                    std::cmp::Ordering::Less => lhs_level,
+                    std::cmp::Ordering::Equal => lhs_level.max(rhs_level),
+                };
+                self.public_alignment(lhs_level, target_level)?;
+                self.public_alignment(rhs_level, target_level)?;
+                Ok(target_level)
+            }
+        }
+    }
+
+    /// Construct the source-ring public alignment action
+    /// `H = Dec_(G_source)(alpha * G_target)`.
+    ///
+    /// The returned preimage is shared by every component of a public key or
+    /// encoding.  Equal compatible physical rings return `None`, which is a
+    /// deliberate no-op and does not create a graph node.
+    pub(crate) fn public_alignment_action(
+        &self,
+        source_level: usize,
+        target_level: usize,
+    ) -> Result<Option<Preimage>, RnsBggError> {
+        let alignment = self.public_alignment(source_level, target_level)?;
+        if alignment.is_noop() {
+            return Ok(None);
+        }
+        let source = self.level(source_level)?;
+        let source_modulus = BigInt::from(source.modulus().as_ref().clone());
+        let target_gadget =
+            self.public_gadget(target_level)?.centered_extend(source_modulus.clone());
+        let alpha = self.scalar(source_level, BigInt::from(alignment.ratio().clone()))?;
+        let scaled_target_gadget = alpha * target_gadget;
+        let base = 1u64
+            .checked_shl(source.base_bits())
+            .ok_or(RnsBggError::Parameters("alignment decomposition base overflow"))?;
+        Ok(Some(scaled_target_gadget.decompose(base, source.modulus_digits())))
     }
 
     pub fn encoding_error_sigma(&self) -> &BigDecimal {
@@ -321,15 +449,130 @@ fn public_gadget_base(base_bits: u32) -> Result<u64, RnsBggError> {
     1u64.checked_shl(base_bits).ok_or(RnsBggError::Parameters("public gadget base overflow"))
 }
 
+/// Check the metadata that must remain identical when no physical modulus
+/// conversion is performed.  Equal numeric moduli alone are insufficient:
+/// gadget decomposition and ring coordinates must describe the same basis.
+fn compatible_level_parameters(lhs: &DCRTPolyParams, rhs: &DCRTPolyParams) -> bool {
+    compatible_level_parameters_except_basis(lhs, rhs) && lhs.to_crt() == rhs.to_crt()
+}
+
+fn compatible_level_parameters_except_basis(lhs: &DCRTPolyParams, rhs: &DCRTPolyParams) -> bool {
+    lhs.ring_dimension() == rhs.ring_dimension() &&
+        lhs.base_bits() == rhs.base_bits() &&
+        lhs.dropped_moduli() == rhs.dropped_moduli()
+}
+
+/// Map a logical operation level to the CRT depth selected by a drop cadence.
+/// Logical chain slots remain present; adjacent slots in one cadence window
+/// therefore intentionally carry equal physical moduli.
+pub(crate) fn planned_crt_depth(
+    logical_level: usize,
+    operations_per_drop: usize,
+    max_crt_depth: usize,
+    terminal_depth: usize,
+) -> Result<usize, RnsBggError> {
+    if operations_per_drop == 0 || terminal_depth == 0 || max_crt_depth < terminal_depth {
+        return Err(RnsBggError::Parameters("invalid CRT drop cadence"));
+    }
+    let physical_drop = logical_level / operations_per_drop;
+    Ok(max_crt_depth.saturating_sub(physical_drop).max(terminal_depth))
+}
+
+/// Return the reusable LUT mask-helper keys required by the encryption
+/// projection.  These keys are deliberately derived from the complete LUT
+/// vector rather than from the Program body: an unreferenced registered LUT
+/// still describes part of the input contract, and every nonterminal logical
+/// level needs the same deterministic public mask matrix when it can host a
+/// LUT operation.  Logical levels remain part of the key even when adjacent
+/// levels have equal physical moduli.
+pub(crate) fn canonical_lut_helper_keys(
+    parameters: &RnsBggParameters,
+    inputs: &crate::program::EncryptionInputs,
+) -> Result<Vec<(usize, usize)>, RnsBggError> {
+    let mut keys = std::collections::BTreeSet::new();
+    let nonterminal_levels = parameters.levels().len().saturating_sub(1);
+    for level in 0..nonterminal_levels {
+        let ring_dimension = parameters.level(level)?.ring_dimension() as usize;
+        for table in inputs.luts() {
+            let layout = table.input_layout();
+            layout.validate(ring_dimension).map_err(|_| RnsBggError::Lut)?;
+            for sigma in
+                layout.automorphism_indices(ring_dimension).map_err(|_| RnsBggError::Lut)?
+            {
+                keys.insert((level, sigma));
+            }
+        }
+    }
+    Ok(keys.into_iter().collect())
+}
+
+fn update_projection_json<T: Serialize>(digest: &mut Sha256, value: &T) -> Result<(), RnsBggError> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|_| RnsBggError::Binding("encryption projection is not serializable"))?;
+    digest.update((encoded.len() as u64).to_le_bytes());
+    digest.update(encoded);
+    Ok(())
+}
+
+fn resolved_input_cardinality(
+    shape: &crate::program::InputShape,
+    parameters: &mxx_ir_core::ParamEnv,
+) -> Result<Option<usize>, RnsBggError> {
+    match shape {
+        crate::program::InputBinding::Scalar(()) => Ok(None),
+        crate::program::InputBinding::Family(count) => count
+            .evaluate(parameters)
+            .ok()
+            .and_then(|value| value.to_usize())
+            .filter(|value| *value > 0)
+            .map(Some)
+            .ok_or(RnsBggError::Binding("encryption input family count is not concrete")),
+    }
+}
+
+/// Hash the exact projection and resolved invocation cardinalities consumed by
+/// encryption.  This intentionally does not include the Program identifier,
+/// computation body, or gate schedule.
+pub(crate) fn encryption_projection_identity(
+    inputs: &crate::program::EncryptionInputs,
+    parameters: &mxx_ir_core::ParamEnv,
+    rns_parameters: &RnsBggParameters,
+) -> Result<[u8; 32], RnsBggError> {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-rns-bgg/encryption-projection/v1");
+    for (wire, declaration) in inputs.inputs() {
+        digest.update(wire.0.to_le_bytes());
+        digest.update([match declaration.knowledge() {
+            crate::program::AttributeKnowledge::PrivatePayload => 0,
+            crate::program::AttributeKnowledge::PublicPayload => 1,
+        }]);
+        update_projection_json(&mut digest, declaration.shape())?;
+        match resolved_input_cardinality(declaration.shape(), parameters)? {
+            Some(cardinality) => digest.update(cardinality.to_le_bytes()),
+            None => digest.update([0xff; std::mem::size_of::<usize>()]),
+        }
+    }
+    digest.update([0xfe]);
+    for (index, table) in inputs.luts().iter().enumerate() {
+        digest.update((index as u64).to_le_bytes());
+        update_projection_json(&mut digest, table)?;
+    }
+    digest.update([0xfd]);
+    for (level, sigma) in canonical_lut_helper_keys(rns_parameters, inputs)? {
+        digest.update((level as u64).to_le_bytes());
+        digest.update((sigma as u64).to_le_bytes());
+    }
+    Ok(digest.finalize().into())
+}
+
 /// The sole descriptor shared by RNS-BGG stage checkpoints.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RnsBggArtifactBinding {
+pub(crate) struct RnsBggArtifactBinding {
     context: [u8; 32],
     program: ExponentLutProgramId,
     parameters: [u8; 32],
+    hash_key_commitment: [u8; 32],
     sources: Vec<mxx_ir_core::artifact::ProductionId>,
-    #[serde(default)]
-    lut_helpers: Vec<(crate::program::WireId, usize, usize)>,
     refresh_commitment: Option<[u8; 32]>,
 }
 
@@ -338,6 +581,7 @@ impl RnsBggArtifactBinding {
         context: [u8; 32],
         program: ExponentLutProgramId,
         parameters: [u8; 32],
+        hash_key_commitment: [u8; 32],
         sources: Vec<mxx_ir_core::artifact::ProductionId>,
     ) -> Result<Self, RnsBggError> {
         if sources.windows(2).any(|pair| pair[0] >= pair[1]) {
@@ -347,8 +591,8 @@ impl RnsBggArtifactBinding {
             context,
             program,
             parameters,
+            hash_key_commitment,
             sources: Vec::new(),
-            lut_helpers: Vec::new(),
             refresh_commitment: None,
         };
         for source in sources {
@@ -376,20 +620,6 @@ impl RnsBggArtifactBinding {
         Ok(self)
     }
 
-    pub(crate) fn with_lut_helper(
-        mut self,
-        origin: crate::program::WireId,
-        level: usize,
-        count: usize,
-    ) -> Result<Self, RnsBggError> {
-        if count == 0 || self.lut_helpers.iter().any(|(wire, _, _)| *wire == origin) {
-            return Err(RnsBggError::Binding("LUT helper metadata is not unique"));
-        }
-        self.lut_helpers.push((origin, level, count));
-        self.lut_helpers.sort_by_key(|(wire, _, _)| *wire);
-        Ok(self)
-    }
-
     pub(crate) fn context(&self) -> &[u8; 32] {
         &self.context
     }
@@ -402,6 +632,10 @@ impl RnsBggArtifactBinding {
         &self.parameters
     }
 
+    pub(crate) fn hash_key_commitment(&self) -> &[u8; 32] {
+        &self.hash_key_commitment
+    }
+
     pub(crate) fn sources(&self) -> &[mxx_ir_core::artifact::ProductionId] {
         &self.sources
     }
@@ -409,10 +643,54 @@ impl RnsBggArtifactBinding {
     pub(crate) fn refresh_commitment(&self) -> Option<&[u8; 32]> {
         self.refresh_commitment.as_ref()
     }
+}
 
-    pub(crate) fn lut_helpers(&self) -> &[(crate::program::WireId, usize, usize)] {
-        &self.lut_helpers
+/// A stage descriptor is deliberately distinct at the type level even though
+/// all three RNS-BGG checkpoints carry the same binding metadata.  The
+/// transparent wrapper keeps the serialized representation owned by the
+/// binding while preventing a preprocess, encryption, or online checkpoint
+/// from being passed to the wrong stage API by accident.
+macro_rules! rns_bgg_stage_descriptor {
+    ($name:ident) => {
+        #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+        #[serde(transparent)]
+        #[doc = "Typed RNS-BGG stage artifact descriptor."]
+        pub struct $name(RnsBggArtifactBinding);
+
+        impl $name {
+            pub(crate) fn from_binding(binding: RnsBggArtifactBinding) -> Self {
+                Self(binding)
+            }
+
+            pub(crate) fn binding(&self) -> &RnsBggArtifactBinding {
+                &self.0
+            }
+        }
+    };
+}
+
+rns_bgg_stage_descriptor!(RnsBggPreprocessEncryptDescriptor);
+
+rns_bgg_stage_descriptor!(RnsBggPreprocessOnlineDescriptor);
+
+rns_bgg_stage_descriptor!(RnsBggEncryptionDescriptor);
+
+rns_bgg_stage_descriptor!(RnsBggRefreshCheckpointDescriptor);
+
+impl RnsBggPreprocessEncryptDescriptor {
+    pub(crate) fn with_source(
+        self,
+        source: mxx_ir_core::artifact::ProductionId,
+    ) -> Result<Self, RnsBggError> {
+        Ok(Self::from_binding(self.0.with_source(source)?))
     }
+}
+
+pub(crate) fn hash_key_commitment(hash_key: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(b"mxx-rns-bgg/hash-key/v1");
+    digest.update(hash_key);
+    digest.finalize().into()
 }
 
 /// Small, one-shot refresh invocation shared by the three stage lowerers.
@@ -548,6 +826,149 @@ pub(crate) fn add_encoding_rows(lhs: RnsBggRow, rhs: RnsBggRow) -> RnsBggRow {
     (lhs.0 + rhs.0, lhs.1 + rhs.1)
 }
 
+/// Decompose a compact right-action matrix at its declared decomposition
+/// level and transport only the resulting bounded digits to the evaluation
+/// ring.  The dense matrix is never extended to the evaluation modulus.
+pub(crate) fn compact_decompose_matrix(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggDecomposition, RnsBggError> {
+    let evaluation_modulus = parameters.level(evaluation_level)?.modulus().as_ref().clone();
+    let decomposition = parameters.level(decomposition_level)?;
+    let decomposition_modulus = decomposition.modulus().as_ref().clone();
+    let expected_dimension = BigInt::from(decomposition.ring_dimension());
+    for entry in [&matrix.0.0, &matrix.0.1, &matrix.1.0, &matrix.1.1] {
+        let matrix_type = entry.matrix_type();
+        let modulus = matrix_type
+            .modulus
+            .evaluate(&mxx_ir_core::ParamEnv::default())
+            .map_err(|_| RnsBggError::Parameters("decomposition modulus must be concrete"))?;
+        let dimension =
+            matrix_type.ring_dimension.evaluate(&mxx_ir_core::ParamEnv::default()).map_err(
+                |_| RnsBggError::Parameters("decomposition ring dimension must be concrete"),
+            )?;
+        if modulus != BigInt::from(decomposition_modulus.clone()) || dimension != expected_dimension
+        {
+            return Err(RnsBggError::Parameters(
+                "compact action matrix does not match its decomposition ring",
+            ));
+        }
+    }
+    if evaluation_modulus < decomposition_modulus {
+        return Err(RnsBggError::Parameters(
+            "evaluation modulus must contain the decomposition modulus",
+        ));
+    }
+    let base = 1u64
+        .checked_shl(decomposition.base_bits())
+        .ok_or(RnsBggError::Parameters("decomposition base overflow"))?;
+    let digits = decomposition.modulus_digits();
+    let value = (
+        (matrix.0.0.decompose(base, digits), matrix.0.1.decompose(base, digits)),
+        (matrix.1.0.decompose(base, digits), matrix.1.1.decompose(base, digits)),
+    );
+    if evaluation_modulus == decomposition_modulus {
+        Ok(value)
+    } else {
+        Ok(centered_extend_compact(value, BigInt::from(evaluation_modulus)))
+    }
+}
+
+fn centered_extend_compact(value: RnsBggDecomposition, modulus: BigInt) -> RnsBggDecomposition {
+    (
+        (value.0.0.centered_extend(modulus.clone()), value.0.1.centered_extend(modulus.clone())),
+        (value.1.0.centered_extend(modulus.clone()), value.1.1.centered_extend(modulus)),
+    )
+}
+
+/// Apply a compact right action to an encoding row.
+pub(crate) fn compact_right_action_row(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    row: RnsBggRow,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggRow, RnsBggError> {
+    let decomposition =
+        compact_decompose_matrix(parameters, evaluation_level, decomposition_level, matrix)?;
+    Ok(multiply_encoding_action(row, decomposition))
+}
+
+/// Apply a compact right action to a public matrix.
+pub(crate) fn compact_right_action_public(
+    parameters: &RnsBggParameters,
+    evaluation_level: usize,
+    decomposition_level: usize,
+    matrix: RnsBggMatrix,
+    action: RnsBggMatrix,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let decomposition =
+        compact_decompose_matrix(parameters, evaluation_level, decomposition_level, action)?;
+    Ok(multiply_public_action(matrix, decomposition))
+}
+
+fn validate_public_alignment_entry(
+    parameters: &RnsBggParameters,
+    source_level: usize,
+    entry: &Mat,
+) -> Result<(), RnsBggError> {
+    let expected = parameters.ring(source_level)?.matrix_type((
+        1,
+        parameters.key_component_columns(
+            source_level,
+            crate::program::AttributeKnowledge::PublicPayload,
+        )?,
+    ));
+    if entry.matrix_type() == &expected {
+        Ok(())
+    } else {
+        Err(RnsBggError::Binding("public alignment operand shape mismatch"))
+    }
+}
+
+/// Apply one shared public alignment action to both encoding-row components.
+pub(crate) fn apply_public_alignment_row(
+    parameters: &RnsBggParameters,
+    source_level: usize,
+    target_level: usize,
+    row: RnsBggRow,
+) -> Result<RnsBggRow, RnsBggError> {
+    validate_public_alignment_entry(parameters, source_level, &row.0)?;
+    validate_public_alignment_entry(parameters, source_level, &row.1)?;
+    let Some(action) = parameters.public_alignment_action(source_level, target_level)? else {
+        return Ok(row);
+    };
+    let aligned = (action.clone().mul_small_rhs(row.0), action.mul_small_rhs(row.1));
+    let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
+    checked_mod_down_encoding(aligned, target_modulus)
+}
+
+/// Apply one shared public alignment action to every component of a public
+/// matrix.  The same `H` is cloned only as an immutable graph handle; no
+/// component receives a separately generated action.
+pub(crate) fn apply_public_alignment_matrix(
+    parameters: &RnsBggParameters,
+    source_level: usize,
+    target_level: usize,
+    matrix: RnsBggMatrix,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    validate_public_alignment_entry(parameters, source_level, &matrix.0.0)?;
+    validate_public_alignment_entry(parameters, source_level, &matrix.0.1)?;
+    validate_public_alignment_entry(parameters, source_level, &matrix.1.0)?;
+    validate_public_alignment_entry(parameters, source_level, &matrix.1.1)?;
+    let Some(action) = parameters.public_alignment_action(source_level, target_level)? else {
+        return Ok(matrix);
+    };
+    let aligned = (
+        (action.clone().mul_small_rhs(matrix.0.0), action.clone().mul_small_rhs(matrix.0.1)),
+        (action.clone().mul_small_rhs(matrix.1.0), action.mul_small_rhs(matrix.1.1)),
+    );
+    let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
+    checked_mod_down_public(aligned, target_modulus)
+}
+
 pub(crate) fn multiply_public_action(lhs: RnsBggMatrix, rhs: RnsBggDecomposition) -> RnsBggMatrix {
     let ((a, b), (c, d)) = lhs;
     let ((u, v), (w, x)) = rhs;
@@ -572,12 +993,103 @@ pub(crate) fn multiply_encoding_action(lhs: RnsBggRow, rhs: RnsBggDecomposition)
     )
 }
 
+fn concrete_entry_modulus(entry: &Mat) -> Result<BigInt, RnsBggError> {
+    entry
+        .matrix_type()
+        .modulus
+        .evaluate(&mxx_ir_core::ParamEnv::default())
+        .map_err(|_| RnsBggError::Parameters("source modulus must be concrete"))
+}
+
+fn validate_mod_down_entry(entry: &Mat, modulus: &BigInt) -> Result<bool, RnsBggError> {
+    if modulus <= &BigInt::zero() {
+        return Err(RnsBggError::Parameters("destination modulus must be positive"));
+    }
+    let source = concrete_entry_modulus(entry)?;
+    match source.cmp(modulus) {
+        std::cmp::Ordering::Less => {
+            Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
+        }
+        std::cmp::Ordering::Equal => Ok(true),
+        std::cmp::Ordering::Greater => {
+            if &source % modulus != BigInt::zero() {
+                return Err(RnsBggError::Parameters("destination modulus must divide source"));
+            }
+            Ok(false)
+        }
+    }
+}
+
+fn checked_mod_down_matrix(
+    value: RnsBggMatrix,
+    modulus: BigInt,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    let entries = [&value.0.0, &value.0.1, &value.1.0, &value.1.1];
+    let source = concrete_entry_modulus(entries[0])?;
+    if entries[1..]
+        .iter()
+        .map(|entry| concrete_entry_modulus(entry))
+        .collect::<Result<Vec<_>, _>>()?
+        .iter()
+        .any(|entry| *entry != source)
+    {
+        return Err(RnsBggError::Parameters("matrix entries have incompatible source moduli"));
+    }
+    let no_op = entries
+        .iter()
+        .map(|entry| validate_mod_down_entry(entry, &modulus))
+        .collect::<Result<Vec<_>, _>>()?;
+    if no_op.iter().all(|entry| *entry) {
+        return Ok(value);
+    }
+    Ok(map_matrix(value, |entry| entry.block_mod_switch(modulus.clone(), 1)))
+}
+
+fn checked_mod_down_row(value: RnsBggRow, modulus: BigInt) -> Result<RnsBggRow, RnsBggError> {
+    let source = concrete_entry_modulus(&value.0)?;
+    if concrete_entry_modulus(&value.1)? != source {
+        return Err(RnsBggError::Parameters("row entries have incompatible source moduli"));
+    }
+    let no_op = [
+        validate_mod_down_entry(&value.0, &modulus)?,
+        validate_mod_down_entry(&value.1, &modulus)?,
+    ];
+    if no_op[0] {
+        return Ok(value);
+    }
+    Ok(map_row(value, |entry| entry.block_mod_switch(modulus.clone(), 1)))
+}
+
+/// Checked public-role ModDown.  Equal physical moduli return the original
+/// graph nodes; upward conversion and non-exact drops fail before graph
+/// construction.
+pub(crate) fn checked_mod_down_public(
+    value: RnsBggMatrix,
+    modulus: BigInt,
+) -> Result<RnsBggMatrix, RnsBggError> {
+    checked_mod_down_matrix(value, modulus)
+}
+
+/// Checked encoding-role ModDown with the same source/target policy as public
+/// matrices.
+pub(crate) fn checked_mod_down_encoding(
+    value: RnsBggRow,
+    modulus: BigInt,
+) -> Result<RnsBggRow, RnsBggError> {
+    checked_mod_down_row(value, modulus)
+}
+
+/// Existing graph callers use this infallible boundary after their enclosing
+/// validation.  Keep the error visible as a panic rather than constructing an
+/// invalid upward or non-exact switch node.
 pub(crate) fn mod_down_public(value: RnsBggMatrix, modulus: BigInt) -> RnsBggMatrix {
-    map_matrix(value, |entry| entry.block_mod_switch(modulus.clone(), 1))
+    checked_mod_down_public(value, modulus)
+        .unwrap_or_else(|error| panic!("invalid public modulus switch: {error}"))
 }
 
 pub(crate) fn mod_down_encoding(value: RnsBggRow, modulus: BigInt) -> RnsBggRow {
-    map_row(value, |entry| entry.block_mod_switch(modulus.clone(), 1))
+    checked_mod_down_encoding(value, modulus)
+        .unwrap_or_else(|error| panic!("invalid encoding modulus switch: {error}"))
 }
 
 pub(crate) fn recompose_public(
@@ -631,11 +1143,209 @@ mod tests {
     }
 
     #[test]
+    fn public_alignment_selects_nested_target_and_rejects_reverse_route() {
+        let high = DCRTPolyParams::new(16, 3, 17, 4, None, None);
+        let middle_modulus =
+            high.to_crt().0[..2].iter().map(|prime| BigUint::from(*prime)).product::<BigUint>();
+        let middle = high.select_modulus(&middle_modulus).unwrap();
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters =
+            RnsBggParameters::new(vec![high.clone(), middle.clone(), low.clone()], 1, 1).unwrap();
+
+        let direct = parameters.public_alignment(0, 2).unwrap();
+        assert_eq!(direct.source_level, 0);
+        assert_eq!(direct.target_level, 2);
+        assert_eq!(direct.ratio(), &(high.modulus().as_ref() / low.modulus().as_ref()));
+        assert!(!direct.is_noop());
+        let action = parameters.public_alignment_action(0, 2).unwrap().unwrap();
+        assert_eq!(
+            action.matrix_type().modulus,
+            IntExpr::constant(BigInt::from(high.modulus().as_ref().clone()))
+        );
+        assert_eq!(
+            action.matrix_type().rows,
+            IntExpr::constant(BigInt::from(high.modulus_digits()))
+        );
+        assert_eq!(
+            action.matrix_type().columns,
+            IntExpr::constant(BigInt::from(low.modulus_digits()))
+        );
+        assert!(parameters.public_alignment(2, 0).is_err());
+        assert_eq!(
+            parameters
+                .mul_public_target_level(0, crate::program::AttributeKnowledge::PublicPayload, 2,)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            parameters
+                .mul_public_target_level(2, crate::program::AttributeKnowledge::PublicPayload, 1,)
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            parameters
+                .mul_public_target_level(1, crate::program::AttributeKnowledge::PrivatePayload, 0,)
+                .unwrap(),
+            1
+        );
+        assert!(
+            parameters
+                .mul_public_target_level(0, crate::program::AttributeKnowledge::PrivatePayload, 1,)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn equal_levels_have_unit_drop() {
         let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
         let parameters = RnsBggParameters::new(vec![level.clone(), level], 1, 1).unwrap();
         assert_eq!(parameters.scale(0).unwrap(), &BigUint::one());
         assert_eq!(parameters.scale(1).unwrap(), &BigUint::one());
+    }
+
+    #[test]
+    fn equal_physical_alignment_is_a_noop_and_upward_switch_is_rejected() {
+        let level = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let parameters = RnsBggParameters::new(vec![level.clone(), level.clone()], 1, 1).unwrap();
+        let alignment = parameters.public_alignment(0, 1).unwrap();
+        assert!(alignment.is_noop());
+        assert_eq!(alignment.ratio(), &BigUint::one());
+        assert!(parameters.public_alignment_action(0, 1).unwrap().is_none());
+
+        let ring = parameters.ring(0).unwrap();
+        let entry = ring.input("equal-modulus-entry", (1, 1));
+        let matrix = ((entry.clone(), entry.clone()), (entry.clone(), entry.clone()));
+        let converted =
+            checked_mod_down_public(matrix.clone(), BigInt::from(level.modulus().as_ref().clone()))
+                .unwrap();
+        assert_eq!(converted.0.0.flatten(), matrix.0.0.flatten());
+        let row = (entry.clone(), entry.clone());
+        let converted_row =
+            checked_mod_down_encoding(row.clone(), BigInt::from(level.modulus().as_ref().clone()))
+                .unwrap();
+        assert_eq!(converted_row.0.flatten(), row.0.flatten());
+
+        let low = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
+        let low_ring = mxx_dsl::Ring::new(
+            BigInt::from(low.modulus().as_ref().clone()),
+            low.ring_dimension() as usize,
+        );
+        let lower_entry = low_ring.input("upward-entry", (1, 1));
+        let lower_matrix = (
+            (lower_entry.clone(), lower_entry.clone()),
+            (lower_entry.clone(), lower_entry.clone()),
+        );
+        assert!(matches!(
+            checked_mod_down_public(lower_matrix, BigInt::from(level.modulus().as_ref().clone())),
+            Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
+        ));
+        let lower_row = (lower_entry.clone(), lower_entry);
+        assert!(matches!(
+            checked_mod_down_encoding(lower_row, BigInt::from(level.modulus().as_ref().clone())),
+            Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
+        ));
+    }
+
+    #[test]
+    fn key_component_columns_follow_attribute_knowledge() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
+        assert_eq!(
+            parameters
+                .key_component_columns(0, crate::program::AttributeKnowledge::PublicPayload)
+                .unwrap(),
+            high.modulus_digits()
+        );
+        assert_eq!(
+            parameters
+                .key_component_columns(0, crate::program::AttributeKnowledge::PrivatePayload)
+                .unwrap(),
+            low.modulus_digits()
+        );
+    }
+
+    #[test]
+    fn parameter_chain_rejects_mismatched_gadget_bases() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = DCRTPolyParams::new(16, 1, 17, 2, Some(vec![high.to_crt().0[0]]), None);
+        assert!(matches!(
+            RnsBggParameters::new(vec![high, low], 1, 1),
+            Err(RnsBggError::Parameters("incompatible ring or partial basis"))
+        ));
+    }
+
+    #[test]
+    fn planned_crt_depth_keeps_three_operation_windows() {
+        let depths =
+            (0..=7).map(|level| planned_crt_depth(level, 3, 6, 2).unwrap()).collect::<Vec<_>>();
+        assert_eq!(depths, vec![6, 6, 6, 5, 5, 5, 4, 4]);
+        assert!(planned_crt_depth(0, 0, 6, 2).is_err());
+    }
+
+    #[test]
+    fn compact_right_action_extends_only_bounded_digits() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
+        let low_ring = parameters.ring(1).unwrap();
+        let low_one = low_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
+        let action = ((low_one.clone(), low_one.clone()), (low_one.clone(), low_one.clone()));
+        let decomposition = compact_decompose_matrix(&parameters, 0, 1, action.clone()).unwrap();
+        assert_eq!(
+            decomposition.0.0.matrix_type().modulus,
+            mxx_ir_core::IntExpr::constant(BigInt::from(high.modulus().as_ref().clone()))
+        );
+        let high_ring = parameters.ring(0).unwrap();
+        let high_one = high_ring.polynomial([mxx_ir_core::IntExpr::constant(BigInt::from(1u8))]);
+        let row = (high_one.clone(), high_one);
+        let result = compact_right_action_row(&parameters, 0, 1, row.clone(), action).unwrap();
+        assert_eq!(result.0.matrix_type(), row.0.matrix_type());
+    }
+
+    #[test]
+    fn compact_decomposition_preserves_gadget_shape_for_negative_coefficients() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
+        let gadget = parameters.public_gadget(1).unwrap();
+        assert_eq!(
+            gadget.matrix_type(),
+            &parameters.ring(1).unwrap().matrix_type((1, low.modulus_digits()))
+        );
+
+        let negative =
+            parameters.ring(1).unwrap().polynomial([IntExpr::constant(BigInt::from(-1i8))]);
+        let action = ((negative.clone(), negative.clone()), (negative.clone(), negative.clone()));
+        let decomposition = compact_decompose_matrix(&parameters, 0, 1, action).unwrap();
+        assert_eq!(
+            decomposition.0.0.matrix_type().ring_dimension,
+            IntExpr::constant(BigInt::from(16u8))
+        );
+    }
+
+    #[test]
+    fn public_alignment_applies_one_action_to_rows_and_all_matrix_components() {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        let parameters = RnsBggParameters::new(vec![high.clone(), low.clone()], 1, 1).unwrap();
+        let source_ring = parameters.ring(0).unwrap();
+        let source_columns = high.modulus_digits();
+        let entry = source_ring.input("alignment-source", (1, source_columns));
+        let row = (entry.clone(), entry.clone());
+        let aligned_row = apply_public_alignment_row(&parameters, 0, 1, row).unwrap();
+        let target_type = parameters.ring(1).unwrap().matrix_type((1, low.modulus_digits()));
+        assert_eq!(aligned_row.0.matrix_type(), &target_type);
+        assert_eq!(aligned_row.1.matrix_type(), &target_type);
+
+        let matrix = ((entry.clone(), entry.clone()), (entry.clone(), entry));
+        let aligned_matrix = apply_public_alignment_matrix(&parameters, 0, 1, matrix).unwrap();
+        for entry in
+            [&aligned_matrix.0.0, &aligned_matrix.0.1, &aligned_matrix.1.0, &aligned_matrix.1.1]
+        {
+            assert_eq!(entry.matrix_type(), &target_type);
+        }
     }
 
     #[test]
@@ -671,109 +1381,92 @@ mod tests {
         graph.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
     }
 
-    #[test]
-    fn lut_helper_artifact_name_preserves_root_stability() {
-        let scope = FamilyScope::new(Vec::new(), Vec::new()).unwrap();
-        assert_eq!(lut_helper_artifact_name(WireId(7), &scope), "lut-data/WireId(7)");
+    fn helper_test_parameters() -> RnsBggParameters {
+        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
+        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
+        RnsBggParameters::new(vec![high.clone(), high, low], 1, 1).unwrap()
+    }
+
+    fn helper_test_program(depth: usize) -> crate::program::ExponentLutProgram {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let layout = crate::program::ExpLayout { stride_log2: 0, width_log2: 1 };
+        let table = crate::program::LutTable::unary(
+            2,
+            layout,
+            2,
+            vec![0, 1],
+            crate::program::LutOutputRepresentation::Exponent(layout),
+        )
+        .unwrap();
+        builder.register_lut(table.clone()).unwrap();
+        builder.register_lut(table).unwrap();
+        let mut output = input;
+        for lut in 0..depth {
+            output = builder
+                .lut(crate::program::Operand::Scalar(output), crate::program::LutId(lut as u32))
+                .unwrap();
+        }
+        builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap()
     }
 
     #[test]
-    fn lut_helper_artifact_name_distinguishes_nonzero_and_nested_scopes() {
-        let origin = WireId(11);
-        let root = FamilyScope::new(Vec::new(), Vec::new()).unwrap();
-        let zero = FamilyScope::new(
-            vec![
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(0),
-                    IntExpr::constant(2),
-                    IntExpr::constant(4),
-                )
-                .unwrap(),
-            ],
-            vec![IntExpr::constant(0)],
-        )
-        .unwrap();
-        let nonzero = FamilyScope::new(
-            vec![
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(1),
-                    IntExpr::constant(2),
-                    IntExpr::constant(4),
-                )
-                .unwrap(),
-            ],
-            vec![IntExpr::constant(1)],
-        )
-        .unwrap();
-        let nested_a = FamilyScope::new(
-            vec![
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(2),
-                    IntExpr::constant(3),
-                    IntExpr::constant(8),
-                )
-                .unwrap(),
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(1),
-                    IntExpr::constant(2),
-                    IntExpr::constant(4),
-                )
-                .unwrap(),
-            ],
-            vec![IntExpr::constant(2), IntExpr::constant(1)],
-        )
-        .unwrap();
-        let nested_b = FamilyScope::new(
-            vec![
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(3),
-                    IntExpr::constant(3),
-                    IntExpr::constant(8),
-                )
-                .unwrap(),
-                crate::program::FamilyRange::bounded(
-                    IntExpr::constant(1),
-                    IntExpr::constant(2),
-                    IntExpr::constant(4),
-                )
-                .unwrap(),
-            ],
-            vec![IntExpr::constant(3), IntExpr::constant(1)],
-        )
-        .unwrap();
-
-        let root_name = lut_helper_artifact_name(origin, &root);
-        let zero_name = lut_helper_artifact_name(origin, &zero);
-        let nonzero_name = lut_helper_artifact_name(origin, &nonzero);
-        let nested_a_name = lut_helper_artifact_name(origin, &nested_a);
-        let nested_b_name = lut_helper_artifact_name(origin, &nested_b);
-
-        assert_ne!(root_name, zero_name);
-        assert_ne!(zero_name, nonzero_name);
-        assert_ne!(nested_a_name, nested_b_name);
-        assert!(nested_a_name.contains("start=Const(2)"));
-        assert!(nested_a_name.contains("count=Const(3)"));
-        assert!(nested_a_name.contains("start=Const(1)"));
-        assert!(nested_a_name.contains("count=Const(2)"));
+    fn projection_helper_keys_include_unused_luts_and_deduplicate() {
+        let parameters = helper_test_parameters();
+        let program = helper_test_program(0);
+        let keys = canonical_lut_helper_keys(&parameters, &program.encryption_inputs()).unwrap();
+        assert!(!keys.is_empty(), "an unused registered LUT is still in the projection");
+        assert_eq!(keys.iter().filter(|(level, _)| *level == 0).count(), 2);
+        assert_eq!(keys.iter().filter(|(level, _)| *level == 1).count(), 2);
+        assert!(keys.iter().any(|(level, _)| *level == 0));
+        assert!(keys.iter().any(|(level, _)| *level == 1));
     }
 
     #[test]
-    fn artifact_binding_rejects_duplicate_or_empty_lut_helper_metadata() {
-        let mut binding = RnsBggArtifactBinding::new(
-            [0; 32],
-            ExponentLutProgramId::from_digest([1; 32]),
-            [2; 32],
-            Vec::new(),
-        )
-        .unwrap();
-        assert!(matches!(
-            binding.clone().with_lut_helper(crate::program::WireId(3), 0, 0),
-            Err(RnsBggError::Binding("LUT helper metadata is not unique"))
-        ));
-        binding = binding.with_lut_helper(crate::program::WireId(3), 0, 1).unwrap();
-        assert!(matches!(
-            binding.with_lut_helper(crate::program::WireId(3), 0, 1),
-            Err(RnsBggError::Binding("LUT helper metadata is not unique"))
-        ));
+    fn projection_helper_keys_ignore_body_and_keep_equal_physical_levels_distinct() {
+        let parameters = helper_test_parameters();
+        let unused = helper_test_program(0);
+        let used = helper_test_program(2);
+        let unused_projection = unused.encryption_inputs();
+        let used_projection = used.encryption_inputs();
+        assert_eq!(
+            canonical_lut_helper_keys(&parameters, &unused_projection).unwrap(),
+            canonical_lut_helper_keys(&parameters, &used_projection).unwrap()
+        );
+        assert_eq!(
+            encryption_projection_identity(
+                &unused_projection,
+                &mxx_ir_core::ParamEnv::default(),
+                &parameters,
+            )
+            .unwrap(),
+            encryption_projection_identity(
+                &used_projection,
+                &mxx_ir_core::ParamEnv::default(),
+                &parameters,
+            )
+            .unwrap()
+        );
+        let keys = canonical_lut_helper_keys(&parameters, &unused_projection).unwrap();
+        assert!(keys.contains(&(0, 1)));
+        assert!(keys.contains(&(1, 1)));
+    }
+
+    #[test]
+    fn stage_descriptors_are_distinct_compile_time_types() {
+        use std::any::TypeId;
+
+        assert_ne!(
+            TypeId::of::<RnsBggPreprocessEncryptDescriptor>(),
+            TypeId::of::<RnsBggPreprocessOnlineDescriptor>()
+        );
+        assert_ne!(
+            TypeId::of::<RnsBggPreprocessEncryptDescriptor>(),
+            TypeId::of::<RnsBggEncryptionDescriptor>()
+        );
+        assert_ne!(
+            TypeId::of::<RnsBggPreprocessOnlineDescriptor>(),
+            TypeId::of::<RnsBggEncryptionDescriptor>()
+        );
     }
 }

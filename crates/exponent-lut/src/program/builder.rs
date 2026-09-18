@@ -1,7 +1,23 @@
 use super::*;
 
 /// Mutable construction session for an immutable program.
-pub(crate) struct ExponentLutProgramBuilder {
+///
+/// The builder allocates all program identifiers and validates every operation
+/// before [`finish`](Self::finish) produces the immutable program. Identifier
+/// constructors and the builder's bookkeeping remain private.
+///
+/// ```
+/// use mxx_exponent_lut::program::{AttributeKnowledge, ExponentLutProgramBuilder, Operand};
+///
+/// let mut builder = ExponentLutProgramBuilder::new();
+/// let private = builder.input(AttributeKnowledge::PrivatePayload)?;
+/// let public = builder.input(AttributeKnowledge::PublicPayload)?;
+/// let output = builder.mul_public(Operand::Scalar(private), Operand::Scalar(public))?;
+/// let program = builder.finish(vec![Operand::Scalar(output)])?;
+/// assert_eq!(program.outputs(), &[Operand::Scalar(output)]);
+/// # Ok::<(), mxx_exponent_lut::program::ProgramValidationError>(())
+/// ```
+pub struct ExponentLutProgramBuilder {
     pub(crate) inputs: BTreeMap<WireId, ProgramInputDeclaration>,
     pub(crate) rhs_inputs: BTreeMap<RhsId, InputShape>,
     pub(crate) luts: Vec<LutTable>,
@@ -13,7 +29,7 @@ pub(crate) struct ExponentLutProgramBuilder {
 }
 
 impl ExponentLutProgramBuilder {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inputs: BTreeMap::new(),
             rhs_inputs: BTreeMap::new(),
@@ -45,7 +61,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn input(
+    pub fn input(
         &mut self,
         knowledge: AttributeKnowledge,
     ) -> Result<WireId, ProgramValidationError> {
@@ -58,7 +74,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn input_family(
+    pub fn input_family(
         &mut self,
         count: IntExpr,
         knowledge: AttributeKnowledge,
@@ -74,7 +90,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn rhs_input(&mut self) -> Result<RhsId, ProgramValidationError> {
+    pub fn rhs_input(&mut self) -> Result<RhsId, ProgramValidationError> {
         if self.bodies.len() != 1 {
             return Err(ProgramValidationError::InputInNestedBody);
         }
@@ -83,7 +99,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn rhs_family(&mut self, count: IntExpr) -> Result<RhsId, ProgramValidationError> {
+    pub fn rhs_family(&mut self, count: IntExpr) -> Result<RhsId, ProgramValidationError> {
         if self.bodies.len() != 1 {
             return Err(ProgramValidationError::InputInNestedBody);
         }
@@ -94,10 +110,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn register_lut(
-        &mut self,
-        table: LutTable,
-    ) -> Result<LutId, ProgramValidationError> {
+    pub fn register_lut(&mut self, table: LutTable) -> Result<LutId, ProgramValidationError> {
         validate_table(&table)?;
         let id =
             LutId(u32::try_from(self.luts.len()).map_err(|_| ProgramValidationError::IdExhausted)?);
@@ -107,18 +120,25 @@ impl ExponentLutProgramBuilder {
 
     /// Register a binary convenience table as the unary table consumed by the
     /// Program. Values use index `lhs + lhs_width * rhs`, with the RHS domain
-    /// outermost; the two input widths do not survive in Program metadata.
-    pub(crate) fn register_binary_lut(
+    /// outermost. The explicit input layout is retained in Program metadata.
+    pub fn register_binary_lut(
         &mut self,
         lhs_width: usize,
         rhs_width: usize,
+        input_layout: ExpLayout,
         output_width: usize,
         values: Vec<usize>,
         output_representation: LutOutputRepresentation,
     ) -> Result<LutId, ProgramValidationError> {
         let input_width =
             lhs_width.checked_mul(rhs_width).ok_or(ProgramValidationError::InvalidLut)?;
-        self.register_lut(LutTable::new(input_width, output_width, values, output_representation)?)
+        self.register_lut(LutTable::new(
+            input_width,
+            input_layout,
+            output_width,
+            values,
+            output_representation,
+        )?)
     }
 
     fn operand_wire(&self, operand: &Operand<WireId>) -> Result<bool, ProgramValidationError> {
@@ -168,7 +188,7 @@ impl ExponentLutProgramBuilder {
         Ok(id)
     }
 
-    pub(crate) fn add(
+    pub fn add(
         &mut self,
         lhs: Operand<WireId>,
         rhs: Operand<WireId>,
@@ -180,22 +200,21 @@ impl ExponentLutProgramBuilder {
         self.output(false, Step::Add { lhs, rhs, output })
     }
 
-    /// Append a public multiplication in the canonical private-first order.
-    /// Immutable-program validation rejects a call whose first operand is
-    /// public or whose second operand is private.
-    pub(crate) fn mul_public(
+    /// Append a public multiplication.  The right operand must be public;
+    /// the left operand may have either knowledge class.
+    pub fn mul_public(
         &mut self,
-        private: Operand<WireId>,
+        lhs: Operand<WireId>,
         public: Operand<WireId>,
     ) -> Result<WireId, ProgramValidationError> {
-        if self.operand_wire(&private)? || self.operand_wire(&public)? {
+        if self.operand_wire(&lhs)? || self.operand_wire(&public)? {
             return Err(ProgramValidationError::ExpectedScalarWire(WireId(0)));
         }
         let output = self.wire()?;
-        self.output(false, Step::MulPublic { private, public, output })
+        self.output(false, Step::MulPublic { private: lhs, public, output })
     }
 
-    pub(crate) fn mul_private(
+    pub fn mul_private(
         &mut self,
         input: Operand<WireId>,
         rhs: Operand<RhsId>,
@@ -210,7 +229,7 @@ impl ExponentLutProgramBuilder {
         self.output(false, Step::MulPrivate { input, rhs, output })
     }
 
-    pub(crate) fn lut(
+    pub fn lut(
         &mut self,
         input: Operand<WireId>,
         table: LutId,
@@ -225,7 +244,7 @@ impl ExponentLutProgramBuilder {
         self.output(false, Step::Lut { input, table, output })
     }
 
-    pub(crate) fn parallel(
+    pub fn parallel(
         &mut self,
         range: FamilyRange,
         body: impl FnOnce(&mut Self, IntExpr) -> Result<Operand<WireId>, ProgramValidationError>,
@@ -286,7 +305,7 @@ impl ExponentLutProgramBuilder {
         self.rhs_kinds = snapshot.5;
     }
 
-    pub(crate) fn sum(&mut self, family: WireId) -> Result<WireId, ProgramValidationError> {
+    pub fn sum(&mut self, family: WireId) -> Result<WireId, ProgramValidationError> {
         if self.wire_kinds.get(&family) != Some(&true) {
             return Err(ProgramValidationError::ExpectedFamilyWire(family));
         }
@@ -294,7 +313,7 @@ impl ExponentLutProgramBuilder {
         self.output(false, Step::Sum { family, output })
     }
 
-    pub(crate) fn finish(
+    pub fn finish(
         mut self,
         outputs: Vec<Operand<WireId>>,
     ) -> Result<ExponentLutProgram, ProgramValidationError> {

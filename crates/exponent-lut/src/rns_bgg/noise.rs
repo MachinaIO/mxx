@@ -25,6 +25,7 @@ use crate::{
         WireId,
     },
 };
+use bigdecimal::BigDecimal;
 use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
 use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
 use num_bigint::{BigInt, BigUint};
@@ -51,6 +52,21 @@ mod bigdecimal_string {
         let value = String::deserialize(deserializer)?;
         BigDecimal::from_str(&value).map_err(serde::de::Error::custom)
     }
+}
+
+fn encoding_variance_from_sigma(sigma: &BigDecimal) -> NonnegativeRational {
+    let (mut numerator, exponent) = sigma.as_bigint_and_exponent();
+    let denominator = if exponent >= 0 {
+        BigUint::from(10u8).pow(exponent as u32)
+    } else {
+        numerator *= BigInt::from(10u8).pow((-exponent) as u32);
+        BigUint::one()
+    };
+    NonnegativeRational::new(
+        numerator.to_biguint().expect("positive encoding sigma").pow(2),
+        denominator.pow(2),
+    )
+    .expect("positive encoding sigma variance")
 }
 
 fn ceil_div_nonnegative(numerator: &BigUint, denominator: &BigUint) -> BigUint {
@@ -231,8 +247,7 @@ impl RnsBggNoiseBindings {
 
 impl RnsBggParameters {
     /// Check the terminal coefficient representation after its single final
-    /// ModDown.  Coefficient LUTs do not use the exponent recurrence's
-    /// intermediate spacing rule.
+    /// ModDown using the q/4 correctness threshold.
     pub fn coefficient_output_noise_fits(
         &self,
         level: usize,
@@ -281,11 +296,11 @@ impl RnsBggParameters {
         })
     }
 
-    /// Check the deterministic spacing and terminal residual bounds.
+    /// Check the deterministic q/4 correctness threshold and q/2 message
+    /// scaling condition.
     pub fn noise_fits(&self, level: usize, noise: &RnsBggNoiseBound) -> Result<bool, RnsBggError> {
         let q = self.level(level)?.modulus();
-        let multiplier = if level + 1 == self.levels().len() { 4u8 } else { 8u8 };
-        Ok(q.as_ref() > &(&noise.error * multiplier) &&
+        Ok(q.as_ref() > &(&noise.error * 4u8) &&
             (level + 1 == self.levels().len() ||
                 self.scale(level)? == &BigUint::one() ||
                 self.scale(level)? > &(&noise.error * 2u8)))
@@ -491,18 +506,7 @@ impl RnsBggParameters {
     /// is squared. This value is used by conditional moment propagation only;
     /// deterministic acceptance continues to use the hard cutoff.
     pub fn encoding_error_variance(&self) -> NonnegativeRational {
-        let (mut numerator, exponent) = self.encoding_error_sigma.as_bigint_and_exponent();
-        let denominator = if exponent >= 0 {
-            BigUint::from(10u8).pow(exponent as u32)
-        } else {
-            numerator *= BigInt::from(10u8).pow((-exponent) as u32);
-            BigUint::one()
-        };
-        NonnegativeRational::new(
-            numerator.to_biguint().expect("positive encoding sigma").pow(2),
-            denominator.pow(2),
-        )
-        .expect("positive encoding sigma variance")
+        encoding_variance_from_sigma(&self.encoding_error_sigma)
     }
 
     /// Physical-coordinate variance transfer for the direct product's four
@@ -723,6 +727,51 @@ impl RnsBggNoiseValue {
             provenance: BTreeMap::new(),
             heuristics: NoiseHeuristicLedger::new(),
         }
+    }
+
+    /// Construct a fresh encoding-error carrier with the configured Gaussian
+    /// moment model.  The deterministic cutoff is retained in `bound`, while
+    /// the conditional model records a zero mean and the exact configured
+    /// variance.  `source` is caller-owned stable context (for example an
+    /// input wire label), so repeated uses of the same encoding sample can be
+    /// represented as a shared provenance source by later composition.
+    pub fn sampled_encoding_sigma(
+        sigma: &BigDecimal,
+        source: &[u8],
+        coefficients: &[BigInt],
+    ) -> Result<Self, RnsBggError> {
+        let sigma = super::canonical_encoding_sigma(sigma.clone())?;
+        let source = stable_source_id(&(b"rns-bgg/encoding", source));
+        Ok(Self {
+            bound: RnsBggNoiseBound {
+                error: super::encoding_error_bound(&sigma)?,
+                payload_l1: coefficients.iter().map(|c| c.magnitude()).sum(),
+            },
+            payload_l2_squared: coefficients.iter().map(|c| c.magnitude().pow(2)).sum(),
+            moments: Some(NoiseMoments {
+                mean_numerator: BigInt::zero(),
+                mean_denominator: BigUint::one(),
+                mean_radius: NonnegativeRational::zero(),
+                variance: encoding_variance_from_sigma(&sigma),
+            }),
+            provenance: BTreeMap::from([(
+                source,
+                NoiseSourceProvenance { source, route: Vec::new() },
+            )]),
+            heuristics: NoiseHeuristicLedger::new(),
+        })
+    }
+
+    /// Construct a fresh encoding-error carrier with a parameter set's
+    /// already-validated sigma.  This is a convenience wrapper around
+    /// [`Self::sampled_encoding_sigma`].
+    pub fn sampled_encoding(
+        parameters: &RnsBggParameters,
+        source: &[u8],
+        coefficients: &[BigInt],
+    ) -> Self {
+        Self::sampled_encoding_sigma(&parameters.encoding_error_sigma, source, coefficients)
+            .expect("validated encoding sigma")
     }
 
     /// Convert a public-role noise carrier along the same alignment transfer
@@ -1459,6 +1508,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         self.trace.dependencies.nodes.push(crate::noise_utils::NoiseDependencyNode::Binding(
             crate::noise_utils::NoiseBinding::GateHelper(wire),
         ));
+        self.trace.node_event_counts.insert(node.0, BigUint::zero());
         node
     }
 
@@ -1474,6 +1524,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             lhs,
             rhs,
         });
+        self.trace.node_event_counts.insert(node.0, BigUint::zero());
         node
     }
 
@@ -1652,18 +1703,37 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
         )
     }
 
+    fn event_coordinates(&self, wire: WireId) -> Result<BigUint, RnsBggError> {
+        let level = self.level(wire)?;
+        Ok(BigUint::from(self.parameters.level(level)?.ring_dimension()) *
+            2u8 *
+            BigUint::from(self.parameters.component_columns(level)?))
+    }
+
+    fn operation_node_with_multiplier(
+        &mut self,
+        wire: WireId,
+        value: RnsBggNoiseValue,
+        node: crate::noise_utils::NoiseDependencyNode,
+        multiplier: BigUint,
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
+        let coordinates = self.event_coordinates(wire)?;
+        self.trace.wires.insert(wire, value.clone());
+        let node_id = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
+        self.trace.dependencies.nodes.push(node);
+        self.trace.dependencies.wires.insert(wire, node_id);
+        self.trace.node_event_counts.insert(node_id.0, multiplier * coordinates);
+        self.add_events(&BigUint::one());
+        Ok((wire, value))
+    }
+
     fn operation_node(
         &mut self,
         wire: WireId,
         value: RnsBggNoiseValue,
         node: crate::noise_utils::NoiseDependencyNode,
-    ) -> (WireId, RnsBggNoiseValue) {
-        self.trace.wires.insert(wire, value.clone());
-        let node_id = crate::noise_utils::NoiseNodeId(self.trace.dependencies.nodes.len());
-        self.trace.dependencies.nodes.push(node);
-        self.trace.dependencies.wires.insert(wire, node_id);
-        self.add_events(&BigUint::one());
-        (wire, value)
+    ) -> Result<(WireId, RnsBggNoiseValue), RnsBggError> {
+        self.operation_node_with_multiplier(wire, value, node, self.event_multiplier.clone())
     }
 
     fn merge_refresh_trace(&mut self, other: &RnsBggNoiseTrace) {
@@ -1723,6 +1793,9 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             };
             self.trace.dependencies.nodes.push(node);
         }
+        for (node, count) in &other.node_event_counts {
+            self.trace.node_event_counts.insert(node + offset, count.clone());
+        }
         for (wire, node) in &other.dependencies.wires {
             self.trace
                 .dependencies
@@ -1761,6 +1834,7 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             range: family.range.clone(),
         });
         self.trace.dependencies.wires.insert(wire, node);
+        self.trace.node_event_counts.insert(node.0, n.clone() * self.event_coordinates(wire)?);
         self.add_events(&n);
         Ok((wire, value))
     }
@@ -2311,9 +2385,11 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             )))?;
         self.trace.dependencies.wires.insert(source_wire, dependency);
         self.trace.wires.insert(source_wire, refreshed.clone());
-        self.trace.joint_event_count += BigUint::from(
+        let refresh_events = BigUint::from(
             topology.joint_event_count().map_err(|error| RnsBggError::Graph(error.to_string()))?,
         );
+        self.trace.node_event_counts.insert(dependency.0, refresh_events.clone());
+        self.trace.joint_event_count += refresh_events;
         self.trace.refreshed_target_level = Some(declaration.target_level());
         self.trace.refreshed_declaration_commitment = Some(*declaration.commitment());
         self.trace.refreshed_target_modulus = Some(target_modulus.as_ref().clone());
@@ -2381,6 +2457,10 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
                         .insert(source, NoiseSourceProvenance { source, route: vec![level] });
                 }
                 self.add_events(&BigUint::one());
+                if let Some(node) = self.trace.dependencies.wires.get(&wire).copied() {
+                    let coordinates = self.event_coordinates(wire)?;
+                    *self.trace.node_event_counts.entry(node.0).or_default() += coordinates;
+                }
                 self.finalized_coefficient_wires.insert(wire, value.clone());
             }
             finalized.push(value);
@@ -2500,7 +2580,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             lhs: self.node_for_wire(lhs.0)?,
             rhs: self.node_for_wire(rhs.0)?,
         };
-        Ok(self.operation_node(wire, value, node))
+        self.operation_node(wire, value, node)
     }
     fn mul_public(
         &mut self,
@@ -2566,7 +2646,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             lhs: self.node_for_wire(lhs.0)?,
             rhs: self.node_for_wire(rhs.0)?,
         };
-        Ok(self.operation_node(wire, value, node))
+        self.operation_node(wire, value, node)
     }
     fn mul_private(
         &mut self,
@@ -2640,7 +2720,7 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             rhs: self.rhs_node(rhs),
             helper: None,
         };
-        Ok(self.operation_node(wire, value, node))
+        self.operation_node(wire, value, node)
     }
     fn lut(&mut self, input: &Self::Wire, table: &LutTable) -> Result<Self::Wire, Self::Error> {
         if self
@@ -2734,7 +2814,12 @@ impl ExponentLUTProgramLowering for RnsBggNoiseEvaluator<'_> {
             input: self.node_for_wire(input.0)?,
             helper: None,
         };
-        Ok(self.operation_node(wire, value, node))
+        self.operation_node_with_multiplier(
+            wire,
+            value,
+            node,
+            self.event_multiplier.clone() * BigUint::from(table.values().len()),
+        )
     }
 }
 
@@ -2760,6 +2845,11 @@ pub struct RnsBggNoiseTrace {
     pub dependencies: crate::noise_utils::NoiseDependencyGraph,
     /// Raw symbolic wire values.
     pub wires: BTreeMap<WireId, RnsBggNoiseValue>,
+    /// Physical event budget for each dependency node. A family body and LUT
+    /// branch set are represented once in the symbolic trace, so their active
+    /// multiplicities are expanded before this map is recorded. Refresh
+    /// transcript nodes store their already-expanded physical event count.
+    pub node_event_counts: BTreeMap<usize, BigUint>,
     /// Finalized declared outputs in declaration order.
     pub outputs: Vec<RnsBggNoiseValue>,
     /// Target logical level of the most recently composed refresh output.
@@ -2831,6 +2921,14 @@ pub fn trace_program(
             crate::noise_utils::NoiseBinding::Input(*wire),
         ));
         evaluator.trace.dependencies.wires.insert(*wire, node);
+        let multiplicity = match binding {
+            InputBinding::Scalar(_) => BigUint::one(),
+            InputBinding::Family(family) => {
+                family.validate_support().map_err(|error| ProgramLowerError::Backend(error))?
+            }
+        };
+        let coordinates = evaluator.event_coordinates(*wire).map_err(ProgramLowerError::Backend)?;
+        evaluator.trace.node_event_counts.insert(node.0, multiplicity * coordinates);
     }
     let mut families = RnsBggNoiseFamilies;
     let outputs =
@@ -2932,6 +3030,7 @@ fn trace_commitment(trace: &RnsBggNoiseTrace) -> [u8; 32] {
         &trace.z_squared,
         &trace.dependencies,
         &trace.wires,
+        &trace.node_event_counts,
         &trace.outputs,
         &trace.joint_event_count,
         &trace.refreshed_target_level,
@@ -2943,74 +3042,16 @@ fn trace_commitment(trace: &RnsBggNoiseTrace) -> [u8; 32] {
     ))
 }
 
-impl RnsBggParameters {
-    /// Evaluate the selected Program noise contract and terminal envelopes.
-    pub fn audit_program(
-        &self,
-        program: &ExponentLutProgram,
-        bindings: &RnsBggNoiseBindings,
-        terminal_value_bounds: &[BigUint],
-        average: Option<&crate::noise_refresh::simulation::AverageCaseConfig>,
-    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
-        if terminal_value_bounds.len() != program.outputs().len() {
-            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
-        }
-        let mut trace = trace_program(self, program, bindings).map_err(|error| match error {
-            ProgramLowerError::Backend(error) => error,
-            ProgramLowerError::Program(error) => RnsBggError::Graph(error.to_string()),
-            ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
-            ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
-        })?;
-        let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
-        for ((index, output), terminal_bound) in
-            program.outputs().iter().enumerate().zip(terminal_value_bounds)
-        {
-            let wire = match output {
-                crate::program::Operand::Scalar(id) |
-                crate::program::Operand::Member { family: id, .. } => *id,
-            };
-            let value = trace
-                .outputs
-                .get(index)
-                .ok_or(RnsBggError::Graph("missing audited output".into()))?;
-            let level = workload.level(wire)?;
-            let fits = if program
-                .wire_is_coefficient_output(wire)
-                .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
-            {
-                self.coefficient_output_noise_fits(level, value)?
-            } else {
-                self.noise_fits(level, &value.bound)?
-            };
-            if !fits {
-                return Err(RnsBggError::Budget(
-                    "evaluation noise does not fit the selected modulus",
-                ));
-            }
-            if &value.bound.payload_l1 > terminal_bound {
-                return Err(RnsBggError::Budget("terminal payload exceeds declared bound"));
-            }
-        }
-        let events = trace.joint_event_count.clone().max(BigUint::one());
-        match average {
-            Some(config) if config.allow_average_acceptance => {
-                trace.acceptance = Some(NoiseModelKind::AverageCase);
-                trace.z_squared =
-                    Some(config.z_squared_for_events(&events).map_err(|_| {
-                        RnsBggError::Parameters("invalid average-case event count")
-                    })?);
-            }
-            _ => trace.acceptance = Some(NoiseModelKind::WorstCase),
-        }
-        Ok(trace)
-    }
+fn average_event_budget(trace: &RnsBggNoiseTrace) -> Result<BigUint, RnsBggError> {
+    let events = trace.node_event_counts.values().sum::<BigUint>();
+    Ok(events.max(BigUint::one()))
+}
 
-    /// Construct a deterministic chain from the Program's actual logical levels.
-    pub fn plan_program(
+impl RnsBggParameters {
+    fn construct_program_parameters(
         request: &RnsBggPlanRequest,
         program: &ExponentLutProgram,
-        bindings: &RnsBggNoiseBindings,
-    ) -> Result<(Self, RnsBggParameterManifest), RnsBggError> {
+    ) -> Result<Self, RnsBggError> {
         if request.operations_per_drop == 0 ||
             request.terminal_depth == 0 ||
             request.max_crt_depth < request.terminal_depth
@@ -3043,11 +3084,154 @@ impl RnsBggParameters {
                     .ok_or(RnsBggError::Parameters("invalid prime basis"))?,
             );
         }
-        let parameters = RnsBggParameters::new(
+        RnsBggParameters::new(
             levels,
             request.encoding_error_sigma.clone(),
             request.operations_per_drop,
-        )?;
+        )
+    }
+
+    /// Evaluate the selected Program noise contract and terminal envelopes.
+    pub fn audit_program(
+        &self,
+        program: &ExponentLutProgram,
+        bindings: &RnsBggNoiseBindings,
+        terminal_value_bounds: &[BigUint],
+        average: Option<&crate::noise_refresh::simulation::AverageCaseConfig>,
+    ) -> Result<RnsBggNoiseTrace, RnsBggError> {
+        if terminal_value_bounds.len() != program.outputs().len() {
+            return Err(RnsBggError::Parameters("terminal bounds must match declared outputs"));
+        }
+        let mut trace = trace_program(self, program, bindings).map_err(|error| match error {
+            ProgramLowerError::Backend(error) => error,
+            ProgramLowerError::Program(error) => RnsBggError::Graph(error.to_string()),
+            ProgramLowerError::Dsl(error) => RnsBggError::Graph(error.to_string()),
+            ProgramLowerError::UnsupportedStructure { reason } => RnsBggError::Graph(reason),
+        })?;
+        let workload = RnsBggDerivedWorkload::from_program_with_parameters(self, program)?;
+        let average = average.filter(|config| config.allow_average_acceptance);
+        let z_squared = average
+            .map(|config| {
+                let events = average_event_budget(&trace)?;
+                let z_squared = config
+                    .z_squared_for_events(&events)
+                    .map_err(|_| RnsBggError::Parameters("invalid average-case event count"))?;
+                let correction = config
+                    .tail_correction_bits
+                    .checked_mul(2)
+                    .ok_or(RnsBggError::Parameters("invalid average-case tail correction"))?;
+                Ok::<_, RnsBggError>(z_squared.scaled(&(BigUint::one() << correction)))
+            })
+            .transpose()?;
+
+        if let Some(z_squared) = z_squared.as_ref() {
+            let mut values = BTreeMap::<usize, (WireId, &RnsBggNoiseValue)>::new();
+            for (wire, value) in &trace.wires {
+                let node =
+                    trace.dependencies.wires.get(wire).ok_or_else(|| {
+                        RnsBggError::Graph("noise dependency node is missing".into())
+                    })?;
+                values.entry(node.0).or_insert((*wire, value));
+            }
+            for (wire, value) in values.values() {
+                let moments = value
+                    .moments
+                    .as_ref()
+                    .ok_or(RnsBggError::Parameters("average-case input moment model is missing"))?;
+                let level = workload.level(*wire)?;
+                let modulus_limit = NonnegativeRational::new(
+                    self.level(level)?.modulus().as_ref().clone(),
+                    4u8.into(),
+                )
+                .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
+                let scale_fits = level + 1 == self.levels.len() ||
+                    self.scale(level)? == &BigUint::one() ||
+                    moments.fits(
+                        &NonnegativeRational::new(self.scale(level)?.clone(), 2u8.into()).map_err(
+                            |_| RnsBggError::Parameters("invalid average-case rational budget"),
+                        )?,
+                        z_squared,
+                    );
+                if !moments.fits(&modulus_limit, z_squared) || !scale_fits {
+                    return Err(RnsBggError::Budget("evaluation noise"));
+                }
+            }
+        }
+
+        for ((index, output), terminal_bound) in
+            program.outputs().iter().enumerate().zip(terminal_value_bounds)
+        {
+            let wire = match output {
+                crate::program::Operand::Scalar(id) |
+                crate::program::Operand::Member { family: id, .. } => *id,
+            };
+            let value = trace
+                .outputs
+                .get(index)
+                .ok_or(RnsBggError::Graph("missing audited output".into()))?;
+            if let Some(z_squared) = z_squared.as_ref() {
+                let moments = value
+                    .moments
+                    .as_ref()
+                    .ok_or(RnsBggError::Parameters("average-case input moment model is missing"))?;
+                let level = workload.level(wire)?;
+                let modulus = if program
+                    .wire_is_coefficient_output(wire)
+                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
+                {
+                    self.levels
+                        .get(level + 1)
+                        .or_else(|| self.levels.get(level))
+                        .ok_or(RnsBggError::Parameters("level outside modulus chain"))?
+                        .modulus()
+                } else {
+                    self.level(level)?.modulus()
+                };
+                let payload = terminal_bound * 2u8;
+                if modulus.as_ref() <= &payload {
+                    return Err(RnsBggError::Budget("terminal range"));
+                }
+                let modulus_limit = NonnegativeRational::new(modulus.as_ref().clone(), 4u8.into())
+                    .map_err(|_| RnsBggError::Parameters("invalid average-case rational budget"))?;
+                if !moments.fits(&modulus_limit, z_squared) {
+                    return Err(RnsBggError::Budget("terminal range"));
+                }
+            } else {
+                let level = workload.level(wire)?;
+                let fits = if program
+                    .wire_is_coefficient_output(wire)
+                    .map_err(|_| RnsBggError::Graph("invalid coefficient output".into()))?
+                {
+                    self.coefficient_output_noise_fits(level, value)?
+                } else {
+                    self.noise_fits(level, &value.bound)?
+                };
+                if !fits {
+                    return Err(RnsBggError::Budget(
+                        "evaluation noise does not fit the selected modulus",
+                    ));
+                }
+            }
+            if &value.bound.payload_l1 > terminal_bound {
+                return Err(RnsBggError::Budget("terminal payload exceeds declared bound"));
+            }
+        }
+        trace.acceptance = Some(if z_squared.is_some() {
+            NoiseModelKind::AverageCase
+        } else {
+            NoiseModelKind::WorstCase
+        });
+        trace.z_squared = z_squared;
+        Ok(trace)
+    }
+
+    /// Construct a deterministic chain from the Program's actual logical levels.
+    pub fn plan_program(
+        request: &RnsBggPlanRequest,
+        program: &ExponentLutProgram,
+        bindings: &RnsBggNoiseBindings,
+    ) -> Result<(Self, RnsBggParameterManifest), RnsBggError> {
+        let parameters = Self::construct_program_parameters(request, program)?;
         let trace = parameters.audit_program(
             program,
             bindings,
@@ -3098,28 +3282,34 @@ impl RnsBggParameters {
             let mut candidate = request.clone();
             candidate.max_crt_depth = depth;
             candidate.terminal_value_bound = trial_bound.clone();
-            let Ok((parameters, mut manifest)) = Self::plan_program(&candidate, program, bindings)
-            else {
+            let Ok(parameters) = Self::construct_program_parameters(&candidate, program) else {
                 continue;
             };
             match parameters.audit_program(program, bindings, terminal_value_bounds, average) {
                 Ok(trace) => {
-                    manifest.request = candidate;
-                    manifest.average = average.cloned();
-                    manifest.noise_contract_commitment = noise_contract_commitment(
+                    let noise_contract_commitment = noise_contract_commitment(
                         program,
                         bindings,
                         terminal_value_bounds,
                         average,
                     );
-                    manifest.trace_commitment = trace_commitment(&trace);
-                    manifest.trace = trace;
-                    manifest.parameter_commitment = parameter_commitment(
-                        &manifest.request,
-                        &parameters,
-                        program,
-                        manifest.noise_contract_commitment,
-                    );
+                    let manifest = RnsBggParameterManifest {
+                        request: candidate.clone(),
+                        program: program.id(),
+                        noise_contract_commitment,
+                        parameter_commitment: parameter_commitment(
+                            &candidate,
+                            &parameters,
+                            program,
+                            noise_contract_commitment,
+                        ),
+                        levels: parameters.levels().iter().map(|level| level.to_crt().0).collect(),
+                        base_bits: parameters.levels().iter().map(PolyParams::base_bits).collect(),
+                        trace_commitment: trace_commitment(&trace),
+                        trace,
+                        average: average.cloned(),
+                        estimated_artifact_bytes: parameter_artifact_bytes(&parameters),
+                    };
                     return Ok((parameters, manifest));
                 }
                 Err(error) => last_error = error,
@@ -3217,7 +3407,7 @@ pub struct RnsNoiseBuild<'a> {
         (WireId, RnsBggNoiseFamily),
         (RhsId, FamilyRange),
     >,
-    refresh_prf: Option<(usize, [u8; 32])>,
+    refresh_prf: Option<(usize, [u8; 32], [u8; 32])>,
     pending_refresh: Option<(usize, (WireId, RnsBggNoiseValue))>,
 }
 
@@ -3286,6 +3476,12 @@ impl<'a> RnsNoiseBuild<'a> {
                 ),
             );
             evaluator.trace.dependencies.wires.insert(*wire, node);
+            let multiplicity = match binding {
+                InputBinding::Scalar(_) => BigUint::one(),
+                InputBinding::Family(family) => family.validate_support()?,
+            };
+            let coordinates = evaluator.event_coordinates(*wire)?;
+            evaluator.trace.node_event_counts.insert(node.0, multiplicity * coordinates);
         }
         Ok(Self {
             evaluator: Some(evaluator),
@@ -3310,6 +3506,15 @@ impl<'a> RnsNoiseBuild<'a> {
         }
         let evaluator =
             self.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        evaluator.parameters.validate_refresh_prf_schedule(declaration, slot)?;
+        let source_q = declaration
+            .slots()
+            .get(slot)
+            .and_then(|slot| slot.q.to_biguint())
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        if evaluator.parameters.level(0)?.modulus().as_ref() != &source_q {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+        }
         if evaluator.program.id() != declaration.prepared().program().id() {
             return Err(RnsBggError::Refresh(RefreshError::Commitment));
         }
@@ -3321,7 +3526,8 @@ impl<'a> RnsNoiseBuild<'a> {
         if self.refresh_prf.is_some() {
             return Err(RnsBggError::Binding("refresh PRF is already bound"));
         }
-        self.refresh_prf = Some((slot, *declaration.commitment()));
+        self.refresh_prf =
+            Some((slot, *declaration.commitment(), evaluator.parameters.parameter_identity()));
         Ok(())
     }
 
@@ -3332,8 +3538,13 @@ impl<'a> RnsNoiseBuild<'a> {
         &mut self,
         declaration: &RefreshDeclaration,
     ) -> Result<BTreeMap<PrfLabel, (WireId, RnsBggNoiseValue)>, RnsBggError> {
-        let (slot, commitment) =
+        let (slot, commitment, parameter_identity) =
             self.refresh_prf.ok_or(RnsBggError::Binding("refresh PRF is not bound"))?;
+        let evaluator =
+            self.evaluator.as_ref().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        if parameter_identity != evaluator.parameters.parameter_identity() {
+            return Err(RnsBggError::Binding("refresh PRF parameter identity changed"));
+        }
         if commitment != *declaration.commitment() || slot >= declaration.slots().len() {
             return Err(RnsBggError::Refresh(RefreshError::Commitment));
         }
@@ -3389,6 +3600,19 @@ impl<'a> RnsNoiseBuild<'a> {
         let mut channel_traces = Vec::with_capacity(channels.len());
         let evaluator =
             self.evaluator.as_mut().ok_or(RnsBggError::Binding("noise evaluator consumed"))?;
+        let source_level = evaluator.workload.level(declaration.source_output())?;
+        evaluator.parameters.validate_refresh_level_contract(declaration, source_level)?;
+        for (slot, channel) in &channels {
+            let expected_child_parameters =
+                evaluator.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
+            if channel.evaluator.as_ref().is_none_or(|child| {
+                child.parameters.parameter_identity() != expected_child_parameters
+            }) || channel.refresh_prf.map(|(_, _, identity)| identity) !=
+                Some(expected_child_parameters)
+            {
+                return Err(RnsBggError::Binding("refresh PRF child parameter identity mismatch"));
+            }
+        }
         let output = {
             let mut refresh = super::RnsBggRefresh::new(evaluator, inputs, declaration)?;
             crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
@@ -4133,6 +4357,127 @@ mod test {
             ));
             assert_eq!(second.provenance[&id].route.len(), 6);
         }
+    }
+
+    #[test]
+    fn sampled_encoding_exposes_zero_mean_variance_and_stable_provenance() {
+        let parameters = nested_alignment_parameters();
+        let first =
+            RnsBggNoiseValue::sampled_encoding(&parameters, b"input-0", &[1.into(), (-2).into()]);
+        let repeated =
+            RnsBggNoiseValue::sampled_encoding(&parameters, b"input-0", &[1.into(), (-2).into()]);
+        let distinct =
+            RnsBggNoiseValue::sampled_encoding(&parameters, b"input-1", &[1.into(), (-2).into()]);
+        let moments = first.moments.as_ref().expect("sampled encoding moments");
+
+        assert_eq!(moments.mean_numerator, BigInt::zero());
+        assert_eq!(moments.mean_denominator, BigUint::one());
+        assert_eq!(moments.mean_radius, NonnegativeRational::zero());
+        assert_eq!(moments.variance, parameters.encoding_error_variance());
+        assert_eq!(first.bound.error, *parameters.encoding_error_bound());
+        assert_eq!(first.provenance, repeated.provenance);
+        assert_ne!(first.provenance, distinct.provenance);
+    }
+
+    fn identity_program() -> (ExponentLutProgram, RnsBggParameters) {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let program = builder.finish(vec![crate::program::Operand::Scalar(input)]).unwrap();
+        (program, nested_alignment_parameters())
+    }
+
+    #[test]
+    fn average_case_can_accept_a_candidate_rejected_by_worst_case() {
+        let (program, parameters) = identity_program();
+        let mut input =
+            RnsBggNoiseValue::sampled_encoding(&parameters, b"average-input", &[1.into()]);
+        input.bound.error = parameters.level(0).unwrap().modulus().as_ref().clone() * 2u8;
+        let bindings = RnsBggNoiseBindings::from_inputs(&program, &[input], &[]).unwrap();
+        let terminal = [BigUint::one()];
+        assert!(parameters.audit_program(&program, &bindings, &terminal, None).is_err());
+        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+            failure_exponent: 1,
+            tail_correction_bits: 0,
+            allow_average_acceptance: true,
+        };
+        let trace =
+            parameters.audit_program(&program, &bindings, &terminal, Some(&average)).unwrap();
+        assert_eq!(trace.acceptance, Some(NoiseModelKind::AverageCase));
+    }
+
+    #[test]
+    fn average_case_rejects_missing_input_moments() {
+        let (program, parameters) = identity_program();
+        let bindings = RnsBggNoiseBindings::from_inputs(
+            &program,
+            &[RnsBggNoiseValue::public(BigUint::one(), &[1.into()])],
+            &[],
+        )
+        .unwrap();
+        let average = crate::noise_refresh::simulation::AverageCaseConfig {
+            failure_exponent: 1,
+            tail_correction_bits: 0,
+            allow_average_acceptance: true,
+        };
+        assert!(matches!(
+            parameters.audit_program(&program, &bindings, &[BigUint::one()], Some(&average)),
+            Err(RnsBggError::Parameters("average-case input moment model is missing"))
+        ));
+    }
+
+    #[test]
+    fn average_event_budget_deduplicates_nodes_and_applies_tail_correction() {
+        let parameters = nested_alignment_parameters();
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(crate::program::AttributeKnowledge::PrivatePayload).unwrap();
+        let program = builder
+            .finish(vec![
+                crate::program::Operand::Scalar(input),
+                crate::program::Operand::Scalar(input),
+            ])
+            .unwrap();
+        let input = RnsBggNoiseValue::sampled_encoding(&parameters, b"budget-input", &[1.into()]);
+        let bindings = RnsBggNoiseBindings::from_inputs(&program, &[input], &[]).unwrap();
+        let trace = trace_program(&parameters, &program, &bindings).unwrap();
+        let events = average_event_budget(&trace).unwrap();
+        let expected = BigUint::from(parameters.level(0).unwrap().ring_dimension()) *
+            2u8 *
+            BigUint::from(parameters.component_columns(0).unwrap());
+        assert_eq!(events, expected);
+        let base = crate::noise_refresh::simulation::AverageCaseConfig {
+            failure_exponent: 1,
+            tail_correction_bits: 0,
+            allow_average_acceptance: true,
+        }
+        .z_squared_for_events(&events)
+        .unwrap();
+        let corrected = crate::noise_refresh::simulation::AverageCaseConfig {
+            failure_exponent: 1,
+            tail_correction_bits: 2,
+            allow_average_acceptance: true,
+        }
+        .z_squared_for_events(&events)
+        .unwrap()
+        .scaled(&(BigUint::one() << 4));
+        assert!(corrected.numerator > base.numerator);
+    }
+
+    #[test]
+    fn correctness_uses_q_over_four_at_terminal_level() {
+        let parameters = nested_alignment_parameters();
+        let q = parameters.level(1).unwrap().modulus().as_ref().clone();
+        let below = (&q - 1u8) / 4u8;
+        let above = &q / 4u8 + 1u8;
+        assert!(
+            parameters
+                .noise_fits(1, &RnsBggNoiseBound { error: below, payload_l1: BigUint::zero() })
+                .unwrap()
+        );
+        assert!(
+            !parameters
+                .noise_fits(1, &RnsBggNoiseBound { error: above, payload_l1: BigUint::zero() })
+                .unwrap()
+        );
     }
 
     #[test]

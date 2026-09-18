@@ -5,23 +5,27 @@ use mxx_bench_estimator::{
 };
 use mxx_dsl::{GraphValue, GraphValueSchema, Ring};
 use mxx_exponent_lut::{
-    ExpLayout, NandCircuit, api,
+    CompiledNandCircuit, ExpLayout, NandCircuit, api,
     noise_refresh::{
         pbc::{PbcParameters, PbcRootSeed, generate_key_layout},
         prf::{PreparedSparseLwrPrf, SparseLwrPrfProgram},
-        refresh::{RefreshDigitPlan, RefreshPrfLabelIndex, RefreshSlot},
-        simulation::{RefreshRouteNoiseGains, RefreshTranscriptTopology},
+        refresh::{RefreshDeclaration, RefreshDigitPlan, RefreshPrfLabelIndex, RefreshSlot},
+        simulation::RefreshTranscriptTopology,
     },
-    noise_utils::{NoiseMomentPolicy, RightActionNoiseGain},
+    noise_utils::{NoiseMomentPolicy, NonnegativeRational},
     program::{FamilyRange, InputBinding},
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
-        RnsBggNoiseValue, RnsBggParameters, RnsEncryptBuild, RnsNoiseBuild, RnsOnlineBuild,
-        RnsPreprocessBuild, checkpoint_refreshed_output, resume_refreshed_output,
-        verify_refreshed_output,
+        RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
+        RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, checkpoint_refreshed_output,
+        resume_refreshed_output, verify_refreshed_output,
+    },
+    utils::{
+        audit_program_at_crt_depth, env_positive_decimal, env_usize, lattice_security_bits,
+        noise_model, ring_dimension_candidates, ring_dimension_stride_log2,
     },
 };
-use mxx_ir_core::{IntExpr, ParamEnv, types::WireType};
+use mxx_ir_core::{IntExpr, ParamEnv};
 use mxx_primitives::poly::{
     Poly, PolyParams,
     dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams, poly::DCRTPoly},
@@ -30,43 +34,137 @@ use mxx_runtime::{
     ExecutionConfig, artifact::FileArtifactStore, backend::poly::gpu::gpu_backend_on,
 };
 use num_bigint::{BigInt, BigUint, Sign};
-use num_traits::{One, Zero};
+use num_traits::One;
 use serial_test::serial as sequential;
 use std::collections::BTreeMap;
 
-fn nested_rns_parameters() -> (DCRTPolyParams, RnsBggParameters) {
-    let pool = DCRTPolyParams::new(32, 4, 10, 5, None, None);
-    let primes = pool.to_crt().0;
-    let levels = [4usize, 3, 2, 1, 1, 1, 1, 1, 1]
-        .into_iter()
-        .map(|depth| {
-            let modulus =
-                primes.iter().take(depth).fold(BigUint::one(), |product, prime| product * *prime);
-            pool.select_modulus(&modulus).expect("nested RNS level")
-        })
-        .collect();
-    let parameters = RnsBggParameters::new(levels, bigdecimal::BigDecimal::from(1u8), 1)
-        .expect("RNS parameters");
-    (pool, parameters)
+const NOISE_REFRESH_PREFIX: &str = "MXX_EXPONENT_LUT_NOISE_REFRESH_";
+
+struct SelectedCandidate {
+    poly_parameters: DCRTPolyParams,
+    parameters: RnsBggParameters,
+    prf_parameters: RnsBggParameters,
+    source: CompiledNandCircuit,
+    declaration: RefreshDeclaration,
+    prf: SparseLwrPrfProgram,
+    refreshed_bound: BigUint,
 }
 
-fn noise_value() -> RnsBggNoiseValue {
-    RnsBggNoiseValue::public(6u8.into(), &[BigInt::from(1u8)])
-}
+fn select_rns_candidate() -> SelectedCandidate {
+    let security_bits = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_SECURITY_BITS", 1)
+        .expect("valid noise-refresh security setting");
+    assert!(security_bits > 0, "MXX_EXPONENT_LUT_NOISE_REFRESH_SECURITY_BITS must be positive");
+    let ring_dimensions = ring_dimension_candidates(
+        "MXX_EXPONENT_LUT_NOISE_REFRESH_MIN_LOG_RING_DIMENSION",
+        "MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_LOG_RING_DIMENSION",
+        5,
+        16,
+    )
+    .expect("valid ring dimension candidates");
+    let crt_bits =
+        env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_CRT_BITS", 40).expect("valid CRT bit setting");
+    assert!(crt_bits > 0, "MXX_EXPONENT_LUT_NOISE_REFRESH_CRT_BITS must be positive");
+    let expected_base_bits = crt_bits.div_ceil(2);
+    assert!(
+        expected_base_bits <= 31,
+        "MXX_EXPONENT_LUT_NOISE_REFRESH_CRT_BITS is unsupported above 62 bits"
+    );
+    let max_crt_depth = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_CRT_DEPTH", 32)
+        .expect("valid maximum CRT depth setting");
+    assert!(max_crt_depth >= 2, "MXX_EXPONENT_LUT_NOISE_REFRESH_MAX_CRT_DEPTH must be at least 2");
+    let operations_per_drop = env_usize("MXX_EXPONENT_LUT_NOISE_REFRESH_OPERATIONS_PER_DROP", 1)
+        .expect("valid operations-per-drop setting");
+    assert!(!NOISE_REFRESH_PREFIX.is_empty());
+    assert!(operations_per_drop > 0);
+    let average =
+        noise_model(NOISE_REFRESH_PREFIX).expect("valid noise-refresh noise-model setting");
+    let encoding_error_sigma =
+        env_positive_decimal("MXX_EXPONENT_LUT_NOISE_REFRESH_ERROR_SIGMA", "4")
+            .expect("valid noise-refresh encoding sigma");
 
-#[test]
-#[sequential(dcrt_runtime)]
-fn noise_refresh_end_to_end() {
-    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
-    if devices.is_empty() {
-        eprintln!("skipping RNS refresh round trip: no CUDA device detected");
-        return;
+    for ring_dimension in ring_dimensions {
+        let Some(stride_log2) = ring_dimension_stride_log2(ring_dimension, 4) else {
+            continue;
+        };
+        let source = match NandCircuit::new(2, vec![[0, 1]], 2)
+            .expect("valid source circuit")
+            .compile(ExpLayout { stride_log2, width_log2: 4 }, ring_dimension as usize, 4)
+        {
+            Ok(source) => source,
+            Err(_) => continue,
+        };
+        for crt_depth in 2..=max_crt_depth {
+            let request = RnsBggPlanRequest {
+                ring_dimension,
+                encoding_error_sigma: encoding_error_sigma.clone(),
+                crt_bits,
+                terminal_depth: 2,
+                max_crt_depth: crt_depth,
+                terminal_value_bound: BigUint::one(),
+                operations_per_drop,
+            };
+            let source_program = source.program();
+            let source_bindings = RnsBggNoiseBindings::from_inputs(
+                source_program,
+                &vec![
+                    RnsBggNoiseValue::sampled_encoding_sigma(
+                        &request.encoding_error_sigma,
+                        format!("noise-refresh-source-{ring_dimension}").as_bytes(),
+                        &[BigInt::from(1u8)],
+                    )
+                    .expect("valid noise-refresh encoding sigma");
+                    source_program.encryption_inputs().inputs().len()
+                ],
+                &vec![
+                    RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
+                    source.rhs_ids().len()
+                ],
+            )
+            .expect("noise-refresh source bindings");
+            let Ok((parameters, _trace)) = audit_program_at_crt_depth(
+                &request,
+                source_program,
+                &source_bindings,
+                &vec![BigUint::one(); source_program.outputs().len()],
+                average.as_ref(),
+            ) else {
+                continue;
+            };
+            if parameters
+                .levels()
+                .iter()
+                .any(|level| level.base_bits() != expected_base_bits as u32)
+            {
+                continue;
+            }
+            let poly_parameters = match parameters.level(0) {
+                Ok(level) => level.clone(),
+                Err(_) => continue,
+            };
+            let Ok(candidate) =
+                build_candidate(poly_parameters, parameters, source.clone(), average.as_ref())
+            else {
+                continue;
+            };
+            if lattice_security_bits(
+                &candidate.poly_parameters,
+                candidate.parameters.encoding_error_sigma(),
+            )
+            .map_or(false, |bits| bits >= security_bits as u64)
+            {
+                return candidate;
+            }
+        }
     }
-    let (poly_parameters, parameters) = nested_rns_parameters();
-    let source = NandCircuit::new(2, vec![[0, 1]], 2)
-        .expect("valid source circuit")
-        .compile(ExpLayout { stride_log2: 0, width_log2: 4 }, 32, 4)
-        .expect("source program");
+    panic!("no noise-refresh RNS candidate satisfies the configured audit and security target")
+}
+
+fn build_candidate(
+    poly_parameters: DCRTPolyParams,
+    parameters: RnsBggParameters,
+    source: CompiledNandCircuit,
+    average: Option<&mxx_exponent_lut::noise_refresh::simulation::AverageCaseConfig>,
+) -> Result<SelectedCandidate, String> {
     let source_program = source.program();
     let source_output = source_program
         .outputs()
@@ -75,57 +173,78 @@ fn noise_refresh_end_to_end() {
             mxx_exponent_lut::program::Operand::Scalar(wire) => Some(*wire),
             mxx_exponent_lut::program::Operand::Member { .. } => None,
         })
-        .expect("source exponent output");
-
-    let target_modulus = parameters.level(2).expect("target level").modulus().as_ref().clone();
+        .ok_or_else(|| "source exponent output is missing".to_owned())?;
+    let source_workload =
+        RnsBggDerivedWorkload::from_program(source_program).map_err(|error| error.to_string())?;
+    let source_level = source_workload.level(source_output).map_err(|error| error.to_string())?;
+    let p_level = source_level
+        .checked_add(1)
+        .ok_or_else(|| "source output logical level overflows".to_owned())?;
+    let target_level = p_level
+        .checked_add(1)
+        .ok_or_else(|| "refresh target logical level overflows".to_owned())?;
+    let target_modulus = parameters
+        .level(target_level)
+        .map_err(|error| error.to_string())?
+        .modulus()
+        .as_ref()
+        .clone();
     let target_primes = parameters
-        .level(2)
-        .expect("target level")
+        .level(target_level)
+        .map_err(|error| error.to_string())?
         .to_crt()
         .0
         .into_iter()
         .map(BigUint::from)
         .collect::<Vec<_>>();
-    let target_columns = parameters.component_columns(2).expect("target columns");
+    if target_primes.iter().product::<BigUint>() != target_modulus {
+        return Err("refresh q_t product does not match the target modulus".to_owned());
+    }
+    let p_modulus =
+        parameters.level(p_level).map_err(|error| error.to_string())?.modulus().as_ref().clone();
+    if &p_modulus % &target_modulus != BigUint::from(0u8) {
+        return Err("refresh p modulus is not divisible by the target modulus".to_owned());
+    }
+    let target_columns =
+        parameters.component_columns(target_level).map_err(|error| error.to_string())?;
     let target_ring = Ring::new(
-        BigInt::from_biguint(Sign::Plus, target_modulus.clone()),
+        BigInt::from_biguint(Sign::Plus, target_modulus),
         poly_parameters.ring_dimension() as usize,
     );
     let target_matrix = (
         (
-            target_ring.input("refresh-schema-00", (1, target_columns)),
-            target_ring.input("refresh-schema-01", (1, target_columns)),
+            target_ring.input("refresh-candidate-00", (1, target_columns)),
+            target_ring.input("refresh-candidate-01", (1, target_columns)),
         ),
         (
-            target_ring.input("refresh-schema-10", (1, target_columns)),
-            target_ring.input("refresh-schema-11", (1, target_columns)),
+            target_ring.input("refresh-candidate-10", (1, target_columns)),
+            target_ring.input("refresh-candidate-11", (1, target_columns)),
         ),
     );
     let output_schema = target_matrix.schema().wire_types();
-    assert_eq!(output_schema.len(), 4, "RNS-BGG public matrix has four ports");
-    assert!(output_schema.iter().all(|wire_type| matches!(
-        wire_type,
-        WireType::Matrix(matrix)
-            if matrix.rows == 1.into() && matrix.columns == target_columns.into()
-    )));
     let topology = RefreshTranscriptTopology::new(
         target_columns,
         poly_parameters.ring_dimension() as usize,
         vec![1; target_primes.len()],
         1,
     )
-    .expect("refresh topology");
-    let labels = RefreshPrfLabelIndex::new([0x72; 32], &topology).expect("refresh labels");
-    let pbc_parameters = PbcParameters::custom(4, 1, 2, 2, 32, None);
+    .map_err(|error| error.to_string())?;
+    let labels =
+        RefreshPrfLabelIndex::new([0x72; 32], &topology).map_err(|error| error.to_string())?;
+    let pbc_parameters = PbcParameters::custom(4, 1, 2, 2, poly_parameters.ring_dimension(), None);
     let generated = (0..32u8)
         .find_map(|seed| generate_key_layout(&pbc_parameters, PbcRootSeed([seed; 32]), &[0]).ok())
-        .expect("PBC layout");
+        .ok_or_else(|| "PBC layout generation failed".to_owned())?;
     let profile = mxx_exponent_lut::noise_refresh::prf::SparseLwrPrfProfile::new(
-        ExpLayout { stride_log2: 1, width_log2: 4 },
+        ExpLayout {
+            stride_log2: ring_dimension_stride_log2(poly_parameters.ring_dimension(), 4)
+                .ok_or_else(|| "ring dimension must be a power of two with log2 >= 4".to_owned())?,
+            width_log2: 4,
+        },
         2,
     )
-    .expect("native PRF profile");
-    let prf_labels = labels.prf_labels().expect("PRF labels");
+    .map_err(|error| error.to_string())?;
+    let prf_labels = labels.prf_labels().map_err(|error| error.to_string())?;
     let prf = SparseLwrPrfProgram::new_structural(
         profile,
         generated.public_layout.bucket_width,
@@ -133,11 +252,33 @@ fn noise_refresh_end_to_end() {
         b"noise-refresh-prf",
         &prf_labels,
     )
-    .expect("structural PRF program");
+    .map_err(|error| error.to_string())?;
     let prepared = PreparedSparseLwrPrf::new(prf.clone(), &generated.public_layout, [0x73; 32])
-        .expect("prepared PRF");
-    let q = parameters.level(0).expect("source level").modulus().as_ref().clone();
-    let p = parameters.level(1).expect("switch level").modulus().as_ref().clone();
+        .map_err(|error| error.to_string())?;
+    let source_q = parameters.level(source_level).map_err(|error| error.to_string())?;
+    let prf_terminal = parameters.level(p_level).map_err(|error| error.to_string())?.clone();
+    let prf_parameters = RnsBggParameters::new(
+        vec![source_q.clone(), source_q.clone(), source_q.clone(), prf_terminal],
+        parameters.encoding_error_sigma().clone(),
+        parameters.operations_per_drop(),
+    )
+    .map_err(|error| error.to_string())?;
+    let prf_q = prf_parameters.level(2).map_err(|error| error.to_string())?;
+    if prf_q.modulus() != source_q.modulus() ||
+        prf_q.modulus_digits() != source_q.modulus_digits() ||
+        prf_q.ring_dimension() != source_q.ring_dimension() ||
+        prf_parameters.component_columns(2).map_err(|error| error.to_string())? !=
+            parameters.component_columns(source_level).map_err(|error| error.to_string())?
+    {
+        return Err("PRF coefficient output schema does not match source q carrier".to_owned());
+    }
+    let q = parameters
+        .level(source_level)
+        .map_err(|error| error.to_string())?
+        .modulus()
+        .as_ref()
+        .clone();
+    let p = p_modulus;
     let slots = target_primes
         .iter()
         .enumerate()
@@ -148,7 +289,7 @@ fn noise_refresh_end_to_end() {
             q_t: BigInt::from_biguint(Sign::Plus, qt.clone()),
         })
         .collect::<Vec<_>>();
-    let declaration = mxx_exponent_lut::noise_refresh::refresh::RefreshDeclaration::new(
+    let declaration = RefreshDeclaration::new(
         source_program,
         source_output,
         output_schema,
@@ -156,20 +297,233 @@ fn noise_refresh_end_to_end() {
         RefreshDigitPlan { base: 4, mask_counts: vec![1; target_primes.len()], fresh_count: 1 },
         labels,
         prepared,
-        2,
+        target_level,
         NoiseMomentPolicy::Continuous,
     )
-    .expect("refresh declaration");
+    .map_err(|error| error.to_string())?;
 
+    let source_noise_bindings = RnsBggNoiseBindings::from_inputs(
+        source_program,
+        &source_program
+            .encryption_inputs()
+            .inputs()
+            .iter()
+            .enumerate()
+            .map(|(index, _)| noise_value(&parameters, format!("source-input-{index}").as_bytes()))
+            .collect::<Vec<_>>(),
+        &vec![
+            RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() };
+            source.rhs_ids().len()
+        ],
+    )
+    .map_err(|error| error.to_string())?;
+    parameters
+        .audit_program(
+            source_program,
+            &source_noise_bindings,
+            &vec![BigUint::one(); source_program.outputs().len()],
+            average,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let prf_program = prf.program();
+    let mut prf_noise_inputs = BTreeMap::new();
+    for (index, (wire, declaration)) in prf_program.encryption_inputs().inputs().iter().enumerate()
+    {
+        let value = noise_value(&prf_parameters, format!("prf-input-{index}").as_bytes());
+        let binding = match declaration.shape() {
+            InputBinding::Scalar(()) => InputBinding::Scalar(value),
+            InputBinding::Family(count) => InputBinding::Family(RnsBggNoiseFamily {
+                element: value,
+                range: FamilyRange::full(count.clone()).map_err(|error| error.to_string())?,
+                max_nonzero_payloads: 1u8.into(),
+            }),
+        };
+        prf_noise_inputs.insert(*wire, binding);
+    }
+    let selector_width = prf.block_count() * prf.bucket_width();
+    let prf_noise_rhs = BTreeMap::from([(
+        prf.selection_families()[0].selector,
+        InputBinding::Family(RnsBggNoiseFamily {
+            element: RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() },
+            range: FamilyRange::full(IntExpr::constant(selector_width))
+                .map_err(|error| error.to_string())?,
+            max_nonzero_payloads: 1u8.into(),
+        }),
+    )]);
+    let prf_noise_bindings = RnsBggNoiseBindings::new(prf_noise_inputs, prf_noise_rhs)
+        .map_err(|error| error.to_string())?;
+    let prf_terminal_bound = prf
+        .profile()
+        .canonical_readout()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .max()
+        .map(BigUint::from)
+        .ok_or_else(|| "PRF canonical readout is empty".to_owned())?;
+    prf_parameters
+        .audit_program(
+            prf_program,
+            &prf_noise_bindings,
+            &vec![prf_terminal_bound; prf_program.outputs().len()],
+            average,
+        )
+        .map_err(|error| error.to_string())?;
+
+    let refresh_noise =
+        parameters.refresh_noise_parameters(&declaration).map_err(|error| error.to_string())?;
+    let prf_workload =
+        RnsBggDerivedWorkload::from_program(prf_program).map_err(|error| error.to_string())?;
+    let mut noise_children = BTreeMap::new();
+    for slot in 0..declaration.slots().len() {
+        let mut child =
+            RnsNoiseBuild::new(&prf_parameters, prf_program, &prf_workload, &prf_noise_bindings)
+                .map_err(|error| error.to_string())?;
+        child.bind_refresh_prf(&declaration, slot).map_err(|error| error.to_string())?;
+        noise_children.insert(slot, child);
+    }
+    let noise_declaration = declaration.clone();
+    let noise_report = api::noise_simulate(
+        source_program,
+        RnsNoiseBuild::new(&parameters, source_program, &source_workload, &source_noise_bindings)
+            .map_err(|error| error.to_string())?,
+        move |build, outputs| {
+            build.with_refresh_noise_parameters(refresh_noise).expect("refresh noise parameters");
+            build
+                .apply_refresh(
+                    0,
+                    &noise_declaration,
+                    (0..noise_declaration.slots().len())
+                        .map(|slot| (slot, outputs[0].clone()))
+                        .collect(),
+                    noise_children,
+                )
+                .expect("source noise refresh");
+            Ok(outputs)
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let refreshed_output = noise_report
+        .refreshed_output
+        .as_ref()
+        .ok_or_else(|| "refresh simulation did not produce an output envelope".to_owned())?;
+    let target_modulus = parameters
+        .level(declaration.target_level())
+        .map_err(|error| error.to_string())?
+        .modulus()
+        .as_ref()
+        .clone();
+    let payload_message_limit = &refreshed_output.bound.payload_l1 * 2u8;
+    if target_modulus <= payload_message_limit {
+        return Err(
+            "refreshed output payload violates the strict q/2 message-scale bound".to_owned()
+        );
+    }
+    let refreshed_fits = if average.is_some() {
+        average_refreshed_output_fits(
+            &parameters,
+            &declaration,
+            average.expect("average mode is present"),
+            &noise_report,
+            refreshed_output,
+        )?
+    } else {
+        parameters
+            .noise_fits(declaration.target_level(), &refreshed_output.bound)
+            .map_err(|error| error.to_string())?
+    };
+    if !refreshed_fits || refreshed_output.bound.payload_l1 > BigUint::one() {
+        return Err("refreshed output fails the correctness predicate".to_owned());
+    }
+
+    Ok(SelectedCandidate {
+        poly_parameters,
+        parameters,
+        prf_parameters,
+        source,
+        declaration,
+        prf,
+        refreshed_bound: refreshed_output.bound.error.clone(),
+    })
+}
+
+fn average_refreshed_output_fits(
+    parameters: &RnsBggParameters,
+    declaration: &RefreshDeclaration,
+    average: &mxx_exponent_lut::noise_refresh::simulation::AverageCaseConfig,
+    trace: &RnsBggNoiseTrace,
+    output: &RnsBggNoiseValue,
+) -> Result<bool, String> {
+    let moments = output
+        .moments
+        .as_ref()
+        .ok_or_else(|| "average refresh output is missing its moment model".to_owned())?;
+    // Match RnsBggParameters::audit_program's authoritative physical event
+    // budget: node_event_counts already includes ring coordinates, component
+    // columns, family multiplicities, and refresh topology events.
+    let events = trace.node_event_counts.values().sum::<BigUint>().max(BigUint::one());
+    let mut z_squared = average.z_squared_for_events(&events).map_err(|error| error.to_string())?;
+    let correction = average
+        .tail_correction_bits
+        .checked_mul(2)
+        .ok_or_else(|| "invalid average-case tail correction".to_owned())?;
+    z_squared = z_squared.scaled(&(BigUint::one() << correction));
+    let modulus = parameters
+        .level(declaration.target_level())
+        .map_err(|error| error.to_string())?
+        .modulus()
+        .as_ref()
+        .clone();
+    let limit = NonnegativeRational::new(modulus, 4u8.into()).map_err(|error| error.to_string())?;
+    Ok(moments.fits(&limit, &z_squared))
+}
+
+fn noise_value(parameters: &RnsBggParameters, source: &[u8]) -> RnsBggNoiseValue {
+    RnsBggNoiseValue::sampled_encoding(parameters, source, &[BigInt::from(1u8)])
+}
+
+#[test]
+#[sequential(dcrt_runtime)]
+fn noise_refresh_end_to_end() {
+    // This scenario is intentionally serialized because the DCRT runtime and
+    // CUDA context are shared by the refresh channels.  Keep the device gate
+    // before allocating any stage state so CPU-only environments exit cleanly.
+    let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids();
+    if devices.is_empty() {
+        eprintln!("skipping RNS refresh round trip: no CUDA device detected");
+        return;
+    }
+    // Build one source NAND Program and a nested modulus chain deep enough for
+    // its exponent workload; the refresh target is a product of CRT slot
+    // moduli at a lower level.
+    let SelectedCandidate {
+        poly_parameters,
+        parameters,
+        prf_parameters,
+        source,
+        declaration,
+        prf,
+        refreshed_bound,
+    } = select_rns_candidate();
+    let source_program = source.program();
+
+    // Construct stage-local PRF bindings and secrets.  RHS values are used
+    // only while preparing the PRF; the online stage receives no RHS
+    // plaintexts, while the LHS plaintext projection remains public to the
+    // encryption stage as required by MulPublic.
     let hash_key = [0x43; 32];
     let prf_program = prf.program();
     let d_width = prf.profile().transform_column_count().expect("D width");
     let selector_width = prf.block_count() * prf.bucket_width();
-    let zero = DCRTPoly::const_zero(&poly_parameters);
-    let one = DCRTPoly::const_rotate_poly(&poly_parameters, 0);
+    let prf_poly_parameters = prf_parameters.level(0).expect("PRF level zero").clone();
+    let zero = DCRTPoly::const_zero(&prf_poly_parameters);
+    let one = DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
     let d_values = (0..d_width)
         .map(|index| {
-            DCRTPoly::const_rotate_poly(&poly_parameters, index % profile.q().expect("Q exponent"))
+            DCRTPoly::const_rotate_poly(
+                &prf_poly_parameters,
+                index % prf.profile().q().expect("Q exponent"),
+            )
         })
         .collect::<Vec<_>>();
     let mut prf_lhs = BTreeMap::new();
@@ -187,7 +541,7 @@ fn noise_refresh_end_to_end() {
     let mut selector_values = vec![zero; selector_width];
     for bucket in 0..prf.block_count() {
         selector_values[bucket * prf.bucket_width()] =
-            DCRTPoly::const_rotate_poly(&poly_parameters, 0);
+            DCRTPoly::const_rotate_poly(&prf_poly_parameters, 0);
     }
     let prf_rhs = BTreeMap::from([(
         prf.selection_families()[0].selector,
@@ -205,121 +559,14 @@ fn noise_refresh_end_to_end() {
     )
     .sample_mask_secret()
     .expect("mask secret");
+    // The PRF schedule has a source-q carrier distinct from the outer
+    // schedule's level zero.  Import the already sampled outer secrets into
+    // that ring; never create an unrelated child secret relation.
+    let prf_payload = payload.at_level(&prf_parameters, 0).expect("PRF payload import");
+    let prf_mask = mask.at_level(&prf_parameters, 0).expect("PRF mask import");
 
-    let input_noise = std::array::from_fn::<_, 3, _>(|_| noise_value());
-    let source_noise_inputs = source_program
-        .encryption_inputs()
-        .inputs()
-        .keys()
-        .map(|wire| (*wire, InputBinding::Scalar(input_noise[0].clone())))
-        .collect();
-    let source_noise_rhs = source
-        .rhs_ids()
-        .iter()
-        .copied()
-        .map(|id| {
-            (
-                id,
-                InputBinding::Scalar(RnsBggNoiseRhs {
-                    payload_l1: 1u8.into(),
-                    payload_l2_squared: 1u8.into(),
-                }),
-            )
-        })
-        .collect();
-    let source_noise_bindings = RnsBggNoiseBindings::new(source_noise_inputs, source_noise_rhs)
-        .expect("source noise bindings");
-    let mut prf_noise_inputs = BTreeMap::new();
-    for ((wire, declaration), value) in
-        prf_program.encryption_inputs().inputs().iter().zip(input_noise)
-    {
-        let binding = match declaration.shape() {
-            InputBinding::Scalar(()) => InputBinding::Scalar(value),
-            InputBinding::Family(count) => InputBinding::Family(RnsBggNoiseFamily {
-                element: value,
-                range: FamilyRange::full(count.clone()).expect("input family range"),
-                max_nonzero_payloads: 1u8.into(),
-            }),
-        };
-        prf_noise_inputs.insert(*wire, binding);
-    }
-    let prf_noise_rhs = BTreeMap::from([(
-        prf.selection_families()[0].selector,
-        InputBinding::Family(RnsBggNoiseFamily {
-            element: RnsBggNoiseRhs { payload_l1: 1u8.into(), payload_l2_squared: 1u8.into() },
-            range: FamilyRange::full(IntExpr::constant(selector_width)).expect("selector range"),
-            max_nonzero_payloads: 1u8.into(),
-        }),
-    )]);
-    let prf_noise_bindings =
-        RnsBggNoiseBindings::new(prf_noise_inputs, prf_noise_rhs).expect("PRF noise bindings");
-
-    // Simulation is the first phase.  It shares the immutable declarations
-    // with production but does not consume plaintexts, GPU state, or
-    // artifacts.
-    let mut refresh_noise =
-        mxx_exponent_lut::noise_refresh::simulation::RefreshNoiseParameters::new(
-            target_primes.clone(),
-            vec![p.clone(); target_primes.len()],
-            4u8.into(),
-            vec![1; target_primes.len()],
-            1,
-        )
-        .expect("refresh noise schema")
-        .with_global_modulus(q.clone())
-        .expect("refresh global modulus")
-        .with_transcript_topology(topology.clone())
-        .expect("refresh noise topology")
-        .with_route_gains(RefreshRouteNoiseGains {
-            state_scaling: vec![RightActionNoiseGain::unit(); target_primes.len()],
-            mask: vec![RightActionNoiseGain::unit(); target_primes.len()],
-            fresh: vec![RightActionNoiseGain::unit(); target_primes.len()],
-            decoder: vec![RightActionNoiseGain::unit(); target_primes.len()],
-        })
-        .expect("refresh route gains");
-    refresh_noise.route_bias_bounds = vec![BigUint::zero(); target_primes.len()];
-    let source_workload =
-        RnsBggDerivedWorkload::from_program(source_program).expect("source noise workload");
-    let prf_workload =
-        RnsBggDerivedWorkload::from_program(prf_program).expect("PRF noise workload");
-    let mut noise_children = BTreeMap::new();
-    for slot in 0..declaration.slots().len() {
-        let mut child =
-            RnsNoiseBuild::new(&parameters, prf_program, &prf_workload, &prf_noise_bindings)
-                .expect("PRF noise child");
-        child.bind_refresh_prf(&declaration, slot).expect("PRF noise child binding");
-        noise_children.insert(slot, child);
-    }
-    let noise_declaration = declaration.clone();
-    let noise_report = api::noise_simulate(
-        source_program,
-        RnsNoiseBuild::new(&parameters, source_program, &source_workload, &source_noise_bindings)
-            .expect("source noise builder"),
-        move |build, outputs| {
-            build.with_refresh_noise_parameters(refresh_noise).expect("refresh noise parameters");
-            build
-                .apply_refresh(
-                    0,
-                    &noise_declaration,
-                    (0..noise_declaration.slots().len())
-                        .map(|slot| (slot, outputs[0].clone()))
-                        .collect(),
-                    noise_children,
-                )
-                .expect("source noise refresh");
-            Ok(outputs)
-        },
-    )
-    .expect("source noise simulation");
-    assert_eq!(noise_report.refreshed_declaration_commitment, Some(*declaration.commitment()));
-    let refreshed_bound = noise_report
-        .refreshed_output
-        .as_ref()
-        .expect("refresh must produce an output envelope")
-        .bound
-        .error
-        .clone();
-
+    // Only after simulation succeeds do we allocate CUDA backends and the
+    // measurement harness used by each of the three production stages.
     let gpu_levels = parameters.levels().iter().map(|level| {
         GpuDCRTPolyParams::new(level.ring_dimension(), level.to_crt().0, level.base_bits(), None)
     });
@@ -352,11 +599,13 @@ fn noise_refresh_end_to_end() {
         .expect("source plaintext bindings");
     let source_lhs = source_lhs_rhs.0;
     let source_rhs = source_lhs_rhs.1;
+    // Prepare one child graph per CRT slot.  These children contribute PRF
+    // artifacts to the owning stage graph and are never executed separately.
     let mut preprocess_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
-        let mut child = RnsPreprocessBuild::new(&parameters, [0x51; 32]);
+        let mut child = RnsPreprocessBuild::new(&prf_parameters, [0x51; 32]);
         child
-            .bind_rhs_inputs(prf_program, &ParamEnv::default(), &prf_rhs, &payload, &hash_key)
+            .bind_rhs_inputs(prf_program, &ParamEnv::default(), &prf_rhs, &prf_payload, &hash_key)
             .expect("PRF preprocess child inputs");
         child.bind_refresh_prf(&declaration, slot).expect("PRF preprocess child binding");
         preprocess_children.insert(slot, child);
@@ -369,6 +618,8 @@ fn noise_refresh_end_to_end() {
     let encryption = directory.path().join("encryption.json");
     let config = ExecutionConfig::default();
     let preprocess_declaration = declaration.clone();
+    // Preprocess executes once and publishes two typed checkpoints from the
+    // same production: one for encryption and one for online evaluation.
     let (preprocess, online) = api::preprocess(
         source_program,
         &ParamEnv::default(),
@@ -397,6 +648,8 @@ fn noise_refresh_end_to_end() {
             Ok(outputs)
         },
         |validated| {
+            // Estimate the validated graph before execution, collect one GPU
+            // measurement, then estimate again using the measured node costs.
             estimate(validated, &mut estimator).expect("estimate preprocess graph");
             estimator.measure_collected().expect("measure preprocess graph");
             let report = estimate(validated, &mut estimator).expect("preprocess estimate");
@@ -406,23 +659,26 @@ fn noise_refresh_end_to_end() {
     )
     .expect("source preprocess");
 
+    // Encryption consumes only the public LHS plaintext projection plus the
+    // payload/mask secrets.  It imports the preprocess-encrypt checkpoint;
+    // no RHS plaintext enters this stage or the later online stage.
     let mut encrypt_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
-        let mut child = RnsEncryptBuild::new(&parameters, [0x51; 32]);
+        let mut child = RnsEncryptBuild::new(&prf_parameters, [0x51; 32]);
         child
             .bind_lhs_inputs(
                 &prf_program.encryption_inputs(),
                 &ParamEnv::default(),
                 &prf_lhs,
-                &payload,
-                &mask,
+                &prf_payload,
+                &prf_mask,
                 &hash_key,
             )
             .expect("PRF encryption child inputs");
-        child.bind_preprocess_artifacts(&preprocess).expect("PRF encryption child artifacts");
         child
             .bind_refresh_prf(&declaration, slot, prf_program)
             .expect("PRF encryption child binding");
+        child.bind_preprocess_artifacts(&preprocess).expect("PRF encryption child artifacts");
         encrypt_children.insert(slot, child);
     }
     let encrypt_declaration = declaration.clone();
@@ -448,6 +704,8 @@ fn noise_refresh_end_to_end() {
             Ok(())
         },
         |validated| {
+            // Keep encryption's estimate independent from preprocess and
+            // online estimates while reusing the same measurement harness.
             estimate(validated, &mut estimator).expect("estimate encrypt graph");
             estimator.measure_collected().expect("measure encrypt graph");
             let report = estimate(validated, &mut estimator).expect("encrypt estimate");
@@ -457,9 +715,12 @@ fn noise_refresh_end_to_end() {
     )
     .expect("source encryption");
 
+    // Online children use only the online preprocess checkpoint and the
+    // encryption checkpoint.  Refresh is bound as a graph operation here;
+    // it is not materialized as a caller-owned carrier or rerun by resume.
     let mut online_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
-        let mut child = RnsOnlineBuild::new(&parameters, [0x51; 32]);
+        let mut child = RnsOnlineBuild::new(&prf_parameters, [0x51; 32]);
         child
             .bind_refresh_artifacts(&declaration, slot, &online, &encrypted, &hash_key)
             .expect("PRF online child artifacts");
@@ -484,6 +745,7 @@ fn noise_refresh_end_to_end() {
             Ok(outputs)
         },
         |validated| {
+            // Measure online lowering separately from the two setup stages.
             estimate(validated, &mut estimator).expect("estimate online graph");
             estimator.measure_collected().expect("measure online graph");
             let report = estimate(validated, &mut estimator).expect("online estimate");
@@ -492,6 +754,8 @@ fn noise_refresh_end_to_end() {
         },
     )
     .expect("source online evaluation");
+    // Verify the independently expected NAND output against the refreshed
+    // carrier returned by online_eval before checkpointing that carrier.
     let expected = DCRTPoly::const_rotate_poly(&poly_parameters, 1);
     verify_refreshed_output(
         source_program,
@@ -510,10 +774,10 @@ fn noise_refresh_end_to_end() {
     assert!(!online_result.outputs.is_empty(), "refresh online evaluation has no outputs");
     assert!(refreshed_bound > 0u8.into(), "refresh simulation must produce a bound");
 
-    // The refresh result is already materialized by the online execution.
-    // Checkpointing imports those returned ports only; it does not lower or
-    // execute the refresh a second time.  Resumption then runs the built-in
-    // single-input identity continuation against the checkpointed carrier.
+    // The refresh result is already materialized by online execution.
+    // Checkpointing imports only its key/row ports and optional public payload;
+    // it does not lower or execute refresh again.  Resumption then runs the
+    // built-in single-input identity continuation over that checkpoint.
     let refresh_checkpoint = directory.path().join("refresh-checkpoint.json");
     let checkpointed = checkpoint_refreshed_output(
         source_program,
@@ -531,10 +795,7 @@ fn noise_refresh_end_to_end() {
     )
     .expect("checkpoint refreshed output");
     let resumed_parameters = RnsBggParameters::new(
-        vec![
-            parameters.level(declaration.target_level()).expect("target level").clone(),
-            parameters.level(declaration.target_level() + 1).expect("target gadget level").clone(),
-        ],
+        vec![parameters.level(declaration.target_level()).expect("target level").clone()],
         parameters.encoding_error_sigma().clone(),
         parameters.operations_per_drop(),
     )

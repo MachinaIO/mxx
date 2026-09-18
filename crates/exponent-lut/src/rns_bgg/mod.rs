@@ -27,8 +27,9 @@ use crate::{
         refresh::{
             RefreshDeclaration, RefreshDigitPlan, RefreshError, RefreshPrfLabelIndex, RefreshSlot,
         },
+        simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
     },
-    program::{ExponentLUTProgramLowering, ExponentLutProgramId},
+    program::{ExponentLUTProgramLowering, ExponentLutProgramId, WireId},
 };
 
 pub use encoding::{
@@ -61,6 +62,16 @@ pub(crate) fn refresh_artifact_name(commitment: [u8; 32], slot: usize, role: &st
 /// Build the canonical per-slot prepared-PRF artifact path.
 pub(crate) fn refresh_prf_artifact_name(commitment: [u8; 32], slot: usize, role: &str) -> String {
     refresh_artifact_name(commitment, slot, &format!("prf/{role}"))
+}
+
+/// Build the canonical prepared-PRF input public-key artifact path.
+pub(crate) fn refresh_prf_input_key_artifact_name(
+    commitment: [u8; 32],
+    slot: usize,
+    wire: WireId,
+    port: usize,
+) -> String {
+    refresh_prf_artifact_name(commitment, slot, &format!("input-key/{wire:?}.{port}"))
 }
 
 /// Build the canonical label-specific target-action artifact path.
@@ -388,6 +399,259 @@ impl RnsBggParameters {
             .collect()
     }
 
+    /// Validate the workload-owned refresh level contract.  The source wire
+    /// determines the physical route: its level is `q`, the immediate next
+    /// level is `p`, and the following level is the CRT-recomposed target.
+    /// This check belongs at production refresh dispatch because deriving a
+    /// noise snapshot alone has no workload from which to resolve the source.
+    pub(crate) fn validate_refresh_level_contract(
+        &self,
+        declaration: &RefreshDeclaration,
+        source_level: usize,
+    ) -> Result<(), RnsBggError> {
+        let p_level = source_level
+            .checked_add(1)
+            .ok_or(RnsBggError::Binding("refresh source level has no q/p/target chain"))?;
+        let target_level = source_level
+            .checked_add(2)
+            .ok_or(RnsBggError::Binding("refresh source level has no q/p/target chain"))?;
+        let source_parameters = self
+            .level(source_level)
+            .map_err(|_| RnsBggError::Binding("refresh source level is not configured"))?;
+        let p_parameters = self
+            .level(p_level)
+            .map_err(|_| RnsBggError::Binding("refresh p level is not configured"))?;
+        let target_parameters = self
+            .level(target_level)
+            .map_err(|_| RnsBggError::Binding("refresh target level is not configured"))?;
+        if declaration.target_level() != target_level {
+            return Err(RnsBggError::Binding("refresh target level is not source+2"));
+        }
+
+        let q = source_parameters.modulus().as_ref().clone();
+        let p = p_parameters.modulus().as_ref().clone();
+        let target_modulus = target_parameters.modulus().as_ref().clone();
+        let mut target_modulus_product = BigUint::one();
+        for slot in declaration.slots() {
+            let declared_q = slot
+                .q
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let declared_p = slot
+                .p
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let qt = slot
+                .q_t
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            if declared_q != q || declared_p != p {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+            }
+            if declared_q <= declared_p ||
+                &declared_q % &declared_p != BigUint::zero() ||
+                declared_p < qt ||
+                &declared_p % &qt != BigUint::zero()
+            {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+            }
+            target_modulus_product *= qt;
+        }
+        if target_modulus_product != target_modulus {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+        }
+        Ok(())
+    }
+
+    /// Derive the refresh noise contract from the actual RNS-BGG setup.
+    ///
+    /// Every prepared refresh action is decomposed in its slot's `p` ring.
+    /// For an evaluation row with `N` ring coordinates, `D_qp` input/decomposition
+    /// columns, and radix `B`, the conservative coefficient gain is
+    /// `K1 = N*D_qp*B`; the squared-L2 envelope is `K1²`. Label weights are
+    /// split using their canonical positional sums, so the evaluator can apply
+    /// each label's digit/`H` weight exactly once. The decoder gain separately
+    /// envelopes the two `N`-coefficient mask-secret convolutions. The returned
+    /// bias also includes the bounded fresh `eta` sampled by every prepared
+    /// label/data action and the canonical positive-digit offsets.
+    pub fn refresh_noise_parameters(
+        &self,
+        declaration: &RefreshDeclaration,
+    ) -> Result<RefreshNoiseParameters, RnsBggError> {
+        if declaration.slots().is_empty() {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
+        let target_level = declaration.target_level();
+        let target_columns = self.component_columns(target_level)?;
+        let coefficient_count = self.level(target_level)?.ring_dimension() as usize;
+        let target_modulus = self.level(target_level)?.modulus().as_ref().clone();
+        let base = BigUint::from(declaration.digits().base);
+        let mask_counts = declaration.digits().mask_counts.clone();
+        let fresh_count = declaration.digits().fresh_count;
+        if mask_counts.len() != declaration.slots().len() || target_columns == 0 {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
+
+        let mut global_modulus = None;
+        let mut plaintext_moduli = Vec::with_capacity(declaration.slots().len());
+        let mut switch_moduli = Vec::with_capacity(declaration.slots().len());
+        let mut state_scaling = Vec::with_capacity(declaration.slots().len());
+        let mut mask = Vec::with_capacity(declaration.slots().len());
+        let mut fresh = Vec::with_capacity(declaration.slots().len());
+        let mut decoder = Vec::with_capacity(declaration.slots().len());
+        let mut route_bias_bounds = Vec::with_capacity(declaration.slots().len());
+        let coordinate_count = BigUint::from(target_columns) * BigUint::from(coefficient_count);
+        let mut target_modulus_product = BigUint::one();
+
+        for (slot, metadata) in declaration.slots().iter().enumerate() {
+            let q = metadata
+                .q
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let p = metadata
+                .p
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let qt = metadata
+                .q_t
+                .to_biguint()
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            if q <= p || &q % &p != BigUint::zero() || p < qt || &p % &qt != BigUint::zero() {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+            }
+            if let Some(expected) = &global_modulus {
+                if expected != &q {
+                    return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+                }
+            } else {
+                global_modulus = Some(q.clone());
+            }
+            let q_level = self
+                .levels
+                .iter()
+                .position(|level| level.modulus().as_ref() == &q)
+                .ok_or(RnsBggError::Binding("refresh q modulus is not configured"))?;
+            let p_level = q_level
+                .checked_add(1)
+                .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+            let p_parameters = self.level(p_level).map_err(|_| {
+                RnsBggError::Binding("refresh p modulus is not the immediate q state level")
+            })?;
+            if p_parameters.modulus().as_ref() != &p {
+                return Err(RnsBggError::Binding(
+                    "refresh p modulus is not the immediate q state level",
+                ));
+            }
+            let decomposition_width = p_parameters.modulus_digits();
+            if self.component_columns(q_level)? != decomposition_width {
+                return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+            }
+            let decomposition_base = BigUint::one() << p_parameters.base_bits();
+            let k1 = BigUint::from(p_parameters.ring_dimension()) *
+                BigUint::from(decomposition_width) *
+                &decomposition_base;
+            let k2_squared = k1.pow(2u32);
+            let single_action_gain = crate::noise_utils::RightActionNoiseGain {
+                l1: k1.clone(),
+                l2_squared: k2_squared.clone(),
+            };
+            state_scaling.push(single_action_gain);
+            let decoder_l1 = BigUint::from(p_parameters.ring_dimension()) * 2u8;
+            decoder.push(crate::noise_utils::RightActionNoiseGain {
+                l2_squared: decoder_l1.pow(2u32),
+                l1: decoder_l1,
+            });
+
+            let mask_weights = refresh_noise_weight_sums(
+                &base,
+                mask_counts[slot],
+                &coordinate_count,
+                &BigUint::one(),
+            );
+            let fresh_weights = refresh_noise_weight_sums(
+                &base,
+                fresh_count,
+                &coordinate_count,
+                &(p.clone() / &qt),
+            );
+            // The evaluator splits each aggregate route gain by these exact
+            // sums before applying the individual label's positional
+            // weight. Every independently prepared dense action must retain
+            // the full single-action K1 envelope, so persist the weighted
+            // aggregate rather than K1 itself.
+            let mask_aggregate_l1 = &k1 * &mask_weights.0;
+            let fresh_aggregate_l1 = &k1 * &fresh_weights.0;
+            mask.push(crate::noise_utils::RightActionNoiseGain {
+                l1: mask_aggregate_l1.clone(),
+                l2_squared: &k2_squared * &mask_weights.1,
+            });
+            fresh.push(crate::noise_utils::RightActionNoiseGain {
+                l1: fresh_aggregate_l1.clone(),
+                l2_squared: &k2_squared * &fresh_weights.1,
+            });
+            let mask_unit_gain = refresh_noise_ceil_div(&mask_aggregate_l1, &mask_weights.0);
+            let fresh_unit_gain = refresh_noise_ceil_div(&fresh_aggregate_l1, &fresh_weights.0);
+            let eta_bound = self.encoding_error_bound();
+            let label_eta = eta_bound *
+                (&mask_weights.0 * &mask_unit_gain + &fresh_weights.0 * &fresh_unit_gain);
+            let data_eta = eta_bound * &k1;
+            let q_to_p = &q / &p;
+            let q_to_qt = &q / &qt;
+            let mask_offset = crate::noise_refresh::refresh::canonical_digit_offset(
+                &base,
+                mask_counts[slot],
+                true,
+            )
+            .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidLayout))?
+            .magnitude() *
+                &q_to_p *
+                &coordinate_count *
+                mask_unit_gain;
+            let fresh_offset =
+                crate::noise_refresh::refresh::canonical_digit_offset(&base, fresh_count, false)
+                    .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidLayout))?
+                    .magnitude() *
+                    &q_to_qt *
+                    &coordinate_count *
+                    fresh_unit_gain;
+            plaintext_moduli.push(qt);
+            switch_moduli.push(p);
+            target_modulus_product *= &plaintext_moduli[slot];
+            route_bias_bounds.push(label_eta + data_eta + mask_offset + fresh_offset);
+        }
+
+        if target_modulus_product != target_modulus {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
+        }
+
+        let topology = RefreshTranscriptTopology::new(
+            target_columns,
+            coefficient_count,
+            mask_counts.clone(),
+            fresh_count,
+        )
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        let mut parameters = RefreshNoiseParameters::new(
+            plaintext_moduli,
+            switch_moduli,
+            base,
+            mask_counts,
+            fresh_count,
+        )
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?
+        .with_global_modulus(
+            global_modulus.ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?,
+        )
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?
+        .with_transcript_topology(topology)
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?
+        .with_route_gains(RefreshRouteNoiseGains { state_scaling, mask, fresh, decoder })
+        .map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        parameters.route_bias_bounds = route_bias_bounds;
+        parameters.validate().map_err(|error| RnsBggError::Graph(error.to_string()))?;
+        Ok(parameters)
+    }
+
     pub fn ring(&self, level: usize) -> Result<Ring, RnsBggError> {
         let parameters = self.level(level)?;
         Ok(Ring::new(
@@ -421,6 +685,91 @@ impl RnsBggParameters {
         digest.finalize().into()
     }
 
+    /// Validate the exact four-level schedule required by a prepared PRF
+    /// child: `[q, q, q, p]`.  The final successor supplies the coefficient
+    /// decomposition width for the level-two q carrier.
+    pub(crate) fn validate_refresh_prf_schedule(
+        &self,
+        declaration: &RefreshDeclaration,
+        slot: usize,
+    ) -> Result<(), RnsBggError> {
+        if self.levels.len() != 4 || slot >= declaration.slots().len() {
+            return Err(RnsBggError::Binding("refresh PRF parameter schedule is not [q,q,q,p]"));
+        }
+        let declared_slot = declaration
+            .slots()
+            .get(slot)
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+        let q = declared_slot
+            .q
+            .to_biguint()
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        let p = declared_slot
+            .p
+            .to_biguint()
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        if self.level(0)?.modulus().as_ref() != &q ||
+            self.level(1)?.modulus().as_ref() != &q ||
+            self.level(2)?.modulus().as_ref() != &q ||
+            self.level(3)?.modulus().as_ref() != &p ||
+            self.level(1)? != self.level(0)? ||
+            self.level(2)? != self.level(0)?
+        {
+            return Err(RnsBggError::Binding("refresh PRF parameter schedule is not [q,q,q,p]"));
+        }
+        if self.component_columns(2)? != self.level(3)?.modulus_digits() {
+            return Err(RnsBggError::Binding(
+                "refresh PRF coefficient output width does not match successor level",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Derive the exact child schedule from the outer source chain and return
+    /// its full parameter identity for retained child/artifact validation.
+    pub(crate) fn expected_refresh_prf_parameter_identity(
+        &self,
+        declaration: &RefreshDeclaration,
+        slot: usize,
+    ) -> Result<[u8; 32], RnsBggError> {
+        let declared_slot = declaration
+            .slots()
+            .get(slot)
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
+        let q = declared_slot
+            .q
+            .to_biguint()
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        let p = declared_slot
+            .p
+            .to_biguint()
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        let q_level = (0..self.levels.len().saturating_sub(1))
+            .find(|level| {
+                self.levels[*level].modulus().as_ref() == &q &&
+                    self.levels[*level + 1].modulus().as_ref() == &p
+            })
+            .ok_or(RnsBggError::Binding("refresh q/p successor is not configured"))?;
+        let q_parameters = self.level(q_level)?.clone();
+        let p_parameters = self.level(q_level + 1)?.clone();
+        let expected = Self::new(
+            vec![
+                q_parameters.clone(),
+                q_parameters.clone(),
+                q_parameters.clone(),
+                p_parameters.clone(),
+            ],
+            self.encoding_error_sigma.clone(),
+            self.operations_per_drop,
+        )?;
+        if expected.component_columns(2)? != self.component_columns(q_level)? {
+            return Err(RnsBggError::Binding(
+                "refresh PRF coefficient output width does not match source q carrier",
+            ));
+        }
+        Ok(expected.parameter_identity())
+    }
+
     pub(crate) fn state_gadget(&self, level: usize) -> Result<Mat, RnsBggError> {
         let high = self.level(level)?;
         match self.levels.get(level + 1) {
@@ -442,6 +791,33 @@ impl RnsBggParameters {
         let base = public_gadget_base(parameters.base_bits())?;
         Ok(self.ring(level)?.gadget(1, base, parameters.modulus_digits()))
     }
+}
+
+fn refresh_noise_ceil_div(numerator: &BigUint, denominator: &BigUint) -> BigUint {
+    if numerator.is_zero() {
+        BigUint::zero()
+    } else {
+        (numerator + denominator - BigUint::one()) / denominator
+    }
+}
+
+fn refresh_noise_weight_sums(
+    base: &BigUint,
+    count: usize,
+    coordinate_count: &BigUint,
+    scalar: &BigUint,
+) -> (BigUint, BigUint) {
+    let mut l1 = BigUint::zero();
+    let mut l2_squared = BigUint::zero();
+    let mut weight = scalar.clone();
+    for _ in 0..count {
+        l1 += &weight;
+        l2_squared += weight.pow(2u32);
+        weight *= base;
+    }
+    l1 = &l1 * coordinate_count;
+    l2_squared = &l2_squared * coordinate_count;
+    (l1, l2_squared)
 }
 
 fn public_gadget_base(base_bits: u32) -> Result<u64, RnsBggError> {
@@ -1473,5 +1849,26 @@ mod tests {
             TypeId::of::<RnsBggPreprocessOnlineDescriptor>(),
             TypeId::of::<RnsBggEncryptionDescriptor>()
         );
+    }
+
+    #[test]
+    fn refresh_noise_weight_sums_include_coordinates_and_fresh_h() {
+        let base = BigUint::from(4u8);
+        let coordinates = BigUint::from(3u8);
+        assert_eq!(
+            refresh_noise_weight_sums(&base, 2, &coordinates, &BigUint::one()),
+            (BigUint::from(5u8) * &coordinates, BigUint::from(17u8) * &coordinates)
+        );
+        assert_eq!(
+            refresh_noise_weight_sums(&base, 2, &coordinates, &BigUint::from(2u8)),
+            (BigUint::from(10u8) * &coordinates, BigUint::from(68u8) * &coordinates)
+        );
+    }
+
+    #[test]
+    fn refresh_noise_ceil_div_rounds_outward() {
+        assert_eq!(refresh_noise_ceil_div(&BigUint::from(10u8), &BigUint::from(3u8)), 4u8.into());
+        assert_eq!(refresh_noise_ceil_div(&BigUint::from(9u8), &BigUint::from(3u8)), 3u8.into());
+        assert_eq!(refresh_noise_ceil_div(&BigUint::zero(), &BigUint::from(3u8)), BigUint::zero());
     }
 }

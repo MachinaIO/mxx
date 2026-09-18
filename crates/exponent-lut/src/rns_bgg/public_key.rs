@@ -746,7 +746,8 @@ impl PublicKeyLowering<'_> {
         // the target ring and ensures the source output has a valid RNS
         // representation; the declaration itself owns CRT divisibility and
         // the exact sparse-PRF schema.
-        self.workload.level(declaration.source_output())?;
+        let source_level = self.workload.level(declaration.source_output())?;
+        self.parameters.validate_refresh_level_contract(declaration, source_level)?;
         self.parameters.level(declaration.target_level())?;
         if declaration.output_schema().is_empty() || declaration.prf_labels().is_empty() {
             return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
@@ -1329,7 +1330,7 @@ pub struct RnsPreprocessBuild<'a, B: Backend> {
     runtime: BTreeMap<String, RuntimeValue<B>>,
     refresh_declaration: Option<crate::noise_refresh::refresh::RefreshDeclaration>,
     pending_refresh: Option<(usize, RnsBggPublicKey)>,
-    refresh_prf_binding: Option<([u8; 32], usize, ExponentLutProgramId)>,
+    refresh_prf_binding: Option<([u8; 32], usize, ExponentLutProgramId, [u8; 32])>,
     refresh_prf_children: BTreeMap<usize, PublicKeyLowering<'a>>,
 }
 impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
@@ -1392,8 +1393,26 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
         declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
         slot: usize,
     ) -> Result<(), ApiError> {
+        self.parameters
+            .validate_refresh_prf_schedule(declaration, slot)
+            .map_err(ApiError::scheme)?;
         if slot >= declaration.slots().len() {
             return Err(ApiError::input("refresh PRF slot is outside declaration"));
+        }
+        let source_q = declaration
+            .slots()
+            .get(slot)
+            .and_then(|slot| slot.q.to_biguint())
+            .ok_or_else(|| ApiError::input("refresh source modulus is invalid"))?;
+        if self
+            .parameters
+            .level(0)
+            .map_err(|error| ApiError::input(error.to_string()))?
+            .modulus()
+            .as_ref() !=
+            &source_q
+        {
+            return Err(ApiError::input("refresh PRF child is not configured at source q"));
         }
         let evaluator =
             self.evaluator.as_ref().ok_or_else(|| ApiError::input("bind_inputs first"))?;
@@ -1422,7 +1441,12 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
         if self.refresh_prf_binding.is_some() {
             return Err(ApiError::input("refresh PRF is already bound"));
         }
-        self.refresh_prf_binding = Some((*declaration.commitment(), slot, expected_program));
+        self.refresh_prf_binding = Some((
+            *declaration.commitment(),
+            slot,
+            expected_program,
+            self.parameters.parameter_identity(),
+        ));
         Ok(())
     }
 
@@ -1430,8 +1454,11 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
         &mut self,
         declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
     ) -> Result<BTreeMap<PrfLabel, RnsBggPublicKey>, RnsBggError> {
-        let (commitment, slot, program) =
+        let (commitment, slot, program, parameter_identity) =
             self.refresh_prf_binding.ok_or(RnsBggError::Binding("refresh PRF is not bound"))?;
+        if parameter_identity != self.parameters.parameter_identity() {
+            return Err(RnsBggError::Binding("refresh PRF parameter identity changed"));
+        }
         if commitment != *declaration.commitment() ||
             slot >= declaration.slots().len() ||
             program != declaration.prepared().program().id()
@@ -1490,6 +1517,16 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
             channels.keys().copied().ne(0..declaration.slots().len())
         {
             return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
+        for (slot, child) in &channels {
+            let expected_child_parameters =
+                self.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
+            if child.parameters.parameter_identity() != expected_child_parameters ||
+                child.refresh_prf_binding.map(|(_, _, _, identity)| identity) !=
+                    Some(expected_child_parameters)
+            {
+                return Err(RnsBggError::Binding("refresh PRF child parameter identity mismatch"));
+            }
         }
         let (output, child_material) = {
             let evaluator = self
@@ -1799,6 +1836,104 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                 .artifact_output(format!("public-key/{:?}", output.wire), output)
                 .map_err(ApiError::scheme)?;
         }
+        // Prepared PRF children use their own source-q key schedule.  Publish
+        // their input keys under the declaration/slot namespace so encryption
+        // cannot resolve a same-named outer-program key or another slot's key.
+        if let Some(declaration) = self.refresh_declaration.as_ref() {
+            let commitment = *declaration.commitment();
+            for (slot, child) in &self.refresh_prf_children {
+                for (wire, input) in child.program.inputs() {
+                    let names = (0..4)
+                        .map(|port| {
+                            refresh_prf_input_key_artifact_name(commitment, *slot, *wire, port)
+                        })
+                        .collect::<Vec<_>>();
+                    match input.shape() {
+                        InputBinding::Scalar(()) => {
+                            let key =
+                                child.sample_input_public_key(*wire).map_err(ApiError::scheme)?;
+                            for (name, entry) in names.into_iter().zip(matrix_entries(&key.matrix))
+                            {
+                                graph =
+                                    graph.artifact_output(name, entry).map_err(ApiError::scheme)?;
+                            }
+                        }
+                        InputBinding::Family(count) => {
+                            let key_parts = (0..4)
+                                .map(|port| {
+                                    mxx_dsl::parallel(count.clone(), |index| {
+                                        let key = child
+                                            .sample_input_public_key_member(*wire, Some(index))
+                                            .map_err(|_| DslError::Schema)?;
+                                        Ok(matrix_entries(&key.matrix)[port].clone())
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()
+                                .map_err(ApiError::scheme)?;
+                            for (name, entry) in names.into_iter().zip(key_parts) {
+                                graph =
+                                    graph.artifact_output(name, entry).map_err(ApiError::scheme)?;
+                            }
+                        }
+                    }
+                }
+                for (rhs, prepared) in &child.rhs_material {
+                    match prepared {
+                        InputBinding::Scalar(value) => {
+                            graph = graph
+                                .artifact_output(
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        *slot,
+                                        &format!("rhs/{rhs:?}"),
+                                    ),
+                                    value.clone(),
+                                )
+                                .map_err(ApiError::scheme)?;
+                        }
+                        InputBinding::Family(value) => {
+                            graph = graph
+                                .artifact_output(
+                                    refresh_prf_artifact_name(
+                                        commitment,
+                                        *slot,
+                                        &format!("rhs/{rhs:?}/family"),
+                                    ),
+                                    value.clone(),
+                                )
+                                .map_err(ApiError::scheme)?;
+                        }
+                    }
+                }
+                for ((evaluation_level, decomposition_level, lut, layout), material) in
+                    &child.lut_material
+                {
+                    let role = format!(
+                        "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
+                    );
+                    graph = graph
+                        .artifact_output(
+                            refresh_prf_artifact_name(commitment, *slot, &role),
+                            material.clone(),
+                        )
+                        .map_err(ApiError::scheme)?;
+                }
+                for ((evaluation_level, sigma), matrix) in &child.lut_public_data {
+                    for (port, entry) in matrix_entries(matrix).into_iter().enumerate() {
+                        graph = graph
+                            .artifact_output(
+                                refresh_prf_artifact_name(
+                                    commitment,
+                                    *slot,
+                                    &format!("lut-public/{evaluation_level}/{sigma}.{port}"),
+                                ),
+                                entry,
+                            )
+                            .map_err(ApiError::scheme)?;
+                    }
+                }
+            }
+        }
         for (rhs, prepared) in &evaluator.rhs_material {
             match prepared {
                 InputBinding::Scalar(value) => {
@@ -1920,7 +2055,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::api::execute_graph;
+    use crate::{api::execute_graph, program::ProgramValidationError};
     use mxx_runtime::{
         ExecutionConfig, MemoryArtifactStore, RuntimeValue, backend::poly::cpu_backend,
     };
@@ -1988,6 +2123,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             catalog: mxx_ir_core::artifact::ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: None,
         };
         let row = ring.input("equal-luts-input", (1, parameters.component_columns(0).unwrap()));
@@ -2311,71 +2447,23 @@ mod test {
     }
 
     #[test]
-    fn mul_public_aligns_both_public_operands_to_lower_modulus() {
+    fn mul_public_rejects_a_private_lhs_even_with_a_public_rhs() {
         let mut builder = crate::program::ExponentLutProgramBuilder::new();
         let public_lhs_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let public_rhs_input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
         let rhs = builder.rhs_input().unwrap();
-        let lower_lhs = builder
+        let private_lhs = builder
             .mul_private(
                 crate::program::Operand::Scalar(public_lhs_input),
                 crate::program::Operand::Scalar(rhs),
             )
             .unwrap();
-        let output = builder
-            .mul_public(
-                crate::program::Operand::Scalar(lower_lhs),
-                crate::program::Operand::Scalar(public_rhs_input),
-            )
-            .unwrap();
-        let program =
-            Arc::new(builder.finish(vec![crate::program::Operand::Scalar(output)]).unwrap());
-        let workload = Arc::new(RnsBggDerivedWorkload::from_program(&program).unwrap());
-        let high = DCRTPolyParams::new(16, 2, 17, 4, None, None);
-        let low = high.select_modulus(&BigUint::from(high.to_crt().0[0])).unwrap();
-        let parameters = RnsBggParameters::new(vec![high, low], 1, 1).unwrap();
-        let high_ring = parameters.ring(0).unwrap();
-        let low_ring = parameters.ring(1).unwrap();
-        let mut lowering = PublicKeyLowering::new(
-            &parameters,
-            program,
-            workload,
-            RnsBggPayloadSecret {
-                row: (high_ring.uniform_interval((1, 1), -1, 1), high_ring.identity(1)),
-            },
-            high_ring.bytes_input("mul-public-public-level", 32),
+        let result = builder.mul_public(
+            crate::program::Operand::Scalar(private_lhs),
+            crate::program::Operand::Scalar(public_rhs_input),
         );
-        lowering.current_site =
-            Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() });
-        let lhs_key = RnsBggPublicKey::new(
-            lower_lhs,
-            input_key_matrix(
-                &low_ring,
-                "mul-public-public-lhs",
-                parameters.key_component_columns(1, AttributeKnowledge::PublicPayload).unwrap(),
-            ),
-        );
-        let rhs_key = RnsBggPublicKey::new(
-            public_rhs_input,
-            input_key_matrix(
-                &high_ring,
-                "mul-public-public-rhs",
-                parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap(),
-            ),
-        );
-        let result = <PublicKeyLowering<'_> as ExponentLUTProgramLowering>::mul_public(
-            &mut lowering,
-            &lhs_key,
-            &rhs_key,
-        )
-        .unwrap();
-        assert_eq!(
-            result.matrix.0.0.matrix_type(),
-            &low_ring.matrix_type((
-                1,
-                parameters.key_component_columns(1, AttributeKnowledge::PublicPayload).unwrap(),
-            ))
-        );
+        assert!(matches!(result, Err(ProgramValidationError::InvalidStructure(message))
+            if message == "MulPublic requires a public exponent LHS"));
     }
 
     #[test]

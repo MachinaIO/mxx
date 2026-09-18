@@ -1,13 +1,224 @@
 //! Scheme-independent LUT polynomials and structural balanced reductions.
 //! These functions construct graph expressions; they do not inspect runtime
 //! ciphertexts or add validation passes to their evaluation.
-use crate::ExponentLutError;
-use bigdecimal::BigDecimal;
+use crate::{
+    ExponentLutError,
+    noise_refresh::simulation::AverageCaseConfig,
+    program::{ExponentLutProgram, Operand},
+    rns_bgg::{
+        RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseTrace, RnsBggParameters,
+        RnsBggPlanRequest,
+    },
+};
+use bigdecimal::{BigDecimal, Zero};
 use mxx_dsl::{Family, GraphValue, Int};
 use mxx_ir_core::{ParamEnv, Rational, RealExpr};
-use num_bigint::BigInt;
+use mxx_primitives::poly::{PolyParams, dcrt::params::DCRTPolyParams};
+use num_bigint::{BigInt, BigUint};
 use num_traits::ToPrimitive;
-use std::{error::Error, fmt};
+use std::{env, error::Error, fmt, process::Command};
+
+/// Read an optional unsigned environment setting without accepting malformed values.
+pub fn env_usize(name: &str, default: usize) -> Result<usize, String> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|error| format!("{name} must be a nonnegative integer: {error}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(format!("{name} is not valid Unicode: {error}")),
+    }
+}
+
+/// Read a positive decimal environment setting, using `default` when absent.
+pub fn env_positive_decimal(name: &str, default: &str) -> Result<BigDecimal, String> {
+    let raw = match env::var(name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => default.to_owned(),
+        Err(error) => return Err(format!("{name} is not valid Unicode: {error}")),
+    };
+    let value =
+        raw.parse::<BigDecimal>().map_err(|error| format!("{name} must be a decimal: {error}"))?;
+    if value <= BigDecimal::zero() {
+        return Err(format!("{name} must be positive"));
+    }
+    Ok(value)
+}
+
+/// Return the layout stride exponent when a power-of-two ring is large enough.
+pub fn ring_dimension_stride_log2(ring_dimension: u32, minimum_log: u32) -> Option<u32> {
+    if ring_dimension == 0 || !ring_dimension.is_power_of_two() {
+        return None;
+    }
+    ring_dimension.trailing_zeros().checked_sub(minimum_log)
+}
+
+/// Select the configured noise authority, defaulting to average-case analysis.
+pub fn noise_model(prefix: &str) -> Result<Option<AverageCaseConfig>, String> {
+    let model_name = format!("{prefix}NOISE_MODEL");
+    let model = match env::var(&model_name) {
+        Ok(value) => value,
+        Err(env::VarError::NotPresent) => "average".to_owned(),
+        Err(error) => return Err(format!("{model_name} is not valid Unicode: {error}")),
+    };
+    match model.as_str() {
+        "average" => {
+            let failure_name = format!("{prefix}FAILURE_EXPONENT");
+            let failure_exponent = env_usize(&failure_name, 100)?;
+            if failure_exponent == 0 {
+                return Err(format!("{failure_name} must be positive"));
+            }
+            Ok(Some(AverageCaseConfig {
+                failure_exponent: u32::try_from(failure_exponent)
+                    .map_err(|_| format!("{failure_name} must fit in u32"))?,
+                allow_average_acceptance: true,
+                ..AverageCaseConfig::default()
+            }))
+        }
+        "worst" => Ok(None),
+        value => Err(format!("{model_name} must be exactly `average` or `worst`, got `{value}`")),
+    }
+}
+
+/// Return inclusive power-of-two ring-dimension candidates.
+pub fn ring_dimension_candidates(
+    min_name: &str,
+    max_name: &str,
+    default_min_log: usize,
+    default_max_log: usize,
+) -> Result<Vec<u32>, String> {
+    let min_log = env_usize(min_name, default_min_log)?;
+    let max_log = env_usize(max_name, default_max_log)?;
+    if min_log > max_log {
+        return Err(format!("{min_name} ({min_log}) must not exceed {max_name} ({max_log})"));
+    }
+    if max_log >= usize::BITS as usize {
+        return Err(format!("{max_name} ({max_log}) is too large for this platform"));
+    }
+    (min_log..=max_log)
+        .map(|log| {
+            let dimension = 1usize
+                .checked_shl(log as u32)
+                .ok_or_else(|| format!("ring dimension 2^{log} overflows usize"))?;
+            u32::try_from(dimension)
+                .map_err(|_| format!("ring dimension 2^{log} does not fit in u32"))
+        })
+        .collect()
+}
+
+/// Obtain one positive integer estimate from `lattice-estimator-cli`.
+pub fn lattice_security_bits(
+    parameters: &DCRTPolyParams,
+    error_sigma: &BigDecimal,
+) -> Result<u64, String> {
+    if parameters.ring_dimension() == 0 || parameters.modulus().is_zero() {
+        return Err("ring parameters must be positive".to_owned());
+    }
+    if error_sigma <= &BigDecimal::zero() {
+        return Err("error sigma must be positive".to_owned());
+    }
+    let output = Command::new("lattice-estimator-cli")
+        .arg(parameters.ring_dimension().to_string())
+        .arg(parameters.modulus().to_string())
+        .arg("--s-dist")
+        .arg(r#"{"name":"Ternary"}"#)
+        .arg("--e-dist")
+        .arg(format!(r#"{{"name":"DiscreteGaussian","stddev":{error_sigma}}}"#))
+        .output()
+        .map_err(|error| format!("failed to start lattice-estimator-cli: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "lattice-estimator-cli failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let result = stdout
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .ok_or_else(|| "lattice-estimator-cli returned no security estimate".to_owned())?
+        .trim();
+    let bits = result.parse::<u64>().map_err(|error| {
+        format!("lattice-estimator-cli returned a non-integer security estimate: {error}")
+    })?;
+    if bits == 0 {
+        return Err("lattice-estimator-cli returned a non-positive security estimate".to_owned());
+    }
+    Ok(bits)
+}
+
+/// Audit one exact CRT-depth candidate using the same workload and noise path
+/// as the public search API.  Keeping the requested terminal depth unchanged
+/// lets callers try deeper source CRT chains without silently changing the
+/// configured drop cadence.
+pub fn audit_program_at_crt_depth(
+    request: &RnsBggPlanRequest,
+    program: &ExponentLutProgram,
+    bindings: &RnsBggNoiseBindings,
+    terminal_value_bounds: &[BigUint],
+    average: Option<&AverageCaseConfig>,
+) -> Result<(RnsBggParameters, RnsBggNoiseTrace), String> {
+    if request.operations_per_drop == 0 ||
+        request.terminal_depth == 0 ||
+        request.max_crt_depth < request.terminal_depth
+    {
+        return Err("invalid CRT-depth search request".to_owned());
+    }
+    let workload =
+        RnsBggDerivedWorkload::from_program(program).map_err(|error| error.to_string())?;
+    let logical_count = program
+        .outputs()
+        .iter()
+        .map(|output| match output {
+            Operand::Scalar(wire) | Operand::Member { family: wire, .. } => *wire,
+        })
+        .map(|wire| workload.level(wire))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let base_bits = request.crt_bits.div_ceil(2);
+    let pool = DCRTPolyParams::try_new(
+        request.ring_dimension,
+        request.max_crt_depth,
+        request.crt_bits,
+        base_bits.min(31) as u32,
+        None,
+        None,
+    )
+    .map_err(|_| "unsupported prime pool".to_owned())?;
+    let primes = pool.to_crt().0;
+    // Keep two successors beyond the program's last output level.  Refresh
+    // uses them as `p` and the target q_t product, respectively; without
+    // both levels a source whose final LUT lands at the last logical level
+    // cannot follow the production q -> p -> q_t chain.
+    let chain_last =
+        logical_count.checked_add(2).ok_or_else(|| "logical level chain overflows".to_owned())?;
+    let mut levels = Vec::with_capacity(chain_last + 1);
+    for logical_level in 0..=chain_last {
+        let physical_drop = logical_level / request.operations_per_drop;
+        let depth = request.max_crt_depth.saturating_sub(physical_drop).max(request.terminal_depth);
+        let modulus = primes
+            .get(..depth)
+            .ok_or_else(|| "CRT-depth candidate exceeds the prime pool".to_owned())?
+            .iter()
+            .copied()
+            .map(BigUint::from)
+            .product();
+        levels.push(pool.select_modulus(&modulus).ok_or_else(|| "invalid CRT basis".to_owned())?);
+    }
+    let parameters = RnsBggParameters::new(
+        levels,
+        request.encoding_error_sigma.clone(),
+        request.operations_per_drop,
+    )
+    .map_err(|error| error.to_string())?;
+    let trace = parameters
+        .audit_program(program, bindings, terminal_value_bounds, average)
+        .map_err(|error| error.to_string())?;
+    Ok((parameters, trace))
+}
 
 /// Errors raised while converting a finite decimal into an exact IR real.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

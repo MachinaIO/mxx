@@ -12,21 +12,22 @@ use mxx_exponent_lut::{
     program::{AttributeKnowledge, FamilyRange, InputBinding, WireId},
     rns_bgg::{
         RnsBggDerivedWorkload, RnsBggNoiseBindings, RnsBggNoiseFamily, RnsBggNoiseRhs,
-        RnsBggNoiseValue, RnsBggParameters, RnsEncryptBuild, RnsNoiseBuild, RnsOnlineBuild,
-        RnsPreprocessBuild, verify_output,
+        RnsBggNoiseTrace, RnsBggNoiseValue, RnsBggParameters, RnsBggPlanRequest, RnsEncryptBuild,
+        RnsNoiseBuild, RnsOnlineBuild, RnsPreprocessBuild, verify_output,
+    },
+    utils::{
+        audit_program_at_crt_depth, env_usize, lattice_security_bits, noise_model,
+        ring_dimension_candidates,
     },
 };
 use mxx_ir_core::{IntExpr, ParamEnv};
-use mxx_primitives::{
-    poly::{
-        Poly, PolyParams,
-        dcrt::{
-            gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-            params::DCRTPolyParams,
-            poly::DCRTPoly,
-        },
+use mxx_primitives::poly::{
+    Poly, PolyParams,
+    dcrt::{
+        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
+        params::DCRTPolyParams,
+        poly::DCRTPoly,
     },
-    sampler::bounds::hard_cutoff_from_sigma_bound,
 };
 use mxx_runtime::{
     ExecutionConfig,
@@ -35,7 +36,7 @@ use mxx_runtime::{
 };
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
-use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
+use std::{cell::RefCell, collections::BTreeMap, env, rc::Rc};
 
 const HASH_KEY: &[u8] = b"lwr-prf-rns-hash-key";
 
@@ -47,81 +48,42 @@ struct Fixture {
     mask: mxx_exponent_lut::rns_bgg::RnsBggMaskSecret,
     rhs: BTreeMap<mxx_exponent_lut::program::RhsId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
     lhs: BTreeMap<WireId, InputBinding<DCRTPoly, Vec<DCRTPoly>>>,
-    noise: RnsBggNoiseBindings,
+    trace: RnsBggNoiseTrace,
     d_exponents: Vec<usize>,
 }
 
-fn parameters() -> (RnsBggParameters, DCRTPolyParams) {
-    let source = DCRTPolyParams::new(32, 3, 10, 5, None, None);
-    let primes = source.to_crt().0;
-    let middle = DCRTPolyParams::new(32, 2, 10, 5, Some(primes[..2].to_vec()), None);
-    let terminal = DCRTPolyParams::new(32, 1, 10, 5, Some(primes[..1].to_vec()), None);
-    let sigma = BigDecimal::from(1u8);
-    let parameters = RnsBggParameters::new(vec![source.clone(), middle, terminal], sigma, 1)
-        .expect("valid RNS modulus chain");
-    (parameters, source)
+fn error_sigma() -> BigDecimal {
+    let sigma = env::var("MXX_EXPONENT_LUT_LWR_PRF_ERROR_SIGMA")
+        .unwrap_or_else(|_| "4".to_owned())
+        .parse()
+        .expect("MXX_EXPONENT_LUT_LWR_PRF_ERROR_SIGMA must be a decimal");
+    assert!(sigma > BigDecimal::from(0u8), "MXX_EXPONENT_LUT_LWR_PRF_ERROR_SIGMA must be positive");
+    sigma
 }
 
-fn fixture() -> Fixture {
-    let (rns_parameters, poly_parameters) = parameters();
-    let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2: 1, width_log2: 4 }, 2)
+fn profile_and_program(ring_dimension: u32) -> (SparseLwrPrfProfile, SparseLwrPrfProgram) {
+    let log_ring_dimension = ring_dimension.ilog2();
+    let stride_log2 =
+        log_ring_dimension.checked_sub(4).expect("LWR ring dimension must be at least 2^4");
+    // Rebuild the profile for every candidate dimension.  The exponent
+    // layout keeps width four while stride expands with the ring, so D's
+    // monomials remain valid in every searched negacyclic ring.
+    let profile = SparseLwrPrfProfile::new(ExpLayout { stride_log2, width_log2: 4 }, 2)
         .expect("valid sparse-LWR profile");
     let labels = [PrfLabel::from_components(&[b"lwr-rns-label"]).expect("canonical label")];
     let program = SparseLwrPrfProgram::new_structural(profile, 2, 2, HASH_KEY, &labels)
         .expect("structural sparse-LWR program");
-    let payload = RnsEncryptBuild::<GpuDcrtBackend>::new(&rns_parameters, [7; 32])
-        .sample_payload_secret()
-        .expect("payload secret");
-    let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&rns_parameters, [7; 32])
-        .sample_mask_secret()
-        .expect("mask secret");
-    let zero = DCRTPoly::const_zero(&poly_parameters);
-    let d_exponents = (0..profile.transform_column_count().expect("D width"))
-        .map(|index| index % profile.q().expect("Q exponent"))
-        .collect::<Vec<_>>();
-    let d_values = d_exponents
-        .iter()
-        .map(|exponent| {
-            let dimension = poly_parameters.ring_dimension() as usize;
-            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
-            let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
-            if rotation >= dimension { -monomial } else { monomial }
-        })
-        .collect::<Vec<_>>();
+    (profile, program)
+}
 
-    let mut lhs = BTreeMap::new();
-    let input_projection = program.program().encryption_inputs();
-    for (wire, declaration) in input_projection.inputs() {
-        let value = match (declaration.knowledge(), declaration.shape()) {
-            (AttributeKnowledge::PrivatePayload, InputBinding::Scalar(())) => {
-                InputBinding::Scalar(zero.clone())
-            }
-            (AttributeKnowledge::PublicPayload, InputBinding::Scalar(())) => {
-                InputBinding::Scalar(zero.clone())
-            }
-            (AttributeKnowledge::PublicPayload, InputBinding::Family(_)) => {
-                InputBinding::Family(d_values.clone())
-            }
-            (knowledge, shape) => panic!("unexpected input declaration: {knowledge:?} {shape:?}"),
-        };
-        lhs.insert(*wire, value);
-    }
-
-    let selector = program.selection_families()[0].selector;
-    let mut selector_values = vec![zero; program.block_count() * program.bucket_width()];
-    for bucket in 0..program.block_count() {
-        selector_values[bucket * program.bucket_width()] =
-            DCRTPoly::const_rotate_poly(&poly_parameters, 0);
-    }
-    let rhs = BTreeMap::from([(selector, InputBinding::Family(selector_values))]);
-
-    let error_bound = hard_cutoff_from_sigma_bound(&BigDecimal::from(1u8));
+fn noise_bindings(program: &SparseLwrPrfProgram, sigma: &BigDecimal) -> RnsBggNoiseBindings {
     let noise_inputs = program
         .program()
         .encryption_inputs()
         .inputs()
         .iter()
-        .map(|(_, declaration)| {
+        .enumerate()
+        .map(|(index, (_, declaration))| {
             match (declaration.knowledge(), declaration.shape()) {
                 (AttributeKnowledge::PrivatePayload, InputBinding::Scalar(())) |
                 (AttributeKnowledge::PublicPayload, InputBinding::Scalar(())) |
@@ -130,7 +92,12 @@ fn fixture() -> Fixture {
                     panic!("unexpected noise declaration: {knowledge:?} {shape:?}")
                 }
             }
-            RnsBggNoiseValue::public(error_bound.clone(), &[BigInt::from(1u8)])
+            RnsBggNoiseValue::sampled_encoding_sigma(
+                sigma,
+                format!("lwr-input-{index}").as_bytes(),
+                &[BigInt::from(1u8)],
+            )
+            .expect("valid LWR encoding sigma")
         })
         .collect::<Vec<_>>();
     let noise_rhs = program
@@ -168,20 +135,216 @@ fn fixture() -> Fixture {
             }),
         )
     });
-    let noise = RnsBggNoiseBindings::new(input_bindings, rhs_binding.into_iter().collect())
-        .expect("declaration-order noise bindings");
+    RnsBggNoiseBindings::new(input_bindings, rhs_binding.into_iter().collect())
+        .expect("declaration-order noise bindings")
+}
 
-    Fixture {
-        parameters: rns_parameters,
-        profile,
-        program,
-        payload,
-        mask,
-        rhs,
-        lhs,
-        noise,
-        d_exponents,
+fn terminal_value_bounds(
+    profile: &SparseLwrPrfProfile,
+    program: &SparseLwrPrfProgram,
+) -> Vec<BigUint> {
+    let bound = profile
+        .canonical_readout()
+        .expect("canonical readout")
+        .into_iter()
+        .max()
+        .map(BigUint::from)
+        .expect("nonempty canonical readout");
+    vec![bound; program.program().outputs().len()]
+}
+
+fn search_fixture(
+    sigma: &BigDecimal,
+) -> (RnsBggParameters, DCRTPolyParams, SparseLwrPrfProfile, SparseLwrPrfProgram, RnsBggNoiseTrace)
+{
+    let required_security = env_usize("MXX_EXPONENT_LUT_LWR_PRF_SECURITY_BITS", 1)
+        .expect("security bits configuration");
+    assert!(required_security > 0, "MXX_EXPONENT_LUT_LWR_PRF_SECURITY_BITS must be positive");
+    let required_security = u64::try_from(required_security)
+        .expect("MXX_EXPONENT_LUT_LWR_PRF_SECURITY_BITS must fit in u64");
+    let crt_bits =
+        env_usize("MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS", 40).expect("CRT bits configuration");
+    assert!(crt_bits > 0, "MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS must be positive");
+    let expected_base_bits = crt_bits.div_ceil(2);
+    assert!(
+        expected_base_bits <= 31,
+        "MXX_EXPONENT_LUT_LWR_PRF_CRT_BITS is unsupported above 62 bits"
+    );
+    let max_crt_depth = env_usize("MXX_EXPONENT_LUT_LWR_PRF_MAX_CRT_DEPTH", 32)
+        .expect("maximum CRT depth configuration");
+    assert!(max_crt_depth > 0, "MXX_EXPONENT_LUT_LWR_PRF_MAX_CRT_DEPTH must be positive");
+    let operations_per_drop = env_usize("MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP", 1)
+        .expect("operations-per-drop configuration");
+    assert!(
+        operations_per_drop > 0,
+        "MXX_EXPONENT_LUT_LWR_PRF_OPERATIONS_PER_DROP must be positive"
+    );
+    let average = noise_model("MXX_EXPONENT_LUT_LWR_PRF_").expect("noise-model configuration");
+    let candidates = ring_dimension_candidates(
+        "MXX_EXPONENT_LUT_LWR_PRF_MIN_LOG_RING_DIMENSION",
+        "MXX_EXPONENT_LUT_LWR_PRF_MAX_LOG_RING_DIMENSION",
+        5,
+        16,
+    )
+    .expect("ring-dimension configuration");
+    let mut failures = Vec::new();
+    for ring_dimension in candidates {
+        let (profile, program) = profile_and_program(ring_dimension);
+        let noise = noise_bindings(&program, sigma);
+        let terminal_bounds = terminal_value_bounds(&profile, &program);
+        for crt_depth in 1..=max_crt_depth {
+            let request = RnsBggPlanRequest {
+                ring_dimension,
+                encoding_error_sigma: sigma.clone(),
+                crt_bits,
+                terminal_depth: 1,
+                max_crt_depth: crt_depth,
+                terminal_value_bound: terminal_bounds
+                    .iter()
+                    .max()
+                    .cloned()
+                    .expect("terminal bounds are nonempty"),
+                operations_per_drop,
+            };
+            let (parameters, audit_trace) = match audit_program_at_crt_depth(
+                &request,
+                program.program(),
+                &noise,
+                &terminal_bounds,
+                average.as_ref(),
+            ) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    failures.push(format!(
+                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: {error}"
+                    ));
+                    continue;
+                }
+            };
+            for (index, level) in parameters.levels().iter().enumerate() {
+                assert_eq!(
+                    level.base_bits(),
+                    expected_base_bits as u32,
+                    "selected LWR level {index} must use ceil(CRT_BITS/2) base bits"
+                );
+            }
+            let workload = match RnsBggDerivedWorkload::from_program_with_parameters(
+                &parameters,
+                program.program(),
+            ) {
+                Ok(workload) => workload,
+                Err(error) => {
+                    failures.push(format!(
+                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: workload validation failed: {error}"
+                    ));
+                    continue;
+                }
+            };
+            let trace = match api::noise_simulate(
+                program.program(),
+                RnsNoiseBuild::new(&parameters, program.program(), &workload, &noise)
+                    .expect("validated candidate noise lowering state"),
+                |_, outputs| Ok(outputs),
+            ) {
+                Ok(trace) => trace,
+                Err(error) => {
+                    failures.push(format!(
+                        "ring dimension {ring_dimension}, CRT depth {crt_depth}: noise simulation failed: {error}"
+                    ));
+                    continue;
+                }
+            };
+            if trace.outputs.len() != program.program().outputs().len() {
+                failures.push(format!(
+                    "ring dimension {ring_dimension}, CRT depth {crt_depth}: noise simulation finalized {} outputs, expected {}",
+                    trace.outputs.len(),
+                    program.program().outputs().len()
+                ));
+                continue;
+            }
+            let source = parameters.level(0).expect("source level").clone();
+            let achieved = lattice_security_bits(&source, sigma)
+                .expect("lattice security estimator must be available");
+            if achieved >= required_security {
+                eprintln!(
+                    "LWR parameters accepted: ring_dimension={ring_dimension} crt_depth={crt_depth} security_bits={achieved} required_security_bits={required_security}"
+                );
+                return (parameters, source, profile, program, audit_trace);
+            }
+            failures.push(format!(
+                "ring dimension {ring_dimension}, CRT depth {crt_depth}: security {achieved} < {required_security}"
+            ));
+        }
     }
+    panic!(
+        "no dynamic LWR parameter candidate was accepted ({}): {}",
+        failures.len(),
+        failures.join("; ")
+    );
+}
+
+fn fixture(
+    parameters: RnsBggParameters,
+    poly_parameters: DCRTPolyParams,
+    profile: SparseLwrPrfProfile,
+    program: SparseLwrPrfProgram,
+    trace: RnsBggNoiseTrace,
+) -> Fixture {
+    let payload = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [7; 32])
+        .sample_payload_secret()
+        .expect("payload secret");
+    let mask = RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [7; 32])
+        .sample_mask_secret()
+        .expect("mask secret");
+    let zero = DCRTPoly::const_zero(&poly_parameters);
+    let d_exponents = (0..profile.transform_column_count().expect("D width"))
+        .map(|index| index % profile.q().expect("Q exponent"))
+        .collect::<Vec<_>>();
+    // D is a public LHS family supplied at encrypt time.  Convert each
+    // exponent to its stride-aware signed monomial, including the
+    // X^n = -1 negacyclic sign when the rotation crosses the boundary.
+    let d_values = d_exponents
+        .iter()
+        .map(|exponent| {
+            let dimension = poly_parameters.ring_dimension() as usize;
+            let rotation = (exponent * profile.layout.stride()) % (2 * dimension);
+            let monomial = DCRTPoly::const_rotate_poly(&poly_parameters, rotation % dimension);
+            if rotation >= dimension { -monomial } else { monomial }
+        })
+        .collect::<Vec<_>>();
+
+    let mut lhs = BTreeMap::new();
+    let input_projection = program.program().encryption_inputs();
+    for (wire, declaration) in input_projection.inputs() {
+        // The initial state is private; public scalar/family inputs are
+        // supplied as encrypt-time attributes.  No private plaintext is
+        // copied into the online call.
+        let value = match (declaration.knowledge(), declaration.shape()) {
+            (AttributeKnowledge::PrivatePayload, InputBinding::Scalar(())) => {
+                InputBinding::Scalar(zero.clone())
+            }
+            (AttributeKnowledge::PublicPayload, InputBinding::Scalar(())) => {
+                InputBinding::Scalar(zero.clone())
+            }
+            (AttributeKnowledge::PublicPayload, InputBinding::Family(_)) => {
+                InputBinding::Family(d_values.clone())
+            }
+            (knowledge, shape) => panic!("unexpected input declaration: {knowledge:?} {shape:?}"),
+        };
+        lhs.insert(*wire, value);
+    }
+
+    // Selectors are fixed private RHS plaintexts.  They are prepared during
+    // preprocessing and later consumed only through compact RHS artifacts.
+    let selector = program.selection_families()[0].selector;
+    let mut selector_values = vec![zero; program.block_count() * program.bucket_width()];
+    for bucket in 0..program.block_count() {
+        selector_values[bucket * program.bucket_width()] =
+            DCRTPoly::const_rotate_poly(&poly_parameters, 0);
+    }
+    let rhs = BTreeMap::from([(selector, InputBinding::Family(selector_values))]);
+
+    Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents }
 }
 
 fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBackend {
@@ -197,6 +360,9 @@ fn gpu_backend(parameters: &RnsBggParameters, devices: Vec<i32>) -> GpuDcrtBacke
 }
 
 fn sequential_dt_oracle(program: &SparseLwrPrfProgram, d_exponents: &[usize]) -> usize {
+    // This is an independent cleartext oracle for the sequential bucket
+    // recurrence.  It reads only the immutable transform bits and fixture D
+    // exponents, never the production key, row, artifact, or online result.
     let q = program.profile().q().expect("Q exponent");
     (0..program.block_count())
         .map(|bucket| {
@@ -217,21 +383,15 @@ fn sequential_dt_oracle(program: &SparseLwrPrfProgram, d_exponents: &[usize]) ->
 fn lwr_prf_end_to_end() {
     let devices = detected_gpu_device_ids();
     if devices.is_empty() {
+        // This target is GPU-only; the sequential runtime lock is applied by
+        // the test attribute when a device is available.
         eprintln!("skipping Sparse-LWR round trip: no CUDA device detected");
         return;
     }
-    let fixture = fixture();
-    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, noise, d_exponents } =
-        fixture;
-    let workload = RnsBggDerivedWorkload::from_program(program.program())
-        .expect("Sparse-LWR workload derivation");
-    let trace = api::noise_simulate(
-        program.program(),
-        RnsNoiseBuild::new(&parameters, program.program(), &workload, &noise)
-            .expect("RNS noise lowering state"),
-        |_, outputs| Ok(outputs),
-    )
-    .expect("RNS noise simulation");
+    let sigma = error_sigma();
+    let (parameters, poly_parameters, profile, program, trace) = search_fixture(&sigma);
+    let Fixture { parameters, profile, program, payload, mask, rhs, lhs, trace, d_exponents } =
+        fixture(parameters, poly_parameters, profile, program, trace);
     assert!(!trace.wires.is_empty(), "noise simulation must visit the PRF gates");
 
     let mut backend = gpu_backend(&parameters, devices.clone());
@@ -261,6 +421,10 @@ fn lwr_prf_end_to_end() {
     let preprocess_encrypt = directory.path().join("preprocess-encrypt.json");
     let preprocess_online = directory.path().join("preprocess-online.json");
     let encryption = directory.path().join("encryption.json");
+    // Preprocess receives the private payload secret and fixed RHS selectors,
+    // while encrypt receives public D attributes, a fresh mask, and only the
+    // preparation artifacts.  Online receives artifacts/configuration only;
+    // RHS plaintexts never cross this boundary.
     let (preprocess, online) = api::preprocess(
         program.program(),
         &ParamEnv::default(),
@@ -315,12 +479,19 @@ fn lwr_prf_end_to_end() {
         },
     )
     .expect("RNS online evaluation");
+    // Estimation is attached to each of the three actual production graphs,
+    // so the measured workflow remains simulation -> preprocess -> encrypt ->
+    // online evaluation rather than a test-only reconstruction.
     estimator.borrow_mut().measure_collected().expect("measure all three production graphs");
     assert_eq!(
         observed.borrow().as_slice(),
         ["preprocess", "encrypt", "online_eval"],
         "observers must see the exact three production graphs"
     );
+    // Compute the expected exponent/readout independently from D and the
+    // structural transform.  The coefficient polynomial is then built in
+    // the source ring with the exact canonical readout in every coefficient;
+    // it is not decoded from the returned carrier.
     let expected_exponent = sequential_dt_oracle(&program, &d_exponents);
     let expected_readout =
         profile.canonical_readout().expect("canonical readout")[expected_exponent];

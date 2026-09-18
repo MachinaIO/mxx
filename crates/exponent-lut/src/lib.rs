@@ -10,7 +10,7 @@ pub mod noise_refresh;
 pub mod noise_utils;
 pub mod program;
 pub mod rns_bgg;
-mod utils;
+pub mod utils;
 
 pub use nand_circuit::{CompiledNandCircuit, NandCircuit, NandCircuitError};
 pub use noise_refresh::prf::SparseLwrPrfProfile;

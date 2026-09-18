@@ -230,10 +230,19 @@ times to `total_time_seconds`. GPU-resident edges have no added transfer charge;
 the matrix-Family staging rule and artifact codecs.
 
 The NAND integration follows the same complete simulation, three-stage estimate,
-and three-stage round-trip order. `MXX_EXPONENT_LUT_NAND_SKIP_SAGE=1` is an
-explicit local mode that skips the lattice-estimator invocation and target
-comparison, and logs `lattice_security_check=skipped`. Otherwise the estimator
-runs and its result must meet `MXX_EXPONENT_LUT_NAND_SECURITY_BITS`.
+and three-stage round-trip order. It builds a complete binary NAND tree from
+`MXX_EXPONENT_LUT_NAND_DEPTH`, searches the configured CRT-depth and inclusive
+log-ring-dimension candidates, validates the production noise report, and
+accepts only a candidate whose `lattice-estimator-cli` result reaches the
+positive `MXX_EXPONENT_LUT_NAND_SECURITY_BITS` target. Sparse-LWR uses the
+corresponding `MXX_EXPONENT_LUT_LWR_PRF_*` namespace for its candidate,
+noise, and security settings; noise-refresh uses the
+`MXX_EXPONENT_LUT_NOISE_REFRESH_*` namespace. Candidate searches use 40 CRT
+bits by default and derive gadget base bits as `ceil(CRT_BITS/2)`, subject
+to backend limits. Average-case noise is the default; each target's
+`*_NOISE_MODEL=worst` override selects worst-case acceptance, while its
+namespaced `*_FAILURE_EXPONENT` sets the average-case failure-event budget.
+Invalid ranges and targets fail closed; no skip-Sage success path exists.
 
 `dataflow` and `transfers` report the extra costs and counts separately. CPU IR
 dispatch is a measured scalar-node proxy, not a full protocol execution trace.

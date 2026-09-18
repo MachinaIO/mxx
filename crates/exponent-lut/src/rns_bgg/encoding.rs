@@ -459,6 +459,34 @@ pub struct RnsBggMaskSecret {
     pub(crate) row: RnsBggRow,
 }
 
+impl RnsBggPayloadSecret {
+    /// Re-express the same sampled coefficients in a requested RNS level.
+    ///
+    /// This preserves the secret relation across stage-local parameter
+    /// schedules; it does not sample a second payload.
+    pub fn at_level(
+        &self,
+        parameters: &RnsBggParameters,
+        level: usize,
+    ) -> Result<Self, RnsBggError> {
+        Ok(Self { row: reduce_secret(parameters, &self.row, level)? })
+    }
+}
+
+impl RnsBggMaskSecret {
+    /// Re-express the same sampled coefficients in a requested RNS level.
+    ///
+    /// This preserves the secret relation across stage-local parameter
+    /// schedules; it does not sample a second mask.
+    pub fn at_level(
+        &self,
+        parameters: &RnsBggParameters,
+        level: usize,
+    ) -> Result<Self, RnsBggError> {
+        Ok(Self { row: reduce_secret(parameters, &self.row, level)? })
+    }
+}
+
 fn graph<E: std::fmt::Display>(error: E) -> RnsBggError {
     RnsBggError::Graph(error.to_string())
 }
@@ -578,10 +606,23 @@ pub struct EncodingLowering<'a> {
     pub(crate) preprocess: ProductionId,
     pub(crate) encryption: ProductionId,
     pub(crate) catalog: ArtifactCatalog,
+    pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
     pub(crate) current_site: Option<LoweringSite>,
 }
 
 impl EncodingLowering<'_> {
+    fn preprocess_artifact_name(&self, role: String) -> String {
+        self.refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
+            refresh_prf_artifact_name(commitment, slot, &role)
+        })
+    }
+
+    fn encryption_artifact_name(&self, role: String) -> String {
+        self.refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
+            refresh_prf_artifact_name(commitment, slot, &role)
+        })
+    }
+
     /// Compute the native Walsh/automorphism branch polynomial for one unary
     /// LUT branch.  The coefficient depends on the complete table, not only
     /// its width; public-key preparation uses this same helper.
@@ -699,12 +740,12 @@ impl EncodingLowering<'_> {
         Ok((
             ring.artifact_input(
                 self.encryption.clone(),
-                format!("lut-helper/{level}/{sigma}.0"),
+                self.encryption_artifact_name(format!("lut-helper/{level}/{sigma}.0")),
                 (1, columns),
             ),
             ring.artifact_input(
                 self.encryption.clone(),
-                format!("lut-helper/{level}/{sigma}.1"),
+                self.encryption_artifact_name(format!("lut-helper/{level}/{sigma}.1")),
                 (1, columns),
             ),
         ))
@@ -716,7 +757,7 @@ impl EncodingLowering<'_> {
         let input = |port: usize| {
             ring.artifact_input(
                 self.preprocess.clone(),
-                format!("lut-public/{level}/{sigma}.{port}"),
+                self.preprocess_artifact_name(format!("lut-public/{level}/{sigma}.{port}")),
                 (1, columns),
             )
         };
@@ -746,7 +787,7 @@ impl EncodingLowering<'_> {
             let family = |port: usize| {
                 ring.family_artifact_input(
                     self.preprocess.clone(),
-                    format!("rhs/{:?}/family.{port}", rhs.id),
+                    self.preprocess_artifact_name(format!("rhs/{:?}/family.{port}", rhs.id)),
                     count.clone(),
                     (1, columns),
                 )
@@ -762,24 +803,24 @@ impl EncodingLowering<'_> {
             (
                 ring.artifact_input(
                     self.preprocess.clone(),
-                    format!("rhs/{:?}.0", rhs.id),
+                    self.preprocess_artifact_name(format!("rhs/{:?}.0", rhs.id)),
                     (1, columns),
                 ),
                 ring.artifact_input(
                     self.preprocess.clone(),
-                    format!("rhs/{:?}.1", rhs.id),
+                    self.preprocess_artifact_name(format!("rhs/{:?}.1", rhs.id)),
                     (1, columns),
                 ),
             ),
             (
                 ring.artifact_input(
                     self.preprocess.clone(),
-                    format!("rhs/{:?}.2", rhs.id),
+                    self.preprocess_artifact_name(format!("rhs/{:?}.2", rhs.id)),
                     (1, columns),
                 ),
                 ring.artifact_input(
                     self.preprocess.clone(),
-                    format!("rhs/{:?}.3", rhs.id),
+                    self.preprocess_artifact_name(format!("rhs/{:?}.3", rhs.id)),
                     (1, columns),
                 ),
             ),
@@ -830,9 +871,9 @@ impl EncodingLowering<'_> {
             .map(|port| {
                 decomposition_ring.family_artifact_input(
                     self.preprocess.clone(),
-                    format!(
+                    self.preprocess_artifact_name(format!(
                         "lut-switching/{evaluation_level}/{decomposition_level}/{lut_id:?}/{input_layout:?}.{port}"
-                    ),
+                    )),
                     count.clone(),
                     (1, target_columns),
                 )
@@ -1401,7 +1442,7 @@ pub struct RnsEncryptBuild<'a, B: Backend> {
     catalog: ArtifactCatalog,
     runtime: BTreeMap<String, RuntimeValue<B>>,
     refresh_prf_children: BTreeMap<usize, Box<RnsEncryptBuild<'a, B>>>,
-    refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId)>,
+    refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId, [u8; 32])>,
 }
 
 fn validate_lut_public_artifacts(
@@ -1409,6 +1450,7 @@ fn validate_lut_public_artifacts(
     production: &ProductionId,
     parameters: &RnsBggParameters,
     inputs: &crate::program::EncryptionInputs,
+    refresh_prf_namespace: Option<([u8; 32], usize)>,
 ) -> Result<(), ApiError> {
     let helper_keys = canonical_lut_helper_keys(parameters, inputs).map_err(ApiError::scheme)?;
     let manifest = catalog
@@ -1417,11 +1459,60 @@ fn validate_lut_public_artifacts(
         .ok_or_else(|| ApiError::compatibility("preprocess manifest is not available"))?;
     for (level, sigma) in helper_keys {
         for port in 0..4 {
-            let name = format!("lut-public/{level}/{sigma}.{port}");
+            let role = format!("lut-public/{level}/{sigma}.{port}");
+            let name = refresh_prf_namespace.map_or(role.clone(), |(commitment, slot)| {
+                refresh_prf_artifact_name(commitment, slot, &role)
+            });
             if !manifest.artifacts.contains_key(&name) {
                 return Err(ApiError::compatibility(format!(
                     "preprocess is missing required LUT A artifact {name}"
                 )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_refresh_prf_input_key_artifacts(
+    catalog: &ArtifactCatalog,
+    production: &ProductionId,
+    parameters: &RnsBggParameters,
+    inputs: &crate::program::EncryptionInputs,
+    commitment: [u8; 32],
+    slot: usize,
+) -> Result<(), RnsBggError> {
+    let manifest = catalog
+        .manifests()
+        .get(production)
+        .ok_or(RnsBggError::Binding("refresh PRF preprocess manifest is missing"))?;
+    let modulus = BigInt::from(parameters.level(0)?.modulus().as_ref().clone());
+    let ring_dimension = parameters.level(0)?.ring_dimension() as usize;
+    for (wire, declaration) in inputs.inputs() {
+        let columns = parameters.key_component_columns(0, declaration.knowledge())?;
+        let artifact_type = ArtifactType::Matrix(ConcreteMatrixType {
+            modulus: modulus.clone(),
+            ring_dimension,
+            rows: 1,
+            columns,
+        });
+        let family_count = match declaration.shape() {
+            InputBinding::Scalar(()) => None,
+            InputBinding::Family(count) => Some(
+                count
+                    .evaluate(&ParamEnv::default())
+                    .ok()
+                    .and_then(|value| value.to_usize())
+                    .ok_or(RnsBggError::Binding("refresh PRF family count is not concrete"))?,
+            ),
+        };
+        for port in 0..4 {
+            let name = refresh_prf_input_key_artifact_name(commitment, slot, *wire, port);
+            let artifact = manifest
+                .artifacts
+                .get(&name)
+                .ok_or(RnsBggError::Binding("refresh PRF input-key artifact is missing"))?;
+            if artifact.artifact_type != artifact_type || artifact.family_count != family_count {
+                return Err(RnsBggError::Binding("refresh PRF input-key artifact schema mismatch"));
             }
         }
     }
@@ -1473,7 +1564,8 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
     ) -> Result<(), ApiError> {
         let binding = preprocess.checkpoint().descriptor().binding().clone();
         if binding.context() != &self.context ||
-            binding.parameters() != &self.parameters.parameter_identity() ||
+            (self.refresh_prf_binding.is_none() &&
+                binding.parameters() != &self.parameters.parameter_identity()) ||
             binding.hash_key_commitment() != &self.hash_key_commitment
         {
             return Err(ApiError::compatibility(
@@ -1492,7 +1584,13 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             .inputs
             .as_ref()
             .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
-        validate_lut_public_artifacts(&self.catalog, &production, self.parameters, inputs)?;
+        validate_lut_public_artifacts(
+            &self.catalog,
+            &production,
+            self.parameters,
+            inputs,
+            self.refresh_prf_binding.map(|(commitment, slot, _, _)| (commitment, slot)),
+        )?;
         self.binding = Some(binding);
         Ok(())
     }
@@ -1515,10 +1613,26 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
         slot: usize,
         program: &ExponentLutProgram,
     ) -> Result<(), RnsBggError> {
+        self.parameters.validate_refresh_prf_schedule(declaration, slot)?;
         if slot >= declaration.slots().len() ||
             program.id() != declaration.prepared().program().id()
         {
             return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
+        }
+        let source_q = declaration
+            .slots()
+            .get(slot)
+            .and_then(|slot| slot.q.to_biguint())
+            .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
+        if self
+            .parameters
+            .level(0)
+            .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?
+            .modulus()
+            .as_ref() !=
+            &source_q
+        {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
         }
         let inputs = self
             .inputs
@@ -1530,7 +1644,12 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
         if self.refresh_prf_binding.is_some() {
             return Err(RnsBggError::Binding("refresh PRF child is already bound"));
         }
-        self.refresh_prf_binding = Some((*declaration.commitment(), slot, program.id()));
+        self.refresh_prf_binding = Some((
+            *declaration.commitment(),
+            slot,
+            program.id(),
+            self.parameters.parameter_identity(),
+        ));
         Ok(())
     }
 
@@ -1553,6 +1672,8 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
         }
         let expected_program = declaration.prepared().program().id();
         for (slot, child) in &children {
+            let expected_child_parameters =
+                self.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
             let binding = child
                 .binding
                 .as_ref()
@@ -1565,14 +1686,30 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                 child.payload_secret.is_none() ||
                 child.mask_secret.is_none() ||
                 child.preprocess.is_none() ||
-                child.refresh_prf_binding.map(|(commitment, child_slot, program)| {
+                child.parameters.parameter_identity() != expected_child_parameters ||
+                child.refresh_prf_binding.map(|(commitment, child_slot, program, identity)| {
                     commitment == *declaration.commitment() &&
                         child_slot == *slot &&
-                        program == expected_program
+                        program == expected_program &&
+                        identity == expected_child_parameters
                 }) != Some(true)
             {
                 return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
             }
+            validate_refresh_prf_input_key_artifacts(
+                &child.catalog,
+                child
+                    .preprocess
+                    .as_ref()
+                    .ok_or(RnsBggError::Binding("refresh PRF child preprocess is not bound"))?,
+                &child.parameters,
+                child
+                    .inputs
+                    .as_ref()
+                    .ok_or(RnsBggError::Binding("refresh PRF child inputs are not bound"))?,
+                *declaration.commitment(),
+                *slot,
+            )?;
             if child
                 .refresh_declaration
                 .as_ref()
@@ -1614,6 +1751,42 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             .ok_or_else(|| ApiError::input("refresh PRF child mask is not bound"))?;
         let ring = child.parameters.ring(0).map_err(ApiError::scheme)?;
         let commitment = *declaration.commitment();
+        let helper_keys =
+            canonical_lut_helper_keys(child.parameters, inputs).map_err(ApiError::scheme)?;
+        for (level, sigma) in helper_keys {
+            let helper_ring = child.parameters.ring(level).map_err(ApiError::scheme)?;
+            let columns = child.parameters.component_columns(level).map_err(ApiError::scheme)?;
+            let public_ports = (0..4)
+                .map(|port| {
+                    helper_ring.artifact_input(
+                        production.clone(),
+                        refresh_prf_artifact_name(
+                            commitment,
+                            slot,
+                            &format!("lut-public/{level}/{sigma}.{port}"),
+                        ),
+                        (1, columns),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let public_data = (
+                (public_ports[0].clone(), public_ports[1].clone()),
+                (public_ports[2].clone(), public_ports[3].clone()),
+            );
+            let helper = child
+                .encrypt_lut_helper(mask, public_data, level, sigma)
+                .map_err(ApiError::scheme)?;
+            graph = graph
+                .artifact_output(
+                    refresh_prf_artifact_name(
+                        commitment,
+                        slot,
+                        &format!("lut-helper/{level}/{sigma}"),
+                    ),
+                    helper,
+                )
+                .map_err(ApiError::scheme)?;
+        }
         for (wire, declaration_input) in inputs.inputs() {
             let columns = child
                 .parameters
@@ -1625,24 +1798,24 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                     (
                         ring.artifact_input(
                             production.clone(),
-                            format!("public-key/{wire:?}.0"),
+                            refresh_prf_input_key_artifact_name(commitment, slot, *wire, 0),
                             (1, columns),
                         ),
                         ring.artifact_input(
                             production.clone(),
-                            format!("public-key/{wire:?}.1"),
+                            refresh_prf_input_key_artifact_name(commitment, slot, *wire, 1),
                             (1, columns),
                         ),
                     ),
                     (
                         ring.artifact_input(
                             production.clone(),
-                            format!("public-key/{wire:?}.2"),
+                            refresh_prf_input_key_artifact_name(commitment, slot, *wire, 2),
                             (1, columns),
                         ),
                         ring.artifact_input(
                             production.clone(),
-                            format!("public-key/{wire:?}.3"),
+                            refresh_prf_input_key_artifact_name(commitment, slot, *wire, 3),
                             (1, columns),
                         ),
                     ),
@@ -1671,7 +1844,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                         .map(|port| {
                             ring.family_artifact_input(
                                 production.clone(),
-                                format!("public-key/{wire:?}.{port}"),
+                                refresh_prf_input_key_artifact_name(commitment, slot, *wire, port),
                                 values.count().clone(),
                                 (1, columns),
                             )
@@ -2255,7 +2428,7 @@ pub struct RnsOnlineBuild<'a> {
         Environment<RnsBggEncoding, RhsRef<Int>, Family<RnsBggEncoding>, Family<RhsRef<Int>>>,
     pending_refresh: Option<(usize, RefreshDeclaration, BTreeMap<usize, RnsOnlineBuild<'a>>)>,
     refreshed_input: Option<(RefreshDeclaration, RnsBggEncoding)>,
-    refresh_prf: Option<(usize, crate::program::ExponentLutProgramId)>,
+    refresh_prf: Option<(usize, crate::program::ExponentLutProgramId, [u8; 32])>,
     refreshed_public_key: Option<RnsBggPublicKey>,
 }
 
@@ -2290,7 +2463,6 @@ impl<'a> RnsOnlineBuild<'a> {
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         let prepared = declaration.prepared().program();
-        let expected_parameters = self.parameters.parameter_identity();
         let preprocess_binding = preprocess.checkpoint().descriptor().binding();
         let encryption_binding = encryption.checkpoint().descriptor().binding();
         let expected_hash_key = hash_key_commitment(hash_key);
@@ -2299,7 +2471,6 @@ impl<'a> RnsOnlineBuild<'a> {
         }
         for binding in [preprocess_binding, encryption_binding] {
             if binding.context() != &self.context ||
-                binding.parameters() != &expected_parameters ||
                 binding.program() != declaration.source_program() ||
                 binding.hash_key_commitment() != &expected_hash_key ||
                 binding.refresh_commitment() != Some(declaration.commitment())
@@ -2513,6 +2684,7 @@ impl<'a> RnsOnlineBuild<'a> {
             preprocess: preprocess_production,
             encryption: encryption_production,
             catalog,
+            refresh_prf_namespace: Some((*declaration.commitment(), slot)),
             current_site: None,
         });
         Ok(())
@@ -2529,6 +2701,7 @@ impl<'a> RnsOnlineBuild<'a> {
         declaration: &RefreshDeclaration,
         slot: usize,
     ) -> Result<(), RnsBggError> {
+        self.parameters.validate_refresh_prf_schedule(declaration, slot)?;
         if slot >= declaration.slots().len() {
             return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
         }
@@ -2568,16 +2741,24 @@ impl<'a> RnsOnlineBuild<'a> {
             .slots()
             .get(slot)
             .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?
-            .p
+            .q
             .to_biguint()
             .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-        if !self.parameters.levels().iter().any(|level| level.modulus().as_ref() == &slot_modulus) {
+        if self
+            .parameters
+            .level(0)
+            .map_err(|_| RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?
+            .modulus()
+            .as_ref() !=
+            &slot_modulus
+        {
             return Err(RnsBggError::Refresh(RefreshError::InvalidModulusRelation));
         }
         if declaration.prepared().setup_identity().program != evaluator.program.id() {
             return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
         }
-        self.refresh_prf = Some((slot, evaluator.program.id()));
+        self.refresh_prf =
+            Some((slot, evaluator.program.id(), self.parameters.parameter_identity()));
         Ok(())
     }
 
@@ -2792,6 +2973,7 @@ impl<'a> RnsOnlineBuild<'a> {
             preprocess,
             encryption,
             catalog,
+            refresh_prf_namespace: None,
             current_site: None,
         });
         self.environment = environment;
@@ -2830,9 +3012,14 @@ impl<'a> RnsOnlineBuild<'a> {
             return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
         }
         for (slot, child) in &prf_children {
-            if child.refresh_prf.map(|(bound_slot, program)| {
-                bound_slot == *slot && program == declaration.prepared().program().id()
-            }) != Some(true)
+            let expected_child_parameters =
+                self.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
+            if child.refresh_prf.map(|(bound_slot, program, identity)| {
+                bound_slot == *slot &&
+                    program == declaration.prepared().program().id() &&
+                    identity == expected_child_parameters
+            }) != Some(true) ||
+                child.parameters.parameter_identity() != expected_child_parameters
             {
                 return Err(RnsBggError::Refresh(RefreshError::Commitment));
             }
@@ -2927,9 +3114,14 @@ impl<'a> RnsOnlineBuild<'a> {
             return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
         }
         for (slot, child) in &children {
-            if child.refresh_prf.map(|(bound_slot, program)| {
-                bound_slot == *slot && program == declaration.prepared().program().id()
-            }) != Some(true)
+            let expected_child_parameters =
+                self.parameters.expected_refresh_prf_parameter_identity(declaration, *slot)?;
+            if child.refresh_prf.map(|(bound_slot, program, identity)| {
+                bound_slot == *slot &&
+                    program == declaration.prepared().program().id() &&
+                    identity == expected_child_parameters
+            }) != Some(true) ||
+                child.parameters.parameter_identity() != expected_child_parameters
             {
                 return Err(RnsBggError::Refresh(RefreshError::Commitment));
             }
@@ -3578,6 +3770,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
             preprocess: preprocess_production,
             encryption: encryption_production,
             catalog,
+            refresh_prf_namespace: None,
             current_site: None,
         });
         Ok(())
@@ -3920,6 +4113,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: None,
         };
         let source_ring = parameters.ring(0).unwrap();
@@ -4105,6 +4299,7 @@ mod test {
             &production,
             &parameters,
             &projection.encryption_inputs(),
+            None,
         )
         .unwrap_err();
         assert!(matches!(error, ApiError::Compatibility { .. }));
@@ -4225,6 +4420,7 @@ mod test {
                 preprocess: production.clone(),
                 encryption: production,
                 catalog: ArtifactCatalog::default(),
+                refresh_prf_namespace: None,
                 current_site: Some(LoweringSite {
                     output,
                     indices: Vec::new(),
@@ -4286,6 +4482,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: scalar_output,
                 indices: Vec::new(),
@@ -4353,6 +4550,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: family_output,
                 indices: vec![IntExpr::constant(1)],
@@ -4411,6 +4609,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production.clone(),
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let ring = parameters.ring(0).unwrap();
@@ -4476,6 +4675,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: public_output,
                 indices: Vec::new(),
@@ -4543,6 +4743,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         let low_ring = parameters.ring(1).unwrap();
@@ -4687,6 +4888,7 @@ mod test {
                 execution_nonce: [129; 32],
             },
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: private_output,
                 indices: Vec::new(),
@@ -4882,6 +5084,7 @@ mod test {
             preprocess: production.clone(),
             encryption: production,
             catalog: ArtifactCatalog::default(),
+            refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
         assert!(lowerer.program.wire_is_coefficient_output(output).unwrap());

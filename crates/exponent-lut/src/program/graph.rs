@@ -63,7 +63,10 @@ pub struct GraphFamilyExecution;
 pub(crate) trait GraphParallelLowering:
     ExponentLUTProgramLowering + ProgramLoweringContext
 {
-    type SideOutput: mxx_dsl::GraphValue;
+    /// Backend-local side state produced for one parallel body.  The ordinary
+    /// `parallel` adapter only uses the hook for lifecycle bookkeeping; graph
+    /// values are handled by `parallel_with_side_outputs` below.
+    type SideOutput;
     fn begin_graph_parallel(&mut self);
     fn finish_graph_parallel(&mut self) -> Result<Self::SideOutput, Self::Error>;
     fn commit_graph_parallel(&mut self) -> Result<(), Self::Error>;
@@ -113,10 +116,10 @@ where
                 evaluator,
                 IntExpr::Add(Box::new(start.clone()), Box::new(index)).canonicalize(),
             ) {
-                Ok(value) => Ok((
-                    value,
-                    evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?,
-                )),
+                Ok(value) => {
+                    evaluator.finish_graph_parallel().map_err(|_| mxx_dsl::DslError::Schema)?;
+                    Ok(value)
+                }
                 Err(error) => {
                     failure = Some(error);
                     Err(mxx_dsl::DslError::Schema)
@@ -126,8 +129,7 @@ where
         if let Some(error) = failure {
             return Err(error);
         }
-        let combined = family.map_err(ProgramLowerError::Dsl)?;
-        let wires = combined.field(|value| value.0).map_err(ProgramLowerError::Dsl)?;
+        let wires = family.map_err(ProgramLowerError::Dsl)?;
         evaluator.commit_graph_parallel().map_err(ProgramLowerError::Backend)?;
         Ok(wires)
     }
@@ -339,9 +341,8 @@ mod tests {
     }
 
     #[test]
-    fn graph_parallel_lifts_tuple_map_side_outputs_with_scope() {
+    fn graph_parallel_lifts_tuple_side_outputs_with_scope() {
         use mxx_dsl::{DslContext, Int};
-        use std::collections::BTreeMap;
 
         let mut families = GraphFamilyExecution;
         let mut evaluator = GraphEvaluator::default();
@@ -353,16 +354,16 @@ mod tests {
                 assert!(matches!(families, GraphFamilyExecution));
                 assert!(evaluator.site.is_none());
                 let value = Int::evaluate(index);
-                let side = BTreeMap::from([("public-action", value.clone())]);
+                let side = (value.clone(), value.clone().add(Int::constant(1)));
                 Ok((value, side))
             })
             .unwrap();
         assert_eq!(wires.count(), &IntExpr::constant(2));
         assert_eq!(actions.count(), &IntExpr::constant(2));
         let graph = DslContext::new("qualified-side-output")
-            .artifact_output("wires", wires)
+            .transferred_output("wires", wires)
             .unwrap()
-            .artifact_output("actions", actions)
+            .transferred_output("actions", actions)
             .unwrap()
             .build()
             .unwrap();
@@ -392,7 +393,7 @@ mod tests {
             })
             .unwrap();
         let graph = DslContext::new("nonzero-nested-indices")
-            .artifact_output("nested", nested)
+            .transferred_output("nested", nested)
             .unwrap()
             .build()
             .unwrap();

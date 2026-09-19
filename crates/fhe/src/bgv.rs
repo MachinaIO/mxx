@@ -825,7 +825,7 @@ mod tests {
                     utils::centered(coefficients.at(i), q.modulus().as_ref())
                 })
                 .unwrap();
-                context = context.artifact_output(format!("error{level}"), centered).unwrap();
+                context = context.transferred_output(format!("error{level}"), centered).unwrap();
             }
             let result = execute_graph(
                 context.build().unwrap(),
@@ -913,9 +913,9 @@ mod tests {
             let centered =
                 parallel(n, |i| utils::centered(coefficients.at(i), parameters.modulus().as_ref()))
                     .unwrap();
-            context = context.artifact_output(*name, centered).unwrap();
+            context = context.transferred_output(*name, centered).unwrap();
             context = context
-                .artifact_output(format!("decoded-{name}"), bgv.decrypt(&secret, ct).unwrap())
+                .transferred_output(format!("decoded-{name}"), bgv.decrypt(&secret, ct).unwrap())
                 .unwrap();
         }
         // A single occupied slot encodes to a nonconstant polynomial. Its
@@ -984,19 +984,19 @@ mod tests {
         let low_input = bgv.mod_switch_to(&ct, top - 1).unwrap();
         let lower_square = bgv.mul(&low_input, &low_input, &lower_key).unwrap();
         let graph = context
-            .artifact_output("roundtrip", bgv.decrypt(&secret, &ct).unwrap())
+            .transferred_output("roundtrip", bgv.decrypt(&secret, &ct).unwrap())
             .unwrap()
-            .artifact_output("quadratic", bgv.decrypt(&secret, &square).unwrap())
+            .transferred_output("quadratic", bgv.decrypt(&secret, &square).unwrap())
             .unwrap()
-            .artifact_output("relinearized", bgv.decrypt(&secret, &relin).unwrap())
+            .transferred_output("relinearized", bgv.decrypt(&secret, &relin).unwrap())
             .unwrap()
-            .artifact_output("once", bgv.decrypt(&secret, &once).unwrap())
+            .transferred_output("once", bgv.decrypt(&secret, &once).unwrap())
             .unwrap()
-            .artifact_output("twice", bgv.decrypt(&secret, &twice).unwrap())
+            .transferred_output("twice", bgv.decrypt(&secret, &twice).unwrap())
             .unwrap()
-            .artifact_output("aligned_sum", bgv.decrypt(&secret, &sum).unwrap())
+            .transferred_output("aligned_sum", bgv.decrypt(&secret, &sum).unwrap())
             .unwrap()
-            .artifact_output("lower_square", bgv.decrypt(&secret, &lower_square).unwrap())
+            .transferred_output("lower_square", bgv.decrypt(&secret, &lower_square).unwrap())
             .unwrap()
             .build()
             .unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
     }
     #[test]
     fn test_bgv_staged_evaluator_without_secret_input() {
-        use mxx_ir_core::ParamEnv;
+        use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
         use mxx_runtime::{
             RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
             transcript::SamplingMode,
@@ -1086,13 +1086,13 @@ mod tests {
         // bound explicitly and rebuild the ciphertext record in the next stage.
         let encryption_noise = ct.noise_bound.clone();
         let encryption = context
-            .artifact_output("secret", secret)
+            .transferred_output("secret", secret)
             .unwrap()
-            .artifact_output("ciphertext", ct.components)
+            .transferred_output("ciphertext", ct.components)
             .unwrap()
-            .artifact_output("noise", Int::constant(encryption_noise.clone()))
+            .transferred_output("noise", Int::constant(encryption_noise.clone()))
             .unwrap()
-            .artifact_output("evaluation_key", key)
+            .transferred_output("evaluation_key", key)
             .unwrap()
             .build()
             .unwrap()
@@ -1118,7 +1118,12 @@ mod tests {
             store.manifest(&encryption_id).unwrap().clone(),
         )]);
         let input_ct = BgvCiphertext {
-            components: common.ring().artifact_input(encryption_id.clone(), "ciphertext", (2, 1)),
+            components: common.ring().artifact_input(
+                encryption_id.clone(),
+                "ciphertext",
+                (2, 1),
+                ArtifactAvailability::Transferred,
+            ),
             correction_factor: 1,
             noise_bound: exported_encryption_noise.to_biguint().unwrap(),
         };
@@ -1127,6 +1132,7 @@ mod tests {
             encryption_id.clone(),
             "evaluation_key",
             (2, key_width),
+            ArtifactAvailability::Transferred,
         );
         let evaluated = bgv
             .mod_switch_to(&bgv.mul(&input_ct, &input_ct, &input_key).unwrap(), top - 1)
@@ -1134,11 +1140,11 @@ mod tests {
         let factor = evaluated.correction_factor;
         let evaluation_noise = evaluated.noise_bound.clone();
         let evaluator = DslContext::new("fhe-bgv-staged-evaluator")
-            .artifact_output("evaluated", evaluated.components)
+            .transferred_output("evaluated", evaluated.components)
             .unwrap()
-            .artifact_output("factor", Int::constant(factor))
+            .transferred_output("factor", Int::constant(factor))
             .unwrap()
-            .artifact_output("noise", Int::constant(evaluation_noise.clone()))
+            .transferred_output("noise", Int::constant(evaluation_noise.clone()))
             .unwrap()
             .build()
             .unwrap()
@@ -1161,13 +1167,26 @@ mod tests {
         let lower = common.parameters_at(top - 1).unwrap();
         let lower_ring = Ring::new(lower.modulus().as_ref().clone(), n);
         let imported = BgvCiphertext {
-            components: lower_ring.artifact_input(evaluation_id.clone(), "evaluated", (2, 1)),
+            components: lower_ring.artifact_input(
+                evaluation_id.clone(),
+                "evaluated",
+                (2, 1),
+                ArtifactAvailability::Transferred,
+            ),
             correction_factor: exported_factor.to_u64().unwrap(),
             noise_bound: exported_noise.to_biguint().unwrap(),
         };
-        let sk = common.ring().artifact_input(encryption_id, "secret", (1, 1));
+        let sk = common.ring().artifact_input(
+            encryption_id,
+            "secret",
+            (1, 1),
+            // The secret key is sampled during key generation.  It has no
+            // public deterministic recipe, so the decryption stage imports
+            // the producer payload as a transfer.
+            ArtifactAvailability::Transferred,
+        );
         let decryption = DslContext::new("fhe-bgv-staged-decryption")
-            .artifact_output("plaintext", bgv.decrypt(&sk, &imported).unwrap())
+            .transferred_output("plaintext", bgv.decrypt(&sk, &imported).unwrap())
             .unwrap()
             .build()
             .unwrap()
@@ -1176,11 +1195,16 @@ mod tests {
         let mut result =
             execute(&decryption, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        result.materialize_output("plaintext", &mut backend, &mut store).unwrap();
+        result.materialize_output("plaintext", &backend, &mut store).unwrap();
         let mut expected = vec![BigInt::from(0); n];
         expected[0] = BigInt::from(9);
         assert_eq!(integers(&result, "plaintext"), expected);
-        let malformed = lower_ring.artifact_input(evaluation_id, "evaluated", (3, 1));
+        let malformed = lower_ring.artifact_input(
+            evaluation_id,
+            "evaluated",
+            (3, 1),
+            ArtifactAvailability::Transferred,
+        );
         assert!(
             DslContext::new("fhe-bgv-invalid-artifact")
                 .output("value", malformed)
@@ -1241,7 +1265,7 @@ mod tests {
         let encrypted = bgv.encrypt(&key, &input).unwrap();
         let switched = bgv.mod_switch_to(&encrypted, 0).unwrap();
         let graph = context
-            .artifact_output("plaintext", bgv.decrypt(&secret, &switched).unwrap())
+            .transferred_output("plaintext", bgv.decrypt(&secret, &switched).unwrap())
             .unwrap()
             .build()
             .unwrap();
@@ -1403,9 +1427,9 @@ mod simd_tests {
         let coefficients = bgv.encode_slots(&input).unwrap();
         let decoded = bgv.decode_slots(&coefficients).unwrap();
         let graph = context
-            .artifact_output("coefficients", coefficients)
+            .transferred_output("coefficients", coefficients)
             .unwrap()
-            .artifact_output("slots", decoded)
+            .transferred_output("slots", decoded)
             .unwrap()
             .build()
             .unwrap();
@@ -1462,9 +1486,9 @@ mod simd_tests {
         let sum = bgv.add(&ct, &ct).unwrap();
         let product = bgv.mul(&ct, &ct, &relin).unwrap();
         let mut context = context
-            .artifact_output("sum", bgv.decrypt(&secret, &sum).unwrap())
+            .transferred_output("sum", bgv.decrypt(&secret, &sum).unwrap())
             .unwrap()
-            .artifact_output("product", bgv.decrypt(&secret, &product).unwrap())
+            .transferred_output("product", bgv.decrypt(&secret, &product).unwrap())
             .unwrap();
         // Include negative and wrapped steps, plus both identity encodings;
         // identity rotations deliberately omit a key to test the no-op contract.
@@ -1477,19 +1501,21 @@ mod simd_tests {
             };
             let rotated = bgv.rotate_rows(key.as_ref(), &ct, step).unwrap();
             context = context
-                .artifact_output(format!("rotate{i}"), bgv.decrypt(&secret, &rotated).unwrap())
+                .transferred_output(format!("rotate{i}"), bgv.decrypt(&secret, &rotated).unwrap())
                 .unwrap();
         }
         let swap_key = bgv.row_swap_key(&secret, top).unwrap();
         let swapped = bgv.swap_rows(&swap_key, &ct).unwrap();
-        context = context.artifact_output("swap", bgv.decrypt(&secret, &swapped).unwrap()).unwrap();
+        context =
+            context.transferred_output("swap", bgv.decrypt(&secret, &swapped).unwrap()).unwrap();
         // Rotation after multiplication and level reduction must use a key at
         // the new level while preserving the nontrivial correction factor.
         let reduced = bgv.mod_switch_to(&product, top - 1).unwrap();
         let low_key = bgv.rotation_key(&secret, top - 1, 1).unwrap();
         let pipeline = bgv.rotate_rows(Some(&low_key), &reduced, 1).unwrap();
-        context =
-            context.artifact_output("pipeline", bgv.decrypt(&secret, &pipeline).unwrap()).unwrap();
+        context = context
+            .transferred_output("pipeline", bgv.decrypt(&secret, &pipeline).unwrap())
+            .unwrap();
         let slots = (0..n).map(|i| i as i64).collect::<Vec<_>>();
         let result = execute_graph(
             context.build().unwrap(),
@@ -1544,11 +1570,11 @@ mod simd_tests {
         let key = bgv.rotation_key(&secret, bgv.common.ring.crt_depth() - 1, 1).unwrap();
         let rotated = bgv.rotate_rows(Some(&key), &scalar, 1).unwrap();
         let graph = context
-            .artifact_output("scalar", bgv.decrypt(&secret, &scalar).unwrap())
+            .transferred_output("scalar", bgv.decrypt(&secret, &scalar).unwrap())
             .unwrap()
-            .artifact_output("partial", bgv.decrypt(&secret, &partial).unwrap())
+            .transferred_output("partial", bgv.decrypt(&secret, &partial).unwrap())
             .unwrap()
-            .artifact_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
+            .transferred_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
             .unwrap()
             .build()
             .unwrap();
@@ -1622,9 +1648,9 @@ mod benchmarks {
         let key = bgv.relinearization_key(&secret, level).unwrap();
         let value = common.ring().uniform_residue((1, 1));
         let preparation = DslContext::new("prepare-switch")
-            .artifact_output("key", key)
+            .transferred_output("key", key)
             .unwrap()
-            .artifact_output("value", value)
+            .transferred_output("value", value)
             .unwrap()
             .build()
             .unwrap()
@@ -1635,15 +1661,15 @@ mod benchmarks {
         let mut prepared =
             execute(&preparation, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
                 .unwrap();
-        let key = prepared.materialize_output("key", &mut backend, &mut store).unwrap().clone();
-        let value = prepared.materialize_output("value", &mut backend, &mut store).unwrap().clone();
+        let key = prepared.materialize_output("key", &backend, &mut store).unwrap().clone();
+        let value = prepared.materialize_output("value", &backend, &mut store).unwrap().clone();
         let (kp, width) = bgv.key_switch_parameters(level).unwrap();
         let kr = Ring::new(kp.modulus().as_ref().clone(), n);
         let switched = bgv
             .key_switch(&common.ring().input("value", (1, 1)), &kr.input("key", (2, width)), level)
             .unwrap();
         let graph = DslContext::new("evaluate-switch")
-            .artifact_output("switched", switched)
+            .transferred_output("switched", switched)
             .unwrap()
             .build()
             .unwrap()
@@ -1659,7 +1685,7 @@ mod benchmarks {
             let start = Instant::now();
             let mut output =
                 execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
-            output.materialize_output("switched", &mut backend, &mut store).unwrap();
+            output.materialize_output("switched", &backend, &mut store).unwrap();
             let elapsed = start.elapsed().as_secs_f64();
             output.cleanup_staged(&mut store).unwrap();
             if repeat != 0 {

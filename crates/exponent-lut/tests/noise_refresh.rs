@@ -613,13 +613,10 @@ fn noise_refresh_end_to_end() {
 
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let preprocess_encrypt = directory.path().join("preprocess-encrypt.json");
-    let preprocess_online = directory.path().join("preprocess-online.json");
-    let encryption = directory.path().join("encryption.json");
     let config = ExecutionConfig::default();
     let preprocess_declaration = declaration.clone();
-    // Preprocess executes once and publishes two typed checkpoints from the
-    // same production: one for encryption and one for online evaluation.
+    // Preprocess executes once and publishes two typed stage records from the
+    // same named session: one for encryption and one for online evaluation.
     let (preprocess, online) = api::preprocess(
         source_program,
         &ParamEnv::default(),
@@ -629,7 +626,6 @@ fn noise_refresh_end_to_end() {
         RnsPreprocessBuild::new(&parameters, [0x51; 32]),
         &mut backend,
         &mut store,
-        [&preprocess_encrypt, &preprocess_online],
         config.clone(),
         move |build, outputs| {
             build
@@ -660,7 +656,7 @@ fn noise_refresh_end_to_end() {
     .expect("source preprocess");
 
     // Encryption consumes only the public LHS plaintext projection plus the
-    // payload/mask secrets.  It imports the preprocess-encrypt checkpoint;
+    // payload/mask secrets.  It imports the preprocess-encrypt stage record;
     // no RHS plaintext enters this stage or the later online stage.
     let mut encrypt_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
@@ -692,7 +688,7 @@ fn noise_refresh_end_to_end() {
         &hash_key,
         RnsEncryptBuild::new(&parameters, [0x51; 32]),
         &mut backend,
-        api::ArtifactDestination { store: &mut store, checkpoint: &encryption },
+        &mut store,
         config.clone(),
         move |build| {
             build
@@ -715,8 +711,8 @@ fn noise_refresh_end_to_end() {
     )
     .expect("source encryption");
 
-    // Online children use only the online preprocess checkpoint and the
-    // encryption checkpoint.  Refresh is bound as a graph operation here;
+    // Online children use only the online preprocess stage record and the
+    // encryption stage record.  Refresh is bound as a graph operation here;
     // it is not materialized as a caller-owned carrier or rerun by resume.
     let mut online_children = BTreeMap::new();
     for slot in 0..declaration.slots().len() {
@@ -778,7 +774,6 @@ fn noise_refresh_end_to_end() {
     // Checkpointing imports only its key/row ports and optional public payload;
     // it does not lower or execute refresh again.  Resumption then runs the
     // built-in single-input identity continuation over that checkpoint.
-    let refresh_checkpoint = directory.path().join("refresh-checkpoint.json");
     let checkpointed = checkpoint_refreshed_output(
         source_program,
         &declaration,
@@ -790,7 +785,6 @@ fn noise_refresh_end_to_end() {
         &hash_key,
         &mut backend,
         &mut store,
-        &refresh_checkpoint,
         ExecutionConfig::default(),
     )
     .expect("checkpoint refreshed output");

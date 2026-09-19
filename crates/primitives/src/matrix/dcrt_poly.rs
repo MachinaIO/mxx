@@ -1,8 +1,8 @@
 use crate::{
     element::PolyElem,
     matrix::{
-        CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError,
-        cpp_matrix::CppMatrix,
+        CompactMatrixDecodeError, CpuSmallMatrix, MatrixElem, MatrixParams, PolyMatrix,
+        PolyMatrixSmallRhs, SmallMatrixError, cpp_matrix::CppMatrix,
     },
     parallel_iter,
     poly::{
@@ -220,11 +220,19 @@ impl PolyMatrix for DCRTPolyMatrix {
     }
 
     fn centered_rebase(&self, destination: &DCRTPolyParams) -> Result<Self, String> {
-        if destination.ring_dimension() != self.params.ring_dimension() ||
-            self.params.to_crt().0.len() != 1
+        if destination.ring_dimension() != self.params.ring_dimension() {
+            return Err("centered rebase requires matching ring dimensions".into());
+        }
+        let source_basis = self.params.to_crt().0;
+        let destination_basis = destination.to_crt().0;
+        if destination_basis.is_empty() {
+            return Err("centered rebase requires a nonempty destination basis".into());
+        }
+        if source_basis.len() > 1 &&
+            source_basis.iter().any(|prime| !destination_basis.contains(prime))
         {
             return Err(
-                "centered rebase requires matching dimensions and one source CRT limb".into()
+                "multi-limb centered rebase destination must contain the source basis".into()
             );
         }
         let polys = (0..self.nrow)
@@ -233,6 +241,31 @@ impl PolyMatrix for DCRTPolyMatrix {
                 (0..self.ncol)
                     .into_par_iter()
                     .map(|column| self.entry(row, column).convert_basis(destination, true))
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::from_poly_vec(destination, polys))
+    }
+
+    fn block_mod_switch(
+        &self,
+        destination: &DCRTPolyParams,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String> {
+        if destination.ring_dimension() != self.params.ring_dimension() {
+            return Err("BlockModSwitch requires matching ring dimensions".into());
+        }
+        if plaintext_modulus.is_zero() {
+            return Err("BlockModSwitch plaintext modulus must be positive".into());
+        }
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| {
+                        self.entry(row, column).block_mod_switch(destination, plaintext_modulus)
+                    })
                     .collect::<Result<Vec<_>, String>>()
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -313,18 +346,6 @@ impl PolyMatrix for DCRTPolyMatrix {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self::from_poly_vec(destination, polys))
-    }
-
-    fn centered_extend(&self, destination: &DCRTPolyParams) -> Result<Self, String> {
-        self.exact_centered_conversion(destination, None)
-    }
-
-    fn block_mod_switch(
-        &self,
-        destination: &DCRTPolyParams,
-        plaintext_modulus: u64,
-    ) -> Result<Self, String> {
-        self.exact_centered_conversion(destination, Some(plaintext_modulus))
     }
 
     fn mul_tensor_identity(&self, other: &Self, identity_size: usize) -> Self {
@@ -430,10 +451,38 @@ impl PolyMatrix for DCRTPolyMatrix {
     }
 
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let entries_bytes: Vec<Vec<Vec<u8>>> =
-            bincode::decode_from_slice(bytes, bincode::config::standard())
-                .expect("Failed to deserialize matrix from compact bytes")
-                .0;
+        Self::try_from_compact_bytes(params, bytes).expect("validated compact matrix")
+    }
+
+    fn try_from_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        let entries_bytes: Vec<Vec<Vec<u8>>> = {
+            let (decoded, consumed) =
+                bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+                    CompactMatrixDecodeError::InvalidHeader("cannot decode compact matrix")
+                })?;
+            if consumed != bytes.len() {
+                return Err(CompactMatrixDecodeError::InvalidHeader(
+                    "trailing compact matrix bytes",
+                ));
+            }
+            decoded
+        };
+
+        let width = entries_bytes.first().map_or(0, Vec::len);
+        if entries_bytes.iter().any(|row| row.len() != width) {
+            return Err(CompactMatrixDecodeError::InvalidHeader(
+                "matrix rows have inconsistent widths",
+            ));
+        }
+        for row in &entries_bytes {
+            for entry in row {
+                DCRTPoly::validate_compact_bytes(params, entry)
+                    .map_err(CompactMatrixDecodeError::InvalidPayload)?;
+            }
+        }
 
         let nrow = entries_bytes.len();
         let ncol = if nrow > 0 { entries_bytes[0].len() } else { 0 };
@@ -450,7 +499,25 @@ impl PolyMatrix for DCRTPolyMatrix {
         };
 
         matrix.replace_entries(0..nrow, 0..ncol, f);
-        matrix
+        Ok(matrix)
+    }
+
+    fn compact_shape(bytes: &[u8]) -> Result<(usize, usize), CompactMatrixDecodeError> {
+        let (entries_bytes, consumed): (Vec<Vec<Vec<u8>>>, usize) =
+            bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+                CompactMatrixDecodeError::InvalidHeader("cannot decode compact matrix")
+            })?;
+        if consumed != bytes.len() {
+            return Err(CompactMatrixDecodeError::InvalidHeader("trailing compact matrix bytes"));
+        }
+        let rows = entries_bytes.len();
+        let columns = entries_bytes.first().map_or(0, Vec::len);
+        if entries_bytes.iter().any(|row| row.len() != columns) {
+            return Err(CompactMatrixDecodeError::InvalidHeader(
+                "matrix rows have inconsistent widths",
+            ));
+        }
+        Ok((rows, columns))
     }
 
     fn zero_compact_bytes(
@@ -514,49 +581,6 @@ impl PolyMatrixSmallRhs for DCRTPolyMatrix {
 }
 
 impl DCRTPolyMatrix {
-    fn exact_centered_conversion(
-        &self,
-        destination: &DCRTPolyParams,
-        plaintext_modulus: Option<u64>,
-    ) -> Result<Self, String> {
-        if self.params.ring_dimension() != destination.ring_dimension() {
-            return Err("ring dimension mismatch".into());
-        }
-        let source = self.params.to_crt().0;
-        let target = destination.to_crt().0;
-        let valid = match plaintext_modulus {
-            Some(t) => {
-                t >= 1 &&
-                    target.len() < source.len() &&
-                    target.iter().all(|p| source.contains(p)) &&
-                    source.iter().all(|p| t % p != 0)
-            }
-            None => source.iter().all(|p| target.contains(p)),
-        };
-        if !valid || self.params.dropped_moduli() != 0 || destination.dropped_moduli() != 0 {
-            return Err("invalid exact centered conversion parameters".into());
-        }
-        if self.nrow == 0 || self.ncol == 0 {
-            return Ok(Self::new_empty(destination, self.nrow, self.ncol));
-        }
-        let entries = (0..self.nrow)
-            .into_par_iter()
-            .map(|row| {
-                (0..self.ncol)
-                    .into_par_iter()
-                    .map(|column| {
-                        let poly = self.entry(row, column);
-                        match plaintext_modulus {
-                            Some(t) => poly.block_mod_switch(destination, t),
-                            None => poly.centered_extend(destination),
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self::from_poly_vec(destination, entries))
-    }
-
     pub(crate) fn to_cpp_matrix_ptr(&self) -> CppMatrix {
         let nrow = self.nrow;
         let ncol = self.ncol;
@@ -910,6 +934,171 @@ mod tests {
     }
 
     #[test]
+    fn test_block_mod_switch_matches_bigint_oracle_for_nonprefix_drop() {
+        let (dimension, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        if depth < 3 {
+            return;
+        }
+        let source = DCRTPolyParams::new(dimension, depth, bits, base_bits, None, None);
+        let source_moduli = source.to_crt().0;
+        let destination_moduli = vec![source_moduli[0], source_moduli[2]];
+        let destination = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(destination_moduli.clone()),
+            None,
+        );
+        let values = (0..dimension as usize)
+            .map(|index| BigUint::from((index * 17 + 1) as u64))
+            .collect::<Vec<_>>();
+        let input = DCRTPolyMatrix::from_poly_vec(
+            &source,
+            vec![vec![DCRTPoly::from_biguints(&source, &values)]],
+        );
+        let t = BigUint::from(3u8);
+        let output = input.block_mod_switch(&destination, &t).unwrap();
+        let dropped_product = source_moduli
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| ![0usize, 2usize].contains(index))
+            .map(|(_, modulus)| BigUint::from(*modulus))
+            .product::<BigUint>();
+        let inverse = crate::utils::mod_inverse_biguints(&t, &dropped_product)
+            .expect("fixture t must be invertible");
+        for (index, z) in values.iter().enumerate() {
+            let centered_residue = (z * &inverse) % &dropped_product;
+            let centered = if &centered_residue * 2u8 > dropped_product {
+                BigInt::from(centered_residue) - BigInt::from(dropped_product.clone())
+            } else {
+                BigInt::from(centered_residue)
+            };
+            let y = (BigInt::from(z.clone()) - BigInt::from(3u8) * centered.clone()) /
+                BigInt::from(dropped_product.clone());
+            let modulus = BigInt::from(destination.modulus().as_ref().clone());
+            let expected = ((&y % &modulus) + &modulus) % &modulus;
+            assert_eq!(output.entry(0, 0).coeffs()[index].value, expected.to_biguint().unwrap());
+        }
+    }
+
+    #[test]
+    fn test_centered_rebase_extends_multi_limb_basis_exactly() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let all = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let primes = all.to_crt().0;
+        let source = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(vec![primes[0], primes[2]]),
+            None,
+        );
+        let destination = DCRTPolyParams::new(
+            dimension,
+            3,
+            bits,
+            base_bits,
+            Some(vec![primes[0], primes[2], primes[1]]),
+            None,
+        );
+        let source_modulus = source.modulus().as_ref().clone();
+        let values = vec![
+            BigUint::from(0u8),
+            BigUint::from(1u8),
+            (&source_modulus / 2u8),
+            (&source_modulus / 2u8) + 1u8,
+            &source_modulus - 1u8,
+        ];
+        let input = DCRTPolyMatrix::from_poly_vec(
+            &source,
+            vec![vec![DCRTPoly::from_biguints(&source, &values)]],
+        );
+        let output = input.centered_rebase(&destination).unwrap();
+        let destination_modulus = destination.modulus().as_ref().clone();
+        let expected = values
+            .iter()
+            .map(|value| {
+                if value * 2u8 > source_modulus {
+                    (value + &destination_modulus - &source_modulus) % &destination_modulus
+                } else {
+                    value.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        for (index, value) in expected.iter().enumerate() {
+            assert_eq!(output.entry(0, 0).coeffs()[index].value, *value);
+        }
+    }
+
+    #[test]
+    fn cpu_compact_centered_rebase_preserves_signed_values_and_bound_for_nonprefix_basis() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let all = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let primes = all.to_crt().0;
+        // Keep the source basis deliberately non-prefix.  A compact owner is
+        // allowed to carry more than one limb, and rebasing must preserve the
+        // signed coefficient represented by that complete source product.
+        let source = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(vec![primes[2], primes[0]]),
+            None,
+        );
+        let destination = DCRTPolyParams::new(
+            dimension,
+            3,
+            bits,
+            base_bits,
+            Some(vec![primes[1], primes[2], primes[0]]),
+            None,
+        );
+        let bound = BigUint::from(7u8);
+        let signed = [-7i64, -1, 0, 1, 7];
+        let source_matrix = DCRTPolyMatrix::from_poly_vec(
+            &source,
+            vec![vec![DCRTPoly::from_biguints(
+                &source,
+                &(0..dimension as usize)
+                    .map(|index| {
+                        let value = signed[index % signed.len()];
+                        if value < 0 {
+                            source.modulus().as_ref() - BigUint::from(value.unsigned_abs())
+                        } else {
+                            BigUint::from(value as u64)
+                        }
+                    })
+                    .collect::<Vec<_>>(),
+            )]],
+        );
+        let owner = CpuSmallMatrix::new(source_matrix, bound.clone()).unwrap();
+        let payload = owner.to_canonical_coefficients().unwrap();
+        let decoded = CpuSmallMatrix::<DCRTPolyMatrix>::from_canonical_coefficients(
+            &source,
+            1,
+            1,
+            bound.clone(),
+            &payload,
+        )
+        .unwrap();
+        let rebased = decoded.centered_rebase(&destination).unwrap();
+        assert_eq!(rebased.max_coefficient_bound(), &bound);
+        let destination_modulus_owned = destination.modulus();
+        let destination_modulus = destination_modulus_owned.as_ref();
+        for (index, value) in signed.iter().cycle().take(dimension as usize).enumerate() {
+            let expected = if *value < 0 {
+                destination_modulus - BigUint::from(value.unsigned_abs())
+            } else {
+                BigUint::from(*value as u64)
+            };
+            assert_eq!(rebased.value().entry(0, 0).coeffs()[index].value, expected);
+        }
+    }
+
+    #[test]
     fn test_mixed_width_basis_gadget_decomposition_relations() {
         let narrow = DCRTPolyParams::new(32, 1, 28, 8, None, None);
         let wide = DCRTPolyParams::new(32, 1, 50, 8, None, None);
@@ -990,10 +1179,6 @@ mod tests {
 
     impl SmallPolyMatrix for MetadataOnlySmallOwner {
         type Params = DCRTPolyParams;
-
-        fn centered_extend(&self, _destination: &Self::Params) -> Result<Self, String> {
-            Err("metadata-only test owner has no coefficient transport".into())
-        }
 
         fn params(&self) -> &Self::Params {
             &self.params
@@ -1428,32 +1613,6 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(chunks[0].concat_rows(&chunks.iter().skip(1).collect::<Vec<_>>()), digits);
         }
-    }
-
-    #[test]
-    fn test_bounded_digits_centered_extension() {
-        use crate::sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler};
-        let n =
-            std::env::var("MXX_TEST_RING_DIMENSION").ok().map(|v| v.parse().unwrap()).unwrap_or(8);
-        let high = DCRTPolyParams::new(n, 3, 17, 4, None, None);
-        let low_modulus = high.to_crt().0[..2].iter().map(|p| BigUint::from(*p)).product();
-        let low = high.select_modulus(&low_modulus).unwrap();
-        let input = DCRTPolyUniformSampler::new().sample_uniform(&low, 2, 3, DistType::FinRingDist);
-        let digits = input.clone().gadget_decompose(false, None).unwrap();
-        let extended = digits.centered_extend(&high).unwrap();
-        assert_eq!(extended.params(), &high);
-        assert_eq!(extended.max_coefficient_bound(), digits.max_coefficient_bound());
-        assert_eq!(
-            extended.to_canonical_coefficients().unwrap(),
-            digits.to_canonical_coefficients().unwrap()
-        );
-        let gadget = DCRTPolyMatrix::gadget_matrix(&low, 2, None);
-        assert_eq!(gadget.multiply_small_rhs(&digits).unwrap(), input);
-        let product = gadget.centered_extend(&high).unwrap().multiply_small_rhs(&extended).unwrap();
-        assert_eq!(
-            product,
-            gadget.centered_extend(&high).unwrap() * digits.value().centered_extend(&high).unwrap()
-        );
     }
 
     #[test]
@@ -1893,6 +2052,21 @@ mod tests {
 
         let expected = DCRTPolyMatrix::from_poly_vec(&destination, expected_vec);
         assert_eq!(switched, expected);
+    }
+
+    #[test]
+    fn malformed_compact_matrix_returns_typed_error_without_panicking() {
+        let params = DCRTPolyParams::default();
+        let error = DCRTPolyMatrix::try_from_compact_bytes(&params, &[0x80]).unwrap_err();
+        assert_eq!(error, CompactMatrixDecodeError::InvalidHeader("cannot decode compact matrix"));
+
+        let valid = DCRTPolyMatrix::zero(&params, 1, 1).to_compact_bytes();
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        assert_eq!(
+            DCRTPolyMatrix::try_from_compact_bytes(&params, &trailing),
+            Err(CompactMatrixDecodeError::InvalidHeader("trailing compact matrix bytes"))
+        );
     }
 
     #[test]

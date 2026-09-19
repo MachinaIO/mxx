@@ -5,6 +5,7 @@ use crate::{
     validate::ValidatedGraph,
 };
 use num_bigint::BigInt;
+use num_traits::Signed;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -25,106 +26,13 @@ pub struct Manifest {
     pub artifacts: BTreeMap<String, ManifestArtifact>,
 }
 
-/// Validated manifests used to connect independently produced graphs.
-/// This validates metadata, not artifact payload integrity or cryptographic security.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct ArtifactCatalog {
-    manifests: BTreeMap<ProductionId, Manifest>,
-}
-
-#[derive(Debug, Error)]
-pub enum ArtifactCatalogError {
-    #[error("manifest production does not match its catalog key")]
-    ProductionMismatch,
-    #[error("manifest IR version is unsupported")]
-    VersionMismatch,
-    #[error("conflicting manifests for the same production")]
-    Conflict,
-    #[error(transparent)]
-    InvalidManifest(#[from] ManifestValidationError),
-}
-
-impl ArtifactCatalog {
-    pub fn from_manifest(manifest: Manifest) -> Result<Self, ArtifactCatalogError> {
-        let mut catalog = Self::default();
-        catalog.insert(manifest.production_id.clone(), manifest)?;
-        Ok(catalog)
-    }
-    pub fn insert(
-        &mut self,
-        production: ProductionId,
-        manifest: Manifest,
-    ) -> Result<(), ArtifactCatalogError> {
-        if production != manifest.production_id {
-            return Err(ArtifactCatalogError::ProductionMismatch);
-        }
-        if manifest.ir_version != IR_VERSION {
-            return Err(ArtifactCatalogError::VersionMismatch);
-        }
-        validate_manifest(&manifest)?;
-        if let Some(previous) = self.manifests.get(&production) {
-            if previous != &manifest {
-                return Err(ArtifactCatalogError::Conflict);
-            }
-            return Ok(());
-        }
-        self.manifests.insert(production, manifest);
-        Ok(())
-    }
-
-    /// Merge transactionally: a conflict leaves this catalog unchanged.
-    pub fn merge(&mut self, other: Self) -> Result<(), ArtifactCatalogError> {
-        for (production, manifest) in &other.manifests {
-            if self.manifests.get(production).is_some_and(|old| old != manifest) {
-                return Err(ArtifactCatalogError::Conflict);
-            }
-        }
-        self.manifests.extend(other.manifests);
-        Ok(())
-    }
-
-    pub fn manifests(&self) -> &BTreeMap<ProductionId, Manifest> {
-        &self.manifests
-    }
-}
-
-#[cfg(test)]
-mod catalog_tests {
-    use super::*;
-
-    #[test]
-    fn test_catalog_validation_conflicts_and_transactional_merge() {
-        let production = ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] };
-        let manifest = Manifest {
-            ir_version: IR_VERSION,
-            production_id: production.clone(),
-            artifacts: BTreeMap::new(),
-        };
-        let mut catalog = ArtifactCatalog::from_manifest(manifest.clone()).unwrap();
-        catalog.insert(production.clone(), manifest.clone()).unwrap();
-        let mut wrong = production.clone();
-        wrong.execution_nonce[0] ^= 1;
-        assert!(catalog.insert(wrong, manifest.clone()).is_err());
-        let mut invalid = manifest.clone();
-        invalid.ir_version += 1;
-        assert!(catalog.insert(production.clone(), invalid).is_err());
-        let mut conflict = manifest.clone();
-        conflict.artifacts.insert(
-            "value".into(),
-            ManifestArtifact {
-                artifact_type: ArtifactType::Bytes { length: 1 },
-                family_count: None,
-                layout: None,
-            },
-        );
-        let other = ArtifactCatalog::from_manifest(conflict.clone()).unwrap();
-        assert!(catalog.merge(other).is_err());
-        assert_eq!(catalog.manifests()[&production], manifest);
-        let mut second = manifest.clone();
-        second.production_id.execution_nonce[1] ^= 1;
-        catalog.merge(ArtifactCatalog::from_manifest(second).unwrap()).unwrap();
-        assert_eq!(catalog.manifests().len(), 2);
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ArtifactAvailability {
+    /// The consumer receives the canonical payload from an external producer.
+    Transferred,
+    /// The consumer can deterministically regenerate the payload from public
+    /// context and uses the stored payload as a cache entry.
+    Cached,
 }
 
 /// Complete validated schema for a compact bounded-coefficient matrix.
@@ -243,6 +151,7 @@ impl ArtifactType {
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
+    pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
 
@@ -259,7 +168,7 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationEr
             ArtifactType::Preimage { max_coefficient_bound, .. } => Some(max_coefficient_bound),
             _ => None,
         };
-        if bound.is_some_and(|bound| bound.sign() == num_bigint::Sign::Minus) {
+        if bound.is_some_and(|bound| bound.is_negative()) {
             return Err(ManifestValidationError::NegativeCoefficientBound { name: name.clone() });
         }
     }
@@ -271,6 +180,7 @@ pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
+    pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
 
@@ -298,6 +208,7 @@ pub fn export_manifest(
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
                     family_count: artifact.family_count,
+                    availability: artifact.availability,
                     layout: artifact.layout.clone(),
                 },
             )
@@ -310,7 +221,7 @@ pub fn export_manifest(
 ///
 /// Indexed-family outputs become artifact families; compatible scalar wires
 /// become singular artifacts. Every persisted output must be backed by an
-/// graph output carrying an artifact declaration.
+/// graph output carrying an explicit availability declaration.
 pub fn export_validated_manifest(
     production_id: ProductionId,
     graph: &ValidatedGraph,
@@ -320,9 +231,7 @@ pub fn export_validated_manifest(
         .outputs()
         .iter()
         .filter_map(|(name, output)| {
-            if !output.artifact_output {
-                return None;
-            }
+            let availability = output.availability?;
             Some((|| {
                 let id = WireId { instantiation_path: Vec::new(), wire: output.value };
                 let wire_type = graph
@@ -344,6 +253,7 @@ pub fn export_validated_manifest(
                         wire: id,
                         artifact_type,
                         family_count: first_class_family_count,
+                        availability,
                         layout: None,
                     },
                 ))
@@ -358,21 +268,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_artifact_schema_contains_only_persistence_metadata() {
+    fn cached_manifest_artifacts_are_valid() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
             artifacts: BTreeMap::from([(
-                "private".to_owned(),
+                "deterministic-cache".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
+                    availability: ArtifactAvailability::Cached,
                     layout: None,
                 },
             )]),
         };
 
-        validate_manifest(&manifest).unwrap();
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]
@@ -426,6 +337,7 @@ mod tests {
                         max_coefficient_bound: BigInt::from(-1),
                     },
                     family_count: None,
+                    availability: ArtifactAvailability::Transferred,
                     layout: None,
                 },
             )]),

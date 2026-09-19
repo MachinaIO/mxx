@@ -370,7 +370,7 @@ mod public_key {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::artifact::ProductionId;
+    use mxx_ir_core::artifact::{ArtifactAvailability, ProductionId};
     use rayon::prelude::*;
 
     #[derive(Clone)]
@@ -418,6 +418,7 @@ mod public_key {
                         production.clone(),
                         super::slot_gate_public_key_name(reduction, &identity),
                         (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
+                        ArtifactAvailability::Transferred,
                     )
                 },
             );
@@ -573,7 +574,7 @@ mod artifact {
     use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor};
     use mxx_ir_core::{
         IntExpr, RealExpr,
-        artifact::ProductionId,
+        artifact::{ArtifactAvailability, ProductionId},
         node::{ConcatAxis, ConstantMatrix, IndexRange},
         types::MatrixType,
     };
@@ -701,10 +702,10 @@ mod artifact {
             base: BggSlotTransferBaseWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             Ok(context
-                .artifact_output(B0_PUBLIC, base.b0.public_matrix())?
-                .artifact_output(B0_TRAPDOOR, base.b0)?
-                .artifact_output(B1_PUBLIC, base.b1.public_matrix())?
-                .artifact_output(B1_TRAPDOOR, base.b1)?)
+                .transferred_output(B0_PUBLIC, base.b0.public_matrix())?
+                .transferred_trapdoor_output(B0_TRAPDOOR, base.b0)?
+                .transferred_output(B1_PUBLIC, base.b1.public_matrix())?
+                .transferred_trapdoor_output(B1_TRAPDOOR, base.b1)?)
         }
 
         pub fn import_base(
@@ -849,22 +850,20 @@ mod artifact {
             slots: BggSlotTransferSlotWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             let context = context
-                .artifact_output(SLOT_SECRET, slots.secrets)?
-                .artifact_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
-            let context = slots
-                .b0_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.artifact_output(b0_preimage_name(chunk), family)
-                })?;
-            Ok(slots
-                .b1_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.artifact_output(b1_preimage_name(chunk), family)
-                })?)
+                .transferred_output(SLOT_SECRET, slots.secrets)?
+                .transferred_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
+            let context = slots.b0_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b0_preimage_name(chunk), family)
+                },
+            )?;
+            Ok(slots.b1_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b1_preimage_name(chunk), family)
+                },
+            )?)
         }
 
         pub fn import_slots(
@@ -879,6 +878,10 @@ mod artifact {
                     SLOT_SECRET,
                     self.slot_count,
                     (self.secret_size, self.secret_size),
+                    // Slot secrets are sampled during artifact production;
+                    // consumers receive the exact payload rather than
+                    // regenerating it from public context.
+                    ArtifactAvailability::Transferred,
                 ),
                 public_keys: public.public_keys,
                 b0_preimage_chunks: public.b0_preimage_chunks,
@@ -898,6 +901,7 @@ mod artifact {
                     SLOT_PUBLIC_KEY,
                     self.slot_count,
                     (self.secret_size, self.gadget_columns()),
+                    ArtifactAvailability::Transferred,
                 ),
                 b0_preimage_chunks: self.import_slot_chunks(
                     &artifacts.production_id,
@@ -1004,7 +1008,7 @@ mod artifact {
             gates: BggSlotTransferGateWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             Ok(gates.preimage_chunks.into_iter().try_fold(context, |context, (name, family)| {
-                context.artifact_output(name, family)
+                context.transferred_output(name, family)
             })?)
         }
 
@@ -1023,7 +1027,7 @@ mod artifact {
                         (true, identity, output_public_key)
                     }
                 };
-                Ok(context.artifact_output(
+                Ok(context.transferred_output(
                     super::slot_gate_public_key_name(reduction, identity),
                     output.clone(),
                 )?)
@@ -1056,6 +1060,7 @@ mod artifact {
                         count,
                         (self.b0_public_columns(), range_len(&columns)),
                         self.preimage_max_coefficient_bound.clone(),
+                        ArtifactAvailability::Transferred,
                     );
                     preimage_chunks.insert(name, family);
                 }
@@ -1211,6 +1216,7 @@ mod artifact {
                         self.slot_count,
                         (rows, range_len(&range)),
                         self.preimage_max_coefficient_bound.clone(),
+                        ArtifactAvailability::Transferred,
                     )
                 })
                 .collect()

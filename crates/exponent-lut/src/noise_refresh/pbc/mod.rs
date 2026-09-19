@@ -16,7 +16,7 @@ pub(crate) mod artifacts;
 mod schedule;
 
 use mxx_dsl::{Family, Mat, Ring};
-use mxx_ir_core::artifact::{ArtifactType, Manifest, ProductionId};
+use mxx_ir_core::artifact::{ArtifactAvailability, ArtifactType, Manifest, ProductionId};
 use thiserror::Error;
 
 /// Semantic version of the serialized public layout schema.
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(materialization_count.get(), 2);
         assert_eq!(oracle_members, trusted.runtime_bits());
         let graph = DslContext::new("trusted-selector-runtime-binding")
-            .artifact_output("bits", trusted.family().clone())
+            .transferred_output("bits", trusted.family().clone())
             .unwrap()
             .build()
             .unwrap()
@@ -2364,7 +2364,13 @@ impl PbcPublicVectorFamilyBinding {
         production_id: ProductionId,
         artifact_name: impl Into<String>,
     ) -> Family<Mat> {
-        ring.family_artifact_input(production_id, artifact_name, self.family_count, (1, 1))
+        ring.family_artifact_input(
+            production_id,
+            artifact_name,
+            self.family_count,
+            (1, 1),
+            ArtifactAvailability::Transferred,
+        )
     }
 }
 
@@ -2499,12 +2505,17 @@ pub(crate) mod routing_tests {
             PbcPublicVectorFamilyBinding::from_encoded(&layout, &vector).expect("bind toy vector");
         let ring = Ring::new(257, 8);
         let production = ProductionId { spec_hash: SpecHash([31; 32]), execution_nonce: [32; 32] };
-        let scalar = ring.artifact_input(production.clone(), "pbc-scalar", (1, 1));
+        let scalar = ring.artifact_input(
+            production.clone(),
+            "pbc-scalar",
+            (1, 1),
+            ArtifactAvailability::Transferred,
+        );
         let family = binding.artifact_input_family(&ring, production.clone(), "pbc-family");
         let graph = DslContext::new("pbc-neutral-artifact-inputs")
-            .artifact_output("scalar", scalar)
+            .transferred_output("scalar", scalar)
             .unwrap()
-            .artifact_output("family", family)
+            .transferred_output("family", family)
             .unwrap()
             .build()
             .unwrap();
@@ -2518,6 +2529,7 @@ pub(crate) mod routing_tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix_type.clone()),
                         family_count: None,
+                        availability: ArtifactAvailability::Transferred,
                         layout: None,
                     },
                 ),
@@ -2526,6 +2538,7 @@ pub(crate) mod routing_tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix_type),
                         family_count: Some(binding.family_count),
+                        availability: ArtifactAvailability::Transferred,
                         layout: None,
                     },
                 ),
@@ -2660,11 +2673,22 @@ impl PbcLayoutFamilies {
             package_index_name,
             rectangular_count,
             (1, 1),
+            ArtifactAvailability::Transferred,
         );
-        families.active_masks =
-            ring.family_artifact_input(production_id.clone(), mask_name, rectangular_count, (1, 1));
-        families.shifts =
-            ring.family_artifact_input(production_id, shift_name, package_count, (1, 1));
+        families.active_masks = ring.family_artifact_input(
+            production_id.clone(),
+            mask_name,
+            rectangular_count,
+            (1, 1),
+            ArtifactAvailability::Transferred,
+        );
+        families.shifts = ring.family_artifact_input(
+            production_id,
+            shift_name,
+            package_count,
+            (1, 1),
+            ArtifactAvailability::Transferred,
+        );
         Ok(families)
     }
 

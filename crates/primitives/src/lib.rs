@@ -8,6 +8,8 @@
 
 pub mod element;
 pub mod env;
+#[cfg(feature = "gpu")]
+pub mod gpu_memory;
 pub mod matrix;
 pub mod modulus;
 pub(crate) mod openfhe_guard;

@@ -359,7 +359,7 @@ impl RnsBggParameters {
         let source = self.level(source_level)?;
         let source_modulus = BigInt::from(source.modulus().as_ref().clone());
         let target_gadget =
-            self.public_gadget(target_level)?.centered_extend(source_modulus.clone());
+            self.public_gadget(target_level)?.centered_rebase(source_modulus.clone());
         let alpha = self.scalar(source_level, BigInt::from(alignment.ratio().clone()))?;
         let scaled_target_gadget = alpha * target_gadget;
         let base = 1u64
@@ -778,7 +778,7 @@ impl RnsBggParameters {
                 Ok(self
                     .ring(level + 1)?
                     .gadget(1, base, low.modulus_digits())
-                    .centered_extend(BigInt::from(high.modulus().as_ref().clone())))
+                    .centered_rebase(BigInt::from(high.modulus().as_ref().clone())))
             }
             None => Ok(self.ring(level)?.identity(1)),
         }
@@ -1126,7 +1126,7 @@ pub(crate) fn checked_modulus_convert(
             Ok(value.reduce_modulus(destination))
         }
         std::cmp::Ordering::Equal => Ok(value),
-        std::cmp::Ordering::Less => Ok(value.centered_extend(destination)),
+        std::cmp::Ordering::Less => Ok(value.centered_rebase(destination)),
     }
 }
 
@@ -1218,14 +1218,14 @@ pub(crate) fn compact_decompose_matrix(
     if evaluation_modulus == decomposition_modulus {
         Ok(value)
     } else {
-        Ok(centered_extend_compact(value, BigInt::from(evaluation_modulus)))
+        Ok(centered_rebase_compact(value, BigInt::from(evaluation_modulus)))
     }
 }
 
-fn centered_extend_compact(value: RnsBggDecomposition, modulus: BigInt) -> RnsBggDecomposition {
+fn centered_rebase_compact(value: RnsBggDecomposition, modulus: BigInt) -> RnsBggDecomposition {
     (
-        (value.0.0.centered_extend(modulus.clone()), value.0.1.centered_extend(modulus.clone())),
-        (value.1.0.centered_extend(modulus.clone()), value.1.1.centered_extend(modulus)),
+        (value.0.0.centered_rebase(modulus.clone()), value.0.1.centered_rebase(modulus.clone())),
+        (value.1.0.centered_rebase(modulus.clone()), value.1.1.centered_rebase(modulus)),
     )
 }
 
@@ -1288,7 +1288,7 @@ pub(crate) fn apply_public_alignment_row(
     };
     let aligned = (action.clone().mul_small_rhs(row.0), action.mul_small_rhs(row.1));
     let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
-    checked_mod_down_encoding(aligned, target_modulus)
+    checked_mod_down_encoding(aligned, target_modulus, &parameters.level(source_level)?.to_crt().0)
 }
 
 /// Apply one shared public alignment action to every component of a public
@@ -1312,7 +1312,7 @@ pub(crate) fn apply_public_alignment_matrix(
         (action.clone().mul_small_rhs(matrix.1.0), action.mul_small_rhs(matrix.1.1)),
     );
     let target_modulus = BigInt::from(parameters.level(target_level)?.modulus().as_ref().clone());
-    checked_mod_down_public(aligned, target_modulus)
+    checked_mod_down_public(aligned, target_modulus, &parameters.level(source_level)?.to_crt().0)
 }
 
 pub(crate) fn multiply_public_action(lhs: RnsBggMatrix, rhs: RnsBggDecomposition) -> RnsBggMatrix {
@@ -1369,6 +1369,7 @@ fn validate_mod_down_entry(entry: &Mat, modulus: &BigInt) -> Result<bool, RnsBgg
 fn checked_mod_down_matrix(
     value: RnsBggMatrix,
     modulus: BigInt,
+    source_moduli: &[u64],
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let entries = [&value.0.0, &value.0.1, &value.1.0, &value.1.1];
     let source = concrete_entry_modulus(entries[0])?;
@@ -1388,10 +1389,16 @@ fn checked_mod_down_matrix(
     if no_op.iter().all(|entry| *entry) {
         return Ok(value);
     }
-    Ok(map_matrix(value, |entry| entry.block_mod_switch(modulus.clone(), 1)))
+    Ok(map_matrix(value, |entry| {
+        entry.block_mod_switch(modulus.clone(), source_moduli.to_vec(), 1)
+    }))
 }
 
-fn checked_mod_down_row(value: RnsBggRow, modulus: BigInt) -> Result<RnsBggRow, RnsBggError> {
+fn checked_mod_down_row(
+    value: RnsBggRow,
+    modulus: BigInt,
+    source_moduli: &[u64],
+) -> Result<RnsBggRow, RnsBggError> {
     let source = concrete_entry_modulus(&value.0)?;
     if concrete_entry_modulus(&value.1)? != source {
         return Err(RnsBggError::Parameters("row entries have incompatible source moduli"));
@@ -1403,7 +1410,7 @@ fn checked_mod_down_row(value: RnsBggRow, modulus: BigInt) -> Result<RnsBggRow, 
     if no_op[0] {
         return Ok(value);
     }
-    Ok(map_row(value, |entry| entry.block_mod_switch(modulus.clone(), 1)))
+    Ok(map_row(value, |entry| entry.block_mod_switch(modulus.clone(), source_moduli.to_vec(), 1)))
 }
 
 /// Checked public-role ModDown.  Equal physical moduli return the original
@@ -1412,8 +1419,9 @@ fn checked_mod_down_row(value: RnsBggRow, modulus: BigInt) -> Result<RnsBggRow, 
 pub(crate) fn checked_mod_down_public(
     value: RnsBggMatrix,
     modulus: BigInt,
+    source_moduli: &[u64],
 ) -> Result<RnsBggMatrix, RnsBggError> {
-    checked_mod_down_matrix(value, modulus)
+    checked_mod_down_matrix(value, modulus, source_moduli)
 }
 
 /// Checked encoding-role ModDown with the same source/target policy as public
@@ -1421,20 +1429,29 @@ pub(crate) fn checked_mod_down_public(
 pub(crate) fn checked_mod_down_encoding(
     value: RnsBggRow,
     modulus: BigInt,
+    source_moduli: &[u64],
 ) -> Result<RnsBggRow, RnsBggError> {
-    checked_mod_down_row(value, modulus)
+    checked_mod_down_row(value, modulus, source_moduli)
 }
 
 /// Existing graph callers use this infallible boundary after their enclosing
 /// validation.  Keep the error visible as a panic rather than constructing an
 /// invalid upward or non-exact switch node.
-pub(crate) fn mod_down_public(value: RnsBggMatrix, modulus: BigInt) -> RnsBggMatrix {
-    checked_mod_down_public(value, modulus)
+pub(crate) fn mod_down_public(
+    value: RnsBggMatrix,
+    modulus: BigInt,
+    source_moduli: &[u64],
+) -> RnsBggMatrix {
+    checked_mod_down_public(value, modulus, source_moduli)
         .unwrap_or_else(|error| panic!("invalid public modulus switch: {error}"))
 }
 
-pub(crate) fn mod_down_encoding(value: RnsBggRow, modulus: BigInt) -> RnsBggRow {
-    checked_mod_down_encoding(value, modulus)
+pub(crate) fn mod_down_encoding(
+    value: RnsBggRow,
+    modulus: BigInt,
+    source_moduli: &[u64],
+) -> RnsBggRow {
+    checked_mod_down_encoding(value, modulus, source_moduli)
         .unwrap_or_else(|error| panic!("invalid encoding modulus switch: {error}"))
 }
 
@@ -1562,14 +1579,20 @@ mod tests {
         let ring = parameters.ring(0).unwrap();
         let entry = ring.input("equal-modulus-entry", (1, 1));
         let matrix = ((entry.clone(), entry.clone()), (entry.clone(), entry.clone()));
-        let converted =
-            checked_mod_down_public(matrix.clone(), BigInt::from(level.modulus().as_ref().clone()))
-                .unwrap();
+        let converted = checked_mod_down_public(
+            matrix.clone(),
+            BigInt::from(level.modulus().as_ref().clone()),
+            &level.to_crt().0,
+        )
+        .unwrap();
         assert_eq!(converted.0.0.flatten(), matrix.0.0.flatten());
         let row = (entry.clone(), entry.clone());
-        let converted_row =
-            checked_mod_down_encoding(row.clone(), BigInt::from(level.modulus().as_ref().clone()))
-                .unwrap();
+        let converted_row = checked_mod_down_encoding(
+            row.clone(),
+            BigInt::from(level.modulus().as_ref().clone()),
+            &level.to_crt().0,
+        )
+        .unwrap();
         assert_eq!(converted_row.0.flatten(), row.0.flatten());
 
         let low = level.select_modulus(&BigUint::from(level.to_crt().0[0])).unwrap();
@@ -1583,12 +1606,20 @@ mod tests {
             (lower_entry.clone(), lower_entry.clone()),
         );
         assert!(matches!(
-            checked_mod_down_public(lower_matrix, BigInt::from(level.modulus().as_ref().clone())),
+            checked_mod_down_public(
+                lower_matrix,
+                BigInt::from(level.modulus().as_ref().clone()),
+                &low.to_crt().0,
+            ),
             Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
         ));
         let lower_row = (lower_entry.clone(), lower_entry);
         assert!(matches!(
-            checked_mod_down_encoding(lower_row, BigInt::from(level.modulus().as_ref().clone())),
+            checked_mod_down_encoding(
+                lower_row,
+                BigInt::from(level.modulus().as_ref().clone()),
+                &low.to_crt().0,
+            ),
             Err(RnsBggError::Parameters("modulus switch cannot increase modulus"))
         ));
     }
@@ -1716,11 +1747,11 @@ mod tests {
         assert_eq!(extended.matrix_type().modulus, IntExpr::constant(BigInt::from(105u8)));
 
         let graph = mxx_dsl::DslContext::new("checked-modulus-conversion")
-            .artifact_output("reduced", reduced)
+            .transferred_output("reduced", reduced)
             .unwrap()
-            .artifact_output("equal", equal)
+            .transferred_output("equal", equal)
             .unwrap()
-            .artifact_output("extended", extended)
+            .transferred_output("extended", extended)
             .unwrap()
             .build()
             .unwrap();

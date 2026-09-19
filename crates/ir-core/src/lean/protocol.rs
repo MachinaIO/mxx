@@ -14,11 +14,22 @@ use crate::{
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
+use thiserror::Error;
 
 pub struct ExportedRoots {
     pub stages: BTreeMap<StageId, LeanArtifact>,
     pub requirements: Vec<LeanArtifact>,
     pub ideal: LeanArtifact,
+}
+
+/// Errors at the protocol/Lean export boundary.  These are deliberately
+/// distinct from GPU operation or placement errors.
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum ProtocolExportError {
+    #[error("unsupported external input contract variant: {variant}")]
+    UnsupportedExternalInputContract { variant: &'static str },
+    #[error("protocol export failed: {0}")]
+    Invalid(String),
 }
 
 /// Export every graph and the linked claim for this exact declaration and backend.
@@ -101,7 +112,7 @@ fn stage_module_name(stage: &StageId) -> Result<String, String> {
     Ok(format!("Stage_{}", stage.0))
 }
 
-fn input_contract(value: &InputValueContract) -> Result<InputContract, String> {
+fn input_contract(value: &InputValueContract) -> Result<InputContract, ProtocolExportError> {
     Ok(match value {
         InputValueContract::IntegerRange { lower, upper } => {
             InputContract::IntegerRange { lower: lower.clone(), upper: upper.clone() }
@@ -112,18 +123,37 @@ fn input_contract(value: &InputValueContract) -> Result<InputContract, String> {
             count: count.clone(),
             element: Box::new(input_contract(element)?),
         },
-        _ => return Err("unsupported external input contract variant".into()),
+        InputValueContract::MatrixExact { .. } => {
+            return Err(ProtocolExportError::UnsupportedExternalInputContract {
+                variant: "MatrixExact",
+            })
+        }
+        InputValueContract::MatrixBounded { .. } => {
+            return Err(ProtocolExportError::UnsupportedExternalInputContract {
+                variant: "MatrixBounded",
+            })
+        }
+        InputValueContract::MatrixLarge { .. } => {
+            return Err(ProtocolExportError::UnsupportedExternalInputContract {
+                variant: "MatrixLarge",
+            })
+        }
+        InputValueContract::Trapdoor { .. } => {
+            return Err(ProtocolExportError::UnsupportedExternalInputContract {
+                variant: "Trapdoor",
+            })
+        }
     })
 }
 
 fn input_contracts(
     contract: &crate::protocol::InputContract,
     bindings: &[crate::protocol::ProtocolInputBinding],
-) -> Result<Vec<InputContract>, String> {
+) -> Result<Vec<InputContract>, ProtocolExportError> {
     let mut contracts = BTreeMap::new();
     for entry in &contract.inputs {
         if contracts.insert(&entry.id, &entry.value).is_some() {
-            return Err("duplicate external input contract ID".into());
+            return Err(ProtocolExportError::Invalid("duplicate external input contract ID".into()));
         }
     }
     let mut external_ids = BTreeSet::new();
@@ -131,15 +161,15 @@ fn input_contracts(
         .iter()
         .map(|binding| {
             if !external_ids.insert(&binding.input) {
-                return Err("duplicate external input ID".into());
+                return Err(ProtocolExportError::Invalid("duplicate external input ID".into()));
             }
-            input_contract(
-                contracts.remove(&binding.input).ok_or("missing external input contract")?,
-            )
+            input_contract(contracts.remove(&binding.input).ok_or_else(|| {
+                ProtocolExportError::Invalid("missing external input contract".into())
+            })?)
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, ProtocolExportError>>()?;
     if !contracts.is_empty() {
-        return Err("unknown external input contract ID".into());
+        return Err(ProtocolExportError::Invalid("unknown external input contract ID".into()));
     }
     Ok(predicates)
 }
@@ -151,18 +181,21 @@ pub fn assemble_claim(
     bindings: &ParamEnv,
     backend: &ClaimBackend<'_>,
     semantics: &ClaimSemantics<'_>,
-) -> Result<String, String> {
-    declaration.validate().map_err(|error| error.to_string())?;
+) -> Result<String, ProtocolExportError> {
+    declaration.validate().map_err(|error| ProtocolExportError::Invalid(error.to_string()))?;
     let bundle = &declaration.bundle;
     let mut positions = BTreeMap::new();
     let mut entries = Vec::new();
     for (index, stage) in bundle.workflow.stages.iter().enumerate() {
         if positions.insert(stage.id.clone(), index).is_some() {
-            return Err("duplicate workflow stage".into());
+            return Err(ProtocolExportError::Invalid("duplicate workflow stage".into()));
         }
         entries.push(ClaimRoot {
             graph: &stage.graph,
-            artifact: roots.stages.get(&stage.id).ok_or("missing generated stage")?,
+            artifact: roots
+                .stages
+                .get(&stage.id)
+                .ok_or_else(|| ProtocolExportError::Invalid("missing generated stage".into()))?,
             field: format!("stage_{index}"),
         });
     }
@@ -170,7 +203,7 @@ pub fn assemble_claim(
         roots.requirements.len() != bundle.requirements.len() ||
         bundle.precondition_spec.requirement_outputs.len() != bundle.requirements.len()
     {
-        return Err("generated root count mismatch".into());
+        return Err(ProtocolExportError::Invalid("generated root count mismatch".into()));
     }
     let requirement_start = entries.len();
     for (index, (requirement, artifact)) in
@@ -188,8 +221,12 @@ pub fn assemble_claim(
         artifact: &roots.ideal,
         field: "ideal".into(),
     });
-    let position =
-        |stage: &StageId| positions.get(stage).copied().ok_or_else(|| "unknown stage".to_string());
+    let position = |stage: &StageId| {
+        positions
+            .get(stage)
+            .copied()
+            .ok_or_else(|| ProtocolExportError::Invalid("unknown stage".into()))
+    };
     let contracts = input_contracts(&bundle.input_contract, &bundle.input_bindings)?;
     let externals = bundle
         .input_bindings
@@ -206,7 +243,9 @@ pub fn assemble_claim(
                         }
                         ProtocolInputDestination::Requirement { requirement, input } => {
                             if *requirement >= roots.requirements.len() {
-                                return Err("unknown requirement destination".into());
+                                return Err(ProtocolExportError::Invalid(
+                                    "unknown requirement destination".into(),
+                                ));
                             }
                             (requirement_start + requirement, input.clone())
                         }
@@ -216,10 +255,10 @@ pub fn assemble_claim(
                     };
                     Ok(Port { root, name })
                 })
-                .collect::<Result<Vec<_>, String>>()?;
+                .collect::<Result<Vec<_>, ProtocolExportError>>()?;
             Ok(ExternalInput { contract, destinations })
         })
-        .collect::<Result<Vec<_>, String>>()?;
+        .collect::<Result<Vec<_>, ProtocolExportError>>()?;
     let mut links = Vec::new();
     for (index, stage) in bundle.workflow.stages.iter().enumerate() {
         for binding in &stage.bindings {
@@ -233,13 +272,15 @@ pub fn assemble_claim(
         }
     }
     let ComparatorSpec::Equality { endpoints } = &bundle.comparator else {
-        return Err("unsupported comparator".into());
+        return Err(ProtocolExportError::Invalid("unsupported comparator".into()));
     };
     if endpoints.len() != 1 ||
         bundle.endpoints.entries.len() != 1 ||
         bundle.operational_decoder_targets.len() != 1
     {
-        return Err("threshold claim currently requires one exact operational endpoint".into());
+        return Err(ProtocolExportError::Invalid(
+            "threshold claim currently requires one exact operational endpoint".into(),
+        ));
     }
     let endpoint = &bundle.endpoints.entries[0];
     let comparison = &endpoints[0];
@@ -247,7 +288,7 @@ pub fn assemble_claim(
         comparison.actual_input != endpoint.workflow_output.output ||
         comparison.ideal_input != endpoint.ideal_output
     {
-        return Err("comparator endpoint mismatch".into());
+        return Err(ProtocolExportError::Invalid("comparator endpoint mismatch".into()));
     }
     let actual_position = position(&endpoint.workflow_output.stage)?;
     entries[actual_position]
@@ -255,10 +296,12 @@ pub fn assemble_claim(
         .root
         .outputs
         .get(&endpoint.workflow_output.output)
-        .ok_or("missing actual endpoint")?;
+        .ok_or_else(|| ProtocolExportError::Invalid("missing actual endpoint".into()))?;
     let target = &bundle.operational_decoder_targets[0];
     if target.endpoint != endpoint.spec {
-        return Err("operational decoder does not identify the actual endpoint".into());
+        return Err(ProtocolExportError::Invalid(
+            "operational decoder does not identify the actual endpoint".into(),
+        ));
     }
     let claim = LinkedClaim {
         roots: entries,
@@ -281,6 +324,7 @@ pub fn assemble_claim(
         },
     };
     claim::assemble_claim(&claim, bindings, backend, semantics)
+        .map_err(ProtocolExportError::Invalid)
 }
 
 #[cfg(test)]
@@ -289,6 +333,7 @@ mod tests {
     use crate::{
         IntExpr,
         protocol::{InputContractEntry, ProtocolInputBinding, ProtocolInputId},
+        types::MatrixType,
     };
     #[test]
     fn test_stage_module_name_accepts_ascii_suffixes() {
@@ -323,5 +368,18 @@ mod tests {
         contract.inputs[0].id = bindings[0].input.clone();
         assert!(input_contracts(&contract, &[bindings[0].clone(), bindings[0].clone()]).is_err());
         assert!(input_contracts(&contract, &[]).is_err());
+
+        let unsupported = InputValueContract::MatrixLarge {
+            matrix_type: MatrixType {
+                modulus: 17.into(),
+                ring_dimension: 8.into(),
+                rows: 1.into(),
+                columns: 1.into(),
+            },
+        };
+        assert!(matches!(
+            input_contract(&unsupported),
+            Err(ProtocolExportError::UnsupportedExternalInputContract { variant: "MatrixLarge" })
+        ));
     }
 }

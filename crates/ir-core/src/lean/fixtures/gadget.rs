@@ -44,7 +44,7 @@ fn export_gadget_fixture() {
         Vec::<CompileParameter>::new(),
         BTreeMap::from([(
             "decomposition".into(),
-            GraphOutput { artifact_output: false, value: decomposition },
+            GraphOutput { value: decomposition, availability: None },
         )]),
         vec![],
         vec![],

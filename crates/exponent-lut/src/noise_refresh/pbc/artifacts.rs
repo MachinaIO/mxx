@@ -244,7 +244,7 @@ impl<M: Clone + Eq + Serialize> PbcSelectorArtifacts<M> {
             return Err(PbcError::ArtifactIdentityMismatch);
         }
         context
-            .artifact_output(selector_family_artifact_name(self, role), families)
+            .transferred_output(selector_family_artifact_name(self, role), families)
             .map_err(|_| PbcError::ArtifactIdentityMismatch)
     }
 

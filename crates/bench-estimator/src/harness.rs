@@ -69,9 +69,10 @@ where
     Ok(BatchMeasurement { batch_size, measurement })
 }
 
-/// Measures host elapsed time after warm-up while polling transient memory.
-/// This harness reports host work seconds. Device timeline measurements use the
-/// GPU adapter's execution-owner events and do not use this host clock as device work.
+/// Measures one production operation after warm-up while polling its transient
+/// memory high-water mark. GPU callers must include their ordinary per-stream
+/// completion fence in `operation`; this harness never performs a device-wide
+/// synchronization.
 pub fn measure_operation<P, F, R>(
     config: &MeasurementHarnessConfig,
     probe: &P,

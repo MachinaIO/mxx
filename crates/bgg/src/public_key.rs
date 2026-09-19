@@ -12,7 +12,7 @@ pub struct BggPublicKeyWire {
     pub reveal_plaintext: bool,
 }
 
-#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq)]
 pub struct BggPublicKeyType {
     pub matrix: MatType,
     pub reveal_plaintext: bool,
@@ -240,7 +240,7 @@ mod tests {
         let compiler = BggPublicKeyCompiler { ring, base: 2.into(), digit_count: 2.into() };
         let output = compiler.mul(&lhs, &rhs);
         let built = DslContext::new("bgg-public-key-mul")
-            .artifact_output("output", output.matrix)
+            .transferred_output("output", output.matrix)
             .expect("output")
             .build()
             .expect("build");

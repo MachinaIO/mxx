@@ -1,5 +1,5 @@
 use crate::{
-    artifact::ProductionId,
+    artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
@@ -96,13 +96,12 @@ pub enum NodeKind {
         source_moduli: Vec<u64>,
         plaintext_modulus: IntExpr,
     },
-    /// Canonical centered lift to a containing odd coefficient modulus.
-    CenteredExtend {
-        modulus: IntExpr,
-    },
-    /// Exact BFV block division preserving an error multiplier t.
+    /// Exact block CRT modulus switching. `source_moduli` is the complete
+    /// source basis; `modulus` is the product of a strict non-empty subset.
+    /// The plaintext modulus is the positive correction factor `t`.
     BlockModSwitch {
         modulus: IntExpr,
+        source_moduli: Vec<u64>,
         plaintext_modulus: IntExpr,
     },
     Transpose,
@@ -211,6 +210,7 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
+    pub availability: ArtifactAvailability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

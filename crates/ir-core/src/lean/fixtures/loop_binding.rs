@@ -79,8 +79,8 @@ fn export_loop_binding_fixture() {
         "loop-bindings",
         vec![],
         BTreeMap::from([
-            ("parallel".into(), GraphOutput { artifact_output: false, value: family }),
-            ("sequential".into(), GraphOutput { artifact_output: false, value: sequential }),
+            ("parallel".into(), GraphOutput { value: family, availability: None }),
+            ("sequential".into(), GraphOutput { value: sequential, availability: None }),
         ]),
         vec![],
         vec![],

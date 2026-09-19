@@ -4,7 +4,7 @@ use crate::{
     utils::common,
 };
 use mxx_dsl::{DslContext, Ring};
-use mxx_ir_core::ParamEnv;
+use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
 use mxx_primitives::poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams};
 use mxx_runtime::{
     ExecutionResult, MemoryArtifactStore, RuntimeValue,
@@ -47,7 +47,7 @@ fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
 fn values(
     result: &mut ExecutionResult<GpuDcrtBackend>,
     name: &str,
-    backend: &mut GpuDcrtBackend,
+    backend: &GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
 ) -> Vec<BigInt> {
     let RuntimeValue::IndexedFamily(values) =
@@ -66,9 +66,6 @@ fn values(
 
 #[test]
 fn test_gpu_fhe_ring_gsw_runtime() {
-    if run_isolated("tests_gpu::test_gpu_fhe_ring_gsw_runtime") {
-        return;
-    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let scheme =
@@ -82,11 +79,11 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     let product = scheme.mul(&ct, &gsw, &()).unwrap();
     let sum = scheme.add(&ct, &ct).unwrap();
     let graph = context
-        .artifact_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
+        .transferred_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
         .unwrap()
-        .artifact_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
+        .transferred_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
         .unwrap()
-        .artifact_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
+        .transferred_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
         .unwrap()
         .build()
         .unwrap()
@@ -110,7 +107,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     )
     .unwrap();
     assert_eq!(
-        values(&mut result, "roundtrip", &mut backend, &mut store),
+        values(&mut result, "roundtrip", &backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(*v)
@@ -118,7 +115,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        values(&mut result, "sum", &mut backend, &mut store),
+        values(&mut result, "sum", &backend, &mut store),
         message
             .iter()
             .map(|v| BigInt::from(2 * v)
@@ -131,7 +128,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     expected.rotate_right(1);
     expected[0] = -expected[0];
     assert_eq!(
-        values(&mut result, "product", &mut backend, &mut store),
+        values(&mut result, "product", &backend, &mut store),
         expected
             .into_iter()
             .map(|v| BigInt::from(v)
@@ -143,9 +140,6 @@ fn test_gpu_fhe_ring_gsw_runtime() {
 
 #[test]
 fn test_gpu_fhe_bgv_simd_staged_runtime() {
-    if run_isolated("tests_gpu::test_gpu_fhe_bgv_simd_staged_runtime") {
-        return;
-    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -165,17 +159,17 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     // the secret key is imported privately by the final decryption graph.
     let encryption_noise = ct.noise_bound.clone();
     let encryption = context
-        .artifact_output("secret", secret)
+        .transferred_output("secret", secret)
         .unwrap()
-        .artifact_output("ciphertext", ct.components)
+        .transferred_output("ciphertext", ct.components)
         .unwrap()
-        .artifact_output("relin", relin)
+        .transferred_output("relin", relin)
         .unwrap()
-        .artifact_output("rotation", rotation)
+        .transferred_output("rotation", rotation)
         .unwrap()
-        .artifact_output("backwards", backwards)
+        .transferred_output("backwards", backwards)
         .unwrap()
-        .artifact_output("swap", swap)
+        .transferred_output("swap", swap)
         .unwrap()
         .build()
         .unwrap()
@@ -197,7 +191,12 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let mut manifests =
         BTreeMap::from([(encryption_id.clone(), store.manifest(&encryption_id).unwrap().clone())]);
     let ct = BgvCiphertext {
-        components: common.ring().artifact_input(encryption_id.clone(), "ciphertext", (2, 1)),
+        components: common.ring().artifact_input(
+            encryption_id.clone(),
+            "ciphertext",
+            (2, 1),
+            ArtifactAvailability::Transferred,
+        ),
         correction_factor: 1,
         noise_bound: encryption_noise,
     };
@@ -206,10 +205,18 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         encryption_id.clone(),
         "relin",
         (2, relin_width),
+        ArtifactAvailability::Transferred,
     );
     let (lower, lower_width) = bgv.key_switch_parameters(top - 1).unwrap();
     let ring = Ring::new(lower.modulus().as_ref().clone(), n);
-    let import_key = |name| ring.artifact_input(encryption_id.clone(), name, (2, lower_width));
+    let import_key = |name| {
+        ring.artifact_input(
+            encryption_id.clone(),
+            name,
+            (2, lower_width),
+            ArtifactAvailability::Transferred,
+        )
+    };
     let sum = bgv.add(&ct, &ct).unwrap();
     let quadratic = bgv.mul_unrelinearized(&ct, &ct).unwrap();
     let product = bgv.relinearize(&quadratic, &relin).unwrap();
@@ -236,7 +243,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     ];
     let mut evaluator = DslContext::new("gpu-bgv-public-evaluator");
     for (name, ct) in &outputs {
-        evaluator = evaluator.artifact_output(*name, ct.components.clone()).unwrap();
+        evaluator = evaluator.transferred_output(*name, ct.components.clone()).unwrap();
     }
     let evaluator = evaluator
         .build()
@@ -249,7 +256,13 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             .unwrap();
     let evaluation_id = evaluated.production_id.unwrap();
     manifests.insert(evaluation_id.clone(), store.manifest(&evaluation_id).unwrap().clone());
-    let secret = common.ring().artifact_input(encryption_id, "secret", (1, 1));
+    let secret = common.ring().artifact_input(
+        encryption_id,
+        "secret",
+        (1, 1),
+        // Secret keys are randomized producer outputs, not cache entries.
+        ArtifactAvailability::Transferred,
+    );
     let mut decryption = DslContext::new("gpu-bgv-decrypt");
     for (name, ct) in &outputs {
         let ty = ct.components.matrix_type();
@@ -258,6 +271,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 evaluation_id.clone(),
                 *name,
                 (ty.rows.clone(), 1),
+                ArtifactAvailability::Transferred,
             ),
             correction_factor: ct.correction_factor,
             // Bounds are public graph metadata, not part of a Matrix artifact.
@@ -265,7 +279,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             noise_bound: ct.noise_bound.clone(),
         };
         decryption =
-            decryption.artifact_output(*name, bgv.decrypt(&secret, &imported).unwrap()).unwrap();
+            decryption.transferred_output(*name, bgv.decrypt(&secret, &imported).unwrap()).unwrap();
     }
     let decryption = decryption
         .build()
@@ -291,16 +305,13 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 BigInt::from(if name == "sum" { (2 * m) % t } else { (m * m) % t })
             })
             .collect::<Vec<_>>();
-        assert_eq!(values(&mut result, name, &mut backend, &mut store), expected, "{name}");
+        assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
     }
     result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
 fn test_gpu_fhe_bgv_short_slot_inputs() {
-    if run_isolated("tests_gpu::test_gpu_fhe_bgv_short_slot_inputs") {
-        return;
-    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let top = common.ring.to_crt().2 - 1;
@@ -317,11 +328,11 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let rotation = bgv.rotation_key(&secret, top, 1).unwrap();
     let rotated = bgv.rotate_rows(Some(&rotation), &single, 1).unwrap();
     let graph = context
-        .artifact_output("single", bgv.decrypt(&secret, &single).unwrap())
+        .transferred_output("single", bgv.decrypt(&secret, &single).unwrap())
         .unwrap()
-        .artifact_output("partial", bgv.decrypt(&secret, &partial).unwrap())
+        .transferred_output("partial", bgv.decrypt(&secret, &partial).unwrap())
         .unwrap()
-        .artifact_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
+        .transferred_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
         .unwrap()
         .build()
         .unwrap()
@@ -344,25 +355,22 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     .unwrap();
     let mut expected = vec![BigInt::from(0); n];
     expected[0] = BigInt::from(t - 1);
-    assert_eq!(values(&mut result, "single", &mut backend, &mut store), expected);
+    assert_eq!(values(&mut result, "single", &backend, &mut store), expected);
     // Positive rotation moves slot zero to the last position of its row,
     // which was outside the single-value input. Decryption must still return it.
     expected[..n / 2].rotate_left(1);
-    assert_eq!(values(&mut result, "rotated", &mut backend, &mut store), expected);
+    assert_eq!(values(&mut result, "rotated", &backend, &mut store), expected);
     let mut expected = partial_values
         .into_iter()
         .map(|v| BigInt::from(v).mod_floor(&BigInt::from(t)))
         .collect::<Vec<_>>();
     expected.push(BigInt::from(0));
-    assert_eq!(values(&mut result, "partial", &mut backend, &mut store), expected);
+    assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
     result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
 fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
-    if run_isolated("tests_gpu::test_gpu_fhe_bgv_hybrid_multilimb_all_levels") {
-        return;
-    }
     let common = common();
     let n = common.ring.ring_dimension() as usize;
     let depth = common.ring.crt_depth();
@@ -409,9 +417,9 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
         assert!(bgv.can_decrypt(&product).unwrap(), "product level {level}");
         assert!(bgv.can_decrypt(&rotated).unwrap(), "rotation level {level}");
         context = context
-            .artifact_output(format!("product{level}"), bgv.decrypt(&secret, &product).unwrap())
+            .transferred_output(format!("product{level}"), bgv.decrypt(&secret, &product).unwrap())
             .unwrap()
-            .artifact_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
+            .transferred_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
             .unwrap();
     }
     let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();
@@ -437,34 +445,8 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     rotated[..n / 2].rotate_left(1);
     rotated[n / 2..].rotate_left(1);
     for level in 0..depth {
-        assert_eq!(
-            values(&mut result, &format!("product{level}"), &mut backend, &mut store),
-            expected
-        );
-        assert_eq!(
-            values(&mut result, &format!("rotated{level}"), &mut backend, &mut store),
-            rotated
-        );
+        assert_eq!(values(&mut result, &format!("product{level}"), &backend, &mut store), expected);
+        assert_eq!(values(&mut result, &format!("rotated{level}"), &backend, &mut store), rotated);
     }
     result.cleanup_staged(&mut store).unwrap();
-}
-
-/// Keep each test's allocation epoch exclusive within its process while the
-/// test harness remains free to run the independent GPU cases concurrently.
-fn run_isolated(test_name: &str) -> bool {
-    if std::env::args().any(|argument| argument == "--exact") {
-        return false;
-    }
-    let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", test_name, "--nocapture"])
-        .output()
-        .expect("run isolated GPU unit test");
-    assert!(
-        result.status.success() &&
-            String::from_utf8_lossy(&result.stdout).contains("1 passed; 0 failed"),
-        "{}\n{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-    true
 }

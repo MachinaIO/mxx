@@ -18,5 +18,4 @@ roots = [
   "RuntimeMatrixOps",
   "RuntimeModulusSwitch",
   "RuntimePrimitives",
-  "RuntimeDecomposition",
 ]

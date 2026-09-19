@@ -9,7 +9,7 @@ use super::*;
 use crate::{
     api::{
         ApiError, EncryptBuild, OnlineBuild, PlaintextInputs, RefreshApplicationError,
-        StageArtifacts, StageGraph, apply_refresh, domain_identity, execute_checkpoint,
+        StageArtifacts, StageGraph, apply_refresh, domain_identity, execute_artifacts,
         execute_graph,
     },
     noise_refresh::{
@@ -25,7 +25,7 @@ use crate::{
 use mxx_dsl::{DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
 use mxx_ir_core::{
     IntExpr, ParamEnv, ValueHandle,
-    artifact::{ArtifactCatalog, ArtifactType, ProductionId},
+    artifact::{ArtifactAvailability, ArtifactType, Manifest, ProductionId},
     node::ConstantMatrix,
     types::{ConcreteMatrixType, WireType},
 };
@@ -36,7 +36,6 @@ use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::Path,
     sync::Arc,
 };
 
@@ -340,7 +339,7 @@ where
     }
     let graph = graph.build().map_err(ApiError::scheme)?;
     let mut verification = crate::api::execute_graph(
-        StageGraph::new(graph, runtime_inputs, ArtifactCatalog::default()),
+        StageGraph::new(graph, runtime_inputs, BTreeMap::new()),
         &mxx_ir_core::ParamEnv::default(),
         backend,
         store,
@@ -383,9 +382,7 @@ where
                 false,
             )
             .map_err(ApiError::scheme)?;
-        if backend.matrix_to_bytes(&matrix).map_err(ApiError::scheme)? !=
-            backend.matrix_to_bytes(&zero).map_err(ApiError::scheme)?
-        {
+        if backend.matrix_to_bytes(&matrix) != backend.matrix_to_bytes(&zero) {
             return Err(ApiError::input("public payload does not match expected plaintext"));
         }
     }
@@ -605,7 +602,7 @@ pub struct EncodingLowering<'a> {
     pub(crate) workload: Arc<RnsBggDerivedWorkload>,
     pub(crate) preprocess: ProductionId,
     pub(crate) encryption: ProductionId,
-    pub(crate) catalog: ArtifactCatalog,
+    pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
     pub(crate) refresh_prf_namespace: Option<([u8; 32], usize)>,
     pub(crate) current_site: Option<LoweringSite>,
 }
@@ -742,11 +739,13 @@ impl EncodingLowering<'_> {
                 self.encryption.clone(),
                 self.encryption_artifact_name(format!("lut-helper/{level}/{sigma}.0")),
                 (1, columns),
+                ArtifactAvailability::Transferred,
             ),
             ring.artifact_input(
                 self.encryption.clone(),
                 self.encryption_artifact_name(format!("lut-helper/{level}/{sigma}.1")),
                 (1, columns),
+                ArtifactAvailability::Transferred,
             ),
         ))
     }
@@ -759,6 +758,7 @@ impl EncodingLowering<'_> {
                 self.preprocess.clone(),
                 self.preprocess_artifact_name(format!("lut-public/{level}/{sigma}.{port}")),
                 (1, columns),
+                ArtifactAvailability::Cached,
             )
         };
         Ok(((input(0), input(1)), (input(2), input(3))))
@@ -790,6 +790,7 @@ impl EncodingLowering<'_> {
                     self.preprocess_artifact_name(format!("rhs/{:?}/family.{port}", rhs.id)),
                     count.clone(),
                     (1, columns),
+                    ArtifactAvailability::Transferred,
                 )
             };
             let matrix = (
@@ -805,11 +806,13 @@ impl EncodingLowering<'_> {
                     self.preprocess.clone(),
                     self.preprocess_artifact_name(format!("rhs/{:?}.0", rhs.id)),
                     (1, columns),
+                    ArtifactAvailability::Transferred,
                 ),
                 ring.artifact_input(
                     self.preprocess.clone(),
                     self.preprocess_artifact_name(format!("rhs/{:?}.1", rhs.id)),
                     (1, columns),
+                    ArtifactAvailability::Transferred,
                 ),
             ),
             (
@@ -817,11 +820,13 @@ impl EncodingLowering<'_> {
                     self.preprocess.clone(),
                     self.preprocess_artifact_name(format!("rhs/{:?}.2", rhs.id)),
                     (1, columns),
+                    ArtifactAvailability::Transferred,
                 ),
                 ring.artifact_input(
                     self.preprocess.clone(),
                     self.preprocess_artifact_name(format!("rhs/{:?}.3", rhs.id)),
                     (1, columns),
+                    ArtifactAvailability::Transferred,
                 ),
             ),
         );
@@ -876,9 +881,11 @@ impl EncodingLowering<'_> {
                     )),
                     count.clone(),
                     (1, target_columns),
+                    ArtifactAvailability::Transferred,
                 )
             })
             .collect::<Vec<_>>();
+        let source_moduli = self.parameters.level(decomposition_level)?.to_crt().0;
         let branch_count = count.clone();
         mxx_dsl::parallel(branch_count.clone(), |index| {
             let b_sigma = (
@@ -909,6 +916,7 @@ impl EncodingLowering<'_> {
                 )
                 .map_err(|_| DslError::Schema)?,
                 target_modulus,
+                &source_moduli,
             );
             let switched_key_decomposition = compact_decompose_matrix(
                 self.parameters,
@@ -956,7 +964,12 @@ impl EncodingLowering<'_> {
             None => refresh_artifact_name(*declaration.commitment(), slot, role),
         };
         let matrix = |port: usize| {
-            ring.artifact_input(self.preprocess.clone(), format!("{prefix}.{port}"), (1, columns))
+            ring.artifact_input(
+                self.preprocess.clone(),
+                format!("{prefix}.{port}"),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            )
         };
         let matrix = ((matrix(0), matrix(1)), (matrix(2), matrix(3)));
         compact_decompose_matrix(self.parameters, q_level, p_level, matrix)
@@ -982,8 +995,18 @@ impl EncodingLowering<'_> {
         let columns = self.parameters.component_columns(declaration.target_level())?;
         let prefix = refresh_artifact_name(*declaration.commitment(), slot, "decoder");
         Ok((
-            ring.artifact_input(self.encryption.clone(), format!("{prefix}.0"), (1, columns)),
-            ring.artifact_input(self.encryption.clone(), format!("{prefix}.1"), (1, columns)),
+            ring.artifact_input(
+                self.encryption.clone(),
+                format!("{prefix}.0"),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            ),
+            ring.artifact_input(
+                self.encryption.clone(),
+                format!("{prefix}.1"),
+                (1, columns),
+                ArtifactAvailability::Transferred,
+            ),
         ))
     }
 
@@ -1060,11 +1083,13 @@ impl EncodingLowering<'_> {
                             production.clone(),
                             format!("{}.0", refresh_artifact_name(commitment, slot.slot, role)),
                             (1, target_columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             format!("{}.1", refresh_artifact_name(commitment, slot.slot, role)),
                             (1, target_columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                     (
@@ -1072,11 +1097,13 @@ impl EncodingLowering<'_> {
                             production.clone(),
                             format!("{}.2", refresh_artifact_name(commitment, slot.slot, role)),
                             (1, target_columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             format!("{}.3", refresh_artifact_name(commitment, slot.slot, role)),
                             (1, target_columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                 )
@@ -1118,13 +1145,14 @@ impl EncodingLowering<'_> {
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
                     let modulus =
                         BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
+                    let source_moduli = self.parameters.level(level)?.to_crt().0;
                     let public_key = RnsBggPublicKey::new(
                         output.public_key.wire,
-                        mod_down_public(output.public_key.matrix, modulus.clone()),
+                        mod_down_public(output.public_key.matrix, modulus.clone(), &source_moduli),
                     );
                     Ok(RnsBggEncoding::new(
                         public_key,
-                        mod_down_encoding(output.row, modulus.clone()),
+                        mod_down_encoding(output.row, modulus.clone(), &source_moduli),
                         output
                             .public_payload
                             .map(|payload| checked_modulus_convert(payload, modulus.clone()))
@@ -1279,16 +1307,22 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         let target_level = self.workload.level(output)?;
         let target_modulus =
             BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+        let source_moduli = self.parameters.level(evaluation_level)?.to_crt().0;
         let public_key = RnsBggPublicKey::new(
             output,
             mod_down_public(
                 multiply_public_action(input.public_key.matrix.clone(), action.clone()),
                 target_modulus.clone(),
+                &source_moduli,
             ),
         );
         Ok(RnsBggEncoding::new(
             public_key,
-            mod_down_encoding(multiply_encoding_action(input.row.clone(), action), target_modulus),
+            mod_down_encoding(
+                multiply_encoding_action(input.row.clone(), action),
+                target_modulus,
+                &source_moduli,
+            ),
             self.checked_payload(output, None)?,
         ))
     }
@@ -1356,8 +1390,9 @@ impl ExponentLUTProgramLowering for EncodingLowering<'_> {
         {
             let target = self.workload.level(output)?;
             let modulus = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-            public_key.matrix = mod_down_public(public_key.matrix, modulus.clone());
-            row = mod_down_encoding(row, modulus);
+            let source_moduli = self.parameters.level(level)?.to_crt().0;
+            public_key.matrix = mod_down_public(public_key.matrix, modulus.clone(), &source_moduli);
+            row = mod_down_encoding(row, modulus, &source_moduli);
         }
         let public_payload = if matches!(
             self.program
@@ -1439,22 +1474,21 @@ pub struct RnsEncryptBuild<'a, B: Backend> {
     preprocess: Option<ProductionId>,
     binding: Option<RnsBggArtifactBinding>,
     refresh_declaration: Option<RefreshDeclaration>,
-    catalog: ArtifactCatalog,
+    manifests: BTreeMap<ProductionId, Manifest>,
     runtime: BTreeMap<String, RuntimeValue<B>>,
     refresh_prf_children: BTreeMap<usize, Box<RnsEncryptBuild<'a, B>>>,
     refresh_prf_binding: Option<([u8; 32], usize, crate::program::ExponentLutProgramId, [u8; 32])>,
 }
 
 fn validate_lut_public_artifacts(
-    catalog: &ArtifactCatalog,
+    manifests: &BTreeMap<ProductionId, Manifest>,
     production: &ProductionId,
     parameters: &RnsBggParameters,
     inputs: &crate::program::EncryptionInputs,
     refresh_prf_namespace: Option<([u8; 32], usize)>,
 ) -> Result<(), ApiError> {
     let helper_keys = canonical_lut_helper_keys(parameters, inputs).map_err(ApiError::scheme)?;
-    let manifest = catalog
-        .manifests()
+    let manifest = manifests
         .get(production)
         .ok_or_else(|| ApiError::compatibility("preprocess manifest is not available"))?;
     for (level, sigma) in helper_keys {
@@ -1474,15 +1508,14 @@ fn validate_lut_public_artifacts(
 }
 
 fn validate_refresh_prf_input_key_artifacts(
-    catalog: &ArtifactCatalog,
+    manifests: &BTreeMap<ProductionId, Manifest>,
     production: &ProductionId,
     parameters: &RnsBggParameters,
     inputs: &crate::program::EncryptionInputs,
     commitment: [u8; 32],
     slot: usize,
 ) -> Result<(), RnsBggError> {
-    let manifest = catalog
-        .manifests()
+    let manifest = manifests
         .get(production)
         .ok_or(RnsBggError::Binding("refresh PRF preprocess manifest is missing"))?;
     let modulus = BigInt::from(parameters.level(0)?.modulus().as_ref().clone());
@@ -1534,7 +1567,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             preprocess: None,
             binding: None,
             refresh_declaration: None,
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             runtime: BTreeMap::new(),
             refresh_prf_children: BTreeMap::new(),
             refresh_prf_binding: None,
@@ -1562,7 +1595,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
         &mut self,
         preprocess: &StageArtifacts<RnsBggPreprocessEncryptDescriptor>,
     ) -> Result<(), ApiError> {
-        let binding = preprocess.checkpoint().descriptor().binding().clone();
+        let binding = preprocess.descriptor().binding().clone();
         if binding.context() != &self.context ||
             (self.refresh_prf_binding.is_none() &&
                 binding.parameters() != &self.parameters.parameter_identity()) ||
@@ -1572,20 +1605,20 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                 "RNS-BGG preprocess binding does not match encryption",
             ));
         }
-        let production = preprocess.checkpoint().production().clone();
+        let production = preprocess.production().clone();
         if binding.sources().len() != 1 || !binding.sources().contains(&production) {
             return Err(ApiError::compatibility(
                 "RNS-BGG preprocess production is not a declared source",
             ));
         }
         self.preprocess = Some(production.clone());
-        self.catalog = preprocess.checkpoint().catalog().clone();
+        self.manifests = BTreeMap::from([(production.clone(), preprocess.manifest().clone())]);
         let inputs = self
             .inputs
             .as_ref()
             .ok_or_else(|| ApiError::input("encryption inputs are not bound"))?;
         validate_lut_public_artifacts(
-            &self.catalog,
+            &self.manifests,
             &production,
             self.parameters,
             inputs,
@@ -1697,7 +1730,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                 return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
             }
             validate_refresh_prf_input_key_artifacts(
-                &child.catalog,
+                &child.manifests,
                 child
                     .preprocess
                     .as_ref()
@@ -1766,6 +1799,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                             &format!("lut-public/{level}/{sigma}.{port}"),
                         ),
                         (1, columns),
+                        ArtifactAvailability::Cached,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1777,7 +1811,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                 .encrypt_lut_helper(mask, public_data, level, sigma)
                 .map_err(ApiError::scheme)?;
             graph = graph
-                .artifact_output(
+                .transferred_output(
                     refresh_prf_artifact_name(
                         commitment,
                         slot,
@@ -1800,11 +1834,13 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                             production.clone(),
                             refresh_prf_input_key_artifact_name(commitment, slot, *wire, 0),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             refresh_prf_input_key_artifact_name(commitment, slot, *wire, 1),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                     (
@@ -1812,11 +1848,13 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                             production.clone(),
                             refresh_prf_input_key_artifact_name(commitment, slot, *wire, 2),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             refresh_prf_input_key_artifact_name(commitment, slot, *wire, 3),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                 ),
@@ -1834,7 +1872,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
             };
             graph = match value {
                 InputBinding::Scalar(value) => graph
-                    .artifact_output(
+                    .transferred_output(
                         refresh_prf_artifact_name(commitment, slot, &format!("input-{wire:?}")),
                         encode(key, value.clone()).map_err(ApiError::scheme)?,
                     )
@@ -1847,6 +1885,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                                 refresh_prf_input_key_artifact_name(commitment, slot, *wire, port),
                                 values.count().clone(),
                                 (1, columns),
+                                ArtifactAvailability::Cached,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -1862,7 +1901,7 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                     })
                     .map_err(ApiError::scheme)?;
                     graph
-                        .artifact_output(
+                        .transferred_output(
                             refresh_prf_artifact_name(commitment, slot, &format!("input-{wire:?}")),
                             family,
                         )
@@ -1960,17 +1999,24 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
         let production =
             self.preprocess.clone().ok_or(RnsBggError::Binding("missing preprocess"))?;
         let matrix = |role: &str| -> Result<RnsBggMatrix, RnsBggError> {
+            let availability = match role {
+                "a-sum" => ArtifactAvailability::Transferred,
+                "a-star" => ArtifactAvailability::Cached,
+                _ => return Err(RnsBggError::Binding("unknown refresh decoder matrix")),
+            };
             Ok((
                 (
                     p_ring.artifact_input(
                         production.clone(),
                         format!("{}.0", refresh_artifact_name(commitment, slot, role)),
                         (1, columns),
+                        availability,
                     ),
                     p_ring.artifact_input(
                         production.clone(),
                         format!("{}.1", refresh_artifact_name(commitment, slot, role)),
                         (1, columns),
+                        availability,
                     ),
                 ),
                 (
@@ -1978,11 +2024,13 @@ impl<'a, B: Backend> RnsEncryptBuild<'a, B> {
                         production.clone(),
                         format!("{}.2", refresh_artifact_name(commitment, slot, role)),
                         (1, columns),
+                        availability,
                     ),
                     p_ring.artifact_input(
                         production.clone(),
                         format!("{}.3", refresh_artifact_name(commitment, slot, role)),
                         (1, columns),
+                        availability,
                     ),
                 ),
             ))
@@ -2282,7 +2330,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
             for (slot, child) in &self.refresh_prf_children {
                 graph = Self::append_refresh_prf_child(child, declaration, *slot, graph)?;
                 merge_runtime_inputs(&mut self.runtime, &child.runtime)?;
-                self.catalog.merge(child.catalog.clone()).map_err(ApiError::scheme)?;
+                self.manifests.extend(child.manifests.clone());
             }
         }
         let helper_keys =
@@ -2296,6 +2344,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                         production.clone(),
                         format!("lut-public/{level}/{sigma}.{port}"),
                         (1, columns),
+                        ArtifactAvailability::Cached,
                     )
                 })
                 .collect::<Vec<_>>();
@@ -2307,7 +2356,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                 .encrypt_lut_helper(&mask, public_data, level, sigma)
                 .map_err(ApiError::scheme)?;
             graph = graph
-                .artifact_output(format!("lut-helper/{level}/{sigma}"), helper)
+                .transferred_output(format!("lut-helper/{level}/{sigma}"), helper)
                 .map_err(ApiError::scheme)?;
         }
         for (wire, declaration) in inputs.inputs() {
@@ -2323,11 +2372,13 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                             production.clone(),
                             format!("public-key/{wire:?}.0"),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             format!("public-key/{wire:?}.1"),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                     (
@@ -2335,11 +2386,13 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                             production.clone(),
                             format!("public-key/{wire:?}.2"),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                         ring.artifact_input(
                             production.clone(),
                             format!("public-key/{wire:?}.3"),
                             (1, columns),
+                            ArtifactAvailability::Cached,
                         ),
                     ),
                 ),
@@ -2357,7 +2410,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
             };
             graph = match value {
                 InputBinding::Scalar(value) => graph
-                    .artifact_output(
+                    .transferred_output(
                         format!("input-{wire:?}"),
                         encode(scalar_key(), value.clone()).map_err(ApiError::scheme)?,
                     )
@@ -2371,6 +2424,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                                 format!("public-key/{wire:?}.{port}"),
                                 family_count.clone(),
                                 (1, columns),
+                                ArtifactAvailability::Cached,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -2386,7 +2440,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                     })
                     .map_err(ApiError::scheme)?;
                     graph
-                        .artifact_output(format!("input-{wire:?}"), encodings)
+                        .transferred_output(format!("input-{wire:?}"), encodings)
                         .map_err(ApiError::scheme)?
                 }
             };
@@ -2397,7 +2451,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
                     .refresh_decoder(&declaration, &mask, slot.slot)
                     .map_err(ApiError::scheme)?;
                 graph = graph
-                    .artifact_output(
+                    .transferred_output(
                         refresh_artifact_name(*declaration.commitment(), slot.slot, "decoder"),
                         decoder.clone(),
                     )
@@ -2411,7 +2465,7 @@ impl<'a, B: Backend, P: Poly> EncryptBuild<B, P> for RnsEncryptBuild<'a, B> {
             descriptor = descriptor.with_refresh_declaration(declaration);
         }
         Ok((
-            StageGraph::new(graph, self.runtime, self.catalog),
+            StageGraph::new(graph, self.runtime, self.manifests),
             RnsBggEncryptionDescriptor::from_binding(descriptor),
         ))
     }
@@ -2463,8 +2517,8 @@ impl<'a> RnsOnlineBuild<'a> {
         hash_key: &[u8],
     ) -> Result<(), ApiError> {
         let prepared = declaration.prepared().program();
-        let preprocess_binding = preprocess.checkpoint().descriptor().binding();
-        let encryption_binding = encryption.checkpoint().descriptor().binding();
+        let preprocess_binding = preprocess.descriptor().binding();
+        let encryption_binding = encryption.descriptor().binding();
         let expected_hash_key = hash_key_commitment(hash_key);
         if slot >= declaration.slots().len() || declaration.output_schema().is_empty() {
             return Err(ApiError::input("invalid refresh PRF slot or schema"));
@@ -2486,16 +2540,17 @@ impl<'a> RnsOnlineBuild<'a> {
             ));
         }
         if encryption_binding.sources().len() != 1 ||
-            !encryption_binding.sources().contains(preprocess.checkpoint().production())
+            !encryption_binding.sources().contains(preprocess.production())
         {
             return Err(ApiError::compatibility(
                 "RNS-BGG refresh encryption source is not preprocess production",
             ));
         }
-        let preprocess_production = preprocess.checkpoint().production().clone();
-        let encryption_production = encryption.checkpoint().production().clone();
-        let mut catalog = preprocess.checkpoint().catalog().clone();
-        catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
+        let preprocess_production = preprocess.production().clone();
+        let encryption_production = encryption.production().clone();
+        let mut manifests = BTreeMap::new();
+        manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
+        manifests.insert(encryption_production.clone(), encryption.manifest().clone());
         let workload =
             Arc::new(RnsBggDerivedWorkload::from_program(prepared).map_err(ApiError::scheme)?);
         self.hash_key_commitment = expected_hash_key;
@@ -2526,6 +2581,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                         &format!("input-{wire:?}.0"),
                                     ),
                                     (1, columns),
+                                    ArtifactAvailability::Transferred,
                                 ),
                                 ring.artifact_input(
                                     encryption_production.clone(),
@@ -2535,6 +2591,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                         &format!("input-{wire:?}.1"),
                                     ),
                                     (1, columns),
+                                    ArtifactAvailability::Transferred,
                                 ),
                             ),
                             (
@@ -2546,6 +2603,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                         &format!("input-{wire:?}.2"),
                                     ),
                                     (1, columns),
+                                    ArtifactAvailability::Transferred,
                                 ),
                                 ring.artifact_input(
                                     encryption_production.clone(),
@@ -2555,6 +2613,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                         &format!("input-{wire:?}.3"),
                                     ),
                                     (1, columns),
+                                    ArtifactAvailability::Transferred,
                                 ),
                             ),
                         ),
@@ -2568,6 +2627,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                 &format!("input-{wire:?}.4"),
                             ),
                             (1, columns),
+                            ArtifactAvailability::Transferred,
                         ),
                         ring.artifact_input(
                             encryption_production.clone(),
@@ -2577,6 +2637,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                 &format!("input-{wire:?}.5"),
                             ),
                             (1, columns),
+                            ArtifactAvailability::Transferred,
                         ),
                     ),
                     public.then(|| {
@@ -2588,6 +2649,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                 &format!("input-{wire:?}.6"),
                             ),
                             (1, 1),
+                            ArtifactAvailability::Transferred,
                         )
                     }),
                 )
@@ -2606,6 +2668,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                 ),
                                 count.clone(),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -2620,6 +2683,7 @@ impl<'a> RnsOnlineBuild<'a> {
                                 ),
                                 count.clone(),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -2633,6 +2697,7 @@ impl<'a> RnsOnlineBuild<'a> {
                             ),
                             count.clone(),
                             (1, 1),
+                            ArtifactAvailability::Transferred,
                         )
                     });
                     InputBinding::Family(
@@ -2683,7 +2748,7 @@ impl<'a> RnsOnlineBuild<'a> {
             workload,
             preprocess: preprocess_production,
             encryption: encryption_production,
-            catalog,
+            manifests,
             refresh_prf_namespace: Some((*declaration.commitment(), slot)),
             current_site: None,
         });
@@ -2777,8 +2842,7 @@ impl<'a> RnsOnlineBuild<'a> {
             .iter()
             .next()
             .ok_or_else(|| ApiError::input("resumption Program has no input"))?;
-        let checkpoint = artifacts.checkpoint();
-        let descriptor = checkpoint.descriptor().binding();
+        let descriptor = artifacts.descriptor().binding();
         if descriptor.context() != &self.context ||
             descriptor.program() != declaration.source_program() ||
             descriptor.refresh_commitment() != Some(declaration.commitment())
@@ -2835,12 +2899,8 @@ impl<'a> RnsOnlineBuild<'a> {
             ));
         }
         let target_ring = resumed_ring;
-        let production = checkpoint.production().clone();
-        let manifest = checkpoint
-            .catalog()
-            .manifests()
-            .get(&production)
-            .ok_or_else(|| ApiError::compatibility("refresh checkpoint manifest is missing"))?;
+        let production = artifacts.production().clone();
+        let manifest = artifacts.manifest();
         let checkpoint_name =
             |role: &str| refresh_checkpoint_artifact_name(*declaration.commitment(), role);
         let matrix_type = |columns| {
@@ -2875,11 +2935,13 @@ impl<'a> RnsOnlineBuild<'a> {
                 production.clone(),
                 checkpoint_name("row.0"),
                 (1, row_columns),
+                ArtifactAvailability::Transferred,
             ),
             target_ring.artifact_input(
                 production.clone(),
                 checkpoint_name("row.1"),
                 (1, row_columns),
+                ArtifactAvailability::Transferred,
             ),
         );
         let public_key = RnsBggPublicKey::new(
@@ -2890,11 +2952,13 @@ impl<'a> RnsOnlineBuild<'a> {
                         production.clone(),
                         checkpoint_name("target.0"),
                         (1, key_columns),
+                        ArtifactAvailability::Transferred,
                     ),
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.1"),
                         (1, key_columns),
+                        ArtifactAvailability::Transferred,
                     ),
                 ),
                 (
@@ -2902,11 +2966,13 @@ impl<'a> RnsOnlineBuild<'a> {
                         production.clone(),
                         checkpoint_name("target.2"),
                         (1, key_columns),
+                        ArtifactAvailability::Transferred,
                     ),
                     target_ring.artifact_input(
                         production.clone(),
                         checkpoint_name("target.3"),
                         (1, key_columns),
+                        ArtifactAvailability::Transferred,
                     ),
                 ),
             ),
@@ -2920,6 +2986,7 @@ impl<'a> RnsOnlineBuild<'a> {
                 production.clone(),
                 checkpoint_name("row.public"),
                 (1, 1),
+                ArtifactAvailability::Transferred,
             ))
         } else {
             None
@@ -2960,10 +3027,10 @@ impl<'a> RnsOnlineBuild<'a> {
         sources.dedup();
         let preprocess = sources.first().cloned().unwrap_or_else(|| production.clone());
         let encryption = sources.get(1).cloned().unwrap_or_else(|| preprocess.clone());
-        let catalog = checkpoint.catalog().clone();
-        if !catalog.manifests().contains_key(&production) {
+        let manifests = BTreeMap::from([(production.clone(), artifacts.manifest().clone())]);
+        if !manifests.contains_key(&production) {
             return Err(ApiError::compatibility(
-                "refresh checkpoint production is not in its catalog",
+                "refresh checkpoint production is not in its manifest map",
             ));
         }
         self.evaluator = Some(EncodingLowering {
@@ -2972,7 +3039,7 @@ impl<'a> RnsOnlineBuild<'a> {
             workload,
             preprocess,
             encryption,
-            catalog,
+            manifests,
             refresh_prf_namespace: None,
             current_site: None,
         });
@@ -3143,10 +3210,7 @@ impl<'a> RnsOnlineBuild<'a> {
         let refreshed_target = evaluator.refresh_public_target(declaration, source.wire())?;
         for child in children.values() {
             if let Some(child_evaluator) = child.evaluator.as_ref() {
-                evaluator
-                    .catalog
-                    .merge(child_evaluator.catalog.clone())
-                    .map_err(|_| RnsBggError::Binding("refresh child catalog conflict"))?;
+                evaluator.manifests.extend(child_evaluator.manifests.clone());
             }
         }
         outputs[output_index] = refreshed.clone();
@@ -3290,7 +3354,6 @@ pub fn checkpoint_refreshed_output<B, S>(
     hash_key: &[u8],
     backend: &mut B,
     store: &mut S,
-    checkpoint: &Path,
     config: ExecutionConfig,
 ) -> Result<StageArtifacts<RnsBggRefreshCheckpointDescriptor>, ApiError>
 where
@@ -3309,14 +3372,13 @@ where
         backend,
         store,
     )?;
-    execute_checkpoint(
+    execute_artifacts(
         graph,
         &ParamEnv::default(),
         descriptor,
         domain_identity(*declaration.commitment(), b"refresh-checkpoint"),
         backend,
         store,
-        checkpoint,
         config,
         |_| Ok(()),
     )
@@ -3340,13 +3402,8 @@ where
     B: Backend,
     S: SessionStore,
 {
-    let binding = checkpoint.checkpoint().descriptor().binding();
-    let manifest = checkpoint
-        .checkpoint()
-        .catalog()
-        .manifests()
-        .get(checkpoint.checkpoint().production())
-        .ok_or_else(|| ApiError::compatibility("refresh checkpoint manifest is missing"))?;
+    let binding = checkpoint.descriptor().binding();
+    let manifest = checkpoint.manifest();
     let public_payload = manifest
         .artifacts
         .contains_key(&refresh_checkpoint_artifact_name(*declaration.commitment(), "row.public"));
@@ -3487,8 +3544,8 @@ where
         None
     };
 
-    let preprocess_binding = preprocess.checkpoint().descriptor().binding();
-    let encryption_binding = encryption.checkpoint().descriptor().binding();
+    let preprocess_binding = preprocess.descriptor().binding();
+    let encryption_binding = encryption.descriptor().binding();
     let expected_parameters = parameters.parameter_identity();
     let expected_hash_key = hash_key_commitment(hash_key);
     for binding in [preprocess_binding, encryption_binding] {
@@ -3503,7 +3560,7 @@ where
     }
     if !preprocess_binding.sources().is_empty() ||
         encryption_binding.sources().len() != 1 ||
-        !encryption_binding.sources().contains(preprocess.checkpoint().production())
+        !encryption_binding.sources().contains(preprocess.production())
     {
         return Err(ApiError::compatibility("refresh checkpoint source artifacts are invalid"));
     }
@@ -3519,23 +3576,24 @@ where
     let checkpoint_name =
         |role: &str| refresh_checkpoint_artifact_name(*declaration.commitment(), role);
     let mut graph = DslContext::new("rns-bgg-refresh-checkpoint")
-        .artifact_output(checkpoint_name("row"), row)
+        .transferred_output(checkpoint_name("row"), row)
         .map_err(ApiError::scheme)?;
     if let Some(payload) = public_payload {
         graph = graph
-            .artifact_output(checkpoint_name("row.public"), payload)
+            .transferred_output(checkpoint_name("row.public"), payload)
             .map_err(ApiError::scheme)?;
     }
-    graph = graph.artifact_output(checkpoint_name("target"), key).map_err(ApiError::scheme)?;
-    let mut catalog = preprocess.checkpoint().catalog().clone();
-    catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
-    for source in [preprocess.checkpoint().production(), encryption.checkpoint().production()] {
-        if !catalog.manifests().contains_key(source) {
+    graph = graph.transferred_output(checkpoint_name("target"), key).map_err(ApiError::scheme)?;
+    let mut manifests = BTreeMap::new();
+    manifests.insert(preprocess.production().clone(), preprocess.manifest().clone());
+    manifests.insert(encryption.production().clone(), encryption.manifest().clone());
+    for source in [preprocess.production(), encryption.production()] {
+        if !manifests.contains_key(source) {
             return Err(ApiError::compatibility("refresh checkpoint source manifest is missing"));
         }
     }
     Ok((
-        StageGraph::new(graph.build().map_err(ApiError::scheme)?, runtime_inputs, catalog),
+        StageGraph::new(graph.build().map_err(ApiError::scheme)?, runtime_inputs, manifests),
         RnsBggRefreshCheckpointDescriptor::from_binding(descriptor),
     ))
 }
@@ -3583,11 +3641,11 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                 }
             }
         }
-        let preprocess_binding = preprocess.checkpoint().descriptor().binding();
-        let encryption_binding = encryption.checkpoint().descriptor().binding();
+        let preprocess_binding = preprocess.descriptor().binding();
+        let encryption_binding = encryption.descriptor().binding();
         let expected_parameters = self.parameters.parameter_identity();
-        let preprocess_production = preprocess.checkpoint().production().clone();
-        let encryption_production = encryption.checkpoint().production().clone();
+        let preprocess_production = preprocess.production().clone();
+        let encryption_production = encryption.production().clone();
         let expected_hash_key = hash_key_commitment(hash_key);
         for binding in [preprocess_binding, encryption_binding] {
             if binding.context() != &self.context ||
@@ -3617,8 +3675,9 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                 "RNS-BGG refresh declaration commitment differs between stages",
             ));
         }
-        let mut catalog = preprocess.checkpoint().catalog().clone();
-        catalog.merge(encryption.checkpoint().catalog().clone()).map_err(ApiError::scheme)?;
+        let mut manifests = BTreeMap::new();
+        manifests.insert(preprocess_production.clone(), preprocess.manifest().clone());
+        manifests.insert(encryption_production.clone(), encryption.manifest().clone());
         let workload =
             Arc::new(RnsBggDerivedWorkload::from_program(program).map_err(ApiError::scheme)?);
         self.hash_key_commitment = expected_hash_key;
@@ -3638,11 +3697,13 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                                 encryption_production.clone(),
                                 format!("input-{wire:?}.{suffix}0"),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             ),
                             ring.artifact_input(
                                 encryption_production.clone(),
                                 format!("input-{wire:?}.{suffix}1"),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             ),
                         ),
                         (
@@ -3650,11 +3711,13 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                                 encryption_production.clone(),
                                 format!("input-{wire:?}.{suffix}2"),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             ),
                             ring.artifact_input(
                                 encryption_production.clone(),
                                 format!("input-{wire:?}.{suffix}3"),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             ),
                         ),
                     ),
@@ -3664,11 +3727,13 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                         encryption_production.clone(),
                         format!("input-{wire:?}.{suffix}4"),
                         (1, columns),
+                        ArtifactAvailability::Transferred,
                     ),
                     ring.artifact_input(
                         encryption_production.clone(),
                         format!("input-{wire:?}.{suffix}5"),
                         (1, columns),
+                        ArtifactAvailability::Transferred,
                     ),
                 );
                 let payload = public.then(|| {
@@ -3676,6 +3741,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                         encryption_production.clone(),
                         format!("input-{wire:?}.{suffix}6"),
                         (1, 1),
+                        ArtifactAvailability::Transferred,
                     )
                 });
                 RnsBggEncoding::new(key, row, payload)
@@ -3690,6 +3756,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                                 format!("input-{wire:?}.{port}"),
                                 count.clone(),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -3700,6 +3767,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                                 format!("input-{wire:?}.{}", port + 4),
                                 count.clone(),
                                 (1, columns),
+                                ArtifactAvailability::Transferred,
                             )
                         })
                         .collect::<Vec<_>>();
@@ -3709,6 +3777,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
                             format!("input-{wire:?}.6"),
                             count.clone(),
                             (1, 1),
+                            ArtifactAvailability::Transferred,
                         )
                     });
                     let family = mxx_dsl::parallel(count.clone(), |index| {
@@ -3761,7 +3830,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
             workload,
             preprocess: preprocess_production,
             encryption: encryption_production,
-            catalog,
+            manifests,
             refresh_prf_namespace: None,
             current_site: None,
         });
@@ -3787,7 +3856,7 @@ impl<'a, B: Backend> OnlineBuild<B> for RnsOnlineBuild<'a> {
         Ok(StageGraph::new(
             graph.build().map_err(ApiError::scheme)?,
             BTreeMap::new(),
-            evaluator.catalog.clone(),
+            evaluator.manifests.clone(),
         ))
     }
 }
@@ -3931,7 +4000,9 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 .p
                 .to_biguint()
                 .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
-            row = mod_down_encoding(row, BigInt::from(producer_modulus));
+            let producer_level = refresh_slot_level(lowerer.parameters, declaration, slot)?;
+            let source_moduli = lowerer.parameters.level(producer_level)?.to_crt().0;
+            row = mod_down_encoding(row, BigInt::from(producer_modulus), &source_moduli);
             let decoder = lowerer.refresh_decoder(declaration, slot)?;
             row = add_encoding_rows(row, (-decoder.0, -decoder.1));
             let slot_modulus = slot_metadata.q_t.clone();
@@ -3942,6 +4013,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 row,
                 BigInt::from(slot_modulus),
                 BigInt::from(target_modulus.clone()),
+                &source_moduli,
             );
             channel_rows.push(row);
             channel_weights.push(lowerer.refresh_crt_weight(declaration, slot)?);
@@ -3968,9 +4040,12 @@ fn mod_down_lift_encoding(
     row: RnsBggRow,
     channel_modulus: BigInt,
     target_modulus: BigInt,
+    source_moduli: &[u64],
 ) -> RnsBggRow {
     map_row(row, |entry| {
-        entry.block_mod_switch(channel_modulus.clone(), 1).centered_extend(target_modulus.clone())
+        entry
+            .block_mod_switch(channel_modulus.clone(), source_moduli.to_vec(), 1)
+            .centered_rebase(target_modulus.clone())
     })
 }
 
@@ -3980,7 +4055,7 @@ fn reduce_anchor_channel(
     target_modulus: BigInt,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let reduced = checked_modulus_convert_matrix(a_star, channel_modulus)?;
-    Ok(map_matrix(reduced, |entry| entry.centered_extend(target_modulus.clone())))
+    Ok(map_matrix(reduced, |entry| entry.centered_rebase(target_modulus.clone())))
 }
 
 #[cfg(test)]
@@ -4035,7 +4110,7 @@ mod test {
         let mut backend = cpu_backend([level]);
         let mut store = MemoryArtifactStore::default();
         let mut result = execute_graph(
-            StageGraph::new(graph.build().unwrap(), BTreeMap::new(), ArtifactCatalog::default()),
+            StageGraph::new(graph.build().unwrap(), BTreeMap::new(), BTreeMap::new()),
             &ParamEnv::default(),
             &mut backend,
             &mut store,
@@ -4095,7 +4170,7 @@ mod test {
             program: program.clone(),
             preprocess: production.clone(),
             encryption: production,
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: None,
         };
@@ -4111,7 +4186,7 @@ mod test {
         let target_gadget = parameters
             .state_gadget(1)
             .unwrap()
-            .centered_extend(BigInt::from(high.modulus().as_ref().clone()));
+            .centered_rebase(BigInt::from(high.modulus().as_ref().clone()));
         let scale = parameters.scale(0).unwrap() * parameters.scale(1).unwrap();
         let raw_signal = target_gadget * parameters.scalar(0, scale).unwrap();
         let mut backend = cpu_backend(parameters.levels().iter().cloned());
@@ -4126,7 +4201,7 @@ mod test {
                 .build()
                 .unwrap();
             let mut result = execute_graph(
-                StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+                StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
                 &ParamEnv::default(),
                 &mut backend,
                 &mut store,
@@ -4205,7 +4280,7 @@ mod test {
             let mut backend = cpu_backend([level.clone()]);
             let mut store = MemoryArtifactStore::default();
             let mut result = execute_graph(
-                StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+                StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
                 &ParamEnv::default(),
                 &mut backend,
                 &mut store,
@@ -4271,14 +4346,14 @@ mod test {
             spec_hash: mxx_ir_core::artifact::SpecHash([17; 32]),
             execution_nonce: [19; 32],
         };
-        let catalog = ArtifactCatalog::from_manifest(mxx_ir_core::artifact::Manifest {
+        let manifest = mxx_ir_core::artifact::Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,
             production_id: production.clone(),
             artifacts: BTreeMap::new(),
-        })
-        .unwrap();
+        };
+        let manifests = BTreeMap::from([(production.clone(), manifest)]);
         let error = validate_lut_public_artifacts(
-            &catalog,
+            &manifests,
             &production,
             &parameters,
             &projection.encryption_inputs(),
@@ -4402,7 +4477,7 @@ mod test {
                 workload,
                 preprocess: production.clone(),
                 encryption: production,
-                catalog: ArtifactCatalog::default(),
+                manifests: BTreeMap::new(),
                 refresh_prf_namespace: None,
                 current_site: Some(LoweringSite {
                     output,
@@ -4464,7 +4539,7 @@ mod test {
             workload: scalar_workload,
             preprocess: production.clone(),
             encryption: production.clone(),
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: scalar_output,
@@ -4499,7 +4574,7 @@ mod test {
         assert_eq!(scalar_action.0.0.max_coefficient_bound(), &decomposed_bound);
         let scalar_name = format!("rhs/{scalar_rhs:?}");
         let scalar_graph = DslContext::new("rhs-scalar-consumer-schema")
-            .artifact_output(scalar_name.clone(), scalar_action)
+            .transferred_output(scalar_name.clone(), scalar_action)
             .unwrap()
             .build()
             .unwrap();
@@ -4532,7 +4607,7 @@ mod test {
             workload: family_workload,
             preprocess: production.clone(),
             encryption: production.clone(),
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: family_output,
@@ -4562,7 +4637,7 @@ mod test {
         })
         .unwrap();
         let family_graph = DslContext::new("rhs-family-consumer-schema")
-            .artifact_output(family_name.clone(), family_members)
+            .transferred_output(family_name.clone(), family_members)
             .unwrap()
             .build()
             .unwrap();
@@ -4591,7 +4666,7 @@ mod test {
             workload,
             preprocess: production.clone(),
             encryption: production.clone(),
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
@@ -4657,7 +4732,7 @@ mod test {
             workload: public_workload,
             preprocess: production.clone(),
             encryption: production,
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: public_output,
@@ -4725,7 +4800,7 @@ mod test {
             workload,
             preprocess: production.clone(),
             encryption: production,
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
@@ -4870,7 +4945,7 @@ mod test {
                 spec_hash: mxx_ir_core::artifact::SpecHash([127; 32]),
                 execution_nonce: [129; 32],
             },
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite {
                 output: private_output,
@@ -5007,7 +5082,7 @@ mod test {
         let mut backend = cpu_backend([level]);
         let mut store = MemoryArtifactStore::default();
         let mut result = execute_graph(
-            StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+            StageGraph::new(graph, BTreeMap::new(), BTreeMap::new()),
             &ParamEnv::default(),
             &mut backend,
             &mut store,
@@ -5066,7 +5141,7 @@ mod test {
             workload,
             preprocess: production.clone(),
             encryption: production,
-            catalog: ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: Some(LoweringSite { output, indices: Vec::new(), ranges: Vec::new() }),
         };
@@ -5145,12 +5220,13 @@ mod test {
         let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
         let value = source.input("refresh-source", (1, 1));
         let row = (value.clone(), value);
-        let producer_row = mod_down_encoding(row, BigInt::from(21u8));
+        let producer_row = mod_down_encoding(row, BigInt::from(21u8), &[3, 5, 7]);
         assert_eq!(producer_row.0.matrix_type().modulus, IntExpr::constant(BigInt::from(21u8)));
         let raw_reduction =
             checked_modulus_convert(producer_row.0.clone(), BigInt::from(21u8)).unwrap();
         assert_eq!(producer_row.0.flatten(), raw_reduction.flatten());
-        let lifted = mod_down_lift_encoding(producer_row, BigInt::from(5u8), BigInt::from(15u8));
+        let lifted =
+            mod_down_lift_encoding(producer_row, BigInt::from(5u8), BigInt::from(15u8), &[3, 7]);
         assert_eq!(lifted.0.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
         assert_eq!(lifted.1.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
     }

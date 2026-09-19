@@ -634,9 +634,9 @@ mod tests {
         )
         .expect("compatible sampler inputs");
         let built = DslContext::new("bgg-sampling")
-            .artifact_output("constant", encodings[0].vector.clone())
+            .transferred_output("constant", encodings[0].vector.clone())
             .expect("constant output")
-            .artifact_output("message", encodings[1].vector.clone())
+            .transferred_output("message", encodings[1].vector.clone())
             .expect("message output")
             .build()
             .expect("build");

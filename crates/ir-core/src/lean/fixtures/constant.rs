@@ -36,17 +36,14 @@ fn export_constant_fixture() {
         BTreeMap::from([
             (
                 "zero".into(),
-                GraphOutput { artifact_output: false, value: constant(ConstantMatrix::Zero) },
+                GraphOutput { value: constant(ConstantMatrix::Zero), availability: None },
             ),
             (
                 "identity".into(),
-                GraphOutput { artifact_output: false, value: constant(ConstantMatrix::Identity) },
+                GraphOutput { value: constant(ConstantMatrix::Identity), availability: None },
             ),
-            (
-                "polynomial".into(),
-                GraphOutput { artifact_output: false, value: polynomial.clone() },
-            ),
-            ("alias".into(), GraphOutput { artifact_output: false, value: polynomial }),
+            ("polynomial".into(), GraphOutput { value: polynomial.clone(), availability: None }),
+            ("alias".into(), GraphOutput { value: polynomial, availability: None }),
         ]),
         vec![constant(ConstantMatrix::Polynomial { coefficients: vec![] })],
         vec![],

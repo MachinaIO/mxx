@@ -418,9 +418,6 @@ fn lwr_prf_end_to_end() {
     };
     let directory = tempfile::tempdir().expect("artifact directory");
     let mut store = FileArtifactStore::new(directory.path()).expect("artifact store");
-    let preprocess_encrypt = directory.path().join("preprocess-encrypt.json");
-    let preprocess_online = directory.path().join("preprocess-online.json");
-    let encryption = directory.path().join("encryption.json");
     // Preprocess receives the private payload secret and fixed RHS selectors,
     // while encrypt receives public D attributes, a fresh mask, and only the
     // preparation artifacts.  Online receives artifacts/configuration only;
@@ -434,7 +431,6 @@ fn lwr_prf_end_to_end() {
         RnsPreprocessBuild::new(&parameters, [7; 32]),
         &mut backend,
         &mut store,
-        [&preprocess_encrypt, &preprocess_online],
         ExecutionConfig::default(),
         |_, outputs| Ok(outputs),
         |graph| {
@@ -453,7 +449,7 @@ fn lwr_prf_end_to_end() {
         HASH_KEY,
         RnsEncryptBuild::new(&parameters, [7; 32]),
         &mut backend,
-        api::ArtifactDestination { store: &mut store, checkpoint: &encryption },
+        &mut store,
         ExecutionConfig::default(),
         |_| Ok(()),
         |graph| {

@@ -2,7 +2,7 @@
 pub use crate::sampler::gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler};
 use crate::{
     matrix::{
-        PolyMatrix,
+        CompactMatrixDecodeError, PolyMatrix,
         cpp_matrix::CppMatrix,
         dcrt_poly::DCRTPolyMatrix,
         i64::{I64Matrix, I64MatrixParams},
@@ -147,21 +147,39 @@ impl DCRTTrapdoor {
     }
 
     pub fn from_compact_bytes(params: &DCRTPolyParams, bytes: &[u8]) -> Option<Self> {
+        Self::try_from_compact_bytes(params, bytes).ok()
+    }
+
+    pub fn try_from_compact_bytes(
+        params: &DCRTPolyParams,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
         let mut offset = 0usize;
-        let next = |buf: &[u8], offset: &mut usize| -> Option<Vec<u8>> {
-            if *offset + 8 > buf.len() {
-                return None;
+        let next = |buf: &[u8], offset: &mut usize| -> Result<Vec<u8>, CompactMatrixDecodeError> {
+            let header_end = (*offset).checked_add(8).ok_or(
+                CompactMatrixDecodeError::InvalidHeader("trapdoor compact length overflows"),
+            )?;
+            if header_end > buf.len() {
+                return Err(CompactMatrixDecodeError::InvalidHeader(
+                    "truncated trapdoor compact length",
+                ));
             }
             let mut len_bytes = [0u8; 8];
-            len_bytes.copy_from_slice(&buf[*offset..*offset + 8]);
+            len_bytes.copy_from_slice(&buf[*offset..header_end]);
             let len = u64::from_le_bytes(len_bytes) as usize;
-            *offset += 8;
-            if *offset + len > buf.len() {
-                return None;
+            *offset = header_end;
+            let payload_end =
+                (*offset).checked_add(len).ok_or(CompactMatrixDecodeError::InvalidHeader(
+                    "trapdoor compact payload length overflows",
+                ))?;
+            if payload_end > buf.len() {
+                return Err(CompactMatrixDecodeError::InvalidHeader(
+                    "truncated trapdoor compact payload",
+                ));
             }
-            let out = buf[*offset..*offset + len].to_vec();
-            *offset += len;
-            Some(out)
+            let out = buf[*offset..payload_end].to_vec();
+            *offset = payload_end;
+            Ok(out)
         };
         let r_bytes = next(bytes, &mut offset)?;
         let e_bytes = next(bytes, &mut offset)?;
@@ -170,15 +188,15 @@ impl DCRTTrapdoor {
         let d_bytes = next(bytes, &mut offset)?;
         let re_bytes = next(bytes, &mut offset)?;
         if offset != bytes.len() {
-            return None;
+            return Err(CompactMatrixDecodeError::InvalidHeader("trailing trapdoor compact bytes"));
         }
-        let r = DCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
-        let e = DCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
-        let a_mat = DCRTPolyMatrix::from_compact_bytes(params, &a_bytes);
-        let b_mat = DCRTPolyMatrix::from_compact_bytes(params, &b_bytes);
-        let d_mat = DCRTPolyMatrix::from_compact_bytes(params, &d_bytes);
-        let re = DCRTPolyMatrix::from_compact_bytes(params, &re_bytes);
-        Some(Self {
+        let r = DCRTPolyMatrix::try_from_compact_bytes(params, &r_bytes)?;
+        let e = DCRTPolyMatrix::try_from_compact_bytes(params, &e_bytes)?;
+        let a_mat = DCRTPolyMatrix::try_from_compact_bytes(params, &a_bytes)?;
+        let b_mat = DCRTPolyMatrix::try_from_compact_bytes(params, &b_bytes)?;
+        let d_mat = DCRTPolyMatrix::try_from_compact_bytes(params, &d_bytes)?;
+        let re = DCRTPolyMatrix::try_from_compact_bytes(params, &re_bytes)?;
+        Ok(Self {
             r: trapdoor_matrix_from_cpu(params, &r),
             e: trapdoor_matrix_from_cpu(params, &e),
             a_mat: trapdoor_matrix_from_cpu(params, &a_mat),

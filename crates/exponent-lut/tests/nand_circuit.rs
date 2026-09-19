@@ -31,7 +31,7 @@ use mxx_runtime::{
 };
 use num_bigint::{BigInt, BigUint};
 use serial_test::serial as sequential;
-use std::{env, path::Path};
+use std::env;
 
 const HASH_KEY: &[u8] = b"nand-rns-public-api-v1";
 const NAND_DEPTH_ENV: &str = "MXX_EXPONENT_LUT_NAND_DEPTH";
@@ -253,10 +253,6 @@ fn select_candidate(
     );
 }
 
-fn checkpoint(path: &Path, name: &str) -> std::path::PathBuf {
-    path.join(name)
-}
-
 #[test]
 #[sequential(dcrt_runtime)]
 fn nand_circuit_end_to_end() {
@@ -311,13 +307,10 @@ fn nand_circuit_end_to_end() {
         );
         let mut backend = gpu_backend_on(gpu_parameters(&parameters), devices.clone());
         let mut store = MemoryArtifactStore::default();
-        let directory = tempfile::tempdir().expect("checkpoint directory");
-        let preprocess_encrypt = checkpoint(directory.path(), "preprocess-encrypt.json");
-        let preprocess_online = checkpoint(directory.path(), "preprocess-online.json");
-        let encrypted_checkpoint = checkpoint(directory.path(), "encrypt.json");
         let config = mxx_runtime::ExecutionConfig::default();
         // Preprocess receives the private RHS plaintexts and caller payload,
-        // then writes the two typed artifacts consumed by later stages.
+        // then returns two typed named-session artifacts consumed by later
+        // stages.
         let (preprocess, online) = api::preprocess(
             compiled.program(),
             &ParamEnv::default(),
@@ -327,7 +320,6 @@ fn nand_circuit_end_to_end() {
             RnsPreprocessBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32]),
             &mut backend,
             &mut store,
-            [&preprocess_encrypt, &preprocess_online],
             config.clone(),
             |_, outputs| Ok(outputs),
             |validated| {
@@ -352,7 +344,7 @@ fn nand_circuit_end_to_end() {
             HASH_KEY,
             RnsEncryptBuild::<GpuDcrtBackend>::new(&parameters, [0x4e; 32]),
             &mut backend,
-            api::ArtifactDestination { store: &mut store, checkpoint: &encrypted_checkpoint },
+            &mut store,
             config.clone(),
             |_| Ok(()),
             |validated| {

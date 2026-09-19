@@ -1079,6 +1079,7 @@ fn artifact_persistent_bytes(artifact: &ManifestArtifact) -> u128 {
 #[cfg(test)]
 mod storage_report_tests {
     use super::*;
+    use mxx_ir_core::artifact::ArtifactAvailability;
 
     #[test]
     fn storage_report_separates_canonical_decoder_and_member_peak() {
@@ -1098,6 +1099,7 @@ mod storage_report_tests {
                 max_coefficient_bound: BigInt::from(7),
             },
             family_count,
+            availability: ArtifactAvailability::Transferred,
             layout,
         };
         let manifest = Manifest {
@@ -1109,6 +1111,7 @@ mod storage_report_tests {
                     ManifestArtifact {
                         artifact_type: ArtifactType::Matrix(matrix.clone()),
                         family_count: None,
+                        availability: ArtifactAvailability::Transferred,
                         layout: None,
                     },
                 ),
@@ -1143,6 +1146,7 @@ mod storage_report_tests {
                 max_coefficient_bound: BigInt::from(7),
             },
             family_count: Some(usize::MAX),
+            availability: ArtifactAvailability::Transferred,
             layout: None,
         };
         let manifest = Manifest {

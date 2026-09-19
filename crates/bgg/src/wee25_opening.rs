@@ -4,7 +4,7 @@ use crate::{Wee25CommitmentCompiler, Wee25CommitmentError};
 use mxx_dsl::{Family, Mat, Preimage};
 use mxx_ir_core::{
     IntExpr,
-    artifact::ProductionId,
+    artifact::{ArtifactAvailability, ProductionId},
     node::{ConcatAxis, ConstantMatrix, IndexRange},
 };
 use rayon::prelude::*;
@@ -80,6 +80,7 @@ impl Wee25CommitmentCompiler {
                     self.public_parameter_block_count(),
                     (self.public_columns(), self.public_columns()),
                     artifacts.preimage_max_coefficient_bound.clone(),
+                    ArtifactAvailability::Transferred,
                 )
             })
             .collect();
@@ -88,6 +89,7 @@ impl Wee25CommitmentCompiler {
                 artifacts.production_id.clone(),
                 WEE25_PUBLIC_B,
                 (self.secret_size, self.public_columns()),
+                ArtifactAvailability::Transferred,
             ),
             t_top,
             t_bottom: ring.family_artifact_input(
@@ -95,6 +97,7 @@ impl Wee25CommitmentCompiler {
                 WEE25_T_BOTTOM,
                 part_count,
                 (self.public_columns(), self.public_columns()),
+                ArtifactAvailability::Transferred,
             ),
         })
     }
@@ -110,12 +113,14 @@ impl Wee25CommitmentCompiler {
                 artifacts.production_id.clone(),
                 WEE25_COMMITMENT,
                 (self.secret_size, self.public_columns()),
+                ArtifactAvailability::Transferred,
             ),
             ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 WEE25_COMMITMENT_NODES,
                 self.cache_node_count(artifacts.block_count),
                 (self.secret_size, self.public_columns()),
+                ArtifactAvailability::Transferred,
             ),
         ))
     }

@@ -13,16 +13,17 @@ use crate::{
     },
 };
 use mxx_dsl::BuiltGraph;
-use mxx_ir_core::{ParamEnv, ValidatedGraph, artifact::ArtifactCatalog, encoding::spec_hash};
+use mxx_ir_core::{
+    ParamEnv, ValidatedGraph,
+    artifact::{Manifest, ProductionId},
+    encoding::spec_hash,
+};
 use mxx_primitives::poly::Poly;
 use mxx_runtime::{
     Backend, ExecutionConfig, ExecutionError, ExecutionResult, RuntimeValue,
-    SessionAliasDescriptor, SessionStore,
-    checkpoint::{ArtifactCheckpoint, CheckpointError},
-    execute_in_session_with_config,
+    SessionAliasDescriptor, SessionStore, execute_in_session_with_config,
 };
-use serde::{Serialize, de::DeserializeOwned};
-use std::{collections::BTreeMap, error::Error, path::Path};
+use std::{collections::BTreeMap, error::Error};
 use thiserror::Error as ThisError;
 
 /// Errors raised while composing the common refresh declaration with a
@@ -45,45 +46,63 @@ pub type PlaintextInputs<I, P> = BTreeMap<I, crate::program::InputBinding<P, Vec
 ///
 /// `BuiltGraph` is deliberately unvalidated here. Stage orchestration
 /// validates it against the invocation's actual parameter environment and the
-/// trusted artifact catalog before execution.
+/// application-owned manifest map before execution.
 pub struct StageGraph<B: Backend> {
     pub(crate) graph: BuiltGraph,
     pub(crate) runtime_inputs: BTreeMap<String, RuntimeValue<B>>,
-    pub(crate) catalog: ArtifactCatalog,
+    pub(crate) manifests: BTreeMap<ProductionId, Manifest>,
 }
 
 impl<B: Backend> StageGraph<B> {
     pub fn new(
         graph: BuiltGraph,
         runtime_inputs: BTreeMap<String, RuntimeValue<B>>,
-        catalog: ArtifactCatalog,
+        manifests: BTreeMap<ProductionId, Manifest>,
     ) -> Self {
-        Self { graph, runtime_inputs, catalog }
+        Self { graph, runtime_inputs, manifests }
     }
 }
 
 /// Connection metadata for one completed artifact production.
 ///
-/// The checkpoint owns descriptor and manifest metadata only. Large payloads
-/// stay in the `SessionStore` and are imported lazily by concrete builders.
+/// The application owns the manifest and descriptor. Large payloads remain in
+/// the `SessionStore` and are imported lazily by concrete builders.
 pub struct StageArtifacts<D> {
-    checkpoint: ArtifactCheckpoint<D, [u8; 32]>,
+    pub(crate) production: ProductionId,
+    pub(crate) manifest: Manifest,
+    pub(crate) descriptor: D,
+    pub(crate) session: SessionAliasDescriptor,
 }
 
 impl<D> StageArtifacts<D> {
-    fn new(checkpoint: ArtifactCheckpoint<D, [u8; 32]>) -> Self {
-        Self { checkpoint }
+    fn new(
+        production: ProductionId,
+        manifest: Manifest,
+        descriptor: D,
+        session: SessionAliasDescriptor,
+    ) -> Self {
+        Self { production, manifest, descriptor, session }
     }
 
-    pub(crate) fn checkpoint(&self) -> &ArtifactCheckpoint<D, [u8; 32]> {
-        &self.checkpoint
+    /// Returns the finalized production identity recorded for this stage.
+    pub fn production(&self) -> &ProductionId {
+        &self.production
     }
-}
 
-/// Destination for a single encrypt-stage checkpoint.
-pub struct ArtifactDestination<'a, S: SessionStore> {
-    pub store: &'a mut S,
-    pub checkpoint: &'a Path,
+    /// Returns the manifest loaded for this stage.
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Returns the application-owned descriptor for this stage.
+    pub fn descriptor(&self) -> &D {
+        &self.descriptor
+    }
+
+    /// Returns the immutable named-session identity for this artifact stage.
+    pub fn session(&self) -> &SessionAliasDescriptor {
+        &self.session
+    }
 }
 
 /// Errors exposed by the common production API.
@@ -101,8 +120,6 @@ pub enum ApiError {
     Graph { source: Box<dyn Error + Send + Sync> },
     #[error("runtime execution failed: {0}")]
     Runtime(#[from] ExecutionError),
-    #[error("artifact checkpoint failed: {0}")]
-    Checkpoint(#[from] CheckpointError),
 }
 
 impl ApiError {
@@ -141,8 +158,8 @@ pub trait PreprocessBuild<B: Backend, P: Poly> {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
     type Families: FamilyExecution<Self::Evaluator>;
     type PayloadSecret;
-    type EncryptDescriptor: Serialize + DeserializeOwned;
-    type OnlineDescriptor: Serialize + DeserializeOwned;
+    type EncryptDescriptor;
+    type OnlineDescriptor;
     type Encrypt: EncryptBuild<
             B,
             P,
@@ -200,8 +217,8 @@ pub trait PreprocessBuild<B: Backend, P: Poly> {
 pub trait EncryptBuild<B: Backend, P: Poly> {
     type PayloadSecret;
     type MaskSecret;
-    type PreprocessDescriptor: Serialize + DeserializeOwned;
-    type Descriptor: Serialize + DeserializeOwned;
+    type PreprocessDescriptor;
+    type Descriptor;
 
     fn bind_inputs(
         &mut self,
@@ -228,8 +245,8 @@ pub trait EncryptBuild<B: Backend, P: Poly> {
 pub trait OnlineBuild<B: Backend> {
     type Evaluator: ExponentLUTProgramLowering + crate::program::ProgramLoweringContext;
     type Families: FamilyExecution<Self::Evaluator>;
-    type PreprocessDescriptor: Serialize + DeserializeOwned;
-    type EncryptDescriptor: Serialize + DeserializeOwned;
+    type PreprocessDescriptor;
+    type EncryptDescriptor;
 
     fn lowering_state(
         &mut self,
@@ -290,33 +307,33 @@ pub trait NoiseBuild {
     ) -> Result<Self::Report, ApiError>;
 }
 
-/// Execute and checkpoint one artifact-producing graph.
+/// Execute one artifact-producing graph and capture its finalized manifest.
 /// Validate, execute, and persist one already-built stage graph.
 ///
 /// This is the common persistence boundary used when a refreshed graph must
 /// resume through the normal `StageArtifacts` lifecycle. It does not create a
 /// second executor or bypass graph validation, observers, or execution
 /// configuration.
-pub(crate) fn execute_checkpoint<B, S, D>(
+pub(crate) fn execute_artifacts<B, S, D>(
     graph: StageGraph<B>,
     parameters: &ParamEnv,
     descriptor: D,
     identity: [u8; 32],
     backend: &mut B,
     store: &mut S,
-    checkpoint: &Path,
     config: ExecutionConfig,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
 ) -> Result<StageArtifacts<D>, ApiError>
 where
     B: Backend,
     S: SessionStore,
-    D: Serialize,
 {
-    let validated =
-        graph.graph.validate_with_catalog(parameters, &graph.catalog).map_err(ApiError::graph)?;
+    let validated = graph
+        .graph
+        .validate_with_manifests(parameters, &graph.manifests)
+        .map_err(ApiError::graph)?;
     before_execute(&validated)?;
-    let execution_nonce = fresh_execution_nonce(&validated, store)?;
+    let (execution_nonce, session) = fresh_execution_session(&validated, store, identity)?;
     let result = execute_in_session_with_config(
         &validated,
         backend,
@@ -325,15 +342,56 @@ where
         execution_nonce,
         config,
     )?;
-    let checkpoint_value =
-        ArtifactCheckpoint::from_execution(&result, store, descriptor, identity)?;
-    checkpoint_value.write(checkpoint)?;
-    Ok(StageArtifacts::new(checkpoint_value))
+    let production = result.production_id.ok_or_else(|| {
+        ApiError::input("artifact execution did not produce a production identity")
+    })?;
+    let manifest = store
+        .load_finalized_named_manifest(&session)
+        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
+    if manifest.production_id != production {
+        return Err(ApiError::compatibility(
+            "finalized named session returned a different production identity",
+        ));
+    }
+    Ok(StageArtifacts::new(production, manifest, descriptor, session))
 }
 
-/// Execute one caller-owned graph without publishing a checkpoint.
+/// Reload a finalized stage from its named session after an application
+/// restart.
 ///
-/// The graph is validated against its catalog, the observer runs before
+/// The descriptor is application-owned and must be reconstructed or loaded by
+/// the caller.  The runtime is the authority for the manifest: this helper
+/// resolves the existing alias with the side-effect-free finalized-session
+/// read, then checks that the alias and manifest agree on the IR/specification
+/// identity before rebuilding the ordinary [`StageArtifacts`] carrier.
+pub fn reload_stage_artifacts<S, D>(
+    store: &mut S,
+    session: SessionAliasDescriptor,
+    descriptor: D,
+) -> Result<StageArtifacts<D>, ApiError>
+where
+    S: SessionStore,
+{
+    let manifest = store
+        .load_finalized_named_manifest(&session)
+        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
+    if manifest.ir_version != session.ir_version {
+        return Err(ApiError::compatibility(
+            "finalized named session manifest has a different IR version",
+        ));
+    }
+    if manifest.production_id.spec_hash != session.spec_hash {
+        return Err(ApiError::compatibility(
+            "finalized named session manifest has a different specification identity",
+        ));
+    }
+    let production = manifest.production_id.clone();
+    Ok(StageArtifacts::new(production, manifest, descriptor, session))
+}
+
+/// Execute one caller-owned graph without publishing application artifacts.
+///
+/// The graph is validated against its manifest map, the observer runs before
 /// execution, and the supplied execution configuration is preserved. The
 /// returned runtime result retains the leases needed by callers that
 /// materialize verification residuals or other outputs.
@@ -349,10 +407,12 @@ where
     B: Backend,
     S: SessionStore,
 {
-    let validated =
-        graph.graph.validate_with_catalog(parameters, &graph.catalog).map_err(ApiError::graph)?;
+    let validated = graph
+        .graph
+        .validate_with_manifests(parameters, &graph.manifests)
+        .map_err(ApiError::graph)?;
     before_execute(&validated)?;
-    let execution_nonce = fresh_execution_nonce(&validated, store)?;
+    let (execution_nonce, _) = fresh_execution_session(&validated, store, rand::random())?;
     Ok(execute_in_session_with_config(
         &validated,
         backend,
@@ -403,11 +463,11 @@ pub(crate) fn domain_identity(base: [u8; 32], domain: &[u8]) -> [u8; 32] {
     digest.finalize().into()
 }
 
-fn fresh_execution_nonce<S: SessionStore>(
+fn fresh_execution_session<S: SessionStore>(
     validated: &ValidatedGraph,
     store: &mut S,
-) -> Result<[u8; 32], ApiError> {
-    let request_digest = rand::random::<[u8; 32]>();
+    request_digest: [u8; 32],
+) -> Result<([u8; 32], SessionAliasDescriptor), ApiError> {
     let alias_name = request_digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
     let specification =
         spec_hash(&validated.source, &validated.bindings).map_err(ApiError::graph)?;
@@ -417,12 +477,13 @@ fn fresh_execution_nonce<S: SessionStore>(
         specification,
         request_digest,
     );
-    store
+    let nonce = store
         .resolve_session_nonce(&alias)
-        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))
+        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
+    Ok((nonce, alias))
 }
 
-/// Build and execute preprocessing once, then publish two typed checkpoints
+/// Build and execute preprocessing once, then publish two typed stage records
 /// over that same finalized production: encryption preparation first and
 /// online preparation second.
 pub fn preprocess<B, S, P, T>(
@@ -434,7 +495,6 @@ pub fn preprocess<B, S, P, T>(
     mut build: T,
     backend: &mut B,
     store: &mut S,
-    checkpoint_paths: [&Path; 2],
     config: ExecutionConfig,
     compose: impl FnOnce(
         &mut T,
@@ -449,11 +509,8 @@ where
     P: Poly,
     T: PreprocessBuild<B, P>,
 {
-    if checkpoint_paths[0] == checkpoint_paths[1] {
-        return Err(ApiError::input("preprocess checkpoint destinations must differ"));
-    }
     build.bind_inputs(program, parameters, rhs, payload, hash_key)?;
-    let (encryption_identity, online_identity) = build.artifact_identities();
+    let (encryption_identity, _) = build.artifact_identities();
     let outputs = {
         let (evaluator, families, environment) = build.lowering_state()?;
         lower_program(program, evaluator, families, environment).map_err(ApiError::lowering)?
@@ -461,12 +518,18 @@ where
     let outputs = compose(&mut build, outputs)?;
     let (graph, (encrypt_descriptor, online_descriptor)) = build.build_graph(outputs)?;
 
-    // Validate and execute once. Both checkpoints are derived from the same
-    // complete finalized result and therefore share its manifest/catalog.
-    let validated =
-        graph.graph.validate_with_catalog(parameters, &graph.catalog).map_err(ApiError::graph)?;
+    // Validate and execute once. Both stage records share the same finalized
+    // production and manifest.
+    let validated = graph
+        .graph
+        .validate_with_manifests(parameters, &graph.manifests)
+        .map_err(ApiError::graph)?;
     before_execute(&validated)?;
-    let execution_nonce = fresh_execution_nonce(&validated, store)?;
+    let (execution_nonce, session) = fresh_execution_session(
+        &validated,
+        store,
+        domain_identity(encryption_identity, b"preprocess"),
+    )?;
     let result = execute_in_session_with_config(
         &validated,
         backend,
@@ -481,21 +544,25 @@ where
         })?,
         (encrypt_descriptor, online_descriptor),
     )?;
-    let encrypt_checkpoint = ArtifactCheckpoint::from_execution(
-        &result,
-        store,
+    let production = result.production_id.ok_or_else(|| {
+        ApiError::input("preprocess execution did not produce an artifact identity")
+    })?;
+    let manifest = store
+        .load_finalized_named_manifest(&session)
+        .map_err(|error| ApiError::Runtime(ExecutionError::Artifact(error.to_string())))?;
+    if manifest.production_id != production {
+        return Err(ApiError::compatibility(
+            "finalized named session returned a different production identity",
+        ));
+    }
+    let encrypt_stage = StageArtifacts::new(
+        production.clone(),
+        manifest.clone(),
         encrypt_descriptor,
-        domain_identity(encryption_identity, b"encrypt-preparation"),
-    )?;
-    let online_checkpoint = ArtifactCheckpoint::from_execution(
-        &result,
-        store,
-        online_descriptor,
-        domain_identity(online_identity, b"online-preparation"),
-    )?;
-    encrypt_checkpoint.write(checkpoint_paths[0])?;
-    online_checkpoint.write(checkpoint_paths[1])?;
-    Ok((StageArtifacts::new(encrypt_checkpoint), StageArtifacts::new(online_checkpoint)))
+        session.clone(),
+    );
+    let online_stage = StageArtifacts::new(production, manifest, online_descriptor, session);
+    Ok((encrypt_stage, online_stage))
 }
 
 /// Build and execute the input-only encryption graph.
@@ -509,7 +576,7 @@ pub fn encrypt<B, S, P, T>(
     hash_key: &[u8],
     mut build: T,
     backend: &mut B,
-    destination: ArtifactDestination<'_, S>,
+    store: &mut S,
     config: ExecutionConfig,
     compose: impl FnOnce(&mut T) -> Result<(), ApiError>,
     before_execute: impl FnOnce(&ValidatedGraph) -> Result<(), ApiError>,
@@ -525,14 +592,13 @@ where
     compose(&mut build)?;
     let identity = build.artifact_identity();
     let (graph, descriptor) = build.build_graph()?;
-    execute_checkpoint(
+    execute_artifacts(
         graph,
         parameters,
         descriptor,
         identity,
         backend,
-        destination.store,
-        destination.checkpoint,
+        store,
         config,
         before_execute,
     )
@@ -608,11 +674,11 @@ mod tests {
 
     fn observer_test_graph() -> StageGraph<mxx_runtime::backend::poly::CpuDcrtBackend> {
         let graph = DslContext::new("api-observer")
-            .artifact_output("value", Int::constant(1))
+            .transferred_output("value", Int::constant(1))
             .expect("artifact output")
             .build()
             .expect("build graph");
-        StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default())
+        StageGraph::new(graph, BTreeMap::new(), BTreeMap::new())
     }
 
     #[test]
@@ -675,29 +741,49 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_observer_error_prevents_checkpoint() {
-        let temporary = tempfile::tempdir().expect("temporary directory");
-        let checkpoint = temporary.path().join("encrypt.json");
+    fn encrypt_observer_error_prevents_artifact_publication() {
         let mut backend = cpu_backend([]);
         let mut store = MemoryArtifactStore::default();
-        let result = execute_checkpoint(
+        let result = execute_artifacts(
             observer_test_graph(),
             &ParamEnv::default(),
             "descriptor".to_owned(),
             [7; 32],
             &mut backend,
             &mut store,
-            &checkpoint,
             ExecutionConfig::default(),
-            |_| Err(ApiError::input("observer rejected checkpoint")),
+            |_| Err(ApiError::input("observer rejected artifact")),
         );
         let error = match result {
-            Ok(_) => panic!("observer error must stop checkpoint production"),
+            Ok(_) => panic!("observer error must stop artifact publication"),
             Err(error) => error,
         };
         assert!(
-            matches!(error, ApiError::Input { message } if message == "observer rejected checkpoint")
+            matches!(error, ApiError::Input { message } if message == "observer rejected artifact")
         );
-        assert!(!checkpoint.exists());
+    }
+
+    #[test]
+    fn finalized_named_stage_can_be_reloaded_with_a_reconstructed_descriptor() {
+        let mut backend = cpu_backend([]);
+        let mut store = MemoryArtifactStore::default();
+        let stage = execute_artifacts(
+            observer_test_graph(),
+            &ParamEnv::default(),
+            "descriptor".to_owned(),
+            [11; 32],
+            &mut backend,
+            &mut store,
+            ExecutionConfig::default(),
+            |_| Ok(()),
+        )
+        .expect("artifact graph executes");
+        let session = stage.session().clone();
+        let reloaded = reload_stage_artifacts(&mut store, session, "reconstructed".to_owned())
+            .expect("finalized named stage reloads");
+
+        assert_eq!(reloaded.production(), stage.production());
+        assert_eq!(reloaded.manifest(), stage.manifest());
+        assert_eq!(reloaded.descriptor(), "reconstructed");
     }
 }

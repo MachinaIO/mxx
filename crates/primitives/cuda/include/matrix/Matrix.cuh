@@ -11,7 +11,6 @@ extern "C" {
 #endif
 
 typedef struct GpuMatrix GpuMatrix;
-typedef struct GpuPreparedMatrixLease GpuPreparedMatrixLease;
 
 typedef enum GpuPolyFormat
 {
@@ -68,9 +67,6 @@ struct GpuMatrix
         size_t n;
         std::vector<uint8_t> limb_coeff_bytes;
         std::vector<size_t> limb_offsets_bytes;
-        // Non-null only while this whole prepared allocation is leased to a
-        // dispatch result. Its backing owner outlives all leased readers.
-        GpuPreparedMatrixLease *prepared_lease = nullptr;
     };
     struct SharedAuxBuffer
     {

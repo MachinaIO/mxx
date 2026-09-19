@@ -108,12 +108,14 @@ impl<V: GraphValue> RefreshVerification<V> {
         decoded_prefix: impl Into<String>,
     ) -> Result<DslContext, RefreshSetupError> {
         let mut context = context
-            .artifact_output("refresh-verification-vector", self.encoding_vector.clone())?
-            .artifact_output("refresh-verification-anchor", self.anchor.clone())?
-            .artifact_output(residual_name, self.residual.clone())?;
+            .transferred_output("refresh-verification-vector", self.encoding_vector.clone())?
+            .transferred_output("refresh-verification-anchor", self.anchor.clone())?
+            .transferred_output(residual_name, self.residual.clone())?;
         for (column, residual) in self.decoder_residuals.iter().enumerate() {
-            context = context
-                .artifact_output(format!("refresh-decoder-residual-{column}"), residual.clone())?;
+            context = context.transferred_output(
+                format!("refresh-decoder-residual-{column}"),
+                residual.clone(),
+            )?;
         }
         let decoded_prefix = decoded_prefix.into();
         for (index, value) in self.decoded.iter().enumerate() {

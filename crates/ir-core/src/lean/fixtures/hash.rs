@@ -61,8 +61,8 @@ fn export_hash_fixture() {
         "hash-fixture",
         vec![],
         BTreeMap::from([
-            ("hash".into(), GraphOutput { artifact_output: false, value: hash }),
-            ("coefficient".into(), GraphOutput { artifact_output: false, value: coefficient }),
+            ("hash".into(), GraphOutput { value: hash, availability: None }),
+            ("coefficient".into(), GraphOutput { value: coefficient, availability: None }),
         ]),
         vec![],
         vec![],

@@ -178,8 +178,9 @@ mod graph_tests {
         assert_eq!(outputs.len(), 3);
         let mut context = DslContext::new("noise-refresh-merge-template");
         for (index, output) in outputs.into_iter().enumerate() {
-            context =
-                context.artifact_output(format!("output_{index}"), output).expect("unique output");
+            context = context
+                .transferred_output(format!("output_{index}"), output)
+                .expect("unique output");
         }
         let built = context.build().expect("build merge Graph IR");
         let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");
@@ -191,11 +192,9 @@ mod graph_tests {
                 )
             })
             .collect::<Vec<_>>();
-        let mut backend = cpu_backend([parameters]);
-        let mut store = MemoryArtifactStore::default();
-        let mut result = execute(
+        let result = execute(
             &validated,
-            &mut backend,
+            &mut cpu_backend([parameters]),
             input_values
                 .iter()
                 .enumerate()
@@ -203,15 +202,12 @@ mod graph_tests {
                     (format!("input_{index}"), RuntimeValue::matrix(value.clone()))
                 })
                 .collect::<BTreeMap<_, _>>(),
-            &mut store,
+            &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
         )
         .expect("execute merge Graph IR");
         for index in 0..3 {
-            let actual = result
-                .materialize_output(&format!("output_{index}"), &mut backend, &mut store)
-                .expect("materialize merge output");
-            let RuntimeValue::Matrix(actual) = actual else {
+            let RuntimeValue::Matrix(actual) = &result.outputs[&format!("output_{index}")] else {
                 panic!("merge output must be a matrix")
             };
             assert_eq!(actual.as_ref(), &(input_values[index].clone() + &input_values[3 + index]));

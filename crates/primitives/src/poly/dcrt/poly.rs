@@ -34,6 +34,51 @@ impl DCRTPoly {
         Self { ptr_poly: ptr_poly.into() }
     }
 
+    /// Validate the length-bearing compact polynomial format before the
+    /// legacy infallible decoder is invoked.  In particular, this prevents a
+    /// malformed `max_byte_size` from indexing past the payload or causing a
+    /// centered subtraction underflow.
+    pub(crate) fn validate_compact_bytes(
+        params: &DCRTPolyParams,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        if bytes.len() < 4 {
+            return Err("compact polynomial header is truncated");
+        }
+        let header: [u8; 4] = bytes
+            .get(..4)
+            .and_then(|header| header.try_into().ok())
+            .ok_or("compact polynomial header is truncated")?;
+        let max_byte_size = u32::from_le_bytes(header) as usize;
+        if max_byte_size == 0 {
+            return Err("compact polynomial width is zero");
+        }
+        let ring_dimension = params.ring_dimension() as usize;
+        let bit_vector_bytes = ring_dimension.div_ceil(8);
+        let coeff_offset =
+            4usize.checked_add(bit_vector_bytes).ok_or("compact polynomial header overflows")?;
+        let coeff_bytes = ring_dimension
+            .checked_mul(max_byte_size)
+            .ok_or("compact polynomial payload overflows")?;
+        let expected_len =
+            coeff_offset.checked_add(coeff_bytes).ok_or("compact polynomial length overflows")?;
+        if bytes.len() != expected_len {
+            return Err("compact polynomial payload length mismatch");
+        }
+
+        let modulus = params.modulus();
+        let modulus = modulus.as_ref();
+        for index in 0..ring_dimension {
+            let start = coeff_offset + index * max_byte_size;
+            let value_bytes = &bytes[start..start + max_byte_size];
+            let value = BigUint::from_bytes_le(value_bytes);
+            if value >= *modulus {
+                return Err("compact polynomial coefficient exceeds modulus");
+            }
+        }
+        Ok(())
+    }
+
     fn from_slice_with_map<T, F>(params: &DCRTPolyParams, slice: &[T], map_fn: F) -> Self
     where
         T: Sync,
@@ -66,6 +111,24 @@ impl DCRTPoly {
         super::native::ffi::exact_basis_convert(&self.ptr_poly, &params.to_crt().0, centered)
             .map(Self::new)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn block_mod_switch(
+        &self,
+        params: &DCRTPolyParams,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String> {
+        let words = plaintext_modulus.to_u64_digits();
+        if words.is_empty() {
+            return Err("BlockModSwitch plaintext modulus must be positive".into());
+        }
+        super::native::ffi::exact_basis_block_mod_switch(
+            &self.ptr_poly,
+            &params.to_crt().0,
+            words.as_slice(),
+        )
+        .map(Self::new)
+        .map_err(|error| error.to_string())
     }
 
     pub(crate) fn rns_convert(
@@ -108,40 +171,6 @@ impl DCRTPoly {
         super::native::ffi::exact_basis_bgv_mod_reduce(&self.ptr_poly, plaintext_modulus)
             .map(Self::new)
             .map_err(|error| error.to_string())
-    }
-
-    /// Canonically lifts centered coefficients into a containing CRT basis.
-    /// Uses residue-only mixed-radix conversion, never full CRT interpolation.
-    pub fn centered_extend(&self, params: &DCRTPolyParams) -> Result<Self, String> {
-        super::native::ffi::exact_centered_conversion(
-            &self.ptr_poly,
-            &params.to_crt().0,
-            params.ring_dimension(),
-            0,
-        )
-        .map(Self::new)
-        .map_err(|error| error.to_string())
-    }
-
-    /// Drops a complete CRT block with `rho = center_P(t^-1 * z)` and
-    /// output `(z - t*rho)/P`. With t=1 this is exact ordinary ModDown.
-    /// With t>1 it preserves the specified error multiplier.
-    pub fn block_mod_switch(
-        &self,
-        params: &DCRTPolyParams,
-        plaintext_modulus: u64,
-    ) -> Result<Self, String> {
-        if plaintext_modulus == 0 {
-            return Err("error multiplier must be positive".into());
-        }
-        super::native::ffi::exact_centered_conversion(
-            &self.ptr_poly,
-            &params.to_crt().0,
-            params.ring_dimension(),
-            plaintext_modulus,
-        )
-        .map(Self::new)
-        .map_err(|error| error.to_string())
     }
 
     pub(crate) fn poly_gen_from_vec(params: &DCRTPolyParams, values: &[Vec<u64>]) -> Self {
@@ -709,95 +738,6 @@ mod tests {
             DCRTPoly::from_biguints(&params, &imported.coeffs_biguints()).evals_biguints(),
             evaluations
         );
-    }
-
-    #[test]
-    fn test_exact_rns_centered_extend_boundaries() {
-        use num_bigint::BigInt;
-        let (n, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
-        let high = DCRTPolyParams::new(n, depth, bits, base, None, None);
-        let primes = high.to_crt().0;
-        // Non-prefix source basis catches accidental prefix-based conversion.
-        let product = primes.iter().step_by(2).map(|p| BigUint::from(*p)).product();
-        let low = high.select_modulus(&product).unwrap();
-        let half = BigInt::from((&product - 1u8) / 2u8);
-        let mut rng = rand::rng();
-        let values = (0..n)
-            .map(|index| match index % 6 {
-                0 => half.clone(),
-                1 => -&half,
-                2 => &half + 1u8,
-                3 => -&half - 1u8,
-                _ => BigInt::from(rng.random::<i64>()),
-            })
-            .map(|value| FinRingElem::new(value, low.modulus()))
-            .collect::<Vec<_>>();
-        let input = DCRTPoly::from_coeffs(&low, &values);
-        let actual = input.centered_extend(&high).unwrap();
-        let expected = values
-            .iter()
-            .map(|value| {
-                let mut centered = BigInt::from(value.value().clone());
-                if centered > half {
-                    centered -= BigInt::from(product.clone());
-                }
-                FinRingElem::new(centered, high.modulus())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(actual, DCRTPoly::from_coeffs(&high, &expected));
-        assert_eq!(input.centered_extend(&low).unwrap(), input);
-        assert!(actual.centered_extend(&low).is_err());
-    }
-
-    #[test]
-    fn test_exact_rns_block_mod_switch_relation() {
-        use num_bigint::BigInt;
-        let (n, depth, bits, base) = crate::env::modulus_conversion_test_parameters();
-        let high = DCRTPolyParams::new(n, depth, bits, base, None, None);
-        let primes = high.to_crt().0;
-        let retained = primes.iter().step_by(2).map(|p| BigUint::from(*p)).product();
-        let low = high.select_modulus(&retained).unwrap();
-        let dropped = high.modulus().as_ref() / low.modulus().as_ref();
-        let half = BigInt::from((&dropped - 1u8) / 2u8);
-        let mut rng = rand::rng();
-        for t in [1u64, 2, 17] {
-            assert!(!primes.contains(&t));
-            // Construct z = P*w + t*rho using trusted ring operations. Every
-            // chosen rho is centered modulo P, so the switch must recover w.
-            let residuals = (0..n)
-                .map(|i| match i % 4 {
-                    0 => half.clone(),
-                    1 => -&half,
-                    _ => BigInt::from(rng.random::<u64>()) % (&half + 1u8),
-                })
-                .collect::<Vec<_>>();
-            let words = (0..n).map(|_| BigInt::from(rng.random::<i64>())).collect::<Vec<_>>();
-            let high_words = words
-                .iter()
-                .map(|w| FinRingElem::new(w.clone(), high.modulus()))
-                .collect::<Vec<_>>();
-            let rho = residuals
-                .iter()
-                .map(|r| FinRingElem::new(r.clone(), high.modulus()))
-                .collect::<Vec<_>>();
-            let z = DCRTPoly::from_biguint_to_constant(&high, dropped.clone()) *
-                DCRTPoly::from_coeffs(&high, &high_words) +
-                DCRTPoly::from_usize_to_constant(&high, t as usize) *
-                    DCRTPoly::from_coeffs(&high, &rho);
-            let expected = words
-                .iter()
-                .map(|w| FinRingElem::new(w.clone(), low.modulus()))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                z.block_mod_switch(&low, t).unwrap(),
-                DCRTPoly::from_coeffs(&low, &expected)
-            );
-            assert!(z.block_mod_switch(&high, t).is_err());
-            assert!(z.block_mod_switch(&low, primes[0]).is_err());
-            assert!(z.block_mod_switch(&low, 0).is_err());
-            let other_dimension = DCRTPolyParams::new(n / 2, depth, bits, base, None, None);
-            assert!(z.centered_extend(&other_dimension).is_err());
-        }
     }
 
     #[test]

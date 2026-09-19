@@ -17,7 +17,11 @@ use mxx_gadgets::{
         lower_circuit,
     },
 };
-use mxx_ir_core::{IntExpr, artifact::ProductionId, types::MatrixType};
+use mxx_ir_core::{
+    IntExpr,
+    artifact::{ArtifactAvailability, ProductionId},
+    types::MatrixType,
+};
 use num_bigint::{BigInt, BigUint, Sign};
 use num_traits::Zero;
 use rayon::prelude::*;
@@ -688,10 +692,10 @@ impl LweLookupCompiler {
         names: &LweLookupArtifactNames,
     ) -> Result<DslContext, LweLookupCompileError> {
         Ok(context
-            .artifact_output(names.output_public_key.clone(), wires.output_public_key)?
-            .artifact_output(names.low_matrices.clone(), wires.low_matrices)?
-            .artifact_output(names.high_matrices.clone(), wires.high_matrices)?
-            .artifact_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
+            .transferred_output(names.output_public_key.clone(), wires.output_public_key)?
+            .transferred_output(names.low_matrices.clone(), wires.low_matrices)?
+            .transferred_output(names.high_matrices.clone(), wires.high_matrices)?
+            .transferred_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
     }
 
     pub fn import_artifacts(
@@ -710,6 +714,7 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.low_matrix_type),
                 balanced_bound(self.gadget_base.clone()),
+                ArtifactAvailability::Transferred,
             ),
             high_matrices: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
@@ -717,12 +722,14 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.high_matrix_type),
                 self.preimage_max_coefficient_bound.clone(),
+                ArtifactAvailability::Transferred,
             ),
             output_plaintexts: ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 names.output_plaintexts,
                 artifacts.table_length,
                 shape(&ring.matrix_type((1, 1))),
+                ArtifactAvailability::Transferred,
             ),
         })
     }
@@ -732,6 +739,7 @@ impl LweLookupCompiler {
             artifacts.production_id.clone(),
             LweLookupArtifactNames::for_compiler(self).output_public_key,
             shape(&self.public_key_type),
+            ArtifactAvailability::Transferred,
         )
     }
 
@@ -1738,7 +1746,7 @@ mod tests {
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
-        artifact::{ProductionId, SpecHash},
+        artifact::{ArtifactAvailability, ProductionId, SpecHash},
         node::{IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
         types::WireType,
     };
@@ -1756,7 +1764,7 @@ mod tests {
     use num_bigint::BigUint;
     use std::num::NonZeroUsize;
 
-    fn mul_private(length: u64) -> PublicLutProgram {
+    fn identity_lut(length: u64) -> PublicLutProgram {
         PublicLutProgram::new(length, LutExpr::input()).expect("identity LUT")
     }
 
@@ -1980,7 +1988,7 @@ mod tests {
         })
         .unwrap();
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
-            .artifact_output("low", wires.low_matrices)
+            .transferred_output("low", wires.low_matrices)
             .unwrap()
             .output("residual", residuals)
             .unwrap()
@@ -2006,7 +2014,7 @@ mod tests {
             .unwrap();
             let low = {
                 let RuntimeValue::IndexedFamily(values) =
-                    result.materialize_output("low", &mut backend, &mut store).unwrap()
+                    result.materialize_output("low", &backend, &mut store).unwrap()
                 else {
                     panic!("low output must be a family")
                 };
@@ -2020,7 +2028,7 @@ mod tests {
             };
             assert_eq!(low.len(), 3);
             let RuntimeValue::IndexedFamily(residuals) =
-                result.materialize_output("residual", &mut backend, &mut store).unwrap()
+                result.materialize_output("residual", &backend, &mut store).unwrap()
             else {
                 panic!("residual output must be a family")
             };
@@ -2440,17 +2448,17 @@ mod tests {
         let (other_rows, other_plaintexts) = third.call(third_inputs).unwrap();
         let context = DslContext::new("tall-lookup-kernel-cache");
         let built = context
-            .artifact_output("rows", rows)
+            .transferred_output("rows", rows)
             .unwrap()
-            .artifact_output("plaintexts", plaintexts)
+            .transferred_output("plaintexts", plaintexts)
             .unwrap()
-            .artifact_output("second-rows", second_rows)
+            .transferred_output("second-rows", second_rows)
             .unwrap()
-            .artifact_output("second-plaintexts", second_plaintexts)
+            .transferred_output("second-plaintexts", second_plaintexts)
             .unwrap()
-            .artifact_output("other-rows", other_rows)
+            .transferred_output("other-rows", other_rows)
             .unwrap()
-            .artifact_output("other-plaintexts", other_plaintexts)
+            .transferred_output("other-plaintexts", other_plaintexts)
             .unwrap()
             .build()
             .unwrap();
@@ -2604,7 +2612,7 @@ mod tests {
     fn lookup_identity_collection_matches_the_lowering_identity() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id).as_single_wire();
         circuit.output([output]);
         assert_eq!(
@@ -2628,7 +2636,7 @@ mod tests {
             500_000_000,
             vec![Some(0), None, Some(2), None],
         );
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(transferred, lookup_id).as_single_wire();
         circuit.output([output]);
 
@@ -2647,7 +2655,7 @@ mod tests {
     #[test]
     fn lookup_registry_conversion_cache_reuses_same_program_arc() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let mut cache = BTreeMap::new();
         let first = cached_lookup_table(&mut cache, &circuit, lookup_id).unwrap();
         let second = cached_lookup_table(&mut cache, &circuit, lookup_id).unwrap();
@@ -2665,8 +2673,8 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let first_lookup_id = circuit.register_public_lookup(mul_private(2));
-        let second_lookup_id = circuit.register_public_lookup(mul_private(2));
+        let first_lookup_id = circuit.register_public_lookup(identity_lut(2));
+        let second_lookup_id = circuit.register_public_lookup(identity_lut(2));
         let first = circuit.public_lookup_gate(input, first_lookup_id);
         let second = circuit.public_lookup_gate(input, second_lookup_id);
         circuit.output([first, second]);
@@ -2757,7 +2765,7 @@ mod tests {
         let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output = circuit.public_lookup_gate(input, lookup_id);
         circuit.output([output]);
         let public_key = |name: &str| NaiveBggPublicKeyVecWire {
@@ -2817,7 +2825,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -2984,7 +2992,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let lookup = compiler(
@@ -3068,6 +3076,7 @@ mod tests {
         };
         assert_eq!(artifact.production_id, production_id);
         assert_eq!(artifact.artifact_name, output_public_key_artifact);
+        assert_eq!(artifact.availability, ArtifactAvailability::Transferred);
 
         let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
             panic!("lookup signal right side must end with a gadget multiplication")
@@ -3099,6 +3108,7 @@ mod tests {
             artifact.artifact_name,
             LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
         );
+        assert_eq!(artifact.availability, ArtifactAvailability::Transferred);
         let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
             panic!("lookup output plaintext selector must be the input coefficient")
         };
@@ -3125,7 +3135,7 @@ mod tests {
         let digit_count = parameters.modulus_digits();
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let input_gate = circuit.input(1).as_single_wire();
-        let lookup_id = circuit.register_public_lookup(mul_private(2));
+        let lookup_id = circuit.register_public_lookup(identity_lut(2));
         let output_gate = circuit.public_lookup_gate(input_gate, lookup_id);
         circuit.output([output_gate]);
         let identity = LweLookupIdentity {

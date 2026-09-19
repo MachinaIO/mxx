@@ -20,7 +20,7 @@ use crate::{
 use mxx_dsl::{Bytes, DslContext, DslError, Family, GraphValue, GraphValueSchema, Int, Mat};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
-    artifact::{ArtifactCatalog, ProductionId},
+    artifact::{ArtifactAvailability, Manifest, ProductionId},
     node::ConstantMatrix,
     types::WireType,
 };
@@ -30,7 +30,10 @@ use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive, Zero};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 /// Public-key carrier paired with its validated Program wire.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -148,13 +151,13 @@ fn decompose_matrix(
     ))
 }
 
-fn centered_extend_decomposition(
+fn centered_rebase_decomposition(
     value: RnsBggDecomposition,
     modulus: BigInt,
 ) -> RnsBggDecomposition {
     (
-        (value.0.0.centered_extend(modulus.clone()), value.0.1.centered_extend(modulus.clone())),
-        (value.1.0.centered_extend(modulus.clone()), value.1.1.centered_extend(modulus)),
+        (value.0.0.centered_rebase(modulus.clone()), value.0.1.centered_rebase(modulus.clone())),
+        (value.1.0.centered_rebase(modulus.clone()), value.1.1.centered_rebase(modulus)),
     )
 }
 
@@ -181,7 +184,7 @@ fn decompose_refresh_matrix(
     );
     let evaluation_modulus =
         BigInt::from(parameters.level(evaluation_level)?.modulus().as_ref().clone());
-    Ok(centered_extend_decomposition(value, evaluation_modulus))
+    Ok(centered_rebase_decomposition(value, evaluation_modulus))
 }
 
 fn refresh_payload_action(
@@ -207,8 +210,8 @@ fn refresh_payload_action(
 }
 
 fn lift_output_target_to_p(value: RnsBggRow, p_modulus: BigInt, h_p: Mat) -> RnsBggRow {
-    let h_p = h_p.centered_extend(p_modulus.clone());
-    super::map_row(value, |entry| h_p.clone() * entry.centered_extend(p_modulus.clone()))
+    let h_p = h_p.centered_rebase(p_modulus.clone());
+    super::map_row(value, |entry| h_p.clone() * entry.centered_rebase(p_modulus.clone()))
 }
 
 fn lut_payload_target(scale: Mat, coefficient: Mat, payload: RnsBggRow, gadget: Mat) -> RnsBggRow {
@@ -232,6 +235,78 @@ fn sampled_key(
         wire,
         matrix_from_hash(&ring, hash_key, input_hash_tag(wire, level, member), columns),
     ))
+}
+
+/// Classify a lowered public-key carrier for the preprocess artifact graph.
+///
+/// Raw input keys are sampled only from the hash key, so they are cacheable
+/// regardless of the payload knowledge attached to the input declaration.
+/// Derived public-payload wires remain hash-key/public-only, while private
+/// payload wires (and refresh replacements) may depend on transferred secret
+/// or private-plaintext material.
+fn preprocess_output_availability(
+    program: &ExponentLutProgram,
+    wire: WireId,
+    refresh_wire: Option<WireId>,
+) -> Result<ArtifactAvailability, RnsBggError> {
+    if refresh_wire == Some(wire) {
+        return Ok(ArtifactAvailability::Transferred);
+    }
+    if program.inputs().contains_key(&wire) ||
+        program
+            .wire_knowledge(wire)
+            .map_err(|_| RnsBggError::Binding("output wire knowledge"))? ==
+            AttributeKnowledge::PublicPayload
+    {
+        Ok(ArtifactAvailability::Cached)
+    } else {
+        Ok(ArtifactAvailability::Transferred)
+    }
+}
+
+fn refresh_output_wire(
+    program: &ExponentLutProgram,
+    output_index: usize,
+) -> Result<WireId, RnsBggError> {
+    let output = program
+        .outputs()
+        .get(output_index)
+        .ok_or(RnsBggError::Binding("refresh output is outside Program outputs"))?;
+    Ok(match output {
+        crate::program::Operand::Scalar(wire) |
+        crate::program::Operand::Member { family: wire, .. } => *wire,
+    })
+}
+
+fn validate_refresh_output_target(
+    program: &ExponentLutProgram,
+    output_index: usize,
+) -> Result<(), RnsBggError> {
+    let wire = refresh_output_wire(program, output_index)?;
+    let occurrences = program
+        .outputs()
+        .iter()
+        .filter(|output| match output {
+            crate::program::Operand::Scalar(candidate) |
+            crate::program::Operand::Member { family: candidate, .. } => *candidate == wire,
+        })
+        .count();
+    if occurrences > 1 {
+        return Err(RnsBggError::Binding(
+            "cannot refresh a duplicated Program output wire because public-key artifacts are deduplicated",
+        ));
+    }
+    if program.inputs().contains_key(&wire) {
+        return Err(RnsBggError::Binding(
+            "cannot refresh a raw Program input output because its public-key artifact is cached",
+        ));
+    }
+    Ok(())
+}
+
+fn deduplicate_outputs(outputs: Vec<RnsBggPublicKey>) -> Vec<RnsBggPublicKey> {
+    let mut seen = BTreeSet::new();
+    outputs.into_iter().filter(|output| seen.insert(output.wire)).collect()
 }
 
 /// Structural public-key lowerer. All prepared values are compact graph
@@ -460,8 +535,8 @@ impl<'a> PublicKeyLowering<'a> {
             .map_err(|_| DslError::Schema)?;
             // B_sigma is sampled in the next ring and constrained by the
             // payload secret. Its signed switching decomposition has
-            // each compact digit centered-extended to the source ring; the
-            // full B matrix is never extended as a dense matrix.
+            // each compact digit centered-rebased to the source ring; the
+            // full B matrix is never rebased as a dense matrix.
             let payload = checked_modulus_convert_row(
                 self.payload_secret.row.clone(),
                 target_modulus.clone(),
@@ -523,7 +598,11 @@ impl<'a> PublicKeyLowering<'a> {
                         .checked_add(1)
                         .ok_or(RnsBggError::Parameters("coefficient output level overflow"))?;
                     let q = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-                    Ok(RnsBggPublicKey::new(output.wire, super::mod_down_public(output.matrix, q)))
+                    let source_moduli = self.parameters.level(level)?.to_crt().0;
+                    Ok(RnsBggPublicKey::new(
+                        output.wire,
+                        super::mod_down_public(output.matrix, q, &source_moduli),
+                    ))
                 } else {
                     Ok(output)
                 }
@@ -642,15 +721,17 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         // Only the bounded decomposition digits cross back into the
         // evaluation ring; the compact RHS artifact itself remains at its
         // native next-level schema.
-        let action = centered_extend_decomposition(compact, evaluation_modulus);
+        let action = centered_rebase_decomposition(compact, evaluation_modulus);
         let target_level = self.workload.level(self.output()?)?;
         let target_modulus =
             BigInt::from(self.parameters.level(target_level)?.modulus().as_ref().clone());
+        let source_moduli = self.parameters.level(evaluation_level)?.to_crt().0;
         Ok(RnsBggPublicKey::new(
             self.output()?,
             super::mod_down_public(
                 super::multiply_public_action(input.matrix.clone(), action),
                 target_modulus,
+                &source_moduli,
             ),
         ))
     }
@@ -673,6 +754,7 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
             BigInt::from(self.parameters.level(source_level)?.modulus().as_ref().clone());
         let target_modulus =
             BigInt::from(self.parameters.level(next_level)?.modulus().as_ref().clone());
+        let source_moduli = self.parameters.level(source_level)?.to_crt().0;
         let layout = table.input_layout();
         let sigmas = layout
             .automorphism_indices(self.parameters.level(source_level)?.ring_dimension() as usize)
@@ -683,7 +765,7 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                     selector: Box::new(index.expression()?),
                     branches: sigmas.iter().map(|sigma| IntExpr::constant(*sigma)).collect(),
                 };
-                let switching_decomposition = centered_extend_decomposition(
+                let switching_decomposition = centered_rebase_decomposition(
                     decompose_matrix(
                         self.parameters,
                         next_level,
@@ -698,8 +780,9 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
                 let switched_public_key = super::mod_down_public(
                     super::multiply_public_action(routed, switching_decomposition),
                     target_modulus.clone(),
+                    &source_moduli,
                 );
-                let switched_key_decomposition = centered_extend_decomposition(
+                let switched_key_decomposition = centered_rebase_decomposition(
                     decompose_matrix(self.parameters, next_level, switched_public_key)
                         .map_err(|_| DslError::Schema)?,
                     source_modulus.clone(),
@@ -718,7 +801,14 @@ impl ExponentLUTProgramLowering for PublicKeyLowering<'_> {
         {
             let target = self.workload.level(output)?;
             let modulus = BigInt::from(self.parameters.level(target)?.modulus().as_ref().clone());
-            return Ok(RnsBggPublicKey::new(output, super::mod_down_public(result, modulus)));
+            return Ok(RnsBggPublicKey::new(
+                output,
+                super::mod_down_public(
+                    result,
+                    modulus,
+                    &self.parameters.level(source_level)?.to_crt().0,
+                ),
+            ));
         }
         Ok(RnsBggPublicKey::new(output, result))
     }
@@ -785,9 +875,12 @@ fn mod_down_lift_public(
     matrix: RnsBggMatrix,
     channel_modulus: BigInt,
     target_modulus: BigInt,
+    source_moduli: &[u64],
 ) -> RnsBggMatrix {
     map_matrix(matrix, |entry| {
-        entry.block_mod_switch(channel_modulus.clone(), 1).centered_extend(target_modulus.clone())
+        entry
+            .block_mod_switch(channel_modulus.clone(), source_moduli.to_vec(), 1)
+            .centered_rebase(target_modulus.clone())
     })
 }
 
@@ -804,7 +897,7 @@ fn reduce_lift_public_anchor(
     target_modulus: BigInt,
 ) -> Result<RnsBggMatrix, RnsBggError> {
     let reduced = checked_modulus_convert_matrix(matrix, channel_modulus)?;
-    Ok(map_matrix(reduced, |entry| entry.centered_extend(target_modulus.clone())))
+    Ok(map_matrix(reduced, |entry| entry.centered_rebase(target_modulus.clone())))
 }
 
 fn matrix_schema_matches(lhs: &RnsBggMatrix, rhs: &RnsBggMatrix) -> bool {
@@ -1291,7 +1384,11 @@ impl PublicKeyLowering<'_> {
                 return Err(RnsBggError::Binding("refresh CRT channel schemas differ"));
             }
             let a_sum = add_public_matrices(a_sum, data_public);
-            let a_sum = mod_down_public(a_sum, p_modulus.clone());
+            let a_sum = mod_down_public(
+                a_sum,
+                p_modulus.clone(),
+                &self.parameters.level(evaluation_level)?.to_crt().0,
+            );
             self.refresh_sums.insert((*declaration.commitment(), slot), a_sum);
             self.refresh_stars.insert((*declaration.commitment(), slot), aout_p);
             self.refresh_targets.insert((*declaration.commitment(), slot), action);
@@ -1504,6 +1601,13 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
                 "refresh output was already selected or is out of range",
             ));
         }
+        let program = self
+            .evaluator
+            .as_ref()
+            .ok_or(RnsBggError::Binding("preprocess builder was not bound"))?
+            .program
+            .as_ref();
+        validate_refresh_output_target(program, output_index)?;
         if self
             .refresh_declaration
             .as_ref()
@@ -1799,18 +1903,56 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         let mut evaluator =
             self.evaluator.ok_or_else(|| ApiError::input("preprocess builder was not bound"))?;
         let mut outputs = outputs;
+        let refresh_output_wire = self.pending_refresh.as_ref().map(|(_, output)| output.wire);
         if let Some((index, output)) = self.pending_refresh.take() {
             let target = outputs.get_mut(index).ok_or_else(|| {
                 ApiError::input("refresh output index is outside lowered outputs")
             })?;
             *target = output;
         }
-        let outputs = evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?;
+        let outputs =
+            deduplicate_outputs(evaluator.finish_outputs(outputs).map_err(ApiError::scheme)?);
         let mut graph = DslContext::new("rns-bgg-preprocess");
+
+        // Input public keys are sampled from the hash key alone. Publish all
+        // declared inputs, including private-payload and family inputs, under
+        // the names consumed by the encoding stage. A raw input can also be a
+        // declared Program output; the output loop below skips that wire so
+        // the shared public-key name is emitted exactly once.
+        for (wire, declaration) in evaluator.program.inputs() {
+            let name = format!("public-key/{wire:?}");
+            match declaration.shape() {
+                InputBinding::Scalar(()) => {
+                    let key = evaluator.sample_input_public_key(*wire).map_err(ApiError::scheme)?;
+                    graph = graph.cached_output(name, key).map_err(ApiError::scheme)?;
+                }
+                InputBinding::Family(count) => {
+                    let keys = mxx_dsl::parallel(count.clone(), |index| {
+                        evaluator
+                            .sample_input_public_key_member(*wire, Some(index))
+                            .map_err(|_| DslError::Schema)
+                    })
+                    .map_err(ApiError::scheme)?;
+                    graph = graph.cached_output(name, keys).map_err(ApiError::scheme)?;
+                }
+            }
+        }
         for output in outputs {
-            graph = graph
-                .artifact_output(format!("public-key/{:?}", output.wire), output)
-                .map_err(ApiError::scheme)?;
+            if evaluator.program.inputs().contains_key(&output.wire) {
+                continue;
+            }
+            let name = format!("public-key/{:?}", output.wire);
+            graph = match preprocess_output_availability(
+                &evaluator.program,
+                output.wire,
+                refresh_output_wire,
+            )
+            .map_err(ApiError::scheme)?
+            {
+                ArtifactAvailability::Cached => graph.cached_output(name, output),
+                ArtifactAvailability::Transferred => graph.transferred_output(name, output),
+            }
+            .map_err(ApiError::scheme)?;
         }
         // Prepared PRF children use their own source-q key schedule.  Publish
         // their input keys under the declaration/slot namespace so encryption
@@ -1831,7 +1973,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                             for (name, entry) in names.into_iter().zip(matrix_entries(&key.matrix))
                             {
                                 graph =
-                                    graph.artifact_output(name, entry).map_err(ApiError::scheme)?;
+                                    graph.cached_output(name, entry).map_err(ApiError::scheme)?;
                             }
                         }
                         InputBinding::Family(count) => {
@@ -1848,7 +1990,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                                 .map_err(ApiError::scheme)?;
                             for (name, entry) in names.into_iter().zip(key_parts) {
                                 graph =
-                                    graph.artifact_output(name, entry).map_err(ApiError::scheme)?;
+                                    graph.cached_output(name, entry).map_err(ApiError::scheme)?;
                             }
                         }
                     }
@@ -1857,7 +1999,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                     match prepared {
                         InputBinding::Scalar(value) => {
                             graph = graph
-                                .artifact_output(
+                                .transferred_output(
                                     refresh_prf_artifact_name(
                                         commitment,
                                         *slot,
@@ -1869,7 +2011,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                         }
                         InputBinding::Family(value) => {
                             graph = graph
-                                .artifact_output(
+                                .transferred_output(
                                     refresh_prf_artifact_name(
                                         commitment,
                                         *slot,
@@ -1888,7 +2030,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                         "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
                     );
                     graph = graph
-                        .artifact_output(
+                        .transferred_output(
                             refresh_prf_artifact_name(commitment, *slot, &role),
                             material.clone(),
                         )
@@ -1897,7 +2039,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
                 for ((evaluation_level, sigma), matrix) in &child.lut_public_data {
                     for (port, entry) in matrix_entries(matrix).into_iter().enumerate() {
                         graph = graph
-                            .artifact_output(
+                            .cached_output(
                                 refresh_prf_artifact_name(
                                     commitment,
                                     *slot,
@@ -1914,12 +2056,12 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
             match prepared {
                 InputBinding::Scalar(value) => {
                     graph = graph
-                        .artifact_output(format!("rhs/{rhs:?}"), value.clone())
+                        .transferred_output(format!("rhs/{rhs:?}"), value.clone())
                         .map_err(ApiError::scheme)?;
                 }
                 InputBinding::Family(value) => {
                     graph = graph
-                        .artifact_output(format!("rhs/{rhs:?}/family"), value.clone())
+                        .transferred_output(format!("rhs/{rhs:?}/family"), value.clone())
                         .map_err(ApiError::scheme)?;
                 }
             }
@@ -1928,7 +2070,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
             &evaluator.lut_material
         {
             graph = graph
-                .artifact_output(
+                .transferred_output(
                     format!(
                         "lut-switching/{evaluation_level}/{decomposition_level}/{lut:?}/{layout:?}"
                     ),
@@ -1944,14 +2086,14 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         for ((evaluation_level, sigma), matrix) in &evaluator.lut_public_data {
             for (port, entry) in matrix_entries(matrix).into_iter().enumerate() {
                 graph = graph
-                    .artifact_output(format!("lut-public/{evaluation_level}/{sigma}.{port}"), entry)
+                    .cached_output(format!("lut-public/{evaluation_level}/{sigma}.{port}"), entry)
                     .map_err(ApiError::scheme)?;
             }
         }
         for ((commitment, slot), sum) in &evaluator.refresh_sums {
             for (index, entry) in matrix_entries(sum).into_iter().enumerate() {
                 graph = graph
-                    .artifact_output(
+                    .transferred_output(
                         refresh_artifact_name(*commitment, *slot, &format!("a-sum.{index}")),
                         entry,
                     )
@@ -1961,7 +2103,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         for ((commitment, slot), star) in &evaluator.refresh_stars {
             for (index, entry) in matrix_entries(star).into_iter().enumerate() {
                 graph = graph
-                    .artifact_output(
+                    .cached_output(
                         refresh_artifact_name(*commitment, *slot, &format!("a-star.{index}")),
                         entry,
                     )
@@ -1970,7 +2112,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         }
         for ((commitment, slot), action) in &evaluator.refresh_targets {
             graph = graph
-                .artifact_output(
+                .transferred_output(
                     refresh_artifact_name(*commitment, *slot, "target"),
                     action.clone(),
                 )
@@ -1978,7 +2120,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         }
         for ((commitment, slot, label), action) in &evaluator.refresh_label_targets {
             graph = graph
-                .artifact_output(
+                .transferred_output(
                     refresh_label_artifact_name(*commitment, *slot, *label),
                     action.clone(),
                 )
@@ -1999,7 +2141,7 @@ impl<'a, B: Backend, P: Poly> PreprocessBuild<B, P> for RnsPreprocessBuild<'a, B
         let encrypt_binding = RnsBggPreprocessEncryptDescriptor::from_binding(binding.clone());
         let online_binding = RnsBggPreprocessOnlineDescriptor::from_binding(binding);
         Ok((
-            StageGraph::new(graph, self.runtime, ArtifactCatalog::default()),
+            StageGraph::new(graph, self.runtime, BTreeMap::<ProductionId, Manifest>::new()),
             (encrypt_binding, online_binding),
         ))
     }
@@ -2090,7 +2232,7 @@ mod test {
             workload,
             preprocess: production.clone(),
             encryption: production,
-            catalog: mxx_ir_core::artifact::ArtifactCatalog::default(),
+            manifests: BTreeMap::new(),
             refresh_prf_namespace: None,
             current_site: None,
         };
@@ -2171,6 +2313,122 @@ mod test {
                 1,
                 parameters.key_component_columns(0, AttributeKnowledge::PublicPayload).unwrap()
             ))
+        );
+    }
+
+    #[test]
+    fn preprocess_classifies_raw_and_public_outputs_as_cached() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
+        let public = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let public_output = builder
+            .add(crate::program::Operand::Scalar(public), crate::program::Operand::Scalar(public))
+            .unwrap();
+        let private_output = builder
+            .mul_public(
+                crate::program::Operand::Scalar(public),
+                crate::program::Operand::Scalar(private),
+            )
+            .unwrap();
+        let rhs = builder.rhs_input().unwrap();
+        let private_rhs_output = builder
+            .mul_private(
+                crate::program::Operand::Scalar(private_output),
+                crate::program::Operand::Scalar(rhs),
+            )
+            .unwrap();
+        let program = builder
+            .finish(vec![
+                crate::program::Operand::Scalar(private),
+                crate::program::Operand::Scalar(public_output),
+                crate::program::Operand::Scalar(private_rhs_output),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            preprocess_output_availability(&program, private, None).unwrap(),
+            ArtifactAvailability::Cached
+        );
+        assert_eq!(
+            preprocess_output_availability(&program, public_output, None).unwrap(),
+            ArtifactAvailability::Cached
+        );
+        assert_eq!(
+            preprocess_output_availability(&program, private_output, None).unwrap(),
+            ArtifactAvailability::Transferred
+        );
+        assert_eq!(
+            preprocess_output_availability(&program, private_rhs_output, None).unwrap(),
+            ArtifactAvailability::Transferred
+        );
+        assert_eq!(
+            preprocess_output_availability(&program, public_output, Some(public_output)).unwrap(),
+            ArtifactAvailability::Transferred
+        );
+    }
+
+    #[test]
+    fn refresh_rejects_a_raw_input_program_output() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let raw = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let derived = builder
+            .add(crate::program::Operand::Scalar(raw), crate::program::Operand::Scalar(raw))
+            .unwrap();
+        let program = builder
+            .finish(vec![
+                crate::program::Operand::Scalar(raw),
+                crate::program::Operand::Scalar(derived),
+            ])
+            .unwrap();
+
+        assert!(matches!(
+            validate_refresh_output_target(&program, 0),
+            Err(RnsBggError::Binding(
+                "cannot refresh a raw Program input output because its public-key artifact is cached"
+            ))
+        ));
+        assert!(validate_refresh_output_target(&program, 1).is_ok());
+    }
+
+    #[test]
+    fn refresh_rejects_a_later_duplicate_program_output_wire() {
+        let mut builder = crate::program::ExponentLutProgramBuilder::new();
+        let input = builder.input(AttributeKnowledge::PublicPayload).unwrap();
+        let output = builder
+            .add(crate::program::Operand::Scalar(input), crate::program::Operand::Scalar(input))
+            .unwrap();
+        let program = builder
+            .finish(vec![
+                crate::program::Operand::Scalar(output),
+                crate::program::Operand::Scalar(output),
+            ])
+            .unwrap();
+
+        assert!(matches!(
+            validate_refresh_output_target(&program, 1),
+            Err(RnsBggError::Binding(
+                "cannot refresh a duplicated Program output wire because public-key artifacts are deduplicated"
+            ))
+        ));
+    }
+
+    #[test]
+    fn repeated_program_outputs_keep_the_first_public_key_carrier() {
+        let ring = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
+        let matrix = || {
+            let one = ring.identity(1);
+            ((one.clone(), one.clone()), (one.clone(), one))
+        };
+        let outputs = vec![
+            RnsBggPublicKey::new(WireId(4), matrix()),
+            RnsBggPublicKey::new(WireId(4), matrix()),
+            RnsBggPublicKey::new(WireId(7), matrix()),
+            RnsBggPublicKey::new(WireId(4), matrix()),
+        ];
+        let outputs = deduplicate_outputs(outputs);
+        assert_eq!(
+            outputs.iter().map(|output| output.wire).collect::<Vec<_>>(),
+            [WireId(4), WireId(7)]
         );
     }
 
@@ -2378,7 +2636,7 @@ mod test {
         let mut backend = cpu_backend([level]);
         let mut store = MemoryArtifactStore::default();
         let mut result = execute_graph(
-            StageGraph::new(graph, BTreeMap::new(), ArtifactCatalog::default()),
+            StageGraph::new(graph, BTreeMap::new(), BTreeMap::<ProductionId, Manifest>::new()),
             &ParamEnv::default(),
             &mut backend,
             &mut store,
@@ -2540,7 +2798,8 @@ mod test {
         let source = mxx_dsl::Ring::new(BigInt::from(105u8), 4);
         let value = source.input("refresh-source", (1, 1));
         let matrix = ((value.clone(), value.clone()), (value.clone(), value));
-        let lifted = mod_down_lift_public(matrix, BigInt::from(3u8), BigInt::from(15u8));
+        let lifted =
+            mod_down_lift_public(matrix, BigInt::from(3u8), BigInt::from(15u8), &[3, 5, 7]);
         for row in [lifted.0, lifted.1] {
             for entry in [row.0, row.1] {
                 assert_eq!(entry.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
@@ -2592,7 +2851,12 @@ mod test {
                 BigInt::from(15u8),
             )
             .unwrap();
-            let divided = mod_down_lift_public(anchor.clone(), channel_modulus, BigInt::from(15u8));
+            let divided = mod_down_lift_public(
+                anchor.clone(),
+                channel_modulus,
+                BigInt::from(15u8),
+                &[3, 5, 7],
+            );
             assert_ne!(reduced.flatten(), divided.flatten());
             assert_eq!(reduced.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(15u8)));
         }
@@ -2604,6 +2868,7 @@ mod test {
             add_public_matrices(a_sum, scale_public_matrix(anchor.clone(), &BigInt::from(-21i8))),
             BigInt::from(5u8),
             BigInt::from(15u8),
+            &[3, 5, 7],
         );
         let public_anchor =
             reduce_lift_public_anchor(anchor, BigInt::from(5u8), BigInt::from(15u8)).unwrap();
@@ -2680,7 +2945,7 @@ mod test {
         assert_eq!(lifted.0.matrix_type().modulus, IntExpr::constant(BigInt::from(105u8)));
         assert_ne!(lifted.flatten(), reduced.flatten());
         let graph = DslContext::new("refresh-qstar-to-p")
-            .artifact_output("lifted", lifted)
+            .transferred_output("lifted", lifted)
             .unwrap()
             .build()
             .unwrap();
@@ -2743,9 +3008,9 @@ mod test {
         assert_eq!(action.0.0.matrix_type().columns, IntExpr::constant(target_columns));
 
         let graph = DslContext::new("refresh-target-width")
-            .artifact_output("anchor", anchor.matrix.clone())
+            .transferred_output("anchor", anchor.matrix.clone())
             .unwrap()
-            .artifact_output("action", action.clone())
+            .transferred_output("action", action.clone())
             .unwrap()
             .build()
             .unwrap();
@@ -2803,7 +3068,7 @@ mod test {
                 "prepared RHS is stored as a compact next-level matrix"
             );
         }
-        let action = centered_extend_decomposition(
+        let action = centered_rebase_decomposition(
             decompose_matrix(&parameters, 1, compact.clone()).unwrap(),
             BigInt::from(parameters.level(0).unwrap().modulus().as_ref().clone()),
         );
@@ -2818,7 +3083,7 @@ mod test {
             );
         }
         let graph = DslContext::new("rhs-next-level-payload-action")
-            .artifact_output("rhs", action)
+            .transferred_output("rhs", action)
             .unwrap()
             .build()
             .unwrap();
@@ -3027,7 +3292,7 @@ mod test {
         let expected = multiply_public_action(data, switching_decomposition);
         assert_eq!(branch.0.0.matrix_type(), expected.0.0.matrix_type());
         let graph = DslContext::new("public-lut-branch")
-            .artifact_output("branch", branch)
+            .transferred_output("branch", branch)
             .unwrap()
             .build()
             .unwrap();
@@ -3045,12 +3310,12 @@ mod test {
     }
 
     #[test]
-    fn switching_decomposition_is_centered_extended_into_the_source_ring() {
+    fn switching_decomposition_is_centered_rebased_into_the_source_ring() {
         let next = mxx_dsl::Ring::new(BigInt::from(17u8), 4);
         let compact = next.preimage_input("lut-switching-decomposition-next", (1, 1), 17);
         let decomposition = ((compact.clone(), compact.clone()), (compact.clone(), compact));
-        let extended = centered_extend_decomposition(decomposition, BigInt::from(257u16));
-        assert_eq!(extended.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
-        assert_eq!(extended.1.1.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
+        let rebased = centered_rebase_decomposition(decomposition, BigInt::from(257u16));
+        assert_eq!(rebased.0.0.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
+        assert_eq!(rebased.1.1.matrix_type().modulus, IntExpr::constant(BigInt::from(257u16)));
     }
 }

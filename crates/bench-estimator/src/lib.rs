@@ -1,40 +1,177 @@
 //! Cost estimation over validated scoped execution plans.
 
-pub mod dataflow;
 #[cfg(feature = "gpu")]
 pub mod gpu;
-#[cfg(feature = "gpu")]
-pub mod gpu_admission;
 pub mod harness;
 
 use mxx_ir_core::{
     BenchmarkRole, FrozenGraphScopeId, IntExpr, LivenessSchedule, ParamEnv, RealExpr,
-    ValidatedGraph, encoding,
+    ValidatedGraph,
+    artifact::ArtifactAvailability,
+    encoding,
     node::NodeKind,
-    types::{ConcreteWireType, NodeId, WireRef, WireType},
+    types::{ConcreteWireType, NodeId, Port, WireRef, WireType},
 };
+use mxx_runtime::{ArtifactKey, ArtifactStore, load_artifact_payload_sizes};
 use num_traits::ToPrimitive;
-use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
 
+/// Exact lengths of canonical artifact payloads captured at an artifact-store
+/// boundary.  This is deliberately not serialized and is kept separate from
+/// the public manifest schema: compact codec lengths are properties of the
+/// persisted payload, not of an artifact's logical type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactPayloadSizes {
+    members: BTreeMap<ArtifactSizeKey, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
+struct ArtifactSizeKey {
+    production: mxx_ir_core::artifact::ProductionId,
+    name: String,
+    index: Option<usize>,
+}
+
+impl ArtifactPayloadSizes {
+    /// Test-only construction helper. Production callers must use
+    /// [`capture_artifact_payload_sizes`], which reads the canonical payload
+    /// lengths from an [`ArtifactStore`].
+    #[cfg(test)]
+    fn from_entries(
+        entries: impl IntoIterator<
+            Item = (mxx_ir_core::artifact::ProductionId, String, Option<usize>, u64),
+        >,
+    ) -> Self {
+        Self {
+            members: entries
+                .into_iter()
+                .map(|(production, name, index, bytes)| {
+                    (ArtifactSizeKey { production, name, index }, bytes)
+                })
+                .collect(),
+        }
+    }
+
+    fn total_for(
+        &self,
+        production: &mxx_ir_core::artifact::ProductionId,
+        name: &str,
+        family_count: Option<usize>,
+    ) -> Option<u64> {
+        match family_count {
+            None => self
+                .members
+                .get(&ArtifactSizeKey {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: None,
+                })
+                .copied(),
+            Some(count) => (0..count).try_fold(0u64, |total, index| {
+                let size = self.members.get(&ArtifactSizeKey {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: Some(index),
+                })?;
+                total.checked_add(*size)
+            }),
+        }
+    }
+
+    fn require_for(
+        &self,
+        production: &mxx_ir_core::artifact::ProductionId,
+        name: &str,
+        family_count: Option<usize>,
+    ) -> Result<u64, EstimateError> {
+        match family_count {
+            None => self.total_for(production, name, None).ok_or_else(|| {
+                EstimateError::MissingArtifactPayloadSize {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: None,
+                }
+            }),
+            Some(count) => {
+                let mut total = 0u64;
+                for index in 0..count {
+                    let size = self
+                        .members
+                        .get(&ArtifactSizeKey {
+                            production: production.clone(),
+                            name: name.to_owned(),
+                            index: Some(index),
+                        })
+                        .copied()
+                        .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                            production: production.clone(),
+                            name: name.to_owned(),
+                            index: Some(index),
+                        })?;
+                    total =
+                        total.checked_add(size).ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                }
+                Ok(total)
+            }
+        }
+    }
+}
+
+/// Captures exact serialized artifact payload lengths from the store boundary.
+///
+/// The returned context is intentionally opaque: callers cannot manufacture
+/// transport sizes or add entries without reading the corresponding payload
+/// from an [`ArtifactStore`].
+pub fn capture_artifact_payload_sizes<S: ArtifactStore>(
+    validated: &ValidatedGraph,
+    store: &mut S,
+) -> Result<ArtifactPayloadSizes, EstimateError> {
+    let mut captured = ArtifactPayloadSizes { members: BTreeMap::new() };
+    let mut seen = BTreeSet::new();
+    for plan in validated.scopes.values() {
+        for (position, handle) in plan.execution_order.iter().enumerate() {
+            let NodeKind::Input { artifact: Some(artifact), .. } = handle.kind() else {
+                continue;
+            };
+            let wire = WireRef { node: NodeId(position as u64), port: Port(0) };
+            let descriptor = plan.artifact_inputs.get(&wire).ok_or_else(|| {
+                EstimateError::MissingArtifactPayloadSize {
+                    production: artifact.production_id.clone(),
+                    name: artifact.artifact_name.clone(),
+                    index: None,
+                }
+            })?;
+            let key = (artifact.production_id.clone(), artifact.artifact_name.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let artifact_key =
+                ArtifactKey { production: key.0.clone(), name: key.1.clone(), index: None };
+            let sizes = load_artifact_payload_sizes(store, &artifact_key, descriptor)
+                .map_err(|error| EstimateError::Backend(error.to_string()))?;
+            for (index, bytes) in sizes {
+                captured.members.insert(
+                    ArtifactSizeKey { production: key.0.clone(), name: key.1.clone(), index },
+                    u64::try_from(bytes).map_err(|_| EstimateError::LogicalByteTotalOverflow)?,
+                );
+            }
+        }
+    }
+    Ok(captured)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
-    /// Backend work units. The GPU backend uses aggregate execution-owner CUDA-event
-    /// spans in device-seconds; the generic host harness uses host elapsed seconds.
     pub work_seconds: f64,
-    /// Ideal dependency latency: maximum measured class time for independent waves,
-    /// plus separately measured preparation/initialization prerequisites when present.
+    /// Dependency latency: one fleet wave for independently column-separable operations.
     pub latency_seconds: f64,
-    /// Sum of production fleet wave latencies and their preparation/initialization
-    /// prerequisites for the full logical operation.
+    /// Sum of all production fleet wave latencies for the full logical operation.
     pub cumulative_wave_seconds: f64,
     /// Number of independent fleet waves needed for the full logical operation.
     pub independent_wave_count: usize,
-    /// Measured incremental allocation, excluding the invocation's resident baseline.
-    /// Allocating GPU representatives include one wave's outputs, not scratch alone.
-    /// Native prepared measurements exclude already retained output/input owners.
+    /// Measured scratch for one bounded execution wave, excluding resident inputs.
     /// This is not the whole-graph runtime peak and is never multiplied by wave count.
     pub measured_wave_workspace_bytes: u64,
     /// Hypothetical workspace when all independent waves execute concurrently.
@@ -70,15 +207,6 @@ pub struct MeasurementNode<'a> {
     pub concrete_output_types: Vec<ConcreteWireType>,
 }
 
-/// Whether the measured inputs and placement establish a concrete runtime scenario.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MeasurementScenario {
-    #[default]
-    BackendDefined,
-    /// Synthetic input values and fresh placement; retained runtime owners/budgets are absent.
-    SyntheticFreshPlacement,
-}
-
 pub trait MeasurementBackend {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -89,72 +217,6 @@ pub trait MeasurementBackend {
         bindings: &ParamEnv,
     ) -> Result<NodeMeasurement, Self::Error>;
 
-    fn measurement_scenario(&self) -> MeasurementScenario {
-        MeasurementScenario::BackendDefined
-    }
-
-    /// GPU backends model runtime staging separately from GPU-resident primitive work.
-    fn models_dataflow(&self) -> bool {
-        false
-    }
-    /// Whole primitive cost for the currently admitted sibling batch. This is
-    /// a CPU-only lookup of explicit warmup observations, never a GPU trial.
-    /// A backend that supplies these costs must cover every non-structural node
-    /// (including zero-cost nodes), or return None for the entire traversal.
-    /// The caller charges the returned joint cost once, not once per member.
-    fn measure_dataflow_batch(
-        &mut self,
-        _graph: &ValidatedGraph,
-        _scope: &FrozenGraphScopeId,
-        _node: NodeId,
-        _instances: &[dataflow::ScopeSiblingState],
-    ) -> Result<Option<NodeMeasurement>, Self::Error> {
-        Ok(None)
-    }
-    /// Establish the graph's dataflow scenario before visiting any scope.
-    /// GPU implementations collect metadata here; disposable GPU work belongs
-    /// to explicit measurement/warmup, never the dataflow traversal.
-    fn prepare_dataflow(&mut self, _graph: &ValidatedGraph) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    /// Observe actual CPU traversal boundaries to carry admission assignments
-    /// and returned owner bindings between scopes. Enter/Leave delimit every
-    /// bounded batch, including repeated invocations. AfterNode publishes one
-    /// sibling in host order. No event authorizes GPU execution or discovery.
-    /// An error aborts traversal; prepare_dataflow resets a subsequent estimate.
-    fn dataflow_step(
-        &mut self,
-        _graph: &ValidatedGraph,
-        _scope: &FrozenGraphScopeId,
-        _instances: &[dataflow::ScopeSiblingState],
-        _ancestors: &[dataflow::ScopeAdmissionState],
-        _step: dataflow::DataflowStep,
-    ) -> Result<(), Self::Error> {
-        Ok(())
-    }
-    /// CPU-only admission before any loop input materialization or body visit.
-    /// The request retains descriptor states, parent wire identities, input
-    /// modes and executor output-retention decisions. Implementations must not
-    /// execute a body or perform GPU discovery. Missing scenario information can
-    /// return an error; the estimator must not substitute a successful wave.
-    /// The default describes a serial synthetic scenario, not GPU admission.
-    fn family_wave_size(
-        &mut self,
-        _request: &dataflow::LoopAdmissionRequest<'_>,
-    ) -> Result<usize, Self::Error> {
-        Ok(1)
-    }
-    fn executor_dispatch_seconds(&self) -> f64 {
-        0.0
-    }
-    fn measure_transfer(
-        &mut self,
-        _kind: dataflow::TransferKind,
-        _ty: &ConcreteWireType,
-    ) -> Result<f64, Self::Error> {
-        Ok(0.0)
-    }
-
     fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64;
     fn persistent_bytes_for_node(&self, _kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         self.persistent_bytes(wire_type)
@@ -164,15 +226,41 @@ pub trait MeasurementBackend {
     /// representation differs from their resident representation.
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         match kind {
-            NodeKind::Input { artifact: Some(_), .. } => 0,
-            NodeKind::Input { .. } => self.persistent_bytes_for_node(kind, wire_type),
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.availability == ArtifactAvailability::Cached =>
+            {
+                0
+            }
+            NodeKind::Input { .. } => self.artifact_payload_bytes_for_node(kind, wire_type, None),
             _ => 0,
         }
     }
     /// Deterministic data reusable between invocations (for example a keyed
     /// hash/cache entry). It is deliberately separate from transmission.
-    fn cache_bytes_for_node(&self, _kind: &NodeKind, _wire_type: &ConcreteWireType) -> u64 {
-        0
+    fn cache_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        match kind {
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.availability == ArtifactAvailability::Cached =>
+            {
+                self.artifact_payload_bytes_for_node(kind, wire_type, None)
+            }
+            _ => 0,
+        }
+    }
+    /// Size of the canonical serialized artifact payload used at the stage
+    /// boundary. This is deliberately separate from resident/persistent
+    /// storage: compact artifacts are transported in their codec form even
+    /// when the runtime expands them into a full device allocation. Exact
+    /// artifact sizes are supplied by `estimate_with_artifact_sizes`; this
+    /// hook remains for non-artifact synthetic backends.
+    fn artifact_payload_bytes_for_node(
+        &self,
+        kind: &NodeKind,
+        wire_type: &ConcreteWireType,
+        manifest_payload_bytes: Option<u64>,
+    ) -> u64 {
+        manifest_payload_bytes
+            .unwrap_or_else(|| self.persistent_storage_bytes_for_node(kind, wire_type))
     }
     /// Persistent storage required for the complete logical output artifact.
     fn persistent_storage_bytes_for_node(
@@ -202,17 +290,9 @@ pub trait MeasurementBackend {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CostReport {
-    /// Synthetic scenarios cannot establish runtime schedule agreement or memory admission.
-    pub measurement_scenario: MeasurementScenario,
-    /// Runtime boundary costs, added to total_time_seconds, not to GPU work.
-    #[serde(default)]
-    pub dataflow: dataflow::DataflowCost,
-    #[serde(default)]
-    pub transfers: Vec<dataflow::TransferCost>,
     pub total_work_seconds: f64,
-    /// Cumulative primitive wave latencies plus measured runtime transfer boundaries and
-    /// modeled executor dispatch, including every logical invocation. This is distinct
-    /// from the unlimited-resource GPU critical path; dataflow costs are reported separately.
+    /// Cumulative measured wave latencies including every logical invocation.
+    /// This work-like sum is distinct from the unlimited-resource critical path.
     pub total_time_seconds: f64,
     /// Total measured work attributable to preimage sampling nodes, including loop multiplicity.
     pub preimage_sampling_work_seconds: f64,
@@ -300,24 +380,14 @@ pub enum EstimateError {
     LoopIndexDependentCost { scope: FrozenGraphScopeId, node: NodeId },
     #[error("logical byte count exceeds u128")]
     LogicalByteTotalOverflow,
-}
-
-/// A measurement backend whose collection pass is completed before reporting.
-pub trait CollectedMeasurementBackend: MeasurementBackend {
-    fn measure_collected(&mut self) -> Result<(), Self::Error>;
-}
-
-/// Collect all stages, measure their shared classes once, then report each stage
-/// in caller order. Backend lifetime, hardware, and oracle inclusion stay explicit.
-pub fn measure_graphs<B: CollectedMeasurementBackend>(
-    graphs: &[&ValidatedGraph],
-    backend: &mut B,
-) -> Result<Vec<CostReport>, EstimateError> {
-    for graph in graphs {
-        estimate(graph, backend)?;
-    }
-    backend.measure_collected().map_err(|error| EstimateError::Backend(error.to_string()))?;
-    graphs.iter().map(|graph| estimate(graph, backend)).collect()
+    #[error(
+        "exact serialized payload size is missing for artifact {production:?}/{name} member {index:?}"
+    )]
+    MissingArtifactPayloadSize {
+        production: mxx_ir_core::artifact::ProductionId,
+        name: String,
+        index: Option<usize>,
+    },
 }
 
 /// Estimates an unlimited-resource DAG schedule. GPU fleet limits are reflected
@@ -326,8 +396,42 @@ pub fn estimate<B: MeasurementBackend>(
     validated: &ValidatedGraph,
     backend: &mut B,
 ) -> Result<CostReport, EstimateError> {
-    let mut estimator =
-        Estimator { validated, backend, cache: HashMap::new(), invocations: BTreeMap::new() };
+    estimate_internal(validated, backend, None)
+}
+
+/// Estimates a graph whose transferred or cached artifact inputs are backed
+/// by exact serialized payload lengths captured from the artifact store.
+pub fn estimate_with_artifact_sizes<B: MeasurementBackend>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    payload_sizes: &ArtifactPayloadSizes,
+) -> Result<CostReport, EstimateError> {
+    estimate_internal(validated, backend, Some(payload_sizes))
+}
+
+/// Estimates a graph using exact payload lengths read from an artifact store.
+/// This is the production entry point for graphs containing artifact inputs.
+pub fn estimate_with_artifact_store<B: MeasurementBackend, S: ArtifactStore>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    store: &mut S,
+) -> Result<CostReport, EstimateError> {
+    let payload_sizes = capture_artifact_payload_sizes(validated, store)?;
+    estimate_with_artifact_sizes(validated, backend, &payload_sizes)
+}
+
+fn estimate_internal<B: MeasurementBackend>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    payload_sizes: Option<&ArtifactPayloadSizes>,
+) -> Result<CostReport, EstimateError> {
+    let mut estimator = Estimator {
+        validated,
+        backend,
+        payload_sizes,
+        cache: HashMap::new(),
+        invocations: BTreeMap::new(),
+    };
     let mut report = estimator.estimate_scope(&FrozenGraphScopeId::Root, &validated.bindings)?;
     estimator.record_child_invocations(&FrozenGraphScopeId::Root, &validated.bindings, 1)?;
     for (key, count) in estimator.invocations {
@@ -357,21 +461,6 @@ pub fn estimate<B: MeasurementBackend>(
             );
         }
     }
-    if estimator.backend.models_dataflow() {
-        let (dataflow, transfers) = dataflow::estimate(validated, estimator.backend)?;
-        if let Some(primitives) = &dataflow.primitives {
-            report.total_work_seconds = primitives.work_seconds;
-            report.total_time_seconds = primitives.total_time_seconds;
-            report.preimage_sampling_work_seconds = primitives.preimage_sampling_work_seconds;
-            report.benchmark_roles = primitives.benchmark_roles.clone();
-            report.measured_wave_workspace_bytes = primitives.measured_wave_workspace_bytes;
-            report.chunk_count = primitives.wave_count;
-        }
-        report.total_time_seconds += dataflow.transfer_seconds + dataflow.executor_dispatch_seconds;
-        report.dataflow = dataflow;
-        report.transfers = transfers;
-    }
-    report.measurement_scenario = estimator.backend.measurement_scenario();
     Ok(report)
 }
 
@@ -421,6 +510,7 @@ impl CacheKey {
 struct Estimator<'a, B: MeasurementBackend> {
     validated: &'a ValidatedGraph,
     backend: &'a mut B,
+    payload_sizes: Option<&'a ArtifactPayloadSizes>,
     cache: HashMap<CacheKey, CostReport>,
     invocations: BTreeMap<CacheKey, usize>,
 }
@@ -605,18 +695,24 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         let mut completion = BTreeMap::<WireRef, f64>::new();
         let mut scheduled = Vec::with_capacity(plan.execution_order.len());
         let mut allocation_roots = BTreeMap::<WireRef, WireRef>::new();
+        // An input node is a logical read of one artifact key.  Graph aliases
+        // can expose that key more than once, but transmission/cache storage
+        // is charged once per execution boundary.
+        let mut accounted_artifacts =
+            BTreeSet::<(mxx_ir_core::artifact::ProductionId, String)>::new();
 
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
             let arguments = scope.arguments(handle).expect("plan node belongs to scope");
             let concrete_argument_types = arguments
-                .par_iter()
+                .iter()
                 .map(|wire| {
-                    self.validated
-                        .concrete_wire_type(scope_id, *wire, bindings)
-                        .map_err(|error| EstimateError::Expression(error.to_string()))
+                    plan.wire_types
+                        .get(wire)
+                        .cloned()
+                        .expect("validated argument has a concrete type")
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect::<Vec<_>>();
             let argument_types = concrete_argument_types.clone();
             let argument_kinds = arguments
                 .iter()
@@ -625,17 +721,13 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 })
                 .collect::<Vec<_>>();
             let concrete_output_types = (0..handle.output_types().len())
-                .into_par_iter()
                 .map(|port| {
-                    self.validated
-                        .concrete_wire_type(
-                            scope_id,
-                            WireRef { node: id, port: mxx_ir_core::Port(port as u32) },
-                            bindings,
-                        )
-                        .map_err(|error| EstimateError::Expression(error.to_string()))
+                    plan.wire_types
+                        .get(&WireRef { node: id, port: mxx_ir_core::Port(port as u32) })
+                        .cloned()
+                        .expect("validated output has a concrete type")
                 })
-                .collect::<Result<Vec<_>, _>>()?;
+                .collect();
             let node = MeasurementNode {
                 scope: scope_id,
                 id,
@@ -689,34 +781,85 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 report.expanded_workspace_bytes.max(measurement.workspace_bytes);
             report.chunk_count =
                 report.chunk_count.saturating_add(measurement.independent_wave_count);
+            // An artifact input is a logical read of one persisted key.  A
+            // graph may expose that key through more than one input wire (or
+            // alias a family in several places), but its durable storage must
+            // be charged once, just like transport and cache accounting
+            // below.  Keep the per-member family size supplied by the
+            // backend; only duplicate references are suppressed here.
+            let account_artifact = match node.kind {
+                NodeKind::Input { artifact: Some(artifact), .. } => accounted_artifacts
+                    .insert((artifact.production_id.clone(), artifact.artifact_name.clone())),
+                _ => true,
+            };
             for wire_type in &node.concrete_output_types {
-                report.output_bytes = report
-                    .output_bytes
-                    .checked_add(u128::from(
-                        self.backend.output_bytes_for_node(node.kind, wire_type),
-                    ))
-                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
-                report.persistent_storage_bytes = report
-                    .persistent_storage_bytes
-                    .checked_add(u128::from(
-                        self.backend.persistent_storage_bytes_for_node(node.kind, wire_type),
-                    ))
-                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                if account_artifact {
+                    report.output_bytes = report
+                        .output_bytes
+                        .checked_add(u128::from(
+                            self.backend.output_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                    report.persistent_storage_bytes = report
+                        .persistent_storage_bytes
+                        .checked_add(u128::from(
+                            self.backend.persistent_storage_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                }
             }
             if matches!(node.kind, NodeKind::Input { .. }) {
-                for wire_type in &node.concrete_output_types {
-                    report.transmitted_bytes = report
-                        .transmitted_bytes
-                        .checked_add(u128::from(
-                            self.backend.transmitted_bytes_for_node(node.kind, wire_type),
-                        ))
-                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
-                    report.cache_bytes = report
-                        .cache_bytes
-                        .checked_add(u128::from(
-                            self.backend.cache_bytes_for_node(node.kind, wire_type),
-                        ))
-                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                if account_artifact {
+                    for wire_type in &node.concrete_output_types {
+                        let exact_payload_bytes = match node.kind {
+                            NodeKind::Input { artifact: Some(artifact), .. } => {
+                                let descriptor = plan
+                                    .artifact_inputs
+                                    .get(&WireRef { node: id, port: mxx_ir_core::Port(0) })
+                                    .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                                        production: artifact.production_id.clone(),
+                                        name: artifact.artifact_name.clone(),
+                                        index: None,
+                                    })?;
+                                Some(
+                                    self.payload_sizes
+                                        .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                                            production: artifact.production_id.clone(),
+                                            name: artifact.artifact_name.clone(),
+                                            index: None,
+                                        })?
+                                        .require_for(
+                                            &artifact.production_id,
+                                            &artifact.artifact_name,
+                                            descriptor.family_count,
+                                        )?,
+                                )
+                            }
+                            _ => None,
+                        };
+                        let payload_bytes = self.backend.artifact_payload_bytes_for_node(
+                            node.kind,
+                            wire_type,
+                            exact_payload_bytes,
+                        );
+                        match node.kind {
+                            NodeKind::Input { artifact: Some(artifact), .. }
+                                if artifact.availability == ArtifactAvailability::Cached =>
+                            {
+                                report.cache_bytes = report
+                                    .cache_bytes
+                                    .checked_add(u128::from(payload_bytes))
+                                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                            }
+                            NodeKind::Input { .. } => {
+                                report.transmitted_bytes = report
+                                    .transmitted_bytes
+                                    .checked_add(u128::from(payload_bytes))
+                                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             report
@@ -744,8 +887,12 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 {
                     0 // Child input nodes borrow the caller's values.
                 } else {
-                    self.backend
-                        .persistent_bytes_for_node(handle.kind(), &node.concrete_output_types[port])
+                    plan.wire_types
+                        .get(&wire)
+                        .map(|wire_type| {
+                            self.backend.persistent_bytes_for_node(handle.kind(), wire_type)
+                        })
+                        .unwrap_or(0)
                 };
                 outputs.push((wire, bytes));
             }
@@ -1102,7 +1249,18 @@ fn child_bindings(
     bindings: &[(String, mxx_ir_core::IntExpr)],
     loop_index: Option<(u32, usize)>,
 ) -> Result<ParamEnv, EstimateError> {
-    parent.child(bindings, loop_index).map_err(|error| EstimateError::Expression(error.to_string()))
+    let mut child = parent.clone();
+    if let Some((slot, index)) = loop_index {
+        child.loop_indices.insert(slot, index.into());
+    }
+    let expression_env = child.clone();
+    for (name, expression) in bindings {
+        let value = expression
+            .evaluate(&expression_env)
+            .map_err(|error| EstimateError::Expression(error.to_string()))?;
+        child.integers.insert(name.clone(), value);
+    }
+    Ok(child)
 }
 
 fn measured_cost_depends_on_loop_slots(
@@ -1398,115 +1556,9 @@ fn wire_type_depends_on(
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn test_measure_graphs_collects_before_measurement_and_reporting() {
-        use std::convert::Infallible;
-        struct OrderedBackend {
-            measured: bool,
-            events: Vec<&'static str>,
-        }
-        impl super::MeasurementBackend for OrderedBackend {
-            type Error = Infallible;
-            fn persistent_bytes(&self, wire_type: &super::ConcreteWireType) -> u64 {
-                wire_type.matrix_type().map_or(0, |matrix| (matrix.rows * matrix.columns) as u64)
-            }
-            fn measure(
-                &mut self,
-                graph: &str,
-                node: &super::MeasurementNode<'_>,
-                bindings: &mxx_ir_core::ParamEnv,
-            ) -> Result<super::NodeMeasurement, Self::Error> {
-                assert!(!graph.is_empty());
-                assert!(!node.concrete_output_types.is_empty());
-                assert_eq!(bindings, &mxx_ir_core::ParamEnv::default());
-                self.events.push(if self.measured { "report" } else { "collect" });
-                Ok(super::NodeMeasurement::default())
-            }
-        }
-        impl super::CollectedMeasurementBackend for OrderedBackend {
-            fn measure_collected(&mut self) -> Result<(), Self::Error> {
-                assert!(!self.measured);
-                self.events.push("measure");
-                self.measured = true;
-                Ok(())
-            }
-        }
-        let ring = mxx_dsl::Ring::new(257, 8);
-        let graph = mxx_dsl::DslContext::new("measurement-order")
-            .output("value", -ring.input("input", (1, 1)))
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&mxx_ir_core::ParamEnv::default())
-            .unwrap();
-        let mut backend = OrderedBackend { measured: false, events: Vec::new() };
-        let reports = super::measure_graphs(&[&graph, &graph], &mut backend).unwrap();
-        assert_eq!(reports.len(), 2);
-        let boundary = backend.events.iter().position(|event| *event == "measure").unwrap();
-        assert!(boundary >= 2);
-        assert!(backend.events[..boundary].iter().all(|event| *event == "collect"));
-        assert!(backend.events[boundary + 1..].iter().all(|event| *event == "report"));
-        assert!(backend.events.len() > boundary + 2);
-    }
-
     use super::*;
     use mxx_dsl::{DslContext, Int, IntType, Ring, Subgraph, iterate, parallel};
     use std::{collections::BTreeSet, convert::Infallible};
-
-    #[test]
-    fn test_scope_measurements_resolve_types_from_invocation_bindings() {
-        #[derive(Default)]
-        struct TypedBackend(Vec<(Vec<ConcreteWireType>, Vec<ConcreteWireType>)>);
-        impl MeasurementBackend for TypedBackend {
-            type Error = Infallible;
-            fn measure(
-                &mut self,
-                _: &str,
-                node: &MeasurementNode<'_>,
-                _: &ParamEnv,
-            ) -> Result<NodeMeasurement, Infallible> {
-                self.0.push((
-                    node.concrete_argument_types.clone(),
-                    node.concrete_output_types.clone(),
-                ));
-                Ok(NodeMeasurement::default())
-            }
-            fn persistent_bytes(&self, ty: &ConcreteWireType) -> u64 {
-                ty.matrix_type().map_or(0, |matrix| (matrix.rows * matrix.columns) as u64)
-            }
-        }
-        let ring = Ring::new(257, 8);
-        let graph = DslContext::new("invocation-type-estimate")
-            .int_parameter("columns")
-            .output("value", -ring.input("input", (1, IntExpr::Var("columns".into()))))
-            .unwrap()
-            .build()
-            .unwrap();
-        let env = |columns| ParamEnv {
-            integers: BTreeMap::from([("columns".into(), num_bigint::BigInt::from(columns))]),
-            ..ParamEnv::default()
-        };
-        let original = graph.validate(&env(3)).unwrap();
-        let actual = env(7);
-        let revalidated = graph.validate(&actual).unwrap();
-        let mut observed = Vec::new();
-        for validated in [&original, &revalidated] {
-            let mut backend = TypedBackend::default();
-            let report = Estimator {
-                validated,
-                backend: &mut backend,
-                cache: HashMap::new(),
-                invocations: BTreeMap::new(),
-            }
-            .estimate_scope(&FrozenGraphScopeId::Root, &actual)
-            .unwrap();
-            observed.push((backend.0, report.peak_memory_bytes, report.persistent_storage_bytes));
-        }
-        assert_eq!(
-            observed[0], observed[1],
-            "resolving an invocation must agree with fresh type validation"
-        );
-    }
 
     struct UnitBackend;
 
@@ -1758,15 +1810,23 @@ mod tests {
     }
 
     #[test]
-    fn artifact_inputs_are_local_persistence_not_transport() {
+    fn deterministic_cache_artifact_inputs_are_local_persistence_not_transport() {
         let ring = Ring::new(17, 8);
         let production_id = mxx_ir_core::artifact::ProductionId {
             spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
             execution_nonce: [8; 32],
         };
-        let artifact = ring.artifact_input(production_id.clone(), "artifact-setup-t", (1, 1));
-        let built = DslContext::new("estimate-artifact-input")
-            .output("setup-t", artifact)
+        // This fixture models a keyed public setup/LUT whose producer is
+        // expected to finalize the deterministic entry before the consumer
+        // runs.  It is intentionally not a sampled secret or trapdoor.
+        let cached_setup = ring.artifact_input(
+            production_id.clone(),
+            "public-deterministic-setup-lut",
+            (1, 1),
+            mxx_ir_core::artifact::ArtifactAvailability::Cached,
+        );
+        let built = DslContext::new("estimate-deterministic-cache-artifact")
+            .output("setup-t", cached_setup)
             .expect("output")
             .build()
             .expect("build");
@@ -1776,7 +1836,7 @@ mod tests {
             artifacts: BTreeMap::new(),
         };
         manifest.artifacts.insert(
-            "artifact-setup-t".to_owned(),
+            "public-deterministic-setup-lut".to_owned(),
             mxx_ir_core::artifact::ManifestArtifact {
                 artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(
                     mxx_ir_core::types::ConcreteMatrixType {
@@ -1787,17 +1847,148 @@ mod tests {
                     },
                 ),
                 family_count: None,
+                availability: mxx_ir_core::artifact::ArtifactAvailability::Cached,
                 layout: None,
             },
         );
         let mut manifests = BTreeMap::new();
-        manifests.insert(production_id, manifest);
+        manifests.insert(production_id.clone(), manifest);
         let validated = built
             .validate_with_manifests(&ParamEnv::default(), &manifests)
-            .expect("artifact graph validates");
-        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
+            .expect("cached artifact graph validates");
+        let payload_sizes = ArtifactPayloadSizes::from_entries([(
+            production_id,
+            "public-deterministic-setup-lut".to_owned(),
+            None,
+            13,
+        )]);
+        let report = estimate_with_artifact_sizes(&validated, &mut UnitBackend, &payload_sizes)
+            .expect("estimate");
         assert_eq!(report.transmitted_bytes, 0);
         assert!(report.persistent_storage_bytes > 0);
+    }
+
+    #[test]
+    fn repeated_shared_and_family_artifact_inputs_are_accounted_once_per_key() {
+        struct ArtifactAccountingBackend;
+        impl MeasurementBackend for ArtifactAccountingBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
+                match wire_type {
+                    ConcreteWireType::Matrix(_) => 8,
+                    ConcreteWireType::IndexedFamily { element, count } => {
+                        self.persistent_bytes(element).saturating_mul(*count as u64)
+                    }
+                    _ => 0,
+                }
+            }
+        }
+
+        let production_id = mxx_ir_core::artifact::ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([61; 32]),
+            execution_nonce: [62; 32],
+        };
+        let ring = Ring::new(17, 8);
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 1,
+        };
+
+        for availability in [
+            mxx_ir_core::artifact::ArtifactAvailability::Transferred,
+            mxx_ir_core::artifact::ArtifactAvailability::Cached,
+        ] {
+            let shared_a =
+                ring.artifact_input(production_id.clone(), "shared-a", (1, 1), availability);
+            let shared_b = shared_a.clone();
+            let members = ring.family_artifact_input(
+                production_id.clone(),
+                "members",
+                3,
+                (1, 1),
+                availability,
+            );
+            let built = DslContext::new("estimate-shared-family-artifacts")
+                .output("shared-a", shared_a)
+                .expect("first shared output")
+                .output("shared-b", shared_b)
+                .expect("second shared output")
+                .output("members", members)
+                .expect("family output")
+                .build()
+                .expect("build");
+            let descriptor = |family_count| mxx_ir_core::artifact::ManifestArtifact {
+                artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(matrix_type.clone()),
+                family_count,
+                availability,
+                layout: None,
+            };
+            let manifest = mxx_ir_core::artifact::Manifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: production_id.clone(),
+                artifacts: BTreeMap::from([
+                    ("shared-a".to_owned(), descriptor(None)),
+                    ("members".to_owned(), descriptor(Some(3))),
+                ]),
+            };
+            let validated = built
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production_id.clone(), manifest)]),
+                )
+                .expect("artifact graph validates");
+            let payload_sizes = ArtifactPayloadSizes::from_entries(
+                std::iter::once((
+                    production_id.clone(),
+                    "shared-a".to_owned(),
+                    None,
+                    b"shared-matrix".len() as u64,
+                ))
+                .chain((0..3).map(|index| {
+                    (
+                        production_id.clone(),
+                        "members".to_owned(),
+                        Some(index),
+                        b"member".len() as u64,
+                    )
+                })),
+            );
+            let report = estimate_with_artifact_sizes(
+                &validated,
+                &mut ArtifactAccountingBackend,
+                &payload_sizes,
+            )
+            .expect("artifact graph estimates");
+
+            // One shared payload plus three family members: duplicate graph
+            // aliases do not multiply durable storage.  Availability only
+            // changes the boundary split, never the logical stored size.
+            assert_eq!(report.persistent_storage_bytes, 8 + 3 * 8);
+            assert_eq!(report.output_bytes, 8 + 3 * 8);
+            let expected_boundary = b"shared-matrix".len() as u128 + 3 * b"member".len() as u128;
+            match availability {
+                mxx_ir_core::artifact::ArtifactAvailability::Transferred => {
+                    assert_eq!(report.transmitted_bytes, expected_boundary);
+                    assert_eq!(report.cache_bytes, 0);
+                }
+                mxx_ir_core::artifact::ArtifactAvailability::Cached => {
+                    assert_eq!(report.transmitted_bytes, 0);
+                    assert_eq!(report.cache_bytes, expected_boundary);
+                }
+            }
+        }
     }
 
     #[test]

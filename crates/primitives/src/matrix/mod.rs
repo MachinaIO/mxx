@@ -24,166 +24,59 @@ pub trait MatrixParams: Debug + Clone + PartialEq + Eq + Send + Sync {
     fn entry_size(&self) -> usize;
 }
 
-/// A source range whose accelerator placement is chosen by its consumer.
-/// Describing a range retains existing storage and never expands staging bytes.
-#[derive(Debug)]
-pub enum PolyMatrixColumnData<M> {
-    Resident {
-        value: Arc<M>,
-        start: usize,
-        end: usize,
-    },
-    CpuStaging {
-        bytes: Arc<Vec<u8>>,
-        ring_dimension: u32,
-        moduli: Arc<Vec<u64>>,
-        base_bits: u32,
-        dropped_moduli: usize,
-        start: usize,
-        end: usize,
-    },
+/// Typed errors for compact matrix headers. The legacy matrix trait retains
+/// its infallible decoder, while backend boundaries can validate versioned
+/// headers before invoking it.
+#[derive(Clone, Debug, Eq, PartialEq, Error)]
+pub enum CompactMatrixDecodeError {
+    #[error(
+        "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedVersion { version: u8, supported_versions: &'static [u8] },
+    #[error("invalid compact matrix header: {0}")]
+    InvalidHeader(&'static str),
+    #[error("invalid compact matrix payload: {0}")]
+    InvalidPayload(&'static str),
 }
 
-impl<M> PolyMatrixColumnData<M> {
-    pub fn staged(params: &impl PolyParams, bytes: Arc<Vec<u8>>, start: usize, end: usize) -> Self {
-        assert!(start <= end, "invalid staged column interval");
-        Self::CpuStaging {
-            bytes,
-            ring_dimension: params.ring_dimension(),
-            moduli: Arc::new(params.to_crt().0),
-            base_bits: params.base_bits(),
-            dropped_moduli: params.dropped_moduli(),
-            start,
-            end,
-        }
-    }
-
-    pub fn columns(&self) -> usize {
-        let (start, end) = match self {
-            Self::Resident { start, end, .. } | Self::CpuStaging { start, end, .. } => {
-                (*start, *end)
-            }
-        };
-        end.checked_sub(start).expect("valid source column interval")
-    }
-
-    pub fn subrange(&self, start: usize, end: usize) -> Self {
-        assert!(start <= end && end <= self.columns(), "invalid source column subrange");
-        match self {
-            Self::Resident { value, start: offset, .. } => Self::Resident {
-                value: Arc::clone(value),
-                start: offset + start,
-                end: offset + end,
-            },
-            Self::CpuStaging {
-                bytes,
-                ring_dimension,
-                moduli,
-                base_bits,
-                dropped_moduli,
-                start: offset,
-                ..
-            } => Self::CpuStaging {
-                bytes: Arc::clone(bytes),
-                ring_dimension: *ring_dimension,
-                moduli: Arc::clone(moduli),
-                base_bits: *base_bits,
-                dropped_moduli: *dropped_moduli,
-                start: offset + start,
-                end: offset + end,
-            },
-        }
-    }
-}
-
-impl<M: PolyMatrix> PolyMatrixColumnData<M> {
-    /// Validate before constructing an expanded tile. Staging identity excludes
-    /// execution placement; an existing resident owner must already belong to
-    /// this execution. Explicit transfers belong to the caller's transport plan.
-    pub fn validate_parameters(
-        &self,
-        params: &<M::P as Poly>::Params,
-    ) -> Result<(), SmallMatrixError> {
-        match self {
-            Self::Resident { value, start, end } => {
-                if start > end || *end > value.col_size() {
-                    return Err(SmallMatrixError::ShapeMismatch);
-                }
-                if value.params() != params {
-                    return Err(SmallMatrixError::ParameterMismatch);
-                }
-                if value.params().execution_owner_id() != params.execution_owner_id() {
-                    return Err(SmallMatrixError::DeviceMismatch);
-                }
-            }
-            Self::CpuStaging {
-                ring_dimension,
-                moduli,
-                base_bits,
-                dropped_moduli,
-                start,
-                end,
-                ..
-            } => {
-                if start > end {
-                    return Err(SmallMatrixError::ShapeMismatch);
-                }
-                if *ring_dimension != params.ring_dimension() ||
-                    **moduli != params.to_crt().0 ||
-                    *base_bits != params.base_bits() ||
-                    *dropped_moduli != params.dropped_moduli()
-                {
-                    return Err(SmallMatrixError::ParameterMismatch);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn materialize(self, params: &<M::P as Poly>::Params) -> Result<M, SmallMatrixError> {
-        self.validate_parameters(params)?;
-        Ok(match self {
-            Self::Resident { value, start, end } => value.slice_columns(start, end),
-            Self::CpuStaging { bytes, start, end, .. } => {
-                M::from_cpu_staging_columns(params, bytes.as_slice(), start, end)
-            }
-        })
-    }
-}
-
-/// A logical full matrix whose columns are materialized on the consumer's owner.
+/// A logical full matrix whose columns are materialized on demand.
 ///
-/// A range describes existing resident storage or host staging. Implementations
-/// must not allocate accelerator storage while constructing that description.
-/// The consumer materializes it with explicit execution parameters, after its
-/// range has been assigned to a worker.
+/// Implementations may be backed by host staging bytes or persistent storage;
+/// callers must not assume that the complete expanded matrix is resident.
 pub trait PolyMatrixColumnSource<M>: Debug + Send + Sync {
     fn row_size(&self) -> usize;
     fn col_size(&self) -> usize;
 
     /// Expanded storage already resident while a sampling tile is live.
+    /// Host-backed sources return `None`; resident sources expose their owner
+    /// so the sampler includes it in its peak-memory calculation.
     fn resident_matrix(&self) -> Option<&M> {
         None
     }
 
     /// Global offset of local column zero in the logical matrix.
-    /// Sampling is reproducible for the same seed and tile schedule; changing
-    /// tile boundaries can change the sampled preimage.
+    ///
+    /// Column-partitioned backends include this offset when deriving tile
+    /// randomness. GPU sampling is reproducible for the same seed and tile
+    /// schedule; changing tile boundaries can change the sampled preimage.
     fn global_column_start(&self) -> usize {
         0
     }
 
-    fn column_range(&self, start: usize, end: usize) -> PolyMatrixColumnData<M>;
+    fn load_columns(&self, start: usize, end: usize) -> M;
 }
 
+/// Owns a resident matrix while presenting it as a logical column source.
+/// Sampling can therefore retain the full logical shape and load only the
+/// requested columns, without exposing an expanded preimage-returning API.
 #[derive(Clone, Debug)]
 pub struct ResidentPolyMatrixColumnSource<M: PolyMatrix> {
-    value: Arc<M>,
+    value: M,
 }
 
 impl<M: PolyMatrix> ResidentPolyMatrixColumnSource<M> {
     pub fn new(value: M) -> Self {
-        Self { value: Arc::new(value) }
+        Self { value }
     }
 }
 
@@ -191,15 +84,17 @@ impl<M: PolyMatrix> PolyMatrixColumnSource<M> for ResidentPolyMatrixColumnSource
     fn resident_matrix(&self) -> Option<&M> {
         Some(&self.value)
     }
+
     fn row_size(&self) -> usize {
         self.value.row_size()
     }
+
     fn col_size(&self) -> usize {
         self.value.col_size()
     }
-    fn column_range(&self, start: usize, end: usize) -> PolyMatrixColumnData<M> {
-        assert!(start <= end && end <= self.col_size(), "invalid resident column interval");
-        PolyMatrixColumnData::Resident { value: Arc::clone(&self.value), start, end }
+
+    fn load_columns(&self, start: usize, end: usize) -> M {
+        self.value.slice_columns(start, end)
     }
 }
 
@@ -442,6 +337,28 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    /// Checked compact decoder used at artifact/runtime boundaries.  The
+    /// historical infallible method remains available for already-validated
+    /// internal values, but untrusted bytes must enter through this method.
+    fn try_from_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::validate_compact_bytes(bytes)?;
+        Ok(Self::from_compact_bytes(params, bytes))
+    }
+    fn validate_compact_bytes(bytes: &[u8]) -> Result<(), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Ok(())
+    }
+    /// Extract the serialized logical shape without allocating a matrix.
+    /// Artifact/runtime boundaries use this before invoking the checked
+    /// decoder so a valid payload for a different wire shape cannot be
+    /// accepted under the requested type.
+    fn compact_shape(bytes: &[u8]) -> Result<(usize, usize), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Err(CompactMatrixDecodeError::InvalidHeader("compact matrix shape is unavailable"))
+    }
     fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_compact_bytes()).collect()
     }
@@ -457,13 +374,31 @@ pub trait PolyMatrix:
         start: usize,
         end: usize,
     ) -> Self {
-        let full = Self::from_cpu_staging_bytes(params, bytes);
-        assert!(start <= end && end <= full.col_size(), "invalid staging column interval");
-        full.slice_columns(start, end)
+        Self::try_from_cpu_staging_columns(params, bytes, start, end)
+            .expect("validated CPU staging artifact")
+    }
+    fn try_from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        let full = Self::try_from_cpu_staging_bytes(params, bytes)?;
+        if start > end || end > full.col_size() {
+            return Err(CompactMatrixDecodeError::InvalidHeader("invalid staging column interval"));
+        }
+        Ok(full.slice_columns(start, end))
     }
 
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         Self::from_compact_bytes(params, bytes)
+    }
+    /// Checked decoder for host/RNS staging artifacts.
+    fn try_from_cpu_staging_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::try_from_compact_bytes(params, bytes)
     }
     fn copy_to_params_direct(&self, _params: &<Self::P as Poly>::Params) -> Option<Self> {
         None
@@ -734,6 +669,14 @@ pub trait PolyMatrix:
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Transfers a single source limb's centered coefficients to a new CRT basis.
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Exact block modulus switch with a public positive integer scale.
+    /// Destination is a strict CRT subset; the dropped block is centered as a
+    /// whole before the retained residues are divided by its product.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String>;
     /// Fused centered RNS ModUp, with contiguous digits stacked in group-major row order.
     /// The destination must contain every source prime. For a source group Q_j,
     /// the result is sum_i (Q_j/q_i) * centered(x_i / (Q_j/q_i) mod q_i).
@@ -750,15 +693,6 @@ pub trait PolyMatrix:
     /// destination, where U is the centered CRT-term extension of -x/t from P.
     /// The destination must be a strict subset and t must be invertible modulo P.
     fn rns_mod_down(
-        &self,
-        destination: &<Self::P as Poly>::Params,
-        plaintext_modulus: u64,
-    ) -> Result<Self, String>;
-    /// Canonical centered coefficient lift to a containing CRT basis.
-    /// No full-coefficient big-integer reconstruction is performed.
-    fn centered_extend(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
-    /// Exact BFV block switch `(z-t*center_P(t^-1*z))/P` to a strict subset.
-    fn block_mod_switch(
         &self,
         destination: &<Self::P as Poly>::Params,
         plaintext_modulus: u64,
@@ -919,6 +853,64 @@ impl<M: PolyMatrix> CpuSmallMatrix<M> {
     pub fn size(&self) -> (usize, usize) {
         self.value.size()
     }
+
+    /// Rebase canonical bounded coefficients without changing their signed
+    /// representative or their declared bound.  The source compact owner is
+    /// already validated at construction, so this path never reconstructs a
+    /// per-coefficient BigInt from a serialized payload.
+    pub fn centered_rebase(
+        &self,
+        destination: &<M::P as Poly>::Params,
+    ) -> Result<Self, SmallMatrixError> {
+        let source_params = self.value.params();
+        if source_params.ring_dimension() != destination.ring_dimension() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let (source_basis, _, _) = source_params.to_crt();
+        let (destination_basis, _, _) = destination.to_crt();
+        if source_basis.len() > 1 &&
+            source_basis.iter().any(|prime| !destination_basis.contains(prime))
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let source_modulus: Arc<BigUint> = source_params.modulus().into();
+        let destination_modulus: Arc<BigUint> = destination.modulus().into();
+        let entries = (0..self.value.size().0)
+            .map(|row| {
+                (0..self.value.size().1)
+                    .map(|column| {
+                        let coefficients = self
+                            .value
+                            .entry(row, column)
+                            .coeffs()
+                            .into_iter()
+                            .map(|coefficient| {
+                                let residue = coefficient.value().clone();
+                                if &residue * 2u8 > *source_modulus {
+                                    if residue.is_zero() {
+                                        BigUint::from(0u8)
+                                    } else {
+                                        let magnitude = &*source_modulus - residue;
+                                        if magnitude.is_zero() {
+                                            BigUint::from(0u8)
+                                        } else {
+                                            (&*destination_modulus -
+                                                (&magnitude % &*destination_modulus)) %
+                                                &*destination_modulus
+                                        }
+                                    }
+                                } else {
+                                    residue % &*destination_modulus
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        M::P::from_biguints(destination, &coefficients)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new(M::from_poly_vec(destination, entries), self.max_coefficient_bound.clone())
+    }
 }
 
 /// Common metadata and canonical coefficient transport for bounded owners.
@@ -927,8 +919,6 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
 
     fn params(&self) -> &Self::Params;
     fn max_coefficient_bound(&self) -> &BigUint;
-    /// Preserve bounded signed coefficients in a containing modulus.
-    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String>;
     fn rows(&self) -> usize;
     fn columns(&self) -> usize;
     fn size(&self) -> (usize, usize) {
@@ -1002,13 +992,6 @@ where
 
     fn params(&self) -> &Self::Params {
         self.value.params()
-    }
-
-    fn centered_extend(&self, destination: &Self::Params) -> Result<Self, String> {
-        Ok(Self::from_validated(
-            self.value.centered_extend(destination)?,
-            self.max_coefficient_bound.clone(),
-        ))
     }
 
     fn max_coefficient_bound(&self) -> &BigUint {
@@ -1129,28 +1112,6 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn staged_column_identity_rejects_wrong_basis_before_decoding() {
-        use crate::{matrix::dcrt_poly::DCRTPolyMatrix, poly::dcrt::params::DCRTPolyParams};
-
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse().expect("ring dimension"))
-            .unwrap_or(32);
-        let parameters = DCRTPolyParams::new(n, 2, 54, 8, None, None);
-        let mut reversed_basis = parameters.to_crt().0;
-        reversed_basis.reverse();
-        let wrong = DCRTPolyParams::new(n, 2, 54, 8, Some(reversed_basis), None);
-        assert_eq!(parameters.modulus(), wrong.modulus());
-        // The payload is deliberately not decodable: a wrong mathematical
-        // identity must return an error before invoking any storage decoder.
-        let data =
-            PolyMatrixColumnData::<DCRTPolyMatrix>::staged(&parameters, Arc::new(Vec::new()), 3, 7);
-        assert!(data.validate_parameters(&parameters).is_ok());
-        assert_eq!(data.columns(), 4);
-        assert_eq!(data.subrange(1, 3).columns(), 2);
-        assert!(matches!(data.materialize(&wrong), Err(SmallMatrixError::ParameterMismatch)));
-    }
 
     #[test]
     fn canonical_coefficient_sign_handles_even_modulus_tie() {

@@ -448,18 +448,16 @@ checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 name = "mxx-bench-estimator"
 version = "0.1.0"
 dependencies = [
+ "bincode",
  "mxx-dsl",
  "mxx-ir-core",
  "mxx-primitives",
  "mxx-runtime",
  "num-bigint",
  "num-traits",
- "rand 0.9.2",
  "rayon",
  "serde",
  "serial_test",
- "sha2",
- "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -477,7 +475,6 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "rayon",
- "serde",
  "serial_test",
  "sha2",
  "thiserror",
@@ -580,7 +577,6 @@ dependencies = [
  "num-bigint",
  "num-integer",
  "num-traits",
- "rayon",
  "serde",
  "serde_json",
  "sha2",

@@ -1047,7 +1047,9 @@ mod tests {
             .enumerate()
             .try_fold(
                 DslContext::new("ring-gsw-native-scalar-adapter"),
-                |context, (wire, family)| context.artifact_output(format!("wire-{wire}"), family),
+                |context, (wire, family)| {
+                    context.transferred_output(format!("wire-{wire}"), family)
+                },
             )
             .unwrap()
             .build()
@@ -1056,7 +1058,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "large nested-RNS Ring-GSW add/sub circuit is too expensive for routine unit runs"]
     fn nested_rns_add_sub_execute_through_ir_and_decrypt() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, context) = test_context(&mut circuit);
@@ -1150,7 +1151,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "large nested-RNS decryption circuit is too expensive for routine unit runs"]
     fn in_circuit_decryption_executes_slot_reduction_through_ir_and_runtime() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, context) = test_context(&mut circuit);
@@ -1215,7 +1215,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "large nested-RNS batch decryption circuit is too expensive for routine unit runs"]
     fn decrypt_batch_packs_one_ciphertext_per_runtime_slot() {
         let mut circuit = PolyCircuit::<DCRTPoly>::new();
         let (params, context) = test_context(&mut circuit);

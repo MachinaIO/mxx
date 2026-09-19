@@ -14,11 +14,10 @@ pub(crate) mod ffi {
             moduli: &[u64],
             centered: bool,
         ) -> Result<UniquePtr<DCRTPoly>>;
-        fn exact_centered_conversion(
+        fn exact_basis_block_mod_switch(
             input: &DCRTPoly,
             moduli: &[u64],
-            destination_dimension: u32,
-            plaintext_modulus: u64,
+            plaintext_modulus_words: &[u64],
         ) -> Result<UniquePtr<DCRTPoly>>;
         fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
         #[namespace = "openfhe"]

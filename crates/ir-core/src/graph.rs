@@ -1,4 +1,5 @@
 use crate::{
+    artifact::ArtifactAvailability,
     expr::RealExpr,
     node::{LoopInputMode, NodeKind, ParallelLoop, SequentialLoop, SubgraphCall},
     types::{NodeId, Port, WireRef, WireType},
@@ -680,13 +681,13 @@ struct SubgraphDefinition {
 #[derive(Clone, Debug)]
 pub struct GraphOutput {
     pub value: ValueHandle,
-    pub artifact_output: bool,
+    pub availability: Option<ArtifactAvailability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputRoot {
     pub value: WireRef,
-    pub artifact_output: bool,
+    pub availability: Option<ArtifactAvailability>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -825,7 +826,7 @@ impl Graph {
                 let value = root_scope
                     .wire_ref(&output.value)
                     .ok_or_else(|| FreezeError::UnreachableOutput { name: name.clone() })?;
-                Ok((name, OutputRoot { value, artifact_output: output.artifact_output }))
+                Ok((name, OutputRoot { value, availability: output.availability }))
             })
             .collect::<Result<BTreeMap<_, _>, FreezeError>>()?;
         let frozen_effects = effect_roots
@@ -1570,7 +1571,7 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { artifact_output: false, value: output },
+                GraphOutput { value: output, availability: None },
             )]),
             Vec::new(),
             Vec::new(),
@@ -1757,10 +1758,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "sharing",
             Vec::new(),
-            BTreeMap::from([(
-                "out".to_owned(),
-                GraphOutput { artifact_output: false, value: sum },
-            )]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value: sum, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1775,7 +1773,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "round-trip",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { artifact_output: false, value })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1802,8 +1800,8 @@ mod tests {
             "root-wiring",
             Vec::new(),
             BTreeMap::from([
-                ("a".to_owned(), GraphOutput { artifact_output: false, value: input("a") }),
-                ("b".to_owned(), GraphOutput { artifact_output: false, value: input("b") }),
+                ("a".to_owned(), GraphOutput { value: input("a"), availability: None }),
+                ("b".to_owned(), GraphOutput { value: input("b"), availability: None }),
             ]),
             vec![input("retained")],
             vec![input("effect")],
@@ -1859,7 +1857,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "clone-lifetime",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { artifact_output: false, value })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1883,7 +1881,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "validated-sharing",
             Vec::new(),
-            BTreeMap::from([("out".to_owned(), GraphOutput { artifact_output: false, value })]),
+            BTreeMap::from([("out".to_owned(), GraphOutput { value, availability: None })]),
             Vec::new(),
             Vec::new(),
             BTreeMap::new(),
@@ -1955,8 +1953,8 @@ mod tests {
             "ambiguous-body-handle",
             Vec::new(),
             BTreeMap::from([
-                ("left".to_owned(), GraphOutput { artifact_output: false, value: make_loop() }),
-                ("right".to_owned(), GraphOutput { artifact_output: false, value: make_loop() }),
+                ("left".to_owned(), GraphOutput { value: make_loop(), availability: None }),
+                ("right".to_owned(), GraphOutput { value: make_loop(), availability: None }),
             ]),
             Vec::new(),
             Vec::new(),

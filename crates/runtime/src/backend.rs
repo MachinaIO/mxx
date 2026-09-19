@@ -3589,11 +3589,10 @@ pub enum RuntimeValue<B: Backend> {
         matrix_type: ConcreteMatrixType,
         bytes: Arc<Vec<u8>>,
     },
-    /// Compact bounded preimage.  This uses the same backend storage as a
-    /// generic small matrix, but remains a distinct runtime value so the
-    /// validated `Preimage` wire type cannot be erased at execution output.
-    Preimage(Arc<B::SmallMatrix>),
     SmallMatrix(Arc<B::SmallMatrix>),
+    /// A bounded relation witness. It shares compact backend storage with
+    /// `SmallMatrix`, but is a distinct runtime value and wire kind.
+    Preimage(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
         public: Arc<B::Matrix>,
@@ -3640,8 +3639,8 @@ impl<B: Backend> Clone for RuntimeValue<B> {
             Self::HostMatrix { matrix_type, bytes } => {
                 Self::HostMatrix { matrix_type: matrix_type.clone(), bytes: bytes.clone() }
             }
-            Self::Preimage(value) => Self::Preimage(value.clone()),
             Self::SmallMatrix(value) => Self::SmallMatrix(value.clone()),
+            Self::Preimage(value) => Self::Preimage(value.clone()),
             Self::Trapdoor {
                 secret,
                 public,
@@ -3692,8 +3691,8 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
-            Self::Preimage(matrix) => Arc::strong_count(matrix) == 1,
             Self::SmallMatrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::Preimage(matrix) => Arc::strong_count(matrix) == 1,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)

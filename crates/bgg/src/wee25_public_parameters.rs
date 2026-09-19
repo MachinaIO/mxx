@@ -219,12 +219,12 @@ mod tests {
 
     type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
 
-    fn small_matrix_output(
+    fn preimage_output(
         result: &ExecutionResult<CpuDcrtBackend>,
         name: &str,
     ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-        let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-            panic!("{name} must be a compact matrix output")
+        let RuntimeValue::Preimage(value) = &result.outputs[name] else {
+            panic!("{name} must be a preimage output")
         };
         value.as_ref().clone()
     }
@@ -343,7 +343,7 @@ mod tests {
                     let expected = gadget.clone() * &j - &(w * bottom);
                     assert_eq!(
                         b.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("top-{digit_row}-{part}-{block}"),
                             ))

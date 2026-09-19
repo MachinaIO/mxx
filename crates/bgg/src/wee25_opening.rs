@@ -750,7 +750,7 @@ mod tests {
             let name = format!("top-family-{family}");
             let values = (0..compiler.public_parameter_block_count())
                 .map(|block| {
-                    RuntimeValue::small_matrix(
+                    RuntimeValue::Preimage(std::sync::Arc::new(
                         mxx_primitives::matrix::CpuSmallMatrix::new(
                             t_top_values[block *
                                 compiler.gadget_rows() *
@@ -760,7 +760,7 @@ mod tests {
                             BigUint::from(1_000_000u32),
                         )
                         .unwrap(),
-                    )
+                    ))
                 })
                 .collect();
             inputs.insert(name.clone(), RuntimeValue::IndexedFamily(values));

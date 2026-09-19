@@ -268,7 +268,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cached_manifest_artifacts_are_valid() {
+    fn cached_manifest_artifacts_validate() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },

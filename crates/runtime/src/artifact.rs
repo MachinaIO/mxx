@@ -43,7 +43,7 @@ pub enum ArtifactPayload {
 }
 
 /// Supplies intact payloads from the matching backend codec and schema. Both
-/// transferred and cached artifacts carry the same integrity metadata; the
+/// transferred and cached artifacts carry the same artifact metadata; the
 /// availability label only selects how the consumer obtains the payload.
 /// Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
@@ -2337,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_load_rejects_session_manifests_before_finalization() {
+    fn artifact_load_and_session_finalization_order() {
         let production = ProductionId { spec_hash: SpecHash([12; 32]), execution_nonce: [13; 32] };
         let key =
             ArtifactKey { production: production.clone(), name: "bytes".to_owned(), index: None };
@@ -2362,6 +2362,11 @@ mod tests {
             )
             .expect("payload");
         store.store_manifest(manifest).expect("manifest");
+        assert_eq!(
+            store.load(&key, &descriptor).expect("load payload"),
+            ArtifactPayload::Bytes(vec![1, 2, 3])
+        );
+
         let session_production =
             ProductionId { spec_hash: SpecHash([14; 32]), execution_nonce: [15; 32] };
         let session_descriptor =

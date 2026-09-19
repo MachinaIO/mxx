@@ -4015,17 +4015,7 @@ impl GpuDcrtBackend {
             (
                 RuntimeValue::SmallMatrix(value),
                 ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound },
-            ) => {
-                value.rows == matrix.rows &&
-                    value.columns == matrix.columns &&
-                    value.shards.iter().all(|shard| {
-                        let params = shard.value.params();
-                        params.ring_dimension() as usize == matrix.ring_dimension &&
-                            BigInt::from(params.modulus().as_ref().clone()) == matrix.modulus &&
-                            BigInt::from(shard.value.max_coefficient_bound().clone()) ==
-                                *max_coefficient_bound
-                    })
-            }
+            ) |
             (
                 RuntimeValue::Preimage(value),
                 ConcreteWireType::Preimage { matrix, max_coefficient_bound },

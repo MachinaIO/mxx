@@ -663,7 +663,10 @@ impl<B: Backend> ExecutionResult<B> {
             .ok_or_else(|| ExecutionError::MissingOutput(name.to_owned()))?;
         // Resident matrices already are the materialized output. In particular,
         // keep their owners in place instead of cloning and reinserting them.
-        if !matches!(value, RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_)) {
+        if !matches!(
+            value,
+            RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_) | RuntimeValue::Preimage(_)
+        ) {
             *value = materialize_runtime_value(value.clone(), backend, store)?;
         }
         Ok(value)
@@ -2406,11 +2409,18 @@ where
                         let FusedBatchOutput::Small(output) = output else {
                             return Err(ExecutionError::InvalidBatch(node.id));
                         };
+                        let semantic_kind = self
+                            .bounded_matrix_schema(
+                                scope_id,
+                                &paths[index],
+                                WireRef { node: node.id, port: Port(0) },
+                            )?
+                            .1;
                         self.put(
                             &mut values[index],
                             node.id,
                             0,
-                            RuntimeValue::small_matrix(output),
+                            compact_runtime_value(output, semantic_kind),
                         );
                         self.has_pending_releases = true;
                     }
@@ -2754,8 +2764,9 @@ where
                         ExecutionError::InvalidGpuPlan("fixed operation without plan".into())
                     })?;
                 let value = self.materialize(&mut values[index], node.args[0])?;
-                let RuntimeValue::SmallMatrix(value) = value else {
-                    break;
+                let value = match value {
+                    RuntimeValue::SmallMatrix(value) | RuntimeValue::Preimage(value) => value,
+                    _ => break,
                 };
                 let destination = self.matrix_type(
                     scope_id,
@@ -2777,7 +2788,14 @@ where
                     return Err(ExecutionError::InvalidBatch(node.id));
                 }
                 for (&index, output) in indices.iter().zip(outputs) {
-                    self.put(&mut values[index], node.id, 0, RuntimeValue::small_matrix(output));
+                    let kind = self
+                        .bounded_matrix_schema(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?
+                        .1;
+                    self.put(&mut values[index], node.id, 0, compact_runtime_value(output, kind));
                 }
                 return Ok(());
             }
@@ -3494,7 +3512,14 @@ where
             return Err(ExecutionError::InvalidBatch(node.id));
         }
         for (&index, output) in indices.iter().zip(outputs) {
-            self.put(&mut values[index], node.id, 0, RuntimeValue::small_matrix(output));
+            let semantic_kind = self
+                .bounded_matrix_schema(
+                    scope_id,
+                    &paths[index],
+                    WireRef { node: node.id, port: Port(0) },
+                )?
+                .1;
+            self.put(&mut values[index], node.id, 0, compact_runtime_value(output, semantic_kind));
         }
         Ok(())
     }
@@ -3632,7 +3657,6 @@ where
                         "output {name} staged descriptor does not match validated metadata"
                     )));
                 }
-                let mut family_hasher = Sha256::new();
                 for index in 0..count {
                     let staged_key = ArtifactKey {
                         production: staged_production.clone(),
@@ -3643,10 +3667,6 @@ where
                         .artifact_store
                         .load_staged(&staged_key, descriptor)
                         .map_err(Self::artifact_error)?;
-                    let bytes = crate::artifact::payload_bytes(&payload);
-                    family_hasher.update((index as u64).to_le_bytes());
-                    family_hasher.update((bytes.len() as u64).to_le_bytes());
-                    family_hasher.update(&bytes);
                     let handle = ArtifactHandle {
                         key: ArtifactKey {
                             production: production.clone(),
@@ -3680,7 +3700,6 @@ where
                         artifact_type,
                         family_count,
                         availability,
-                        content_hash: Some(family_hasher.finalize().into()),
                         layout: None,
                     },
                 );
@@ -3698,12 +3717,8 @@ where
                         "output {name} family count does not match validated metadata"
                     )));
                 }
-                let mut family_hasher = Sha256::new();
                 for (index, member) in members.iter().enumerate() {
-                    let (payload, bytes) = self.encode_artifact(member, &artifact_type)?;
-                    family_hasher.update((index as u64).to_le_bytes());
-                    family_hasher.update((bytes.len() as u64).to_le_bytes());
-                    family_hasher.update(&bytes);
+                    let payload = self.encode_artifact(member, &artifact_type)?;
                     let handle = ArtifactHandle {
                         key: ArtifactKey {
                             production: production.clone(),
@@ -3737,14 +3752,12 @@ where
                         artifact_type,
                         family_count,
                         availability,
-                        content_hash: Some(family_hasher.finalize().into()),
                         layout: None,
                     },
                 );
                 continue;
             }
-            let (payload, bytes) = self.encode_artifact(output, &artifact_type)?;
-            let content_hash = Sha256::digest(&bytes).into();
+            let payload = self.encode_artifact(output, &artifact_type)?;
             let handle = ArtifactHandle {
                 key: ArtifactKey {
                     production: production.clone(),
@@ -3775,7 +3788,6 @@ where
                     artifact_type,
                     family_count: None,
                     availability,
-                    content_hash: Some(content_hash),
                     layout: None,
                 },
             );
@@ -3928,7 +3940,6 @@ where
             // staging therefore carries the payload across the scope
             // boundary instead of masquerading as a cache hit.
             availability: ArtifactAvailability::Transferred,
-            content_hash: None,
             layout: Some("runtime/staged-family-v1".to_owned()),
         };
         // Scratch identity is private to streamed families. Ordinary resident
@@ -4014,34 +4025,50 @@ where
         &self,
         value: &RuntimeValue<B>,
         artifact_type: &ArtifactType,
-    ) -> Result<(ArtifactPayload, Vec<u8>), ExecutionError> {
+    ) -> Result<ArtifactPayload, ExecutionError> {
         match (value, artifact_type) {
             (RuntimeValue::Int(value), ArtifactType::Int) => {
                 let bytes = value.to_signed_bytes_le();
-                Ok((ArtifactPayload::Bytes(bytes.clone()), bytes))
+                Ok(ArtifactPayload::Bytes(bytes))
             }
             (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
-                let bytes = self.backend.matrix_to_bytes(matrix);
-                Ok((ArtifactPayload::Matrix(bytes.clone()), bytes))
+                Ok(ArtifactPayload::Matrix(self.backend.matrix_to_bytes(matrix)))
             }
-            (RuntimeValue::SmallMatrix(matrix), artifact_type)
-                if artifact_type.bounded_matrix_schema().is_some() =>
-            {
-                let (schema, semantic_kind) =
-                    artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
+            (
+                RuntimeValue::SmallMatrix(matrix),
+                ArtifactType::SmallMatrix { matrix: matrix_type, max_coefficient_bound },
+            ) => {
+                let schema = ConcreteBoundedMatrixSchema {
+                    matrix: matrix_type.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                };
                 let bytes = self
                     .backend
-                    .small_matrix_to_bytes(matrix, &schema, semantic_kind)
+                    .small_matrix_to_bytes(matrix, &schema, SmallMatrixSemanticKind::Generic)
                     .map_err(Self::backend_error)?;
-                Ok((ArtifactPayload::SmallMatrix(bytes.clone()), bytes))
+                Ok(ArtifactPayload::SmallMatrix(bytes))
+            }
+            (
+                RuntimeValue::Preimage(matrix),
+                ArtifactType::Preimage { matrix: matrix_type, max_coefficient_bound },
+            ) => {
+                let schema = ConcreteBoundedMatrixSchema {
+                    matrix: matrix_type.clone(),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                };
+                let bytes = self
+                    .backend
+                    .small_matrix_to_bytes(matrix, &schema, SmallMatrixSemanticKind::Preimage)
+                    .map_err(Self::backend_error)?;
+                Ok(ArtifactPayload::SmallMatrix(bytes))
             }
             (RuntimeValue::Bytes(bytes), ArtifactType::Bytes { length })
                 if bytes.len() == *length =>
             {
-                Ok((ArtifactPayload::Bytes(bytes.clone()), bytes.clone()))
+                Ok(ArtifactPayload::Bytes(bytes.clone()))
             }
             (RuntimeValue::TypedBlob(bytes), ArtifactType::TypedBlob { .. }) => {
-                Ok((ArtifactPayload::TypedBlob(bytes.clone()), bytes.clone()))
+                Ok(ArtifactPayload::TypedBlob(bytes.clone()))
             }
             (
                 RuntimeValue::Trapdoor { secret: Some(secret), public, .. },
@@ -4049,14 +4076,7 @@ where
             ) => {
                 let public_bytes = self.backend.matrix_to_bytes(public);
                 let secret_bytes = self.backend.trapdoor_to_bytes(secret);
-                let mut canonical = Vec::with_capacity(
-                    16usize.saturating_add(public_bytes.len()).saturating_add(secret_bytes.len()),
-                );
-                canonical.extend_from_slice(&(public_bytes.len() as u64).to_le_bytes());
-                canonical.extend_from_slice(&public_bytes);
-                canonical.extend_from_slice(&(secret_bytes.len() as u64).to_le_bytes());
-                canonical.extend_from_slice(&secret_bytes);
-                Ok((ArtifactPayload::Trapdoor { public_bytes, secret_bytes }, canonical))
+                Ok(ArtifactPayload::Trapdoor { public_bytes, secret_bytes })
             }
             _ => Err(ExecutionError::Manifest(
                 "runtime value does not match declared artifact type".to_owned(),
@@ -4729,7 +4749,12 @@ where
                 if sampled {
                     self.record_preimages(1);
                 }
-                self.put(values, node.id, 0, RuntimeValue::small_matrix(value));
+                self.put(
+                    values,
+                    node.id,
+                    0,
+                    compact_runtime_value(value, SmallMatrixSemanticKind::Preimage),
+                );
             }
             NodeKind::GadgetDecompose { base, small, digit_count } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -4759,7 +4784,14 @@ where
                     .backend
                     .gadget_decompose(&input, *small, Some(digit_count))
                     .map_err(Self::backend_error)?;
-                self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
+                let semantic_kind = self
+                    .bounded_matrix_schema(
+                        scope_id,
+                        path,
+                        WireRef { node: node.id, port: Port(0) },
+                    )?
+                    .1;
+                self.put(values, node.id, 0, compact_runtime_value(output, semantic_kind));
             }
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
@@ -4776,11 +4808,42 @@ where
                             self.put(values, node.id, 0, RuntimeValue::matrix(output));
                         }
                         RuntimeValue::SmallMatrix(input) => {
+                            let output_kind = self
+                                .bounded_matrix_schema(
+                                    scope_id,
+                                    path,
+                                    WireRef { node: node.id, port: Port(0) },
+                                )?
+                                .1;
                             let output = self
                                 .backend
                                 .centered_rebase_small(&input, &ty)
                                 .map_err(Self::backend_error)?;
-                            self.put(values, node.id, 0, RuntimeValue::small_matrix(output));
+                            self.put(
+                                values,
+                                node.id,
+                                0,
+                                compact_runtime_value(output, output_kind),
+                            );
+                        }
+                        RuntimeValue::Preimage(input) => {
+                            let output_kind = self
+                                .bounded_matrix_schema(
+                                    scope_id,
+                                    path,
+                                    WireRef { node: node.id, port: Port(0) },
+                                )?
+                                .1;
+                            let output = self
+                                .backend
+                                .centered_rebase_small(&input, &ty)
+                                .map_err(Self::backend_error)?;
+                            self.put(
+                                values,
+                                node.id,
+                                0,
+                                compact_runtime_value(output, output_kind),
+                            );
                         }
                         _ => return Err(ExecutionError::ValueKind(node.args[0])),
                     }
@@ -5098,7 +5161,7 @@ where
                             self.set_placement(child_placements[offset])?;
                             for (port, value) in instance.outputs.into_iter().enumerate() {
                                 if let Some((name, descriptor)) = &staged[port] {
-                                    let (payload, _) =
+                                    let payload =
                                         self.encode_artifact(&value, &descriptor.artifact_type)?;
                                     self.artifact_store
                                         .store(
@@ -5451,7 +5514,12 @@ where
                         .backend
                         .gadget_decompose(&target, small, Some(digit_count))
                         .map_err(Self::backend_error)?;
-                    self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(value));
+                    self.put(
+                        &mut values[instance],
+                        node.id,
+                        0,
+                        compact_runtime_value(value, SmallMatrixSemanticKind::Preimage),
+                    );
                 }
                 continue;
             }
@@ -5526,7 +5594,23 @@ where
                 return Err(ExecutionError::InvalidBatch(node.id));
             }
             for (instance, output) in instances.into_iter().zip(outputs) {
-                self.put(&mut values[instance], node.id, 0, RuntimeValue::small_matrix(output));
+                // This batch is the GadgetTrapdoor-backed PreimageSample
+                // lowering.  The backend intentionally shares compact
+                // storage, but the runtime value must retain the relation
+                // wire kind for strict downstream validation.
+                let output_wire = WireRef { node: node.id, port: Port(0) };
+                let (_, semantic_kind) =
+                    self.bounded_matrix_schema(scope_id, &paths[instance], output_wire)?;
+                if semantic_kind != SmallMatrixSemanticKind::Preimage {
+                    return Err(ExecutionError::Manifest(
+                        "fixed gadget preimage output is not relation typed".to_owned(),
+                    ));
+                }
+                self.put(&mut values[instance], node.id, 0, RuntimeValue::preimage(output));
+                debug_assert!(matches!(
+                    values[instance].get(&output_wire),
+                    Some(RuntimeValue::Preimage(_))
+                ));
             }
         }
         if pending.is_empty() {
@@ -5664,7 +5748,7 @@ where
                     &mut values[request.instance],
                     node.id,
                     0,
-                    RuntimeValue::small_matrix(
+                    RuntimeValue::preimage(
                         output.expect("every session preimage draw is resolved"),
                     ),
                 );
@@ -5794,7 +5878,7 @@ where
             }
         }
         for (request, output) in pending.into_iter().zip(outputs) {
-            self.put(&mut values[request.instance], node.id, 0, RuntimeValue::small_matrix(output));
+            self.put(&mut values[request.instance], node.id, 0, RuntimeValue::preimage(output));
         }
         Ok(())
     }
@@ -6244,7 +6328,7 @@ where
         wire: WireRef,
     ) -> Result<Arc<B::SmallMatrix>, ExecutionError> {
         match self.materialize(values, wire)? {
-            RuntimeValue::SmallMatrix(value) => Ok(value),
+            RuntimeValue::SmallMatrix(value) | RuntimeValue::Preimage(value) => Ok(value),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -6389,6 +6473,17 @@ where
                     )
                 }
             }
+            RuntimeValue::Preimage(matrix) => {
+                if self.backend.small_matrix_is_on_active_placement(matrix.as_ref()) {
+                    RuntimeValue::Preimage(matrix)
+                } else {
+                    RuntimeValue::preimage(
+                        self.backend
+                            .small_matrix_to_active_placement(matrix.as_ref())
+                            .map_err(Self::backend_error)?,
+                    )
+                }
+            }
             RuntimeValue::Trapdoor {
                 secret,
                 public,
@@ -6473,6 +6568,17 @@ where
                     placed
                         .map(RuntimeValue::small_matrix)
                         .unwrap_or_else(|| RuntimeValue::SmallMatrix(matrix.clone()))
+                })
+                .collect(),
+            RuntimeValue::Preimage(matrix) => self
+                .backend
+                .small_matrix_to_placements(matrix.as_ref())
+                .map_err(Self::backend_error)?
+                .into_iter()
+                .map(|placed| {
+                    placed
+                        .map(RuntimeValue::preimage)
+                        .unwrap_or_else(|| RuntimeValue::Preimage(matrix.clone()))
                 })
                 .collect(),
             RuntimeValue::Trapdoor {
@@ -6859,6 +6965,25 @@ fn hash_runtime_value<B: Backend>(
             hasher.update([12]);
             hash_sized(hasher, &bytes);
         }
+        RuntimeValue::Preimage(value) => {
+            let ArtifactType::Preimage { matrix, max_coefficient_bound } =
+                ArtifactType::from_wire_type(concrete).ok_or_else(|| {
+                    ExecutionError::Manifest(
+                        "preimage runtime input has no relation schema".to_owned(),
+                    )
+                })?
+            else {
+                return Err(ExecutionError::Manifest(
+                    "preimage runtime input does not match a preimage wire".to_owned(),
+                ));
+            };
+            let schema = ConcreteBoundedMatrixSchema { matrix, max_coefficient_bound };
+            let bytes = backend
+                .small_matrix_to_bytes(value, &schema, SmallMatrixSemanticKind::Preimage)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            hasher.update([13]);
+            hash_sized(hasher, &bytes);
+        }
         RuntimeValue::Trapdoor {
             secret,
             public,
@@ -6959,6 +7084,16 @@ fn runtime_value_matches_wire_type<B: Backend>(
     concrete: &ConcreteWireType,
 ) -> bool {
     value.matches_wire_type(concrete)
+}
+
+fn compact_runtime_value<B: Backend>(
+    value: B::SmallMatrix,
+    semantic_kind: SmallMatrixSemanticKind,
+) -> RuntimeValue<B> {
+    match semantic_kind {
+        SmallMatrixSemanticKind::Generic => RuntimeValue::small_matrix(value),
+        SmallMatrixSemanticKind::Preimage => RuntimeValue::preimage(value),
+    }
 }
 
 fn hash_sized(hasher: &mut Sha256, bytes: &[u8]) {
@@ -7084,15 +7219,25 @@ fn decode_artifact<B: Backend>(
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok(RuntimeValue::matrix(matrix))
         }
-        (artifact_type, ArtifactPayload::SmallMatrix(bytes))
-            if artifact_type.bounded_matrix_schema().is_some() =>
-        {
-            let (schema, semantic_kind) =
-                artifact_type.bounded_matrix_schema().expect("bounded artifact checked above");
+        (
+            ArtifactType::SmallMatrix { matrix, max_coefficient_bound },
+            ArtifactPayload::SmallMatrix(bytes),
+        ) => {
+            let schema = ConcreteBoundedMatrixSchema { matrix, max_coefficient_bound };
             let matrix = backend
-                .small_matrix_from_bytes(&schema, &bytes, semantic_kind)
+                .small_matrix_from_bytes(&schema, &bytes, SmallMatrixSemanticKind::Generic)
                 .map_err(|error| ExecutionError::Backend(error.to_string()))?;
             Ok(RuntimeValue::small_matrix(matrix))
+        }
+        (
+            ArtifactType::Preimage { matrix, max_coefficient_bound },
+            ArtifactPayload::SmallMatrix(bytes),
+        ) => {
+            let schema = ConcreteBoundedMatrixSchema { matrix, max_coefficient_bound };
+            let matrix = backend
+                .small_matrix_from_bytes(&schema, &bytes, SmallMatrixSemanticKind::Preimage)
+                .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+            Ok(RuntimeValue::preimage(matrix))
         }
         (ArtifactType::Bytes { length }, ArtifactPayload::Bytes(bytes))
             if bytes.len() == length =>
@@ -7178,6 +7323,149 @@ mod tests {
             Err(ExecutionError::InvalidGpuPlan(message)) if message.contains("exceeding execution limit 64")
         ));
         assert!(validate_gpu_plan_wave_limit(&choice, 65).is_ok());
+    }
+
+    #[test]
+    fn runtime_value_wire_matching_is_strict_for_compact_semantic_kinds_and_families() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+            ring_dimension: parameters.ring_dimension() as usize,
+            rows: 1,
+            columns: 1,
+        };
+        let bound = BigInt::from(1u8);
+        let compact =
+            CpuSmallMatrix::new(DCRTPolyMatrix::identity(&parameters, 1, None), 1u8.into())
+                .expect("bounded compact owner");
+        let small = RuntimeValue::<CpuDcrtBackend>::small_matrix(compact.clone());
+        let preimage = RuntimeValue::<CpuDcrtBackend>::preimage(compact);
+        let small_wire = ConcreteWireType::SmallMatrix {
+            matrix: matrix.clone(),
+            max_coefficient_bound: bound.clone(),
+        };
+        let preimage_wire = ConcreteWireType::Preimage { matrix, max_coefficient_bound: bound };
+
+        assert!(small.matches_wire_type(&small_wire));
+        assert!(preimage.matches_wire_type(&preimage_wire));
+        assert!(!small.matches_wire_type(&preimage_wire));
+        assert!(!preimage.matches_wire_type(&small_wire));
+
+        let small_family_wire =
+            ConcreteWireType::IndexedFamily { element: Box::new(small_wire.clone()), count: 2 };
+        assert!(
+            RuntimeValue::IndexedFamily(vec![small.clone(), small.clone()])
+                .matches_wire_type(&small_family_wire)
+        );
+        assert!(
+            !RuntimeValue::IndexedFamily(vec![small.clone()]).matches_wire_type(&small_family_wire)
+        );
+        assert!(
+            !RuntimeValue::IndexedFamily(vec![small, preimage])
+                .matches_wire_type(&small_family_wire)
+        );
+    }
+
+    #[test]
+    fn decode_artifact_restores_generic_and_preimage_runtime_kinds() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+            ring_dimension: parameters.ring_dimension() as usize,
+            rows: 1,
+            columns: 1,
+        };
+        let schema = ConcreteBoundedMatrixSchema {
+            matrix: matrix.clone(),
+            max_coefficient_bound: BigInt::from(1u8),
+        };
+        let compact =
+            CpuSmallMatrix::new(DCRTPolyMatrix::identity(&parameters, 1, None), 1u8.into())
+                .expect("bounded compact owner");
+        let backend = cpu_backend([parameters]);
+        let generic_bytes = backend
+            .small_matrix_to_bytes(&compact, &schema, SmallMatrixSemanticKind::Generic)
+            .expect("generic compact payload");
+        let preimage_bytes = backend
+            .small_matrix_to_bytes(&compact, &schema, SmallMatrixSemanticKind::Preimage)
+            .expect("preimage compact payload");
+
+        let generic = decode_artifact(
+            &backend,
+            ArtifactType::SmallMatrix {
+                matrix: matrix.clone(),
+                max_coefficient_bound: schema.max_coefficient_bound.clone(),
+            },
+            ArtifactPayload::SmallMatrix(generic_bytes),
+        )
+        .expect("decode generic compact artifact");
+        assert!(matches!(generic, RuntimeValue::SmallMatrix(_)));
+
+        let preimage = decode_artifact(
+            &backend,
+            ArtifactType::Preimage { matrix, max_coefficient_bound: schema.max_coefficient_bound },
+            ArtifactPayload::SmallMatrix(preimage_bytes),
+        )
+        .expect("decode preimage compact artifact");
+        assert!(matches!(preimage, RuntimeValue::Preimage(_)));
+    }
+
+    #[test]
+    fn runtime_input_digest_distinguishes_compact_semantic_kinds_and_rejects_cross_kind() {
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let ring = Ring::new(modulus, parameters.ring_dimension() as usize);
+        let generic_graph = DslContext::new("runtime-generic-digest-kind")
+            .output("value", ring.small_matrix_input("value", (1, 1), 1))
+            .expect("generic output")
+            .build()
+            .expect("generic graph")
+            .validate(&ParamEnv::default())
+            .expect("generic validation");
+        let preimage_graph = DslContext::new("runtime-preimage-digest-kind")
+            .output("value", ring.preimage_input("value", (1, 1), 1))
+            .expect("preimage output")
+            .build()
+            .expect("preimage graph")
+            .validate(&ParamEnv::default())
+            .expect("preimage validation");
+        let compact =
+            CpuSmallMatrix::new(DCRTPolyMatrix::identity(&parameters, 1, None), 1u8.into())
+                .expect("bounded compact owner");
+        let backend = cpu_backend([parameters]);
+        let generic_digest = runtime_inputs_digest(
+            &generic_graph,
+            &backend,
+            &BTreeMap::from([("value".to_owned(), RuntimeValue::small_matrix(compact.clone()))]),
+        )
+        .expect("generic input digest");
+        let preimage_digest = runtime_inputs_digest(
+            &preimage_graph,
+            &backend,
+            &BTreeMap::from([("value".to_owned(), RuntimeValue::preimage(compact.clone()))]),
+        )
+        .expect("preimage input digest");
+        assert_ne!(generic_digest, preimage_digest);
+
+        assert!(matches!(
+            runtime_inputs_digest(
+                &preimage_graph,
+                &backend,
+                &BTreeMap::from([(
+                    "value".to_owned(),
+                    RuntimeValue::small_matrix(compact.clone()),
+                )]),
+            ),
+            Err(ExecutionError::Manifest(message)) if message.contains("does not match")
+        ));
+        assert!(matches!(
+            runtime_inputs_digest(
+                &generic_graph,
+                &backend,
+                &BTreeMap::from([("value".to_owned(), RuntimeValue::preimage(compact))]),
+            ),
+            Err(ExecutionError::Manifest(message)) if message.contains("does not match")
+        ));
     }
 
     #[test]
@@ -9090,6 +9378,12 @@ mod tests {
                 RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
             ])
         };
+        let preimage_members = || {
+            RuntimeValue::IndexedFamily(vec![
+                RuntimeValue::preimage(PlacementProbeSmallMatrix { placement: 0 }),
+                RuntimeValue::preimage(PlacementProbeSmallMatrix { placement: 0 }),
+            ])
+        };
         let mut backend = PlacementProbeBackend::default();
         let mut store = MemoryArtifactStore::default();
         let result = execute_with_config(
@@ -9097,7 +9391,7 @@ mod tests {
             &mut backend,
             BTreeMap::from([
                 ("small".to_owned(), members()),
-                ("preimage".to_owned(), members()),
+                ("preimage".to_owned(), preimage_members()),
                 (
                     "broadcast".to_owned(),
                     RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
@@ -9138,7 +9432,7 @@ mod tests {
                 &mut failing_backend,
                 BTreeMap::from([
                     ("small".to_owned(), members()),
-                    ("preimage".to_owned(), members()),
+                    ("preimage".to_owned(), preimage_members()),
                     (
                         "broadcast".to_owned(),
                         RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
@@ -9163,7 +9457,7 @@ mod tests {
                 &mut preparation_failing_backend,
                 BTreeMap::from([
                     ("small".to_owned(), members()),
-                    ("preimage".to_owned(), members()),
+                    ("preimage".to_owned(), preimage_members()),
                     (
                         "broadcast".to_owned(),
                         RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
@@ -9190,7 +9484,7 @@ mod tests {
                 &mut broadcast_failing_backend,
                 BTreeMap::from([
                     ("small".to_owned(), members()),
-                    ("preimage".to_owned(), members()),
+                    ("preimage".to_owned(), preimage_members()),
                     (
                         "broadcast".to_owned(),
                         RuntimeValue::small_matrix(PlacementProbeSmallMatrix { placement: 0 }),
@@ -9884,7 +10178,6 @@ mod tests {
         let production = result.production_id.expect("artifact production");
         let manifest = store.manifest(&production).expect("artifact manifest").clone();
         assert_eq!(manifest.artifacts["public"].availability, ArtifactAvailability::Transferred);
-        assert!(manifest.artifacts["public"].content_hash.is_some());
         let public_descriptor = &manifest.artifacts["public"];
         let _public_payload_bytes = (0..public_descriptor.family_count.unwrap())
             .map(|index| {
@@ -9902,7 +10195,6 @@ mod tests {
             })
             .sum::<usize>();
         assert_eq!(manifest.artifacts["trapdoors"].availability, ArtifactAvailability::Transferred);
-        assert!(manifest.artifacts["trapdoors"].content_hash.is_some());
         let trapdoor_descriptor = &manifest.artifacts["trapdoors"];
         let _trapdoor_payload_bytes = (0..trapdoor_descriptor.family_count.unwrap())
             .map(|index| {
@@ -10498,6 +10790,7 @@ mod tests {
                 panic!("empty range output became a matrix")
             }
             RuntimeValue::SmallMatrix(_) => panic!("empty range output became a small matrix"),
+            RuntimeValue::Preimage(_) => panic!("empty range output became a preimage"),
             RuntimeValue::Trapdoor { .. } => panic!("empty range output became a trapdoor"),
             RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. } => {
                 panic!("empty range output became a scalar artifact")

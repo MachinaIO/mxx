@@ -551,7 +551,7 @@ fn dsl_preimage_cold_warm_profile_and_fixed_sampling_are_one_lifecycle() {
         SamplingMode::Fresh,
     )
     .expect("fixed preimage sampling must complete");
-    let RuntimeValue::SmallMatrix(value) = &output.outputs["preimage"] else {
+    let RuntimeValue::Preimage(value) = &output.outputs["preimage"] else {
         panic!("fixed preimage output must preserve the compact output contract");
     };
     use mxx_primitives::matrix::SmallPolyMatrix;

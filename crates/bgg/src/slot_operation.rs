@@ -1285,12 +1285,12 @@ mod artifact {
         use num_bigint::BigInt;
         use std::collections::BTreeMap;
 
-        fn small_matrix_output(
+        fn preimage_output(
             result: &ExecutionResult<CpuDcrtBackend>,
             name: &str,
         ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-            let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-                panic!("{name} must be a compact matrix output")
+            let RuntimeValue::Preimage(value) = &result.outputs[name] else {
+                panic!("{name} must be a preimage output")
             };
             value.as_ref().clone()
         }
@@ -1445,7 +1445,7 @@ mod artifact {
                     let (start, end) = static_range(&range);
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b0_{chunk}_{slot}")
                             ))
@@ -1462,7 +1462,7 @@ mod artifact {
                         .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                     assert_eq!(
                         b1.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b1_{chunk}_{slot}")
                             ))
@@ -1492,7 +1492,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_transfer_{chunk}_{destination}"),
                             ))
@@ -1515,7 +1515,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_reduce_{chunk}_{destination}"),
                             ))

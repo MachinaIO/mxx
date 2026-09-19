@@ -3590,6 +3590,9 @@ pub enum RuntimeValue<B: Backend> {
         bytes: Arc<Vec<u8>>,
     },
     SmallMatrix(Arc<B::SmallMatrix>),
+    /// A bounded relation witness. It shares compact backend storage with
+    /// `SmallMatrix`, but is a distinct runtime value and wire kind.
+    Preimage(Arc<B::SmallMatrix>),
     Trapdoor {
         secret: Option<Arc<B::Trapdoor>>,
         public: Arc<B::Matrix>,
@@ -3637,6 +3640,7 @@ impl<B: Backend> Clone for RuntimeValue<B> {
                 Self::HostMatrix { matrix_type: matrix_type.clone(), bytes: bytes.clone() }
             }
             Self::SmallMatrix(value) => Self::SmallMatrix(value.clone()),
+            Self::Preimage(value) => Self::Preimage(value.clone()),
             Self::Trapdoor {
                 secret,
                 public,
@@ -3688,6 +3692,7 @@ impl<B: Backend> RuntimeValue<B> {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
             Self::SmallMatrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::Preimage(matrix) => Arc::strong_count(matrix) == 1,
             Self::Trapdoor { secret, public, .. } => {
                 Arc::strong_count(public) == 1 ||
                     secret.as_ref().is_some_and(|secret| Arc::strong_count(secret) == 1)
@@ -3718,6 +3723,10 @@ impl<B: Backend> RuntimeValue<B> {
         Self::SmallMatrix(Arc::new(value))
     }
 
+    pub fn preimage(value: B::SmallMatrix) -> Self {
+        Self::Preimage(Arc::new(value))
+    }
+
     /// Check the complete runtime shape against validated wire metadata.
     ///
     /// Input binding and warmup representatives must use this same check.
@@ -3732,10 +3741,8 @@ impl<B: Backend> RuntimeValue<B> {
             (Self::Bytes(_), ConcreteWireType::Bytes { .. }) |
             (Self::TypedBlob(_), ConcreteWireType::TypedBlob { .. }) |
             (Self::Matrix(_) | Self::HostMatrix { .. }, ConcreteWireType::Matrix(_)) |
-            (
-                Self::SmallMatrix(_),
-                ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. },
-            ) |
+            (Self::SmallMatrix(_), ConcreteWireType::SmallMatrix { .. }) |
+            (Self::Preimage(_), ConcreteWireType::Preimage { .. }) |
             (Self::Trapdoor { .. }, ConcreteWireType::Trapdoor { .. }) => true,
             (Self::IndexedFamily(values), ConcreteWireType::IndexedFamily { element, count }) => {
                 values.len() == *count &&

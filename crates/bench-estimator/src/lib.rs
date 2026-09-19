@@ -1848,7 +1848,6 @@ mod tests {
                 ),
                 family_count: None,
                 availability: mxx_ir_core::artifact::ArtifactAvailability::Cached,
-                content_hash: None,
                 layout: None,
             },
         );
@@ -1934,7 +1933,6 @@ mod tests {
                 artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(matrix_type.clone()),
                 family_count,
                 availability,
-                content_hash: None,
                 layout: None,
             };
             let manifest = mxx_ir_core::artifact::Manifest {

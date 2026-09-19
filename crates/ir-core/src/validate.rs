@@ -2106,7 +2106,6 @@ mod tests {
                     artifact_type,
                     family_count: None,
                     availability: crate::artifact::ArtifactAvailability::Transferred,
-                    content_hash: None,
                     layout: None,
                 },
             )]),

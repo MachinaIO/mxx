@@ -488,9 +488,9 @@ mod tests {
                 ("rhs-vector".to_owned(), RuntimeValue::matrix(rhs_vector.clone())),
                 (
                     "rhs-decomposition".to_owned(),
-                    RuntimeValue::small_matrix(
+                    RuntimeValue::Preimage(std::sync::Arc::new(
                         rhs_public.clone().gadget_decompose(false, None).unwrap(),
-                    ),
+                    )),
                 ),
                 ("lhs-plaintext".to_owned(), RuntimeValue::matrix(lhs_plaintext.clone())),
                 ("rhs-plaintext".to_owned(), RuntimeValue::matrix(rhs_plaintext.clone())),

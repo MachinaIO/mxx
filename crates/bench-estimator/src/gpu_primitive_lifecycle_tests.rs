@@ -619,7 +619,7 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
     let inputs = BTreeMap::from([
         ("matrix".to_owned(), RuntimeValue::matrix(matrix_value)),
         ("small".to_owned(), RuntimeValue::small_matrix(small_value)),
-        ("preimage".to_owned(), RuntimeValue::small_matrix(preimage_value)),
+        ("preimage".to_owned(), RuntimeValue::preimage(preimage_value)),
     ]);
 
     let mut warmup_config = config(&graph, &parameters, device);
@@ -751,22 +751,21 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
         actual_block.shards().first().expect("block output shard").value.to_cpu_matrix(),
         expected_block
     );
-    for name in ["small", "preimage"] {
-        let RuntimeValue::SmallMatrix(value) = &output.outputs[name] else {
-            panic!("{name} centered rebase changed its compact wire kind");
-        };
-        let semantic = if name == "small" {
-            SmallMatrixSemanticKind::Generic
-        } else {
-            SmallMatrixSemanticKind::Preimage
-        };
-        let bytes = backend
-            .small_matrix_to_bytes(value, &compact_schema, semantic)
-            .expect("fixed compact output encoding");
-        let expected =
-            if name == "small" { &generic_compact_bytes } else { &preimage_compact_bytes };
-        assert_eq!(&bytes, expected, "{name} compact payload changed during rebase");
-    }
+    let RuntimeValue::SmallMatrix(value) = &output.outputs["small"] else {
+        panic!("small centered rebase changed its compact wire kind");
+    };
+    let bytes = backend
+        .small_matrix_to_bytes(value, &compact_schema, SmallMatrixSemanticKind::Generic)
+        .expect("fixed generic compact output encoding");
+    assert_eq!(&bytes, &generic_compact_bytes, "small compact payload changed during rebase");
+
+    let RuntimeValue::Preimage(value) = &output.outputs["preimage"] else {
+        panic!("preimage centered rebase changed its compact wire kind");
+    };
+    let bytes = backend
+        .small_matrix_to_bytes(value, &compact_schema, SmallMatrixSemanticKind::Preimage)
+        .expect("fixed preimage compact output encoding");
+    assert_eq!(&bytes, &preimage_compact_bytes, "preimage compact payload changed during rebase");
     // The provider is setup-only.  Dropping the input map at the executor
     // boundary and synchronizing here exercises native consumer lifetime
     // events before the output owners are released.

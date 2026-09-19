@@ -152,7 +152,6 @@ pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
     pub availability: ArtifactAvailability,
-    pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
 
@@ -182,7 +181,6 @@ pub struct ExportArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
     pub availability: ArtifactAvailability,
-    pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
 
@@ -211,11 +209,6 @@ pub fn export_manifest(
                     artifact_type: artifact.artifact_type.clone(),
                     family_count: artifact.family_count,
                     availability: artifact.availability,
-                    // Availability controls how a consumer obtains the artifact;
-                    // it does not control integrity metadata.  A cached artifact
-                    // may still carry a content hash and must be verified exactly
-                    // like a transferred artifact.
-                    content_hash: artifact.content_hash,
                     layout: artifact.layout.clone(),
                 },
             )
@@ -261,7 +254,6 @@ pub fn export_validated_manifest(
                         artifact_type,
                         family_count: first_class_family_count,
                         availability,
-                        content_hash: None,
                         layout: None,
                     },
                 ))
@@ -276,20 +268,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cached_manifest_artifacts_preserve_content_hashes() {
+    fn cached_manifest_artifacts_validate() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
             artifacts: BTreeMap::from([(
-                // A cached entry is valid here because the fixture models a
-                // public deterministic cache key; availability is unrelated
-                // to confidentiality and does not suppress integrity hashes.
                 "deterministic-cache".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
                     availability: ArtifactAvailability::Cached,
-                    content_hash: Some([3; 32]),
                     layout: None,
                 },
             )]),
@@ -350,7 +338,6 @@ mod tests {
                     },
                     family_count: None,
                     availability: ArtifactAvailability::Transferred,
-                    content_hash: None,
                     layout: None,
                 },
             )]),

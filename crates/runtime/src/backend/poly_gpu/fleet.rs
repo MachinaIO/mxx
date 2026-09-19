@@ -3958,6 +3958,24 @@ impl GpuDcrtBackend {
                             })
                             .collect::<Vec<_>>()
                     ),
+                    RuntimeValue::Preimage(value) => format!(
+                        "preimage:{}x{}:{:?}",
+                        value.rows,
+                        value.columns,
+                        value
+                            .shards
+                            .iter()
+                            .map(|shard| {
+                                (
+                                    shard.device_id,
+                                    shard.global_column_start,
+                                    shard.value.columns(),
+                                    shard.value.params().ring_dimension(),
+                                    shard.value.params().moduli().to_vec(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    ),
                     RuntimeValue::HostMatrix { matrix_type, .. } => format!("host:{matrix_type:?}"),
                     RuntimeValue::Trapdoor { public, matrix_type, sigma, gadget_base, digit_count, gadget_small, .. } => {
                         let public_layout = Self::runtime_shape_descriptor(&std::collections::BTreeMap::from([("public".into(), RuntimeValue::Matrix(public.clone()))]));
@@ -3996,7 +4014,10 @@ impl GpuDcrtBackend {
             }
             (
                 RuntimeValue::SmallMatrix(value),
-                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound },
+            ) |
+            (
+                RuntimeValue::Preimage(value),
                 ConcreteWireType::Preimage { matrix, max_coefficient_bound },
             ) => {
                 value.rows == matrix.rows &&

@@ -1892,14 +1892,18 @@ mod tests {
         let NodeKind::ParallelLoop(spec) = loops[0].kind() else { unreachable!() };
         assert_eq!(spec.count, IntExpr::constant(3));
         assert_eq!(loops[0].output_types().len(), 2);
-        assert!(loops[0].output_types().iter().all(|output| {
-            matches!(
-                output,
-                WireType::IndexedFamily { element, count }
-                    if matches!(element.as_ref(), WireType::SmallMatrix { .. } | WireType::Preimage { .. }) &&
-                        count == &IntExpr::constant(3)
-            )
-        }));
+        assert!(matches!(
+            loops[0].output_types().first(),
+            Some(WireType::IndexedFamily { element, count })
+                if matches!(element.as_ref(), WireType::SmallMatrix { .. }) &&
+                    count == &IntExpr::constant(3)
+        ));
+        assert!(matches!(
+            loops[0].output_types().get(1),
+            Some(WireType::IndexedFamily { element, count })
+                if matches!(element.as_ref(), WireType::Preimage { .. }) &&
+                    count == &IntExpr::constant(3)
+        ));
 
         for node in built.graph.scopes().values().flat_map(|scope| scope.nodes()) {
             assert!(!matches!(node.kind(), NodeKind::FamilyGetStatic { .. }));
@@ -2199,13 +2203,13 @@ mod tests {
                     .iter()
                     .cloned()
                     .map(|value| {
-                        RuntimeValue::small_matrix(
+                        RuntimeValue::Preimage(std::sync::Arc::new(
                             mxx_primitives::matrix::CpuSmallMatrix::new(
                                 value,
                                 BigUint::from(1_000_000u32),
                             )
                             .unwrap(),
-                        )
+                        ))
                     })
                     .collect(),
             ),

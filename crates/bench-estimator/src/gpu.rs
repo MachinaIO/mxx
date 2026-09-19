@@ -5655,8 +5655,7 @@ impl GpuNodeMeasurementBackend {
                 .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
                 .map(RuntimeValue::matrix)
                 .map_err(|error| GpuMeasurementError(error.to_string())),
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
                 let owner = backend
                     .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
@@ -5691,6 +5690,42 @@ impl GpuNodeMeasurementBackend {
                 )
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
                 Ok(RuntimeValue::small_matrix(GpuFleetSmallMatrix::from(value)))
+            }
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                let owner = backend
+                    .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                let params = owner
+                    .shards()
+                    .first()
+                    .ok_or_else(|| {
+                        GpuMeasurementError("preimage representative has no shard".into())
+                    })?
+                    .value
+                    .params()
+                    .clone();
+                let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
+                    GpuMeasurementError("preimage representative bound must be nonnegative".into())
+                })?;
+                let magnitude_bytes =
+                    usize::try_from(bound.bits().div_ceil(8)).unwrap_or(usize::MAX).max(1);
+                let payload_len = matrix
+                    .rows
+                    .checked_mul(matrix.columns)
+                    .and_then(|value| value.checked_mul(matrix.ring_dimension as usize))
+                    .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+                    .ok_or_else(|| {
+                        GpuMeasurementError("preimage representative is too large".into())
+                    })?;
+                let value = GpuSmallMatrix::from_canonical_coefficients(
+                    &params,
+                    matrix.rows,
+                    matrix.columns,
+                    bound,
+                    &vec![0u8; payload_len],
+                )
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                Ok(RuntimeValue::preimage(GpuFleetSmallMatrix::from(value)))
             }
             ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } => {
                 let sigma = sigma

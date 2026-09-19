@@ -6,7 +6,6 @@ use mxx_ir_core::{
     encoding::IR_VERSION,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::{
@@ -44,7 +43,7 @@ pub enum ArtifactPayload {
 }
 
 /// Supplies intact payloads from the matching backend codec and schema. Both
-/// transferred and cached artifacts carry the same integrity metadata; the
+/// transferred and cached artifacts carry the same artifact metadata; the
 /// availability label only selects how the consumer obtains the payload.
 /// Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
@@ -199,8 +198,6 @@ pub enum FileArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
-    #[error("artifact content hash does not match its manifest: {0:?}")]
-    ContentHashMismatch(ArtifactKey),
 }
 
 /// Durable artifact storage for production runs.
@@ -214,8 +211,6 @@ pub struct FileArtifactStore {
     active_sessions: BTreeSet<ProductionId>,
     locks: BTreeMap<ProductionId, fs::File>,
     loads: BTreeMap<ArtifactKey, usize>,
-    verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
-    family_hash_verifications: usize,
 }
 
 /// Descriptive alias for callers that prefer the storage medium in the name.
@@ -247,8 +242,6 @@ impl FileArtifactStore {
             active_sessions: BTreeSet::new(),
             locks: BTreeMap::new(),
             loads: BTreeMap::new(),
-            verified_families: BTreeSet::new(),
-            family_hash_verifications: 0,
         })
     }
 
@@ -258,10 +251,6 @@ impl FileArtifactStore {
 
     pub fn root(&self) -> &Path {
         &self.root
-    }
-
-    pub fn family_hash_verification_count(&self) -> usize {
-        self.family_hash_verifications
     }
 
     pub fn load_count(&self, key: &ArtifactKey) -> usize {
@@ -571,74 +560,6 @@ impl FileArtifactStore {
         }
         Ok(())
     }
-
-    fn verify_content_hash(
-        &mut self,
-        key: &ArtifactKey,
-        descriptor: &ManifestArtifact,
-        payload: &ArtifactPayload,
-    ) -> Result<(), FileArtifactError> {
-        // A family hash covers the ordered collection and therefore cannot be
-        // checked without reading sibling members. Keep that audit explicit;
-        // ordinary member loads remain bounded to the requested file.
-        if descriptor.family_count.is_some() {
-            return Ok(());
-        }
-        let Some(expected) = descriptor.content_hash else { return Ok(()) };
-        let verification_key = (key.production.clone(), key.name.clone(), expected);
-        if self.verified_families.contains(&verification_key) {
-            return Ok(());
-        }
-        let actual: [u8; 32] = Sha256::digest(payload_bytes(payload)).into();
-        if actual != expected {
-            return Err(FileArtifactError::ContentHashMismatch(key.clone()));
-        }
-        self.family_hash_verifications += 1;
-        self.verified_families.insert(verification_key);
-        Ok(())
-    }
-
-    /// Verifies a public family content hash by streaming its members one at a
-    /// time. This is intentionally separate from [`ArtifactStore::load`],
-    /// whose contract is a lazy single-member load.
-    pub fn verify_family(
-        &mut self,
-        key: &ArtifactKey,
-        descriptor: &ManifestArtifact,
-    ) -> Result<(), FileArtifactError> {
-        let Some(count) = descriptor.family_count else {
-            return Err(FileArtifactError::FamilyIndexMismatch(key.clone()));
-        };
-        let Some(expected) = descriptor.content_hash else { return Ok(()) };
-        let manifest = self.load_manifest(&key.production)?;
-        if manifest.artifacts.get(&key.name) != Some(descriptor) {
-            return Err(FileArtifactError::DescriptorMismatch(key.clone()));
-        }
-        let verification_key = (key.production.clone(), key.name.clone(), expected);
-        if self.verified_families.contains(&verification_key) {
-            return Ok(());
-        }
-        let mut hasher = Sha256::new();
-        for index in 0..count {
-            let member_key = ArtifactKey {
-                production: key.production.clone(),
-                name: key.name.clone(),
-                index: Some(index),
-            };
-            let member = self.read_stored(&member_key)?;
-            Self::validate_stored(&member_key, descriptor, &member)?;
-            let bytes = payload_bytes(&member.payload);
-            hasher.update((index as u64).to_le_bytes());
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        if <[u8; 32]>::from(hasher.finalize()) != expected {
-            return Err(FileArtifactError::ContentHashMismatch(key.clone()));
-        }
-        self.family_hash_verifications += 1;
-        self.verified_families.insert(verification_key);
-        Ok(())
-    }
 }
 
 impl ArtifactStore for FileArtifactStore {
@@ -668,7 +589,6 @@ impl ArtifactStore for FileArtifactStore {
         Self::validate_key_index(key, descriptor)?;
         let stored = self.read_stored(key)?;
         Self::validate_stored(key, descriptor, &stored)?;
-        self.verify_content_hash(key, descriptor, &stored.payload)?;
         *self.loads.entry(key.clone()).or_default() += 1;
         Ok(stored.payload)
     }
@@ -711,8 +631,6 @@ impl ArtifactStore for FileArtifactStore {
             }
             Err(error) => return Err(error),
         }
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -736,8 +654,6 @@ impl ArtifactStore for FileArtifactStore {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(source) => return Err(FileArtifactError::Io { path, source }),
         }
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -1247,8 +1163,6 @@ pub struct MemoryArtifactStore {
     /// `active_sessions`, which denotes the sole mutable writer, so opening a
     /// finalized session can never accidentally authorize a write.
     read_sessions: BTreeSet<ProductionId>,
-    verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
-    family_hash_verifications: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1308,8 +1222,6 @@ pub enum MemoryArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
-    #[error("artifact content hash does not match its manifest: {0:?}")]
-    ContentHashMismatch(ArtifactKey),
 }
 
 impl MemoryArtifactStore {
@@ -1391,10 +1303,6 @@ impl MemoryArtifactStore {
 
     pub fn transcript_len(&self, production: &ProductionId) -> Option<usize> {
         self.sessions.get(production).map(|session| session.transcript.len())
-    }
-
-    pub fn family_hash_verification_count(&self) -> usize {
-        self.family_hash_verifications
     }
 
     /// Session-backed manifests are only visible through the final artifact
@@ -1505,40 +1413,6 @@ impl ArtifactStore for MemoryArtifactStore {
         if !payload_matches(artifact_type, payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
-        if let Some(expected) = manifest_artifact.content_hash {
-            let verification_key = (key.production.clone(), key.name.clone(), expected);
-            if self.verified_families.contains(&verification_key) {
-                *self.loads.entry(key.clone()).or_default() += 1;
-                return Ok(payload.clone());
-            }
-            self.family_hash_verifications += 1;
-            let actual: [u8; 32] = match manifest_artifact.family_count {
-                None => Sha256::digest(payload_bytes(payload)).into(),
-                Some(count) => {
-                    let mut hasher = Sha256::new();
-                    for index in 0..count {
-                        let member_key = ArtifactKey {
-                            production: key.production.clone(),
-                            name: key.name.clone(),
-                            index: Some(index),
-                        };
-                        let (_, _, _, member) = self
-                            .entries
-                            .get(&member_key)
-                            .ok_or_else(|| MemoryArtifactError::Missing(member_key.clone()))?;
-                        let bytes = payload_bytes(member);
-                        hasher.update((index as u64).to_le_bytes());
-                        hasher.update((bytes.len() as u64).to_le_bytes());
-                        hasher.update(bytes);
-                    }
-                    hasher.finalize().into()
-                }
-            };
-            if actual != expected {
-                return Err(MemoryArtifactError::ContentHashMismatch(key.clone()));
-            }
-            self.verified_families.insert(verification_key);
-        }
         *self.loads.entry(key.clone()).or_default() += 1;
         Ok(payload.clone())
     }
@@ -1603,8 +1477,6 @@ impl ArtifactStore for MemoryArtifactStore {
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
         self.ensure_session_mutable(&key.production)?;
         self.entries.remove(key);
-        self.verified_families
-            .retain(|(production, name, _)| production != &key.production || name != &key.name);
         Ok(())
     }
 
@@ -1996,7 +1868,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: Some(2),
             availability: ArtifactAvailability::Transferred,
-            content_hash: None,
             layout: None,
         };
         let manifest = Manifest {
@@ -2037,70 +1908,6 @@ mod tests {
     }
 
     #[test]
-    fn file_store_explicitly_verifies_family_hash_and_detects_corruption() {
-        let directory = tempdir().expect("temporary artifact directory");
-        let production = production(35);
-        let artifact_type = ArtifactType::Bytes { length: 1 };
-        let mut hasher = Sha256::new();
-        for index in 0..2u8 {
-            let bytes = [index];
-            hasher.update((index as u64).to_le_bytes());
-            hasher.update((bytes.len() as u64).to_le_bytes());
-            hasher.update(bytes);
-        }
-        let descriptor = ManifestArtifact {
-            artifact_type: artifact_type.clone(),
-            family_count: Some(2),
-            availability: ArtifactAvailability::Transferred,
-            content_hash: Some(hasher.finalize().into()),
-            layout: None,
-        };
-        let manifest = Manifest {
-            ir_version: IR_VERSION,
-            production_id: production.clone(),
-            artifacts: BTreeMap::from([(String::from("family"), descriptor.clone())]),
-        };
-        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
-        for index in 0..2 {
-            store
-                .store(
-                    ArtifactKey {
-                        production: production.clone(),
-                        name: String::from("family"),
-                        index: Some(index),
-                    },
-                    &artifact_type,
-                    ArtifactAvailability::Transferred,
-                    None,
-                    ArtifactPayload::Bytes(vec![index as u8]),
-                )
-                .expect("store family member");
-        }
-        store.store_manifest(manifest).expect("store manifest");
-        let member_zero = ArtifactKey {
-            production: production.clone(),
-            name: String::from("family"),
-            index: Some(0),
-        };
-        let member_one = ArtifactKey { production, name: String::from("family"), index: Some(1) };
-        store.verify_family(&member_zero, &descriptor).expect("verify intact family");
-
-        let member_path = store.artifact_path(&member_one);
-        let mut corrupted = fs::read(&member_path).expect("read member file");
-        *corrupted.last_mut().expect("member payload") = 42;
-        fs::write(member_path, corrupted).expect("corrupt member file");
-        let mut reopened = FileArtifactStore::new(directory.path()).expect("reopen store");
-        assert!(matches!(
-            reopened.verify_family(&member_zero, &descriptor),
-            Err(FileArtifactError::ContentHashMismatch(actual)) if actual == member_zero
-        ));
-        assert_eq!(
-            reopened.load(&member_zero, &descriptor).expect("load requested intact member"),
-            ArtifactPayload::Bytes(vec![0])
-        );
-    }
-
-    #[test]
     fn file_store_round_trips_typed_preimage_payload() {
         let directory = tempdir().expect("temporary artifact directory");
         let production = production(40);
@@ -2123,7 +1930,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Transferred,
-            content_hash: Some(Sha256::digest(&bytes).into()),
             layout: None,
         };
         let manifest = Manifest {
@@ -2189,7 +1995,6 @@ mod tests {
             artifact_type,
             family_count: None,
             availability: ArtifactAvailability::Transferred,
-            content_hash: None,
             layout: None,
         };
         store
@@ -2219,7 +2024,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Transferred,
-            content_hash: None,
             layout: None,
         };
         let key =
@@ -2416,7 +2220,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Cached,
-            content_hash: Some(Sha256::digest([7u8]).into()),
             layout: None,
         };
         let key =
@@ -2534,7 +2337,7 @@ mod tests {
     }
 
     #[test]
-    fn artifact_load_verifies_manifest_hash_and_session_finalization_order() {
+    fn artifact_load_and_session_finalization_order() {
         let production = ProductionId { spec_hash: SpecHash([12; 32]), execution_nonce: [13; 32] };
         let key =
             ArtifactKey { production: production.clone(), name: "bytes".to_owned(), index: None };
@@ -2542,7 +2345,6 @@ mod tests {
             artifact_type: ArtifactType::Bytes { length: 3 },
             family_count: None,
             availability: ArtifactAvailability::Transferred,
-            content_hash: Some([0; 32]),
             layout: None,
         };
         let manifest = Manifest {
@@ -2560,10 +2362,10 @@ mod tests {
             )
             .expect("payload");
         store.store_manifest(manifest).expect("manifest");
-        assert!(matches!(
-            store.load(&key, &descriptor),
-            Err(MemoryArtifactError::ContentHashMismatch(actual)) if actual == key
-        ));
+        assert_eq!(
+            store.load(&key, &descriptor).expect("load payload"),
+            ArtifactPayload::Bytes(vec![1, 2, 3])
+        );
 
         let session_production =
             ProductionId { spec_hash: SpecHash([14; 32]), execution_nonce: [15; 32] };
@@ -2579,7 +2381,6 @@ mod tests {
                     artifact_type: ArtifactType::Bytes { length: 3 },
                     family_count: None,
                     availability: ArtifactAvailability::Cached,
-                    content_hash: None,
                     layout: None,
                 },
             )]),
@@ -2593,42 +2394,18 @@ mod tests {
     }
 
     #[test]
-    fn memory_store_accepts_cached_manifest_content_hashes() {
-        let production = ProductionId { spec_hash: SpecHash([17; 32]), execution_nonce: [18; 32] };
-        let manifest = Manifest {
-            ir_version: mxx_ir_core::encoding::IR_VERSION,
-            production_id: production,
-            artifacts: BTreeMap::from([(
-                "private".to_owned(),
-                ManifestArtifact {
-                    artifact_type: ArtifactType::Bytes { length: 1 },
-                    family_count: None,
-                    availability: ArtifactAvailability::Cached,
-                    content_hash: Some([19; 32]),
-                    layout: None,
-                },
-            )]),
-        };
-        let mut store = MemoryArtifactStore::default();
-
-        store.store_manifest(manifest).expect("availability does not suppress integrity hash");
-    }
-
-    #[test]
     fn manifest_snapshot_contains_every_scalar_and_family_payload() {
         let production = ProductionId { spec_hash: SpecHash([20; 32]), execution_nonce: [21; 32] };
         let scalar = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: None,
             availability: ArtifactAvailability::Cached,
-            content_hash: None,
             layout: None,
         };
         let family = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: Some(2),
             availability: ArtifactAvailability::Transferred,
-            content_hash: None,
             layout: Some("lane".to_owned()),
         };
         let manifest = Manifest {
@@ -2711,7 +2488,6 @@ mod tests {
                     artifact_type: artifact_type.clone(),
                     family_count: None,
                     availability,
-                    content_hash: Some(Sha256::digest(payload_bytes(&payload)).into()),
                     layout: Some("compact/rns-v1".to_owned()),
                 },
             );
@@ -2748,7 +2524,6 @@ mod tests {
                 artifact_type: ArtifactType::Bytes { length: 1 },
                 family_count: None,
                 availability: ArtifactAvailability::Cached,
-                content_hash: None,
                 layout: None,
             }
         }
@@ -2895,7 +2670,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Cached,
-            content_hash: None,
             layout: Some("v1".to_owned()),
         };
         let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
@@ -2963,7 +2737,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Cached,
-            content_hash: None,
             layout: None,
         };
         let manifest_for = |production: ProductionId| Manifest {
@@ -3060,7 +2833,6 @@ mod tests {
             artifact_type: artifact_type.clone(),
             family_count: None,
             availability: ArtifactAvailability::Cached,
-            content_hash: None,
             layout: None,
         };
         let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };

@@ -89,12 +89,12 @@ impl Wee25PublicParameterCompiler {
         mut context: DslContext,
         wires: Wee25PublicParameterPreprocessingWires,
     ) -> Result<DslContext, DslError> {
-        context = context.public_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
-        context = context.private_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
-        context = context.public_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
+        context = context.transferred_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
+        context = context.transferred_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
+        context = context.transferred_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_output(
+            context = context.transferred_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;

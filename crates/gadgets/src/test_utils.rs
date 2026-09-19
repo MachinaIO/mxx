@@ -425,7 +425,7 @@ pub(crate) fn build_circuit_graph(
     let mut context = DslContext::new(name);
     for (index, output) in outputs.into_iter().enumerate() {
         context = context
-            .public_output(format!("output-{index}"), output)
+            .transferred_output(format!("output-{index}"), output)
             .expect("output names are unique");
     }
     context

@@ -3,6 +3,29 @@ namespace
     constexpr int kCrtMaxLimbs = 64;
     constexpr int kCrtMaxWords = 64;
 
+    bool mod_inverse_u64(uint64_t value, uint64_t modulus, uint64_t &inverse)
+    {
+        if (!modulus || value % modulus == 0) return false;
+        // CRT primes are below 2^60 in the native backend, so signed
+        // __int128 is sufficient for the extended Euclidean coefficients.
+        uint64_t r0 = modulus, r1 = value % modulus;
+        __int128 t0 = 0, t1 = 1;
+        while (r1 != 0)
+        {
+            const uint64_t quotient = r0 / r1;
+            const uint64_t next_r = r0 - quotient * r1;
+            const __int128 next_t = t0 - static_cast<__int128>(quotient) * t1;
+            r0 = r1;
+            r1 = next_r;
+            t0 = t1;
+            t1 = next_t;
+        }
+        if (r0 != 1) return false;
+        const __int128 reduced = t0 % static_cast<__int128>(modulus);
+        inverse = static_cast<uint64_t>(reduced < 0 ? reduced + modulus : reduced);
+        return true;
+    }
+
     struct ModulusConversionMetadata
     {
         size_t source_count;
@@ -187,27 +210,158 @@ namespace
         uint64_t moduli[kCrtMaxLimbs];
     };
 
-    __global__ void centered_rebase_kernel(
+    // Recover the exact mixed-radix digits of a CRT value and select its
+    // centered representative.  `selected_indices == nullptr` means the
+    // source basis is contiguous; otherwise it names the source limbs used
+    // by the dropped block.  Keeping both cases in one device helper avoids
+    // subtly diverging center-boundary behavior between CRT operations while
+    // retaining the caller-owned local digit array.
+    __device__ __forceinline__ bool crt_recover_centered_digits(
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source,
-        CrtOutputMetadata output, uint64_t source_modulus,
+        const size_t *selected_indices,
+        const uint64_t *source_moduli,
+        const uint64_t *residue_inverses,
+        const uint64_t *prefix_inverses,
+        size_t count,
+        size_t poly,
+        size_t coefficient,
+        uint64_t *digits)
+    {
+        for (size_t current = 0; current < count; ++current)
+        {
+            const size_t source_index = selected_indices ? selected_indices[current] : current;
+            const uint64_t modulus = source_moduli[source_index];
+            const auto input = source[source_index];
+            const uint64_t raw = matrix_load_limb_u64(input.base, poly, coefficient,
+                input.stride, input.width) % modulus;
+            const uint64_t residue = residue_inverses
+                ? mul_mod_u64(raw, residue_inverses[current], modulus)
+                : raw;
+            uint64_t prefix = 0;
+            uint64_t weight = 1;
+            for (size_t previous = 0; previous < current; ++previous)
+            {
+                const size_t previous_index = selected_indices ? selected_indices[previous] : previous;
+                const uint64_t previous_modulus = source_moduli[previous_index];
+                prefix = add_mod_u64(prefix,
+                    mul_mod_u64(digits[previous] % modulus, weight, modulus), modulus);
+                weight = mul_mod_u64(weight, previous_modulus % modulus, modulus);
+            }
+            const uint64_t difference = residue >= prefix ? residue - prefix : modulus - (prefix - residue);
+            digits[current] = mul_mod_u64(difference, prefix_inverses[current], modulus);
+        }
+        for (size_t current = count; current-- > 0;)
+        {
+            const size_t source_index = selected_indices ? selected_indices[current] : current;
+            const uint64_t half = (source_moduli[source_index] - 1) / 2;
+            if (digits[current] != half) return digits[current] > half;
+        }
+        return false;
+    }
+
+    struct CenteredRebaseMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+        CrtOutputMetadata output;
+        size_t source_count;
+        uint64_t source_moduli[kCrtMaxLimbs];
+        uint64_t prefix_inverses[kCrtMaxLimbs];
+        int target_source[kCrtMaxLimbs];
+    };
+
+    __global__ void centered_rebase_kernel(
+        const CenteredRebaseMetadata *metadata,
         size_t coefficient_count, size_t ring_dimension)
     {
         const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-        if (index >= coefficient_count * output.limb_count) return;
+        if (index >= coefficient_count * metadata->output.limb_count) return;
         const size_t limb = index / coefficient_count;
         const size_t position = index % coefficient_count;
         const size_t poly = position / ring_dimension;
         const size_t coefficient = position % ring_dimension;
-        const auto input = source[0];
-        const uint64_t residue = matrix_load_limb_u64(input.base, poly, coefficient,
-            input.stride, input.width) % source_modulus;
-        const uint64_t modulus = output.moduli[limb];
-        // Keep the magnitude unsigned, including for source moduli above INT64_MAX.
-        const bool negative = residue > source_modulus / 2;
-        const uint64_t magnitude = (negative ? source_modulus - residue : residue) % modulus;
-        const uint64_t value = negative && magnitude != 0 ? modulus - magnitude : magnitude;
-        const auto target = output.descriptors[limb];
+        uint64_t digits[kCrtMaxLimbs];
+        const bool negative = crt_recover_centered_digits(
+            metadata->source, nullptr, metadata->source_moduli, nullptr,
+            metadata->prefix_inverses, metadata->source_count, poly, coefficient, digits);
+        const uint64_t modulus = metadata->output.moduli[limb];
+        uint64_t value = 0;
+        const int source_index = metadata->target_source[limb];
+        if (source_index >= 0)
+        {
+            const auto input = metadata->source[source_index];
+            value = matrix_load_limb_u64(input.base, poly, coefficient,
+                input.stride, input.width) % modulus;
+        }
+        else
+        {
+            for (size_t current = metadata->source_count; current-- > 0;)
+                value = (static_cast<unsigned __int128>(value) *
+                    (metadata->source_moduli[current] % modulus) + digits[current] % modulus) % modulus;
+            if (negative)
+            {
+                uint64_t source_product = 1;
+                for (size_t current = 0; current < metadata->source_count; ++current)
+                    source_product = mul_mod_u64(source_product,
+                        metadata->source_moduli[current] % modulus, modulus);
+                value = value >= source_product ? value - source_product : modulus - (source_product - value);
+            }
+        }
+        const auto target = metadata->output.descriptors[limb];
         matrix_store_limb_u64(target.base, poly, coefficient, target.stride, target.width, value);
+    }
+
+    struct BlockModSwitchMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+        CrtOutputMetadata output;
+        size_t source_count;
+        size_t dropped_count;
+        uint64_t source_moduli[kCrtMaxLimbs];
+        uint64_t dropped_t_inverses[kCrtMaxLimbs];
+        uint64_t prefix_inverses[kCrtMaxLimbs];
+        uint64_t target_t[kCrtMaxLimbs];
+        uint64_t target_p_inverses[kCrtMaxLimbs];
+        size_t dropped_indices[kCrtMaxLimbs];
+        int target_source[kCrtMaxLimbs];
+    };
+
+    __global__ void block_mod_switch_kernel(
+        const BlockModSwitchMetadata *metadata,
+        size_t coefficient_count, size_t ring_dimension)
+    {
+        const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (index >= coefficient_count * metadata->output.limb_count) return;
+        const size_t target_limb = index / coefficient_count;
+        const size_t position = index % coefficient_count;
+        const size_t poly = position / ring_dimension;
+        const size_t coefficient = position % ring_dimension;
+        uint64_t digits[kCrtMaxLimbs];
+        const bool negative = crt_recover_centered_digits(
+            metadata->source, metadata->dropped_indices, metadata->source_moduli,
+            metadata->dropped_t_inverses, metadata->prefix_inverses, metadata->dropped_count,
+            poly, coefficient, digits);
+        const uint64_t modulus = metadata->output.moduli[target_limb];
+        uint64_t centered = 0;
+        for (size_t current = metadata->dropped_count; current-- > 0;)
+        {
+            const uint64_t p = metadata->source_moduli[metadata->dropped_indices[current]];
+            centered = (static_cast<unsigned __int128>(centered) * (p % modulus) +
+                digits[current] % modulus) % modulus;
+        }
+        uint64_t dropped_product = 1;
+        for (size_t current = 0; current < metadata->dropped_count; ++current)
+            dropped_product = mul_mod_u64(dropped_product,
+                metadata->source_moduli[metadata->dropped_indices[current]] % modulus, modulus);
+        if (negative)
+            centered = centered >= dropped_product ? centered - dropped_product : modulus - (dropped_product - centered);
+        const auto retained = metadata->source[metadata->target_source[target_limb]];
+        const uint64_t z = matrix_load_limb_u64(retained.base, poly, coefficient,
+            retained.stride, retained.width) % modulus;
+        const uint64_t correction = mul_mod_u64(metadata->target_t[target_limb], centered, modulus);
+        const uint64_t numerator = z >= correction ? z - correction : modulus - (correction - z);
+        const uint64_t value = mul_mod_u64(numerator, metadata->target_p_inverses[target_limb], modulus);
+        const auto output = metadata->output.descriptors[target_limb];
+        matrix_store_limb_u64(output.base, poly, coefficient, output.stride, output.width, value);
     }
 
     __global__ void crt_recompose_kernel(
@@ -440,19 +594,36 @@ extern "C" int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *sourc
 {
     if (!out || !source || !out->ctx || !source->ctx ||
         out->ctx->execution != source->ctx->execution || out->ctx->N != source->ctx->N ||
-        source->level != 0 || source->ctx->moduli.size() != 1 || out->level < 0 ||
+        source->level < 0 || out->level < 0 ||
         source->rows != out->rows || source->cols != out->cols ||
         source->format != GPU_POLY_FORMAT_COEFF || out->format != GPU_POLY_FORMAT_COEFF ||
         source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
-        return set_error("centered rebase requires colocated single-limb coefficients and matching execution");
+        return set_error("centered rebase requires colocated coefficient matrices with matching execution");
+    const size_t source_count = static_cast<size_t>(source->level) + 1;
     const size_t target_count = static_cast<size_t>(out->level) + 1;
-    if (target_count > kCrtMaxLimbs || target_count > out->ctx->moduli.size())
+    if (!source_count || source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
+        source_count > source->ctx->moduli.size() || target_count > out->ctx->moduli.size())
         return set_error("invalid centered rebase destination basis");
     const auto &input = source->shared_limb_buffers[0];
     const auto &output = out->shared_limb_buffers[0];
     if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
-        input.limb_count != 1 || output.limb_count < target_count)
+        input.limb_count < source_count || output.limb_count < target_count)
         return set_error("centered rebase requires colocated device descriptors");
+    if (source_count > 1)
+    {
+        for (size_t source_limb = 0; source_limb < source_count; ++source_limb)
+        {
+            const uint64_t p = source->ctx->moduli[source_limb];
+            if (p <= 1 || !(p & 1)) return set_error("centered rebase requires odd source CRT moduli");
+            bool retained = false;
+            for (size_t target_limb = 0; target_limb < target_count; ++target_limb)
+                retained = retained || out->ctx->moduli[target_limb] == p;
+            if (!retained) return set_error("multi-limb centered rebase destination must contain the source basis");
+        }
+    }
+    for (size_t target_limb = 0; target_limb < target_count; ++target_limb)
+        if (out->ctx->moduli[target_limb] <= 1 || !(out->ctx->moduli[target_limb] & 1))
+            return set_error("centered rebase requires odd destination CRT moduli");
     if (!out->rows || !out->cols || out->rows > std::numeric_limits<size_t>::max() / out->cols ||
         out->rows * out->cols > std::numeric_limits<size_t>::max() / static_cast<size_t>(out->ctx->N))
         return set_error("centered rebase shape overflow");
@@ -468,30 +639,223 @@ extern "C" int gpu_matrix_centered_rebase(GpuMatrix *out, const GpuMatrix *sourc
     cudaStream_t stream = nullptr;
     int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
     if (status != 0) return status;
-    status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[0], output.device, stream, false, true);
-    if (status != 0) return status;
+    // CenteredRebase reads every source limb while reconstructing the exact
+    // mixed-radix value.  Wait for each producer on the output device before
+    // allocating metadata or launching the kernel; waiting only on limb zero
+    // leaves later-limb writes racy when source work is asynchronous.
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[limb], output.device,
+            stream, false, true);
+        if (status != 0) return status;
+    }
     for (size_t limb = 0; limb < target_count; ++limb)
     {
         status = matrix_wait_limb_stream(out, out->ctx->limb_gpu_ids[limb], output.device, stream);
         if (status != 0) return status;
     }
-    CrtOutputMetadata metadata{};
-    metadata.descriptors = output.device_descriptors;
-    metadata.limb_count = target_count;
-    std::copy_n(out->ctx->moduli.begin(), target_count, metadata.moduli);
-    centered_rebase_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
-        input.device_descriptors, metadata, source->ctx->moduli[0],
-        coefficient_count, static_cast<size_t>(out->ctx->N));
-    error = cudaGetLastError();
-    if (error != cudaSuccess) status = set_error(error);
+    CenteredRebaseMetadata host_metadata{};
+    host_metadata.source = input.device_descriptors;
+    host_metadata.output.descriptors = output.device_descriptors;
+    host_metadata.output.limb_count = target_count;
+    std::copy_n(out->ctx->moduli.begin(), target_count, host_metadata.output.moduli);
+    host_metadata.source_count = source_count;
+    std::copy_n(source->ctx->moduli.begin(), source_count, host_metadata.source_moduli);
+    host_metadata.prefix_inverses[0] = 1;
+    for (size_t current = 1; current < source_count; ++current)
+    {
+        const uint64_t modulus = host_metadata.source_moduli[current];
+        uint64_t product = 1;
+        for (size_t previous = 0; previous < current; ++previous)
+            product = static_cast<uint64_t>((static_cast<unsigned __int128>(product) *
+                host_metadata.source_moduli[previous]) % modulus);
+        uint64_t inverse = 0;
+        if (!mod_inverse_u64(product, modulus, inverse))
+            return set_error("centered rebase source CRT basis is not invertible");
+        host_metadata.prefix_inverses[current] = inverse;
+    }
+    for (size_t target_limb = 0; target_limb < target_count; ++target_limb)
+    {
+        host_metadata.target_source[target_limb] = -1;
+        for (size_t source_limb = 0; source_limb < source_count; ++source_limb)
+            if (out->ctx->moduli[target_limb] == source->ctx->moduli[source_limb])
+                host_metadata.target_source[target_limb] = static_cast<int>(source_limb);
+    }
+    CenteredRebaseMetadata *device_metadata = nullptr;
+    std::vector<void *> pinned;
+    status = crt_alloc_and_copy_async(&device_metadata, std::vector<CenteredRebaseMetadata>{host_metadata}, stream, &pinned);
+    if (status == 0)
+    {
+        centered_rebase_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+            device_metadata, coefficient_count, static_cast<size_t>(out->ctx->N));
+        error = cudaGetLastError();
+        if (error != cudaSuccess) status = set_error(error);
+    }
     // The temporary INTT source can be dropped immediately after this call.
-    const int tracked = matrix_track_limb_consumer_readonly(source,
-        source->ctx->limb_gpu_ids[0], output.device, stream);
-    if (status == 0) status = tracked;
+    for (size_t source_limb = 0; source_limb < source_count; ++source_limb)
+    {
+        const int tracked = matrix_track_limb_consumer_readonly(source,
+            source->ctx->limb_gpu_ids[source_limb], output.device, stream);
+        if (status == 0) status = tracked;
+    }
     for (size_t limb = 0; limb < target_count; ++limb)
     {
         const int recorded = matrix_record_limb_write(out, out->ctx->limb_gpu_ids[limb], stream);
         if (status == 0) status = recorded;
+    }
+    if (device_metadata) cudaFreeAsync(device_metadata, stream);
+    if (!pinned.empty())
+    {
+        const int deferred = gpu_defer_pinned_frees(out->ctx, output.device, stream, pinned.data(), pinned.size());
+        if (status == 0) status = deferred;
+    }
+    return status;
+}
+
+extern "C" int gpu_matrix_block_mod_switch(
+    GpuMatrix *out, const GpuMatrix *source,
+    const uint64_t *plaintext_modulus_words, size_t plaintext_modulus_word_count)
+{
+    if (!out || !source || !out->ctx || !source->ctx || !plaintext_modulus_words ||
+        !plaintext_modulus_word_count || out->ctx->execution != source->ctx->execution ||
+        out->ctx->N != source->ctx->N || source->level < 0 || out->level < 0 ||
+        source->rows != out->rows || source->cols != out->cols ||
+        source->format != GPU_POLY_FORMAT_COEFF || out->format != GPU_POLY_FORMAT_COEFF ||
+        source->shared_limb_buffers.size() != 1 || out->shared_limb_buffers.size() != 1)
+        return set_error("invalid BlockModSwitch layout");
+    const size_t source_count = static_cast<size_t>(source->level) + 1;
+    const size_t target_count = static_cast<size_t>(out->level) + 1;
+    // BlockModSwitch only needs t modulo each CRT prime.  `words_mod` below
+    // folds the complete host-provided little-endian word slice into those
+    // residues before the metadata is copied to the device, so this path must
+    // not impose the fixed word-array bound used by CRT recomposition.
+    if (!source_count || !target_count || source_count > kCrtMaxLimbs || target_count > kCrtMaxLimbs ||
+        source_count > source->ctx->moduli.size() || target_count > out->ctx->moduli.size())
+        return set_error("invalid BlockModSwitch basis");
+    const auto &input = source->shared_limb_buffers[0];
+    const auto &output = out->shared_limb_buffers[0];
+    if (input.device != output.device || !input.device_descriptors || !output.device_descriptors ||
+        input.limb_count < source_count || output.limb_count < target_count)
+        return set_error("BlockModSwitch requires colocated device descriptors");
+    BlockModSwitchMetadata host_metadata{};
+    host_metadata.source = input.device_descriptors;
+    host_metadata.output.descriptors = output.device_descriptors;
+    host_metadata.output.limb_count = target_count;
+    host_metadata.source_count = source_count;
+    host_metadata.dropped_count = 0;
+    std::copy_n(out->ctx->moduli.begin(), target_count, host_metadata.output.moduli);
+    std::copy_n(source->ctx->moduli.begin(), source_count, host_metadata.source_moduli);
+    int target_source[kCrtMaxLimbs];
+    bool retained[kCrtMaxLimbs]{};
+    for (size_t target = 0; target < target_count; ++target)
+    {
+        target_source[target] = -1;
+        for (size_t source_limb = 0; source_limb < source_count; ++source_limb)
+            if (out->ctx->moduli[target] == source->ctx->moduli[source_limb])
+            {
+                if (target_source[target] >= 0 || retained[source_limb])
+                    return set_error("BlockModSwitch basis contains duplicate limbs");
+                target_source[target] = static_cast<int>(source_limb);
+                retained[source_limb] = true;
+            }
+        if (target_source[target] < 0)
+            return set_error("BlockModSwitch destination basis is not a source subset");
+        host_metadata.target_source[target] = target_source[target];
+    }
+    for (size_t source_limb = 0; source_limb < source_count; ++source_limb)
+        if (!retained[source_limb])
+            host_metadata.dropped_indices[host_metadata.dropped_count++] = source_limb;
+    if (!host_metadata.dropped_count)
+        return set_error("BlockModSwitch requires a strict destination subset");
+    auto words_mod = [&](uint64_t modulus) {
+        uint64_t value = 0;
+        const uint64_t radix = static_cast<uint64_t>((static_cast<unsigned __int128>(1) << 64) % modulus);
+        for (size_t word = plaintext_modulus_word_count; word-- > 0;)
+            value = static_cast<uint64_t>((static_cast<unsigned __int128>(value) * radix +
+                plaintext_modulus_words[word] % modulus) % modulus);
+        return value;
+    };
+    for (size_t current = 0; current < host_metadata.dropped_count; ++current)
+    {
+        const uint64_t p = host_metadata.source_moduli[host_metadata.dropped_indices[current]];
+        uint64_t t_inverse = 0;
+        if (!mod_inverse_u64(words_mod(p), p, t_inverse))
+            return set_error("BlockModSwitch t is not invertible modulo a dropped prime");
+        host_metadata.dropped_t_inverses[current] = t_inverse;
+        host_metadata.prefix_inverses[current] = 1;
+        if (current)
+        {
+            uint64_t product = 1;
+            for (size_t previous = 0; previous < current; ++previous)
+                product = static_cast<uint64_t>((static_cast<unsigned __int128>(product) *
+                    host_metadata.source_moduli[host_metadata.dropped_indices[previous]]) % p);
+            if (!mod_inverse_u64(product, p, host_metadata.prefix_inverses[current]))
+                return set_error("BlockModSwitch dropped basis is not invertible");
+        }
+    }
+    for (size_t target = 0; target < target_count; ++target)
+    {
+        const uint64_t q = host_metadata.output.moduli[target];
+        host_metadata.target_t[target] = words_mod(q);
+        uint64_t product = 1;
+        for (size_t current = 0; current < host_metadata.dropped_count; ++current)
+            product = static_cast<uint64_t>((static_cast<unsigned __int128>(product) *
+                host_metadata.source_moduli[host_metadata.dropped_indices[current]]) % q);
+        if (!mod_inverse_u64(product, q, host_metadata.target_p_inverses[target]))
+            return set_error("BlockModSwitch dropped product is not invertible in destination");
+    }
+    if (!out->rows || !out->cols || out->rows > std::numeric_limits<size_t>::max() / out->cols ||
+        out->rows * out->cols > std::numeric_limits<size_t>::max() / static_cast<size_t>(out->ctx->N))
+        return set_error("BlockModSwitch shape overflow");
+    const size_t coefficient_count = out->rows * out->cols * static_cast<size_t>(out->ctx->N);
+    if (coefficient_count > std::numeric_limits<size_t>::max() / target_count)
+        return set_error("BlockModSwitch coefficient count overflow");
+    const size_t count = coefficient_count * target_count;
+    const size_t blocks = count / 128 + (count % 128 != 0);
+    if (blocks > static_cast<size_t>(std::numeric_limits<int>::max()))
+        return set_error("BlockModSwitch exceeds CUDA grid capacity");
+    cudaError_t error = cudaSetDevice(output.device);
+    if (error != cudaSuccess) return set_error(error);
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(out, out->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(source, source->ctx->limb_gpu_ids[limb], output.device, stream, false, true);
+        if (status != 0) return status;
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        status = matrix_wait_limb_stream(out, out->ctx->limb_gpu_ids[limb], output.device, stream);
+        if (status != 0) return status;
+    }
+    BlockModSwitchMetadata *device_metadata = nullptr;
+    std::vector<void *> pinned;
+    status = crt_alloc_and_copy_async(&device_metadata,
+        std::vector<BlockModSwitchMetadata>{host_metadata}, stream, &pinned);
+    if (status == 0)
+    {
+        block_mod_switch_kernel<<<static_cast<int>(blocks), 128, 0, stream>>>(
+            device_metadata, coefficient_count, static_cast<size_t>(out->ctx->N));
+        error = cudaGetLastError();
+        if (error != cudaSuccess) status = set_error(error);
+    }
+    for (size_t limb = 0; limb < source_count; ++limb)
+    {
+        const int tracked = matrix_track_limb_consumer_readonly(source,
+            source->ctx->limb_gpu_ids[limb], output.device, stream);
+        if (status == 0) status = tracked;
+    }
+    for (size_t limb = 0; limb < target_count; ++limb)
+    {
+        const int recorded = matrix_record_limb_write(out, out->ctx->limb_gpu_ids[limb], stream);
+        if (status == 0) status = recorded;
+    }
+    if (device_metadata) cudaFreeAsync(device_metadata, stream);
+    if (!pinned.empty())
+    {
+        const int deferred = gpu_defer_pinned_frees(out->ctx, output.device, stream, pinned.data(), pinned.size());
+        if (status == 0) status = deferred;
     }
     return status;
 }

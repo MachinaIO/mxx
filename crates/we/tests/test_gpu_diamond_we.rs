@@ -109,6 +109,29 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
     let warm_up_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_WARMUPS", 1);
     let measured_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS", 1);
     assert!(measured_iterations > 0, "MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS must be positive");
+    let runtime_started = Instant::now();
+    let mut runtime = GpuDiamondWeRuntime::new(
+        selected.compiler,
+        gpu_parameters.clone(),
+        MemoryArtifactStore::default(),
+    )
+    .expect("GPU Diamond WE runtime construction")
+    .with_execution_config(ExecutionConfig {
+        max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
+            .expect("effective parallel width is nonzero"),
+        ..ExecutionConfig::default()
+    });
+    let circuit = and_circuit();
+    let instance = [true];
+    let witness = [true];
+    let message = true;
+    let encrypt_started = Instant::now();
+    let ciphertext =
+        runtime.encrypt(&circuit, &instance, message).expect("GPU Diamond WE encryption");
+    info!(
+        elapsed_seconds = encrypt_started.elapsed().as_secs_f64(),
+        "completed GPU Diamond WE encryption"
+    );
     let estimate_started = Instant::now();
     let mut measurement_backend = DiamondGpuMeasurementBackend::new(
         gpu_parameters.clone(),
@@ -119,8 +142,13 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             ..MeasurementHarnessConfig::default()
         },
     );
-    let estimate = estimate_diamond_cost(&selected.compiler, &mut measurement_backend)
-        .expect("GPU Diamond WE graph cost estimation");
+    let estimate = estimate_diamond_cost(
+        &runtime.compiler,
+        &mut measurement_backend,
+        &ciphertext.encryption,
+        &mut runtime.store,
+    )
+    .expect("GPU Diamond WE graph cost estimation");
     info!(
         encryption_work_seconds = estimate.encryption.total_work_seconds,
         encryption_critical_path_seconds = estimate.encryption.critical_path_seconds,
@@ -145,27 +173,6 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
             .unwrap_or_default() >
             0,
         "the analytical matrix/trapdoor payload estimate must be nonzero"
-    );
-
-    let runtime_started = Instant::now();
-    let mut runtime =
-        GpuDiamondWeRuntime::new(selected.compiler, gpu_parameters, MemoryArtifactStore::default())
-            .expect("GPU Diamond WE runtime construction")
-            .with_execution_config(ExecutionConfig {
-                max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
-                    .expect("effective parallel width is nonzero"),
-                ..ExecutionConfig::default()
-            });
-    let circuit = and_circuit();
-    let instance = [true];
-    let witness = [true];
-    let message = true;
-    let encrypt_started = Instant::now();
-    let ciphertext =
-        runtime.encrypt(&circuit, &instance, message).expect("GPU Diamond WE encryption");
-    info!(
-        elapsed_seconds = encrypt_started.elapsed().as_secs_f64(),
-        "completed GPU Diamond WE encryption"
     );
     let decrypt_started = Instant::now();
     let decoded = runtime

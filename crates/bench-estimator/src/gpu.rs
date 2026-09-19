@@ -20,7 +20,7 @@ use crate::{
 };
 use mxx_ir_core::{
     ParamEnv,
-    artifact::{ArtifactConfidentiality, ArtifactType},
+    artifact::{ArtifactAvailability, ArtifactType},
     encoding,
     node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
     types::{ConcreteMatrixType, ConcreteWireType},
@@ -142,6 +142,21 @@ fn require_exclusive_measurement_context(
             "GPU {device_id} has {live_contexts} live mxx contexts but the measurement backend owns {owned_contexts}; exclusive CUDA mempool measurement is required"
         )))
     }
+}
+
+/// Select the worker for a physical device.  In replicated multi-GPU setup
+/// every worker backend may contain the entire fleet, so backend containment
+/// alone is ambiguous.  The worker's explicit device owner is authoritative;
+/// containment is retained only for legacy/shared-backend fallback.
+fn select_worker_index_for_physical(
+    worker_count: usize,
+    physical: i32,
+    worker_device_id: impl Fn(usize) -> i32,
+    backend_contains: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    (0..worker_count)
+        .find(|&index| worker_device_id(index) == physical)
+        .or_else(|| (0..worker_count).find(|&index| backend_contains(index)))
 }
 
 fn begin_gpu_memory_measurement(
@@ -615,11 +630,18 @@ impl GpuNodeMeasurementBackend {
         self.physical_device_ids().into_iter().position(|device| device == physical)
     }
 
+    fn worker_index_for_physical_device(&self, physical: i32) -> Option<usize> {
+        select_worker_index_for_physical(
+            self.workers.len(),
+            physical,
+            |index| self.workers[index].device_id,
+            |index| self.workers[index].backend.physical_device_ids().contains(&physical),
+        )
+    }
+
     fn worker_index_for_logical_device(&self, logical: usize) -> Option<usize> {
         let physical = self.physical_device_ids().get(logical).copied()?;
-        self.workers.iter().position(|worker| {
-            worker.device_id == physical || worker.backend.physical_device_ids().contains(&physical)
-        })
+        self.worker_index_for_physical_device(physical)
     }
 
     /// Convert the native sampler owner returned by the cold setup query into
@@ -1737,6 +1759,41 @@ impl GpuNodeMeasurementBackend {
                     components,
                 )
                 .map_err(|error| GpuMeasurementError(error.to_string()))?
+        } else if domain == CanonicalWarmupProfileDomain::CenteredRebase {
+            // Compact CenteredRebase has no regular DCRT argument.  Query
+            // the native compact owner topology directly so warmup charges
+            // the same compact-to-compact D2D/alias envelope as production;
+            // falling through to generated/full-modulus accounting would
+            // widen the payload and admit a different resource contract.
+            let mapped = mapped_inputs.first().ok_or_else(|| {
+                GpuMeasurementError("compact centered rebase has no mapped input".into())
+            })?;
+            let input =
+                prepared.small_arguments.get(mapped.operand).and_then(Option::as_ref).ok_or_else(
+                    || GpuMeasurementError("compact centered rebase input owner is missing".into()),
+                )?;
+            let output_type = representative
+                .concrete_output_types
+                .iter()
+                .find_map(|ty| ty.matrix_type())
+                .ok_or_else(|| {
+                    GpuMeasurementError("compact centered rebase output type is missing".into())
+                })?;
+            let input_start = mapped.range.start.min(input.size().1);
+            let input_end = mapped.range.end.min(input.size().1);
+            if input_start >= input_end {
+                return Err(GpuMeasurementError(
+                    "compact centered rebase allocation range is empty".into(),
+                ));
+            }
+            worker
+                .backend
+                .compact_centered_rebase_allocation_envelope(
+                    input,
+                    output_type,
+                    input_start..input_end,
+                )
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
         } else {
             let matrix_type = representative
                 .concrete_output_types
@@ -1961,9 +2018,7 @@ impl GpuNodeMeasurementBackend {
     /// streams: the next (usually smaller) candidate is allowed to reuse the
     /// context only after this fence and allocator/context validation pass.
     fn recover_measurement_oom(&mut self, physical: i32, message: String) -> GpuWarmupProfileError {
-        let worker_index = self.workers.iter().position(|worker| {
-            worker.device_id == physical || worker.backend.physical_device_ids().contains(&physical)
-        });
+        let worker_index = self.worker_index_for_physical_device(physical);
         let Some(worker) = worker_index.and_then(|index| self.workers.get_mut(index)) else {
             return GpuWarmupProfileError::Measurement(format!(
                 "OOM cleanup cannot find selected physical device {physical}: {message}"
@@ -4014,6 +4069,7 @@ impl GpuNodeMeasurementBackend {
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
             NodeKind::CenteredRebase { .. } |
+            NodeKind::BlockModSwitch { .. } |
             NodeKind::RnsModUp { .. } |
             NodeKind::RnsModDown { .. } |
             NodeKind::MatrixNegate => {
@@ -6503,6 +6559,37 @@ impl GpuNodeMeasurementBackend {
                         .collect(),
                 )
             }
+            NodeKind::BlockModSwitch { source_moduli, plaintext_modulus, .. } => {
+                let destination = output_matrix_type()?;
+                let t = plaintext_modulus
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            backend
+                                .block_mod_switch(matrix(0)?, &destination, source_moduli, &t)
+                                .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
+            NodeKind::CenteredRebase { .. }
+                if matches!(
+                    node.concrete_argument_types.first(),
+                    Some(ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. })
+                ) =>
+            {
+                let destination = output_matrix_type()?;
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .centered_rebase_small(small_matrix_arc(0)?.as_ref(), &destination)
+                            .map(GpuMeasurementOutput::SmallMatrix)
+                            .map_err(backend_error)
+                    })
+                    .collect()
+            }
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
             NodeKind::CenteredRebase { .. } => {
@@ -7290,13 +7377,38 @@ impl MeasurementBackend for GpuNodeMeasurementBackend {
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         match kind {
             NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.confidentiality == ArtifactConfidentiality::Private =>
+                if artifact.availability == ArtifactAvailability::Cached =>
             {
                 0
             }
             NodeKind::Input { .. } => self.persistent_storage_bytes_for_node(kind, wire_type),
             _ => 0,
         }
+    }
+
+    fn cache_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        match kind {
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.availability == ArtifactAvailability::Cached =>
+            {
+                self.persistent_storage_bytes_for_node(kind, wire_type)
+            }
+            _ => 0,
+        }
+    }
+
+    fn artifact_payload_bytes_for_node(
+        &self,
+        _kind: &NodeKind,
+        _wire_type: &ConcreteWireType,
+        manifest_payload_bytes: Option<u64>,
+    ) -> u64 {
+        // Production artifact inputs are rejected by the estimator before
+        // reaching this hook when no exact store-captured size is available.
+        // Keeping this hook total preserves the measurement-backend trait for
+        // non-artifact synthetic inputs without reintroducing a resident-byte
+        // or modulus-bit approximation as production authority.
+        manifest_payload_bytes.unwrap_or(0)
     }
 
     fn persistent_alias_argument(&self, kind: &NodeKind, output_port: usize) -> Option<usize> {
@@ -7352,7 +7464,7 @@ mod tests {
         GpuMeasurementError, GpuMeasurementOutput, GpuNodeMeasurementBackend, PendingMeasurement,
         PreparedMeasurement, aggregate_fleet_wave, authoritative_production_route,
         compact_matrix_bytes, extrapolate_fleet_waves, gpu_capped_waterfill_columns, matrix_bytes,
-        require_exclusive_measurement_context,
+        require_exclusive_measurement_context, select_worker_index_for_physical,
     };
     use crate::{MeasurementNode, NodeMeasurement, harness::MeasurementHarnessConfig};
     use mxx_ir_core::{
@@ -7392,6 +7504,37 @@ mod tests {
     };
     use num_bigint::{BigInt, BigUint};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn worker_selection_prefers_explicit_owner_in_replicated_full_fleet() {
+        let worker_devices = [0, 1];
+        let replicated_fleet = [vec![0, 1], vec![0, 1]];
+        let select = |physical| {
+            select_worker_index_for_physical(
+                worker_devices.len(),
+                physical,
+                |index| worker_devices[index],
+                |index| replicated_fleet[index].contains(&physical),
+            )
+        };
+
+        assert_eq!(select(0), Some(0));
+        assert_eq!(select(1), Some(1));
+
+        // Shared-backend configurations have no exact worker owner and still
+        // use containment as the compatibility fallback.
+        let shared_devices = [7, 8];
+        let shared_fleet = [vec![0, 1], vec![0, 1]];
+        assert_eq!(
+            select_worker_index_for_physical(
+                shared_devices.len(),
+                1,
+                |index| shared_devices[index],
+                |index| shared_fleet[index].contains(&1),
+            ),
+            Some(0)
+        );
+    }
 
     #[test]
     fn canonical_profile_inventory_is_closed_and_provider_rejects_domain_drift() {

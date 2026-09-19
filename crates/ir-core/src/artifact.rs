@@ -27,9 +27,12 @@ pub struct Manifest {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum ArtifactConfidentiality {
-    Public,
-    Private,
+pub enum ArtifactAvailability {
+    /// The consumer receives the canonical payload from an external producer.
+    Transferred,
+    /// The consumer can deterministically regenerate the payload from public
+    /// context and uses the stored payload as a cache entry.
+    Cached,
 }
 
 /// Complete validated schema for a compact bounded-coefficient matrix.
@@ -148,26 +151,19 @@ impl ArtifactType {
 pub struct ManifestArtifact {
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
 pub enum ManifestValidationError {
-    #[error("private artifact {name} must not expose a content hash")]
-    PrivateContentHash { name: String },
     #[error("bounded artifact {name} has a negative coefficient bound")]
     NegativeCoefficientBound { name: String },
 }
 
 pub fn validate_manifest(manifest: &Manifest) -> Result<(), ManifestValidationError> {
     for (name, artifact) in &manifest.artifacts {
-        if artifact.confidentiality == ArtifactConfidentiality::Private &&
-            artifact.content_hash.is_some()
-        {
-            return Err(ManifestValidationError::PrivateContentHash { name: name.clone() });
-        }
         let bound = match &artifact.artifact_type {
             ArtifactType::SmallMatrix { max_coefficient_bound, .. } |
             ArtifactType::Preimage { max_coefficient_bound, .. } => Some(max_coefficient_bound),
@@ -185,7 +181,7 @@ pub struct ExportArtifact {
     pub wire: WireId,
     pub artifact_type: ArtifactType,
     pub family_count: Option<usize>,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
     pub content_hash: Option<[u8; 32]>,
     pub layout: Option<String>,
 }
@@ -214,11 +210,12 @@ pub fn export_manifest(
                 ManifestArtifact {
                     artifact_type: artifact.artifact_type.clone(),
                     family_count: artifact.family_count,
-                    confidentiality: artifact.confidentiality,
-                    content_hash: match artifact.confidentiality {
-                        ArtifactConfidentiality::Public => artifact.content_hash,
-                        ArtifactConfidentiality::Private => None,
-                    },
+                    availability: artifact.availability,
+                    // Availability controls how a consumer obtains the artifact;
+                    // it does not control integrity metadata.  A cached artifact
+                    // may still carry a content hash and must be verified exactly
+                    // like a transferred artifact.
+                    content_hash: artifact.content_hash,
                     layout: artifact.layout.clone(),
                 },
             )
@@ -231,7 +228,7 @@ pub fn export_manifest(
 ///
 /// Indexed-family outputs become artifact families; compatible scalar wires
 /// become singular artifacts. Every persisted output must be backed by an
-/// graph output carrying an explicit confidentiality declaration.
+/// graph output carrying an explicit availability declaration.
 pub fn export_validated_manifest(
     production_id: ProductionId,
     graph: &ValidatedGraph,
@@ -241,7 +238,7 @@ pub fn export_validated_manifest(
         .outputs()
         .iter()
         .filter_map(|(name, output)| {
-            let confidentiality = output.confidentiality?;
+            let availability = output.availability?;
             Some((|| {
                 let id = WireId { instantiation_path: Vec::new(), wire: output.value };
                 let wire_type = graph
@@ -263,7 +260,7 @@ pub fn export_validated_manifest(
                         wire: id,
                         artifact_type,
                         family_count: first_class_family_count,
-                        confidentiality,
+                        availability,
                         content_hash: None,
                         layout: None,
                     },
@@ -279,26 +276,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn private_manifest_artifacts_cannot_expose_content_hashes() {
+    fn cached_manifest_artifacts_preserve_content_hashes() {
         let manifest = Manifest {
             ir_version: IR_VERSION,
             production_id: ProductionId { spec_hash: SpecHash([1; 32]), execution_nonce: [2; 32] },
             artifacts: BTreeMap::from([(
-                "private".to_owned(),
+                // A cached entry is valid here because the fixture models a
+                // public deterministic cache key; availability is unrelated
+                // to confidentiality and does not suppress integrity hashes.
+                "deterministic-cache".to_owned(),
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
+                    availability: ArtifactAvailability::Cached,
                     content_hash: Some([3; 32]),
                     layout: None,
                 },
             )]),
         };
 
-        assert!(matches!(
-            validate_manifest(&manifest),
-            Err(ManifestValidationError::PrivateContentHash { name }) if name == "private"
-        ));
+        assert!(validate_manifest(&manifest).is_ok());
     }
 
     #[test]
@@ -352,7 +349,7 @@ mod tests {
                         max_coefficient_bound: BigInt::from(-1),
                     },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Public,
+                    availability: ArtifactAvailability::Transferred,
                     content_hash: None,
                     layout: None,
                 },

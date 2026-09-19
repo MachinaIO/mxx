@@ -1,5 +1,5 @@
 use crate::{
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
@@ -92,6 +92,14 @@ pub enum NodeKind {
     },
     /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
     RnsModDown {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: IntExpr,
+    },
+    /// Exact block CRT modulus switching. `source_moduli` is the complete
+    /// source basis; `modulus` is the product of a strict non-empty subset.
+    /// The plaintext modulus is the positive correction factor `t`.
+    BlockModSwitch {
         modulus: IntExpr,
         source_moduli: Vec<u64>,
         plaintext_modulus: IntExpr,
@@ -202,7 +210,7 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

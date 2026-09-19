@@ -17,6 +17,7 @@ gpu = [
 ]
 
 [dependencies]
+bincode.workspace = true
 mxx-ir-core.workspace = true
 mxx-primitives = { workspace = true, optional = true }
 mxx-runtime.workspace = true

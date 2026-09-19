@@ -34,6 +34,51 @@ impl DCRTPoly {
         Self { ptr_poly: ptr_poly.into() }
     }
 
+    /// Validate the length-bearing compact polynomial format before the
+    /// legacy infallible decoder is invoked.  In particular, this prevents a
+    /// malformed `max_byte_size` from indexing past the payload or causing a
+    /// centered subtraction underflow.
+    pub(crate) fn validate_compact_bytes(
+        params: &DCRTPolyParams,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        if bytes.len() < 4 {
+            return Err("compact polynomial header is truncated");
+        }
+        let header: [u8; 4] = bytes
+            .get(..4)
+            .and_then(|header| header.try_into().ok())
+            .ok_or("compact polynomial header is truncated")?;
+        let max_byte_size = u32::from_le_bytes(header) as usize;
+        if max_byte_size == 0 {
+            return Err("compact polynomial width is zero");
+        }
+        let ring_dimension = params.ring_dimension() as usize;
+        let bit_vector_bytes = ring_dimension.div_ceil(8);
+        let coeff_offset =
+            4usize.checked_add(bit_vector_bytes).ok_or("compact polynomial header overflows")?;
+        let coeff_bytes = ring_dimension
+            .checked_mul(max_byte_size)
+            .ok_or("compact polynomial payload overflows")?;
+        let expected_len =
+            coeff_offset.checked_add(coeff_bytes).ok_or("compact polynomial length overflows")?;
+        if bytes.len() != expected_len {
+            return Err("compact polynomial payload length mismatch");
+        }
+
+        let modulus = params.modulus();
+        let modulus = modulus.as_ref();
+        for index in 0..ring_dimension {
+            let start = coeff_offset + index * max_byte_size;
+            let value_bytes = &bytes[start..start + max_byte_size];
+            let value = BigUint::from_bytes_le(value_bytes);
+            if value >= *modulus {
+                return Err("compact polynomial coefficient exceeds modulus");
+            }
+        }
+        Ok(())
+    }
+
     fn from_slice_with_map<T, F>(params: &DCRTPolyParams, slice: &[T], map_fn: F) -> Self
     where
         T: Sync,
@@ -66,6 +111,24 @@ impl DCRTPoly {
         super::native::ffi::exact_basis_convert(&self.ptr_poly, &params.to_crt().0, centered)
             .map(Self::new)
             .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn block_mod_switch(
+        &self,
+        params: &DCRTPolyParams,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String> {
+        let words = plaintext_modulus.to_u64_digits();
+        if words.is_empty() {
+            return Err("BlockModSwitch plaintext modulus must be positive".into());
+        }
+        super::native::ffi::exact_basis_block_mod_switch(
+            &self.ptr_poly,
+            &params.to_crt().0,
+            words.as_slice(),
+        )
+        .map(Self::new)
+        .map_err(|error| error.to_string())
     }
 
     pub(crate) fn rns_convert(

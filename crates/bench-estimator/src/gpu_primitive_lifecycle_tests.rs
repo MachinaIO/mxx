@@ -19,17 +19,21 @@ use std::{
 use mxx_dsl::{DslContext, Family, Ring};
 use mxx_ir_core::{
     ParamEnv,
+    artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     node::{ConcatAxis, ConstantMatrix, IndexRange},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_primitives::poly::{
     PolyParams,
-    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
+    dcrt::{
+        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
+        params::DCRTPolyParams,
+    },
 };
 use mxx_runtime::{
     Backend, RuntimeValue,
     artifact::MemoryArtifactStore,
-    backend::{GpuWarmupProvenance, poly_gpu::gpu_backend_on},
+    backend::{GpuWarmupProvenance, poly::cpu_backend, poly_gpu::gpu_backend_on},
     executor::execute_with_gpu_plan,
     gpu_column_policy::{
         CanonicalWarmupProfileDomain, WarmupMeasurementKind, canonical_warmup_profile_domain,
@@ -168,6 +172,8 @@ fn ordinary_graph(parameters: &GpuDCRTPolyParams) -> mxx_ir_core::ValidatedGraph
     let rns_source = Ring::new(BigInt::from(131_009u64), parameters.ring_dimension() as usize)
         .uniform_interval((1, 2), -1, 1);
     let centered_rebase = rns_source.clone().centered_rebase(modulus.clone());
+    let block_mod_switch =
+        interval.clone().block_mod_switch(130_817u64, vec![131_009, 130_817], 3u64);
     let rns_up = rns_source.rns_mod_up(modulus.clone(), vec![131_009], 1, true);
     let rns_down = rns_up.clone().rns_mod_down(131_009u64, vec![131_009, 130_817], 2);
     let crt = mxx_dsl::Mat::crt_recompose(
@@ -264,6 +270,8 @@ fn ordinary_graph(parameters: &GpuDCRTPolyParams) -> mxx_ir_core::ValidatedGraph
         .expect("modulus reduce")
         .output("centered-rebase", centered_rebase)
         .expect("centered rebase")
+        .output("block-mod-switch", block_mod_switch)
+        .expect("block mod switch")
         .output("rns-up", rns_up)
         .expect("rns up")
         .output("rns-down", rns_down)
@@ -332,8 +340,23 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         Some(&parameters),
         None,
     );
+    let block_parameters = GpuDCRTPolyParams::new_with_gpu(
+        8,
+        vec![130_817],
+        8,
+        vec![device],
+        None,
+        Some(&parameters),
+        None,
+    );
     let mut provider = GpuNodeMeasurementBackend::new(
-        vec![(gpu_backend_on([source_parameters, parameters.clone()], [device]), device)],
+        vec![(
+            gpu_backend_on(
+                [source_parameters, block_parameters.clone(), parameters.clone()],
+                [device],
+            ),
+            device,
+        )],
         harness,
     );
     let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
@@ -404,7 +427,8 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         Some(&parameters),
         None,
     );
-    let mut backend = gpu_backend_on([source_parameters, parameters.clone()], [device]);
+    let mut backend =
+        gpu_backend_on([source_parameters, block_parameters, parameters.clone()], [device]);
     backend.select_operation([0xA7; 32]).expect("select operation");
     warmup.plan.contract = backend
         .gpu_runtime_contract(
@@ -468,5 +492,285 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         "trapdoor sampling must use the metadata-bearing fixed path"
     );
     assert_eq!(call_counter.load(Ordering::SeqCst), measured_calls);
+    gpu_device_sync();
+}
+
+/// Centered rebase is a value-preserving basis conversion, not a single-limb
+/// special case.  This test keeps the source matrix on the complete two-limb
+/// basis and runs both compact wire representations through the same public
+/// DSL -> provider -> frozen-plan -> fixed-executor lifecycle.  BlockModSwitch
+/// is included as a matrix-only sibling so the primitive inventory cannot
+/// accidentally cover it only through a hand-written provider table.
+#[test]
+#[serial_test::serial(gpu_context)]
+fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() {
+    let detected = detected_gpu_device_ids();
+    let Some(&device) = detected.first() else {
+        panic!("CenteredRebase lifecycle requires a detected GPU");
+    };
+    // Run the same graph on one device.  The existing multi-GPU lifecycle
+    // suite exercises the identical ownership contract when a second device
+    // is present; this test intentionally keeps the numeric oracle compact.
+    let devices = vec![device];
+    let parameters = GpuDCRTPolyParams::new_with_gpu(
+        8,
+        vec![131_009, 130_817],
+        8,
+        devices.clone(),
+        None,
+        None,
+        None,
+    );
+    let block_parameters = GpuDCRTPolyParams::new_with_gpu(
+        8,
+        vec![130_817],
+        8,
+        devices.clone(),
+        None,
+        Some(&parameters),
+        None,
+    );
+    let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+    let digits = parameters.crt_bits().div_ceil(parameters.base_bits() as usize);
+    let ring = Ring::new(modulus.clone(), parameters.ring_dimension() as usize);
+    let matrix = ring.input("matrix", (1, 3));
+    let small = ring.small_matrix_input("small", (digits, 3), 255u64);
+    let preimage = ring.preimage_input("preimage", (digits, 3), 255u64);
+    let graph = DslContext::new("vertical-multilimb-centered-rebase")
+        .output("matrix", matrix.clone().centered_rebase(modulus.clone()))
+        .expect("matrix centered rebase output")
+        .output("small", small.clone().centered_rebase(modulus.clone()))
+        .expect("small centered rebase output")
+        .output("preimage", preimage.clone().centered_rebase(modulus.clone()))
+        .expect("preimage centered rebase output")
+        .output("block", matrix.block_mod_switch(130_817u64, vec![131_009, 130_817], 3u64))
+        .expect("block modulus switch output")
+        .build()
+        .expect("DSL build")
+        .validate(&ParamEnv::default())
+        .expect("graph validation");
+
+    let full_type = ConcreteMatrixType {
+        modulus: modulus.clone(),
+        ring_dimension: parameters.ring_dimension() as usize,
+        rows: 1,
+        columns: 3,
+    };
+    let block_type = ConcreteMatrixType { modulus: BigInt::from(130_817u64), ..full_type.clone() };
+    let cpu_parameters = DCRTPolyParams::new(
+        parameters.ring_dimension(),
+        2,
+        parameters.crt_bits(),
+        parameters.base_bits(),
+        Some(vec![131_009, 130_817]),
+        None,
+    );
+    let cpu_block_parameters = DCRTPolyParams::new(
+        parameters.ring_dimension(),
+        1,
+        parameters.crt_bits(),
+        parameters.base_bits(),
+        Some(vec![130_817]),
+        None,
+    );
+    let mut cpu = cpu_backend([cpu_parameters, cpu_block_parameters]);
+    let cpu_input = cpu
+        .constant_matrix(
+            &full_type,
+            &ConstantMatrix::UnitRow { index: 0.into() },
+            &ParamEnv::default(),
+        )
+        .expect("CPU oracle input");
+    let expected_centered =
+        cpu.centered_rebase(&cpu_input, &full_type).expect("CPU multi-limb centered rebase");
+    let expected_block = cpu
+        .block_mod_switch(&cpu_input, &block_type, &[131_009, 130_817], &BigInt::from(3u8))
+        .expect("CPU BigInt block modulus switch");
+    let compact_schema = ConcreteBoundedMatrixSchema {
+        matrix: ConcreteMatrixType { rows: digits, ..full_type.clone() },
+        max_coefficient_bound: BigInt::from(255u16),
+    };
+    let mut backend =
+        gpu_backend_on([parameters.clone(), block_parameters.clone()], devices.clone());
+    backend.select_operation([0x36; 32]).expect("select GPU operation");
+    let matrix_value = backend
+        .constant_matrix(
+            &full_type,
+            &ConstantMatrix::UnitRow { index: 0.into() },
+            &ParamEnv::default(),
+        )
+        .expect("GPU matrix input");
+    let small_value = backend
+        .sample_hash_small_decomposed(
+            &compact_schema.matrix,
+            [0x37; 32],
+            b"centered-rebase-compact-oracle",
+            &BigInt::from(256u16),
+            digits,
+        )
+        .expect("GPU small-matrix input");
+    let generic_compact_bytes = backend
+        .small_matrix_to_bytes(&small_value, &compact_schema, SmallMatrixSemanticKind::Generic)
+        .expect("GPU generic compact encoding");
+    let preimage_compact_bytes = backend
+        .small_matrix_to_bytes(&small_value, &compact_schema, SmallMatrixSemanticKind::Preimage)
+        .expect("GPU preimage compact encoding");
+    let preimage_value = small_value.clone();
+    let inputs = BTreeMap::from([
+        ("matrix".to_owned(), RuntimeValue::matrix(matrix_value)),
+        ("small".to_owned(), RuntimeValue::small_matrix(small_value)),
+        ("preimage".to_owned(), RuntimeValue::small_matrix(preimage_value)),
+    ]);
+
+    let mut warmup_config = config(&graph, &parameters, device);
+    warmup_config.contract.logical_to_physical_devices =
+        devices.iter().map(|id| *id as usize).collect();
+    warmup_config.contract.device_budgets = devices
+        .iter()
+        .enumerate()
+        .map(|(index, _)| GpuDeviceBudget {
+            device: index,
+            device_bytes: u64::MAX,
+            pinned_host_bytes: u64::MAX,
+            host_bytes: u64::MAX,
+        })
+        .collect();
+    warmup_config.default_tile_widths = vec![2];
+    warmup_config.default_cost = vec![GpuStageCostModel::default(); devices.len()];
+    for layout in &mut warmup_config.layouts {
+        layout.instance_device_stride = 1;
+    }
+    let harness = MeasurementHarnessConfig {
+        warm_up_iterations: 0,
+        measured_iterations: 1,
+        memory_poll_interval: Duration::ZERO,
+    };
+    let mut provider = GpuNodeMeasurementBackend::new(
+        devices
+            .iter()
+            .map(|id| {
+                (
+                    gpu_backend_on([parameters.clone(), block_parameters.clone()], devices.clone()),
+                    *id,
+                )
+            })
+            .collect(),
+        harness,
+    );
+    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+        &graph,
+        &warmup_config,
+        &mut provider,
+    )
+    .expect("multi-limb compact warmup must complete");
+    let records = provider.warmup_dispatch_records();
+    for domain in
+        [CanonicalWarmupProfileDomain::CenteredRebase, CanonicalWarmupProfileDomain::BlockModSwitch]
+    {
+        assert!(
+            records.iter().any(|record| {
+                record.profile_domain == domain &&
+                    record.measurement == WarmupMeasurementKind::GpuMeasured &&
+                    record.range.start < record.range.end
+            }),
+            "{domain:?} was not measured by the production provider"
+        );
+    }
+    assert!(provider.warmup_measurement_call_count() > 0);
+    assert!(
+        warmup.report.stages.iter().all(|stage| {
+            stage.predicted_seconds.is_finite() &&
+                stage.peak.iter().all(|peak| peak.total_bytes() < u64::MAX)
+        }),
+        "warmup must carry finite complete memory evidence"
+    );
+    assert!(
+        warmup
+            .report
+            .stages
+            .iter()
+            .any(|stage| { stage.peak.iter().any(|peak| peak.total_bytes() > 0) }),
+        "GPU stages must retain nonzero allocation evidence"
+    );
+    let measured_calls = provider.warmup_measurement_counter();
+    let measured_count = provider.warmup_measurement_call_count();
+    drop(provider);
+    gpu_device_sync();
+
+    warmup.plan.contract = backend
+        .gpu_runtime_contract(&graph, &inputs)
+        .expect("runtime contract query")
+        .expect("GPU runtime contract");
+    warmup.plan.validate().expect("frozen plan validation");
+    for choice in &warmup.plan.nodes {
+        if !choice.columns_per_job.iter().any(|width| *width > 0) {
+            continue;
+        }
+        let Some(layout_id) = choice.output_layouts.first() else {
+            continue;
+        };
+        let layout = warmup.plan.layout(*layout_id).expect("frozen output layout");
+        if layout.columns < 3 {
+            continue;
+        }
+        let schedule = layout.schedule(&choice.columns_per_job, 0).expect("frozen output schedule");
+        assert!(schedule.intervals().iter().all(|interval| interval.start < interval.end));
+        let ownership_schedule =
+            if schedule.waves().any(|jobs| jobs.iter().any(|job| job.start > 0)) {
+                schedule
+            } else {
+                layout
+                    .schedule(&vec![2; choice.columns_per_job.len()], 0)
+                    .expect("owner/tail candidate schedule")
+            };
+        assert!(ownership_schedule.waves().any(|jobs| jobs.iter().any(|job| job.start > 0)));
+        assert!(
+            ownership_schedule.waves().any(|jobs| jobs.iter().any(|job| job.end - job.start < 2))
+        );
+    }
+    let output = execute_with_gpu_plan(
+        &graph,
+        &warmup.plan,
+        &mut backend,
+        inputs,
+        &mut MemoryArtifactStore::default(),
+        SamplingMode::Fresh,
+    )
+    .expect("fixed multi-limb centered-rebase execution");
+    let RuntimeValue::Matrix(actual_matrix) = &output.outputs["matrix"] else {
+        panic!("matrix centered rebase changed its wire kind");
+    };
+    let RuntimeValue::Matrix(actual_block) = &output.outputs["block"] else {
+        panic!("block modulus switch changed its wire kind");
+    };
+    assert_eq!(
+        actual_matrix.shards().first().expect("matrix output shard").value.to_cpu_matrix(),
+        expected_centered
+    );
+    assert_eq!(
+        actual_block.shards().first().expect("block output shard").value.to_cpu_matrix(),
+        expected_block
+    );
+    for name in ["small", "preimage"] {
+        let RuntimeValue::SmallMatrix(value) = &output.outputs[name] else {
+            panic!("{name} centered rebase changed its compact wire kind");
+        };
+        let semantic = if name == "small" {
+            SmallMatrixSemanticKind::Generic
+        } else {
+            SmallMatrixSemanticKind::Preimage
+        };
+        let bytes = backend
+            .small_matrix_to_bytes(value, &compact_schema, semantic)
+            .expect("fixed compact output encoding");
+        let expected =
+            if name == "small" { &generic_compact_bytes } else { &preimage_compact_bytes };
+        assert_eq!(&bytes, expected, "{name} compact payload changed during rebase");
+    }
+    // The provider is setup-only.  Dropping the input map at the executor
+    // boundary and synchronizing here exercises native consumer lifetime
+    // events before the output owners are released.
+    assert_eq!(measured_calls.load(Ordering::SeqCst), measured_count);
+    drop(output);
     gpu_device_sync();
 }

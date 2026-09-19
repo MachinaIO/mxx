@@ -8,7 +8,7 @@ use mxx_gadgets::{
 };
 use mxx_ir_core::{
     IntExpr, RealExpr,
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
 };
 use num_bigint::BigUint;
 use std::collections::{BTreeMap, BTreeSet};
@@ -316,7 +316,7 @@ impl TallRotationEncodingCompiler {
         context: DslContext,
         public: TallLinearTransformPublicWires,
     ) -> Result<DslContext, TallCompileError> {
-        Ok(context.public_output(TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, public.left_matrix)?)
+        Ok(context.transferred_output(TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT, public.left_matrix)?)
     }
 
     pub fn import_anchor_reduce_artifact(
@@ -330,7 +330,7 @@ impl TallRotationEncodingCompiler {
             artifacts.production_id.clone(),
             TALL_ANCHOR_REDUCE_MATRIX_ARTIFACT,
             (self.secret_size, self.gadget_columns()),
-            ArtifactConfidentiality::Public,
+            ArtifactAvailability::Transferred,
         );
         Ok(TallLinearTransformPublicWires { left_matrix: matrix.clone(), right_matrix: matrix })
     }
@@ -434,8 +434,8 @@ impl TallRotationEncodingCompiler {
         for (key, rotation) in wires.rotations {
             let names = TallRotationEncodingArtifactNames::for_key(key);
             context = context
-                .public_output(names.a_forward, rotation.left_matrix)?
-                .public_output(names.a_backward, rotation.right_matrix)?;
+                .transferred_output(names.a_forward, rotation.left_matrix)?
+                .transferred_output(names.a_backward, rotation.right_matrix)?;
         }
         Ok(context)
     }
@@ -464,13 +464,13 @@ impl TallRotationEncodingCompiler {
                     artifacts.production_id.clone(),
                     names.a_forward,
                     (self.secret_size, self.gadget_columns()),
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                 ),
                 right_matrix: ring.artifact_input(
                     artifacts.production_id.clone(),
                     names.a_backward,
                     (self.secret_size, self.gadget_columns()),
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                 ),
             },
         )))

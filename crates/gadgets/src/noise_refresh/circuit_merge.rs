@@ -178,8 +178,9 @@ mod graph_tests {
         assert_eq!(outputs.len(), 3);
         let mut context = DslContext::new("noise-refresh-merge-template");
         for (index, output) in outputs.into_iter().enumerate() {
-            context =
-                context.public_output(format!("output_{index}"), output).expect("unique output");
+            context = context
+                .transferred_output(format!("output_{index}"), output)
+                .expect("unique output");
         }
         let built = context.build().expect("build merge Graph IR");
         let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");

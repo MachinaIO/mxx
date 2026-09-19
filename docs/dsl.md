@@ -173,9 +173,12 @@ infer these from a sigma. The values above are illustrative parameters.
 
 ## Outputs and reusable definitions
 
-Declare each result with `output`, or use `public_output` and `private_output` when declaring its
-artifact visibility. These methods accept complete graph values, including records and families.
-For values containing both public and secret fields, select the fields appropriate to each output.
+Declare each result with `output`. Use `transferred_output` when the result is a persisted artifact
+whose canonical payload is supplied across the execution boundary. These methods accept complete
+graph values, including records and families. For values containing both public and secret fields,
+select the fields appropriate to each output. The core `GraphOutput` declaration can also mark an
+artifact as `ArtifactAvailability::Cached` when its payload is deterministically regenerated from
+public context; cached storage is a reusable cache, not a confidentiality or public/secret label.
 The reference specifies output naming and the trapdoor-specific persistence methods.
 
 To reuse a graph body at multiple call sites, define a `Subgraph` with an input schema and a
@@ -215,7 +218,7 @@ The crate root exports `DslContext`, `BuiltGraph`, `Ring`, `Shape`, `IntoShape`,
 `Preimage`, `Trapdoor`, `Int`, `Bool`, `Bytes`, `Family`, `Subgraph`, `GraphValue`, `GraphValueSchema`,
 `MatType`, `SmallMatrixType`, `PreimageType`, `TrapdoorType`, `IntType`, `BoolType`, `BytesType`,
 `FamilyType`, `HashTag`, `HashTagPart`, `DslError`, `ValidationBuildError`, the three control functions,
-and the four macros listed below. Core-owned reexports are `Rational`, `Confidentiality`,
+and the four macros listed below. Core-owned reexports are `Rational`, `ArtifactAvailability`,
 `IdealSpec`, `PurePredicateSpec`, and `ConcatAxis`.
 
 `IntExpr`, `RealExpr`, `ParamEnv`, `MatrixType`, `ValueHandle`, `Graph`, `ProductionId`,
@@ -235,7 +238,7 @@ and protocol declarations retain their own APIs; they are not additional DSL con
 | `FamilyType { element, count }` | Element schema and `IntExpr` count; one indexed wire per flattened element field. |
 | `(A,)` through `(A, ..., L)` | Graph-value/schema tuples of arity 1 through 12, with fields in tuple order. The unit tuple has no supplied `GraphValue` implementation. |
 | `Vec<T>` / `Vec<T::Schema>` | Rust grouping supported by `GraphValue`: each position contributes its own schema and wires, in vector order. Length is fixed during construction; element schemas may differ. Rust indexing retrieves existing handles; use `Family<T>` for graph indexing. |
-| `Confidentiality::{Public, Private}` | Alias of core `ArtifactConfidentiality`; controls declared artifact visibility. |
+| `ArtifactAvailability::{Transferred, Cached}` | Declares how an artifact payload is obtained: `Transferred` requires an external payload, while `Cached` permits deterministic regeneration from public context and uses stored bytes as a cache. This is not a secrecy classification. |
 | `ConcatAxis::{Rows, Columns, Diagonal}` | Row concatenation, column concatenation, or block diagonal construction. |
 
 All graph values and schemas implement `Clone`. Cloning values preserves producer identity rather
@@ -254,11 +257,10 @@ a graph value. A custom record may contain optional data only through its own fi
 | `context.input::<V>(name: N, schema: V::Schema)` | `Result<V, DslError>`; named runtime input leaves, no artifact provenance. Includes records and families. |
 | `context.evaluate_int(expression: E)` | `Int`; materializes a compile expression as a runtime integer wire, including expressions combining a loop binder with parameters. |
 | `context.int_family_input(name: N, fixed_count: E)` | `Family<Int>`; convenience builder for a runtime integer family. |
-| `context.output(name: N, value: V)` | `Result<DslContext, DslError>`; consumes the context and graph value; no explicit confidentiality declaration. |
-| `context.public_output(name: N, value: V)` | Same naming/flattening, sets every output leaf to `Some(Public)`. |
-| `context.private_output(name: N, value: V)` | Same naming/flattening, sets every output leaf to `Some(Private)`. |
-| `context.private_trapdoor_output(name: N, trapdoor: Trapdoor)` | Outputs only the secret trapdoor wire, explicitly private. |
-| `context.private_trapdoor_family_output(name: N, trapdoors: Family<Trapdoor>)` | Outputs only the aligned secret trapdoor family wire, explicitly private. |
+| `context.output(name: N, value: V)` | `Result<DslContext, DslError>`; consumes the context and graph value without declaring a persisted artifact. |
+| `context.transferred_output(name: N, value: V)` | Same naming/flattening, declares every output leaf as `ArtifactAvailability::Transferred`. |
+| `context.transferred_trapdoor_output(name: N, trapdoor: Trapdoor)` | Outputs only the trapdoor value wire as a transferred artifact. |
+| `context.transferred_trapdoor_family_output(name: N, trapdoors: Family<Trapdoor>)` | Outputs only the aligned trapdoor family wire as transferred artifacts. |
 | `context.build()` | `Result<BuiltGraph, DslError>`; freezes reachable named outputs and validates graph structure. |
 | `built.graph` | Public core `Graph` field, for runtime, serialization, and protocol construction. |
 | `built.validate(bindings: &ParamEnv)` | `Result<ValidatedGraph, ValidationBuildError>`; validates concrete parameters and plans execution. |
@@ -267,10 +269,11 @@ a graph value. A custom record may contain optional data only through its own fi
 Output methods consume the context and return it for chaining. Names must be unique after flattening;
 for example, composite output `x` can conflict with existing `x.0`. A scalar or single-leaf family
 keeps `x`, even if supplied through a one-element tuple/vector. Composite outputs use `x.0`, `x.1`,
-... without recursively preserving Rust field names. An explicit public/private operation applies
-to every flattened leaf: `private_output` on a `Trapdoor` includes both public and secret leaves,
-whereas `private_trapdoor_output` projects the secret leaf only. Visibility is an output declaration; artifact validation checks that an imported declaration
-agrees with its producer manifest. It does not implement information-flow analysis or access control. Only declared outputs and their dependencies are retained by the DSL builder.
+... without recursively preserving Rust field names. Artifact availability is an output declaration;
+artifact validation checks that an imported declaration agrees with its producer manifest. It does
+not implement information-flow analysis or access control: `Transferred` and `Cached` describe
+payload transport and deterministic regeneration, not whether a value is public or secret. Only
+declared outputs and their dependencies are retained by the DSL builder.
 
 ### Ring inputs and artifact inputs
 
@@ -289,19 +292,19 @@ checked by the relevant validator/runtime. Integer, Boolean, and byte inputs are
 | `input_family(name: N, count: E, shape: S)` | `Family<Mat>` |
 | `small_matrix_input_family(name: N, count: E, shape: S, max_coefficient_bound: E)` | `Family<SmallMatrix>` |
 | `preimage_input_family(name: N, count: E, shape: S, max_coefficient_bound: E)` | `Family<Preimage>` |
-| `artifact_input(production_id: ProductionId, artifact_name: N, shape: S, confidentiality: Confidentiality)` | `Mat` |
-| `small_matrix_artifact_input(production_id: ProductionId, artifact_name: N, shape: S, max_coefficient_bound: E, confidentiality: Confidentiality)` | `SmallMatrix` |
-| `preimage_artifact_input(production_id: ProductionId, artifact_name: N, shape: S, max_coefficient_bound: E, confidentiality: Confidentiality)` | `Preimage` |
-| `bytes_artifact_input(production_id: ProductionId, artifact_name: N, length: E, confidentiality: Confidentiality)` | `Bytes` |
-| `family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, confidentiality: Confidentiality)` | `Family<Mat>` |
-| `small_matrix_family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, max_coefficient_bound: E, confidentiality: Confidentiality)` | `Family<SmallMatrix>` |
-| `preimage_family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, max_coefficient_bound: E, confidentiality: Confidentiality)` | `Family<Preimage>` |
+| `artifact_input(production_id: ProductionId, artifact_name: N, shape: S, availability: ArtifactAvailability)` | `Mat` |
+| `small_matrix_artifact_input(production_id: ProductionId, artifact_name: N, shape: S, max_coefficient_bound: E, availability: ArtifactAvailability)` | `SmallMatrix` |
+| `preimage_artifact_input(production_id: ProductionId, artifact_name: N, shape: S, max_coefficient_bound: E, availability: ArtifactAvailability)` | `Preimage` |
+| `bytes_artifact_input(production_id: ProductionId, artifact_name: N, length: E, availability: ArtifactAvailability)` | `Bytes` |
+| `family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, availability: ArtifactAvailability)` | `Family<Mat>` |
+| `small_matrix_family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, max_coefficient_bound: E, availability: ArtifactAvailability)` | `Family<SmallMatrix>` |
+| `preimage_family_artifact_input(production_id: ProductionId, artifact_name: N, count: E, shape: S, max_coefficient_bound: E, availability: ArtifactAvailability)` | `Family<Preimage>` |
 | `trapdoor_artifact_input(production_id: ProductionId, public_artifact_name: N, trapdoor_artifact_name: N, rows: E, sigma: R, gadget_base: E, digit_count: E, preimage_max_coefficient_bound: E)` | `Trapdoor` |
 | `trapdoor_family_artifact_input(production_id: ProductionId, public_artifact_name: N, trapdoor_artifact_name: N, count: E, rows: E, sigma: R, gadget_base: E, digit_count: E, preimage_max_coefficient_bound: E)` | `Family<Trapdoor>` |
 
 Artifact builders declare dependencies; they do not load files during graph construction. Metadata
-must agree with the producer and supplied manifest. Trapdoor imports use a public matrix artifact
-and a private secret artifact from the same production. Their public matrix has
+must agree with the producer and supplied manifest. Trapdoor imports use a transferred public
+matrix artifact and a transferred secret artifact from the same production. Their public matrix has
 `rows × (rows * (digit_count + 2))` entries. For other complete schemas, including `Family<Bool>`,
 `Family<Bytes>`, or a custom record, use `context.input` rather than inventing a typed ring method.
 

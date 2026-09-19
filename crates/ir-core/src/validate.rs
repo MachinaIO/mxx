@@ -508,11 +508,11 @@ fn validate_node(
                         artifact: artifact.artifact_name.clone(),
                     }
                 })?;
-                if artifact.confidentiality != stored.confidentiality {
+                if artifact.availability != stored.availability {
                     return node_error(
                         scope,
                         node.id,
-                        "artifact confidentiality does not match manifest",
+                        "artifact availability does not match manifest",
                     );
                 }
                 let (element, count) = family_element(&declared);
@@ -692,24 +692,12 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::ModulusSwitch { modulus } |
-        NodeKind::ModulusReduce { modulus } |
-        NodeKind::CenteredRebase { modulus } => {
+        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
             require_arity(scope, node, 1)?;
-            let input = match argument(scope, values, node, 0)? {
-                ConcreteWireType::Matrix(matrix) => matrix.clone(),
-                _ => {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "modulus conversion requires an ordinary matrix",
-                    )
-                }
-            };
+            let input = matrix_argument(scope, values, node, 0)?;
             let modulus = modulus.evaluate(env)?;
             if modulus <= BigInt::one() ||
-                (!matches!(node.kind, NodeKind::CenteredRebase { .. }) &&
-                    (&input.modulus % &modulus) != BigInt::zero()) ||
+                (&input.modulus % &modulus) != BigInt::zero() ||
                 (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
                     ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
             {
@@ -720,6 +708,94 @@ fn validate_node(
                 );
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+        }
+        NodeKind::CenteredRebase { modulus } => {
+            require_arity(scope, node, 1)?;
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() {
+                return node_error(scope, node.id, "centered rebase destination must exceed one");
+            }
+            let input = argument(scope, values, node, 0)?.clone();
+            match input {
+                ConcreteWireType::Matrix(matrix) => {
+                    vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..matrix })]
+                }
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
+                    vec![ConcreteWireType::SmallMatrix {
+                        matrix: ConcreteMatrixType { modulus, ..matrix },
+                        max_coefficient_bound,
+                    }]
+                }
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                    vec![ConcreteWireType::Preimage {
+                        matrix: ConcreteMatrixType { modulus, ..matrix },
+                        max_coefficient_bound,
+                    }]
+                }
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "centered rebase requires a matrix or bounded compact matrix",
+                    )
+                }
+            }
+        }
+        NodeKind::BlockModSwitch { modulus, source_moduli, plaintext_modulus } => {
+            require_arity(scope, node, 1)?;
+            let input = matrix_argument(scope, values, node, 0)?;
+            let destination = modulus.evaluate(env)?;
+            let plaintext = plaintext_modulus.evaluate(env)?;
+            if source_moduli.is_empty() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch requires a nonempty source basis",
+                );
+            }
+            let mut source_product = BigInt::one();
+            let mut destination_product = BigInt::one();
+            let mut destination_members = 0usize;
+            for prime in source_moduli {
+                let prime_value = BigInt::from(*prime);
+                if *prime <= 2 ||
+                    (*prime - 1) as u128 % (2 * input.ring_dimension as u128) != 0 ||
+                    !source_product.gcd(&prime_value).is_one()
+                {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "block modulus switch requires distinct coprime NTT-compatible odd source moduli",
+                    );
+                }
+                source_product *= &prime_value;
+                if (&destination % &prime_value).is_zero() {
+                    destination_product *= &prime_value;
+                    destination_members += 1;
+                }
+            }
+            if source_product != input.modulus ||
+                destination <= BigInt::one() ||
+                destination_product != destination ||
+                destination_members == 0 ||
+                destination_members == source_moduli.len() ||
+                plaintext <= BigInt::zero()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch requires a strict nonempty CRT subset and positive correction factor",
+                );
+            }
+            let dropped_product = &source_product / &destination;
+            if !plaintext.gcd(&dropped_product).is_one() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch correction factor must be coprime to the dropped basis",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus: destination, ..input })]
         }
         NodeKind::RnsModUp { modulus, source_moduli, .. } |
         NodeKind::RnsModDown { modulus, source_moduli, .. } => {
@@ -2013,7 +2089,7 @@ mod tests {
                 artifact: Some(ArtifactInput {
                     production_id: production_id.clone(),
                     artifact_name: artifact_name.clone(),
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                    availability: crate::artifact::ArtifactAvailability::Transferred,
                 }),
             },
             Vec::new(),
@@ -2029,7 +2105,7 @@ mod tests {
                 ManifestArtifact {
                     artifact_type,
                     family_count: None,
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                    availability: crate::artifact::ArtifactAvailability::Transferred,
                     content_hash: None,
                     layout: None,
                 },
@@ -2100,7 +2176,7 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { value: output, confidentiality: None },
+                GraphOutput { value: output, availability: None },
             )]),
             Vec::new(),
             Vec::new(),
@@ -2747,6 +2823,77 @@ mod tests {
                 vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
             );
             assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn centered_rebase_preserves_compact_bounds() {
+        for preimage in [false, true] {
+            let source = bounded_input("source", matrix_type(17, 2, 3), 7, preimage);
+            let rebased = value(
+                NodeKind::CenteredRebase { modulus: IntExpr::constant(257) },
+                vec![source],
+                vec![if preimage {
+                    WireType::Preimage {
+                        matrix: matrix_type(257, 2, 3),
+                        max_coefficient_bound: IntExpr::constant(7),
+                    }
+                } else {
+                    WireType::SmallMatrix {
+                        matrix: matrix_type(257, 2, 3),
+                        max_coefficient_bound: IntExpr::constant(7),
+                    }
+                }],
+            );
+            let validated = validate(&graph("compact-rebase", rebased), &ParamEnv::default())
+                .expect("compact centered rebase should preserve its bound");
+            assert!(validated.root_scope().wire_types.values().any(|ty| {
+                matches!(
+                    ty,
+                    ConcreteWireType::SmallMatrix { max_coefficient_bound, .. } |
+                        ConcreteWireType::Preimage { max_coefficient_bound, .. }
+                        if max_coefficient_bound == &BigInt::from(7)
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn block_mod_switch_requires_strict_source_basis_subset_and_coprime_t() {
+        let source_basis = vec![17, 97];
+        let valid = value(
+            NodeKind::BlockModSwitch {
+                modulus: IntExpr::constant(97),
+                source_moduli: source_basis.clone(),
+                plaintext_modulus: IntExpr::constant(3),
+            },
+            vec![input("source", matrix_type(17 * 97, 2, 3))],
+            vec![WireType::Matrix(matrix_type(97, 2, 3))],
+        );
+        assert!(validate(&graph("block-mod-switch", valid), &ParamEnv::default()).is_ok());
+
+        for (destination, basis, plaintext, expected) in [
+            (17 * 97, vec![17, 97], 3, "strict nonempty CRT subset"),
+            (17, vec![17, 97], 97, "correction factor"),
+            (97, vec![17, 17], 3, "distinct coprime"),
+            (19, vec![17, 97], 3, "strict nonempty CRT subset"),
+        ] {
+            let candidate = value(
+                NodeKind::BlockModSwitch {
+                    modulus: IntExpr::constant(destination),
+                    source_moduli: basis,
+                    plaintext_modulus: IntExpr::constant(plaintext),
+                },
+                vec![input("source", matrix_type(17 * 97, 2, 3))],
+                vec![WireType::Matrix(matrix_type(destination, 2, 3))],
+            );
+            assert!(
+                node_message(
+                    validate(&graph("invalid-block-mod-switch", candidate), &ParamEnv::default())
+                        .unwrap_err()
+                )
+                .contains(expected)
+            );
         }
     }
 

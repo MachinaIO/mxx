@@ -30,9 +30,9 @@ fn test_gpu_bgv_round_trip() {
     let lhs = bgv.encrypt(&pk, &context.int_family_input("x", n)).unwrap();
     let rhs = bgv.encrypt(&pk, &context.int_family_input("y", n)).unwrap();
     let encryption = context
-        .public_output("lhs", lhs.components.clone())
+        .transferred_output("lhs", lhs.components.clone())
         .unwrap()
-        .public_output("rhs", rhs.components.clone())
+        .transferred_output("rhs", rhs.components.clone())
         .unwrap()
         .build()
         .unwrap();
@@ -70,11 +70,11 @@ fn test_gpu_bgv_round_trip() {
     let generated_rk = bgv.relinearization_key(&sk, top).unwrap();
     let keygen = compile(
         DslContext::new("integration-bgv-keygen")
-            .private_output("sk", sk)
+            .transferred_output("sk", sk)
             .unwrap()
-            .public_output("pk", pk)
+            .transferred_output("pk", pk)
             .unwrap()
-            .public_output("rk", generated_rk)
+            .transferred_output("rk", generated_rk)
             .unwrap()
             .build()
             .unwrap(),
@@ -173,9 +173,9 @@ fn test_gpu_bgv_round_trip() {
         }
         let decrypt = compile(
             DslContext::new(format!("integration-bgv-check-{name}"))
-                .private_output("slots", bgv.decrypt(&secret, &imported).unwrap())
+                .transferred_output("slots", bgv.decrypt(&secret, &imported).unwrap())
                 .unwrap()
-                .private_output("phase", phase.coefficients())
+                .transferred_output("phase", phase.coefficients())
                 .unwrap()
                 .build()
                 .unwrap(),

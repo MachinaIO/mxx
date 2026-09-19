@@ -520,11 +520,29 @@ pub enum FixedUnaryOperation {
         source_moduli: Vec<u64>,
         plaintext_modulus: u64,
     },
+    BlockModSwitch {
+        destination: ConcreteMatrixType,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: BigInt,
+    },
     Transpose,
     Slice {
         rows: Option<IndexRange>,
         columns: Option<IndexRange>,
     },
+}
+
+/// Compact fixed-plan unary operations.  Compact values have a distinct
+/// return type and therefore cannot be smuggled through the matrix-valued
+/// fixed batch request without widening them to DCRT storage.
+pub enum FixedCompactUnaryOperation {
+    CenteredRebase { destination: ConcreteMatrixType },
+}
+
+pub struct FixedCompactOperationBatchRequest<S> {
+    pub metadata: PlannedNodeBatchRequest,
+    pub operation: FixedCompactUnaryOperation,
+    pub value: Arc<S>,
 }
 
 /// Fixed-plan generated-column requests.  Sampling backends receive one
@@ -2734,6 +2752,16 @@ pub trait Backend {
                         FixedUnaryOperation::CenteredRebase { destination } => {
                             self.centered_rebase(&value, &destination)
                         }
+                        FixedUnaryOperation::BlockModSwitch {
+                            destination,
+                            source_moduli,
+                            plaintext_modulus,
+                        } => self.block_mod_switch(
+                            &value,
+                            &destination,
+                            &source_moduli,
+                            &plaintext_modulus,
+                        ),
                         FixedUnaryOperation::RnsModUp {
                             destination,
                             source_moduli,
@@ -2781,6 +2809,23 @@ pub trait Backend {
                     &reconstruction_coefficients,
                     &destination,
                 ),
+            })
+            .collect()
+    }
+
+    /// Submit compact fixed-plan operations as one owner/slot-bound batch.
+    /// The default keeps backend semantics available for non-GPU callers;
+    /// GPU fleets override this with their frozen schedule path.
+    fn fixed_compact_operation_batch(
+        &mut self,
+        requests: Vec<FixedCompactOperationBatchRequest<Self::SmallMatrix>>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        requests
+            .into_iter()
+            .map(|request| match request.operation {
+                FixedCompactUnaryOperation::CenteredRebase { destination } => {
+                    self.centered_rebase_small(&request.value, &destination)
+                }
             })
             .collect()
     }
@@ -3165,6 +3210,27 @@ pub trait Backend {
         &mut self,
         value: &Self::Matrix,
         destination: &ConcreteMatrixType,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    /// Rebase a bounded compact matrix without widening it to a full matrix.
+    /// The canonical compact payload and coefficient bound are preserved;
+    /// implementations may alias an owner or make a compact-to-compact copy.
+    fn centered_rebase_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error>;
+
+    /// Exact block CRT modulus switching.  The correction factor remains a
+    /// BigInt through validation and backend dispatch; implementations must
+    /// reject values that cannot be represented by their native arithmetic
+    /// instead of silently truncating them.
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: &BigInt,
     ) -> Result<Self::Matrix, Self::Error>;
 
     fn rns_mod_up(
@@ -3915,6 +3981,11 @@ mod warmup_profile_tests {
             NodeKind::ModulusSwitch { modulus: one() },
             NodeKind::ModulusReduce { modulus: one() },
             NodeKind::CenteredRebase { modulus: one() },
+            NodeKind::BlockModSwitch {
+                modulus: one(),
+                source_moduli: vec![17, 97],
+                plaintext_modulus: one(),
+            },
             NodeKind::RnsModUp {
                 modulus: one(),
                 source_moduli: vec![17],

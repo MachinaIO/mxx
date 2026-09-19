@@ -110,8 +110,8 @@ impl Wee25CommitmentCompiler {
         tree: Wee25CommitmentTreeWire,
     ) -> Result<DslContext, DslError> {
         context
-            .public_output("wee25_commitment", tree.root)?
-            .public_output("wee25_commitment_nodes", tree.cached_nodes)
+            .transferred_output("wee25_commitment", tree.root)?
+            .transferred_output("wee25_commitment_nodes", tree.cached_nodes)
     }
 
     fn commit_level(

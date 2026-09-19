@@ -1,6 +1,6 @@
 use mxx_ir_core::{
     artifact::{
-        ArtifactConfidentiality, ArtifactType, Manifest, ManifestArtifact, ProductionId,
+        ArtifactAvailability, ArtifactType, Manifest, ManifestArtifact, ProductionId,
         validate_manifest,
     },
     encoding::IR_VERSION,
@@ -43,9 +43,10 @@ pub enum ArtifactPayload {
     TypedBlob(Vec<u8>),
 }
 
-/// Supplies intact payloads from the matching backend codec and schema. Private artifacts
-/// have no manifest content hash; the caller/storage layer must establish integrity before
-/// execution. Corrupt compact matrix payloads can panic during decoding.
+/// Supplies intact payloads from the matching backend codec and schema. Both
+/// transferred and cached artifacts carry the same integrity metadata; the
+/// availability label only selects how the consumer obtains the payload.
+/// Corrupt compact matrix payloads can panic during decoding.
 pub trait ArtifactStore {
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -55,11 +56,22 @@ pub trait ArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error>;
+    /// Returns the exact canonical payload length at the artifact boundary.
+    /// This default implementation only decodes the persisted opaque payload
+    /// into its byte vectors; it never expands a GPU value or performs device
+    /// readback. Stores may override it with an O(1) persisted-header lookup.
+    fn load_payload_size(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<usize, Self::Error> {
+        self.load(key, descriptor).map(|payload| payload_bytes(&payload).len())
+    }
     fn store(
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error>;
@@ -74,10 +86,35 @@ pub trait ArtifactStore {
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error>;
 }
 
+/// Captures exact serialized lengths for a scalar artifact or every member of
+/// a family. The returned indices are suitable for the estimator's private
+/// payload-size context and are intentionally not part of the public manifest.
+pub fn load_artifact_payload_sizes<S: ArtifactStore>(
+    store: &mut S,
+    key: &ArtifactKey,
+    descriptor: &ManifestArtifact,
+) -> Result<Vec<(Option<usize>, usize)>, S::Error> {
+    match descriptor.family_count {
+        None => Ok(vec![(None, store.load_payload_size(key, descriptor)?)]),
+        Some(count) => {
+            let mut sizes = Vec::with_capacity(count);
+            for index in 0..count {
+                let member_key = ArtifactKey {
+                    production: key.production.clone(),
+                    name: key.name.clone(),
+                    index: Some(index),
+                };
+                sizes.push((Some(index), store.load_payload_size(&member_key, descriptor)?));
+            }
+            Ok(sizes)
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct FileStoredArtifact {
     artifact_type: ArtifactType,
-    confidentiality: ArtifactConfidentiality,
+    availability: ArtifactAvailability,
     layout: Option<String>,
     payload: ArtifactPayload,
 }
@@ -85,7 +122,7 @@ struct FileStoredArtifact {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct FileStoredHeader {
     artifact_type: ArtifactType,
-    confidentiality: ArtifactConfidentiality,
+    availability: ArtifactAvailability,
     layout: Option<String>,
     payload_kind: u8,
 }
@@ -95,8 +132,7 @@ struct FileSession {
     descriptor: SessionDescriptor,
     status: SessionStatus,
     transcript: Vec<(DrawSite, RecordedValue)>,
-    committed_artifacts:
-        Vec<(ArtifactKey, (ArtifactType, ArtifactConfidentiality, Option<String>))>,
+    committed_artifacts: Vec<(ArtifactKey, (ArtifactType, ArtifactAvailability, Option<String>))>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -137,12 +173,22 @@ pub enum FileArtifactError {
     SessionBusy(ProductionId),
     #[error("session does not exist or is not open: {0:?}")]
     SessionNotOpen(ProductionId),
+    #[error("session is not finalized: {0:?}")]
+    SessionNotFinalized(ProductionId),
+    #[error("finalized session is immutable: {0:?}")]
+    SessionFinalized(ProductionId),
+    #[error("named session alias does not exist: {0}")]
+    MissingSessionAlias(String),
+    #[error("finalized session manifest does not match its session record: {0:?}")]
+    SessionManifestMismatch(ProductionId),
     #[error("session transcript entry conflicts at {site:?} in {production:?}")]
     TranscriptConflict { production: ProductionId, site: DrawSite },
     #[error("artifact was not stored before its completion marker: {0:?}")]
     UnstoredArtifact(ArtifactKey),
     #[error("session manifest refers to an uncommitted artifact: {0:?}")]
     UncommittedArtifact(ArtifactKey),
+    #[error("session committed an artifact absent from its manifest: {0:?}")]
+    UnexpectedCommittedArtifact(ArtifactKey),
     #[error("artifact manifest does not exist: {0:?}")]
     MissingManifest(ProductionId),
     #[error(
@@ -293,6 +339,206 @@ impl FileArtifactStore {
         Self::read_encoded(&path)
     }
 
+    fn read_session(&self, production: &ProductionId) -> Result<FileSession, FileArtifactError> {
+        let path = self.session_path(production);
+        if !path.exists() {
+            return Err(FileArtifactError::SessionNotOpen(production.clone()));
+        }
+        Self::read_encoded(&path)
+    }
+
+    fn validate_finalized_session(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, FileArtifactError> {
+        let session = self.read_session(production)?;
+        if session.status != SessionStatus::Finalized {
+            return Err(FileArtifactError::SessionNotFinalized(production.clone()));
+        }
+        if session.descriptor.production_id != *production {
+            return Err(FileArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        // Do not call `load_manifest` here: finalized readers already hold
+        // the production lock, and doing so would recursively acquire it.
+        // Reading the manifest directly keeps the whole session/manifest
+        // snapshot under the lock held by the caller.
+        let manifest = self.read_validated_manifest(production)?;
+        let mut expected = BTreeMap::new();
+        for (name, artifact) in &manifest.artifacts {
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
+                Some(count) => Box::new((0..count).map(Some)),
+                None => Box::new(std::iter::once(None)),
+            };
+            for index in indices {
+                let key = ArtifactKey { production: production.clone(), name: name.clone(), index };
+                expected.insert(
+                    key,
+                    (
+                        artifact.artifact_type.clone(),
+                        artifact.availability,
+                        artifact.layout.clone(),
+                    ),
+                );
+            }
+        }
+        let committed = session.committed_artifacts.iter().cloned().collect::<BTreeMap<_, _>>();
+        if committed != expected {
+            return Err(FileArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        Ok(manifest)
+    }
+
+    fn read_validated_manifest(
+        &self,
+        production: &ProductionId,
+    ) -> Result<Manifest, FileArtifactError> {
+        let path = self.manifest_path(production);
+        if !path.exists() {
+            return Err(FileArtifactError::MissingManifest(production.clone()));
+        }
+        let manifest: Manifest = Self::read_encoded(&path)?;
+        if manifest.ir_version != IR_VERSION {
+            return Err(FileArtifactError::UnsupportedArtifactVersion {
+                version: manifest.ir_version,
+                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
+            });
+        }
+        if manifest.production_id != *production {
+            return Err(FileArtifactError::InvalidManifest(format!(
+                "manifest identity/version mismatch for {production:?}"
+            )));
+        }
+        validate_manifest(&manifest)
+            .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?;
+        Ok(manifest)
+    }
+
+    /// Reject a write against a session which has crossed the finalization
+    /// boundary.  This check deliberately happens before validating the
+    /// proposed payload: callers must never be able to turn an idempotent
+    /// write into a metadata or payload mutation after finalization.
+    fn ensure_session_mutable(&self, production: &ProductionId) -> Result<(), FileArtifactError> {
+        let path = self.session_path(production);
+        if !path.exists() {
+            return Ok(());
+        }
+        let session = Self::read_encoded::<FileSession>(&path)?;
+        if session.status == SessionStatus::Finalized {
+            return Err(FileArtifactError::SessionFinalized(production.clone()));
+        }
+        if session.descriptor.production_id != *production {
+            return Err(FileArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        Ok(())
+    }
+
+    /// Hold the production lock across a standalone payload/manifest write.
+    /// Session-owned writers already hold this lock in `self.locks`; all other
+    /// writers must acquire it before checking status so finalization cannot
+    /// race the check and the subsequent filesystem mutation.
+    fn lock_session_mutation(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Option<fs::File>, FileArtifactError> {
+        if self.active_sessions.contains(production) {
+            self.ensure_session_mutable(production)?;
+            return Ok(None);
+        }
+        if !self.session_path(production).exists() {
+            return Ok(None);
+        }
+        let lock_path = self.lock_path(production);
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?;
+        if !try_lock(&lock)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?
+        {
+            return Err(FileArtifactError::SessionBusy(production.clone()));
+        }
+        self.ensure_session_mutable(production)?;
+        Ok(Some(lock))
+    }
+
+    /// Acquire the existing per-production lock for a finalized read.  The
+    /// lock is held by the returned file until the snapshot has been fully
+    /// validated, so a reader can never observe a manifest/status/commit
+    /// mixture produced by an active writer or cleanup.
+    fn lock_finalized_read(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Option<fs::File>, FileArtifactError> {
+        if self.active_sessions.contains(production) {
+            let session = self.session(production)?;
+            return if session.status == SessionStatus::Finalized {
+                Ok(None)
+            } else {
+                Err(FileArtifactError::SessionBusy(production.clone()))
+            };
+        }
+        if !self.session_path(production).exists() {
+            return Err(FileArtifactError::SessionNotOpen(production.clone()));
+        }
+        let lock_path = self.lock_path(production);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| FileArtifactError::Io { path: parent.to_owned(), source })?;
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?;
+        if !try_lock(&lock)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?
+        {
+            return Err(FileArtifactError::SessionBusy(production.clone()));
+        }
+        Ok(Some(lock))
+    }
+
+    /// Acquire the production lock when a session record exists.  A
+    /// standalone manifest has no session gate and therefore remains
+    /// readable without a lock.  The caller validates the session snapshot
+    /// while the returned lock is held.
+    fn lock_manifest_read(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Option<fs::File>, FileArtifactError> {
+        if self.active_sessions.contains(production) {
+            let session = self.session(production)?;
+            return if session.status == SessionStatus::Finalized {
+                Ok(None)
+            } else {
+                Err(FileArtifactError::SessionNotFinalized(production.clone()))
+            };
+        }
+        if !self.session_path(production).exists() {
+            return Ok(None);
+        }
+        let lock_path = self.lock_path(production);
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|source| FileArtifactError::Io { path: parent.to_owned(), source })?;
+        }
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_path)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?;
+        if !try_lock(&lock)
+            .map_err(|source| FileArtifactError::Io { path: lock_path.clone(), source })?
+        {
+            return Err(FileArtifactError::SessionBusy(production.clone()));
+        }
+        Ok(Some(lock))
+    }
+
     fn store_session(&self, session: &FileSession) -> Result<(), FileArtifactError> {
         Self::write_encoded(&self.session_path(&session.descriptor.production_id), session)
     }
@@ -315,7 +561,7 @@ impl FileArtifactStore {
         stored: &FileStoredArtifact,
     ) -> Result<(), FileArtifactError> {
         if stored.artifact_type != descriptor.artifact_type ||
-            stored.confidentiality != descriptor.confidentiality ||
+            stored.availability != descriptor.availability ||
             stored.layout != descriptor.layout
         {
             return Err(FileArtifactError::DescriptorMismatch(key.clone()));
@@ -399,25 +645,11 @@ impl ArtifactStore for FileArtifactStore {
     type Error = FileArtifactError;
 
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
-        let path = self.manifest_path(production);
-        if !path.exists() {
-            return Err(FileArtifactError::MissingManifest(production.clone()));
+        let _lock = self.lock_manifest_read(production)?;
+        if self.session_path(production).exists() {
+            return self.validate_finalized_session(production);
         }
-        let manifest: Manifest = Self::read_encoded(&path)?;
-        if manifest.ir_version != IR_VERSION {
-            return Err(FileArtifactError::UnsupportedArtifactVersion {
-                version: manifest.ir_version,
-                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
-            });
-        }
-        if manifest.production_id != *production {
-            return Err(FileArtifactError::InvalidManifest(format!(
-                "manifest identity/version mismatch for {production:?}"
-            )));
-        }
-        validate_manifest(&manifest)
-            .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?;
-        Ok(manifest)
+        self.read_validated_manifest(production)
     }
 
     fn load(
@@ -445,16 +677,17 @@ impl ArtifactStore for FileArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error> {
+        let _lock = self.lock_session_mutation(&key.production)?;
         if !payload_matches(artifact_type, &payload) {
             return Err(FileArtifactError::PayloadTypeMismatch(key));
         }
         let stored = FileStoredArtifact {
             artifact_type: artifact_type.clone(),
-            confidentiality,
+            availability,
             layout: layout.map(str::to_owned),
             payload,
         };
@@ -496,6 +729,7 @@ impl ArtifactStore for FileArtifactStore {
     }
 
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        let _lock = self.lock_session_mutation(&key.production)?;
         let path = self.artifact_path(key);
         match fs::remove_file(&path) {
             Ok(()) => {}
@@ -508,6 +742,7 @@ impl ArtifactStore for FileArtifactStore {
     }
 
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+        let _lock = self.lock_session_mutation(&manifest.production_id)?;
         validate_manifest(&manifest)
             .map_err(|error| FileArtifactError::InvalidManifest(error.to_string()))?;
         let path = self.manifest_path(&manifest.production_id);
@@ -607,8 +842,8 @@ impl SessionStore for FileArtifactStore {
         {
             return Err(FileArtifactError::SessionBusy(production));
         }
-        if let Err(error) = self.store_session(&session) {
-            return Err(error);
+        if session.status != SessionStatus::Finalized {
+            self.store_session(&session)?;
         }
         self.locks.insert(production.clone(), lock);
         self.active_sessions.insert(production);
@@ -641,6 +876,7 @@ impl SessionStore for FileArtifactStore {
         production: &ProductionId,
         entries: &[(DrawSite, RecordedValue)],
     ) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(production)?;
         let mut session = self.session(production)?;
         let mut batch = BTreeMap::new();
         for (site, value) in entries {
@@ -679,16 +915,16 @@ impl SessionStore for FileArtifactStore {
     }
 
     fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(&handle.key.production)?;
         let stored = self.read_stored(&handle.key)?;
         if stored.artifact_type != handle.artifact_type ||
-            stored.confidentiality != handle.confidentiality ||
+            stored.availability != handle.availability ||
             stored.layout != handle.layout
         {
             return Err(FileArtifactError::DescriptorMismatch(handle.key.clone()));
         }
         let mut session = self.session(&handle.key.production)?;
-        let expected =
-            (handle.artifact_type.clone(), handle.confidentiality, handle.layout.clone());
+        let expected = (handle.artifact_type.clone(), handle.availability, handle.layout.clone());
         match session.committed_artifacts.iter().position(|(key, _)| key == &handle.key) {
             None => session.committed_artifacts.push((handle.key.clone(), expected)),
             Some(position) if session.committed_artifacts[position].1 == expected => return Ok(()),
@@ -699,13 +935,16 @@ impl SessionStore for FileArtifactStore {
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
         let production = manifest.production_id.clone();
+        self.ensure_session_mutable(&production)?;
         let mut session = self.session(&production)?;
+        let mut expected_keys = BTreeSet::new();
         for (name, artifact) in &manifest.artifacts {
-            let check_index = |index| {
+            let mut check_index = |index| {
                 let key = ArtifactKey { production: production.clone(), name: name.clone(), index };
+                expected_keys.insert(key.clone());
                 let expected = (
                     artifact.artifact_type.clone(),
-                    artifact.confidentiality,
+                    artifact.availability,
                     artifact.layout.clone(),
                 );
                 if session
@@ -728,9 +967,39 @@ impl SessionStore for FileArtifactStore {
                 None => check_index(None)?,
             }
         }
+        if let Some((key, _)) =
+            session.committed_artifacts.iter().find(|(key, _)| !expected_keys.contains(key))
+        {
+            return Err(FileArtifactError::UnexpectedCommittedArtifact(key.clone()));
+        }
         self.store_manifest(manifest)?;
         session.status = SessionStatus::Finalized;
         self.store_session(&session)
+    }
+
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        let _lock = self.lock_finalized_read(production)?;
+        self.validate_finalized_session(production)
+    }
+
+    fn load_finalized_named_manifest(
+        &mut self,
+        expected: &SessionAliasDescriptor,
+    ) -> Result<Manifest, Self::Error> {
+        let path = self.alias_path(&expected.name);
+        if !path.exists() {
+            return Err(FileArtifactError::MissingSessionAlias(expected.name.clone()));
+        }
+        let alias: FileSessionAlias = Self::read_encoded(&path)?;
+        if alias.descriptor != *expected {
+            return Err(FileArtifactError::SessionAliasConflict(expected.name.clone()));
+        }
+        let production =
+            ProductionId { spec_hash: expected.spec_hash.clone(), execution_nonce: alias.nonce };
+        self.load_finalized_manifest(&production)
     }
 }
 
@@ -816,7 +1085,7 @@ fn decode_stored_payload(kind: u8, bytes: &[u8]) -> Result<ArtifactPayload, Stri
 fn write_stored_file(path: &Path, stored: &FileStoredArtifact) -> Result<(), FileArtifactError> {
     let header = FileStoredHeader {
         artifact_type: stored.artifact_type.clone(),
-        confidentiality: stored.confidentiality,
+        availability: stored.availability,
         layout: stored.layout.clone(),
         payload_kind: payload_kind(&stored.payload),
     };
@@ -868,7 +1137,7 @@ fn read_stored_file(path: &Path) -> Result<FileStoredArtifact, FileArtifactError
         .map_err(|message| FileArtifactError::Decode { path: path.to_owned(), message })?;
     Ok(FileStoredArtifact {
         artifact_type: header.artifact_type,
-        confidentiality: header.confidentiality,
+        availability: header.availability,
         layout: header.layout,
         payload,
     })
@@ -967,13 +1236,17 @@ fn try_lock(_file: &fs::File) -> io::Result<bool> {
 pub struct MemoryArtifactStore {
     entries: BTreeMap<
         ArtifactKey,
-        (ArtifactType, ArtifactConfidentiality, Option<String>, ArtifactPayload),
+        (ArtifactType, ArtifactAvailability, Option<String>, ArtifactPayload),
     >,
     loads: BTreeMap<ArtifactKey, usize>,
     manifests: BTreeMap<ProductionId, Manifest>,
     sessions: BTreeMap<ProductionId, MemorySession>,
     session_aliases: BTreeMap<String, (SessionAliasDescriptor, [u8; 32])>,
     active_sessions: BTreeSet<ProductionId>,
+    /// Finalized sessions opened for immutable reads.  This is distinct from
+    /// `active_sessions`, which denotes the sole mutable writer, so opening a
+    /// finalized session can never accidentally authorize a write.
+    read_sessions: BTreeSet<ProductionId>,
     verified_families: BTreeSet<(ProductionId, String, [u8; 32])>,
     family_hash_verifications: usize,
 }
@@ -984,7 +1257,7 @@ struct MemorySession {
     status: SessionStatus,
     transcript: BTreeMap<DrawSite, RecordedValue>,
     committed_artifacts:
-        BTreeMap<ArtifactKey, (ArtifactType, ArtifactConfidentiality, Option<String>)>,
+        BTreeMap<ArtifactKey, (ArtifactType, ArtifactAvailability, Option<String>)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Error)]
@@ -1009,12 +1282,22 @@ pub enum MemoryArtifactError {
     SessionBusy(ProductionId),
     #[error("session does not exist or is not open: {0:?}")]
     SessionNotOpen(ProductionId),
+    #[error("session is not finalized: {0:?}")]
+    SessionNotFinalized(ProductionId),
+    #[error("finalized session is immutable: {0:?}")]
+    SessionFinalized(ProductionId),
+    #[error("named session alias does not exist: {0}")]
+    MissingSessionAlias(String),
+    #[error("finalized session manifest does not match its session record: {0:?}")]
+    SessionManifestMismatch(ProductionId),
     #[error("session transcript entry conflicts at {site:?} in {production:?}")]
     TranscriptConflict { production: ProductionId, site: DrawSite },
     #[error("artifact was not stored before its completion marker: {0:?}")]
     UnstoredArtifact(ArtifactKey),
     #[error("session manifest refers to an uncommitted artifact: {0:?}")]
     UncommittedArtifact(ArtifactKey),
+    #[error("session committed an artifact absent from its manifest: {0:?}")]
+    UnexpectedCommittedArtifact(ArtifactKey),
     #[error("artifact manifest does not exist: {0:?}")]
     MissingManifest(ProductionId),
     #[error(
@@ -1034,21 +1317,21 @@ impl MemoryArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: ArtifactType,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
         payload: ArtifactPayload,
     ) -> Result<(), MemoryArtifactError> {
-        self.store(key, &artifact_type, confidentiality, None, payload)
+        self.store(key, &artifact_type, availability, None, payload)
     }
 
     pub fn insert_with_layout(
         &mut self,
         key: ArtifactKey,
         artifact_type: ArtifactType,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), MemoryArtifactError> {
-        self.store(key, &artifact_type, confidentiality, layout, payload)
+        self.store(key, &artifact_type, availability, layout, payload)
     }
 
     pub fn load_count(&self, key: &ArtifactKey) -> usize {
@@ -1056,6 +1339,7 @@ impl MemoryArtifactStore {
     }
 
     pub fn manifest(&self, production: &ProductionId) -> Option<&Manifest> {
+        self.validated_manifest_snapshot(production).ok()?;
         self.manifests.get(production)
     }
 
@@ -1068,7 +1352,8 @@ impl MemoryArtifactStore {
         &self,
         manifest: &Manifest,
     ) -> Result<Vec<(ArtifactKey, ArtifactPayload)>, MemoryArtifactError> {
-        if self.manifests.get(&manifest.production_id) != Some(manifest) {
+        let visible = self.validated_manifest_snapshot(&manifest.production_id)?;
+        if visible != *manifest {
             return Err(MemoryArtifactError::MissingManifest(manifest.production_id.clone()));
         }
         let mut payloads = Vec::new();
@@ -1083,12 +1368,12 @@ impl MemoryArtifactStore {
                     name: name.clone(),
                     index,
                 };
-                let (artifact_type, confidentiality, layout, payload) = self
+                let (artifact_type, availability, layout, payload) = self
                     .entries
                     .get(&key)
                     .ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
                 if artifact_type != &descriptor.artifact_type ||
-                    confidentiality != &descriptor.confidentiality ||
+                    availability != &descriptor.availability ||
                     layout != &descriptor.layout ||
                     !payload_matches(artifact_type, payload)
                 {
@@ -1111,12 +1396,14 @@ impl MemoryArtifactStore {
     pub fn family_hash_verification_count(&self) -> usize {
         self.family_hash_verifications
     }
-}
 
-impl ArtifactStore for MemoryArtifactStore {
-    type Error = MemoryArtifactError;
-
-    fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+    /// Session-backed manifests are only visible through the final artifact
+    /// read path after finalization.  Standalone manifests remain supported
+    /// for callers that intentionally do not open a resumable session.
+    fn validated_manifest_snapshot(
+        &self,
+        production: &ProductionId,
+    ) -> Result<Manifest, MemoryArtifactError> {
         let manifest = self
             .manifests
             .get(production)
@@ -1133,7 +1420,60 @@ impl ArtifactStore for MemoryArtifactStore {
                 "manifest identity/version mismatch for {production:?}"
             )));
         }
+        validate_manifest(&manifest)
+            .map_err(|error| MemoryArtifactError::InvalidManifest(error.to_string()))?;
+
+        let Some(session) = self.sessions.get(production) else {
+            return Ok(manifest);
+        };
+        if session.status != SessionStatus::Finalized {
+            return Err(MemoryArtifactError::SessionNotFinalized(production.clone()));
+        }
+        if session.descriptor.production_id != *production {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        let mut expected = BTreeMap::new();
+        for (name, artifact) in &manifest.artifacts {
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
+                Some(count) => Box::new((0..count).map(Some)),
+                None => Box::new(std::iter::once(None)),
+            };
+            for index in indices {
+                expected.insert(
+                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    (
+                        artifact.artifact_type.clone(),
+                        artifact.availability,
+                        artifact.layout.clone(),
+                    ),
+                );
+            }
+        }
+        if session.committed_artifacts != expected {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+        }
         Ok(manifest)
+    }
+
+    fn ensure_session_mutable(&self, production: &ProductionId) -> Result<(), MemoryArtifactError> {
+        let Some(session) = self.sessions.get(production) else {
+            return Ok(());
+        };
+        if session.status == SessionStatus::Finalized {
+            return Err(MemoryArtifactError::SessionFinalized(production.clone()));
+        }
+        if session.descriptor.production_id != *production {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        Ok(())
+    }
+}
+
+impl ArtifactStore for MemoryArtifactStore {
+    type Error = MemoryArtifactError;
+
+    fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+        self.validated_manifest_snapshot(production)
     }
 
     fn load(
@@ -1141,19 +1481,7 @@ impl ArtifactStore for MemoryArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error> {
-        let manifest = self
-            .manifests
-            .get(&key.production)
-            .ok_or_else(|| MemoryArtifactError::MissingManifest(key.production.clone()))?;
-        if manifest.ir_version != mxx_ir_core::encoding::IR_VERSION {
-            return Err(MemoryArtifactError::UnsupportedArtifactVersion {
-                version: manifest.ir_version,
-                supported_versions: SUPPORTED_ARTIFACT_VERSIONS,
-            });
-        }
-        if manifest.production_id != key.production {
-            return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
-        }
+        let manifest = self.load_manifest(&key.production)?;
         let manifest_artifact = manifest
             .artifacts
             .get(&key.name)
@@ -1166,10 +1494,10 @@ impl ArtifactStore for MemoryArtifactStore {
             (Some(count), Some(index)) if index < count => {}
             _ => return Err(MemoryArtifactError::FamilyIndexMismatch(key.clone())),
         }
-        let (artifact_type, confidentiality, layout, payload) =
+        let (artifact_type, availability, layout, payload) =
             self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
         if artifact_type != &descriptor.artifact_type ||
-            confidentiality != &descriptor.confidentiality ||
+            availability != &descriptor.availability ||
             layout != &descriptor.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
@@ -1219,10 +1547,11 @@ impl ArtifactStore for MemoryArtifactStore {
         &mut self,
         key: ArtifactKey,
         artifact_type: &ArtifactType,
-        confidentiality: ArtifactConfidentiality,
+        availability: ArtifactAvailability,
         layout: Option<&str>,
         payload: ArtifactPayload,
     ) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(&key.production)?;
         if !payload_matches(artifact_type, &payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key));
         }
@@ -1230,7 +1559,7 @@ impl ArtifactStore for MemoryArtifactStore {
             Entry::Vacant(entry) => {
                 entry.insert((
                     artifact_type.clone(),
-                    confidentiality,
+                    availability,
                     layout.map(str::to_owned),
                     payload,
                 ));
@@ -1240,7 +1569,7 @@ impl ArtifactStore for MemoryArtifactStore {
                 if entry.get() ==
                     &(
                         artifact_type.clone(),
-                        confidentiality,
+                        availability,
                         layout.map(str::to_owned),
                         payload,
                     ) =>
@@ -1256,10 +1585,10 @@ impl ArtifactStore for MemoryArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error> {
-        let (stored_type, stored_confidentiality, stored_layout, payload) =
+        let (stored_type, stored_availability, stored_layout, payload) =
             self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
         if stored_type != &descriptor.artifact_type ||
-            *stored_confidentiality != descriptor.confidentiality ||
+            *stored_availability != descriptor.availability ||
             stored_layout != &descriptor.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
@@ -1272,6 +1601,7 @@ impl ArtifactStore for MemoryArtifactStore {
     }
 
     fn remove_staged(&mut self, key: &ArtifactKey) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(&key.production)?;
         self.entries.remove(key);
         self.verified_families
             .retain(|(production, name, _)| production != &key.production || name != &key.name);
@@ -1279,6 +1609,7 @@ impl ArtifactStore for MemoryArtifactStore {
     }
 
     fn store_manifest(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(&manifest.production_id)?;
         validate_manifest(&manifest)
             .map_err(|error| MemoryArtifactError::InvalidManifest(error.to_string()))?;
         match self.manifests.entry(manifest.production_id.clone()) {
@@ -1330,16 +1661,27 @@ impl SessionStore for MemoryArtifactStore {
                 });
                 SessionStatus::Running
             }
-            Entry::Occupied(entry) if entry.get().descriptor == *descriptor => entry.get().status,
+            Entry::Occupied(entry) if entry.get().descriptor == *descriptor => {
+                let status = entry.get().status;
+                if status == SessionStatus::Finalized {
+                    self.read_sessions.insert(production.clone());
+                }
+                status
+            }
             Entry::Occupied(_) => return Err(MemoryArtifactError::SessionConflict(production)),
         };
-        self.active_sessions.insert(production);
+        if status == SessionStatus::Running {
+            self.active_sessions.insert(production);
+        }
         Ok(status)
     }
 
     fn release_session(&mut self, production: &ProductionId) -> Result<(), Self::Error> {
-        if !self.sessions.contains_key(production) || !self.active_sessions.remove(production) {
+        if !self.sessions.contains_key(production) {
             return Err(MemoryArtifactError::SessionNotOpen(production.clone()));
+        }
+        if !self.active_sessions.remove(production) {
+            self.read_sessions.remove(production);
         }
         Ok(())
     }
@@ -1349,7 +1691,7 @@ impl SessionStore for MemoryArtifactStore {
         production: &ProductionId,
         site: &DrawSite,
     ) -> Result<Option<RecordedValue>, Self::Error> {
-        let session = self.open_session_record(production)?;
+        let session = self.open_session_read_record(production)?;
         Ok(session.transcript.get(site).cloned())
     }
 
@@ -1358,6 +1700,7 @@ impl SessionStore for MemoryArtifactStore {
         production: &ProductionId,
         entries: &[(DrawSite, RecordedValue)],
     ) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(production)?;
         let session = self.open_session_record(production)?;
         let mut batch = BTreeMap::new();
         for (site, value) in entries {
@@ -1391,12 +1734,13 @@ impl SessionStore for MemoryArtifactStore {
     }
 
     fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error> {
+        self.ensure_session_mutable(&handle.key.production)?;
         let stored = self
             .entries
             .get(&handle.key)
             .ok_or_else(|| MemoryArtifactError::UnstoredArtifact(handle.key.clone()))?;
         if stored.0 != handle.artifact_type ||
-            stored.1 != handle.confidentiality ||
+            stored.1 != handle.availability ||
             stored.2 != handle.layout
         {
             return Err(MemoryArtifactError::DescriptorMismatch(handle.key.clone()));
@@ -1406,7 +1750,7 @@ impl SessionStore for MemoryArtifactStore {
             Entry::Vacant(entry) => {
                 entry.insert((
                     handle.artifact_type.clone(),
-                    handle.confidentiality,
+                    handle.availability,
                     handle.layout.clone(),
                 ));
                 Ok(())
@@ -1415,7 +1759,7 @@ impl SessionStore for MemoryArtifactStore {
                 if entry.get() ==
                     &(
                         handle.artifact_type.clone(),
-                        handle.confidentiality,
+                        handle.availability,
                         handle.layout.clone(),
                     ) =>
             {
@@ -1427,15 +1771,18 @@ impl SessionStore for MemoryArtifactStore {
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error> {
         let production = manifest.production_id.clone();
+        self.ensure_session_mutable(&production)?;
         {
             let session = self.open_session_record(&production)?;
+            let mut expected_keys = BTreeSet::new();
             for (name, artifact) in &manifest.artifacts {
-                let check_index = |index| {
+                let mut check_index = |index| {
                     let key =
                         ArtifactKey { production: production.clone(), name: name.clone(), index };
+                    expected_keys.insert(key.clone());
                     let expected = (
                         artifact.artifact_type.clone(),
-                        artifact.confidentiality,
+                        artifact.availability,
                         artifact.layout.clone(),
                     );
                     if session.committed_artifacts.get(&key) != Some(&expected) {
@@ -1453,11 +1800,87 @@ impl SessionStore for MemoryArtifactStore {
                     None => check_index(None)?,
                 }
             }
+            if let Some(key) =
+                session.committed_artifacts.keys().find(|key| !expected_keys.contains(key))
+            {
+                return Err(MemoryArtifactError::UnexpectedCommittedArtifact(key.clone()));
+            }
         }
         self.store_manifest(manifest)?;
         let session = self.open_session_record(&production)?;
         session.status = SessionStatus::Finalized;
         Ok(())
+    }
+
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error> {
+        if self.active_sessions.contains(production) {
+            // The writer remains held through staged cleanup.  Do not expose
+            // a snapshot while that writer can still mutate committed state.
+            let session = self
+                .sessions
+                .get(production)
+                .ok_or_else(|| MemoryArtifactError::SessionNotOpen(production.clone()))?;
+            if session.status != SessionStatus::Finalized {
+                return Err(MemoryArtifactError::SessionBusy(production.clone()));
+            }
+        }
+        let session = self
+            .sessions
+            .get(production)
+            .ok_or_else(|| MemoryArtifactError::SessionNotOpen(production.clone()))?;
+        if session.status != SessionStatus::Finalized ||
+            session.descriptor.production_id != *production
+        {
+            return Err(MemoryArtifactError::SessionNotFinalized(production.clone()));
+        }
+        let manifest = self
+            .manifests
+            .get(production)
+            .cloned()
+            .ok_or_else(|| MemoryArtifactError::MissingManifest(production.clone()))?;
+        validate_manifest(&manifest)
+            .map_err(|error| MemoryArtifactError::InvalidManifest(error.to_string()))?;
+        let mut expected = BTreeMap::new();
+        for (name, artifact) in &manifest.artifacts {
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match artifact.family_count {
+                Some(count) => Box::new((0..count).map(Some)),
+                None => Box::new(std::iter::once(None)),
+            };
+            for index in indices {
+                expected.insert(
+                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    (
+                        artifact.artifact_type.clone(),
+                        artifact.availability,
+                        artifact.layout.clone(),
+                    ),
+                );
+            }
+        }
+        if session.committed_artifacts != expected {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+        }
+        Ok(manifest)
+    }
+
+    fn load_finalized_named_manifest(
+        &mut self,
+        expected: &SessionAliasDescriptor,
+    ) -> Result<Manifest, Self::Error> {
+        let (descriptor, nonce) = self
+            .session_aliases
+            .get(&expected.name)
+            .cloned()
+            .ok_or_else(|| MemoryArtifactError::MissingSessionAlias(expected.name.clone()))?;
+        if descriptor != *expected {
+            return Err(MemoryArtifactError::SessionAliasConflict(expected.name.clone()));
+        }
+        let production =
+            ProductionId { spec_hash: expected.spec_hash.clone(), execution_nonce: nonce };
+        self.load_finalized_manifest(&production)
     }
 }
 
@@ -1471,6 +1894,18 @@ impl MemoryArtifactStore {
         }
         self.sessions
             .get_mut(production)
+            .ok_or_else(|| MemoryArtifactError::SessionNotOpen(production.clone()))
+    }
+
+    fn open_session_read_record(
+        &self,
+        production: &ProductionId,
+    ) -> Result<&MemorySession, MemoryArtifactError> {
+        if !self.active_sessions.contains(production) && !self.read_sessions.contains(production) {
+            return Err(MemoryArtifactError::SessionNotOpen(production.clone()));
+        }
+        self.sessions
+            .get(production)
             .ok_or_else(|| MemoryArtifactError::SessionNotOpen(production.clone()))
     }
 }
@@ -1560,7 +1995,7 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: None,
             layout: None,
         };
@@ -1579,7 +2014,7 @@ mod tests {
                         index: Some(index),
                     },
                     &artifact_type,
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                     None,
                     ArtifactPayload::Bytes(vec![index as u8]),
                 )
@@ -1616,7 +2051,7 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: Some(hasher.finalize().into()),
             layout: None,
         };
@@ -1635,7 +2070,7 @@ mod tests {
                         index: Some(index),
                     },
                     &artifact_type,
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                     None,
                     ArtifactPayload::Bytes(vec![index as u8]),
                 )
@@ -1687,7 +2122,7 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: Some(Sha256::digest(&bytes).into()),
             layout: None,
         };
@@ -1702,7 +2137,7 @@ mod tests {
             .store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::SmallMatrix(bytes.clone()),
             )
@@ -1725,7 +2160,7 @@ mod tests {
             .store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::Bytes(vec![1]),
             )
@@ -1735,7 +2170,7 @@ mod tests {
             .store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::Bytes(vec![1]),
             )
@@ -1744,7 +2179,7 @@ mod tests {
             store.store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::Bytes(vec![2]),
             ),
@@ -1753,7 +2188,7 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type,
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: None,
             layout: None,
         };
@@ -1773,19 +2208,17 @@ mod tests {
     #[test]
     fn file_store_persists_session_alias_transcript_and_finalization() {
         let directory = tempdir().expect("temporary artifact directory");
-        let production = production(50);
-        let alias = SessionAliasDescriptor::new(
-            "persistent",
-            "graph",
-            production.spec_hash.clone(),
-            [9; 32],
-        );
+        let alias = SessionAliasDescriptor::new("persistent", "graph", SpecHash([50; 32]), [9; 32]);
+        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
+        let nonce = store.resolve_session_nonce(&alias).expect("allocate alias");
+        let production =
+            ProductionId { spec_hash: alias.spec_hash.clone(), execution_nonce: nonce };
         let descriptor = SessionDescriptor::new(production.clone(), "graph", [10; 32]);
         let artifact_type = ArtifactType::Bytes { length: 1 };
         let artifact_descriptor = ManifestArtifact {
             artifact_type: artifact_type.clone(),
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: None,
             layout: None,
         };
@@ -1806,8 +2239,6 @@ mod tests {
             },
             bytes: vec![1, 2],
         };
-        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
-        let nonce = store.resolve_session_nonce(&alias).expect("allocate alias");
         assert_eq!(store.resolve_session_nonce(&alias).expect("reuse alias"), nonce);
         let mut alias_reopened =
             FileArtifactStore::new(directory.path()).expect("open alias store");
@@ -1825,7 +2256,7 @@ mod tests {
             .store(
                 key.clone(),
                 &artifact_type,
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::Bytes(vec![7]),
             )
@@ -1834,15 +2265,26 @@ mod tests {
             .commit_artifact(&ArtifactHandle {
                 key: key.clone(),
                 artifact_type,
-                confidentiality: ArtifactConfidentiality::Public,
+                availability: ArtifactAvailability::Transferred,
                 layout: None,
             })
             .expect("commit output");
         store.finalize_session(manifest).expect("finalize");
+        assert_eq!(
+            store
+                .load_finalized_named_manifest(&alias)
+                .expect("read finalized named manifest")
+                .production_id,
+            production
+        );
         drop(store);
 
         let mut reopened = FileArtifactStore::new(directory.path()).expect("reopen store");
         assert_eq!(reopened.resolve_session_nonce(&alias).expect("load alias"), nonce);
+        assert_eq!(
+            reopened.load_finalized_named_manifest(&alias).expect("read finalized manifest"),
+            reopened.load_finalized_manifest(&production).expect("read finalized production")
+        );
         assert_eq!(
             reopened.open_session(&descriptor).expect("reopen session"),
             SessionStatus::Finalized
@@ -1861,7 +2303,7 @@ mod tests {
             .store(
                 key(),
                 &ArtifactType::Bytes { length: 3 },
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 None,
                 ArtifactPayload::Bytes(vec![1, 2]),
             )
@@ -1878,7 +2320,7 @@ mod tests {
             .store(
                 key(),
                 &matrix_type,
-                ArtifactConfidentiality::Private,
+                ArtifactAvailability::Cached,
                 None,
                 ArtifactPayload::TypedBlob(vec![0]),
             )
@@ -1949,6 +2391,69 @@ mod tests {
             store.resolve_session_nonce(&changed),
             Err(MemoryArtifactError::SessionAliasConflict(name)) if name == "diamond-we"
         ));
+    }
+
+    #[test]
+    fn finalized_manifest_read_is_read_only_and_validates_committed_members() {
+        let mut store = MemoryArtifactStore::default();
+        let expected =
+            SessionAliasDescriptor::new("missing", "graph", SpecHash([31; 32]), [32; 32]);
+        assert!(matches!(
+            store.load_finalized_named_manifest(&expected),
+            Err(MemoryArtifactError::MissingSessionAlias(name)) if name == "missing"
+        ));
+        assert!(store.session_aliases.is_empty(), "a read must not allocate an alias");
+
+        let alias = SessionAliasDescriptor::new("finished", "graph", SpecHash([33; 32]), [35; 32]);
+        let nonce = store.resolve_session_nonce(&alias).expect("alias");
+        assert_eq!(nonce, store.resolve_session_nonce(&alias).expect("same alias"));
+        // The alias nonce identifies the production used by the finalized session.
+        let production =
+            ProductionId { spec_hash: alias.spec_hash.clone(), execution_nonce: nonce };
+        let session = SessionDescriptor::new(production.clone(), "graph", [36; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            content_hash: Some(Sha256::digest([7u8]).into()),
+            layout: None,
+        };
+        let key =
+            ArtifactKey { production: production.clone(), name: "value".to_owned(), index: None };
+        store.open_session(&session).expect("open");
+        store
+            .store(
+                key.clone(),
+                &artifact_type,
+                descriptor.availability,
+                None,
+                ArtifactPayload::Bytes(vec![7]),
+            )
+            .expect("payload");
+        store
+            .commit_artifact(&ArtifactHandle {
+                key,
+                artifact_type,
+                availability: descriptor.availability,
+                layout: None,
+            })
+            .expect("commit");
+        store
+            .finalize_session(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([("value".to_owned(), descriptor)]),
+            })
+            .expect("finalize");
+        store.release_session(&production).expect("release");
+        assert_eq!(
+            store
+                .load_finalized_named_manifest(&alias)
+                .expect("named finalized read")
+                .production_id,
+            production
+        );
     }
 
     #[test]
@@ -2036,7 +2541,7 @@ mod tests {
         let descriptor = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 3 },
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: Some([0; 32]),
             layout: None,
         };
@@ -2050,7 +2555,7 @@ mod tests {
             .insert(
                 key.clone(),
                 ArtifactType::Bytes { length: 3 },
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
                 ArtifactPayload::Bytes(vec![1, 2, 3]),
             )
             .expect("payload");
@@ -2073,7 +2578,7 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 3 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
+                    availability: ArtifactAvailability::Cached,
                     content_hash: None,
                     layout: None,
                 },
@@ -2088,7 +2593,7 @@ mod tests {
     }
 
     #[test]
-    fn memory_store_rejects_private_manifest_content_hashes() {
+    fn memory_store_accepts_cached_manifest_content_hashes() {
         let production = ProductionId { spec_hash: SpecHash([17; 32]), execution_nonce: [18; 32] };
         let manifest = Manifest {
             ir_version: mxx_ir_core::encoding::IR_VERSION,
@@ -2098,7 +2603,7 @@ mod tests {
                 ManifestArtifact {
                     artifact_type: ArtifactType::Bytes { length: 1 },
                     family_count: None,
-                    confidentiality: ArtifactConfidentiality::Private,
+                    availability: ArtifactAvailability::Cached,
                     content_hash: Some([19; 32]),
                     layout: None,
                 },
@@ -2106,10 +2611,7 @@ mod tests {
         };
         let mut store = MemoryArtifactStore::default();
 
-        assert!(matches!(
-            store.store_manifest(manifest),
-            Err(MemoryArtifactError::InvalidManifest(_))
-        ));
+        store.store_manifest(manifest).expect("availability does not suppress integrity hash");
     }
 
     #[test]
@@ -2118,14 +2620,14 @@ mod tests {
         let scalar = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: None,
-            confidentiality: ArtifactConfidentiality::Private,
+            availability: ArtifactAvailability::Cached,
             content_hash: None,
             layout: None,
         };
         let family = ManifestArtifact {
             artifact_type: ArtifactType::Bytes { length: 1 },
             family_count: Some(2),
-            confidentiality: ArtifactConfidentiality::Public,
+            availability: ArtifactAvailability::Transferred,
             content_hash: None,
             layout: Some("lane".to_owned()),
         };
@@ -2146,7 +2648,7 @@ mod tests {
                     index: None,
                 },
                 &scalar.artifact_type,
-                scalar.confidentiality,
+                scalar.availability,
                 scalar.layout.as_deref(),
                 ArtifactPayload::Bytes(vec![1]),
             )
@@ -2160,7 +2662,7 @@ mod tests {
                         index: Some(index),
                     },
                     &family.artifact_type,
-                    family.confidentiality,
+                    family.availability,
                     family.layout.as_deref(),
                     ArtifactPayload::Bytes(vec![index as u8]),
                 )
@@ -2175,5 +2677,431 @@ mod tests {
         assert_eq!(snapshot[1].0.index, Some(1));
         assert_eq!(snapshot[2].0.name, "scalar");
         assert_eq!(snapshot[2].0.index, None);
+    }
+
+    #[test]
+    fn compact_payload_bytes_are_identical_for_transferred_and_cached_artifacts() {
+        let directory = tempdir().expect("temporary artifact directory");
+        let production = production(60);
+        let matrix = ConcreteMatrixType {
+            modulus: BigInt::from(257),
+            ring_dimension: 8,
+            rows: 2,
+            columns: 3,
+        };
+        let artifact_type = ArtifactType::SmallMatrix {
+            matrix: matrix.clone(),
+            max_coefficient_bound: BigInt::from(7),
+        };
+        let payload = ArtifactPayload::SmallMatrix((0..48).map(|i| i as u8).collect());
+        let mut manifest_artifacts = BTreeMap::new();
+        let mut store = FileArtifactStore::new(directory.path()).expect("create store");
+        for (index, availability) in
+            [(0usize, ArtifactAvailability::Transferred), (1usize, ArtifactAvailability::Cached)]
+        {
+            let name = format!("compact-{index}");
+            let key =
+                ArtifactKey { production: production.clone(), name: name.clone(), index: None };
+            store
+                .store(key, &artifact_type, availability, Some("compact/rns-v1"), payload.clone())
+                .expect("store compact bytes");
+            manifest_artifacts.insert(
+                name,
+                ManifestArtifact {
+                    artifact_type: artifact_type.clone(),
+                    family_count: None,
+                    availability,
+                    content_hash: Some(Sha256::digest(payload_bytes(&payload)).into()),
+                    layout: Some("compact/rns-v1".to_owned()),
+                },
+            );
+        }
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: manifest_artifacts,
+        };
+        store.store_manifest(manifest.clone()).expect("store manifest");
+        drop(store);
+
+        let mut reopened = FileArtifactStore::new(directory.path()).expect("reopen store");
+        for (name, descriptor) in &manifest.artifacts {
+            let key =
+                ArtifactKey { production: production.clone(), name: name.clone(), index: None };
+            assert_eq!(reopened.load(&key, descriptor).expect("reload compact bytes"), payload);
+            let mut wrong = descriptor.clone();
+            wrong.availability = match descriptor.availability {
+                ArtifactAvailability::Transferred => ArtifactAvailability::Cached,
+                ArtifactAvailability::Cached => ArtifactAvailability::Transferred,
+            };
+            assert!(matches!(
+                reopened.load(&key, &wrong),
+                Err(FileArtifactError::DescriptorMismatch(actual)) if actual == key
+            ));
+        }
+    }
+
+    #[test]
+    fn memory_and_file_reads_reject_session_manifests_before_finalization() {
+        fn descriptor() -> ManifestArtifact {
+            ManifestArtifact {
+                artifact_type: ArtifactType::Bytes { length: 1 },
+                family_count: None,
+                availability: ArtifactAvailability::Cached,
+                content_hash: None,
+                layout: None,
+            }
+        }
+
+        let production = production(61);
+        let session = SessionDescriptor::new(production.clone(), "not-final", [62; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let manifest_descriptor = descriptor();
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([("value".into(), manifest_descriptor.clone())]),
+        };
+
+        let mut memory = MemoryArtifactStore::default();
+        memory.open_session(&session).expect("open memory session");
+        memory
+            .store(
+                key.clone(),
+                &artifact_type,
+                ArtifactAvailability::Cached,
+                None,
+                ArtifactPayload::Bytes(vec![1]),
+            )
+            .expect("memory payload");
+        memory.store_manifest(manifest.clone()).expect("memory manifest");
+        assert!(matches!(
+            memory.load_manifest(&production),
+            Err(MemoryArtifactError::SessionNotFinalized(actual)) if actual == production
+        ));
+        assert!(matches!(
+            memory.load(&key, &manifest_descriptor),
+            Err(MemoryArtifactError::SessionNotFinalized(actual)) if actual == production
+        ));
+        assert!(matches!(
+            memory.load_finalized_manifest(&production),
+            Err(MemoryArtifactError::SessionBusy(actual) | MemoryArtifactError::SessionNotFinalized(actual))
+                if actual == production
+        ));
+        memory
+            .commit_artifact(&ArtifactHandle {
+                key: key.clone(),
+                artifact_type: artifact_type.clone(),
+                availability: ArtifactAvailability::Cached,
+                layout: None,
+            })
+            .expect("commit memory payload");
+        memory.finalize_session(manifest.clone()).expect("finalize memory");
+        memory.release_session(&production).expect("release memory");
+        assert_eq!(
+            memory.load_manifest(&production).expect("read finalized memory manifest"),
+            manifest
+        );
+        assert_eq!(
+            memory.load(&key, &manifest_descriptor).expect("read finalized memory"),
+            ArtifactPayload::Bytes(vec![1])
+        );
+        assert_eq!(
+            memory.load_finalized_manifest(&production).expect("read finalized memory manifest"),
+            manifest
+        );
+
+        let directory = tempdir().expect("temporary artifact directory");
+        let mut file = FileArtifactStore::new(directory.path()).expect("create file store");
+        file.open_session(&session).expect("open file session");
+        file.store(
+            key.clone(),
+            &artifact_type,
+            ArtifactAvailability::Cached,
+            None,
+            ArtifactPayload::Bytes(vec![1]),
+        )
+        .expect("file payload");
+        file.store_manifest(manifest.clone()).expect("file manifest");
+        assert!(matches!(
+            file.load_manifest(&production),
+            Err(FileArtifactError::SessionNotFinalized(actual)) if actual == production
+        ));
+        assert!(matches!(
+            file.load(&key, &manifest_descriptor),
+            Err(FileArtifactError::SessionNotFinalized(actual)) if actual == production
+        ));
+        assert!(matches!(
+            file.load_finalized_manifest(&production),
+            Err(FileArtifactError::SessionBusy(actual) | FileArtifactError::SessionNotFinalized(actual))
+                if actual == production
+        ));
+        file.commit_artifact(&ArtifactHandle {
+            key,
+            artifact_type,
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+        })
+        .expect("commit file payload");
+        file.finalize_session(manifest.clone()).expect("finalize file");
+        file.release_session(&production).expect("release file");
+        assert_eq!(
+            file.load_manifest(&production).expect("read finalized file manifest"),
+            manifest
+        );
+        assert_eq!(
+            file.load_finalized_manifest(&production).expect("read finalized file manifest"),
+            manifest
+        );
+
+        let standalone_production =
+            ProductionId { spec_hash: SpecHash([63; 32]), execution_nonce: [64; 32] };
+        let standalone_manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: standalone_production.clone(),
+            artifacts: BTreeMap::new(),
+        };
+        let mut standalone_memory = MemoryArtifactStore::default();
+        standalone_memory
+            .store_manifest(standalone_manifest.clone())
+            .expect("standalone memory manifest");
+        assert_eq!(
+            standalone_memory
+                .load_manifest(&standalone_production)
+                .expect("read standalone memory manifest"),
+            standalone_manifest
+        );
+        let standalone_directory = tempdir().expect("standalone artifact directory");
+        let mut standalone_file =
+            FileArtifactStore::new(standalone_directory.path()).expect("standalone file store");
+        standalone_file
+            .store_manifest(standalone_manifest.clone())
+            .expect("standalone file manifest");
+        assert_eq!(
+            standalone_file
+                .load_manifest(&standalone_production)
+                .expect("read standalone file manifest"),
+            standalone_manifest
+        );
+    }
+
+    #[test]
+    fn finalized_memory_session_rejects_every_mutation_entry_point() {
+        let production = production(62);
+        let session = SessionDescriptor::new(production.clone(), "immutable", [63; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            content_hash: None,
+            layout: Some("v1".to_owned()),
+        };
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([("value".to_owned(), descriptor.clone())]),
+        };
+        let mut store = MemoryArtifactStore::default();
+        store.open_session(&session).expect("open");
+        store
+            .store(
+                key.clone(),
+                &artifact_type,
+                descriptor.availability,
+                descriptor.layout.as_deref(),
+                ArtifactPayload::Bytes(vec![7]),
+            )
+            .expect("payload");
+        store
+            .commit_artifact(&ArtifactHandle {
+                key: key.clone(),
+                artifact_type: artifact_type.clone(),
+                availability: descriptor.availability,
+                layout: descriptor.layout.clone(),
+            })
+            .expect("commit");
+        store.finalize_session(manifest.clone()).expect("finalize");
+        store.release_session(&production).expect("release writer");
+        assert_eq!(store.open_session(&session).expect("immutable open"), SessionStatus::Finalized);
+
+        let assert_finalized = |result: Result<(), MemoryArtifactError>| {
+            assert!(
+                matches!(result, Err(MemoryArtifactError::SessionFinalized(actual)) if actual == production)
+            );
+        };
+        assert_finalized(store.store(
+            key.clone(),
+            &artifact_type,
+            descriptor.availability,
+            descriptor.layout.as_deref(),
+            ArtifactPayload::Bytes(vec![7]),
+        ));
+        assert_finalized(store.remove_staged(&key));
+        assert_finalized(store.store_manifest(manifest.clone()));
+        assert_finalized(store.record_transcript_batch(&production, &[]));
+        assert_finalized(store.commit_artifact(&ArtifactHandle {
+            key: key.clone(),
+            artifact_type: artifact_type.clone(),
+            availability: descriptor.availability,
+            layout: descriptor.layout.clone(),
+        }));
+        assert_finalized(store.finalize_session(manifest));
+
+        assert_eq!(
+            store.load(&key, &descriptor).expect("immutable payload"),
+            ArtifactPayload::Bytes(vec![7])
+        );
+    }
+
+    #[test]
+    fn finalize_rejects_committed_artifacts_absent_from_the_manifest() {
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            content_hash: None,
+            layout: None,
+        };
+        let manifest_for = |production: ProductionId| Manifest {
+            ir_version: IR_VERSION,
+            production_id: production,
+            artifacts: BTreeMap::from([("value".to_owned(), descriptor.clone())]),
+        };
+
+        let memory_production = production(65);
+        let memory_session =
+            SessionDescriptor::new(memory_production.clone(), "extra-memory", [66; 32]);
+        let memory_value = ArtifactKey {
+            production: memory_production.clone(),
+            name: "value".to_owned(),
+            index: None,
+        };
+        let memory_extra = ArtifactKey {
+            production: memory_production.clone(),
+            name: "extra".to_owned(),
+            index: None,
+        };
+        let mut memory = MemoryArtifactStore::default();
+        memory.open_session(&memory_session).expect("open memory session");
+        for key in [memory_value.clone(), memory_extra.clone()] {
+            memory
+                .store(
+                    key.clone(),
+                    &artifact_type,
+                    descriptor.availability,
+                    None,
+                    ArtifactPayload::Bytes(vec![7]),
+                )
+                .expect("store memory artifact");
+            memory
+                .commit_artifact(&ArtifactHandle {
+                    key,
+                    artifact_type: artifact_type.clone(),
+                    availability: descriptor.availability,
+                    layout: None,
+                })
+                .expect("commit memory artifact");
+        }
+        assert!(matches!(
+            memory.finalize_session(manifest_for(memory_production)),
+            Err(MemoryArtifactError::UnexpectedCommittedArtifact(actual)) if actual == memory_extra
+        ));
+        assert_eq!(memory.session_status(&memory_extra.production), Some(SessionStatus::Running));
+
+        let file_production = production(67);
+        let file_session = SessionDescriptor::new(file_production.clone(), "extra-file", [68; 32]);
+        let file_value = ArtifactKey {
+            production: file_production.clone(),
+            name: "value".to_owned(),
+            index: None,
+        };
+        let file_extra = ArtifactKey {
+            production: file_production.clone(),
+            name: "extra".to_owned(),
+            index: None,
+        };
+        let directory = tempdir().expect("temporary artifact directory");
+        let mut file = FileArtifactStore::new(directory.path()).expect("create file store");
+        file.open_session(&file_session).expect("open file session");
+        for key in [file_value, file_extra.clone()] {
+            file.store(
+                key.clone(),
+                &artifact_type,
+                descriptor.availability,
+                None,
+                ArtifactPayload::Bytes(vec![7]),
+            )
+            .expect("store file artifact");
+            file.commit_artifact(&ArtifactHandle {
+                key,
+                artifact_type: artifact_type.clone(),
+                availability: descriptor.availability,
+                layout: None,
+            })
+            .expect("commit file artifact");
+        }
+        assert!(matches!(
+            file.finalize_session(manifest_for(file_production)),
+            Err(FileArtifactError::UnexpectedCommittedArtifact(actual)) if actual == file_extra
+        ));
+    }
+
+    #[test]
+    fn file_finalized_manifest_snapshot_respects_the_process_lock() {
+        let directory = tempdir().expect("temporary artifact directory");
+        let production = production(64);
+        let session = SessionDescriptor::new(production.clone(), "locked", [65; 32]);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Cached,
+            content_hash: None,
+            layout: None,
+        };
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([("value".to_owned(), descriptor.clone())]),
+        };
+        let mut writer = FileArtifactStore::new(directory.path()).expect("writer");
+        writer.open_session(&session).expect("open");
+        writer
+            .store(
+                key.clone(),
+                &artifact_type,
+                descriptor.availability,
+                None,
+                ArtifactPayload::Bytes(vec![9]),
+            )
+            .expect("payload");
+        writer
+            .commit_artifact(&ArtifactHandle {
+                key,
+                artifact_type,
+                availability: descriptor.availability,
+                layout: None,
+            })
+            .expect("commit");
+        let mut reader = FileArtifactStore::new(directory.path()).expect("reader");
+        assert!(matches!(
+            reader.load_finalized_manifest(&production),
+            Err(FileArtifactError::SessionBusy(actual)) if actual == production
+        ));
+        writer.finalize_session(manifest).expect("finalize");
+        assert!(matches!(
+            reader.load_finalized_manifest(&production),
+            Err(FileArtifactError::SessionBusy(actual)) if actual == production
+        ));
+        writer.release_session(&production).expect("release");
+        assert_eq!(
+            reader.load_finalized_manifest(&production).expect("consistent snapshot").production_id,
+            production
+        );
     }
 }

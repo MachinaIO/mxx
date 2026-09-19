@@ -16,7 +16,7 @@ pub mod transcript;
 
 pub use artifact::{
     ArtifactKey, ArtifactPayload, ArtifactStore, FileArtifactError, FileArtifactStore,
-    FilesystemArtifactStore, MemoryArtifactStore,
+    FilesystemArtifactStore, MemoryArtifactStore, load_artifact_payload_sizes,
 };
 pub use backend::{Backend, RuntimeValue};
 pub use executor::{

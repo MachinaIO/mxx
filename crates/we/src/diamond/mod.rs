@@ -14,7 +14,10 @@ pub use config::{
     DiamondConfigError, DiamondSamplerBoundError, DiamondWeConfig,
     default_error_max_coefficient_bound, default_preimage_max_coefficient_bound,
 };
-pub use estimate::{DiamondCostEstimate, DiamondEstimateError, estimate_diamond_cost};
+pub use estimate::{
+    DiamondCostEstimate, DiamondEstimateError, estimate_diamond_cost,
+    estimate_diamond_cost_with_artifact_store,
+};
 #[cfg(feature = "gpu")]
 pub use estimate_gpu::{DiamondGpuMeasurementBackend, DiamondGpuMeasurementError};
 pub use graph::{

@@ -44,6 +44,11 @@ pub enum GpuMemoryOperation {
     UniformSampler,
     GaussianSampler,
     ModulusConversion,
+    /// Full DCRT centered rebase.  This is deliberately distinct from
+    /// modulus conversion: the native kernel reconstructs the centered
+    /// mixed-radix representative and may extend the destination basis.
+    CenteredRebase,
+    BlockModSwitch,
     RnsConversion,
     RingAutomorphism,
     CrtRecompose,
@@ -59,6 +64,15 @@ pub enum GpuMemoryOperation {
     FusedSmallProduct,
     FusedPreimageBatch,
 }
+
+/// Native topology limits shared with `MatrixCrt.cu`'s centered-rebase
+/// metadata.  Keep these public so admission tests and production callers
+/// cannot silently drift from the CUDA contract.
+pub const CENTERED_REBASE_MAX_LIMBS: usize = 64;
+pub const CENTERED_REBASE_METADATA_BYTES: usize = 2 * std::mem::size_of::<*const u8>() +
+    2 * std::mem::size_of::<usize>() +
+    3 * CENTERED_REBASE_MAX_LIMBS * std::mem::size_of::<u64>() +
+    CENTERED_REBASE_MAX_LIMBS * std::mem::size_of::<i32>();
 
 /// Native implementation selected by `tensor_sum_rows` for one row grouping.
 ///
@@ -109,6 +123,8 @@ impl GpuMemoryOperation {
         Self::UniformSampler,
         Self::GaussianSampler,
         Self::ModulusConversion,
+        Self::CenteredRebase,
+        Self::BlockModSwitch,
         Self::RnsConversion,
         Self::RingAutomorphism,
         Self::CrtRecompose,
@@ -144,6 +160,8 @@ impl fmt::Display for GpuMemoryOperation {
             Self::UniformSampler => "uniform_sampler",
             Self::GaussianSampler => "gaussian_sampler",
             Self::ModulusConversion => "modulus_conversion",
+            Self::CenteredRebase => "centered_rebase",
+            Self::BlockModSwitch => "block_mod_switch",
             Self::RnsConversion => "rns_conversion",
             Self::RingAutomorphism => "ring_automorphism",
             Self::CrtRecompose => "crt_recompose",
@@ -880,6 +898,32 @@ fn operation_metadata_bytes(
                 checked_mul(3 + 2 * MAX_LIMBS + 4 * MAX_LIMBS + MAX_LIMBS * MAX_LIMBS, u64_bytes)?;
             Ok((metadata, 0, metadata))
         }
+        GpuMemoryOperation::CenteredRebase => {
+            // CenteredRebaseMetadata in MatrixCrt.cu contains source and
+            // destination descriptor pointers, destination moduli, source
+            // moduli, mixed-radix prefix inverses, and the destination-to-
+            // source limb map.  crt_alloc_and_copy_async owns one device
+            // copy and one pinned host staging copy until the output event
+            // completes; neither is the matrix output owner itself.
+            Ok((CENTERED_REBASE_METADATA_BYTES, 0, CENTERED_REBASE_METADATA_BYTES))
+        }
+        GpuMemoryOperation::BlockModSwitch => {
+            // BlockModSwitchMetadata in MatrixCrt.cu: source/output
+            // descriptors plus source/target/dropped basis maps and the
+            // mixed-radix inverse tables.  The metadata is copied to device
+            // and retained by the launch until its completion event.
+            const MAX_LIMBS: usize = 64;
+            let metadata = checked_add(
+                pointers +
+                    3 * std::mem::size_of::<usize>() +
+                    2 * std::mem::size_of::<usize>() +
+                    (4 * MAX_LIMBS + MAX_LIMBS * 2) * u64_bytes +
+                    MAX_LIMBS * std::mem::size_of::<usize>() +
+                    MAX_LIMBS * std::mem::size_of::<i32>(),
+                0,
+            )?;
+            Ok((metadata, 0, metadata))
+        }
         GpuMemoryOperation::RnsConversion => {
             const MAX_LIMBS: usize = 64;
             let launch = 4 * words + MAX_LIMBS * words + 4 * MAX_LIMBS * u64_bytes + u64_bytes;
@@ -957,6 +1001,62 @@ fn certified_operation_footprint(
     Ok(footprint)
 }
 
+/// Account the complete full-matrix centered-rebase topology.
+///
+/// Production first materializes an output in coefficient format, launches
+/// the mixed-radix kernel, and converts that same owner back to evaluation
+/// format.  An evaluation-format input is first cloned and transformed to a
+/// temporary coefficient owner; that owner (including its lifetime events)
+/// remains live through the kernel launch and is therefore scratch rather
+/// than resident input.  The destination output is queried using the native
+/// matrix allocator, while metadata and pinned staging are charged from the
+/// dedicated centered-rebase contract above.
+fn centered_rebase_operation_footprint(
+    params: &GpuDCRTPolyParams,
+    query: &GpuMatrixMemoryQuery,
+) -> Result<GpuOperationMemoryFootprint, GpuMemoryQueryError> {
+    if query.shape.level >= params.crt_depth() ||
+        query.output_shape.level >= params.crt_depth() ||
+        query.output_shape.level < query.shape.level ||
+        query.shape.rows != query.output_shape.rows ||
+        query.output_range.width() != query.shape.range.width()
+    {
+        return Err(GpuMemoryQueryError::InvalidRange);
+    }
+    // The native destination is allocated in coefficient format even though
+    // the public operation returns an evaluation-domain matrix after the
+    // in-place NTT.  Query the same owner layout, then retain the caller's
+    // final shape in the evidence for diagnostics.
+    let mut allocation_query = query.clone();
+    allocation_query.output_shape.is_ntt = false;
+    allocation_query.output_is_ntt = false;
+    let mut footprint = output_only_footprint(params, &allocation_query)?;
+    footprint.output_shape = query.output_shape;
+    let (metadata, control, pinned) = operation_metadata_bytes(params, query)?;
+    footprint.scratch_bytes = metadata;
+    footprint.control_bytes = control;
+    footprint.pinned_host_bytes = pinned;
+
+    if query.shape.is_ntt {
+        // `into_coeff_domain` clones the source owner and retains its matrix
+        // descriptor/event allocation until the centered-rebase launch has
+        // recorded all source consumers.
+        let source = params
+            .matrix_allocation_bytes(
+                query.shape.level,
+                query.shape.rows,
+                query.shape.range.width(),
+                false,
+            )
+            .map_err(GpuMemoryQueryError::Native)?;
+        footprint.scratch_bytes = footprint
+            .scratch_bytes
+            .checked_add(source.total_bytes)
+            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+    }
+    Ok(footprint)
+}
+
 /// Query the native matrix owner and operation contract for one exact range.
 ///
 /// The arithmetic kernels below are audited to launch into a caller-owned
@@ -1018,6 +1118,10 @@ pub fn query_matrix_operation_memory(
     );
     if output_only {
         return output_only_footprint(params, &query).map(GpuOperationMemoryEvidence::Exact);
+    }
+    if query.operation == GpuMemoryOperation::CenteredRebase {
+        return centered_rebase_operation_footprint(params, &query)
+            .map(GpuOperationMemoryEvidence::Certified);
     }
     if matches!(query.operation, GpuMemoryOperation::Decompose | GpuMemoryOperation::FusedDecompose)
     {
@@ -1326,6 +1430,79 @@ mod tests {
             panic!("add output query should be certified")
         };
         assert!(narrow.output.unwrap().total_bytes < wide.output.unwrap().total_bytes);
+    }
+
+    #[test]
+    fn centered_rebase_has_a_distinct_certified_destination_contract() {
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
+        let range = GpuMemoryRange::new(0, 2).unwrap();
+        let coefficient_shape = GpuMemoryShape::new(0, 3, 2, false, range).unwrap();
+        let query = GpuMatrixMemoryQuery::new(
+            GpuMemoryOperation::CenteredRebase,
+            coefficient_shape,
+            3,
+            2,
+            true,
+        );
+        let GpuOperationMemoryEvidence::Certified(footprint) =
+            query_matrix_operation_memory(&params, query).unwrap()
+        else {
+            panic!("centered rebase must use its certified native contract")
+        };
+        assert_eq!(footprint.operation, GpuMemoryOperation::CenteredRebase);
+        assert_eq!(footprint.output_shape.is_ntt, true);
+        assert_eq!(footprint.scratch_bytes, CENTERED_REBASE_METADATA_BYTES);
+        assert_eq!(footprint.pinned_host_bytes, CENTERED_REBASE_METADATA_BYTES);
+        assert_eq!(footprint.control_bytes, 0);
+
+        let eval_shape = GpuMemoryShape::new(0, 3, 2, true, range).unwrap();
+        let eval_query =
+            GpuMatrixMemoryQuery::new(GpuMemoryOperation::CenteredRebase, eval_shape, 3, 2, true);
+        let GpuOperationMemoryEvidence::Certified(eval) =
+            query_matrix_operation_memory(&params, eval_query).unwrap()
+        else {
+            panic!("evaluation input must retain a coefficient conversion owner")
+        };
+        let source = params.matrix_allocation_bytes(0, 3, 2, false).unwrap();
+        assert_eq!(eval.scratch_bytes, CENTERED_REBASE_METADATA_BYTES + source.total_bytes);
+        assert_ne!(
+            eval.scratch_bytes,
+            operation_metadata_bytes(
+                &params,
+                &GpuMatrixMemoryQuery::new(
+                    GpuMemoryOperation::ModulusConversion,
+                    coefficient_shape,
+                    3,
+                    2,
+                    true,
+                )
+            )
+            .unwrap()
+            .0
+        );
+    }
+
+    #[test]
+    fn centered_rebase_rejects_shape_or_range_mismatches() {
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
+        let source =
+            GpuMemoryShape::new(0, 2, 4, false, GpuMemoryRange::new(0, 2).unwrap()).unwrap();
+        let rows_mismatch =
+            GpuMatrixMemoryQuery::new(GpuMemoryOperation::CenteredRebase, source, 3, 4, true);
+        assert_eq!(
+            query_matrix_operation_memory(&params, rows_mismatch),
+            Err(GpuMemoryQueryError::InvalidRange)
+        );
+        let width_mismatch =
+            GpuMatrixMemoryQuery::new(GpuMemoryOperation::CenteredRebase, source, 2, 4, true)
+                .with_output_shape(
+                    GpuMemoryShape::new(0, 2, 4, true, GpuMemoryRange::new(0, 4).unwrap()).unwrap(),
+                    GpuMemoryRange::new(0, 4).unwrap(),
+                );
+        assert_eq!(
+            query_matrix_operation_memory(&params, width_mismatch),
+            Err(GpuMemoryQueryError::InvalidRange)
+        );
     }
 
     #[test]

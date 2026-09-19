@@ -358,6 +358,12 @@ unsafe extern "C" {
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,
     ) -> c_int;
+    pub(crate) fn gpu_matrix_block_mod_switch(
+        out: *mut GpuMatrixOpaque,
+        source: *const GpuMatrixOpaque,
+        plaintext_modulus_words: *const u64,
+        plaintext_modulus_word_count: usize,
+    ) -> c_int;
     pub(crate) fn gpu_matrix_convert_modulus(
         out: *mut GpuMatrixOpaque,
         source: *const GpuMatrixOpaque,
@@ -513,6 +519,10 @@ unsafe extern "C" {
     pub(crate) fn gpu_small_matrix_destroy(mat: *mut GpuSmallMatrixOpaque);
     pub(crate) fn gpu_small_matrix_wait(mat: *const GpuSmallMatrixOpaque) -> c_int;
     pub(crate) fn gpu_small_matrix_copy(
+        out: *mut GpuSmallMatrixOpaque,
+        src: *const GpuSmallMatrixOpaque,
+    ) -> c_int;
+    pub(crate) fn gpu_small_matrix_copy_cross_context(
         out: *mut GpuSmallMatrixOpaque,
         src: *const GpuSmallMatrixOpaque,
     ) -> c_int;

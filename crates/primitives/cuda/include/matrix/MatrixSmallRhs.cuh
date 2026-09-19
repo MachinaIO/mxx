@@ -45,6 +45,7 @@ int gpu_small_matrix_query_allocation_bytes(
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
 int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
 int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src);
+int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const GpuSmallMatrix *src);
 int gpu_small_matrix_copy_columns(
     GpuSmallMatrix *out,
     const GpuSmallMatrix *src,

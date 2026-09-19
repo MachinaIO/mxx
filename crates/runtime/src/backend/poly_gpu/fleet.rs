@@ -4,9 +4,10 @@ use super::super::poly::{
 use crate::{
     backend::{
         Backend, BackendStorageContract, BackendStorageDescriptor, DynamicFusedBatchRequest,
-        FixedGadgetDecomposeRequest, FixedGenerationOutput, FixedGenerationRequest,
-        FixedOperationBatchRequest, FixedTrapdoorRequest, FusedBatchOutput, FusedBatchRequest,
-        IndexRange, MatrixMulAccumulateRequest, PlannedLayoutMetadata, PlannedNodeBatchRequest,
+        FixedCompactOperationBatchRequest, FixedCompactUnaryOperation, FixedGadgetDecomposeRequest,
+        FixedGenerationOutput, FixedGenerationRequest, FixedOperationBatchRequest,
+        FixedTrapdoorRequest, FusedBatchOutput, FusedBatchRequest, IndexRange,
+        MatrixMulAccumulateRequest, PlannedLayoutMetadata, PlannedNodeBatchRequest,
         PlannedOperandMetadata, RuntimeValue, SampleRange, validate_backend_storage_contract,
     },
     gpu_calibration::{
@@ -36,7 +37,10 @@ use mxx_ir_core::{
 use mxx_primitives::{
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallPolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix, GpuSmallMatrixColumnView},
+        gpu_dcrt_poly::{
+            GpuCompactMatrixEncoding, GpuDCRTPolyMatrix, GpuSmallMatrix, GpuSmallMatrixColumnView,
+            decode_compact_matrix_bytes,
+        },
     },
     poly::{
         Poly, PolyParams,
@@ -250,6 +254,27 @@ impl GpuProductionCompletion for GpuFleetTrapdoor {
 }
 
 impl GpuDcrtBackend {
+    fn validate_block_mod_switch_source(
+        value: &GpuFleetMatrix,
+        source_moduli: &[u64],
+    ) -> Result<(), PolyBackendError> {
+        // A zero-column value has no active CRT payload to validate.  For a
+        // nonempty value every shard must carry the exact ordered source
+        // tower sequence; product-only comparisons would incorrectly accept
+        // reordered and level-truncated bases.
+        if value.columns == 0 {
+            return Ok(());
+        }
+        if value.shards.is_empty() ||
+            value.shards.iter().any(|shard| shard.value.params().to_crt().0 != source_moduli)
+        {
+            return Err(PolyBackendError::BasisConversion(
+                "BlockModSwitch source CRT basis disagrees with graph".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Distinct native contexts retained for one physical device, including
     /// the multiple CRT/ring parameter sets needed by conversion primitives.
     pub fn owned_context_count(&self, physical: i32) -> usize {
@@ -366,14 +391,6 @@ type DeviceBackend = PolyBackend<
 >;
 
 static NEXT_FLEET_VALUE_ID: AtomicU64 = AtomicU64::new(1);
-
-type CompactMatrixEncoding = (u8, u8, u32, usize, usize, u16, u16, Vec<u8>);
-
-fn decode_compact_matrix(bytes: &[u8]) -> Result<CompactMatrixEncoding, PolyBackendError> {
-    bincode::decode_from_slice(bytes, bincode::config::standard())
-        .map(|decoded| decoded.0)
-        .map_err(|_| PolyBackendError::InvalidInteger)
-}
 
 fn copy_packed_bits(
     source: &[u8],
@@ -2077,9 +2094,9 @@ impl GpuDcrtBackend {
             Domain::MatrixNegate => Op::Negate,
             Domain::MatrixScale => Op::Scale,
             Domain::RingAutomorphism => Op::RingAutomorphism,
-            Domain::ModulusSwitch | Domain::ModulusReduce | Domain::CenteredRebase => {
-                Op::ModulusConversion
-            }
+            Domain::ModulusSwitch | Domain::ModulusReduce => Op::ModulusConversion,
+            Domain::CenteredRebase => Op::CenteredRebase,
+            Domain::BlockModSwitch => Op::BlockModSwitch,
             Domain::RnsModUp | Domain::RnsModDown => Op::RnsConversion,
             Domain::UniformResidueSample | Domain::UniformIntervalSample => Op::UniformSampler,
             Domain::GaussianSample => Op::GaussianSampler,
@@ -2455,6 +2472,91 @@ impl GpuDcrtBackend {
             }
         }
         total.ok_or(GpuAllocationQueryError::InvalidRange)
+    }
+
+    /// Query the compact-to-compact centered-rebase envelope used by the
+    /// production fixed path.  This deliberately stays in the compact owner
+    /// vocabulary: source shard residency is queried from each compact owner
+    /// and the destination is sized with the native compact allocator.  It
+    /// must never be routed through the full DCRT modulus-conversion query.
+    pub fn compact_centered_rebase_allocation_envelope(
+        &self,
+        input: &GpuFleetSmallMatrix,
+        output_type: &ConcreteMatrixType,
+        local_range: Range<usize>,
+    ) -> Result<GpuAllocationEnvelope, GpuAllocationQueryError> {
+        if local_range.start >= local_range.end || local_range.end > input.columns {
+            return Err(GpuAllocationQueryError::InvalidRange);
+        }
+        let overlaps = compact_shard_overlaps(
+            &input
+                .shards
+                .iter()
+                .map(|shard| (shard.global_column_start, shard.value.columns()))
+                .collect::<Vec<_>>(),
+            local_range.start,
+            local_range.end,
+        )
+        .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        let first = input.shards.get(overlaps[0].0).ok_or(GpuAllocationQueryError::InvalidRange)?;
+        let target = self
+            .devices
+            .first()
+            .ok_or(GpuAllocationQueryError::InvalidDevice)?
+            .1
+            .parameters(output_type)
+            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        let source_basis = first.value.params().moduli();
+        let target_basis = target.moduli();
+        if source_basis.len() > 1 && source_basis.iter().any(|prime| !target_basis.contains(prime))
+        {
+            return Err(GpuAllocationQueryError::UnsupportedEvidence {
+                operation: "compact centered rebase destination omits source CRT basis".into(),
+            });
+        }
+        if first.value.params().ring_dimension() != target.ring_dimension() ||
+            first.value.params().execution_owner_id() != target.execution_owner_id()
+        {
+            return Err(GpuAllocationQueryError::UnsupportedEvidence {
+                operation: "compact centered rebase parameter topology mismatch".into(),
+            });
+        }
+        let input_resident_bytes = self
+            .resident_small_allocation_bytes_by_device(input)?
+            .values()
+            .copied()
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(GpuAllocationQueryError::Overflow)?;
+        // All compact shards of one logical value carry the same bound and
+        // payload width. Query the destination allocation once for the full
+        // local job; per-shard output queries would double-count the final
+        // compact concat allocation when a job crosses producer boundaries.
+        let output_allocation = GpuSmallMatrix::allocation_bytes_for_shape(
+            target,
+            output_type.rows,
+            local_range.end - local_range.start,
+            first.value.payload_magnitude_bytes(),
+        )
+        .map_err(GpuAllocationQueryError::Backend)?;
+        Ok(GpuAllocationEnvelope {
+            input_resident_bytes,
+            output_bytes: output_allocation.data_bytes,
+            auxiliary_bytes: output_allocation
+                .aux_bytes
+                .checked_add(output_allocation.event_bytes)
+                .ok_or(GpuAllocationQueryError::Overflow)?,
+            scratch_bytes: 0,
+            transfer_bytes: 0,
+            assembly_bytes: 0,
+            replica_bytes: 0,
+            source_device_bytes: 0,
+            destination_device_bytes: 0,
+            host_bytes: 0,
+            pinned_host_bytes: 0,
+            per_device_bytes: BTreeMap::new(),
+            output_inclusive: true,
+            evidence: GpuAllocationEvidenceKind::ExactQuery,
+        })
     }
 
     pub fn matrix_range_allocation_envelope(
@@ -6325,6 +6427,15 @@ mod tests {
             assert_eq!(restored.shards()[0].value, small);
             let invalid = ConcreteMatrixType { columns: 6, ..ty.clone() };
             assert!(backend.matrix_from_bytes(&invalid, &bytes).is_err());
+
+            let one_type = ConcreteMatrixType { rows: 1, columns: 1, ..ty.clone() };
+            let one = backend.devices[0]
+                .1
+                .sample_hash(&one_type, rand::random(), b"shape-input")
+                .unwrap();
+            let one_bytes = backend.devices[0].1.matrix_to_bytes(&one);
+            let wrong_shape = ConcreteMatrixType { rows: 2, columns: 2, ..one_type };
+            assert!(backend.matrix_from_bytes(&wrong_shape, &one_bytes).is_err());
         }
     }
 
@@ -6764,6 +6875,24 @@ mod tests {
         assert!(cached.upgrade().is_none(), "replica cache must not extend GPU value liveness");
         let bytes = backend.matrix_to_bytes(&source);
         assert_eq!(backend.matrix_from_bytes(&source_type, &bytes).unwrap(), source);
+        let malformed_zero = bincode::encode_to_vec(
+            (1u8, 0u8, 0u32, 1usize, 3usize, 0u16, 0u16, vec![0u8]),
+            bincode::config::standard(),
+        )
+        .unwrap();
+        assert!(matches!(
+            backend.matrix_from_bytes(&source_type, &malformed_zero),
+            Err(PolyBackendError::InvalidCompactMatrix(_))
+        ));
+        let short_payload = bincode::encode_to_vec(
+            (1u8, 0u8, 0u32, 1usize, 3usize, 8u16, 1u16, Vec::<u8>::new()),
+            bincode::config::standard(),
+        )
+        .unwrap();
+        assert!(matches!(
+            backend.matrix_from_bytes(&source_type, &short_payload),
+            Err(PolyBackendError::InvalidCompactMatrix(_))
+        ));
 
         let digits = parameters.modulus_digits();
         let base = BigInt::from(1u8) << parameters.base_bits();
@@ -7899,6 +8028,17 @@ impl GpuDcrtBackend {
         if inputs.is_empty() {
             return Ok(Vec::new());
         }
+        // Validate all BlockModSwitch inputs before fixed scheduling, device
+        // mapping, or allocation.  The declared basis is ordered and exact;
+        // equal products, reordered towers, and truncated levels are not
+        // interchangeable for the correction-factor computation.
+        for (operation, value) in &inputs {
+            if let crate::backend::FixedUnaryOperation::BlockModSwitch { source_moduli, .. } =
+                operation
+            {
+                Self::validate_block_mod_switch_source(value, source_moduli)?;
+            }
+        }
         let output_shapes = inputs
             .iter()
             .map(|(operation, value)| match operation {
@@ -7910,6 +8050,7 @@ impl GpuDcrtBackend {
                 crate::backend::FixedUnaryOperation::ModulusSwitch { destination } |
                 crate::backend::FixedUnaryOperation::ReduceModulus { destination } |
                 crate::backend::FixedUnaryOperation::CenteredRebase { destination } |
+                crate::backend::FixedUnaryOperation::BlockModSwitch { destination, .. } |
                 crate::backend::FixedUnaryOperation::RnsModUp { destination, .. } |
                 crate::backend::FixedUnaryOperation::RnsModDown { destination, .. } => {
                     (destination.rows, destination.columns)
@@ -7963,6 +8104,18 @@ impl GpuDcrtBackend {
                 crate::backend::FixedUnaryOperation::CenteredRebase { destination } => {
                     let kind = NodeKind::CenteredRebase {
                         modulus: IntExpr::constant(destination.modulus.clone()),
+                    };
+                    (kind.clone(), map_input(&kind)?)
+                }
+                crate::backend::FixedUnaryOperation::BlockModSwitch {
+                    destination,
+                    source_moduli,
+                    plaintext_modulus,
+                } => {
+                    let kind = NodeKind::BlockModSwitch {
+                        modulus: IntExpr::constant(destination.modulus.clone()),
+                        source_moduli: source_moduli.clone(),
+                        plaintext_modulus: IntExpr::constant(plaintext_modulus.clone()),
                     };
                     (kind.clone(), map_input(&kind)?)
                 }
@@ -8060,6 +8213,16 @@ impl GpuDcrtBackend {
                 crate::backend::FixedUnaryOperation::CenteredRebase { destination } => {
                     backend.centered_rebase(&input, destination)?
                 }
+                crate::backend::FixedUnaryOperation::BlockModSwitch {
+                    destination,
+                    source_moduli,
+                    plaintext_modulus,
+                } => backend.block_mod_switch(
+                    &input,
+                    destination,
+                    source_moduli,
+                    plaintext_modulus,
+                )?,
                 crate::backend::FixedUnaryOperation::RnsModUp {
                     destination,
                     source_moduli,
@@ -10178,6 +10341,19 @@ impl Backend for GpuDcrtBackend {
         let node = self.fixed_node.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?.clone();
         let plan = self.frozen_plan.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?.clone();
 
+        // Reject an invalid source basis before touching fixed-instance state
+        // or asking the scheduler to map/allocate any device payload.
+        for request in &requests {
+            if let FixedOperationBatchRequest::UnaryTransform { operation, value, .. } = request {
+                if let crate::backend::FixedUnaryOperation::BlockModSwitch {
+                    source_moduli, ..
+                } = operation
+                {
+                    Self::validate_block_mod_switch_source(value, source_moduli)?;
+                }
+            }
+        }
+
         // The executor keeps one metadata record per original instance.  Do
         // not infer slots from the compressed request index: that would rotate
         // owners incorrectly whenever a sibling group is a tail or a filtered
@@ -10428,6 +10604,134 @@ impl Backend for GpuDcrtBackend {
                 }
             }
         })();
+        self.clear_fixed_batch_state();
+        result
+    }
+
+    fn fixed_compact_operation_batch(
+        &mut self,
+        requests: Vec<FixedCompactOperationBatchRequest<Self::SmallMatrix>>,
+    ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.frozen_plan.is_none() {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let node = self.fixed_node.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?.clone();
+        let plan = self.frozen_plan.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?.clone();
+        if node.effective_operation !=
+            crate::gpu_column_policy::EffectiveGpuOperation::CenteredRebase
+        {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let slots = requests
+            .iter()
+            .map(|request| {
+                let metadata = &request.metadata;
+                if metadata.instance_slots.len() != 1 ||
+                    metadata.instance_paths.len() != 1 ||
+                    metadata.draw_sites.len() != 1 ||
+                    metadata.randomness_seeds.len() != 1
+                {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+                self.fixed_metadata_layouts(Some(metadata), &node, &plan)?;
+                Ok(metadata.instance_slots[0])
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if !self.fixed_instance_slots.is_empty() && self.fixed_instance_slots != slots {
+            self.clear_fixed_batch_state();
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        self.fixed_instance_slots = slots.clone();
+        let destination = match &requests[0].operation {
+            FixedCompactUnaryOperation::CenteredRebase { destination } => destination.clone(),
+        };
+        if requests.iter().any(|request| {
+            matches!(&request.operation, FixedCompactUnaryOperation::CenteredRebase { destination: other } if *other != destination)
+        }) {
+            self.clear_fixed_batch_state();
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        let columns = requests[0].value.columns;
+        if requests.iter().any(|request| request.value.columns != columns) {
+            self.clear_fixed_batch_state();
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        if columns == 0 {
+            let result = requests
+                .iter()
+                .map(|request| GpuFleetSmallMatrix::new(request.value.rows, 0, Vec::new()))
+                .collect();
+            self.clear_fixed_batch_state();
+            return Ok(result);
+        }
+        let schedules_owned = self.fixed_batch_schedules_checked(columns, &slots)?;
+        let schedules = schedules_owned.iter().collect::<Vec<_>>();
+        let destination_kind =
+            NodeKind::CenteredRebase { modulus: IntExpr::constant(destination.modulus.clone()) };
+        let arguments = requests
+            .iter()
+            .map(|request| Self::policy_small_matrix_type(&request.value))
+            .collect::<Result<Vec<_>, _>>()?;
+        let jobs = match self.launch_fixed_column_batch(&schedules, |backend, instance, job| {
+            let request = &requests[instance];
+            let mapped = Self::fixed_policy_ranges_for_wires(
+                &destination_kind,
+                std::slice::from_ref(&arguments[instance]),
+                columns,
+                job.start,
+                job.end,
+            )?;
+            let range = mapped.first().ok_or(PolyBackendError::UnsupportedPlacement)?.range;
+            let pieces = Self::small_matrix_piece_on_device(
+                backend,
+                &request.value,
+                range.start,
+                range.end,
+            )?;
+            pieces
+                .iter()
+                .map(|piece| backend.centered_rebase_small(piece.as_matrix(), &destination))
+                .collect::<Result<Vec<_>, _>>()
+        }) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                self.clear_fixed_batch_state();
+                return Err(error);
+            }
+        };
+        let mut outputs = (0..requests.len()).map(|_| Vec::new()).collect::<Vec<Vec<_>>>();
+        for (instance, job, pieces) in jobs {
+            let mut start = job.start;
+            for value in pieces {
+                let width = value.columns();
+                outputs.get_mut(instance).ok_or(PolyBackendError::InvalidConstantShape)?.push(
+                    GpuColumnShard {
+                        device_id: self.devices[job.device].0,
+                        global_column_start: start,
+                        value,
+                    },
+                );
+                start = start.checked_add(width).ok_or(PolyBackendError::InvalidInteger)?;
+            }
+            if start != job.end {
+                self.clear_fixed_batch_state();
+                return Err(PolyBackendError::InvalidConstantShape);
+            }
+        }
+        let result = outputs
+            .into_iter()
+            .zip(&requests)
+            .map(|(mut shards, request)| {
+                shards.sort_by_key(|shard| shard.global_column_start);
+                if shards.is_empty() {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                Ok(GpuFleetSmallMatrix::new(request.value.rows, columns, shards))
+            })
+            .collect();
         self.clear_fixed_batch_state();
         result
     }
@@ -11111,6 +11415,54 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, input| backend.centered_rebase(input, destination))
+    }
+
+    fn centered_rebase_small(
+        &mut self,
+        value: &Self::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<Self::SmallMatrix, Self::Error> {
+        if value.shards.is_empty() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        let source_basis = value.shards[0].value.params().to_crt().0;
+        let mut shards = Vec::with_capacity(value.shards.len());
+        for shard in &value.shards {
+            let (device_id, backend) = self
+                .devices
+                .iter_mut()
+                .find(|(device, _)| *device == shard.device_id)
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let target = backend.parameters(destination)?;
+            let target_basis = target.to_crt().0;
+            if source_basis.len() > 1 &&
+                source_basis.iter().any(|prime| !target_basis.contains(prime))
+            {
+                return Err(PolyBackendError::BasisConversion(
+                    "multi-limb centered rebase destination must contain the source basis".into(),
+                ));
+            }
+            let output = shard.value.centered_rebase(target).map_err(PolyBackendError::from)?;
+            shards.push(GpuColumnShard {
+                device_id: *device_id,
+                global_column_start: shard.global_column_start,
+                value: output,
+            });
+        }
+        Ok(GpuFleetSmallMatrix::new(value.rows, value.columns, shards))
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &Self::Matrix,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: &BigInt,
+    ) -> Result<Self::Matrix, Self::Error> {
+        Self::validate_block_mod_switch_source(value, source_moduli)?;
+        self.unary_columns(value, |backend, input| {
+            backend.block_mod_switch(input, destination, source_moduli, plaintext_modulus)
+        })
     }
 
     fn rns_mod_up(
@@ -12992,7 +13344,7 @@ impl Backend for GpuDcrtBackend {
         if let [shard] = value.shards.as_slice() {
             return shard.value.to_compact_bytes();
         }
-        let decoded = value
+        let decoded: Vec<GpuCompactMatrixEncoding> = value
             .shards
             .iter()
             .map(|shard| {
@@ -13003,18 +13355,20 @@ impl Backend for GpuDcrtBackend {
                     .expect("fleet shard device must be registered")
                     .1
                     .matrix_to_bytes(&shard.value);
-                decode_compact_matrix(&bytes).expect("backend produced invalid compact bytes")
+                decode_compact_matrix_bytes(shard.value.params(), &bytes)
+                    .expect("backend produced invalid compact bytes")
             })
             .collect::<Vec<_>>();
         let first = decoded.first().expect("nonempty matrix has a shard");
-        let bytes_per_coefficient = decoded.iter().map(|encoding| encoding.6).max().unwrap_or(0);
-        let max_coefficient_bits = decoded.iter().map(|encoding| encoding.5).max().unwrap_or(0);
+        let bytes_per_coefficient =
+            decoded.iter().map(|encoding| encoding.bytes_per_coeff).max().unwrap_or(0);
+        let max_coefficient_bits =
+            decoded.iter().map(|encoding| encoding.max_coeff_bits).max().unwrap_or(0);
         assert!(
             decoded.iter().all(|encoding| {
-                encoding.0 == first.0 &&
-                    encoding.1 == first.1 &&
-                    encoding.2 == first.2 &&
-                    encoding.3 == value.rows
+                encoding.format == first.format &&
+                    encoding.level == first.level &&
+                    encoding.rows == value.rows
             }),
             "fleet shards disagree on compact matrix state"
         );
@@ -13023,7 +13377,7 @@ impl Backend for GpuDcrtBackend {
         let global_count = value.rows * value.columns * ring_dimension;
         let mut payload = vec![0u8; (global_count * global_bits).div_ceil(8)];
         for (shard, encoding) in value.shards.iter().zip(&decoded) {
-            let local_bits = usize::from(encoding.5);
+            let local_bits = usize::from(encoding.max_coeff_bits);
             for row in 0..value.rows {
                 for column in 0..shard.value.col_size() {
                     for coefficient in 0..ring_dimension {
@@ -13036,7 +13390,7 @@ impl Backend for GpuDcrtBackend {
                             coefficient) *
                             global_bits;
                         copy_packed_bits(
-                            &encoding.7,
+                            &encoding.payload,
                             source_index,
                             &mut payload,
                             target_index,
@@ -13048,9 +13402,9 @@ impl Backend for GpuDcrtBackend {
         }
         bincode::encode_to_vec(
             (
-                first.0,
-                first.1,
-                first.2,
+                1u8,
+                first.format,
+                first.level as u32,
                 value.rows,
                 value.columns,
                 max_coefficient_bits,
@@ -13067,11 +13421,33 @@ impl Backend for GpuDcrtBackend {
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<Self::Matrix, Self::Error> {
-        let (version, format, level, rows, columns, max_bits, bytes_per_coefficient, payload) =
-            decode_compact_matrix(bytes)?;
+        let parameters = self.devices[0].1.parameters(ty)?;
+        let decoded =
+            decode_compact_matrix_bytes(parameters, bytes).map_err(|error| match error {
+                mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                    version,
+                    supported_versions,
+                } => PolyBackendError::UnsupportedCompactMatrixVersion {
+                    version,
+                    supported_versions,
+                },
+                mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+                mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                    PolyBackendError::InvalidCompactMatrix(message)
+                }
+            })?;
+        let rows = decoded.rows;
+        let columns = decoded.columns;
         if rows != ty.rows || columns != ty.columns {
-            return Err(PolyBackendError::InvalidInteger);
+            return Err(PolyBackendError::InvalidCompactMatrix(
+                "serialized compact matrix shape does not match expected type",
+            ));
         }
+        let format = decoded.format;
+        let level = decoded.level as u32;
+        let max_bits = decoded.max_coeff_bits;
+        let bytes_per_coefficient = decoded.bytes_per_coeff;
+        let payload = decoded.payload;
         if !self
             .active_operation
             .is_some_and(|operation| self.operation_widths.contains_key(&operation))
@@ -13108,7 +13484,7 @@ impl Backend for GpuDcrtBackend {
             }
             let local_bytes = bincode::encode_to_vec(
                 (
-                    version,
+                    1u8,
                     format,
                     level,
                     rows,

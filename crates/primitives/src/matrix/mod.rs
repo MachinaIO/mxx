@@ -35,6 +35,8 @@ pub enum CompactMatrixDecodeError {
     UnsupportedVersion { version: u8, supported_versions: &'static [u8] },
     #[error("invalid compact matrix header: {0}")]
     InvalidHeader(&'static str),
+    #[error("invalid compact matrix payload: {0}")]
+    InvalidPayload(&'static str),
 }
 
 /// A logical full matrix whose columns are materialized on demand.
@@ -335,9 +337,27 @@ pub trait PolyMatrix:
         self.clone().into_compact_bytes()
     }
     fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self;
+    /// Checked compact decoder used at artifact/runtime boundaries.  The
+    /// historical infallible method remains available for already-validated
+    /// internal values, but untrusted bytes must enter through this method.
+    fn try_from_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::validate_compact_bytes(bytes)?;
+        Ok(Self::from_compact_bytes(params, bytes))
+    }
     fn validate_compact_bytes(bytes: &[u8]) -> Result<(), CompactMatrixDecodeError> {
         let _ = bytes;
         Ok(())
+    }
+    /// Extract the serialized logical shape without allocating a matrix.
+    /// Artifact/runtime boundaries use this before invoking the checked
+    /// decoder so a valid payload for a different wire shape cannot be
+    /// accepted under the requested type.
+    fn compact_shape(bytes: &[u8]) -> Result<(usize, usize), CompactMatrixDecodeError> {
+        let _ = bytes;
+        Err(CompactMatrixDecodeError::InvalidHeader("compact matrix shape is unavailable"))
     }
     fn compact_bytes_batch(values: &[&Self]) -> Vec<Vec<u8>> {
         values.iter().map(|value| value.to_compact_bytes()).collect()
@@ -354,13 +374,31 @@ pub trait PolyMatrix:
         start: usize,
         end: usize,
     ) -> Self {
-        let full = Self::from_cpu_staging_bytes(params, bytes);
-        assert!(start <= end && end <= full.col_size(), "invalid staging column interval");
-        full.slice_columns(start, end)
+        Self::try_from_cpu_staging_columns(params, bytes, start, end)
+            .expect("validated CPU staging artifact")
+    }
+    fn try_from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        let full = Self::try_from_cpu_staging_bytes(params, bytes)?;
+        if start > end || end > full.col_size() {
+            return Err(CompactMatrixDecodeError::InvalidHeader("invalid staging column interval"));
+        }
+        Ok(full.slice_columns(start, end))
     }
 
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
         Self::from_compact_bytes(params, bytes)
+    }
+    /// Checked decoder for host/RNS staging artifacts.
+    fn try_from_cpu_staging_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, CompactMatrixDecodeError> {
+        Self::try_from_compact_bytes(params, bytes)
     }
     fn copy_to_params_direct(&self, _params: &<Self::P as Poly>::Params) -> Option<Self> {
         None
@@ -631,6 +669,14 @@ pub trait PolyMatrix:
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Transfers a single source limb's centered coefficients to a new CRT basis.
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Exact block modulus switch with a public positive integer scale.
+    /// Destination is a strict CRT subset; the dropped block is centered as a
+    /// whole before the retained residues are divided by its product.
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String>;
     /// Fused centered RNS ModUp, with contiguous digits stacked in group-major row order.
     /// The destination must contain every source prime. For a source group Q_j,
     /// the result is sum_i (Q_j/q_i) * centered(x_i / (Q_j/q_i) mod q_i).
@@ -806,6 +852,64 @@ impl<M: PolyMatrix> CpuSmallMatrix<M> {
 
     pub fn size(&self) -> (usize, usize) {
         self.value.size()
+    }
+
+    /// Rebase canonical bounded coefficients without changing their signed
+    /// representative or their declared bound.  The source compact owner is
+    /// already validated at construction, so this path never reconstructs a
+    /// per-coefficient BigInt from a serialized payload.
+    pub fn centered_rebase(
+        &self,
+        destination: &<M::P as Poly>::Params,
+    ) -> Result<Self, SmallMatrixError> {
+        let source_params = self.value.params();
+        if source_params.ring_dimension() != destination.ring_dimension() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let (source_basis, _, _) = source_params.to_crt();
+        let (destination_basis, _, _) = destination.to_crt();
+        if source_basis.len() > 1 &&
+            source_basis.iter().any(|prime| !destination_basis.contains(prime))
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        let source_modulus: Arc<BigUint> = source_params.modulus().into();
+        let destination_modulus: Arc<BigUint> = destination.modulus().into();
+        let entries = (0..self.value.size().0)
+            .map(|row| {
+                (0..self.value.size().1)
+                    .map(|column| {
+                        let coefficients = self
+                            .value
+                            .entry(row, column)
+                            .coeffs()
+                            .into_iter()
+                            .map(|coefficient| {
+                                let residue = coefficient.value().clone();
+                                if &residue * 2u8 > *source_modulus {
+                                    if residue.is_zero() {
+                                        BigUint::from(0u8)
+                                    } else {
+                                        let magnitude = &*source_modulus - residue;
+                                        if magnitude.is_zero() {
+                                            BigUint::from(0u8)
+                                        } else {
+                                            (&*destination_modulus -
+                                                (&magnitude % &*destination_modulus)) %
+                                                &*destination_modulus
+                                        }
+                                    }
+                                } else {
+                                    residue % &*destination_modulus
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        M::P::from_biguints(destination, &coefficients)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        Self::new(M::from_poly_vec(destination, entries), self.max_coefficient_bound.clone())
     }
 }
 

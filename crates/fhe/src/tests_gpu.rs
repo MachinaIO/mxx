@@ -4,7 +4,7 @@ use crate::{
     utils::common,
 };
 use mxx_dsl::{DslContext, Ring};
-use mxx_ir_core::{ParamEnv, artifact::ArtifactConfidentiality};
+use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
 use mxx_primitives::poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams};
 use mxx_runtime::{
     ExecutionResult, MemoryArtifactStore, RuntimeValue,
@@ -79,11 +79,11 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     let product = scheme.mul(&ct, &gsw, &()).unwrap();
     let sum = scheme.add(&ct, &ct).unwrap();
     let graph = context
-        .private_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
+        .transferred_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
         .unwrap()
-        .private_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
+        .transferred_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
         .unwrap()
-        .private_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
+        .transferred_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
         .unwrap()
         .build()
         .unwrap()
@@ -159,17 +159,17 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     // the secret key is imported privately by the final decryption graph.
     let encryption_noise = ct.noise_bound.clone();
     let encryption = context
-        .private_output("secret", secret)
+        .transferred_output("secret", secret)
         .unwrap()
-        .public_output("ciphertext", ct.components)
+        .transferred_output("ciphertext", ct.components)
         .unwrap()
-        .public_output("relin", relin)
+        .transferred_output("relin", relin)
         .unwrap()
-        .public_output("rotation", rotation)
+        .transferred_output("rotation", rotation)
         .unwrap()
-        .public_output("backwards", backwards)
+        .transferred_output("backwards", backwards)
         .unwrap()
-        .public_output("swap", swap)
+        .transferred_output("swap", swap)
         .unwrap()
         .build()
         .unwrap()
@@ -195,7 +195,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             encryption_id.clone(),
             "ciphertext",
             (2, 1),
-            ArtifactConfidentiality::Public,
+            ArtifactAvailability::Transferred,
         ),
         correction_factor: 1,
         noise_bound: encryption_noise,
@@ -205,7 +205,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         encryption_id.clone(),
         "relin",
         (2, relin_width),
-        ArtifactConfidentiality::Public,
+        ArtifactAvailability::Transferred,
     );
     let (lower, lower_width) = bgv.key_switch_parameters(top - 1).unwrap();
     let ring = Ring::new(lower.modulus().as_ref().clone(), n);
@@ -214,7 +214,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             encryption_id.clone(),
             name,
             (2, lower_width),
-            ArtifactConfidentiality::Public,
+            ArtifactAvailability::Transferred,
         )
     };
     let sum = bgv.add(&ct, &ct).unwrap();
@@ -243,7 +243,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     ];
     let mut evaluator = DslContext::new("gpu-bgv-public-evaluator");
     for (name, ct) in &outputs {
-        evaluator = evaluator.public_output(*name, ct.components.clone()).unwrap();
+        evaluator = evaluator.transferred_output(*name, ct.components.clone()).unwrap();
     }
     let evaluator = evaluator
         .build()
@@ -260,7 +260,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         encryption_id,
         "secret",
         (1, 1),
-        ArtifactConfidentiality::Private,
+        // Secret keys are randomized producer outputs, not cache entries.
+        ArtifactAvailability::Transferred,
     );
     let mut decryption = DslContext::new("gpu-bgv-decrypt");
     for (name, ct) in &outputs {
@@ -270,7 +271,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 evaluation_id.clone(),
                 *name,
                 (ty.rows.clone(), 1),
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
             ),
             correction_factor: ct.correction_factor,
             // Bounds are public graph metadata, not part of a Matrix artifact.
@@ -278,7 +279,7 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
             noise_bound: ct.noise_bound.clone(),
         };
         decryption =
-            decryption.private_output(*name, bgv.decrypt(&secret, &imported).unwrap()).unwrap();
+            decryption.transferred_output(*name, bgv.decrypt(&secret, &imported).unwrap()).unwrap();
     }
     let decryption = decryption
         .build()
@@ -327,11 +328,11 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let rotation = bgv.rotation_key(&secret, top, 1).unwrap();
     let rotated = bgv.rotate_rows(Some(&rotation), &single, 1).unwrap();
     let graph = context
-        .private_output("single", bgv.decrypt(&secret, &single).unwrap())
+        .transferred_output("single", bgv.decrypt(&secret, &single).unwrap())
         .unwrap()
-        .private_output("partial", bgv.decrypt(&secret, &partial).unwrap())
+        .transferred_output("partial", bgv.decrypt(&secret, &partial).unwrap())
         .unwrap()
-        .private_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
+        .transferred_output("rotated", bgv.decrypt(&secret, &rotated).unwrap())
         .unwrap()
         .build()
         .unwrap()
@@ -416,9 +417,9 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
         assert!(bgv.can_decrypt(&product).unwrap(), "product level {level}");
         assert!(bgv.can_decrypt(&rotated).unwrap(), "rotation level {level}");
         context = context
-            .private_output(format!("product{level}"), bgv.decrypt(&secret, &product).unwrap())
+            .transferred_output(format!("product{level}"), bgv.decrypt(&secret, &product).unwrap())
             .unwrap()
-            .private_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
+            .transferred_output(format!("rotated{level}"), bgv.decrypt(&secret, &rotated).unwrap())
             .unwrap();
     }
     let graph = context.build().unwrap().validate(&ParamEnv::default()).unwrap();

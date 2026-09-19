@@ -329,6 +329,8 @@ pub enum PolyBackendError {
     SmallMatrix(#[from] SmallMatrixError),
     #[error("invalid small-matrix artifact: {0}")]
     InvalidSmallMatrixArtifact(&'static str),
+    #[error("invalid compact matrix artifact: {0}")]
+    InvalidCompactMatrix(&'static str),
     #[error(
         "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
     )]
@@ -1096,6 +1098,57 @@ where
             .map_err(PolyBackendError::BasisConversion)
     }
 
+    fn centered_rebase_small(
+        &mut self,
+        value: &M::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let source_basis = value.params().to_crt().0;
+        let target = self.parameters(destination)?;
+        let target_basis = target.to_crt().0;
+        if source_basis.len() > 1 && source_basis.iter().any(|prime| !target_basis.contains(prime))
+        {
+            return Err(PolyBackendError::BasisConversion(
+                "multi-limb centered rebase destination must contain the source basis".into(),
+            ));
+        }
+        let payload = value.to_canonical_coefficients()?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            target,
+            value.rows(),
+            value.columns(),
+            value.max_coefficient_bound().clone(),
+            &payload,
+        )?)
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: &BigInt,
+    ) -> Result<M, Self::Error> {
+        // The graph carries the complete ordered source CRT basis.  Checking
+        // the sequence (rather than only its product) is important: a
+        // reordered or level-truncated basis changes the correction factors
+        // used by exact block switching and must be rejected before any
+        // destination allocation or native dispatch.
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "BlockModSwitch source CRT basis disagrees with graph".into(),
+            ));
+        }
+        let plaintext_modulus = plaintext_modulus.to_biguint().ok_or_else(|| {
+            PolyBackendError::BasisConversion(
+                "BlockModSwitch plaintext modulus must be positive".into(),
+            )
+        })?;
+        value
+            .block_mod_switch(self.parameters(destination)?, &plaintext_modulus)
+            .map_err(PolyBackendError::BasisConversion)
+    }
+
     fn rns_mod_up(
         &mut self,
         value: &M,
@@ -1162,7 +1215,16 @@ where
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<M, Self::Error> {
-        Ok(M::from_cpu_staging_bytes(self.parameters(ty)?, bytes))
+        M::try_from_cpu_staging_bytes(self.parameters(ty)?, bytes).map_err(|error| match error {
+            mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions,
+            } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
+            }
+        })
     }
 
     fn preimage_target_from_staging(
@@ -1569,16 +1631,31 @@ where
     }
 
     fn matrix_from_bytes(&self, ty: &ConcreteMatrixType, bytes: &[u8]) -> Result<M, Self::Error> {
-        M::validate_compact_bytes(bytes).map_err(|error| match error {
+        let (rows, columns) = M::compact_shape(bytes).map_err(|error| match error {
             mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
                 version,
                 supported_versions,
             } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
-            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(_) => {
-                PolyBackendError::InvalidInteger
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
             }
         })?;
-        Ok(M::from_compact_bytes(self.parameters(ty)?, bytes))
+        if (rows, columns) != (ty.rows, ty.columns) {
+            return Err(PolyBackendError::InvalidCompactMatrix(
+                "serialized compact matrix shape does not match expected type",
+            ));
+        }
+        M::try_from_compact_bytes(self.parameters(ty)?, bytes).map_err(|error| match error {
+            mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions,
+            } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
+            }
+        })
     }
 
     fn small_matrix_to_bytes(
@@ -2067,6 +2144,25 @@ mod tests {
                 .small_matrix_from_bytes(&schema, &negative_zero, SmallMatrixSemanticKind::Generic,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn matrix_artifact_decode_rejects_a_valid_payload_with_the_wrong_shape() {
+        let parameters = DCRTPolyParams::new(4, 1, 16, 8, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let source_type =
+            ConcreteMatrixType { modulus: modulus.clone(), ring_dimension: 4, rows: 1, columns: 1 };
+        let wrong_type = ConcreteMatrixType { rows: 2, columns: 2, ..source_type.clone() };
+        let backend = cpu_backend([parameters.clone()]);
+        let value = DCRTPolyMatrix::zero(&parameters, 1, 1);
+        let bytes = backend.matrix_to_bytes(&value);
+        assert_eq!(backend.matrix_from_bytes(&source_type, &bytes).unwrap().size(), (1, 1));
+        assert!(matches!(
+            backend.matrix_from_bytes(&wrong_type, &bytes),
+            Err(PolyBackendError::InvalidCompactMatrix(
+                "serialized compact matrix shape does not match expected type"
+            ))
+        ));
     }
 }
 

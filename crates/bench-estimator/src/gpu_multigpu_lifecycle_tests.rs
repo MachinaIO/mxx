@@ -326,6 +326,10 @@ fn dsl_multigpu_owner_candidates_keep_route_evidence_through_selection() {
         ],
         harness,
     );
+    // Each worker owns a backend replicated over the full fleet.  Logical
+    // device 1 must therefore select the worker whose explicit owner is the
+    // second physical device, rather than the first backend that contains it.
+    assert_eq!(provider.worker_index_for_logical_device(1), Some(1));
     let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_for_inputs_with_candidates(
         &graph,
         &mut backend,

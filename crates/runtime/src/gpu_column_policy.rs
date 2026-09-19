@@ -55,6 +55,7 @@ pub enum EffectiveGpuOperation {
     ModulusSwitch,
     ModulusReduce,
     CenteredRebase,
+    BlockModSwitch,
     RnsModUp,
     RnsModDown,
     CrtRecompose,
@@ -103,6 +104,7 @@ impl EffectiveGpuOperation {
         Self::ModulusSwitch,
         Self::ModulusReduce,
         Self::CenteredRebase,
+        Self::BlockModSwitch,
         Self::RnsModUp,
         Self::RnsModDown,
         Self::CrtRecompose,
@@ -154,6 +156,7 @@ impl EffectiveGpuOperation {
             Self::ModulusSwitch |
             Self::ModulusReduce |
             Self::CenteredRebase |
+            Self::BlockModSwitch |
             Self::RnsModUp |
             Self::RnsModDown |
             Self::CrtRecompose |
@@ -215,6 +218,7 @@ pub enum CanonicalWarmupProfileDomain {
     ModulusSwitch,
     ModulusReduce,
     CenteredRebase,
+    BlockModSwitch,
     RnsModUp,
     RnsModDown,
     Transpose,
@@ -350,6 +354,7 @@ impl CanonicalWarmupProfileDomain {
         Self::ModulusSwitch,
         Self::ModulusReduce,
         Self::CenteredRebase,
+        Self::BlockModSwitch,
         Self::RnsModUp,
         Self::RnsModDown,
         Self::Transpose,
@@ -439,6 +444,7 @@ impl CanonicalWarmupProfileDomain {
             Self::ModulusSwitch => "modulus_switch",
             Self::ModulusReduce => "modulus_reduce",
             Self::CenteredRebase => "centered_rebase",
+            Self::BlockModSwitch => "block_mod_switch",
             Self::RnsModUp => "rns_mod_up",
             Self::RnsModDown => "rns_mod_down",
             Self::Transpose => "transpose",
@@ -523,6 +529,7 @@ impl CanonicalWarmupProfileDomain {
             Self::ModulusSwitch |
             Self::ModulusReduce |
             Self::CenteredRebase |
+            Self::BlockModSwitch |
             Self::RnsModUp |
             Self::RnsModDown |
             Self::Transpose |
@@ -595,6 +602,7 @@ impl CanonicalWarmupProfileDomain {
             Self::ModulusSwitch |
             Self::ModulusReduce |
             Self::CenteredRebase |
+            Self::BlockModSwitch |
             Self::RnsModUp |
             Self::RnsModDown |
             Self::Transpose |
@@ -695,6 +703,7 @@ pub fn canonical_warmup_profile_domain(kind: &NodeKind) -> CanonicalWarmupProfil
         NodeKind::ModulusSwitch { .. } => CanonicalWarmupProfileDomain::ModulusSwitch,
         NodeKind::ModulusReduce { .. } => CanonicalWarmupProfileDomain::ModulusReduce,
         NodeKind::CenteredRebase { .. } => CanonicalWarmupProfileDomain::CenteredRebase,
+        NodeKind::BlockModSwitch { .. } => CanonicalWarmupProfileDomain::BlockModSwitch,
         NodeKind::RnsModUp { .. } => CanonicalWarmupProfileDomain::RnsModUp,
         NodeKind::RnsModDown { .. } => CanonicalWarmupProfileDomain::RnsModDown,
         NodeKind::Transpose => CanonicalWarmupProfileDomain::Transpose,
@@ -1297,6 +1306,7 @@ pub fn gpu_execution_range(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::BlockModSwitch { .. } |
         NodeKind::RnsModUp { .. } |
         NodeKind::RnsModDown { .. } |
         NodeKind::CrtRecompose { .. } |
@@ -1519,7 +1529,7 @@ pub fn effective_gpu_operation(kind: &NodeKind) -> EffectiveGpuOperation {
         NodeKind::LiftIntegerToConstantPolynomial { .. } => {
             EffectiveGpuOperation::LiftIntegerToConstantPolynomial
         }
-        NodeKind::TrapdoorPublic => EffectiveGpuOperation::HostOrControl,
+        NodeKind::TrapdoorPublic => EffectiveGpuOperation::TrapdoorPublic,
         NodeKind::PreimageSample { .. } => EffectiveGpuOperation::PreimageSample,
         NodeKind::GadgetDecompose { .. } => EffectiveGpuOperation::GadgetDecompose,
         NodeKind::MatrixScale { .. } => EffectiveGpuOperation::MatrixScale,
@@ -1528,6 +1538,7 @@ pub fn effective_gpu_operation(kind: &NodeKind) -> EffectiveGpuOperation {
         NodeKind::ModulusSwitch { .. } => EffectiveGpuOperation::ModulusSwitch,
         NodeKind::ModulusReduce { .. } => EffectiveGpuOperation::ModulusReduce,
         NodeKind::CenteredRebase { .. } => EffectiveGpuOperation::CenteredRebase,
+        NodeKind::BlockModSwitch { .. } => EffectiveGpuOperation::BlockModSwitch,
         NodeKind::RnsModUp { .. } => EffectiveGpuOperation::RnsModUp,
         NodeKind::RnsModDown { .. } => EffectiveGpuOperation::RnsModDown,
         NodeKind::CrtRecompose { .. } => EffectiveGpuOperation::CrtRecompose,
@@ -1574,7 +1585,10 @@ pub fn effective_gpu_operation(kind: &NodeKind) -> EffectiveGpuOperation {
 /// Whether an operation is explicitly known to remain on the host/control
 /// path. This is deliberately narrower than "not column-separable".
 pub fn known_host_or_control(kind: &NodeKind) -> bool {
-    effective_gpu_operation(kind) == EffectiveGpuOperation::HostOrControl
+    matches!(
+        effective_gpu_operation(kind),
+        EffectiveGpuOperation::HostOrControl | EffectiveGpuOperation::TrapdoorPublic
+    )
 }
 
 /// Classify an effective operation using only validated operation and concrete
@@ -1614,6 +1628,7 @@ pub fn capability_for_effective_operation(
         EffectiveGpuOperation::ModulusSwitch |
         EffectiveGpuOperation::ModulusReduce |
         EffectiveGpuOperation::CenteredRebase |
+        EffectiveGpuOperation::BlockModSwitch |
         EffectiveGpuOperation::RnsModUp |
         EffectiveGpuOperation::RnsModDown |
         EffectiveGpuOperation::CrtRecompose |
@@ -1688,7 +1703,7 @@ pub fn map_output_range_to_inputs_with_output(
                 operation: "unknown GPU operation",
             });
         }
-        EffectiveGpuOperation::HostOrControl => {
+        EffectiveGpuOperation::TrapdoorPublic | EffectiveGpuOperation::HostOrControl => {
             return Err(ColumnPolicyError::UnsupportedOperation {
                 operation: "host/control operation",
             });
@@ -1707,7 +1722,6 @@ pub fn map_output_range_to_inputs_with_output(
         EffectiveGpuOperation::PackPolynomialCoefficients |
         EffectiveGpuOperation::PolynomialFromValues |
         EffectiveGpuOperation::PolynomialValues |
-        EffectiveGpuOperation::TrapdoorPublic |
         EffectiveGpuOperation::PreimageSample |
         EffectiveGpuOperation::GadgetDecompose |
         EffectiveGpuOperation::MatrixScale |
@@ -1716,6 +1730,7 @@ pub fn map_output_range_to_inputs_with_output(
         EffectiveGpuOperation::ModulusSwitch |
         EffectiveGpuOperation::ModulusReduce |
         EffectiveGpuOperation::CenteredRebase |
+        EffectiveGpuOperation::BlockModSwitch |
         EffectiveGpuOperation::RnsModUp |
         EffectiveGpuOperation::RnsModDown |
         EffectiveGpuOperation::CrtRecompose |
@@ -1787,6 +1802,7 @@ pub fn map_output_range_to_inputs_with_output(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::BlockModSwitch { .. } |
         NodeKind::RnsModUp { .. } |
         NodeKind::RnsModDown { .. } |
         NodeKind::CrtRecompose { .. } |
@@ -2429,13 +2445,32 @@ mod tests {
     #[test]
     fn host_projection_and_gpu_boundaries_have_distinct_measurement_routes() {
         assert_eq!(
+            effective_gpu_operation(&NodeKind::TrapdoorPublic),
+            EffectiveGpuOperation::TrapdoorPublic
+        );
+        assert!(EffectiveGpuOperation::all().contains(&EffectiveGpuOperation::TrapdoorPublic));
+        assert!(known_host_or_control(&NodeKind::TrapdoorPublic));
+        assert_eq!(
             canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic).measurement_kind(),
             WarmupMeasurementKind::HostMeasured
         );
         assert_eq!(
+            canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic),
+            CanonicalWarmupProfileDomain::TrapdoorPublic
+        );
+        assert!(canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic).is_profileable());
+        assert_eq!(
             column_capability(&NodeKind::TrapdoorPublic, &[]),
             ColumnCapability::HostOrControl
         );
+        assert!(matches!(
+            map_output_range_to_inputs(
+                &NodeKind::TrapdoorPublic,
+                &[],
+                ColumnRange { start: 0, end: 1 }
+            ),
+            Err(ColumnPolicyError::UnsupportedOperation { .. })
+        ));
 
         let matrix = matrix(1, 1);
         let extract = NodeKind::ExtractCoefficient {

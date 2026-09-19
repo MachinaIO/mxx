@@ -30,8 +30,8 @@ use mxx_gadgets::{
 use mxx_ir_core::{
     IntExpr, ParamEnv, RealExpr,
     artifact::{
-        ArtifactConfidentiality, Manifest as RuntimeManifest, ProductionId,
-        export_validated_manifest, production_id,
+        ArtifactAvailability, Manifest as RuntimeManifest, ProductionId, export_validated_manifest,
+        production_id,
     },
     encoding::spec_hash,
     node::IndexRange,
@@ -763,18 +763,24 @@ fn prepare_candidate(
         "lookup preprocessing preimage plan"
     );
     let mut preprocessing_context = DslContext::new("gpu-tall-nested-rns-preprocessing")
-        .public_output(LOOKUP_PUBLIC_B_ARTIFACT, lookup_trapdoor.public_matrix())
+        .transferred_output(LOOKUP_PUBLIC_B_ARTIFACT, lookup_trapdoor.public_matrix())
         .map_err(|error| error.to_string())?;
     for (index, public_key) in public_keys.iter().enumerate() {
         preprocessing_context = preprocessing_context
-            .public_output(format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}"), public_key.matrix.clone())
+            .transferred_output(
+                format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}"),
+                public_key.matrix.clone(),
+            )
             .map_err(|error| error.to_string())?;
     }
     preprocessing_context = preprocessing_context
-        .public_output(DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT, diagonal_mask_public_key.matrix.clone())
+        .transferred_output(
+            DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT,
+            diagonal_mask_public_key.matrix.clone(),
+        )
         .map_err(|error| error.to_string())?;
     preprocessing_context = preprocessing_context
-        .public_output(OUTPUT_PUBLIC_KEY_ARTIFACT, output_public_key.matrix)
+        .transferred_output(OUTPUT_PUBLIC_KEY_ARTIFACT, output_public_key.matrix)
         .map_err(|error| error.to_string())?;
     for entry in &lookup_entries {
         preprocessing_context =
@@ -900,7 +906,7 @@ fn imported_public_keys(
                 production.clone(),
                 format!("{INPUT_PUBLIC_KEY_PREFIX}_{index}"),
                 (1, columns),
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
             ),
             reveal_plaintext: true,
         })
@@ -958,7 +964,7 @@ fn validate_tall_preprocessing_manifest(
     if let Some((name, _)) = manifest
         .artifacts
         .iter()
-        .find(|(_, descriptor)| descriptor.confidentiality != ArtifactConfidentiality::Public)
+        .find(|(_, descriptor)| descriptor.availability != ArtifactAvailability::Transferred)
     {
         return Err(format!("Tall preprocessing exports non-public artifact {name}"));
     }
@@ -1022,7 +1028,7 @@ fn build_encoding_graph(
         production.clone(),
         LOOKUP_PUBLIC_B_ARTIFACT,
         (layout.secret_dimension, layout.secret_dimension * (layout.digit_count + 2)),
-        ArtifactConfidentiality::Public,
+        ArtifactAvailability::Transferred,
     );
     let lookup_error_sigma =
         RealExpr::from_f64_exact(error_sigma).map_err(|error| error.to_string())?;
@@ -1105,7 +1111,7 @@ fn build_encoding_graph(
             production.clone(),
             DIAGONAL_MASK_PUBLIC_KEY_ARTIFACT,
             (layout.secret_dimension, layout.public_key_columns()),
-            ArtifactConfidentiality::Public,
+            ArtifactAvailability::Transferred,
         ),
         reveal_plaintext: true,
     };
@@ -1168,7 +1174,7 @@ fn build_encoding_graph(
         production.clone(),
         OUTPUT_PUBLIC_KEY_ARTIFACT,
         (layout.secret_dimension, layout.public_key_columns()),
-        ArtifactConfidentiality::Public,
+        ArtifactAvailability::Transferred,
     );
     let mut context = DslContext::new("gpu-tall-nested-rns-encoding")
         .output("encoding_rows", encoding_rows.clone())
@@ -1418,7 +1424,7 @@ fn save_preprocessing(
             name = key.name,
             index = ?key.index,
             artifact_type = ?descriptor.artifact_type,
-            confidentiality = ?descriptor.confidentiality,
+            availability = ?descriptor.availability,
             payload_bytes = payload_size(payload),
             "preprocessing artifact payload"
         );
@@ -1452,7 +1458,7 @@ fn reload_preprocessing(
             .store(
                 key,
                 &descriptor.artifact_type,
-                descriptor.confidentiality,
+                descriptor.availability,
                 descriptor.layout.as_deref(),
                 payload,
             )

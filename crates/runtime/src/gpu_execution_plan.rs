@@ -726,7 +726,7 @@ impl GpuLayout {
                 ..*interval
             })
             .collect();
-        GpuColumnSchedule::new(self.columns, widths.to_vec(), owners)
+        GpuColumnSchedule::new_for_instance(self.columns, widths.to_vec(), owners, instance, offset)
     }
     fn validate(&self, device_count: usize) -> Result<(), GpuPlanError> {
         if self.representation.is_empty() {

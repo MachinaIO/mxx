@@ -8,6 +8,9 @@
 #[path = "gpu_lifecycle_tests.rs"]
 mod gpu_lifecycle_tests;
 #[cfg(test)]
+#[path = "gpu_multigpu_lifecycle_tests.rs"]
+mod gpu_multigpu_lifecycle_tests;
+#[cfg(test)]
 #[path = "gpu_primitive_lifecycle_tests.rs"]
 mod gpu_primitive_lifecycle_tests;
 
@@ -1322,77 +1325,6 @@ impl GpuNodeMeasurementBackend {
             request.device
         };
         self.profile_key(request, &descriptor, domain, device)
-    }
-
-    /// Import one already measured point into the canonical setup-session
-    /// table.  This is intentionally not a request/profile cache: the point
-    /// must carry a complete execution key and validated provenance.
-    pub fn register_warmup_measurement(
-        &mut self,
-        request: GpuWarmupProfileRequest,
-        measurement: &NodeMeasurement,
-    ) -> Result<(), GpuMeasurementError> {
-        if self.harness.measured_iterations == 0 {
-            return Err(GpuMeasurementError(
-                "imported warmup points require at least one measured repetition".into(),
-            ));
-        }
-        if !measurement.cumulative_wave_seconds.is_finite() ||
-            measurement.cumulative_wave_seconds <= 0.0
-        {
-            return Err(GpuMeasurementError(
-                "imported warmup timing must be finite and positive".into(),
-            ));
-        }
-        let descriptor = self.warmup_operations.get(&request.signature).ok_or_else(|| {
-            GpuMeasurementError(
-                "cannot import a warmup point before registering its operation".into(),
-            )
-        })?;
-        let domain =
-            self.warmup_profile_domains.get(&request.signature).copied().ok_or_else(|| {
-                GpuMeasurementError(
-                    "cannot import a warmup point without a canonical domain".into(),
-                )
-            })?;
-        let key = self
-            .profile_key_for_pending(&request, descriptor, domain)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        // Registration validates the point's operation context, but does not
-        // retain a second request->profile table in the provider.  The
-        // runtime warmup session owns the canonical point table and is the
-        // only authority used for interpolation/admission.
-        let _ = key;
-        Ok(())
-    }
-
-    /// Register a measured preimage point together with the sampler metadata
-    /// required by warmup admission. Generic operation measurements must not
-    /// be promoted to preimage footprints without these explicit facts.
-    pub fn register_warmup_preimage_measurement(
-        &mut self,
-        request: GpuWarmupProfileRequest,
-        measurement: &NodeMeasurement,
-        max_attempts: usize,
-        certified_tile_width: usize,
-    ) -> Result<(), GpuMeasurementError> {
-        let descriptor = self.warmup_operations.get(&request.signature).ok_or_else(|| {
-            GpuMeasurementError(
-                "cannot import a warmup point before registering its operation".into(),
-            )
-        })?;
-        let domain =
-            self.warmup_profile_domains.get(&request.signature).copied().ok_or_else(|| {
-                GpuMeasurementError(
-                    "cannot import a warmup point without a canonical domain".into(),
-                )
-            })?;
-        let key = self
-            .profile_key_for_pending(&request, descriptor, domain)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        self.preimage_profile_metadata
-            .insert((key.clone(), certified_tile_width), (max_attempts, certified_tile_width));
-        self.register_warmup_measurement(request, measurement)
     }
 
     /// Query the primitive sampler's fixed-width cold allocation envelope for
@@ -5583,11 +5515,12 @@ impl GpuNodeMeasurementBackend {
         bindings: &ParamEnv,
     ) -> Result<RuntimeValue<GpuDcrtBackend>, GpuMeasurementError> {
         if let ConcreteWireType::IndexedFamily { element, count } = wire_type {
-            return Ok(RuntimeValue::IndexedFamily(
-                (0..*count)
-                    .map(|_| Self::representative_runtime_value(backend, element, bindings))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ));
+            // Preserve the exact family cardinality for typed input lookup,
+            // but clone one payload exemplar.  Matrix/compact values are
+            // Arc-backed, so this keeps family storage O(count) while VRAM
+            // remains bounded instead of allocating count independent GPUs.
+            let exemplar = Self::representative_runtime_value(backend, element, bindings)?;
+            return Ok(RuntimeValue::IndexedFamily((0..*count).map(|_| exemplar.clone()).collect()));
         }
         match wire_type {
             ConcreteWireType::ConstantInt | ConcreteWireType::Int => {
@@ -5660,6 +5593,43 @@ impl GpuNodeMeasurementBackend {
             // cannot silently fall through to a scalar representative.
             ConcreteWireType::IndexedFamily { .. } => unreachable!("family handled above"),
         }
+    }
+
+    /// Build one payload that can stand for a family member during host-side
+    /// container timing.  Host family access does not consume every member's
+    /// backend value, so materializing a fresh matrix for each member would
+    /// make setup VRAM scale with the family cardinality.  Nested families
+    /// retain their container shape but contain one bounded exemplar.
+    fn representative_family_member(
+        backend: &mut GpuDcrtBackend,
+        wire_type: &ConcreteWireType,
+        bindings: &ParamEnv,
+    ) -> Result<RuntimeValue<GpuDcrtBackend>, GpuMeasurementError> {
+        match wire_type {
+            ConcreteWireType::IndexedFamily { element, count } => {
+                if *count == 0 {
+                    return Err(GpuMeasurementError(
+                        "host family representative cannot use an empty nested family".into(),
+                    ));
+                }
+                Ok(RuntimeValue::IndexedFamily(vec![Self::representative_family_member(
+                    backend, element, bindings,
+                )?]))
+            }
+            _ => Self::representative_runtime_value(backend, wire_type, bindings),
+        }
+    }
+
+    fn evaluated_family_count(wire_type: &ConcreteWireType) -> Result<usize, GpuMeasurementError> {
+        let ConcreteWireType::IndexedFamily { count, .. } = wire_type else {
+            return Err(GpuMeasurementError("host family input is not indexed".into()));
+        };
+        if *count == 0 {
+            return Err(GpuMeasurementError(
+                "host family representative cannot use an empty family".into(),
+            ));
+        }
+        Ok(*count)
     }
 
     fn run_host_primitive(
@@ -5759,10 +5729,15 @@ impl GpuNodeMeasurementBackend {
                 } else {
                     node.concrete_argument_types.clone()
                 };
-                prepared.family_inputs = member_types
-                    .iter()
-                    .map(|ty| Self::representative_runtime_value(backend, ty, bindings))
-                    .collect::<Result<Vec<_>, _>>()?;
+                // FamilyPack's host work is intentionally still O(count): the
+                // timed runtime helper clones this vector into the resulting
+                // family.  Each member shares one bounded representative
+                // payload rather than allocating an independent GPU object.
+                if let Some(first) = member_types.first() {
+                    let exemplar = Self::representative_family_member(backend, first, bindings)?;
+                    prepared.family_inputs =
+                        member_types.iter().map(|_| exemplar.clone()).collect();
+                }
             }
             NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => {
                 let family = node
@@ -5786,37 +5761,64 @@ impl GpuNodeMeasurementBackend {
                     .ok_or_else(|| {
                         GpuMeasurementError("family selection has no family input".into())
                     })?;
-                prepared
-                    .family_inputs
-                    .push(Self::representative_runtime_value(backend, &family, bindings)?);
+                let count = Self::evaluated_family_count(&family)?;
+                let ConcreteWireType::IndexedFamily { element, .. } = &family else {
+                    unreachable!("evaluated_family_count validated indexed family");
+                };
+                let exemplar = Self::representative_family_member(backend, element, bindings)?;
+                let selected_index = match node.kind {
+                    NodeKind::FamilyGetStatic { index } => index
+                        .evaluate(bindings)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            GpuMeasurementError("family index does not fit usize".into())
+                        })?,
+                    NodeKind::FamilyGetDynamic => 0,
+                    _ => unreachable!(),
+                };
+                if selected_index >= count {
+                    return Err(GpuMeasurementError(format!(
+                        "family representative index {selected_index} is out of range for {count} members"
+                    )));
+                }
+                // Static access may select a nonzero member.  Keep only the
+                // prefix needed to satisfy the production bounds check; all
+                // unselected entries are zero-byte host placeholders.
+                let mut family_values = (0..selected_index)
+                    .map(|_| RuntimeValue::Int(BigInt::from(0u8)))
+                    .collect::<Vec<_>>();
+                family_values.push(exemplar);
+                prepared.family_inputs.push(RuntimeValue::IndexedFamily(family_values));
                 if matches!(node.kind, NodeKind::FamilyGetDynamic) {
-                    if let Some(index) = node.concrete_argument_types.get(1) {
-                        prepared.dynamic_index =
-                            Some(Self::representative_runtime_value(backend, index, bindings)?);
-                    } else {
-                        prepared.dynamic_index = Some(RuntimeValue::Int(BigInt::from(0u8)));
-                    }
+                    // Index zero is valid for every nonempty family and is
+                    // deliberately independent of the generic Int exemplar.
+                    prepared.dynamic_index = Some(RuntimeValue::Int(BigInt::from(0u8)));
                 }
             }
             NodeKind::Select { .. } => {
-                let index =
-                    node.concrete_argument_types.first().cloned().unwrap_or(ConcreteWireType::Int);
-                prepared.dynamic_index = if node.concrete_argument_types.is_empty() {
-                    Some(RuntimeValue::Int(BigInt::from(0u8)))
-                } else {
-                    Some(Self::representative_runtime_value(backend, &index, bindings)?)
+                let count = match node.kind {
+                    NodeKind::Select { count } => count
+                        .evaluate(bindings)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?
+                        .to_usize()
+                        .ok_or_else(|| {
+                            GpuMeasurementError("select count does not fit usize".into())
+                        })?,
+                    _ => unreachable!(),
                 };
+                if count == 0 {
+                    return Err(GpuMeasurementError(
+                        "select representative cannot use zero choices".into(),
+                    ));
+                }
+                // Zero is in range for every nonempty Select.  Do not use the
+                // generic Int representative (7), which is invalid for the
+                // common two-choice case.
+                prepared.dynamic_index = Some(RuntimeValue::Int(BigInt::from(0u8)));
                 let choice_types = if node.concrete_argument_types.len() > 1 {
                     node.concrete_argument_types.iter().skip(1).cloned().collect()
                 } else {
-                    let count = match node.kind {
-                        NodeKind::Select { count } => count
-                            .evaluate(bindings)
-                            .ok()
-                            .and_then(|value| value.to_usize())
-                            .unwrap_or(1),
-                        _ => 1,
-                    };
                     let output = node
                         .concrete_output_types
                         .first()
@@ -5824,10 +5826,15 @@ impl GpuNodeMeasurementBackend {
                         .unwrap_or(ConcreteWireType::Int);
                     vec![output; count]
                 };
-                prepared.choices = choice_types
-                    .iter()
-                    .map(|ty| Self::representative_runtime_value(backend, ty, bindings))
-                    .collect::<Result<Vec<_>, _>>()?;
+                if choice_types.is_empty() {
+                    return Err(GpuMeasurementError("select representative has no choices".into()));
+                }
+                // Only choice zero is consumed by the representative index.
+                // Reuse its payload for the remaining entries to preserve the
+                // choice vector's O(count) host work without count×GPU memory.
+                let exemplar =
+                    Self::representative_family_member(backend, &choice_types[0], bindings)?;
+                prepared.choices = (0..count).map(|_| exemplar.clone()).collect();
             }
             NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
                 prepared.scalar_inputs = vec![
@@ -7650,6 +7657,184 @@ mod tests {
                 record.profile_domain == domain && record.fused_operation.is_none()
             }));
         }
+        gpu_device_sync();
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn host_family_representatives_use_valid_indices_and_bounded_payloads() {
+        use mxx_primitives::poly::dcrt::gpu::{
+            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
+        };
+        use mxx_runtime::backend::{RuntimeValue, poly_gpu::gpu_backend_on};
+        use num_bigint::Sign;
+
+        let device = detected_gpu_device_ids()
+            .into_iter()
+            .next()
+            .expect("GPU feature tests require one detected device");
+        let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let matrix = |columns| {
+            ConcreteWireType::Matrix(ConcreteMatrixType {
+                modulus: modulus.clone(),
+                ring_dimension: parameters.ring_dimension() as usize,
+                rows: 1,
+                columns,
+            })
+        };
+        let scope = FrozenGraphScopeId::Root;
+        let mut backend = gpu_backend_on([parameters.clone()], [device]);
+        backend.select_operation([0xD1; 32]).expect("select setup operation");
+        for (id, count) in [1usize, 2, 7, 8].into_iter().enumerate() {
+            let family_type =
+                ConcreteWireType::IndexedFamily { element: Box::new(matrix(1)), count };
+            let arguments = [family_type, ConcreteWireType::Int];
+            let outputs = [matrix(1)];
+            let kind = NodeKind::FamilyGetDynamic;
+            let node = MeasurementNode {
+                scope: &scope,
+                id: NodeId(10 + id as u64),
+                kind: &kind,
+                arguments: &[],
+                argument_kinds: &[],
+                argument_types: &[],
+                output_types: &[],
+                concrete_argument_types: arguments.to_vec(),
+                concrete_output_types: outputs.to_vec(),
+            };
+            let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+                &mut backend,
+                &node,
+                &ParamEnv::default(),
+            )
+            .expect("nonempty dynamic family must prepare");
+            assert!(matches!(
+                prepared.dynamic_index,
+                Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
+            ));
+            let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
+                panic!("dynamic family representative must remain indexed");
+            };
+            assert_eq!(values.len(), 1);
+        }
+
+        let family_type =
+            ConcreteWireType::IndexedFamily { element: Box::new(matrix(64)), count: 64 };
+        let dynamic_arguments = [family_type, ConcreteWireType::Int];
+        let dynamic_outputs = [matrix(64)];
+        let dynamic_kind = NodeKind::FamilyGetDynamic;
+        let dynamic_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(1),
+            kind: &dynamic_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: dynamic_arguments.to_vec(),
+            concrete_output_types: dynamic_outputs.to_vec(),
+        };
+        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+            &mut backend,
+            &dynamic_node,
+            &ParamEnv::default(),
+        )
+        .expect("nonempty dynamic family must prepare");
+        assert!(matches!(
+            prepared.dynamic_index,
+            Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
+        ));
+        let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
+            panic!("dynamic family representative must remain indexed");
+        };
+        assert_eq!(values.len(), 1, "family access must not materialize all payloads");
+        assert!(matches!(values.first(), Some(RuntimeValue::Matrix(_))));
+
+        let select_kind = NodeKind::Select { count: IntExpr::constant(2) };
+        let select_outputs = [matrix(64)];
+        let select_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(2),
+            kind: &select_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: select_outputs.to_vec(),
+        };
+        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+            &mut backend,
+            &select_node,
+            &ParamEnv::default(),
+        )
+        .expect("nonempty select must prepare");
+        assert!(matches!(
+            prepared.dynamic_index,
+            Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
+        ));
+        assert_eq!(prepared.choices.len(), 2);
+        let (Some(RuntimeValue::Matrix(first)), Some(RuntimeValue::Matrix(second))) =
+            (prepared.choices.first(), prepared.choices.get(1))
+        else {
+            panic!("select choices must contain matrix exemplars");
+        };
+        assert!(std::sync::Arc::ptr_eq(first, second));
+
+        let pack_kind = NodeKind::FamilyPack { count: IntExpr::constant(64) };
+        let pack_outputs =
+            [ConcreteWireType::IndexedFamily { element: Box::new(matrix(64)), count: 64 }];
+        let pack_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(3),
+            kind: &pack_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: pack_outputs.to_vec(),
+        };
+        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+            &mut backend,
+            &pack_node,
+            &ParamEnv::default(),
+        )
+        .expect("family pack must prepare");
+        assert_eq!(prepared.family_inputs.len(), 64);
+        let matrices = prepared
+            .family_inputs
+            .iter()
+            .map(|value| match value {
+                RuntimeValue::Matrix(matrix) => matrix,
+                _ => panic!("family pack representative must preserve payload kind"),
+            })
+            .collect::<Vec<_>>();
+        assert!(matrices.windows(2).all(|pair| std::sync::Arc::ptr_eq(pair[0], pair[1])));
+
+        let empty_kind = NodeKind::Select { count: IntExpr::constant(0) };
+        let empty_outputs = [ConcreteWireType::Int];
+        let empty_node = MeasurementNode {
+            scope: &scope,
+            id: NodeId(4),
+            kind: &empty_kind,
+            arguments: &[],
+            argument_kinds: &[],
+            argument_types: &[],
+            output_types: &[],
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: empty_outputs.to_vec(),
+        };
+        assert!(
+            GpuNodeMeasurementBackend::prepare_host_primitive(
+                &mut backend,
+                &empty_node,
+                &ParamEnv::default(),
+            )
+            .is_err()
+        );
         gpu_device_sync();
     }
 

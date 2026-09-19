@@ -1323,17 +1323,61 @@ pub(crate) fn gpu_alias_facts(
             facts.insert(*output, *source);
         }
     }
-    let Some(scope) = validated.source.scope(scope_id) else { return facts };
-    for (concat, _, groups) in aliases.compact_products.values() {
-        let Some(handle) = scope.node(*concat) else { continue };
-        let Some(arguments) = scope.arguments(handle) else { continue };
-        for (source, outputs) in arguments.iter().zip(groups) {
-            for output in outputs {
-                facts.insert(*output, *source);
+    for (_, _, groups) in aliases.compact_products.values() {
+        for outputs in groups {
+            // Each result block owns a new product allocation. Only duplicate
+            // views of that same result may alias; multiplicands never do.
+            if let Some((owner, views)) = outputs.split_first() {
+                for view in views {
+                    facts.insert(*view, *owner);
+                }
             }
         }
     }
     facts
+}
+
+/// Storage owners of the result blocks created by fused multiplication.
+/// The logical concatenated product is represented by these allocations.
+pub(crate) fn gpu_fused_result_owners(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+) -> BTreeMap<WireRef, Vec<WireRef>> {
+    root_block_aliases(validated, scope_id, false)
+        .compact_products
+        .iter()
+        .map(|(node, (_, _, groups))| {
+            (
+                WireRef { node: *node, port: Port(0) },
+                groups.iter().filter_map(|group| group.first().copied()).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The production lowering is the sole authority for fused profile selection.
+pub(crate) fn gpu_fused_operation_for_site(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    node: NodeId,
+) -> Option<crate::gpu_column_policy::FusedWarmupOperation> {
+    use crate::gpu_column_policy::FusedWarmupOperation;
+    let aliases = root_block_aliases(validated, scope_id, false);
+    if let Some(plan) = aliases.row_sums.get(&node) {
+        Some(if plan.tensor_operands.is_some() {
+            FusedWarmupOperation::TensorRowSum
+        } else {
+            FusedWarmupOperation::RowSum
+        })
+    } else if aliases.compact_products.contains_key(&node) {
+        Some(FusedWarmupOperation::CompactProduct)
+    } else if aliases.decompositions.contains_key(&node) {
+        Some(FusedWarmupOperation::Decompose)
+    } else if aliases.adds.contains_key(&node) {
+        Some(FusedWarmupOperation::RowBlockAdd)
+    } else {
+        None
+    }
 }
 
 fn canonical_gpu_effective_source_wires(
@@ -1476,6 +1520,28 @@ pub fn gpu_effective_inputs(
     Ok(result)
 }
 
+/// Resolve the fixed backend slot for one production instance.  The executor
+/// batches a wave into local arrays, but owner rotation is keyed by the
+/// global sibling slot used by warmup.  Every loop frame carries that slot in
+/// its instantiation path; the innermost frame is the current sibling loop.
+/// Calls outside a loop retain the local root slot (normally zero).
+fn fixed_global_instance_slot(
+    path: &[InstantiationFrame],
+    local_index: usize,
+) -> Result<usize, ExecutionError> {
+    path.iter()
+        .rev()
+        .find_map(|frame| frame.loop_index)
+        .map(|slot| {
+            usize::try_from(slot).map_err(|_| {
+                ExecutionError::InvalidGpuPlan(
+                    "instantiation loop index does not fit the fixed instance slot".into(),
+                )
+            })
+        })
+        .unwrap_or(Ok(local_index))
+}
+
 impl<B, S> Executor<'_, B, S>
 where
     B: Backend,
@@ -1547,7 +1613,7 @@ where
         &self,
         scope_id: &FrozenGraphScopeId,
         node: NodeId,
-        instance_slots: &[usize],
+        instance_indices: &[usize],
         instance_paths: &[Vec<InstantiationFrame>],
         instance_envs: &[ParamEnv],
         output_ports: usize,
@@ -1555,8 +1621,8 @@ where
         let Some(plan) = &self.gpu_plan else {
             return Ok(None);
         };
-        if instance_slots.len() != instance_paths.len() ||
-            instance_slots.iter().any(|slot| *slot >= instance_envs.len())
+        if instance_indices.len() != instance_paths.len() ||
+            instance_indices.iter().any(|index| *index >= instance_envs.len())
         {
             return Err(ExecutionError::InvalidGpuPlan(
                 "fixed node batch instance metadata is inconsistent".into(),
@@ -1578,7 +1644,7 @@ where
             .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing planned node".into()))?;
         // A scope template is usable only for the concrete shape class checked
         // during warmup. Never silently reuse instance zero's shape.
-        for &instance in instance_slots {
+        for &instance in instance_indices {
             for wire in scope
                 .arguments(handle)
                 .ok_or_else(|| ExecutionError::InvalidGpuPlan("missing node arguments".into()))?
@@ -1706,7 +1772,7 @@ where
             self.validated,
             scope_id,
             node,
-            &instance_envs[*instance_slots.first().unwrap_or(&0)],
+            &instance_envs[*instance_indices.first().unwrap_or(&0)],
         )
         .map_err(ExecutionError::InvalidGpuPlan)?;
         let output_ports = if effective_ports == 0 { output_ports } else { effective_ports };
@@ -1718,7 +1784,17 @@ where
             output_layout_metadata,
             choice.columns_per_job.clone(),
         );
-        request.instance_slots = instance_slots.to_vec();
+        // `instance_indices` address the current wave's local arrays, while
+        // the backend slot is the global sibling position that determines
+        // owner rotation.  Warmup schedules use those global positions.  The
+        // path is authoritative for production, including tail waves and
+        // nested/subgraph calls; root/single-instance paths retain slot 0 (or
+        // their caller-provided local position when no loop frame exists).
+        request.instance_slots = instance_indices
+            .iter()
+            .zip(instance_paths)
+            .map(|(&index, path)| fixed_global_instance_slot(path, index))
+            .collect::<Result<Vec<_>, _>>()?;
         request.instance_paths = instance_paths.to_vec();
         request.draw_sites = instance_paths
             .iter()
@@ -5226,7 +5302,7 @@ where
                 wire,
                 path: paths[instance].clone(),
                 request: PreimageRequest {
-                    instance_slot: instance,
+                    instance_slot: fixed_global_instance_slot(&paths[instance], instance)?,
                     fixed_metadata,
                     matrix_type: schema.matrix.clone(),
                     sigma,
@@ -5306,15 +5382,18 @@ where
             }
             if !missing.is_empty() {
                 if self.gpu_plan.is_some() {
-                    let slots = missing
-                        .iter()
-                        .map(|index| pending[*index].request.instance_slot)
-                        .collect::<Vec<_>>();
+                    // `missing` indexes the pending/local wave arrays.  The
+                    // request builder derives the global sibling slots from
+                    // each instantiation path; passing global slots here
+                    // would incorrectly use them as env indexes on a tail or
+                    // a wave starting at a nonzero slot.
+                    let instances =
+                        missing.iter().map(|index| pending[*index].instance).collect::<Vec<_>>();
                     let paths = missing
                         .iter()
                         .map(|index| pending[*index].path.clone())
                         .collect::<Vec<_>>();
-                    self.prepare_fixed_node_batch(scope_id, node.id, &slots, &paths, envs, 1)?;
+                    self.prepare_fixed_node_batch(scope_id, node.id, &instances, &paths, envs, 1)?;
                 }
                 let mut sampled_by_index =
                     (0..pending.len()).map(|_| None).collect::<Vec<Option<B::SmallMatrix>>>();
@@ -5451,10 +5530,9 @@ where
             outputs
         } else {
             if self.gpu_plan.is_some() {
-                let slots =
-                    pending.iter().map(|request| request.request.instance_slot).collect::<Vec<_>>();
+                let instances = pending.iter().map(|request| request.instance).collect::<Vec<_>>();
                 let paths = pending.iter().map(|request| request.path.clone()).collect::<Vec<_>>();
-                self.prepare_fixed_node_batch(scope_id, node.id, &slots, &paths, envs, 1)?;
+                self.prepare_fixed_node_batch(scope_id, node.id, &instances, &paths, envs, 1)?;
             }
             let mut outputs =
                 (0..pending.len()).map(|_| None).collect::<Vec<Option<B::SmallMatrix>>>();
@@ -6888,6 +6966,28 @@ mod tests {
     }
 
     #[test]
+    fn fixed_instance_slots_follow_global_loop_indices_across_tail_waves() {
+        let call = NodeId(41);
+        let root = vec![InstantiationFrame { call, loop_index: None }];
+        assert_eq!(fixed_global_instance_slot(&root, 0).unwrap(), 0);
+
+        // The second wave has local indexes 0/1 but global sibling slots 2/3.
+        // The tail keeps the same rule for its final single instance.
+        let wave = |slot| vec![InstantiationFrame { call, loop_index: Some(slot) }];
+        assert_eq!(fixed_global_instance_slot(&wave(2), 0).unwrap(), 2);
+        assert_eq!(fixed_global_instance_slot(&wave(3), 1).unwrap(), 3);
+        assert_eq!(fixed_global_instance_slot(&wave(4), 0).unwrap(), 4);
+
+        // A subgraph call appends a non-loop frame; the innermost loop frame
+        // remains the owning sibling slot for fixed dispatch.
+        let nested = vec![
+            InstantiationFrame { call, loop_index: Some(7) },
+            InstantiationFrame { call: NodeId(42), loop_index: None },
+        ];
+        assert_eq!(fixed_global_instance_slot(&nested, 0).unwrap(), 7);
+    }
+
+    #[test]
     #[cfg(feature = "gpu")]
     fn fixed_plan_binding_rejects_tampered_child_loop_and_subgraph_sites() {
         // Keep one graph containing all three non-root scope forms.  The
@@ -8088,6 +8188,24 @@ mod tests {
             let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
             assert_eq!(plan.decompositions.len(), usize::from(!retained));
             assert_eq!(plan.compact_products.len(), usize::from(!retained));
+            let facts = gpu_alias_facts(&graph, &FrozenGraphScopeId::Root);
+            let owners = gpu_fused_result_owners(&graph, &FrozenGraphScopeId::Root);
+            for (product, (concat, _, groups)) in &plan.compact_products {
+                let scope = graph.source.scope(&FrozenGraphScopeId::Root).unwrap();
+                let inputs = scope.arguments(scope.node(*concat).unwrap()).unwrap();
+                let result_owners = &owners[&WireRef { node: *product, port: Port(0) }];
+                assert_eq!(result_owners.len(), groups.len());
+                for (owner, views) in result_owners.iter().zip(groups) {
+                    assert!(
+                        !inputs.contains(owner),
+                        "product storage must not alias multiplicands"
+                    );
+                    assert_eq!(owner, &views[0]);
+                    for view in views {
+                        assert!(!facts.get(view).is_some_and(|source| inputs.contains(source)));
+                    }
+                }
+            }
             let traced = root_block_aliases(&graph, &FrozenGraphScopeId::Root, true);
             assert!(traced.decompositions.is_empty() && traced.compact_products.is_empty());
             let matrix = |rows, columns| {

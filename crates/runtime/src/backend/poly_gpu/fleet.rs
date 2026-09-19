@@ -9576,49 +9576,36 @@ impl Backend for GpuDcrtBackend {
                 return Err(error);
             }
         }
-        let metadata_slots = requests.iter().map(|request| match request {
-            FusedBatchRequest::RowSum { metadata, .. } |
-            FusedBatchRequest::Decompose { metadata, .. } |
-            FusedBatchRequest::SmallProduct { metadata, .. } |
-            FusedBatchRequest::Add { metadata, .. } => Some((
-                metadata.instance_slots.clone(),
-                metadata.instance_paths.len(),
-                metadata.draw_sites.len(),
-                metadata.randomness_seeds.len(),
-            )),
-        });
-        let metadata_count = metadata_slots.clone().filter(Option::is_some).count();
-        if metadata_count != 0 && metadata_count != requests.len() {
-            self.clear_fixed_batch_state();
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let mut authoritative_slots = Vec::with_capacity(requests.len());
-        for metadata in metadata_slots {
-            if let Some((slots, path_count, draw_count, seed_count)) = metadata {
-                if slots.len() != 1 || path_count != 1 || draw_count != 1 || seed_count != 1 {
-                    self.clear_fixed_batch_state();
+        let authoritative_slots = requests
+            .iter()
+            .map(|request| {
+                let metadata = match request {
+                    FusedBatchRequest::RowSum { metadata, .. } |
+                    FusedBatchRequest::Decompose { metadata, .. } |
+                    FusedBatchRequest::SmallProduct { metadata, .. } |
+                    FusedBatchRequest::Add { metadata, .. } => metadata,
+                };
+                if metadata.instance_slots.len() != 1 ||
+                    metadata.instance_paths.len() != 1 ||
+                    metadata.draw_sites.len() != 1 ||
+                    metadata.randomness_seeds.len() != 1
+                {
                     return Err(PolyBackendError::InvalidConstantShape);
                 }
-                authoritative_slots.push(slots[0]);
-            }
-        }
-        let slots = if metadata_count == requests.len() {
-            {
-                if !self.fixed_instance_slots.is_empty() &&
-                    self.fixed_instance_slots != authoritative_slots
-                {
+                Ok(metadata.instance_slots[0])
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let slots = match authoritative_slots {
+            Ok(slots) => {
+                if !self.fixed_instance_slots.is_empty() && self.fixed_instance_slots != slots {
                     self.clear_fixed_batch_state();
                     return Err(PolyBackendError::UnsupportedPlacement);
                 }
-                authoritative_slots
+                slots
             }
-        } else {
-            match self.fixed_slots(requests.len()) {
-                Ok(slots) => slots,
-                Err(error) => {
-                    self.clear_fixed_batch_state();
-                    return Err(error);
-                }
+            Err(error) => {
+                self.clear_fixed_batch_state();
+                return Err(error);
             }
         };
         let mut schedules_by_port = Vec::with_capacity(layouts.len());

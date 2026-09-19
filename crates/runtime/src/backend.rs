@@ -824,6 +824,10 @@ pub struct GpuWarmupStorageLayout {
     pub columns: usize,
     pub ring_dimension: usize,
     pub representation: BackendStorageRepresentation,
+    /// Deterministic owner rotation used by fixed sibling dispatch.  The
+    /// intervals below describe slot zero; callers resolving a concrete
+    /// instance must apply this stride before deriving source owners.
+    pub instance_device_stride: usize,
     pub owner_intervals: Vec<(usize, usize, usize)>,
 }
 
@@ -1068,14 +1072,14 @@ impl GpuWarmupOperationDescriptor {
 /// Profile lifecycle state.  Every admitted profile is timed; the enum is
 /// retained as an explicit discriminator for serialized planner diagnostics,
 /// but there is deliberately no size-only escape hatch.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GpuWarmupProfileKind {
     Measured,
 }
 
 /// Time and workspace for one operation signature and tile-width candidate.
 /// Every admitted profile carries a finite measured elapsed time.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpuWarmupProfile {
     pub kind: GpuWarmupProfileKind,
     /// Distinguishes a timed GPU-kernel profile from a timed host profile.
@@ -1274,7 +1278,7 @@ impl GpuWarmupProfileKey {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuWarmupMemoryObservations {
     pub affected_devices: BTreeMap<GpuWarmupDeviceIdentity, u64>,
     pub host_bytes: u64,
@@ -1335,7 +1339,7 @@ impl GpuWarmupMemoryObservations {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuWarmupResidencyDelta {
     pub affected_devices: BTreeMap<GpuWarmupDeviceIdentity, i64>,
     pub host_bytes: i64,
@@ -1370,6 +1374,9 @@ pub struct GpuWarmupProfilePoint {
     pub preimage_certified_tile_width: Option<usize>,
     pub preimage_footprint: Option<crate::gpu_warmup::GpuPreimageFootprint>,
     pub resolved_cache_identity: Option<[u8; 32]>,
+    /// Full physical route observed at this coordinate. The table key strips
+    /// range ends and staging byte counts to define an interpolation class.
+    pub resolved_route_descriptor: Option<GpuExecutionRouteDescriptor>,
 }
 
 impl GpuWarmupProfilePoint {
@@ -1421,6 +1428,7 @@ impl GpuWarmupProfilePoint {
             preimage_certified_tile_width: None,
             preimage_footprint: None,
             resolved_cache_identity: None,
+            resolved_route_descriptor: None,
         })
     }
 }
@@ -2013,6 +2021,10 @@ impl GpuWarmupSessionProfileCache {
         profile.preimage_certified_tile_width = point.preimage_certified_tile_width;
         profile.preimage_footprint = point.preimage_footprint.clone();
         profile.resolved_cache_identity = point.resolved_cache_identity;
+        // A cache hit must retain the same authoritative physical route as
+        // the measured response. Returning an unresolved route here creates
+        // a second, incompatible job key on repeated collection.
+        profile.resolved_route_descriptor = point.resolved_route_descriptor;
         Ok(Some(profile))
     }
 
@@ -2266,6 +2278,7 @@ impl GpuWarmupProfile {
         point.preimage_certified_tile_width = self.preimage_certified_tile_width;
         point.preimage_footprint = self.preimage_footprint;
         point.resolved_cache_identity = self.resolved_cache_identity;
+        point.resolved_route_descriptor = self.resolved_route_descriptor;
         Ok(point)
     }
 
@@ -4263,9 +4276,20 @@ mod canonical_profile_table_tests {
     fn l14_session_cache_has_one_table_authority_per_execution_class() {
         let class = key();
         let mut cache = GpuWarmupSessionProfileCache::new();
-        cache.insert_point(point(class.clone(), 4, 0.4, MemoryEvidenceKind::ExactQuery)).unwrap();
+        let mut measured = point(class.clone(), 4, 0.4, MemoryEvidenceKind::ExactQuery);
+        measured.resolved_route_descriptor = Some(GpuExecutionRouteDescriptor::device_local(
+            0,
+            ColumnRange { start: 0, end: 4 },
+            crate::gpu_column_policy::GpuFragmentClass::Full,
+        ));
+        let physical_route = measured.resolved_route_descriptor;
+        cache.insert_point(measured).unwrap();
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.resolve(&class, 4).unwrap().time_seconds, 0.4);
+        assert_eq!(
+            cache.exact_profile(&class, 4).unwrap().unwrap().resolved_route_descriptor,
+            physical_route
+        );
         assert!(cache.resolve(&class, 8).is_err());
     }
 

@@ -59,6 +59,11 @@ pub struct GpuColumnSchedule {
     owners: Vec<Vec<usize>>,
     local_job_counts: Vec<usize>,
     wave_count: usize,
+    /// The fixed executor's global sibling slot which produced this schedule.
+    /// Keeping the slot/rotation on the schedule prevents compressed wave
+    /// consumers from accidentally reusing instance zero's owner class.
+    instance_slot: usize,
+    rotation_class: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -82,6 +87,16 @@ impl GpuColumnSchedule {
         columns: usize,
         widths: Vec<usize>,
         intervals: Vec<GpuColumnInterval>,
+    ) -> Result<Self, GpuScheduleError> {
+        Self::new_for_instance(columns, widths, intervals, 0, 0)
+    }
+
+    pub fn new_for_instance(
+        columns: usize,
+        widths: Vec<usize>,
+        intervals: Vec<GpuColumnInterval>,
+        instance_slot: usize,
+        rotation_class: usize,
     ) -> Result<Self, GpuScheduleError> {
         if widths.is_empty() {
             return Err(GpuScheduleError::EmptyFleet);
@@ -110,7 +125,32 @@ impl GpuColumnSchedule {
             return Err(GpuScheduleError::InvalidCoverage);
         }
         let wave_count = local_job_counts.iter().copied().max().unwrap_or(0);
-        Ok(Self { intervals, widths, owners, local_job_counts, wave_count })
+        Ok(Self {
+            intervals,
+            widths,
+            owners,
+            local_job_counts,
+            wave_count,
+            instance_slot,
+            rotation_class,
+        })
+    }
+
+    pub fn instance_slot(&self) -> usize {
+        self.instance_slot
+    }
+
+    pub fn rotation_class(&self) -> usize {
+        self.rotation_class
+    }
+
+    /// Replace the accounting rotation class while retaining the exact
+    /// schedule geometry.  Warmup uses one combined class for all layouts
+    /// participating in a primitive (output, inputs, and retained owners),
+    /// whereas this schedule was initially constructed from one layout.
+    pub fn with_rotation_class(mut self, rotation_class: usize) -> Self {
+        self.rotation_class = rotation_class;
+        self
     }
 
     pub fn local_job_counts(&self) -> &[usize] {

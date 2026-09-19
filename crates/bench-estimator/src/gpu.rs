@@ -26,6 +26,7 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_primitives::{
+    gpu_memory::{GpuMemoryRange, GpuMemoryShape},
     matrix::{PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
     poly::dcrt::gpu::{
         GpuOutOfMemory, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
@@ -1062,6 +1063,7 @@ impl GpuNodeMeasurementBackend {
             cache_state: request.cache_state,
             route,
             route_descriptor: request.route_descriptor,
+            binding_port: request.binding_port,
             fragment,
             timing_scope: request.timing_scope,
         })
@@ -1554,6 +1556,51 @@ impl GpuNodeMeasurementBackend {
                 _ => 1,
             };
             components.level_count = representative.concrete_argument_types.len().max(1);
+            if domain == CanonicalWarmupProfileDomain::FusedTensorRowSum {
+                let groups = representative.inputs.row_groups.clone();
+                let rhs = prepared.arguments.get(1).and_then(Option::as_ref).ok_or_else(|| {
+                    GpuMeasurementError(
+                        "tensor row-sum allocation query lacks its rhs owner".into(),
+                    )
+                })?;
+                let lhs_shard = input.shards().first().ok_or_else(|| {
+                    GpuMeasurementError("tensor row-sum allocation query lacks lhs shard".into())
+                })?;
+                let rhs_shard = rhs.shards().first().ok_or_else(|| {
+                    GpuMeasurementError("tensor row-sum allocation query lacks rhs shard".into())
+                })?;
+                let lhs_size = input.size();
+                let rhs_size = rhs.size();
+                components.input_shape = Some(
+                    GpuMemoryShape::new(
+                        lhs_shard.value.level(),
+                        lhs_size.0,
+                        lhs_size.1,
+                        lhs_shard.value.is_ntt(),
+                        GpuMemoryRange::new(input_start, input_end).ok_or_else(|| {
+                            GpuMeasurementError(
+                                "tensor row-sum lhs allocation range is empty".into(),
+                            )
+                        })?,
+                    )
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?,
+                );
+                components.tensor_row_sum_rhs_shape = Some(
+                    GpuMemoryShape::new(
+                        rhs_shard.value.level(),
+                        rhs_size.0,
+                        rhs_size.1,
+                        rhs_shard.value.is_ntt(),
+                        GpuMemoryRange::new(0, rhs_size.1).ok_or_else(|| {
+                            GpuMeasurementError(
+                                "tensor row-sum rhs allocation range is empty".into(),
+                            )
+                        })?,
+                    )
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?,
+                );
+                components.tensor_row_sum_groups = Some(groups);
+            }
             if domain == CanonicalWarmupProfileDomain::FusedDecompose {
                 let (small, digits) = match &representative.kind {
                     NodeKind::GadgetDecompose { small, digit_count, .. } => (
@@ -2572,6 +2619,7 @@ impl GpuNodeMeasurementBackend {
                             &descriptor.bindings,
                             &representative,
                             fused,
+                            request.binding_port.unwrap_or(0),
                             preimage_session_prepared.as_ref(),
                         ),
                         None => Self::measure_representative(
@@ -4463,6 +4511,7 @@ impl GpuNodeMeasurementBackend {
                     prepared,
                     1,
                     None,
+                    None,
                     false,
                 )?;
                 Ok(Some(device_started.elapsed().as_secs_f64()))
@@ -4672,6 +4721,7 @@ impl GpuNodeMeasurementBackend {
                 &prepared,
                 representative_batch,
                 None,
+                None,
                 false,
             ) {
                 operation_error = Some(error);
@@ -4729,6 +4779,7 @@ impl GpuNodeMeasurementBackend {
         bindings: &ParamEnv,
         prepared: &PreparedMeasurement,
         batch_size: usize,
+        binding_port: usize,
     ) -> Result<Vec<GpuMeasurementOutput>, GpuMeasurementError> {
         let matrix = |index: usize| {
             prepared.arguments.get(index).and_then(Option::as_ref).cloned().ok_or_else(|| {
@@ -4860,6 +4911,7 @@ impl GpuNodeMeasurementBackend {
                         .fixed_fused_range_for_measurement(
                             request,
                             ColumnRange { start: range_start, end: range_end },
+                            binding_port,
                         )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?
                     {
@@ -4950,6 +5002,7 @@ impl GpuNodeMeasurementBackend {
         prepared: &PreparedMeasurement,
         batch_size: usize,
         fused: Option<FusedWarmupOperation>,
+        binding_port: Option<usize>,
         transfer_only: bool,
     ) -> Result<(), GpuMeasurementError> {
         let output_columns = representative
@@ -5186,6 +5239,13 @@ impl GpuNodeMeasurementBackend {
                     }
                 }
                 let outputs = if let Some(fused) = fused {
+                    let binding_port = binding_port
+                        .ok_or_else(|| {
+                            GpuMeasurementError(
+                                "fused production measurement lacks binding port".into(),
+                            )
+                        })
+                        .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
                     Self::run_fused_batch(
                         backend,
                         fused,
@@ -5193,6 +5253,7 @@ impl GpuNodeMeasurementBackend {
                         bindings,
                         &execution_prepared,
                         batch_size,
+                        binding_port,
                     )
                     .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
                 } else {
@@ -5240,6 +5301,7 @@ impl GpuNodeMeasurementBackend {
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
         fused: FusedWarmupOperation,
+        binding_port: usize,
         session_prepared: Option<&PreparedMeasurement>,
     ) -> Result<NodeMeasurement, GpuMeasurementError> {
         let node = MeasurementNode {
@@ -5286,6 +5348,7 @@ impl GpuNodeMeasurementBackend {
                 &prepared,
                 batch_size,
                 Some(fused),
+                Some(binding_port),
                 false,
             ) {
                 operation_error = Some(error);
@@ -5416,6 +5479,7 @@ impl GpuNodeMeasurementBackend {
                 &prepared,
                 batch_size,
                 None,
+                None,
                 true,
             ) {
                 operation_error = Some(error);
@@ -5484,6 +5548,7 @@ impl GpuNodeMeasurementBackend {
             representative,
             &prepared,
             1,
+            None,
             None,
             false,
         )?;
@@ -5599,7 +5664,9 @@ impl GpuNodeMeasurementBackend {
     /// container timing.  Host family access does not consume every member's
     /// backend value, so materializing a fresh matrix for each member would
     /// make setup VRAM scale with the family cardinality.  Nested families
-    /// retain their container shape but contain one bounded exemplar.
+    /// retain their *exact* container shape and cardinality; cloning the
+    /// representative only clones the O(count) host vectors while the
+    /// heavyweight matrix/compact owners remain Arc-backed and shared.
     fn representative_family_member(
         backend: &mut GpuDcrtBackend,
         wire_type: &ConcreteWireType,
@@ -5612,9 +5679,8 @@ impl GpuNodeMeasurementBackend {
                         "host family representative cannot use an empty nested family".into(),
                     ));
                 }
-                Ok(RuntimeValue::IndexedFamily(vec![Self::representative_family_member(
-                    backend, element, bindings,
-                )?]))
+                let exemplar = Self::representative_family_member(backend, element, bindings)?;
+                Ok(RuntimeValue::IndexedFamily((0..*count).map(|_| exemplar.clone()).collect()))
             }
             _ => Self::representative_runtime_value(backend, wire_type, bindings),
         }
@@ -5782,13 +5848,11 @@ impl GpuNodeMeasurementBackend {
                         "family representative index {selected_index} is out of range for {count} members"
                     )));
                 }
-                // Static access may select a nonzero member.  Keep only the
-                // prefix needed to satisfy the production bounds check; all
-                // unselected entries are zero-byte host placeholders.
-                let mut family_values = (0..selected_index)
-                    .map(|_| RuntimeValue::Int(BigInt::from(0u8)))
-                    .collect::<Vec<_>>();
-                family_values.push(exemplar);
+                // Static access may select a nonzero member.  Preserve the
+                // complete family shape: production clones/accesses a real
+                // indexed container, and replacing unselected nested values
+                // with scalar sentinels would measure a different operation.
+                let family_values = (0..count).map(|_| exemplar.clone()).collect::<Vec<_>>();
                 prepared.family_inputs.push(RuntimeValue::IndexedFamily(family_values));
                 if matches!(node.kind, NodeKind::FamilyGetDynamic) {
                     // Index zero is valid for every nonempty family and is
@@ -5829,12 +5893,31 @@ impl GpuNodeMeasurementBackend {
                 if choice_types.is_empty() {
                     return Err(GpuMeasurementError("select representative has no choices".into()));
                 }
-                // Only choice zero is consumed by the representative index.
-                // Reuse its payload for the remaining entries to preserve the
-                // choice vector's O(count) host work without count×GPU memory.
-                let exemplar =
-                    Self::representative_family_member(backend, &choice_types[0], bindings)?;
-                prepared.choices = (0..count).map(|_| exemplar.clone()).collect();
+                // Preserve each choice's complete nested shape.  Reusing the
+                // first representative for homogeneous choices keeps one GPU
+                // owner; heterogeneous choices are materialized once per
+                // distinct type and then cloned as O(count) host entries.
+                let mut representatives =
+                    HashMap::<ConcreteWireType, RuntimeValue<GpuDcrtBackend>>::new();
+                prepared.choices = choice_types
+                    .iter()
+                    .take(count)
+                    .map(|choice_type| {
+                        if let Some(value) = representatives.get(choice_type) {
+                            return Ok(value.clone());
+                        }
+                        let value =
+                            Self::representative_family_member(backend, choice_type, bindings)?;
+                        representatives.insert(choice_type.clone(), value.clone());
+                        Ok(value)
+                    })
+                    .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
+                if prepared.choices.len() != count {
+                    return Err(GpuMeasurementError(format!(
+                        "select representative has {} choices for count {count}",
+                        prepared.choices.len()
+                    )));
+                }
             }
             NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
                 prepared.scalar_inputs = vec![
@@ -7639,6 +7722,7 @@ mod tests {
                     GpuFragmentClass::Full,
                 ),
                 route_resolver: None,
+                binding_port: None,
                 fragment: GpuWarmupFragmentClass::Whole,
                 retry_cap: None,
                 cache_identity: None,
@@ -7717,7 +7801,7 @@ mod tests {
             let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
                 panic!("dynamic family representative must remain indexed");
             };
-            assert_eq!(values.len(), 1);
+            assert_eq!(values.len(), count);
         }
 
         let family_type =
@@ -7749,8 +7833,67 @@ mod tests {
         let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
             panic!("dynamic family representative must remain indexed");
         };
-        assert_eq!(values.len(), 1, "family access must not materialize all payloads");
+        assert_eq!(values.len(), 64, "family access must preserve its container cardinality");
         assert!(matches!(values.first(), Some(RuntimeValue::Matrix(_))));
+
+        // Nested family representatives must retain every container layer's
+        // cardinality.  The leaf matrix owner is shared, so this exercises
+        // real O(count) vector construction/cloning without count×GPU payload.
+        for nested_count in [1usize, 2, 1024] {
+            let nested = ConcreteWireType::IndexedFamily {
+                element: Box::new(matrix(1)),
+                count: nested_count,
+            };
+            let outer =
+                ConcreteWireType::IndexedFamily { element: Box::new(nested), count: nested_count };
+            let nested_arguments = [outer, ConcreteWireType::Int];
+            let nested_outputs = [ConcreteWireType::IndexedFamily {
+                element: Box::new(matrix(1)),
+                count: nested_count,
+            }];
+            let nested_kind = NodeKind::FamilyGetDynamic;
+            let nested_node = MeasurementNode {
+                scope: &scope,
+                id: NodeId(100 + nested_count as u64),
+                kind: &nested_kind,
+                arguments: &[],
+                argument_kinds: &[],
+                argument_types: &[],
+                output_types: &[],
+                concrete_argument_types: nested_arguments.to_vec(),
+                concrete_output_types: nested_outputs.to_vec(),
+            };
+            let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+                &mut backend,
+                &nested_node,
+                &ParamEnv::default(),
+            )
+            .expect("nested family representative must prepare");
+            let Some(RuntimeValue::IndexedFamily(outer_values)) = prepared.family_inputs.first()
+            else {
+                panic!("nested family representative must remain indexed");
+            };
+            assert_eq!(outer_values.len(), nested_count);
+            let Some(RuntimeValue::IndexedFamily(first_inner)) = outer_values.first() else {
+                panic!("nested family member must remain indexed");
+            };
+            assert_eq!(first_inner.len(), nested_count);
+            let Some(RuntimeValue::Matrix(first_leaf)) = first_inner.first() else {
+                panic!("nested family leaf must remain a matrix");
+            };
+            for outer_value in outer_values {
+                let RuntimeValue::IndexedFamily(inner_values) = outer_value else {
+                    panic!("every nested family member must retain its shape");
+                };
+                assert_eq!(inner_values.len(), nested_count);
+                for inner_value in inner_values {
+                    let RuntimeValue::Matrix(leaf) = inner_value else {
+                        panic!("every nested family leaf must remain a matrix");
+                    };
+                    assert!(std::sync::Arc::ptr_eq(first_leaf, &leaf));
+                }
+            }
+        }
 
         let select_kind = NodeKind::Select { count: IntExpr::constant(2) };
         let select_outputs = [matrix(64)];
@@ -8203,6 +8346,7 @@ mod tests {
                 route: GpuWarmupRoute::DeviceLocal,
                 route_descriptor: case_resolver.resolve(GpuFragmentClass::Full),
                 route_resolver: Some(case_resolver),
+                binding_port: None,
                 fragment: GpuWarmupFragmentClass::Whole,
                 retry_cap: None,
                 cache_identity: None,

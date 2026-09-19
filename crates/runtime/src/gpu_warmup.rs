@@ -25,8 +25,9 @@ use crate::{
         fused_warmup_profile_domain, map_output_range_to_inputs_with_output,
     },
     gpu_execution_plan::{
-        FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout, GpuLoopChoice,
-        GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract, LayoutId, scope_shape_class,
+        FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuFusedUnionJob, GpuLayout,
+        GpuLoopChoice, GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract, LayoutId,
+        fused_union_jobs_for_wave, scope_shape_class,
     },
     gpu_schedule::{GpuColumnInterval, GpuColumnJob, GpuColumnSchedule, GpuScheduleError},
     host_control::{HostControlBodyNode, HostControlChild, HostControlCoverage, HostControlError},
@@ -172,8 +173,9 @@ pub struct GpuStageCostModel {
     /// provider's affected pools, repetition count, and provenance from
     /// being collapsed into one stage-wide flag.
     pub measurement_evidence_by_width: BTreeMap<usize, GpuStageMeasurementEvidence>,
-    /// Class-specific local-job time models. Production measured plans
-    /// resolve through this map before using the compact legacy `time` field.
+    /// Legacy class-specific time projections for imported pure-planner
+    /// fixtures. Production measurement uses `profiles_by_job` as the sole
+    /// authority for duration, resources, and evidence.
     #[serde(default)]
     pub time_by_job: BTreeMap<GpuWarmupJobProfileKey, GpuTimeModel>,
     /// Authoritative measured point for a physical job class. Duration,
@@ -187,7 +189,8 @@ pub struct GpuStageCostModel {
     /// profile key that measurement used.  A missing or ambiguous entry is a
     /// planning error, never a reason to fall back by width or range alone.
     #[serde(default)]
-    pub job_profile_keys: BTreeMap<(usize, usize, usize, usize), Vec<GpuWarmupJobProfileKey>>,
+    pub job_profile_keys:
+        BTreeMap<(usize, usize, usize, usize, Option<usize>), Vec<GpuWarmupJobProfileKey>>,
     /// Empirical peaks can rank candidates but cannot certify hard capacity
     /// admission. `None` is reserved for explicitly supplied pure-planner
     /// test evidence; production measurements must carry a canonical kind.
@@ -231,6 +234,9 @@ pub struct GpuWarmupJobProfileKey {
     pub global_start: usize,
     pub global_end: usize,
     pub fragment: GpuWarmupFragmentClass,
+    /// Fused-union output port that supplied the binding range/layout.
+    #[serde(default)]
+    pub binding_port: Option<usize>,
     pub route_descriptor: GpuExecutionRouteDescriptor,
 }
 
@@ -243,6 +249,7 @@ struct GpuWarmupJobQuery {
     planned_width: usize,
     range: IndexRange,
     fragment: GpuWarmupFragmentClass,
+    binding_port: Option<usize>,
     route_descriptor: GpuExecutionRouteDescriptor,
     route_resolver: Option<GpuWarmupRouteResolverData>,
 }
@@ -413,7 +420,7 @@ impl GpuStageCostModel {
         let width = job.end.saturating_sub(job.start);
         let keys = self
             .job_profile_keys
-            .get(&(rotation_class, job.source_interval, job.start, job.end))
+            .get(&(rotation_class, job.source_interval, job.start, job.end, None))
             .into_iter()
             .flatten()
             .filter(|key| key.planned_width == planned_width && key.width == width)
@@ -453,59 +460,107 @@ impl GpuStageCostModel {
         )
     }
 
-    /// Resolve a clipped multi-output union segment from the complete
-    /// measured job that contains it.  The union builder splits jobs at
-    /// cross-port boundaries, but those split ranges are not independently
-    /// measured dispatch classes.  Requiring an exact key for every split
-    /// would reject valid heterogeneous output schedules; scaling the one
-    /// canonical point by the covered fraction preserves the measured job's
-    /// total time when its containing range is partitioned.
-    fn time_for_containing_job_segment(
+    /// Resolve one fused-union invocation against the exact point measured
+    /// for that invocation.  The fixed executor uses the first active output
+    /// port as its binding range, so the same port/source interval is part of
+    /// the canonical point lookup.  A union fragment is a real native call;
+    /// its duration and resource envelope are never derived by scaling a
+    /// containing port job.
+    fn keys_for_fused_union_job(
         &self,
-        device: usize,
-        planned_width: usize,
-        containing: GpuColumnJob,
-        segment: GpuColumnJob,
-        rotation_class: usize,
-    ) -> Result<f64, GpuWarmupError> {
-        let containing_width = containing.end.saturating_sub(containing.start);
-        let segment_width = segment.end.saturating_sub(segment.start);
-        if containing_width == 0 ||
-            segment_width == 0 ||
-            segment.start < containing.start ||
-            segment.end > containing.end
-        {
+        schedules_by_port: &[Vec<GpuColumnSchedule>],
+        job: &GpuFusedUnionJob,
+    ) -> Result<Vec<&GpuWarmupJobProfileKey>, GpuWarmupError> {
+        let (binding_port, binding) = job
+            .port_jobs
+            .iter()
+            .enumerate()
+            .find_map(|(port, port_job)| port_job.clipped_range.map(|_| (port, port_job)))
+            .ok_or_else(|| {
+                GpuWarmupError::InvalidPlan(format!(
+                    "fused union job [{}, {}) has no active output port",
+                    job.range.start, job.range.end
+                ))
+            })?;
+        let schedule = schedules_by_port
+            .get(binding_port)
+            .and_then(|port| port.get(job.instance))
+            .ok_or_else(|| GpuWarmupError::InvalidPlan("missing fused union schedule".into()))?;
+        let planned_width =
+            *schedule.widths().get(job.device).ok_or(GpuWarmupError::DeviceCount {
+                expected: schedules_by_port
+                    .first()
+                    .and_then(|port| port.first())
+                    .map_or(0, |schedule| schedule.widths().len()),
+                actual: schedule.widths().len(),
+            })?;
+        let source_interval = binding.source_interval.ok_or_else(|| {
+            GpuWarmupError::InvalidPlan("fused union binding port has no source interval".into())
+        })?;
+        let width =
+            job.range.end.checked_sub(job.range.start).ok_or(GpuWarmupError::ArithmeticOverflow)?;
+        if planned_width == 0 || width == 0 || width > planned_width {
             return Err(GpuWarmupError::InvalidPlan(format!(
-                "invalid clipped multi-output job [{}, {}) within [{}, {})",
-                segment.start, segment.end, containing.start, containing.end
+                "invalid fused union profile width {width} for planned width {planned_width}"
             )));
         }
+        let fragment = if width < planned_width {
+            GpuWarmupFragmentClass::Tail
+        } else {
+            GpuWarmupFragmentClass::Whole
+        };
         let keys = self
             .job_profile_keys
-            .get(&(rotation_class, containing.source_interval, containing.start, containing.end))
+            .get(&(
+                schedule.rotation_class(),
+                source_interval,
+                job.range.start,
+                job.range.end,
+                Some(binding_port),
+            ))
             .into_iter()
             .flatten()
-            .filter(|key| key.planned_width == planned_width && key.width == containing_width)
             .filter(|key| {
-                self.profiles_by_job.contains_key(*key) || self.time_by_job.contains_key(*key)
+                key.instance_slot == schedule.instance_slot() &&
+                    key.rotation_class == schedule.rotation_class() &&
+                    key.planned_width == planned_width &&
+                    key.width == width &&
+                    key.fragment == fragment &&
+                    key.binding_port == Some(binding_port) &&
+                    (self.profiles_by_job.contains_key(*key) ||
+                        self.time_by_job.contains_key(*key))
             })
             .collect::<Vec<_>>();
         if keys.len() != 1 {
             return Err(GpuWarmupError::InvalidPlan(format!(
-                "missing or ambiguous containing GPU profile for device {device}, planned width {planned_width}, source interval {}, range [{}, {}), matches={}",
-                containing.source_interval,
-                containing.start,
-                containing.end,
+                "missing or ambiguous exact fused union profile for device {}, port {}, slot {}, rotation {}, source interval {}, range [{}, {}), matches={}",
+                job.device,
+                binding_port,
+                schedule.instance_slot(),
+                schedule.rotation_class(),
+                source_interval,
+                job.range.start,
+                job.range.end,
                 keys.len()
             )));
         }
-        let key = keys[0];
-        let duration = if let Some(point) = self.profiles_by_job.get(key) {
-            point.time_seconds
+        Ok(keys)
+    }
+
+    fn time_for_fused_union_job(
+        &self,
+        schedules_by_port: &[Vec<GpuColumnSchedule>],
+        job: &GpuFusedUnionJob,
+    ) -> Result<f64, GpuWarmupError> {
+        let key = *self
+            .keys_for_fused_union_job(schedules_by_port, job)?
+            .first()
+            .ok_or_else(|| GpuWarmupError::InvalidPlan("missing fused union profile".into()))?;
+        if let Some(profile) = self.profiles_by_job.get(key) {
+            Ok(profile.time_seconds)
         } else {
-            self.time_by_job[key].checked_job_seconds(key.width)?
-        };
-        Ok(duration * segment_width as f64 / containing_width as f64)
+            self.time_by_job[key].checked_job_seconds(key.width)
+        }
     }
 
     fn peak_for(
@@ -1588,12 +1643,253 @@ fn bounded_job_queries_for_layout(
                 planned_width,
                 range: IndexRange { start: job.start, end: job.end },
                 fragment,
+                // Ordinary fused sites have one output layout and use the
+                // legacy positional binding. Multi-output union jobs below
+                // carry their explicit physical binding port.
+                binding_port: None,
                 route_descriptor: route_resolver.resolve(typed_fragment),
                 route_resolver: Some(route_resolver),
             })
         })
         .collect::<Result<Vec<_>, GpuWarmupError>>()
         .map_err(|error| error)
+}
+
+/// Inventory the exact fused-union calls emitted by fixed dispatch.  The
+/// union lowering is intentionally shared with the executor: every boundary
+/// split, source interval, owner, and logical wave comes from
+/// `fused_union_jobs_for_wave`, rather than a second warmup-only merge.
+fn bounded_fused_union_job_queries_for_layouts(
+    layouts: &[&GpuLayout],
+    devices: usize,
+    planned_width: usize,
+    candidate_widths: &[usize],
+    instance_count: usize,
+    source_layouts: &[GpuWarmupStorageLayout],
+    operation: &GpuWarmupOperationDescriptor,
+) -> Result<Vec<GpuWarmupJobQuery>, GpuWarmupError> {
+    if layouts.len() < 2 || devices == 0 || instance_count == 0 {
+        return Ok(Vec::new());
+    }
+    let columns = layouts.iter().map(|layout| layout.columns).max().unwrap_or(0);
+    if columns == 0 {
+        return Ok(Vec::new());
+    }
+    let mut effective_sources = source_layouts.to_vec();
+    for source in &mut effective_sources {
+        if source.owner_intervals.is_empty() && source.columns > 0 {
+            source.owner_intervals = balanced_intervals(source.columns, devices)
+                .into_iter()
+                .map(|interval| (interval.device, interval.start, interval.end))
+                .collect();
+        }
+    }
+    let output_layouts = layouts
+        .iter()
+        .map(|layout| {
+            let mut output = warmup_storage_layout(layout);
+            if output.owner_intervals.is_empty() && output.columns > 0 {
+                output.owner_intervals = balanced_intervals(output.columns, devices)
+                    .into_iter()
+                    .map(|interval| (interval.device, interval.start, interval.end))
+                    .collect();
+            }
+            output
+        })
+        .collect::<Vec<_>>();
+    let rotation_strides = effective_sources
+        .iter()
+        .map(|source| source.instance_device_stride)
+        .chain(output_layouts.iter().map(|output| output.instance_device_stride))
+        .chain(layouts.iter().map(|layout| layout.instance_device_stride))
+        .collect::<Vec<_>>();
+    let rotation_slots = rotation_slots_for_strides(&rotation_strides, devices, instance_count)?;
+    let mut queries = Vec::new();
+    for (instance_slot, rotation_class) in rotation_slots {
+        let mut width_vectors = Vec::new();
+        let base = vec![planned_width; devices];
+        width_vectors.push(base.clone());
+        for device in 0..devices {
+            for &candidate in candidate_widths.iter().filter(|width| **width > 0) {
+                if candidate == base[device] {
+                    continue;
+                }
+                let mut widths = base.clone();
+                widths[device] = candidate;
+                width_vectors.push(widths);
+            }
+        }
+        for widths in width_vectors {
+            let schedules_by_port = layouts
+                .iter()
+                .map(|layout| {
+                    layout
+                        .schedule(&widths, instance_slot)
+                        .map(|schedule| schedule.with_rotation_class(rotation_class))
+                        .map_err(|error| {
+                            GpuWarmupError::InvalidPlan(format!(
+                                "fused union candidate schedule: {error}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let by_port = schedules_by_port
+                .iter()
+                .cloned()
+                .map(|schedule| vec![schedule])
+                .collect::<Vec<_>>();
+            let wave_count = by_port
+                .iter()
+                .flat_map(|port| port.iter().map(GpuColumnSchedule::wave_count))
+                .max()
+                .unwrap_or(0);
+            for logical_wave in 0..wave_count {
+                for job in fused_union_jobs_for_wave(&by_port, 0, logical_wave)
+                    .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+                {
+                    let (binding_port, binding) = job
+                        .port_jobs
+                        .iter()
+                        .enumerate()
+                        .find_map(|(port, port_job)| {
+                            port_job.clipped_range.map(|_| (port, *port_job))
+                        })
+                        .ok_or_else(|| {
+                            GpuWarmupError::InvalidPlan(
+                                "fused union job has no active binding port".into(),
+                            )
+                        })?;
+                    let planned_width = schedules_by_port[binding_port].widths()[job.device];
+                    let width = job.range.end.saturating_sub(job.range.start);
+                    if planned_width == 0 || width == 0 || width > planned_width {
+                        return Err(GpuWarmupError::InvalidPlan(format!(
+                            "invalid fused union range [{}, {}) for planned width {planned_width}",
+                            job.range.start, job.range.end
+                        )));
+                    }
+                    let fragment = if width < planned_width {
+                        GpuWarmupFragmentClass::Tail
+                    } else {
+                        GpuWarmupFragmentClass::Whole
+                    };
+                    let typed_fragment = match fragment {
+                        GpuWarmupFragmentClass::Tail => TypedFragmentClass::Tail,
+                        _ => TypedFragmentClass::Full,
+                    };
+                    let output_range = ColumnRange { start: job.range.start, end: job.range.end };
+                    let mapped = map_output_range_to_inputs_with_output(
+                        &operation.kind,
+                        &operation.concrete_argument_types,
+                        layouts[binding_port].columns,
+                        output_range,
+                    )
+                    .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?;
+                    let source_range = mapped
+                        .iter()
+                        .map(|input| input.range)
+                        .reduce(|left, right| ColumnRange {
+                            start: left.start.min(right.start),
+                            end: left.end.max(right.end),
+                        })
+                        .unwrap_or(output_range);
+                    let routed_sources = if mapped.is_empty() {
+                        effective_sources
+                            .iter()
+                            .map(|source| rotated_storage_layout(source, devices, instance_slot))
+                            .collect::<Vec<_>>()
+                    } else {
+                        mapped
+                            .iter()
+                            .map(|input| {
+                                let mut source = effective_sources
+                                    .get(input.operand)
+                                    .map(|source| {
+                                        rotated_storage_layout(source, devices, instance_slot)
+                                    })
+                                    .ok_or_else(|| {
+                                        GpuWarmupError::InvalidPlan(
+                                            "fused union mapped operand lacks physical layout"
+                                                .into(),
+                                        )
+                                    })?;
+                                source.owner_intervals = source
+                                    .owner_intervals
+                                    .iter()
+                                    .filter_map(|&(owner, start, end)| {
+                                        let start = start.max(input.range.start);
+                                        let end = end.min(input.range.end);
+                                        (start < end).then_some((owner, start, end))
+                                    })
+                                    .collect();
+                                Ok(source)
+                            })
+                            .collect::<Result<Vec<_>, GpuWarmupError>>()?
+                    };
+                    let source_fragments =
+                        source_owner_fragments_for_range(&routed_sources, source_range);
+                    if source_fragments.is_empty() {
+                        return Err(GpuWarmupError::InvalidPlan(format!(
+                            "no source owner interval covers fused union range [{}, {})",
+                            job.range.start, job.range.end
+                        )));
+                    }
+                    let output_layout = rotated_storage_layout(
+                        &output_layouts[binding_port],
+                        devices,
+                        instance_slot,
+                    );
+                    let source_owners =
+                        source_fragments.iter().map(|(owner, _)| *owner).collect::<Vec<_>>();
+                    let resolver = GpuWarmupRouteResolverData {
+                        source_layouts: routed_sources,
+                        output_layout: Some(output_layout.clone()),
+                        source_owners,
+                        destination_owner: job.device,
+                        source_range,
+                        destination_range: output_range,
+                        source_compact: effective_sources.iter().any(|source| {
+                            source.representation == BackendStorageRepresentation::CompactBounded
+                        }),
+                        destination_compact: output_layout.representation ==
+                            BackendStorageRepresentation::CompactBounded,
+                        peer_available: false,
+                        source_staging_bytes: 0,
+                        host_staging_bytes: 0,
+                        pinned_host_staging_bytes: 0,
+                    };
+                    queries.push(GpuWarmupJobQuery {
+                        device: job.device,
+                        source_interval: binding.source_interval.ok_or_else(|| {
+                            GpuWarmupError::InvalidPlan(
+                                "fused union binding lacks source interval".into(),
+                            )
+                        })?,
+                        instance_slot,
+                        rotation_class,
+                        planned_width,
+                        range: IndexRange { start: job.range.start, end: job.range.end },
+                        fragment,
+                        binding_port: Some(binding_port),
+                        route_descriptor: resolver.resolve(typed_fragment),
+                        route_resolver: Some(resolver),
+                    });
+                }
+            }
+        }
+    }
+    queries.sort_unstable_by_key(|query| {
+        (
+            query.device,
+            query.rotation_class,
+            query.instance_slot,
+            query.source_interval,
+            query.range.start,
+            query.range.end,
+            query.planned_width,
+        )
+    });
+    queries.dedup();
+    Ok(queries)
 }
 
 fn gcd_usize(mut left: usize, mut right: usize) -> usize {
@@ -1626,6 +1922,35 @@ fn rotation_slots_for_strides(
         slots.push((slot, slot % period.max(1)));
     }
     Ok(slots)
+}
+
+/// Return the concrete wave starts that can be reached by a loop.  Full waves
+/// are bounded to one owner-rotation cycle; callers may repeat that cycle
+/// symbolically only after at least one complete cycle exists.  The final
+/// tail is always represented with its actual instance count.
+fn reachable_wave_phases(
+    loop_count: usize,
+    wave_instances: usize,
+    rotation_period: usize,
+) -> Vec<(usize, usize)> {
+    if loop_count == 0 || wave_instances == 0 {
+        return Vec::new();
+    }
+    let period = rotation_period.max(1);
+    let full_waves = loop_count / wave_instances;
+    let tail = loop_count % wave_instances;
+    let cycle_waves = period / gcd_usize(period, wave_instances).max(1);
+    let represented_full_waves = full_waves.min(cycle_waves);
+    let mut phases = (0..represented_full_waves)
+        .map(|wave| {
+            (((wave as u128 * wave_instances as u128) % period as u128) as usize, wave_instances)
+        })
+        .collect::<Vec<_>>();
+    if tail > 0 {
+        let first_slot = ((full_waves as u128 * wave_instances as u128) % period as u128) as usize;
+        phases.push((first_slot, tail));
+    }
+    phases
 }
 
 /// Compute the finite simultaneous owner-rotation period for every layout
@@ -1808,6 +2133,7 @@ fn bounded_single_device_job_query(
         planned_width: 1,
         range: IndexRange { start: 0, end: columns },
         fragment: GpuWarmupFragmentClass::SingleDevice,
+        binding_port: None,
         route_descriptor,
         route_resolver: Some(resolver),
     }])
@@ -1978,7 +2304,11 @@ pub fn gpu_batch_wave_time(
 /// Class-aware variant used by production planning. The schedule supplies the
 /// exact global range of every local job; a model measured for another range,
 /// tail class, or route is never silently reused.
-fn gpu_multi_output_batch_wave_time_with_costs(
+/// The legacy cost path is valid only for ordinary (single-output) profiles.
+/// Fused multi-output profiles carry an explicit `binding_port` and must be
+/// resolved through the union lowering below, even when all ports happen to
+/// have identical schedules.
+fn gpu_multi_output_batch_wave_time_with_costs_legacy(
     schedules: &[Vec<GpuColumnSchedule>],
     costs: &[GpuStageCostModel],
 ) -> Result<f64, GpuWarmupError> {
@@ -2030,6 +2360,22 @@ fn gpu_multi_output_batch_wave_time_with_costs(
     Ok(total)
 }
 
+fn costs_have_explicit_binding_port(costs: &[GpuStageCostModel]) -> bool {
+    costs.iter().any(|cost| {
+        cost.profiles_by_job.keys().any(|key| key.binding_port.is_some()) ||
+            cost.time_by_job.keys().any(|key| key.binding_port.is_some()) ||
+            cost.job_profile_keys.keys().any(|(_, _, _, _, binding)| binding.is_some())
+    })
+}
+
+fn gpu_multi_output_batch_wave_time_with_costs(
+    schedules: &[Vec<GpuColumnSchedule>],
+    costs: &[GpuStageCostModel],
+) -> Result<f64, GpuWarmupError> {
+    let times = costs.iter().map(|cost| cost.time.clone()).collect::<Vec<_>>();
+    gpu_multi_output_batch_wave_time_resolved(schedules, &times, Some(costs))
+}
+
 fn checked_wave_overhead(times: &[GpuTimeModel]) -> Result<f64, GpuWarmupError> {
     let mut overhead = 0.0_f64;
     for time in times {
@@ -2079,50 +2425,6 @@ pub fn gpu_non_column_batch_wave_time(
     Ok(time.setup_seconds + instances as f64 * (job_seconds + time.wave_overhead_seconds))
 }
 
-/// Reconstruct the production union's interval jobs without materializing all
-/// future jobs. Unlike a same-wave port merge, this deliberately includes
-/// jobs from every source interval and retains their source wave; a wide port
-/// can overlap a narrower port's later logical wave.
-fn compressed_jobs_over_ranges(
-    schedule: &GpuColumnSchedule,
-    ranges: &[(usize, usize)],
-) -> Vec<(usize, GpuColumnJob)> {
-    let mut wave_starts = vec![0usize; schedule.widths().len()];
-    let mut jobs = Vec::new();
-    for (source_interval, interval) in schedule.intervals().iter().enumerate() {
-        let width = schedule.widths()[interval.device];
-        let wave_start = wave_starts[interval.device];
-        let count = (interval.end - interval.start).div_ceil(width);
-        wave_starts[interval.device] += count;
-        for &(range_start, range_end) in ranges {
-            if range_start >= range_end ||
-                interval.end <= range_start ||
-                interval.start >= range_end
-            {
-                continue;
-            }
-            let offset = range_start.saturating_sub(interval.start) / width * width;
-            let mut start = interval.start + offset;
-            while start < range_end && start < interval.end {
-                let end = start + width.min(interval.end - start);
-                if end > range_start {
-                    jobs.push((
-                        wave_start + (start - interval.start) / width,
-                        GpuColumnJob { device: interval.device, source_interval, start, end },
-                    ));
-                }
-                if end == interval.end {
-                    break;
-                }
-                start = end;
-            }
-        }
-    }
-    jobs.sort_unstable_by_key(|(wave, job)| (job.start, job.end, job.device, *wave));
-    jobs.dedup();
-    jobs
-}
-
 fn checked_lcm(lhs: usize, rhs: usize) -> Result<usize, GpuWarmupError> {
     if lhs == 0 || rhs == 0 {
         return Ok(0);
@@ -2145,76 +2447,39 @@ fn gpu_multi_output_wave_time_at(
     costs: Option<&[GpuStageCostModel]>,
 ) -> Result<f64, GpuWarmupError> {
     let mut by_device = BTreeMap::<usize, f64>::new();
+    // This is the same authoritative interval lowering consumed by fixed
+    // dispatch. Every returned union job is one real native invocation, so a
+    // clipped range is resolved as its own measured execution class.
     for instance in 0..instances {
-        let mut candidate_ranges = schedules_by_port
-            .iter()
-            .flat_map(|port| port[instance].wave_jobs(logical_wave))
-            .filter_map(|job| (job.start < job.end).then_some((job.start, job.end)))
-            .collect::<Vec<_>>();
-        if candidate_ranges.is_empty() {
-            continue;
-        }
-        candidate_ranges.sort_unstable();
-        candidate_ranges.dedup();
-        let port_jobs = schedules_by_port
-            .iter()
-            .map(|port| compressed_jobs_over_ranges(&port[instance], &candidate_ranges))
-            .collect::<Vec<_>>();
-        let mut boundaries = port_jobs
-            .iter()
-            .flat_map(|jobs| jobs.iter().flat_map(|(_, job)| [job.start, job.end]))
-            .collect::<Vec<_>>();
-        boundaries.sort_unstable();
-        boundaries.dedup();
-        for pair in boundaries.windows(2) {
-            let (start, end) = (pair[0], pair[1]);
-            if start >= end {
-                continue;
-            }
-            let containing = port_jobs
-                .iter()
-                .enumerate()
-                .flat_map(|(port, jobs)| {
-                    jobs.iter()
-                        .filter(|(_, job)| job.start <= start && end <= job.end)
-                        .map(move |(wave, job)| (port, *wave, *job))
-                })
-                .collect::<Vec<_>>();
-            let Some(source_wave) = containing.iter().map(|(_, wave, _)| *wave).max() else {
-                // The production union builder skips a local span without a
-                // representative source job (not an invalid schedule).
-                continue;
-            };
-            if source_wave != logical_wave {
-                continue;
-            }
-            let device = containing.iter().map(|(_, _, job)| job.device).min().unwrap();
-            let time = times.get(device).ok_or(GpuWarmupError::DeviceCount {
-                expected: schedules_by_port
-                    .first()
-                    .and_then(|port| port.first())
-                    .map_or(0, |schedule| schedule.widths().len()),
-                actual: times.len(),
-            })?;
-            let width = end.checked_sub(start).ok_or(GpuWarmupError::ArithmeticOverflow)?;
+        for job in fused_union_jobs_for_wave(schedules_by_port, instance, logical_wave)
+            .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+        {
+            let device = job.device;
             let seconds = if let Some(costs) = costs {
-                let (port, _, representative) =
-                    containing.iter().find(|(_, _, job)| job.device == device).unwrap();
-                let planned_width = schedules_by_port[*port][instance].widths()[device];
-                costs[device].time_for_containing_job_segment(
-                    device,
-                    planned_width,
-                    *representative,
-                    GpuColumnJob {
-                        device,
-                        source_interval: representative.source_interval,
-                        start,
-                        end,
-                    },
-                    schedules_by_port[*port][instance].rotation_class(),
-                )?
+                costs
+                    .get(device)
+                    .ok_or(GpuWarmupError::DeviceCount {
+                        expected: schedules_by_port
+                            .first()
+                            .and_then(|port| port.first())
+                            .map_or(0, |schedule| schedule.widths().len()),
+                        actual: costs.len(),
+                    })?
+                    .time_for_fused_union_job(schedules_by_port, &job)?
             } else {
-                time.checked_job_seconds(width)?
+                let time = times.get(device).ok_or(GpuWarmupError::DeviceCount {
+                    expected: schedules_by_port
+                        .first()
+                        .and_then(|port| port.first())
+                        .map_or(0, |schedule| schedule.widths().len()),
+                    actual: times.len(),
+                })?;
+                time.checked_job_seconds(
+                    job.range
+                        .end
+                        .checked_sub(job.range.start)
+                        .ok_or(GpuWarmupError::ArithmeticOverflow)?,
+                )?
             };
             *by_device.entry(device).or_default() += seconds;
         }
@@ -2399,14 +2664,19 @@ fn gpu_multi_output_batch_wave_time_resolved(
     let schedules_by_port = (0..port_count)
         .map(|port| schedules.iter().map(|instance| instance[port].clone()).collect::<Vec<_>>())
         .collect::<Vec<_>>();
-    // A single (or identical multi-output) port has no cross-port boundary;
-    // use the schedule's compressed wave classes directly. This is the
-    // constant-memory path for huge width-one ranges.
-    if port_count == 1 || schedules_by_port.iter().skip(1).all(|port| port == &schedules_by_port[0])
+    let identical_ports =
+        schedules_by_port.iter().skip(1).all(|port| port == &schedules_by_port[0]);
+    // Explicit binding ports carry physical output/source/layout identity.
+    // Even identical schedules are not sufficient to prove that port 0 is a
+    // valid representative: the ports may have different routes, resources,
+    // or output representations.  Keep the exact union lowering for every
+    // such profile; only genuinely unbound operations may use the compressed
+    // ordinary path below.
+    if (port_count == 1 || identical_ports) && !costs.is_some_and(costs_have_explicit_binding_port)
     {
         let references = schedules_by_port[0].iter().collect::<Vec<_>>();
         return if let Some(costs) = costs {
-            gpu_multi_output_batch_wave_time_with_costs(schedules, costs)
+            gpu_multi_output_batch_wave_time_with_costs_legacy(schedules, costs)
         } else {
             gpu_batch_wave_time(&references, times)
         };
@@ -2531,10 +2801,16 @@ fn storage_resource_for_wave(
     schedules: &[Vec<GpuColumnSchedule>],
     widths: &[usize],
     layouts: &BTreeMap<LayoutId, &GpuLayout>,
+    instance_count: usize,
+    first_global_slot: usize,
 ) -> Result<Vec<GpuResourceCost>, GpuWarmupError> {
     let devices = widths.len();
     let mut by_device = vec![GpuResourceCost::zero(); devices];
-    for instance in 0..schedules.len().max(1) {
+    // The wave cardinality is a property of the enclosing executor, not of
+    // whether this particular node emits column schedules.  Host/control and
+    // indivisible stages can still retain one allocation per sibling
+    // instance.  A zero count is a real empty tail and owns no storage.
+    for instance in 0..instance_count {
         for allocation in &node.storage_allocations {
             if allocation.wave_shared && instance > 0 {
                 continue;
@@ -2545,10 +2821,10 @@ fn storage_resource_for_wave(
             // The slot is carried by the schedule produced for the output
             // layout.  Rebuild each retained allocation using that same
             // global slot so its owner rotation follows fixed dispatch.
-            let slot = schedules
-                .get(instance)
-                .and_then(|ports| ports.first())
-                .map_or(instance, GpuColumnSchedule::instance_slot);
+            let slot = schedules.get(instance).and_then(|ports| ports.first()).map_or_else(
+                || first_global_slot.saturating_add(instance),
+                GpuColumnSchedule::instance_slot,
+            );
             let schedule = layout.schedule(widths, slot).map_err(|error| {
                 GpuWarmupError::InvalidPlan(format!(
                     "storage layout {} schedule for slot {}: {error}",
@@ -2584,22 +2860,55 @@ fn measured_job_workspace(
 ) -> Result<Vec<GpuResourceCost>, GpuWarmupError> {
     let devices = widths.len();
     let mut keys = vec![BTreeSet::new(); devices];
-    for instance in schedules {
-        for schedule in instance {
-            for class in schedule.wave_classes() {
-                for job in class.jobs {
+    let multi_output_profiles = schedules.first().is_some_and(|instance| instance.len() > 1) &&
+        node.cost
+            .iter()
+            .any(|cost| costs_have_explicit_binding_port(std::slice::from_ref(cost)));
+    if multi_output_profiles {
+        // Multi-output fused dispatch is lowered as union jobs, including the
+        // canonical binding port. Resource admission must use the same exact
+        // profile keys as timing; iterating each port independently would
+        // silently turn Some(0) into the ordinary None lookup.
+        let port_count = schedules[0].len();
+        let schedules_by_port = (0..port_count)
+            .map(|port| schedules.iter().map(|instance| instance[port].clone()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        for instance in 0..schedules.len() {
+            let wave_count =
+                schedules_by_port.iter().map(|port| port[instance].wave_count()).max().unwrap_or(0);
+            for logical_wave in 0..wave_count {
+                for job in fused_union_jobs_for_wave(&schedules_by_port, instance, logical_wave)
+                    .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+                {
                     if !node.cost[job.device].profiles_by_job.is_empty() {
                         keys[job.device].extend(
                             node.cost[job.device]
-                                .keys_for_job(
-                                    job.device,
-                                    widths[job.device],
-                                    job,
-                                    schedule.rotation_class(),
-                                )?
+                                .keys_for_fused_union_job(&schedules_by_port, &job)?
                                 .into_iter()
                                 .cloned(),
                         );
+                    }
+                }
+            }
+        }
+    } else {
+        for instance in schedules {
+            for schedule in instance {
+                for class in schedule.wave_classes() {
+                    for job in class.jobs {
+                        if !node.cost[job.device].profiles_by_job.is_empty() {
+                            keys[job.device].extend(
+                                node.cost[job.device]
+                                    .keys_for_job(
+                                        job.device,
+                                        widths[job.device],
+                                        job,
+                                        schedule.rotation_class(),
+                                    )?
+                                    .into_iter()
+                                    .cloned(),
+                            );
+                        }
                     }
                 }
             }
@@ -2796,16 +3105,21 @@ fn choose_node_with_candidates(
             1
         };
         // Admission must use the maximum affected-device envelope over every
-        // rotation phase that can occur in a sibling wave.  The old code only
-        // inspected slots 0..W and therefore missed later owner classes.
+        // rotation phase that can actually occur in this loop.  In particular,
+        // a short tail is not a full sibling wave, and a short loop must not
+        // force measurement/lookup of imaginary classes beyond its end.
+        let reachable_phases = if column_work {
+            reachable_wave_phases(loop_count, wave_instances, rotation_period)
+        } else if loop_count == 0 {
+            Vec::new()
+        } else {
+            vec![(0, loop_count.min(wave_instances))]
+        };
         let mut job_workspace = vec![GpuResourceCost::zero(); devices];
         let mut storage_by_instance = vec![GpuResourceCost::zero(); devices];
-        for phase in 0..wave_phase_count {
-            let first_slot =
-                phase.checked_mul(wave_instances).ok_or(GpuWarmupError::ArithmeticOverflow)? %
-                    rotation_period.max(1);
+        for (first_slot, phase_instances) in reachable_phases {
             let phase_schedules = if column_work {
-                schedules_for_wave(layouts, &widths, first_slot, wave_instances, rotation_period)?
+                schedules_for_wave(layouts, &widths, first_slot, phase_instances, rotation_period)?
             } else {
                 Vec::new()
             };
@@ -2821,8 +3135,14 @@ fn choose_node_with_candidates(
             for (total, resource) in job_workspace.iter_mut().zip(phase_workspace) {
                 *total = total.component_max(resource);
             }
-            let phase_storage =
-                storage_resource_for_wave(node, &phase_schedules, &widths, global_layouts)?;
+            let phase_storage = storage_resource_for_wave(
+                node,
+                &phase_schedules,
+                &widths,
+                global_layouts,
+                phase_instances,
+                first_slot,
+            )?;
             for (total, resource) in storage_by_instance.iter_mut().zip(phase_storage) {
                 *total = total.component_max(resource);
             }
@@ -3006,31 +3326,33 @@ fn choose_node_with_candidates(
             // wave-zero latency across rotated sibling waves.
             let cycle_waves = wave_phase_count.max(1);
             let complete_cycles = full_waves / cycle_waves;
-            let cycle_sum = (0..cycle_waves)
-                .map(|phase| {
-                    let first_slot = phase
-                        .checked_mul(wave_instances)
-                        .ok_or(GpuWarmupError::ArithmeticOverflow)? %
-                        rotation_period.max(1);
-                    let schedules = schedules_for_wave(
-                        layouts,
-                        &widths,
-                        first_slot,
-                        wave_instances,
-                        rotation_period,
-                    )?;
-                    if node.cost.iter().any(|cost| !cost.time_by_job.is_empty()) {
-                        gpu_multi_output_batch_wave_time_with_costs(&schedules, &node.cost)
-                    } else {
-                        let references =
-                            schedules.iter().map(|ports| &ports[0]).collect::<Vec<_>>();
-                        gpu_batch_wave_time(&references, &times)
-                    }
-                })
-                .collect::<Result<Vec<_>, GpuWarmupError>>()?
-                .into_iter()
-                .sum::<f64>();
-            seconds += cycle_sum * complete_cycles as f64;
+            if complete_cycles > 0 {
+                let cycle_sum = (0..cycle_waves)
+                    .map(|phase| {
+                        let first_slot = phase
+                            .checked_mul(wave_instances)
+                            .ok_or(GpuWarmupError::ArithmeticOverflow)? %
+                            rotation_period.max(1);
+                        let schedules = schedules_for_wave(
+                            layouts,
+                            &widths,
+                            first_slot,
+                            wave_instances,
+                            rotation_period,
+                        )?;
+                        if node.cost.iter().any(|cost| !cost.profiles_by_job.is_empty()) {
+                            gpu_multi_output_batch_wave_time_with_costs(&schedules, &node.cost)
+                        } else {
+                            let references =
+                                schedules.iter().map(|ports| &ports[0]).collect::<Vec<_>>();
+                            gpu_batch_wave_time(&references, &times)
+                        }
+                    })
+                    .collect::<Result<Vec<_>, GpuWarmupError>>()?
+                    .into_iter()
+                    .sum::<f64>();
+                seconds += cycle_sum * complete_cycles as f64;
+            }
             for phase in (complete_cycles * cycle_waves)..full_waves {
                 let first_slot =
                     phase.checked_mul(wave_instances).ok_or(GpuWarmupError::ArithmeticOverflow)? %
@@ -3042,7 +3364,7 @@ fn choose_node_with_candidates(
                     wave_instances,
                     rotation_period,
                 )?;
-                seconds += if node.cost.iter().any(|cost| !cost.time_by_job.is_empty()) {
+                seconds += if node.cost.iter().any(|cost| !cost.profiles_by_job.is_empty()) {
                     gpu_multi_output_batch_wave_time_with_costs(&schedules, &node.cost)?
                 } else {
                     let references = schedules.iter().map(|ports| &ports[0]).collect::<Vec<_>>();
@@ -3056,7 +3378,7 @@ fn choose_node_with_candidates(
                     rotation_period.max(1);
                 let schedules =
                     schedules_for_wave(layouts, &widths, first_slot, tail, rotation_period)?;
-                seconds += if node.cost.iter().any(|cost| !cost.time_by_job.is_empty()) {
+                seconds += if node.cost.iter().any(|cost| !cost.profiles_by_job.is_empty()) {
                     gpu_multi_output_batch_wave_time_with_costs(&schedules, &node.cost)?
                 } else {
                     let references = schedules.iter().map(|ports| &ports[0]).collect::<Vec<_>>();
@@ -3589,6 +3911,7 @@ fn make_profile_request(
         // query or the fleet adapter must attach the actual resolver before a
         // GPU request is admitted.
         route_resolver: None,
+        binding_port: None,
         fragment,
         retry_cap: None,
         cache_identity: None,
@@ -3888,7 +4211,10 @@ fn discard_infeasible_width(
     width: usize,
     device_successes: &mut BTreeMap<usize, GpuWarmupProfile>,
     class_successes: &mut BTreeMap<GpuWarmupJobProfileKey, GpuWarmupProfile>,
-    job_profile_keys: &mut BTreeMap<(usize, usize, usize, usize), Vec<GpuWarmupJobProfileKey>>,
+    job_profile_keys: &mut BTreeMap<
+        (usize, usize, usize, usize, Option<usize>),
+        Vec<GpuWarmupJobProfileKey>,
+    >,
     primary_profile_keys: &mut BTreeMap<usize, GpuWarmupJobProfileKey>,
     transfer_profiles: &mut BTreeMap<GpuWarmupJobProfileKey, GpuWarmupProfile>,
 ) {
@@ -3969,6 +4295,7 @@ fn measured_cost_from_profile_provider(
                     TypedFragmentClass::Full,
                 ),
                 route_resolver: None,
+                binding_port: None,
                 fragment: GpuWarmupFragmentClass::Whole,
                 retry_cap: None,
                 cache_identity: None,
@@ -4009,8 +4336,10 @@ fn measured_cost_from_profile_provider(
         }
         let mut device_successes = BTreeMap::new();
         let mut class_successes = BTreeMap::new();
-        let mut job_profile_keys =
-            BTreeMap::<(usize, usize, usize, usize), Vec<GpuWarmupJobProfileKey>>::new();
+        let mut job_profile_keys = BTreeMap::<
+            (usize, usize, usize, usize, Option<usize>),
+            Vec<GpuWarmupJobProfileKey>,
+        >::new();
         let mut primary_profile_keys = BTreeMap::<usize, GpuWarmupJobProfileKey>::new();
         let mut transfer_profiles = BTreeMap::<GpuWarmupJobProfileKey, GpuWarmupProfile>::new();
         let mut setup_seconds = 0.0_f64;
@@ -4059,7 +4388,7 @@ fn measured_cost_from_profile_provider(
                 },
                 |query| query.fragment,
             );
-            let request = make_profile_request(
+            let mut request = make_profile_request(
                 descriptor.as_ref(),
                 signature,
                 device,
@@ -4069,6 +4398,7 @@ fn measured_cost_from_profile_provider(
                 GpuWarmupCacheState::Warm,
                 GpuWarmupTimingScope::LocalJob,
             );
+            request.binding_port = query.and_then(|query| query.binding_port);
             let mut request = if let Some(query) = query {
                 if let Some(resolver) = query.route_resolver.as_ref() {
                     resolve_request_from_route_resolver(
@@ -4102,6 +4432,7 @@ fn measured_cost_from_profile_provider(
                                 GpuWarmupRoute::HostStaging
                             }
                         },
+                        binding_port: query.binding_port,
                         ..request
                     }
                 }
@@ -4231,6 +4562,7 @@ fn measured_cost_from_profile_provider(
                 global_start: request.range.start,
                 global_end: request.range.end,
                 fragment: request.fragment,
+                binding_port: request.binding_port,
                 route_descriptor: canonical_job_route_descriptor(
                     request.route_descriptor,
                     request.fragment,
@@ -4284,6 +4616,7 @@ fn measured_cost_from_profile_provider(
                         query.source_interval,
                         request.range.start,
                         request.range.end,
+                        query.binding_port,
                     ))
                     .or_default();
                 let key = GpuWarmupJobProfileKey {
@@ -4294,6 +4627,7 @@ fn measured_cost_from_profile_provider(
                     global_start: profile_key.global_start,
                     global_end: profile_key.global_end,
                     fragment: profile_key.fragment,
+                    binding_port: profile_key.binding_port,
                     route_descriptor: canonical_job_route_descriptor(
                         profile_key.route_descriptor,
                         request.fragment,
@@ -4327,6 +4661,7 @@ fn measured_cost_from_profile_provider(
                             extra.range.start != request.range.start ||
                             extra.range.end != request.range.end ||
                             extra.fragment != request.fragment ||
+                            extra.binding_port != query.and_then(|query| query.binding_port) ||
                             extra.route_descriptor != request.route_descriptor ||
                             extra.route_resolver.as_ref() !=
                                 query.and_then(|query| query.route_resolver.as_ref()))
@@ -4369,6 +4704,7 @@ fn measured_cost_from_profile_provider(
                                     GpuWarmupRoute::HostStaging
                                 }
                             },
+                            binding_port: extra.binding_port,
                             ..extra_request
                         }
                     };
@@ -4403,6 +4739,7 @@ fn measured_cost_from_profile_provider(
                         global_start: extra.range.start,
                         global_end: extra.range.end,
                         fragment: extra.fragment,
+                        binding_port: extra.binding_port,
                         route_descriptor: canonical_job_route_descriptor(
                             extra_route,
                             extra.fragment,
@@ -4451,6 +4788,7 @@ fn measured_cost_from_profile_provider(
                             extra.source_interval,
                             extra.range.start,
                             extra.range.end,
+                            extra.binding_port,
                         ))
                         .or_default();
                     if !entry.contains(&extra_profile_key) {
@@ -4498,7 +4836,7 @@ fn measured_cost_from_profile_provider(
                     return Ok((GpuStageCostModel::default(), Vec::new()));
                 }
                 let mut times = Vec::with_capacity(profiles.len());
-                let mut time_by_job = BTreeMap::new();
+                let time_by_job = BTreeMap::new();
                 let mut profiles_by_job = BTreeMap::new();
                 let mut workspace_by_width = BTreeMap::new();
                 let mut device_workspace_by_width = BTreeMap::new();
@@ -4585,22 +4923,21 @@ fn measured_cost_from_profile_provider(
                     fixed_resource.live = 0;
                 }
                 for (key, mut profile) in class_profiles {
-                    let resolved_time = profile.time_seconds;
-                    let mut model = GpuTimeModel::default();
-                    model.measured_time_points = vec![(key.width, resolved_time)];
                     if let Some(transfer) = transfer_profiles.get(&key) {
                         // GPU local jobs already include their source movement.
                         // Host codec points exclude the separately measured boundary.
                         if profile.measurement ==
                             crate::gpu_column_policy::WarmupMeasurementKind::HostMeasured
                         {
-                            model.transfer_seconds = transfer.time_seconds;
                             profile.time_seconds += transfer.time_seconds;
                         }
                         profile.memory = merge_transfer_memory(&profile, transfer);
                     }
                     profiles_by_job.insert(key.clone(), profile);
-                    time_by_job.insert(key, model);
+                    // `profiles_by_job` is the canonical production point.
+                    // Do not copy its duration into a second time authority;
+                    // the legacy projection remains available only for
+                    // explicitly constructed pure-planner fixtures.
                 }
                 if !profiles_by_job.is_empty() {
                     // The canonical point owns its complete residency envelope.
@@ -4705,6 +5042,7 @@ fn canonical_profile_key_with_context(
             request.route
         },
         route_descriptor,
+        binding_port: request.binding_port,
         fragment,
         timing_scope,
     }
@@ -5535,7 +5873,7 @@ fn warmup_input_for_owner_placement(
                     }
                 }
             }
-            let local_max_widths = if matches!(
+            let base_local_max_widths = if matches!(
                 capability,
                 ColumnCapability::SingleDevice | ColumnCapability::HostOrControl
             ) {
@@ -5597,6 +5935,46 @@ fn warmup_input_for_owner_placement(
                         })
                     })
                     .transpose()?
+            } else if output_layouts.len() > 1 {
+                let output_layout_refs = output_layouts
+                    .iter()
+                    .map(|layout_id| {
+                        layouts.iter().find(|layout| layout.id == *layout_id).ok_or_else(|| {
+                            GpuWarmupError::InvalidPlan(format!(
+                                "missing fused output layout {layout_id}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let instance_count = loop_info.as_ref().map_or(1, |(_, count, _)| *count);
+                let maps = candidate_widths
+                    .iter()
+                    .copied()
+                    .filter(|width| *width > 0)
+                    .map(|width| {
+                        bounded_fused_union_job_queries_for_layouts(
+                            &output_layout_refs,
+                            devices,
+                            width,
+                            &candidate_widths,
+                            instance_count,
+                            &operation_descriptor.source_layouts,
+                            &operation_descriptor,
+                        )
+                        .map(|queries| {
+                            let mut by_actual_width =
+                                BTreeMap::<usize, Vec<GpuWarmupJobQuery>>::new();
+                            for query in queries {
+                                by_actual_width
+                                    .entry(query.range.end.saturating_sub(query.range.start))
+                                    .or_default()
+                                    .push(query);
+                            }
+                            by_actual_width
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Some(merge_job_query_candidates(maps))
             } else {
                 layouts
                     .iter()
@@ -5635,6 +6013,33 @@ fn warmup_input_for_owner_placement(
                             .map(merge_job_query_candidates)
                     })
                     .transpose()?
+            };
+            // The base owner intervals describe only slot zero.  A nonzero
+            // instance stride can rotate the same local job onto devices
+            // that are inactive in that base map, so derive the measurement
+            // domain from the complete reachable query inventory instead.
+            // The query range is the physical local geometry; planned width
+            // is intentionally not used as a proxy for it.
+            let local_max_widths = if let Some(queries) = job_queries_by_width.as_ref() {
+                (0..devices)
+                    .map(|device| {
+                        queries
+                            .values()
+                            .flatten()
+                            .filter(|query| query.device == device)
+                            .map(|query| {
+                                if query.fragment == GpuWarmupFragmentClass::SingleDevice {
+                                    columns
+                                } else {
+                                    query.range.end.saturating_sub(query.range.start)
+                                }
+                            })
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                base_local_max_widths
             };
             // Provider allocation envelopes include the output owner.  Keep
             // the per-range output bytes separate so measured high-water
@@ -6202,6 +6607,44 @@ pub fn warmup_gpu_for_inputs_with_candidates_with_execution_config<
     measure_owner_candidates(validated, &config, device_candidates, owner_candidates, provider)
 }
 
+const OWNER_CANDIDATE_SEARCH_BUDGET: usize = 4096;
+
+/// Visit ownership candidates lazily in deterministic map/choice order.  The
+/// old implementation materialized the complete Cartesian product before it
+/// measured the first route, which made a large but mostly infeasible search
+/// consume unbounded memory.  The boolean return reports whether the explicit
+/// finite search budget truncated the candidate set.
+fn visit_owner_candidate_variants(
+    candidates: &[(LayoutId, &Vec<Vec<GpuColumnInterval>>)],
+    index: usize,
+    current: &mut BTreeMap<LayoutId, Vec<GpuColumnInterval>>,
+    visited: &mut usize,
+    callback: &mut impl FnMut(&BTreeMap<LayoutId, Vec<GpuColumnInterval>>) -> Result<(), GpuWarmupError>,
+) -> Result<bool, GpuWarmupError> {
+    if *visited >= OWNER_CANDIDATE_SEARCH_BUDGET {
+        return Ok(true);
+    }
+    if index == candidates.len() {
+        *visited += 1;
+        callback(current)?;
+        return Ok(false);
+    }
+    let (layout, choices) = candidates[index];
+    if choices.is_empty() {
+        return visit_owner_candidate_variants(candidates, index + 1, current, visited, callback);
+    }
+    for choice in choices {
+        current.insert(layout, choice.clone());
+        let truncated =
+            visit_owner_candidate_variants(candidates, index + 1, current, visited, callback)?;
+        current.remove(&layout);
+        if truncated {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Resolve and measure each ownership candidate before admission. A route's
 /// timing and allocation proof belong to that placement, not merely its width.
 fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
@@ -6215,31 +6658,18 @@ fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
     config.default_tile_widths.extend(device_candidates.values().flatten().flatten().copied());
     config.default_tile_widths.sort_unstable();
     config.default_tile_widths.dedup();
-    let mut variants = vec![BTreeMap::new()];
-    for (layout, choices) in owner_candidates {
-        if choices.is_empty() {
-            continue;
-        }
-        variants = variants
-            .into_iter()
-            .flat_map(|prefix| {
-                choices.iter().map(move |choice| {
-                    let mut variant = prefix.clone();
-                    variant.insert(*layout, choice.clone());
-                    variant
-                })
-            })
-            .collect();
-    }
+    let candidate_sets =
+        owner_candidates.iter().map(|(layout, choices)| (*layout, choices)).collect::<Vec<_>>();
     let mut best: Option<GpuWarmupResult> = None;
     let mut failure = None;
-    for owners in variants {
+    let mut visited = 0usize;
+    let mut evaluate = |owners: &BTreeMap<LayoutId, Vec<GpuColumnInterval>>| {
         let input =
-            match warmup_input_for_owner_placement(validated, &config, Some(provider), &owners) {
+            match warmup_input_for_owner_placement(validated, &config, Some(provider), owners) {
                 Ok(input) => input,
                 Err(error @ GpuWarmupError::NoFeasibleMeasuredCandidate { .. }) => {
                     failure = Some(error);
-                    continue;
+                    return Ok(());
                 }
                 Err(error) => return Err(error),
             };
@@ -6253,7 +6683,7 @@ fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
             Err(error @ GpuWarmupError::ResourceExhausted { .. }) |
             Err(error @ GpuWarmupError::HostResourceExhausted { .. }) => {
                 failure = Some(error);
-                continue;
+                return Ok(());
             }
             Err(error) => return Err(error),
         };
@@ -6262,6 +6692,19 @@ fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
         }) {
             best = Some(result);
         }
+        Ok(())
+    };
+    let truncated = visit_owner_candidate_variants(
+        &candidate_sets,
+        0,
+        &mut BTreeMap::new(),
+        &mut visited,
+        &mut evaluate,
+    )?;
+    if truncated {
+        return Err(GpuWarmupError::InvalidPlan(format!(
+            "owner candidate search exceeded explicit budget: considered {visited} candidates, budget {OWNER_CANDIDATE_SEARCH_BUDGET}"
+        )));
     }
     best.ok_or_else(|| failure.unwrap_or(GpuWarmupError::EmptyFleet))
 }
@@ -6869,6 +7312,7 @@ mod tests {
         types::ConcreteWireType,
     };
     use num_bigint::BigInt;
+    use std::cell::Cell;
 
     fn contract(devices: usize, budget: u64) -> GpuPlanContract {
         GpuPlanContract {
@@ -8322,7 +8766,7 @@ mod tests {
     }
 
     #[test]
-    fn heterogeneous_measured_union_uses_containing_profiles_for_split_segments() {
+    fn heterogeneous_measured_union_uses_exact_fragment_profiles_with_nonzero_intercept() {
         let port0 = GpuColumnSchedule::new(
             6,
             vec![2],
@@ -8342,40 +8786,67 @@ mod tests {
                 TypedFragmentClass::PlannedJob,
             )
         };
+        let by_port = vec![vec![port0.clone()], vec![port1.clone()]];
         let mut cost = GpuStageCostModel::default();
-        for schedule in [&port0, &port1] {
-            for wave in 0..schedule.wave_count() {
-                for job in schedule.wave_jobs(wave) {
-                    let width = job.end - job.start;
-                    let key = GpuWarmupJobProfileKey {
-                        planned_width: schedule.widths()[0],
-                        instance_slot: schedule.instance_slot(),
-                        rotation_class: schedule.rotation_class(),
-                        width,
-                        global_start: job.start,
-                        global_end: job.end,
-                        fragment: GpuWarmupFragmentClass::Whole,
-                        route_descriptor: route(job.start, job.end),
-                    };
-                    cost.job_profile_keys
-                        .entry((schedule.rotation_class(), job.source_interval, job.start, job.end))
-                        .or_default()
-                        .push(key.clone());
-                    cost.time_by_job.insert(
-                        key,
-                        GpuTimeModel {
-                            measured_time_points: vec![(width, width as f64)],
-                            ..Default::default()
-                        },
-                    );
-                }
+        let mut expected = 0.0;
+        let wave_count = by_port
+            .iter()
+            .flat_map(|port| port.iter().map(GpuColumnSchedule::wave_count))
+            .max()
+            .unwrap_or(0);
+        for logical_wave in 0..wave_count {
+            for job in fused_union_jobs_for_wave(&by_port, 0, logical_wave).unwrap() {
+                let (port, binding) = job
+                    .port_jobs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, port_job)| port_job.clipped_range.is_some())
+                    .unwrap();
+                let schedule = &by_port[port][0];
+                let width = job.range.end - job.range.start;
+                let planned_width = schedule.widths()[job.device];
+                let fragment = (width < planned_width)
+                    .then_some(GpuWarmupFragmentClass::Tail)
+                    .unwrap_or(GpuWarmupFragmentClass::Whole);
+                let source_interval = binding.source_interval.unwrap();
+                let key = GpuWarmupJobProfileKey {
+                    planned_width,
+                    instance_slot: schedule.instance_slot(),
+                    rotation_class: schedule.rotation_class(),
+                    width,
+                    global_start: job.range.start,
+                    global_end: job.range.end,
+                    fragment,
+                    binding_port: Some(port),
+                    route_descriptor: route(job.range.start, job.range.end),
+                };
+                cost.job_profile_keys
+                    .entry((
+                        schedule.rotation_class(),
+                        source_interval,
+                        job.range.start,
+                        job.range.end,
+                        Some(port),
+                    ))
+                    .or_default()
+                    .push(key.clone());
+                cost.time_by_job.insert(
+                    key,
+                    GpuTimeModel {
+                        fixed_seconds: 3.0,
+                        per_column_seconds: 1.0,
+                        ..Default::default()
+                    },
+                );
+                expected += 3.0 + width as f64;
             }
         }
         let predicted = gpu_multi_output_batch_wave_time_with_costs(&[vec![port0, port1]], &[cost])
-            .expect("every clipped union segment must resolve through its containing measured job");
-        // Cross-port boundaries split [0,2), [2,3), [3,4), [4,6), but the
-        // containing points still cover exactly six columns in total.
-        assert_eq!(predicted, 6.0);
+            .expect("every emitted union fragment must resolve through its exact measured point");
+        // Cross-port boundaries split [0,2), [2,3), [3,4), [4,6). The
+        // nonzero per-call intercept is charged for all four native calls.
+        assert_eq!(predicted, expected);
+        assert_eq!(predicted, 18.0);
     }
 
     #[test]
@@ -8784,6 +9255,7 @@ mod tests {
             planned_width,
             range: range.clone(),
             fragment,
+            binding_port: None,
             route_descriptor: route,
             route_resolver: None,
         };
@@ -8861,6 +9333,7 @@ mod tests {
                     planned_width: 2,
                     range: range.clone(),
                     fragment: GpuWarmupFragmentClass::Whole,
+                    binding_port: None,
                     route_descriptor: whole_route,
                     route_resolver: None,
                 },
@@ -8872,6 +9345,7 @@ mod tests {
                     planned_width: 4,
                     range,
                     fragment: GpuWarmupFragmentClass::Tail,
+                    binding_port: None,
                     route_descriptor: tail_route,
                     route_resolver: None,
                 },
@@ -8898,7 +9372,7 @@ mod tests {
         )
         .expect("both same-width candidate identities are measured");
         let model = &costs[0];
-        let keys = model.time_by_job.keys().collect::<Vec<_>>();
+        let keys = model.profiles_by_job.keys().collect::<Vec<_>>();
         assert_eq!(keys.len(), 2);
         assert!(keys.iter().any(|key| {
             key.planned_width == 2 &&
@@ -8924,6 +9398,186 @@ mod tests {
                 "admission must resolve memory from the same job-class point as time"
             );
         }
+    }
+
+    #[test]
+    fn fused_union_binding_ports_are_distinct_provider_profiles() {
+        struct Provider {
+            calls: Cell<usize>,
+        }
+
+        impl GpuWarmupProfileProvider for Provider {
+            fn register_operation(
+                &mut self,
+                _descriptor: GpuWarmupOperationDescriptor,
+            ) -> Result<(), GpuWarmupProfileError> {
+                Ok(())
+            }
+
+            fn measure(
+                &mut self,
+                request: &GpuWarmupProfileRequest,
+            ) -> Result<GpuWarmupProfile, GpuWarmupProfileError> {
+                self.calls.set(self.calls.get() + 1);
+                let bytes = 10 + request.binding_port.unwrap_or(0) as u64;
+                let memory = crate::backend::GpuWarmupMemoryObservations {
+                    affected_devices: BTreeMap::from([(request.device_identity.clone(), bytes)]),
+                    evidence: MemoryEvidenceKind::ExactQuery,
+                    ..Default::default()
+                };
+                GpuWarmupProfile::measured_with_observation(
+                    1.0 + bytes as f64 / 100.0,
+                    bytes,
+                    WarmupMeasurementKind::GpuMeasured,
+                    memory,
+                    crate::backend::GpuWarmupResidencyDelta::default(),
+                    1,
+                    0.0,
+                    GpuWarmupProvenance::ProductionEquivalent,
+                    request.cache_state,
+                    request.timing_scope,
+                )
+            }
+        }
+
+        let signature = GpuWarmupOperationSignature {
+            operation: [0xc4; 32],
+            shape_class: 1,
+            instance_class: 0,
+        };
+        let descriptor = GpuWarmupOperationDescriptor {
+            inputs: Default::default(),
+            signature,
+            scope: FrozenGraphScopeId::Root,
+            node: NodeId(0),
+            kind: NodeKind::MatrixNegate,
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: Vec::new(),
+            bindings: mxx_ir_core::expr::ParamEnv::default(),
+            effective_operation: "fused_row_sum".into(),
+            profile_domain: fused_warmup_profile_domain(FusedWarmupOperation::RowSum),
+            fused_operation: Some(FusedWarmupOperation::RowSum),
+            implementation_variant: "fused_row_sum:test".into(),
+            source_layouts: Vec::new(),
+            output_layout: None,
+            route_resolver: None,
+            host_control: None,
+        };
+        let route = GpuExecutionRouteDescriptor::device_local(
+            0,
+            ColumnRange { start: 0, end: 1 },
+            TypedFragmentClass::PlannedJob,
+        );
+        let query = |binding_port| GpuWarmupJobQuery {
+            device: 0,
+            source_interval: 0,
+            instance_slot: 0,
+            rotation_class: 0,
+            planned_width: 1,
+            range: IndexRange { start: 0, end: 1 },
+            fragment: GpuWarmupFragmentClass::Whole,
+            binding_port: Some(binding_port),
+            route_descriptor: route,
+            route_resolver: None,
+        };
+        let queries = BTreeMap::from([(1, vec![query(0), query(1)])]);
+        let mut provider = Provider { calls: Cell::new(0) };
+        let (costs, _) = measured_cost_from_profile_provider(
+            &mut provider,
+            &mut GpuWarmupSessionProfileCache::new(),
+            Some(descriptor),
+            signature,
+            &[1],
+            &[],
+            1,
+            1,
+            None,
+            &BTreeMap::new(),
+            GpuExecutionSiteKey { site: 0xc4, shape_class: 1, instance_class: 0 },
+            Some(&queries),
+        )
+        .expect("both fused binding ports must be measured");
+        assert_eq!(provider.calls.get(), 2);
+        let keys = costs[0].profiles_by_job.keys().collect::<Vec<_>>();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().any(|key| key.binding_port == Some(0)));
+        assert!(keys.iter().any(|key| key.binding_port == Some(1)));
+        assert_ne!(keys[0], keys[1]);
+        let resources = costs[0]
+            .profiles_by_job
+            .values()
+            .map(|profile| profile.memory.affected_devices.values().copied().sum::<u64>())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(resources, BTreeSet::from([10, 11]));
+    }
+
+    #[test]
+    fn identical_multi_output_profiles_keep_canonical_binding_port() {
+        let schedule = GpuColumnSchedule::new(
+            4,
+            vec![2],
+            vec![GpuColumnInterval { device: 0, start: 0, end: 4 }],
+        )
+        .unwrap();
+        let by_port = vec![vec![schedule.clone(), schedule]];
+        let route = |start, end| {
+            GpuExecutionRouteDescriptor::device_local(
+                0,
+                ColumnRange { start, end },
+                TypedFragmentClass::PlannedJob,
+            )
+        };
+        let mut cost = GpuStageCostModel::default();
+        let mut expected = 0.0;
+        let wave_count = by_port
+            .iter()
+            .flat_map(|port| port.iter().map(GpuColumnSchedule::wave_count))
+            .max()
+            .unwrap_or(0);
+        for logical_wave in 0..wave_count {
+            for job in fused_union_jobs_for_wave(&by_port, 0, logical_wave).unwrap() {
+                let (binding_port, binding) = job
+                    .port_jobs
+                    .iter()
+                    .enumerate()
+                    .find(|(_, port_job)| port_job.clipped_range.is_some())
+                    .unwrap();
+                assert_eq!(binding_port, 0, "fixed dispatch must bind identical ports to port 0");
+                let width = job.range.end - job.range.start;
+                let schedule = &by_port[binding_port][0];
+                let planned_width = schedule.widths()[job.device];
+                let fragment = (width < planned_width)
+                    .then_some(GpuWarmupFragmentClass::Tail)
+                    .unwrap_or(GpuWarmupFragmentClass::Whole);
+                let key = GpuWarmupJobProfileKey {
+                    planned_width,
+                    instance_slot: schedule.instance_slot(),
+                    rotation_class: schedule.rotation_class(),
+                    width,
+                    global_start: job.range.start,
+                    global_end: job.range.end,
+                    fragment,
+                    binding_port: Some(0),
+                    route_descriptor: route(job.range.start, job.range.end),
+                };
+                cost.job_profile_keys
+                    .entry((
+                        schedule.rotation_class(),
+                        binding.source_interval.unwrap(),
+                        job.range.start,
+                        job.range.end,
+                        Some(0),
+                    ))
+                    .or_default()
+                    .push(key.clone());
+                cost.time_by_job
+                    .insert(key, GpuTimeModel { fixed_seconds: 7.0, ..Default::default() });
+                expected += 7.0;
+            }
+        }
+        let actual = gpu_multi_output_batch_wave_time_with_costs(&by_port, &[cost])
+            .expect("identical fused output schedules must resolve Some(0) profiles");
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -9183,6 +9837,7 @@ mod tests {
             planned_width: 1,
             range: IndexRange { start: 0, end: 1 },
             fragment: GpuWarmupFragmentClass::Whole,
+            binding_port: None,
             route_descriptor: route,
             route_resolver: Some(GpuWarmupRouteResolverData {
                 source_layouts: Vec::new(),
@@ -9326,6 +9981,7 @@ mod tests {
             planned_width: 4,
             range: IndexRange { start: 0, end: 4 },
             fragment: GpuWarmupFragmentClass::Whole,
+            binding_port: None,
             route_descriptor: route,
             route_resolver: None,
         };
@@ -9348,10 +10004,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provider.calls.get(), 2, "host and transfer scopes are separate points");
-        let model = costs[0].time_by_job.values().next().expect("local job profile");
-        assert_eq!(model.measured_time_points, vec![(4, 2.0)]);
-        assert_eq!(model.transfer_seconds, 3.0);
-        assert_eq!(model.job_seconds(4), 5.0, "transfer time is composed exactly once");
+        let profile = costs[0].profiles_by_job.values().next().expect("local job profile");
+        assert_eq!(profile.time_seconds, 5.0, "transfer time is composed exactly once");
     }
 
     #[test]
@@ -9435,6 +10089,7 @@ mod tests {
             planned_width: 4,
             range: IndexRange { start, end: start + 4 },
             fragment: GpuWarmupFragmentClass::Whole,
+            binding_port: None,
             route_descriptor: route,
             route_resolver: None,
         };
@@ -9457,10 +10112,10 @@ mod tests {
             Some(&queries),
         )
         .unwrap();
-        let models = costs[0].time_by_job.values().collect::<Vec<_>>();
-        assert_eq!(models.len(), 2);
-        assert!(models.iter().any(|model| model.transfer_seconds == 64.0));
-        assert!(models.iter().any(|model| model.transfer_seconds == 128.0));
+        let profiles = costs[0].profiles_by_job.values().collect::<Vec<_>>();
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.iter().any(|profile| profile.time_seconds == 65.0));
+        assert!(profiles.iter().any(|profile| profile.time_seconds == 129.0));
     }
 
     #[test]
@@ -9572,6 +10227,7 @@ mod tests {
             planned_width: 4,
             range: IndexRange { start: 0, end: 4 },
             fragment,
+            binding_port: None,
             route_descriptor: route,
             route_resolver: None,
         };

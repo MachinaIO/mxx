@@ -578,6 +578,11 @@ pub struct GpuAllocationComponents {
     pub small_rhs_report:
         Option<mxx_primitives::matrix::gpu_dcrt_poly::GpuSmallMatrixAllocationReport>,
     pub input_shape: Option<mxx_primitives::gpu_memory::GpuMemoryShape>,
+    /// Physical row grouping and second operand shape for fused tensor-row
+    /// sum.  These facts are required to select the native fast kernel versus
+    /// the materialized-tensor lowering during allocation accounting.
+    pub tensor_row_sum_groups: Option<Vec<Vec<usize>>>,
+    pub tensor_row_sum_rhs_shape: Option<mxx_primitives::gpu_memory::GpuMemoryShape>,
     pub product_count: usize,
     pub level_count: usize,
     pub auxiliary_bytes: usize,
@@ -2155,6 +2160,32 @@ impl GpuDcrtBackend {
         }
         if let Some(evidence) = components.fused_decompose_evidence.clone() {
             query = query.with_fused_decompose_evidence(evidence);
+        }
+        if operation == Op::FusedTensorRowSum {
+            let groups = components.tensor_row_sum_groups.clone().ok_or_else(|| {
+                GpuAllocationQueryError::UnsupportedEvidence {
+                    operation: "fused tensor row sum is missing row-group topology".into(),
+                }
+            })?;
+            let right_shape = components.tensor_row_sum_rhs_shape.ok_or_else(|| {
+                GpuAllocationQueryError::UnsupportedEvidence {
+                    operation: "fused tensor row sum is missing rhs shape".into(),
+                }
+            })?;
+            let left_shape = components.input_shape.ok_or_else(|| {
+                GpuAllocationQueryError::UnsupportedEvidence {
+                    operation: "fused tensor row sum is missing lhs shape".into(),
+                }
+            })?;
+            let evidence = mxx_primitives::gpu_memory::tensor_sum_rows_allocation_evidence(
+                params,
+                left_shape,
+                right_shape,
+                &groups,
+                range,
+            )
+            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+            query = query.with_tensor_row_sum_evidence(evidence);
         }
         if operation == Op::Trapdoor {
             query = query.with_trapdoor_evidence(
@@ -4553,6 +4584,7 @@ impl GpuDcrtBackend {
         &mut self,
         request: FusedBatchRequest<GpuFleetMatrix, GpuFleetSmallMatrix>,
         range: ColumnRange,
+        binding_port: usize,
     ) -> Result<FusedBatchOutput<GpuFleetMatrix, GpuFleetSmallMatrix>, PolyBackendError> {
         if self.devices.len() != 1 || range.is_empty() || self.frozen_plan.is_some() {
             return Err(PolyBackendError::UnsupportedPlacement);
@@ -4566,7 +4598,7 @@ impl GpuDcrtBackend {
         };
         let columns = metadata
             .output_layout_metadata
-            .first()
+            .get(binding_port)
             .ok_or(PolyBackendError::InvalidConstantShape)?
             .columns;
         let replicas = match &request {

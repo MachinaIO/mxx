@@ -697,6 +697,10 @@ pub struct GpuWarmupProfileRequest {
     /// Keeping this on the request prevents a provider from silently
     /// substituting a device-local representative for a peer/staged job.
     pub route_resolver: Option<GpuWarmupRouteResolverData>,
+    /// Fused output port whose physical layout binds this local union job.
+    /// `None` is the canonical value for ordinary (single-output) jobs;
+    /// fused jobs must carry the exact port selected by fixed dispatch.
+    pub binding_port: Option<usize>,
     pub fragment: GpuWarmupFragmentClass,
     /// Sampler/cache settings that affect both allocation and elapsed time.
     /// `cache_identity` is an opaque, canonical digest supplied by the native
@@ -1254,6 +1258,10 @@ pub struct GpuWarmupProfileKey {
     pub cache_state: GpuWarmupCacheState,
     pub route: GpuWarmupRoute,
     pub route_descriptor: GpuExecutionRouteDescriptor,
+    /// Fused union binding port. Distinct output ports can share all range
+    /// and route coordinates while requiring different output geometry.
+    #[serde(default)]
+    pub binding_port: Option<usize>,
     pub fragment: GpuWarmupFragmentClass,
     pub timing_scope: GpuWarmupTimingScope,
 }
@@ -1273,6 +1281,7 @@ impl GpuWarmupProfileKey {
             self.cache_state == other.cache_state &&
             self.route == other.route &&
             self.route_descriptor == other.route_descriptor &&
+            self.binding_port == other.binding_port &&
             self.fragment == other.fragment &&
             self.timing_scope == other.timing_scope
     }
@@ -2056,6 +2065,7 @@ impl GpuWarmupSessionProfileCache {
             key.executed_range_class != request.executed_range_class ||
             key.route != request.route ||
             key.route_descriptor != request.route_descriptor ||
+            key.binding_port != request.binding_port ||
             key.fragment != request.fragment ||
             key.retry_cap != request.retry_cap ||
             key.cache_identity != request.cache_identity ||
@@ -3823,6 +3833,7 @@ mod warmup_profile_tests {
                 crate::gpu_column_policy::GpuFragmentClass::Full,
             ),
             route_resolver: None,
+            binding_port: None,
             fragment: GpuWarmupFragmentClass::Whole,
             retry_cap: None,
             cache_identity: None,
@@ -4098,6 +4109,7 @@ mod warmup_profile_tests {
             cache_state: request.cache_state,
             route: GpuWarmupRoute::DeviceLocal,
             route_descriptor: request.route_descriptor,
+            binding_port: None,
             fragment: GpuWarmupFragmentClass::Whole,
             timing_scope: request.timing_scope,
         };
@@ -4107,6 +4119,57 @@ mod warmup_profile_tests {
         assert_eq!(cached.time_seconds, 1.0);
         assert_eq!(cached.workspace_bytes, 20);
         assert_eq!(provider.calls.get(), 1);
+    }
+
+    #[test]
+    fn session_cache_exact_request_requires_matching_binding_port_in_both_directions() {
+        let make_key = |request: &GpuWarmupProfileRequest| GpuWarmupProfileKey {
+            effective_domain: CanonicalWarmupProfileDomain::MatrixAdd,
+            implementation_variant: GpuWarmupEffectiveVariant::Ordinary,
+            operation_identity: request.signature.operation,
+            noninterpolated_shape: Vec::new(),
+            native_parameters: vec![
+                request.signature.shape_class,
+                request.signature.instance_class,
+            ],
+            device: request.device_identity.clone(),
+            executed_range_start: request.executed_range_start,
+            executed_range_class: request.executed_range_class,
+            retry_cap: request.retry_cap,
+            cache_identity: request.cache_identity,
+            cache_state: request.cache_state,
+            route: request.route,
+            route_descriptor: request.route_descriptor,
+            binding_port: request.binding_port,
+            fragment: request.fragment,
+            timing_scope: request.timing_scope,
+        };
+
+        for (stored_port, mismatching_port) in [(Some(0), Some(1)), (Some(1), Some(0))] {
+            let mut stored_request = request(2);
+            stored_request.binding_port = stored_port;
+            let key = make_key(&stored_request);
+            let profile =
+                GpuWarmupProfile::measured_for_domain(key.effective_domain, 1.0, 20).unwrap();
+            let mut cache = GpuWarmupSessionProfileCache::new();
+            cache
+                .insert_profile(
+                    key.clone(),
+                    stored_request.tile_width,
+                    stored_request.range.clone(),
+                    profile,
+                )
+                .unwrap();
+
+            assert!(cache.exact_profile_for_request(&key, &stored_request).unwrap().is_some());
+
+            let mut mismatching_request = stored_request.clone();
+            mismatching_request.binding_port = mismatching_port;
+            assert!(matches!(
+                cache.exact_profile_for_request(&key, &mismatching_request),
+                Err(GpuWarmupProfileError::InvalidMeasurement(_))
+            ));
+        }
     }
 }
 
@@ -4133,6 +4196,7 @@ mod canonical_profile_table_tests {
                 crate::gpu_column_policy::ColumnRange { start: 2, end: 6 },
                 crate::gpu_column_policy::GpuFragmentClass::Full,
             ),
+            binding_port: None,
             fragment: GpuWarmupFragmentClass::Whole,
             timing_scope: GpuWarmupTimingScope::LocalJob,
         }

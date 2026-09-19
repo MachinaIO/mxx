@@ -350,7 +350,7 @@ fn jobs_over_ranges(
     jobs
 }
 
-fn fused_union_jobs_for_wave(
+pub(crate) fn fused_union_jobs_for_wave(
     schedules_by_port: &[Vec<GpuColumnSchedule>],
     instance: usize,
     logical_wave: usize,

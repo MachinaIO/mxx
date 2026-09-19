@@ -60,6 +60,35 @@ pub enum GpuMemoryOperation {
     FusedPreimageBatch,
 }
 
+/// Native implementation selected by `tensor_sum_rows` for one row grouping.
+///
+/// The limits are part of the primitive contract, rather than a warmup
+/// heuristic.  Keeping this decision here makes the allocator query and the
+/// production dispatch use the same topology.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TensorRowSumImplementation {
+    FusedKernel,
+    MaterializedTensor,
+}
+
+impl TensorRowSumImplementation {
+    pub const MAX_GROUPS: usize = 16;
+    pub const MAX_TERMS: usize = 32;
+
+    pub fn for_groups(groups: &[Vec<usize>]) -> Self {
+        let terms = groups.iter().map(Vec::len).sum::<usize>();
+        if groups.len() > Self::MAX_GROUPS || terms > Self::MAX_TERMS {
+            Self::MaterializedTensor
+        } else {
+            Self::FusedKernel
+        }
+    }
+
+    pub fn is_materialized(self) -> bool {
+        matches!(self, Self::MaterializedTensor)
+    }
+}
+
 impl GpuMemoryOperation {
     /// Canonical registry used by warmup coverage tests and provider
     /// dispatch.  Keeping this list next to the operation enum makes adding a
@@ -312,6 +341,7 @@ pub enum GpuNativeMemoryEvidence {
     Preimage(PreimageAllocationEvidence),
     Trapdoor(TrapdoorAllocationEvidence),
     FusedDecompose(FusedDecomposeAllocationEvidence),
+    TensorRowSum(TensorRowSumAllocationEvidence),
 }
 
 impl GpuMatrixMemoryQuery {
@@ -405,6 +435,14 @@ impl GpuMatrixMemoryQuery {
         self.native_evidence = Some(GpuNativeMemoryEvidence::FusedDecompose(evidence));
         self
     }
+
+    pub fn with_tensor_row_sum_evidence(
+        mut self,
+        evidence: TensorRowSumAllocationEvidence,
+    ) -> Self {
+        self.native_evidence = Some(GpuNativeMemoryEvidence::TensorRowSum(evidence));
+        self
+    }
 }
 
 /// Why a query cannot be certified by the currently exposed native contract.
@@ -476,6 +514,227 @@ pub enum GpuMemoryQueryError {
     Native(String),
     ArithmeticOverflow,
     MissingNativeEvidence { operation: GpuMemoryOperation },
+}
+
+/// Complete allocation topology for the native `tensor_sum_rows` call.
+///
+/// The materialized implementation first creates the full tensor and then
+/// lowers the row groups through bounded row-sum batches.  Those owners are
+/// deliberately represented as scratch/workspace instead of being hidden in
+/// an output-only exact footprint.  Conversion owners are likewise retained
+/// when either source is supplied in coefficient format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TensorRowSumAllocationEvidence {
+    pub implementation: TensorRowSumImplementation,
+    pub left_shape: GpuMemoryShape,
+    pub right_shape: GpuMemoryShape,
+    pub output_shape: GpuMemoryShape,
+    pub tensor_allocation: Option<GpuMatrixAllocationBytes>,
+    pub tensor_shape: Option<GpuMemoryShape>,
+    pub left_conversion_allocation: Option<GpuMatrixAllocationBytes>,
+    pub right_conversion_allocation: Option<GpuMatrixAllocationBytes>,
+    pub row_sum_output: GpuMatrixAllocationBytes,
+    pub row_sum_workspace_bytes: usize,
+    pub row_sum_workspace_owners: usize,
+    pub input_resident_bytes: usize,
+    pub output_range: GpuMemoryRange,
+}
+
+impl TensorRowSumAllocationEvidence {
+    pub fn total_scratch_bytes(&self) -> Result<usize, GpuMemoryQueryError> {
+        let conversions = self
+            .left_conversion_allocation
+            .map_or(0, |allocation| allocation.total_bytes)
+            .checked_add(
+                self.right_conversion_allocation.map_or(0, |allocation| allocation.total_bytes),
+            )
+            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+        let tensor = self.tensor_allocation.map_or(0, |allocation| allocation.total_bytes);
+        conversions
+            .checked_add(tensor)
+            .and_then(|bytes| bytes.checked_add(self.row_sum_workspace_bytes))
+            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)
+    }
+
+    pub fn memory_evidence(&self) -> Result<GpuOperationMemoryEvidence, GpuMemoryQueryError> {
+        let output = self.row_sum_output;
+        let scratch_bytes = self.total_scratch_bytes()?;
+        Ok(GpuOperationMemoryEvidence::Certified(GpuOperationMemoryFootprint {
+            operation: GpuMemoryOperation::FusedTensorRowSum,
+            shape: self.left_shape,
+            output_shape: self.output_shape,
+            output_range: self.output_range,
+            output: Some(output),
+            output_bytes: output.data_bytes,
+            input_resident_bytes: self.input_resident_bytes,
+            auxiliary_bytes: output.aux_bytes.saturating_add(output.event_bytes),
+            scratch_bytes,
+            control_bytes: 0,
+            cache_bytes: 0,
+            assembly_bytes: 0,
+            transfer_bytes: 0,
+            host_bytes: 0,
+            pinned_host_bytes: 0,
+        }))
+    }
+}
+
+/// Query the complete native allocation envelope for `tensor_sum_rows`.
+///
+/// The returned evidence is certified rather than exact because CUDA event
+/// allocator overhead is represented by each queried matrix owner and the
+/// fallback's bounded reduction may release owners between launches.  The
+/// envelope intentionally sums every owner topology, so it is safe for
+/// admission even when the allocator reuses released slabs differently.
+pub fn tensor_sum_rows_allocation_evidence(
+    params: &GpuDCRTPolyParams,
+    left_shape: GpuMemoryShape,
+    right_shape: GpuMemoryShape,
+    groups: &[Vec<usize>],
+    output_range: GpuMemoryRange,
+) -> Result<TensorRowSumAllocationEvidence, GpuMemoryQueryError> {
+    if groups.is_empty() ||
+        groups.iter().any(Vec::is_empty) ||
+        left_shape.level != right_shape.level ||
+        left_shape.range.start >= left_shape.range.end ||
+        right_shape.range.start >= right_shape.range.end
+    {
+        return Err(GpuMemoryQueryError::InvalidRange);
+    }
+    let left_columns = left_shape.range.width();
+    let right_columns = right_shape.range.width();
+    let tensor_columns =
+        left_columns.checked_mul(right_columns).ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+    if output_range.start >= output_range.end || output_range.end > tensor_columns {
+        return Err(GpuMemoryQueryError::InvalidRange);
+    }
+    let tensor_rows = left_shape
+        .rows
+        .checked_mul(right_shape.rows)
+        .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+    if groups.iter().flatten().any(|&row| row >= tensor_rows) {
+        return Err(GpuMemoryQueryError::InvalidRange);
+    }
+    let output_shape = GpuMemoryShape {
+        level: left_shape.level,
+        rows: groups.len(),
+        columns: tensor_columns,
+        is_ntt: true,
+        range: output_range,
+    };
+    let row_sum_output = params
+        .matrix_allocation_bytes(left_shape.level, groups.len(), tensor_columns, true)
+        .map_err(GpuMemoryQueryError::Native)?;
+    let implementation = TensorRowSumImplementation::for_groups(groups);
+    let left_conversion_allocation = (!left_shape.is_ntt)
+        .then(|| {
+            params.matrix_allocation_bytes(left_shape.level, left_shape.rows, left_columns, true)
+        })
+        .transpose()
+        .map_err(GpuMemoryQueryError::Native)?;
+    let right_conversion_allocation = (!right_shape.is_ntt)
+        .then(|| {
+            params.matrix_allocation_bytes(right_shape.level, right_shape.rows, right_columns, true)
+        })
+        .transpose()
+        .map_err(GpuMemoryQueryError::Native)?;
+    let (tensor_allocation, row_sum_workspace_bytes, row_sum_workspace_owners) = if implementation
+        .is_materialized()
+    {
+        let tensor = params
+            .matrix_allocation_bytes(left_shape.level, tensor_rows, tensor_columns, true)
+            .map_err(GpuMemoryQueryError::Native)?;
+        // Mirror the production bounded `sum_rows` lowering.  Every batch
+        // output and pairwise partial addition is retained in the certified
+        // envelope; this may be above the instantaneous high-water mark but
+        // cannot under-account a driver that delays an asynchronous release.
+        let one_row = params
+            .matrix_allocation_bytes(left_shape.level, 1, tensor_columns, true)
+            .map_err(GpuMemoryQueryError::Native)?
+            .total_bytes;
+        let mut workspace = 0usize;
+        let mut owners = 0usize;
+        let mut batch_groups = 0usize;
+        let mut batch_terms = 0usize;
+        let flush_batch = |workspace: &mut usize,
+                           owners: &mut usize,
+                           batch_groups: &mut usize,
+                           batch_terms: &mut usize|
+         -> Result<(), GpuMemoryQueryError> {
+            if *batch_groups == 0 {
+                return Ok(());
+            }
+            let allocation = params
+                .matrix_allocation_bytes(left_shape.level, *batch_groups, tensor_columns, true)
+                .map_err(GpuMemoryQueryError::Native)?
+                .total_bytes;
+            *workspace =
+                workspace.checked_add(allocation).ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+            *owners = owners.checked_add(1).ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+            *batch_groups = 0;
+            *batch_terms = 0;
+            Ok(())
+        };
+        for group in groups {
+            if group.len() > TensorRowSumImplementation::MAX_TERMS {
+                flush_batch(&mut workspace, &mut owners, &mut batch_groups, &mut batch_terms)?;
+                let partials = group.len().div_ceil(TensorRowSumImplementation::MAX_TERMS);
+                workspace = workspace
+                    .checked_add(
+                        one_row
+                            .checked_mul(partials)
+                            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+                workspace = workspace
+                    .checked_add(
+                        one_row
+                            .checked_mul(partials.saturating_sub(1))
+                            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?,
+                    )
+                    .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+                owners = owners
+                    .checked_add(partials.saturating_mul(2).saturating_sub(1))
+                    .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+            } else {
+                if batch_groups > 0 &&
+                    (batch_groups == TensorRowSumImplementation::MAX_GROUPS ||
+                        batch_terms + group.len() > TensorRowSumImplementation::MAX_TERMS)
+                {
+                    flush_batch(&mut workspace, &mut owners, &mut batch_groups, &mut batch_terms)?;
+                }
+                batch_groups += 1;
+                batch_terms += group.len();
+            }
+        }
+        flush_batch(&mut workspace, &mut owners, &mut batch_groups, &mut batch_terms)?;
+        (Some(tensor), workspace, owners)
+    } else {
+        (None, 0, 0)
+    };
+    let tensor_shape = tensor_allocation.map(|_| GpuMemoryShape {
+        level: left_shape.level,
+        rows: tensor_rows,
+        columns: tensor_columns,
+        is_ntt: true,
+        range: GpuMemoryRange::new(0, tensor_columns)
+            .expect("validated tensor columns are nonzero"),
+    });
+    Ok(TensorRowSumAllocationEvidence {
+        implementation,
+        left_shape,
+        right_shape,
+        output_shape,
+        tensor_allocation,
+        tensor_shape,
+        left_conversion_allocation,
+        right_conversion_allocation,
+        row_sum_output,
+        row_sum_workspace_bytes,
+        row_sum_workspace_owners,
+        input_resident_bytes: 0,
+        output_range,
+    })
 }
 
 impl fmt::Display for GpuMemoryQueryError {
@@ -722,7 +981,8 @@ pub fn query_matrix_operation_memory(
             GpuMemoryOperation::Trapdoor |
             GpuMemoryOperation::Preimage |
             GpuMemoryOperation::FusedPreimageBatch |
-            GpuMemoryOperation::FusedDecompose
+            GpuMemoryOperation::FusedDecompose |
+            GpuMemoryOperation::FusedTensorRowSum
     ) {
         return match (query.operation, query.native_evidence.clone()) {
             (
@@ -740,6 +1000,10 @@ pub fn query_matrix_operation_memory(
                 GpuMemoryOperation::FusedDecompose,
                 Some(GpuNativeMemoryEvidence::FusedDecompose(evidence)),
             ) => Ok(evidence.memory_evidence()),
+            (
+                GpuMemoryOperation::FusedTensorRowSum,
+                Some(GpuNativeMemoryEvidence::TensorRowSum(evidence)),
+            ) => evidence.memory_evidence(),
             _ => Err(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation }),
         };
     }
@@ -750,7 +1014,6 @@ pub fn query_matrix_operation_memory(
             GpuMemoryOperation::Tensor |
             GpuMemoryOperation::Concat |
             GpuMemoryOperation::FusedRowSum |
-            GpuMemoryOperation::FusedTensorRowSum |
             GpuMemoryOperation::FusedRowBlockAdd
     );
     if output_only {
@@ -1097,10 +1360,32 @@ mod tests {
                 .for_decomposition(2, 0)
                 .with_batch_topology(2, 2)
                 .with_crt_topology(2, 1);
-            let query = if operation == GpuMemoryOperation::FusedDecompose {
-                query.with_fused_decompose_evidence(fused_decompose.clone())
-            } else {
-                query
+            let query = match operation {
+                GpuMemoryOperation::FusedDecompose => {
+                    query.with_fused_decompose_evidence(fused_decompose.clone())
+                }
+                GpuMemoryOperation::FusedTensorRowSum => {
+                    // This operation's native allocation contract includes
+                    // the tensor owner and row-reduction workspace.  Supply
+                    // the same valid topology that production queries use;
+                    // output-only accounting is intentionally not accepted.
+                    let groups = vec![vec![0], vec![1]];
+                    let output_range = GpuMemoryRange::new(0, 4).unwrap();
+                    let tensor_evidence = tensor_sum_rows_allocation_evidence(
+                        &params,
+                        shape,
+                        shape,
+                        &groups,
+                        output_range,
+                    )
+                    .expect("tensor row sum must expose native allocation evidence");
+                    let output_shape =
+                        GpuMemoryShape::new(0, groups.len(), 4, true, output_range).unwrap();
+                    query
+                        .with_output_shape(output_shape, output_range)
+                        .with_tensor_row_sum_evidence(tensor_evidence)
+                }
+                _ => query,
             };
             let evidence = query_matrix_operation_memory(&params, query)
                 .unwrap_or_else(|error| panic!("{operation} query failed: {error}"));
@@ -1157,5 +1442,57 @@ mod tests {
         assert_eq!(evidence.output_shape.columns, 3);
         assert_eq!(evidence.output_range.width(), 3);
         assert!(evidence.scratch_bytes > 0);
+    }
+
+    #[test]
+    fn tensor_row_sum_native_boundaries_select_and_account_the_real_topology() {
+        let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
+        let left = GpuMemoryShape::new(0, 2, 2, false, GpuMemoryRange::new(0, 2).unwrap()).unwrap();
+        let right =
+            GpuMemoryShape::new(0, 2, 2, false, GpuMemoryRange::new(0, 2).unwrap()).unwrap();
+        let output_range = GpuMemoryRange::new(0, 4).unwrap();
+        // The 2x2 tensor has only four valid rows.  Repeat valid rows while
+        // crossing the group/term boundaries so this test exercises dispatch
+        // selection rather than an invalid-row rejection.
+        let groups16 = (0..16).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups17 = (0..17).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups32 = (0..16).map(|row| vec![row % 4, row % 4]).collect::<Vec<_>>();
+        let mut groups33 = groups32.clone();
+        groups33[0].push(0);
+
+        assert_eq!(groups17.len(), 17);
+        assert_eq!(groups17.iter().map(Vec::len).sum::<usize>(), 17);
+        assert_eq!(groups33.len(), 16);
+        assert_eq!(groups33.iter().map(Vec::len).sum::<usize>(), 33);
+
+        for (groups, expected) in [
+            (&groups16, TensorRowSumImplementation::FusedKernel),
+            (&groups32, TensorRowSumImplementation::FusedKernel),
+            (&groups17, TensorRowSumImplementation::MaterializedTensor),
+            (&groups33, TensorRowSumImplementation::MaterializedTensor),
+        ] {
+            let evidence =
+                tensor_sum_rows_allocation_evidence(&params, left, right, groups, output_range)
+                    .unwrap();
+            assert_eq!(evidence.implementation, expected);
+            assert_eq!(evidence.output_shape.rows, groups.len());
+            if expected.is_materialized() {
+                assert!(evidence.tensor_allocation.is_some());
+                assert_eq!(evidence.tensor_shape.unwrap().rows, 4);
+                assert_eq!(evidence.tensor_shape.unwrap().columns, 4);
+                assert!(evidence.left_conversion_allocation.is_some());
+                assert!(evidence.right_conversion_allocation.is_some());
+                assert!(evidence.row_sum_workspace_bytes > 0);
+                assert!(matches!(
+                    evidence.memory_evidence().unwrap(),
+                    GpuOperationMemoryEvidence::Certified(_)
+                ));
+            } else {
+                assert!(evidence.tensor_allocation.is_none());
+                assert_eq!(evidence.row_sum_workspace_bytes, 0);
+                assert!(evidence.left_conversion_allocation.is_some());
+                assert!(evidence.right_conversion_allocation.is_some());
+            }
+        }
     }
 }

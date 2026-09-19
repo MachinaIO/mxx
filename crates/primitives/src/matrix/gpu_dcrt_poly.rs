@@ -1,5 +1,6 @@
 use crate::{
     element::PolyElem,
+    gpu_memory::TensorRowSumImplementation,
     matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix},
     parallel_iter,
     poly::{
@@ -1188,6 +1189,13 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Return the exact native topology selected by `tensor_sum_rows` for
+    /// the supplied row groups.  Warmup allocation queries call this same
+    /// decision so a fallback can never be advertised as output-only.
+    pub fn tensor_sum_rows_implementation(rows: &[Vec<usize>]) -> TensorRowSumImplementation {
+        TensorRowSumImplementation::for_groups(rows)
+    }
+
     fn convert_modulus(&self, destination: &GpuDCRTPolyParams, round_scale: bool) -> Self {
         assert_eq!(
             self.params.ring_dimension(),
@@ -3763,10 +3771,10 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         debug_assert_eq!(self.level, rhs.level, "tensor row sums require same level");
         debug_assert_eq!(self.is_ntt, rhs.is_ntt, "tensor row sums require same domain");
         let columns = self.ncol.checked_mul(rhs.ncol).expect("tensor columns overflow");
-        let terms = rows.iter().map(Vec::len).sum::<usize>();
-        if rows.len() > 16 || terms > 32 {
+        if Self::tensor_sum_rows_implementation(rows).is_materialized() {
             return self.tensor(rhs).sum_rows(rows);
         }
+        let terms = rows.iter().map(Vec::len).sum::<usize>();
         let out = Self::new_empty_with_state(
             &self.params,
             rows.len(),
@@ -5295,6 +5303,95 @@ mod tests {
                 drop(output);
                 assert_eq!(transposed.to_cpu_matrix(), expected.transpose());
             }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_tensor_sum_rows_allocation_topology_matches_native_selection() {
+        let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        let left_cpu = random_cpu_matrix(&params, 5, 2, &mut random);
+        let right_cpu = random_cpu_matrix(&params, 4, 2, &mut random);
+        let left = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu);
+        let right = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right_cpu);
+        let left_shape = crate::gpu_memory::GpuMemoryShape::new(
+            left.level(),
+            left.nrow,
+            left.ncol,
+            left.is_ntt,
+            crate::gpu_memory::GpuMemoryRange::new(0, left.ncol).unwrap(),
+        )
+        .unwrap();
+        let right_shape = crate::gpu_memory::GpuMemoryShape::new(
+            right.level(),
+            right.nrow,
+            right.ncol,
+            right.is_ntt,
+            crate::gpu_memory::GpuMemoryRange::new(0, right.ncol).unwrap(),
+        )
+        .unwrap();
+        // Deliberately repeat valid tensor rows so the two fallback boundaries
+        // are exercised independently of the available tensor-row count.
+        let groups16 = (0..16).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups17 = (0..17).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups32 = (0..16).map(|row| vec![row % 4, row % 4]).collect::<Vec<_>>();
+        let mut groups33 = groups32.clone();
+        groups33[0].push(0);
+        assert_eq!(groups17.len(), 17);
+        assert_eq!(groups17.iter().map(Vec::len).sum::<usize>(), 17);
+        assert_eq!(groups33.len(), 16);
+        assert_eq!(groups33.iter().map(Vec::len).sum::<usize>(), 33);
+        for (groups, expected_topology) in [
+            (groups16, TensorRowSumImplementation::FusedKernel),
+            (groups17, TensorRowSumImplementation::MaterializedTensor),
+            (groups32, TensorRowSumImplementation::FusedKernel),
+            (groups33, TensorRowSumImplementation::MaterializedTensor),
+        ] {
+            let expected = left_cpu.tensor(&right_cpu).sum_rows(&groups);
+            let topology = GpuDCRTPolyMatrix::tensor_sum_rows_implementation(&groups);
+            assert_eq!(topology, expected_topology);
+            let evidence = crate::gpu_memory::tensor_sum_rows_allocation_evidence(
+                &gpu_params,
+                left_shape,
+                right_shape,
+                &groups,
+                crate::gpu_memory::GpuMemoryRange::new(0, 4).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(evidence.implementation, topology);
+            let device = *gpu_params.gpu_ids().first().unwrap();
+            crate::poly::dcrt::gpu::gpu_default_mempool_reset_high_water(device).unwrap();
+            let before =
+                crate::poly::dcrt::gpu::gpu_default_mempool_usage(device).unwrap().used_current;
+            let output = left.tensor_sum_rows(&right, &groups);
+            assert_eq!(output.to_cpu_matrix(), expected);
+            let measured_peak = crate::poly::dcrt::gpu::gpu_default_mempool_usage(device)
+                .unwrap()
+                .used_high
+                .saturating_sub(before);
+            let hard_envelope = evidence
+                .total_scratch_bytes()
+                .unwrap()
+                .saturating_add(evidence.row_sum_output.total_bytes);
+            assert!(measured_peak > 0);
+            assert!(hard_envelope > 0);
+            // CUDA pool high-water includes allocator-page rounding, while
+            // the native query reports logical owner bytes.  The measured
+            // peak must nevertheless include the complete result owner.
+            assert!(measured_peak >= evidence.row_sum_output.total_bytes);
+            if topology.is_materialized() {
+                assert!(evidence.tensor_allocation.is_some());
+                assert!(evidence.total_scratch_bytes().unwrap() > 0);
+                assert!(evidence.row_sum_workspace_owners > 0);
+            } else {
+                assert!(evidence.tensor_allocation.is_none());
+                let has_conversion = !left_shape.is_ntt || !right_shape.is_ntt;
+                assert_eq!(evidence.total_scratch_bytes().unwrap() > 0, has_conversion);
+            }
+            drop(output);
         }
     }
 

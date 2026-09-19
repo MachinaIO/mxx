@@ -14,27 +14,46 @@ use mxx_ir_core::IntExpr;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
-/// Apply a sequence of public factors to an accumulator.
+/// Reduces a non-empty value list with a balanced pairwise tree.
 ///
-/// `MulPublic` is public-left: every factor is the public LHS and the running
-/// accumulator is the RHS. The first RHS may be private; subsequent gates
-/// preserve that RHS knowledge while remaining valid public-left operations.
+/// An odd final value is carried to the next level unchanged, matching
+/// [`BalancedProductSchedule`]. `None` represents an empty input product.
+fn reduce_balanced<T, E>(
+    mut level: Vec<T>,
+    mut multiply: impl FnMut(T, T) -> Result<T, E>,
+) -> Result<Option<T>, E> {
+    while level.len() > 1 {
+        let mut next_level = Vec::with_capacity(level.len().div_ceil(2));
+        let mut children = level.into_iter();
+        while let Some(lhs) = children.next() {
+            if let Some(rhs) = children.next() {
+                next_level.push(multiply(lhs, rhs)?);
+            } else {
+                next_level.push(lhs);
+            }
+        }
+        level = next_level;
+    }
+    Ok(level.pop())
+}
+
+/// Apply a balanced product of public factors to an accumulator.
+///
+/// Public factors are first reduced pairwise, carrying an odd final factor to
+/// the next level unchanged. The resulting public root is then applied once to
+/// `rhs`, which may be private. Thus `k` public factors require
+/// `ceil(log2(k)) + 1` multiplication depth for `k > 1`, rather than a linear
+/// chain of `k` accumulator updates. `MulPublic` remains public-left at every
+/// gate, including the final action on `rhs`.
 fn apply_public_product(
     builder: &mut ExponentLutProgramBuilder,
     rhs: WireId,
     leaves: Vec<Operand<WireId>>,
 ) -> Result<WireId, ProgramValidationError> {
-    if leaves.is_empty() {
-        return Err(ProgramValidationError::InvalidStructure("empty product".into()));
-    }
-    let mut state = Operand::Scalar(rhs);
-    for lhs in leaves {
-        state = Operand::Scalar(builder.mul_public(lhs, state)?);
-    }
-    match state {
-        Operand::Scalar(wire) => Ok(wire),
-        Operand::Member { .. } => unreachable!("public product accumulator is scalar"),
-    }
+    let public_root =
+        reduce_balanced(leaves, |lhs, rhs| builder.mul_public(lhs, rhs).map(Operand::Scalar))?
+            .ok_or_else(|| ProgramValidationError::InvalidStructure("empty product".into()))?;
+    builder.mul_public(public_root, Operand::Scalar(rhs))
 }
 
 fn transform_columns(transform: &BinaryTransformMatrix) -> Option<Vec<usize>> {
@@ -474,10 +493,21 @@ impl SparseLwrPrfProgram {
         output_labels: Vec<PrfLabel>,
         transforms: Vec<BinaryTransformMatrix>,
     ) -> Result<Self, PrfError> {
+        // Derive the exact width of the encryptor-supplied public vector D0.
+        // A transform selects from these columns, so accepting any other
+        // transform width would make its indices invalid at evaluation time.
         profile.validate()?;
         let d_columns = profile.transform_column_count()?;
+
+        // Branches are numbered globally by flattening (bucket, local slot).
+        // This same index addresses both a branch transform and its private
+        // selector member.
         let branch_count =
             block_count.checked_mul(bucket_width).ok_or(PrfError::InvalidSparseLwrBlock)?;
+
+        // Output labels are Program identities, not merely display metadata:
+        // every label must be present exactly once so that output order and
+        // transform ownership remain unambiguous.
         if output_labels.is_empty() ||
             output_labels.iter().enumerate().any(|(index, label)| {
                 output_labels[..index].iter().any(|previous| previous == label)
@@ -485,6 +515,12 @@ impl SparseLwrPrfProgram {
         {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
+
+        // `transforms` is label-major. Each label owns one binary transform
+        // for every flattened branch, and every transform must select from
+        // exactly the D0 column domain derived above. Both row-vector and
+        // column-vector representations are accepted and normalized later by
+        // `transform_columns`.
         let transform_count =
             branch_count.checked_mul(output_labels.len()).ok_or(PrfError::InvalidSparseLwrBlock)?;
         if bucket_width == 0 ||
@@ -497,6 +533,11 @@ impl SparseLwrPrfProgram {
         {
             return Err(PrfError::InvalidSparseLwrBlock);
         }
+
+        // Declare the shared Program inputs once. `initial_input` starts each
+        // label's accumulator chain; `d0` contains the public exponent factors;
+        // `selector` contains one private one-hot member per flattened branch;
+        // and `identity` represents the public empty product.
         let readout = profile.canonical_readout()?;
         let mut builder = ExponentLutProgramBuilder::new();
         let initial_input = builder.input(AttributeKnowledge::PrivatePayload)?;
@@ -504,6 +545,9 @@ impl SparseLwrPrfProgram {
             .input_family(IntExpr::constant(d_columns), AttributeKnowledge::PublicPayload)?;
         let selector = builder.rhs_family(IntExpr::constant(branch_count))?;
         let identity = builder.input(AttributeKnowledge::PublicPayload)?;
+
+        // The bucket chain stays in exponent representation. This terminal LUT
+        // performs the sole conversion to the coefficient-valued PRF output.
         let values = readout.clone();
         let lut = builder.register_lut(LutTable::unary(
             profile.native_width(),
@@ -515,24 +559,39 @@ impl SparseLwrPrfProgram {
         let mut selection_families = Vec::with_capacity(block_count);
         let mut outputs = Vec::with_capacity(output_labels.len());
         for label_index in 0..output_labels.len() {
+            // Locate this label's contiguous branch-transform block, then
+            // begin an independent bucket chain from the shared initial input.
             let transform_offset =
                 label_index.checked_mul(branch_count).ok_or(PrfError::InvalidSparseLwrBlock)?;
             let mut state = initial_input;
             for bucket in 0..block_count {
+                // Convert the bucket-local slot range into global branch IDs.
                 let bucket_start =
                     bucket.checked_mul(bucket_width).ok_or(PrfError::InvalidSparseLwrBlock)?;
+
+                // A parallel family has one static body shape. Group branches
+                // by the number of selected D0 columns so that every member of
+                // a group executes the same number of MulPublic gates.
                 let mut grouped =
                     std::collections::BTreeMap::<usize, Vec<(usize, Vec<usize>)>>::new();
                 for local in 0..bucket_width {
                     let branch = bucket_start + local;
+                    // The 1-bits of T_(label, branch) select the D0 factors
+                    // whose exponent product represents D0 * T_(label, branch).
                     let selected = transform_columns(&transforms[transform_offset + branch])
                         .ok_or(PrfError::InvalidSparseLwrBlock)?;
                     grouped.entry(selected.len()).or_default().push((branch, selected));
                 }
+
+                // Each group is reduced independently below; `bucket_sum`
+                // combines those partial sums into the complete branch sum.
                 let mut bucket_sum = None;
                 for (leaf_count, branches) in grouped {
                     let range = FamilyRange::full(IntExpr::constant(branches.len()))?;
                     let family = builder.parallel(range, |builder, branch_index| {
+                        // `branch_index` is local to this equal-width group.
+                        // Translate it back to the flattened branch index used
+                        // by the shared selector family.
                         let branch_indices = branches
                             .iter()
                             .map(|(branch, _)| IntExpr::constant(*branch))
@@ -545,9 +604,15 @@ impl SparseLwrPrfProgram {
                             branches.first().ok_or(ProgramValidationError::InvalidFamilyRange)?;
                         let mut leaves = Vec::with_capacity(leaf_count);
                         if first_selected.is_empty() {
+                            // An all-zero transform denotes an empty product,
+                            // whose public exponent encoding is the identity.
                             leaves.push(Operand::Scalar(identity));
                         } else {
                             for column in 0..leaf_count {
+                                // At each product position, select the D0 index
+                                // belonging to the current group-local branch.
+                                // This preserves one common family body while
+                                // allowing each branch to use different columns.
                                 let indices = branches
                                     .iter()
                                     .map(|(_, selected)| IntExpr::constant(selected[column]))
@@ -561,13 +626,25 @@ impl SparseLwrPrfProgram {
                                 });
                             }
                         }
+
+                        // Multiply the previous bucket state by the public D0
+                        // factors selected by T_(label, branch). In exponent
+                        // representation their product adds the selected D0
+                        // exponents, yielding state + D0*T_(label, branch).
                         let multiplied = apply_public_product(builder, state, leaves)?;
+
+                        // Weight the candidate by its private selector. With a
+                        // one-hot selector, exactly one branch survives in each
+                        // bucket without revealing which branch was selected.
                         let weighted = builder.mul_private(
                             Operand::Scalar(multiplied),
                             Operand::Member { family: selector, index: selector_index },
                         )?;
                         Ok(Operand::Scalar(weighted))
                     })?;
+
+                    // Sum all branches with this product width, then merge the
+                    // result with the other width groups in the same bucket.
                     let reduced = builder.sum(family)?;
                     bucket_sum = Some(match bucket_sum {
                         None => reduced,
@@ -576,8 +653,15 @@ impl SparseLwrPrfProgram {
                         }
                     });
                 }
+
+                // Feed the selected branch sum into the next bucket, making
+                // buckets sequential even though branches within one bucket
+                // are represented by parallel families.
                 state = bucket_sum.ok_or(PrfError::InvalidSparseLwrBlock)?;
                 if label_index == 0 {
+                    // All labels reuse the same D0 and selector declarations.
+                    // Record bucket-facing metadata only once rather than
+                    // duplicating identical declarations for every label.
                     selection_families.push(PrfSelectionFamily {
                         selector,
                         d0,
@@ -585,9 +669,16 @@ impl SparseLwrPrfProgram {
                     });
                 }
             }
+
+            // Read the final exponent accumulator into the scalar value
+            // associated with this output label.
             outputs.push(builder.lut(Operand::Scalar(state), lut)?);
         }
         let output = *outputs.first().ok_or(PrfError::InvalidSparseLwrBlock)?;
+
+        // Freeze all ordered label roots into one immutable Program. The first
+        // root is also retained for the scalar `output` accessor, while
+        // `outputs` preserves the complete label order.
         let accumulation =
             builder.finish(outputs.iter().copied().map(Operand::Scalar).collect())?;
         Ok(Self {
@@ -986,19 +1077,29 @@ mod tests {
     }
 
     #[test]
-    fn public_product_keeps_public_factors_on_the_left() {
+    fn public_product_uses_balanced_depth_and_keeps_public_factors_on_the_left() {
+        for leaf_count in 1..=17 {
+            let schedule = BalancedProductSchedule::new(leaf_count).unwrap();
+            let mut multiplication_count = 0;
+            let depth = reduce_balanced(vec![0_usize; leaf_count], |lhs, rhs| {
+                multiplication_count += 1;
+                Ok::<_, std::convert::Infallible>(lhs.max(rhs) + 1)
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(depth, schedule.level_count() - 1);
+            assert_eq!(multiplication_count, leaf_count - 1);
+        }
+
         let mut builder = ExponentLutProgramBuilder::new();
         let private = builder.input(AttributeKnowledge::PrivatePayload).unwrap();
-        let a = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let b = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let c = builder.input(AttributeKnowledge::PublicPayload).unwrap();
-        let output = apply_public_product(
-            &mut builder,
-            private,
-            vec![Operand::Scalar(a), Operand::Scalar(b), Operand::Scalar(c)],
-        )
-        .unwrap();
-        builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        let public = (0..8)
+            .map(|_| builder.input(AttributeKnowledge::PublicPayload).unwrap())
+            .map(Operand::Scalar)
+            .collect();
+        let output = apply_public_product(&mut builder, private, public).unwrap();
+        let program = builder.finish(vec![Operand::Scalar(output)]).unwrap();
+        assert_eq!(program.wire_knowledge(output).unwrap(), AttributeKnowledge::PrivatePayload);
     }
 
     #[test]

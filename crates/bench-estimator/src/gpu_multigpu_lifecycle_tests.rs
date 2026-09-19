@@ -17,7 +17,7 @@ use mxx_dsl::{DslContext, Ring, parallel};
 use mxx_ir_core::{ParamEnv, node::ConstantMatrix, types::ConcreteMatrixType};
 use mxx_primitives::poly::{
     PolyParams,
-    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
+    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info},
 };
 use mxx_runtime::{
     Backend, RuntimeValue,
@@ -104,9 +104,10 @@ fn config(
             device_budgets: devices
                 .iter()
                 .enumerate()
-                .map(|(device, _)| GpuDeviceBudget {
+                .map(|(device, physical)| GpuDeviceBudget {
                     device,
-                    device_bytes: u64::MAX,
+                    device_bytes: gpu_memory_info(*physical).expect("query GPU memory").total
+                        as u64,
                     pinned_host_bytes: u64::MAX,
                     host_bytes: u64::MAX,
                 })

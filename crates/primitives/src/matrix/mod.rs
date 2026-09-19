@@ -863,16 +863,7 @@ impl<M: PolyMatrix> CpuSmallMatrix<M> {
         destination: &<M::P as Poly>::Params,
     ) -> Result<Self, SmallMatrixError> {
         let source_params = self.value.params();
-        if source_params.ring_dimension() != destination.ring_dimension() {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
-        let (source_basis, _, _) = source_params.to_crt();
-        let (destination_basis, _, _) = destination.to_crt();
-        if source_basis.len() > 1 &&
-            source_basis.iter().any(|prime| !destination_basis.contains(prime))
-        {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
+        self.validate_centered_rebase(destination)?;
         let source_modulus: Arc<BigUint> = source_params.modulus().into();
         let destination_modulus: Arc<BigUint> = destination.modulus().into();
         let entries = (0..self.value.size().0)
@@ -926,6 +917,34 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
     }
     fn is_on_params(&self, params: &Self::Params) -> bool {
         self.params() == params
+    }
+    /// Check the public domain in which copying signed compact coefficients
+    /// preserves destination canonicality. This is also used before sizing
+    /// the corresponding native operation.
+    fn validate_centered_rebase(&self, destination: &Self::Params) -> Result<(), SmallMatrixError> {
+        let source_basis = self.params().to_crt().0;
+        let destination_basis = destination.to_crt().0;
+        let destination_modulus: BigUint =
+            destination_basis.iter().copied().map(BigUint::from).product();
+        if self.params().ring_dimension() != destination.ring_dimension() ||
+            (!source_basis.iter().all(|prime| destination_basis.contains(prime)) &&
+                self.max_coefficient_bound() > &(destination_modulus >> 1))
+        {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        Ok(())
+    }
+    /// Re-encode a compact owner without changing its signed representation.
+    /// Device implementations override this at the primitive boundary.
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        self.validate_centered_rebase(destination)?;
+        Self::from_canonical_coefficients(
+            destination,
+            self.rows(),
+            self.columns(),
+            self.max_coefficient_bound().clone(),
+            &self.to_canonical_coefficients()?,
+        )
     }
     fn validate_metadata(
         &self,
@@ -989,6 +1008,10 @@ where
     <M::P as Poly>::Elem: PolyElem,
 {
     type Params = <M::P as Poly>::Params;
+
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        CpuSmallMatrix::centered_rebase(self, destination)
+    }
 
     fn params(&self) -> &Self::Params {
         self.value.params()

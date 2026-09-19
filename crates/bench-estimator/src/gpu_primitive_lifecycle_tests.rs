@@ -26,7 +26,7 @@ use mxx_ir_core::{
 use mxx_primitives::poly::{
     PolyParams,
     dcrt::{
-        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
+        gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info},
         params::DCRTPolyParams,
     },
 };
@@ -82,7 +82,7 @@ fn config(
             logical_to_physical_devices: vec![device as usize],
             device_budgets: vec![GpuDeviceBudget {
                 device: 0,
-                device_bytes: u64::MAX,
+                device_bytes: gpu_memory_info(device).expect("query GPU memory").total as u64,
                 pinned_host_bytes: u64::MAX,
                 host_bytes: u64::MAX,
             }],
@@ -536,13 +536,17 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
     let matrix = ring.input("matrix", (1, 3));
     let small = ring.small_matrix_input("small", (digits, 3), 255u64);
     let preimage = ring.preimage_input("preimage", (digits, 3), 255u64);
+    let preimage_rebased = preimage.clone().centered_rebase(modulus.clone());
+    let preimage_product = ring.identity(digits).mul_small_rhs(preimage_rebased.clone());
     let graph = DslContext::new("vertical-multilimb-centered-rebase")
         .output("matrix", matrix.clone().centered_rebase(modulus.clone()))
         .expect("matrix centered rebase output")
         .output("small", small.clone().centered_rebase(modulus.clone()))
         .expect("small centered rebase output")
-        .output("preimage", preimage.clone().centered_rebase(modulus.clone()))
+        .output("preimage", preimage_rebased)
         .expect("preimage centered rebase output")
+        .output("preimage-product", preimage_product)
+        .expect("preimage centered rebase product output")
         .output("block", matrix.block_mod_switch(130_817u64, vec![131_009, 130_817], 3u64))
         .expect("block modulus switch output")
         .build()
@@ -615,12 +619,41 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
     let preimage_compact_bytes = backend
         .small_matrix_to_bytes(&small_value, &compact_schema, SmallMatrixSemanticKind::Preimage)
         .expect("GPU preimage compact encoding");
+    let cpu_preimage = cpu
+        .small_matrix_from_bytes(
+            &compact_schema,
+            &preimage_compact_bytes,
+            SmallMatrixSemanticKind::Preimage,
+        )
+        .expect("CPU preimage codec oracle");
+    let product_lhs_type =
+        ConcreteMatrixType { rows: digits, columns: digits, ..full_type.clone() };
+    let product_lhs = cpu
+        .constant_matrix(&product_lhs_type, &ConstantMatrix::Identity, &ParamEnv::default())
+        .expect("CPU compact product lhs oracle");
+    let expected_preimage_product =
+        cpu.multiply_small_rhs(&product_lhs, &cpu_preimage).expect("CPU compact product oracle");
     let preimage_value = small_value.clone();
     let inputs = BTreeMap::from([
         ("matrix".to_owned(), RuntimeValue::matrix(matrix_value)),
         ("small".to_owned(), RuntimeValue::small_matrix(small_value)),
         ("preimage".to_owned(), RuntimeValue::preimage(preimage_value)),
     ]);
+    let RuntimeValue::Preimage(input_preimage) = inputs.get("preimage").expect("preimage input")
+    else {
+        panic!("preimage input changed its strict wire kind");
+    };
+    assert_eq!(
+        backend
+            .small_matrix_to_bytes(
+                input_preimage,
+                &compact_schema,
+                SmallMatrixSemanticKind::Preimage
+            )
+            .expect("strict preimage input metadata"),
+        preimage_compact_bytes,
+        "preimage input must retain its bounded witness metadata"
+    );
 
     let mut warmup_config = config(&graph, &parameters, device);
     warmup_config.contract.logical_to_physical_devices =
@@ -628,9 +661,9 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
     warmup_config.contract.device_budgets = devices
         .iter()
         .enumerate()
-        .map(|(index, _)| GpuDeviceBudget {
+        .map(|(index, device)| GpuDeviceBudget {
             device: index,
-            device_bytes: u64::MAX,
+            device_bytes: gpu_memory_info(*device).expect("query GPU memory").total as u64,
             pinned_host_bytes: u64::MAX,
             host_bytes: u64::MAX,
         })
@@ -759,13 +792,26 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
         .expect("fixed generic compact output encoding");
     assert_eq!(&bytes, &generic_compact_bytes, "small compact payload changed during rebase");
 
-    let RuntimeValue::Preimage(value) = &output.outputs["preimage"] else {
-        panic!("preimage centered rebase changed its compact wire kind");
+    let RuntimeValue::SmallMatrix(value) = &output.outputs["preimage"] else {
+        panic!("preimage centered rebase did not produce a SmallMatrix");
     };
     let bytes = backend
-        .small_matrix_to_bytes(value, &compact_schema, SmallMatrixSemanticKind::Preimage)
-        .expect("fixed preimage compact output encoding");
-    assert_eq!(&bytes, &preimage_compact_bytes, "preimage compact payload changed during rebase");
+        .small_matrix_to_bytes(value, &compact_schema, SmallMatrixSemanticKind::Generic)
+        .expect("fixed centered-rebase compact output metadata");
+    assert_eq!(&bytes, &generic_compact_bytes, "preimage compact payload changed during rebase");
+    let RuntimeValue::Matrix(actual_preimage_product) = &output.outputs["preimage-product"] else {
+        panic!("preimage centered rebase product changed its matrix wire kind");
+    };
+    assert_eq!(
+        actual_preimage_product
+            .shards()
+            .first()
+            .expect("preimage product output shard")
+            .value
+            .to_cpu_matrix(),
+        expected_preimage_product,
+        "fixed mul_small_rhs consumed the centered-rebase SmallMatrix with wrong values"
+    );
     // The provider is setup-only.  Dropping the input map at the executor
     // boundary and synchronizing here exercises native consumer lifetime
     // events before the output owners are released.

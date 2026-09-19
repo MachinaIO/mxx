@@ -309,6 +309,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial(gpu_context)]
     fn test_gpu_execute_preserves_events_across_calls_and_release_policies() {
         use super::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_backend_on};
         use crate::{
@@ -324,6 +325,8 @@ mod tests {
         use mxx_primitives::poly::PolyParams;
         use std::{collections::BTreeMap, num::NonZeroUsize};
 
+        let device = detected_gpu_device_ids()[0];
+        super::wait_for_gpu_test_context_quiescence(device);
         let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
         let ring = Ring::new(parameters.modulus().as_ref().clone(), 32);
         let generate = DslContext::new("async-release-input")

@@ -620,7 +620,7 @@ where
             .ok_or(PolyBackendError::MissingParameters(key))
     }
 
-    fn parameters_for_small_matrix(
+    pub(super) fn parameters_for_small_matrix(
         &self,
         matrix: &M::SmallMatrix,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError>
@@ -1103,23 +1103,8 @@ where
         value: &M::SmallMatrix,
         destination: &ConcreteMatrixType,
     ) -> Result<M::SmallMatrix, Self::Error> {
-        let source_basis = value.params().to_crt().0;
         let target = self.parameters(destination)?;
-        let target_basis = target.to_crt().0;
-        if source_basis.len() > 1 && source_basis.iter().any(|prime| !target_basis.contains(prime))
-        {
-            return Err(PolyBackendError::BasisConversion(
-                "multi-limb centered rebase destination must contain the source basis".into(),
-            ));
-        }
-        let payload = value.to_canonical_coefficients()?;
-        Ok(M::SmallMatrix::from_canonical_coefficients(
-            target,
-            value.rows(),
-            value.columns(),
-            value.max_coefficient_bound().clone(),
-            &payload,
-        )?)
+        Ok(value.centered_rebase(target)?)
     }
 
     fn block_mod_switch(

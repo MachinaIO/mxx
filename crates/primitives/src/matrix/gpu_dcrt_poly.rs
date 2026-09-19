@@ -180,6 +180,17 @@ pub struct GpuSmallMatrix {
     raw: *mut GpuSmallMatrixOpaque,
 }
 
+/// Exact resources required by the canonical compact importer.  The native
+/// loader uses one pageable payload and one `cudaHostAlloc` staging payload;
+/// keeping these values beside the importer prevents warmup from inventing a
+/// separate compact fixture representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuSmallMatrixImportAllocationEvidence {
+    pub device: GpuMatrixAllocationBytes,
+    pub pageable_host_bytes: usize,
+    pub pinned_host_bytes: usize,
+}
+
 /// Accounting for one compact-RHS multiplication. `lhs_eval_bytes` and
 /// `full_output_bytes` are complete authoritative owner allocations, including
 /// their data, auxiliary slabs, and deterministic event handles. The expanded
@@ -432,6 +443,36 @@ impl AsRef<GpuSmallMatrix> for GpuSmallMatrixColumnView<'_> {
     }
 }
 
+impl GpuSmallMatrixColumnView<'_> {
+    /// Query the compact owner allocation that would be created if this
+    /// borrowed range were materialized.  The view itself keeps the parent
+    /// owner's resident payload so multiplication accounting continues to
+    /// describe borrowed residency; temporary-owner accounting must instead
+    /// use this range-sized query.
+    pub fn materialization_allocation_bytes(&self) -> Result<GpuMatrixAllocationBytes, String> {
+        GpuSmallMatrix::allocation_bytes_for_shape(
+            &self.value.params,
+            self.value.rows,
+            self.value.columns,
+            self.value.magnitude_bytes,
+        )
+    }
+
+    /// Return canonical import resources for this range without charging the
+    /// source owner's full resident payload.  This is the descriptor used by
+    /// host-staged compact materialization and warmup admission.
+    pub fn canonical_import_allocation_evidence(
+        &self,
+    ) -> Result<GpuSmallMatrixImportAllocationEvidence, SmallMatrixError> {
+        GpuSmallMatrix::canonical_import_allocation_evidence(
+            &self.value.params,
+            self.value.rows,
+            self.value.columns,
+            &self.value.max_coefficient_bound,
+        )
+    }
+}
+
 impl GpuSmallMatrix {
     /// Wait only for this compact owner's last write event.
     pub fn wait_until_ready(&self) {
@@ -471,13 +512,8 @@ impl GpuSmallMatrix {
         {
             return Err("compact centered rebase parameter placement mismatch".into());
         }
-        let source_basis = self.params.moduli();
-        let destination_basis = destination.moduli();
-        if source_basis.len() > 1 &&
-            source_basis.iter().any(|prime| !destination_basis.contains(prime))
-        {
-            return Err("compact centered rebase destination omits source CRT basis".into());
-        }
+        <Self as SmallPolyMatrix>::validate_centered_rebase(self, destination)
+            .map_err(|error| error.to_string())?;
         Self::allocation_bytes_for_shape(destination, self.rows, self.columns, self.magnitude_bytes)
     }
 
@@ -504,6 +540,24 @@ impl GpuSmallMatrix {
             return Err(crate::poly::dcrt::gpu::last_error_string());
         }
         Ok(allocation)
+    }
+
+    pub fn canonical_import_allocation_evidence(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        bound: &BigUint,
+    ) -> Result<GpuSmallMatrixImportAllocationEvidence, SmallMatrixError> {
+        let magnitude_bytes = Self::magnitude_bytes(bound)?;
+        let payload_bytes =
+            Self::payload_len(rows, columns, params.ring_dimension(), magnitude_bytes)?;
+        let device = Self::allocation_bytes_for_shape(params, rows, columns, magnitude_bytes)
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        Ok(GpuSmallMatrixImportAllocationEvidence {
+            device,
+            pageable_host_bytes: payload_bytes,
+            pinned_host_bytes: payload_bytes,
+        })
     }
 
     /// Return the exact canonical coefficient payload length without reading
@@ -534,18 +588,7 @@ impl GpuSmallMatrix {
         &self,
         destination: &GpuDCRTPolyParams,
     ) -> Result<Self, SmallMatrixError> {
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.params.execution_owner_id() != destination.execution_owner_id()
-        {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
-        let source_basis = self.params.moduli();
-        let destination_basis = destination.moduli();
-        if source_basis.len() > 1 &&
-            source_basis.iter().any(|prime| !destination_basis.contains(prime))
-        {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
+        self.validate_centered_rebase_destination(destination)?;
         if self.params.device_ids() != destination.device_ids() {
             return Err(SmallMatrixError::DeviceMismatch);
         }
@@ -562,6 +605,20 @@ impl GpuSmallMatrix {
         };
         check_status(status, "gpu_small_matrix_centered_rebase");
         Ok(output)
+    }
+
+    /// Validate the public centered-rebase domain without allocating or
+    /// touching CUDA state.  Warmup sizing and production execution share
+    /// this validator so a query cannot certify a parameter topology that
+    /// the native operation would reject.
+    pub fn validate_centered_rebase_destination(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), SmallMatrixError> {
+        if self.params.execution_owner_id() != destination.execution_owner_id() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        <Self as SmallPolyMatrix>::validate_centered_rebase(self, destination)
     }
 
     pub fn slice_columns(&self, start: usize, end: usize) -> Self {
@@ -934,6 +991,10 @@ impl GpuSmallMatrix {
 
 impl SmallPolyMatrix for GpuSmallMatrix {
     type Params = GpuDCRTPolyParams;
+
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        GpuSmallMatrix::centered_rebase(self, destination)
+    }
 
     fn params(&self) -> &Self::Params {
         &self.params
@@ -1355,6 +1416,33 @@ impl GpuDCRTPolyMatrix {
     /// decision so a fallback can never be advertised as output-only.
     pub fn tensor_sum_rows_implementation(rows: &[Vec<usize>]) -> TensorRowSumImplementation {
         TensorRowSumImplementation::for_groups(rows)
+    }
+
+    /// Validate the public centered-rebase domain without allocating or
+    /// touching CUDA state. Warmup sizing and production execution share this
+    /// validator so a query cannot certify an invalid source basis.
+    pub fn validate_centered_rebase_destination(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), String> {
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.execution_owner_id() != destination.execution_owner_id()
+        {
+            return Err("centered rebase requires matching dimensions and shared execution".into());
+        }
+        let source_basis = self.params.moduli();
+        let destination_basis = destination.moduli();
+        if source_basis.len() > 1 &&
+            source_basis
+                .iter()
+                .take(self.level + 1)
+                .any(|prime| !destination_basis.contains(prime))
+        {
+            return Err(
+                "multi-limb centered rebase destination must contain the source basis".into()
+            );
+        }
+        Ok(())
     }
 
     fn convert_modulus(&self, destination: &GpuDCRTPolyParams, round_scale: bool) -> Self {
@@ -4256,23 +4344,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String> {
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.params.execution_owner_id() != destination.execution_owner_id()
-        {
-            return Err("centered rebase requires matching dimensions and shared execution".into());
-        }
-        let source_basis = self.params.moduli();
-        let destination_basis = destination.moduli();
-        if source_basis.len() > 1 &&
-            source_basis
-                .iter()
-                .take(self.level + 1)
-                .any(|prime| !destination_basis.contains(prime))
-        {
-            return Err(
-                "multi-limb centered rebase destination must contain the source basis".into()
-            );
-        }
+        self.validate_centered_rebase_destination(destination)?;
         let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
         let source = coefficients.as_ref().unwrap_or(self);
         let mut output = Self::new_empty_with_state(
@@ -6964,6 +7036,16 @@ mod tests {
         )
         .unwrap();
         let view = rhs.column_view(1, 4);
+        let owner_allocation = rhs.allocation_bytes().unwrap();
+        let view_allocation = view.materialization_allocation_bytes().unwrap();
+        assert!(
+            view_allocation.total_bytes < owner_allocation.total_bytes,
+            "a narrow compact view must not charge the full parent payload"
+        );
+        let import = view.canonical_import_allocation_evidence().unwrap();
+        assert_eq!(import.device, view_allocation);
+        assert_eq!(import.pageable_host_bytes, view.as_ref().canonical_payload_bytes().unwrap());
+        assert_eq!(import.pinned_host_bytes, import.pageable_host_bytes);
         let report = view.as_ref().allocation_report(&lhs).unwrap();
         assert_eq!(report.compact_rhs_bytes, rhs.resident_payload_bytes);
         let actual = lhs.multiply_small_rhs(view.as_ref()).unwrap();

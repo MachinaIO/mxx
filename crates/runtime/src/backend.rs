@@ -2550,6 +2550,16 @@ impl std::error::Error for GpuWarmupProfileError {}
 /// device-local production range operation that fixed execution will submit;
 /// this trait is intentionally unavailable as a production-operation fallback.
 pub trait GpuWarmupProfileProvider {
+    /// Propagate the exact fixed-plan resource budgets into a backend-backed
+    /// setup provider before it constructs any representatives. Providers
+    /// without native resource ownership may leave the default as a no-op.
+    fn configure_gpu_plan_budgets(
+        &mut self,
+        _budgets: &[crate::gpu_execution_plan::GpuDeviceBudget],
+    ) -> Result<(), GpuWarmupProfileError> {
+        Ok(())
+    }
+
     /// Binds the validated operation descriptor before any candidate request
     /// is measured. A provider must not rely on caller-side profile injection
     /// to discover the production operation.
@@ -2568,6 +2578,13 @@ impl<P> GpuWarmupProfileProvider for &mut P
 where
     P: GpuWarmupProfileProvider + ?Sized,
 {
+    fn configure_gpu_plan_budgets(
+        &mut self,
+        budgets: &[crate::gpu_execution_plan::GpuDeviceBudget],
+    ) -> Result<(), GpuWarmupProfileError> {
+        (**self).configure_gpu_plan_budgets(budgets)
+    }
+
     fn register_operation(
         &mut self,
         descriptor: GpuWarmupOperationDescriptor,

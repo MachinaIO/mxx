@@ -28,9 +28,12 @@ use mxx_ir_core::{
 use mxx_primitives::{
     gpu_memory::{GpuMemoryRange, GpuMemoryShape},
     matrix::{PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
-    poly::dcrt::gpu::{
-        GpuOutOfMemory, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
-        gpu_device_memory_usage, gpu_device_runtime_identity, gpu_memory_info,
+    poly::{
+        PolyParams,
+        dcrt::gpu::{
+            GpuOutOfMemory, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
+            gpu_device_memory_usage, gpu_device_runtime_identity, gpu_memory_info,
+        },
     },
     sampler::trapdoor::gpu::{
         PreimageAllocationEvidence, PreimageCacheIdentity as NativePreimageCacheIdentity,
@@ -86,7 +89,7 @@ use num_traits::{One, ToPrimitive};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     panic::{self, AssertUnwindSafe},
     sync::{
@@ -1578,6 +1581,33 @@ impl GpuNodeMeasurementBackend {
                 _ => 1,
             };
             components.level_count = representative.concrete_argument_types.len().max(1);
+            if domain == CanonicalWarmupProfileDomain::CrtRecompose {
+                let mut allocations = Vec::new();
+                for mapped in &mapped_inputs {
+                    let Some(level) =
+                        prepared.arguments.get(mapped.operand).and_then(Option::as_ref)
+                    else {
+                        return Err(GpuMeasurementError(
+                            "CRT recomposition allocation query lacks a level owner".into(),
+                        ));
+                    };
+                    let evidence = worker
+                        .backend
+                        .source_allocation_evidence_for_range(
+                            level,
+                            mapped.range.start..mapped.range.end.min(level.size().1),
+                        )
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                    allocations.extend(evidence.allocations);
+                }
+                if allocations.len() != representative.concrete_argument_types.len() {
+                    return Err(GpuMeasurementError(
+                        "CRT recomposition source evidence does not match level count".into(),
+                    ));
+                }
+                components.source_allocations =
+                    Some(mxx_primitives::gpu_memory::GpuSourceAllocationEvidence { allocations });
+            }
             if domain == CanonicalWarmupProfileDomain::FusedTensorRowSum {
                 let groups = representative.inputs.row_groups.clone();
                 let rhs = prepared.arguments.get(1).and_then(Option::as_ref).ok_or_else(|| {
@@ -1709,6 +1739,33 @@ impl GpuNodeMeasurementBackend {
                         .compact_product_allocation_report(input, rhs, range.clone())
                         .map_err(|error| GpuMeasurementError(error.to_string()))?,
                 );
+                // The production observation normally supplies these
+                // materialization owners through merge_production_memory.
+                // Keep the same piece classifier available to query-only
+                // callers, but do not add the owners twice when the measured
+                // production job already reported them.
+                if domain == CanonicalWarmupProfileDomain::FusedCompactProduct ||
+                    worker.last_production_job.is_none()
+                {
+                    let temporary = worker
+                        .backend
+                        .compact_piece_materialization_components(
+                            rhs,
+                            range.clone(),
+                            worker.device_id,
+                        )
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                    components.replica_bytes =
+                        components.replica_bytes.checked_add(temporary.replica_bytes).ok_or_else(
+                            || GpuMeasurementError("compact temporary owners overflow".into()),
+                        )?;
+                    for (device, bytes) in temporary.per_device_bytes {
+                        let entry = components.per_device_bytes.entry(device).or_insert(0);
+                        *entry = entry.checked_add(bytes).ok_or_else(|| {
+                            GpuMeasurementError("compact per-device owners overflow".into())
+                        })?;
+                    }
+                }
                 if domain == CanonicalWarmupProfileDomain::FusedCompactProduct {
                     let report =
                         components.small_rhs_report.as_mut().expect("installed compact report");
@@ -1893,6 +1950,13 @@ impl GpuNodeMeasurementBackend {
                 add_device_bytes(owner, bytes)?;
             }
         }
+        // Operation-specific native queries may expose temporary owners that
+        // are not retained inputs (for example compact piece imports).
+        // Preserve those physical owners in the same map used by production
+        // observations; transport resources are merged separately below.
+        for (owner, bytes) in &envelope.per_device_bytes {
+            add_device_bytes(*owner, *bytes)?;
+        }
         let destination_physical = request
             .route_descriptor
             .destination_device
@@ -1907,15 +1971,10 @@ impl GpuNodeMeasurementBackend {
             .saturating_add(envelope.destination_device_bytes)
             .saturating_add(envelope.transfer_bytes);
         add_device_bytes(destination_physical, destination_bytes)?;
-        for source_route in request.route_descriptor.source_routes() {
-            if let Some(source_physical) = worker_device_ids.get(source_route.source_owner).copied()
-            {
-                add_device_bytes(source_physical, source_route.source_staging_bytes)?;
-            }
-        }
-        // Host-staged transfers retain host/pinned bytes separately; the
-        // source and destination device staging allocations above remain on
-        // their respective physical owners.  If no resident input was
+        // Host-staged transfers retain host/pinned bytes separately and are
+        // supplied by the production observation merge.  Do not add route
+        // staging here as well: production materialization already reports
+        // each source/destination owner exactly once. If no resident input was
         // available (e.g. generated constants), the destination entry still
         // records the complete native output envelope.
         envelope.per_device_bytes = per_device_bytes;
@@ -2372,21 +2431,23 @@ impl GpuNodeMeasurementBackend {
                 ),
                 output_range: None,
             };
-            let (elapsed, spread, repetitions) = Self::measure_host_boundary_repeated(
-                &mut self.workers[selected_device],
-                &self.harness,
-                &descriptor.scope,
-                descriptor.id,
-                &descriptor.bindings,
-                &representative,
-            )
-            .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
+            let (elapsed, spread, repetitions, setup_memory) =
+                Self::measure_host_boundary_repeated(
+                    &mut self.workers[selected_device],
+                    selected_device,
+                    &self.harness,
+                    &descriptor.scope,
+                    descriptor.id,
+                    &descriptor.bindings,
+                    &representative,
+                )
+                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
             let mut profile = GpuWarmupProfile::measured_with_observation(
                 elapsed,
                 0,
                 WarmupMeasurementKind::HostMeasured,
                 GpuWarmupMemoryObservations::explicit_exact_zero(),
-                GpuWarmupResidencyDelta::default(),
+                Self::setup_residency_delta(&setup_memory),
                 repetitions,
                 spread,
                 GpuWarmupProvenance::ProductionEquivalent,
@@ -2437,8 +2498,9 @@ impl GpuNodeMeasurementBackend {
                 concrete_argument_types: descriptor.concrete_argument_types.clone(),
                 concrete_output_types: descriptor.concrete_output_types.clone(),
             };
-            let (elapsed, spread, repetitions) = Self::measure_scalar_host_repeated(
+            let (elapsed, spread, repetitions, setup_memory) = Self::measure_scalar_host_repeated(
                 &mut self.workers[selected_device],
+                selected_device,
                 &node,
                 &descriptor.bindings,
                 &self.harness,
@@ -2449,7 +2511,7 @@ impl GpuNodeMeasurementBackend {
                 0,
                 WarmupMeasurementKind::HostMeasured,
                 GpuWarmupMemoryObservations::explicit_exact_zero(),
-                GpuWarmupResidencyDelta::default(),
+                Self::setup_residency_delta(&setup_memory),
                 repetitions,
                 spread,
                 GpuWarmupProvenance::ProductionEquivalent,
@@ -4341,6 +4403,22 @@ impl GpuNodeMeasurementBackend {
                 node.concrete_argument_types.len()
             )));
         }
+        // Query every compact owner as one allocation-free aggregate before
+        // constructing any of them, preserving simultaneous setup peaks.
+        let compact_types =
+            node.concrete_argument_types
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| {
+                    fixed_phase
+                        .is_none_or(|(fixed_arguments, fixed)| fixed_arguments[*index] == fixed) &&
+                        !(matches!(node.kind, NodeKind::PreimageSample { .. }) &&
+                            node.concrete_argument_types.len() >= 3 &&
+                            *index < 2)
+                })
+                .map(|(_, wire_type)| wire_type)
+                .collect::<Vec<_>>();
+        Self::preflight_compact_setup(backend, &compact_types)?;
         let mut arguments = Vec::with_capacity(node.concrete_argument_types.len());
         let mut small_arguments = Vec::with_capacity(node.concrete_argument_types.len());
         for (index, wire_type) in node.concrete_argument_types.iter().enumerate() {
@@ -4365,49 +4443,17 @@ impl GpuNodeMeasurementBackend {
                     arguments.push(Some(Arc::new(value)));
                     small_arguments.push(None);
                 }
-                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                    let parameters = backend
-                        .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
-                        .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                    let max_coefficient_bound =
-                        max_coefficient_bound.to_biguint().ok_or_else(|| {
-                            GpuMeasurementError(
-                                "compact matrix coefficient bound must be nonnegative".to_owned(),
-                            )
-                        })?;
-                    let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
-                        .map_err(|_| {
-                            GpuMeasurementError(
-                                "compact matrix bound width overflows usize".to_owned(),
-                            )
-                        })?
-                        .max(1);
-                    let payload_len = matrix
-                        .rows
-                        .checked_mul(matrix.columns)
-                        .and_then(|value| value.checked_mul(matrix.ring_dimension as usize))
-                        .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-                        .ok_or_else(|| {
-                            GpuMeasurementError(
-                                "compact matrix payload length overflows".to_owned(),
-                            )
-                        })?;
-                    let value = GpuSmallMatrix::from_canonical_coefficients(
-                        parameters
-                            .shards()
-                            .first()
-                            .expect("single-device estimator matrix needs one shard")
-                            .value
-                            .params(),
-                        matrix.rows,
-                        matrix.columns,
-                        max_coefficient_bound,
-                        &vec![0u8; payload_len],
-                    )
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                compact @ (ConcreteWireType::SmallMatrix { .. } |
+                ConcreteWireType::Preimage { .. }) => {
+                    let value =
+                        match Self::representative_runtime_value(backend, compact, bindings)? {
+                            RuntimeValue::SmallMatrix(value) | RuntimeValue::Preimage(value) => {
+                                value
+                            }
+                            _ => unreachable!("compact representative preserves its semantic kind"),
+                        };
                     arguments.push(None);
-                    small_arguments.push(Some(Arc::new(GpuFleetSmallMatrix::from(value))));
+                    small_arguments.push(Some(value));
                 }
                 _ => {
                     arguments.push(None);
@@ -4482,6 +4528,93 @@ impl GpuNodeMeasurementBackend {
             None
         };
         Ok(PreparedMeasurement { arguments, small_arguments, preimage_trapdoor, preimage_target })
+    }
+
+    fn preflight_compact_setup(
+        backend: &GpuDcrtBackend,
+        wire_types: &[&ConcreteWireType],
+    ) -> Result<(), GpuMeasurementError> {
+        let mut totals = BTreeMap::<i32, (u128, u128, u128)>::new();
+        for wire_type in wire_types {
+            let compact = match family_leaf_type(wire_type) {
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                    (matrix, max_coefficient_bound)
+                }
+                _ => continue,
+            };
+            // `parameters` is the same first registered placement consumed by
+            // the compact constructor. Never admit against another device.
+            let params = backend
+                .parameters(compact.0)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?;
+            let owner = *params.device_ids().first().ok_or_else(|| {
+                GpuMeasurementError("compact setup has no selected device owner".into())
+            })?;
+            let bound = compact.1.to_biguint().ok_or_else(|| {
+                GpuMeasurementError("compact representative bound must be nonnegative".into())
+            })?;
+            let evidence = GpuSmallMatrix::canonical_import_allocation_evidence(
+                params,
+                compact.0.rows,
+                compact.0.columns,
+                &bound,
+            )
+            .map_err(|error| GpuMeasurementError(error.to_string()))?;
+            let entry = totals.entry(owner).or_default();
+            entry.0 = entry
+                .0
+                .checked_add(evidence.device.total_bytes as u128)
+                .ok_or_else(|| GpuMeasurementError("compact setup device bytes overflow".into()))?;
+            entry.1 = entry
+                .1
+                .checked_add(evidence.pageable_host_bytes as u128)
+                .ok_or_else(|| GpuMeasurementError("compact setup host bytes overflow".into()))?;
+            entry.2 = entry
+                .2
+                .checked_add(evidence.pinned_host_bytes as u128)
+                .ok_or_else(|| GpuMeasurementError("compact setup pinned bytes overflow".into()))?;
+        }
+        if totals.is_empty() {
+            return Ok(());
+        }
+        let physical = backend.physical_device_ids();
+        let configured = backend.configured_plan_budgets();
+        for (owner, (device_bytes, host_bytes, pinned_bytes)) in totals {
+            let index = physical.iter().position(|device| *device == owner).ok_or_else(|| {
+                GpuMeasurementError(format!("compact setup owner {owner} is not in this fleet"))
+            })?;
+            let usage = gpu_device_memory_usage(owner).map_err(GpuMeasurementError)?;
+            let device_budget = configured
+                .and_then(|budgets| budgets.get(index).map(|budget| budget.device_bytes as u128))
+                .unwrap_or_else(|| {
+                    (usage.total.max(0) as u128).saturating_mul(backend.vram_percent() as u128) /
+                        100
+                });
+            if (usage.resident.max(0) as u128).saturating_add(device_bytes) > device_budget {
+                return Err(GpuMeasurementError(format!(
+                    "compact setup device allocation exceeds selected owner budget: device={owner}, required={device_bytes}, budget={device_budget}"
+                )));
+            }
+            if let Some(budgets) = configured {
+                let budget = budgets.get(index).ok_or_else(|| {
+                    GpuMeasurementError("compact setup budget count does not match fleet".into())
+                })?;
+                if host_bytes > budget.host_bytes as u128 {
+                    return Err(GpuMeasurementError(format!(
+                        "compact setup pageable staging exceeds selected owner budget: device={owner}, required={host_bytes}, budget={}",
+                        budget.host_bytes
+                    )));
+                }
+                if pinned_bytes > budget.pinned_host_bytes as u128 {
+                    return Err(GpuMeasurementError(format!(
+                        "compact setup pinned staging exceeds selected owner budget: device={owner}, required={pinned_bytes}, budget={}",
+                        budget.pinned_host_bytes
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn preimage_session_prepared(
@@ -5655,77 +5788,36 @@ impl GpuNodeMeasurementBackend {
                 .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
                 .map(RuntimeValue::matrix)
                 .map_err(|error| GpuMeasurementError(error.to_string())),
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
-                let owner = backend
-                    .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                let params = backend
+                    .parameters(matrix)
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                let params = owner
-                    .shards()
-                    .first()
-                    .ok_or_else(|| {
-                        GpuMeasurementError("compact representative has no shard".into())
-                    })?
-                    .value
-                    .params()
-                    .clone();
                 let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
                     GpuMeasurementError("compact representative bound must be nonnegative".into())
                 })?;
-                let magnitude_bytes =
-                    usize::try_from(bound.bits().div_ceil(8)).unwrap_or(usize::MAX).max(1);
-                let payload_len = matrix
-                    .rows
-                    .checked_mul(matrix.columns)
-                    .and_then(|value| value.checked_mul(matrix.ring_dimension as usize))
-                    .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-                    .ok_or_else(|| {
-                        GpuMeasurementError("compact representative is too large".into())
-                    })?;
+                let payload_len = GpuSmallMatrix::canonical_import_allocation_evidence(
+                    params,
+                    matrix.rows,
+                    matrix.columns,
+                    &bound,
+                )
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                .pageable_host_bytes;
                 let value = GpuSmallMatrix::from_canonical_coefficients(
-                    &params,
+                    params,
                     matrix.rows,
                     matrix.columns,
                     bound,
                     &vec![0u8; payload_len],
                 )
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                Ok(RuntimeValue::small_matrix(GpuFleetSmallMatrix::from(value)))
-            }
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                let owner = backend
-                    .constant_matrix(matrix, &ConstantMatrix::Zero, bindings)
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                let params = owner
-                    .shards()
-                    .first()
-                    .ok_or_else(|| {
-                        GpuMeasurementError("preimage representative has no shard".into())
-                    })?
-                    .value
-                    .params()
-                    .clone();
-                let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
-                    GpuMeasurementError("preimage representative bound must be nonnegative".into())
-                })?;
-                let magnitude_bytes =
-                    usize::try_from(bound.bits().div_ceil(8)).unwrap_or(usize::MAX).max(1);
-                let payload_len = matrix
-                    .rows
-                    .checked_mul(matrix.columns)
-                    .and_then(|value| value.checked_mul(matrix.ring_dimension as usize))
-                    .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-                    .ok_or_else(|| {
-                        GpuMeasurementError("preimage representative is too large".into())
-                    })?;
-                let value = GpuSmallMatrix::from_canonical_coefficients(
-                    &params,
-                    matrix.rows,
-                    matrix.columns,
-                    bound,
-                    &vec![0u8; payload_len],
-                )
-                .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                Ok(RuntimeValue::preimage(GpuFleetSmallMatrix::from(value)))
+                let value = GpuFleetSmallMatrix::from(value);
+                Ok(if matches!(wire_type, ConcreteWireType::Preimage { .. }) {
+                    RuntimeValue::preimage(value)
+                } else {
+                    RuntimeValue::small_matrix(value)
+                })
             }
             ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. } => {
                 let sigma = sigma
@@ -5849,6 +5941,55 @@ impl GpuNodeMeasurementBackend {
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
     ) -> Result<PreparedHostPrimitive, GpuMeasurementError> {
+        let mut compact_types = Vec::new();
+        match node.kind {
+            NodeKind::Input { .. } => {
+                if let Some(output) = node.concrete_output_types.first() {
+                    compact_types.push(output);
+                }
+            }
+            NodeKind::TrapdoorPublic => {
+                if let Some(input) = node.concrete_argument_types.first() {
+                    compact_types.push(input);
+                }
+            }
+            NodeKind::FamilyPack { .. } => {
+                if let Some(input) = node.concrete_argument_types.first() {
+                    compact_types.push(input);
+                } else if let Some(ConcreteWireType::IndexedFamily { element, .. }) =
+                    node.concrete_output_types.first()
+                {
+                    compact_types.push(element);
+                }
+            }
+            NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => {
+                if let Some(input) = node.concrete_argument_types.first() {
+                    compact_types.push(input);
+                } else if let Some(output) = node.concrete_output_types.first() {
+                    compact_types.push(output);
+                }
+            }
+            NodeKind::Select { count } => {
+                let count = count
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| GpuMeasurementError("select count does not fit usize".into()))?;
+                let choices = if node.concrete_argument_types.len() > 1 {
+                    node.concrete_argument_types.iter().skip(1).take(count).collect::<Vec<_>>()
+                } else {
+                    node.concrete_output_types.first().into_iter().cycle().take(count).collect()
+                };
+                let mut seen = HashSet::new();
+                for choice in choices {
+                    if seen.insert(choice) {
+                        compact_types.push(choice);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Self::preflight_compact_setup(backend, &compact_types)?;
         let mut prepared = PreparedHostPrimitive {
             typed_inputs: None,
             trapdoor: None,
@@ -6098,16 +6239,18 @@ impl GpuNodeMeasurementBackend {
 
     fn measure_scalar_host_repeated(
         worker: &mut GpuMeasurementWorker,
+        logical_device: usize,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
         harness: &MeasurementHarnessConfig,
-    ) -> Result<(f64, f64, usize), GpuMeasurementError> {
+    ) -> Result<(f64, f64, usize, GpuWarmupMemoryObservations), GpuMeasurementError> {
         if harness.measured_iterations == 0 {
             return Err(GpuMeasurementError(
                 "host warmup measurement requires at least one measured repetition".into(),
             ));
         }
         let prepared = Self::prepare_host_primitive(&mut worker.backend, node, bindings)?;
+        let setup_memory = Self::host_setup_memory(&worker.backend, &prepared, logical_device)?;
         for _ in 0..harness.warm_up_iterations {
             Self::run_prepared_host_primitive(node, bindings, &prepared)?;
         }
@@ -6126,17 +6269,291 @@ impl GpuNodeMeasurementBackend {
         } else {
             0.0
         };
-        Ok((mean, spread, samples.len()))
+        Ok((mean, spread, samples.len(), setup_memory))
+    }
+
+    fn host_setup_memory(
+        backend: &GpuDcrtBackend,
+        prepared: &PreparedHostPrimitive,
+        logical_device: usize,
+    ) -> Result<GpuWarmupMemoryObservations, GpuMeasurementError> {
+        fn visit(
+            backend: &GpuDcrtBackend,
+            value: &RuntimeValue<GpuDcrtBackend>,
+            logical_device: usize,
+            matrices: &mut HashSet<usize>,
+            compacts: &mut HashSet<usize>,
+            secrets: &mut HashSet<usize>,
+            observations: &mut GpuWarmupMemoryObservations,
+        ) -> Result<(), GpuMeasurementError> {
+            match value {
+                RuntimeValue::Matrix(matrix) => {
+                    if !matrices.insert(Arc::as_ptr(matrix) as usize) {
+                        return Ok(());
+                    }
+                    for (device, bytes) in backend
+                        .resident_allocation_bytes_by_device(matrix)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    {
+                        let identity =
+                            gpu_device_runtime_identity(device).map_err(GpuMeasurementError)?;
+                        let owner = GpuWarmupDeviceIdentity::new(
+                            logical_device,
+                            format!(
+                                "uuid={}-{}-sm{}.{}-mem{}",
+                                identity.uuid,
+                                identity.name,
+                                identity.compute_major,
+                                identity.compute_minor,
+                                identity.total_global_memory
+                            ),
+                            format!(
+                                "{}:driver{}:runtime{}",
+                                identity.native_kernel_revision,
+                                identity.driver_version,
+                                identity.runtime_version
+                            ),
+                        )
+                        .with_context_generation(identity.context_generation);
+                        let entry = observations.affected_devices.entry(owner).or_default();
+                        *entry = entry.checked_add(bytes as u64).ok_or_else(|| {
+                            GpuMeasurementError("host setup device bytes overflow".into())
+                        })?;
+                    }
+                }
+                RuntimeValue::Trapdoor { secret, public, .. } => {
+                    // Public A and the retained secret owners are real setup
+                    // residency.  Deduplicate Arc-backed values because a
+                    // trapdoor can be referenced by several host containers.
+                    visit(
+                        backend,
+                        &RuntimeValue::Matrix(public.clone()),
+                        logical_device,
+                        matrices,
+                        compacts,
+                        secrets,
+                        observations,
+                    )?;
+                    if let Some(secret) = secret {
+                        if secrets.insert(Arc::as_ptr(secret) as usize) {
+                            for (device, bytes) in secret
+                                .retained_allocation_bytes_by_device()
+                                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                            {
+                                let identity = gpu_device_runtime_identity(device)
+                                    .map_err(GpuMeasurementError)?;
+                                let owner = GpuWarmupDeviceIdentity::new(
+                                    logical_device,
+                                    format!(
+                                        "uuid={}-{}-sm{}.{}-mem{}",
+                                        identity.uuid,
+                                        identity.name,
+                                        identity.compute_major,
+                                        identity.compute_minor,
+                                        identity.total_global_memory
+                                    ),
+                                    format!(
+                                        "{}:driver{}:runtime{}",
+                                        identity.native_kernel_revision,
+                                        identity.driver_version,
+                                        identity.runtime_version
+                                    ),
+                                )
+                                .with_context_generation(identity.context_generation);
+                                let entry = observations.affected_devices.entry(owner).or_default();
+                                *entry = entry.checked_add(bytes as u64).ok_or_else(|| {
+                                    GpuMeasurementError("host setup trapdoor bytes overflow".into())
+                                })?;
+                            }
+                        }
+                    }
+                }
+                RuntimeValue::SmallMatrix(compact) | RuntimeValue::Preimage(compact) => {
+                    if !compacts.insert(Arc::as_ptr(compact) as usize) {
+                        return Ok(());
+                    }
+                    for shard in compact.shards() {
+                        let allocation =
+                            shard.value.allocation_bytes().map_err(GpuMeasurementError)?;
+                        let identity = gpu_device_runtime_identity(shard.device_id)
+                            .map_err(GpuMeasurementError)?;
+                        let owner = GpuWarmupDeviceIdentity::new(
+                            logical_device,
+                            format!(
+                                "uuid={}-{}-sm{}.{}-mem{}",
+                                identity.uuid,
+                                identity.name,
+                                identity.compute_major,
+                                identity.compute_minor,
+                                identity.total_global_memory
+                            ),
+                            format!(
+                                "{}:driver{}:runtime{}",
+                                identity.native_kernel_revision,
+                                identity.driver_version,
+                                identity.runtime_version
+                            ),
+                        )
+                        .with_context_generation(identity.context_generation);
+                        let entry = observations.affected_devices.entry(owner).or_default();
+                        *entry =
+                            entry.checked_add(allocation.total_bytes as u64).ok_or_else(|| {
+                                GpuMeasurementError("host setup compact bytes overflow".into())
+                            })?;
+                        // Canonical import buffers are pageable/pinned
+                        // temporaries. They are dropped after setup and must
+                        // not become persistent residency deltas.
+                    }
+                }
+                RuntimeValue::IndexedFamily(values) => {
+                    for value in values {
+                        visit(
+                            backend,
+                            value,
+                            logical_device,
+                            matrices,
+                            compacts,
+                            secrets,
+                            observations,
+                        )?;
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+        let mut observations = GpuWarmupMemoryObservations {
+            evidence: MemoryEvidenceKind::ExactQuery,
+            ..Default::default()
+        };
+        let mut matrices = HashSet::new();
+        let mut compacts = HashSet::new();
+        let mut secrets = HashSet::new();
+        for value in prepared
+            .typed_inputs
+            .as_ref()
+            .into_iter()
+            .flat_map(|(inputs, _, _)| inputs.values())
+            .chain(prepared.trapdoor.iter())
+            .chain(prepared.family_inputs.iter())
+            .chain(prepared.choices.iter())
+        {
+            visit(
+                backend,
+                value,
+                logical_device,
+                &mut matrices,
+                &mut compacts,
+                &mut secrets,
+                &mut observations,
+            )?;
+        }
+        Ok(observations)
+    }
+
+    /// Inventory the owners that are already live for a host-visible boundary.
+    /// The boundary's input is the prepared measurement value; manufacturing a
+    /// representative from the output type here would allocate an unrelated
+    /// GPU owner and charge it to host setup.
+    fn host_boundary_setup_memory(
+        backend: &GpuDcrtBackend,
+        prepared: &PreparedMeasurement,
+        logical_device: usize,
+    ) -> Result<GpuWarmupMemoryObservations, GpuMeasurementError> {
+        let mut observations = GpuWarmupMemoryObservations {
+            evidence: MemoryEvidenceKind::ExactQuery,
+            ..Default::default()
+        };
+        for value in prepared.arguments.iter().flatten() {
+            for (device, bytes) in backend
+                .resident_allocation_bytes_by_device(value)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
+            {
+                let identity = gpu_device_runtime_identity(device).map_err(GpuMeasurementError)?;
+                let owner = GpuWarmupDeviceIdentity::new(
+                    logical_device,
+                    format!(
+                        "uuid={}-{}-sm{}.{}-mem{}",
+                        identity.uuid,
+                        identity.name,
+                        identity.compute_major,
+                        identity.compute_minor,
+                        identity.total_global_memory
+                    ),
+                    format!(
+                        "{}:driver{}:runtime{}",
+                        identity.native_kernel_revision,
+                        identity.driver_version,
+                        identity.runtime_version
+                    ),
+                )
+                .with_context_generation(identity.context_generation);
+                let entry = observations.affected_devices.entry(owner).or_default();
+                *entry = entry.checked_add(bytes as u64).ok_or_else(|| {
+                    GpuMeasurementError("host boundary input bytes overflow".into())
+                })?;
+            }
+        }
+        for value in prepared.small_arguments.iter().flatten() {
+            for shard in value.shards() {
+                let allocation = shard.value.allocation_bytes().map_err(GpuMeasurementError)?;
+                let identity =
+                    gpu_device_runtime_identity(shard.device_id).map_err(GpuMeasurementError)?;
+                let owner = GpuWarmupDeviceIdentity::new(
+                    logical_device,
+                    format!(
+                        "uuid={}-{}-sm{}.{}-mem{}",
+                        identity.uuid,
+                        identity.name,
+                        identity.compute_major,
+                        identity.compute_minor,
+                        identity.total_global_memory
+                    ),
+                    format!(
+                        "{}:driver{}:runtime{}",
+                        identity.native_kernel_revision,
+                        identity.driver_version,
+                        identity.runtime_version
+                    ),
+                )
+                .with_context_generation(identity.context_generation);
+                let entry = observations.affected_devices.entry(owner).or_default();
+                *entry = entry.checked_add(allocation.total_bytes as u64).ok_or_else(|| {
+                    GpuMeasurementError("host boundary compact bytes overflow".into())
+                })?;
+                // Compact canonical-import staging is temporary setup memory;
+                // only the retained compact owner belongs in the residency
+                // observation.
+            }
+        }
+        Ok(observations)
+    }
+
+    fn setup_residency_delta(memory: &GpuWarmupMemoryObservations) -> GpuWarmupResidencyDelta {
+        // `memory` contains only owners retained beyond setup.  In particular,
+        // canonical import/upload staging is deliberately omitted by the
+        // setup inventories above because those pageable/pinned buffers are
+        // dropped before the timed phase.
+        GpuWarmupResidencyDelta {
+            affected_devices: memory
+                .affected_devices
+                .iter()
+                .map(|(device, bytes)| (device.clone(), *bytes as i64))
+                .collect(),
+            host_bytes: memory.host_bytes as i64,
+            pinned_host_bytes: memory.pinned_host_bytes as i64,
+        }
     }
 
     fn measure_host_boundary_repeated(
         worker: &mut GpuMeasurementWorker,
+        logical_device: usize,
         config: &MeasurementHarnessConfig,
         scope: &mxx_ir_core::FrozenGraphScopeId,
         id: mxx_ir_core::types::NodeId,
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
-    ) -> Result<(f64, f64, usize), GpuMeasurementError> {
+    ) -> Result<(f64, f64, usize, GpuWarmupMemoryObservations), GpuMeasurementError> {
         if config.measured_iterations == 0 {
             return Err(GpuMeasurementError(
                 "host warmup measurement requires at least one measured repetition".into(),
@@ -6156,6 +6573,11 @@ impl GpuNodeMeasurementBackend {
         // Preparation is setup work.  In particular, a matrix upload made to
         // build the representative must never be charged to the host core.
         let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)?;
+        // Account only for owners retained by the actual prepared input.  In
+        // particular, PolynomialFromValues and PackPolynomialCoefficients
+        // have no GPU output owner during their host-only phase.
+        let mut setup_memory =
+            Self::host_boundary_setup_memory(&worker.backend, &prepared, logical_device)?;
         let matrix_type = representative
             .concrete_output_types
             .iter()
@@ -6181,6 +6603,24 @@ impl GpuNodeMeasurementBackend {
             }
             _ => Vec::new(),
         };
+        // The downloaded polynomial remains live for every host repetition and
+        // is therefore part of setup residency.  Count its vector storage and
+        // the native limbs represented by each BigUint without constructing a
+        // second GPU value merely to measure the boundary.
+        let downloaded_bytes = downloaded.iter().try_fold(
+            downloaded.capacity().saturating_mul(std::mem::size_of::<num_bigint::BigUint>()),
+            |total, value| {
+                total
+                    .checked_add(value.to_bytes_le().len())
+                    .ok_or_else(|| GpuMeasurementError("boundary host buffer overflow".into()))
+            },
+        )?;
+        let downloaded_bytes = u64::try_from(downloaded_bytes)
+            .map_err(|_| GpuMeasurementError("boundary host buffer exceeds u64".into()))?;
+        setup_memory.host_bytes = setup_memory
+            .host_bytes
+            .checked_add(downloaded_bytes)
+            .ok_or_else(|| GpuMeasurementError("boundary host buffer overflow".into()))?;
         let evaluate = |value: &mxx_ir_core::IntExpr| {
             value.evaluate(bindings).map_err(|error| GpuMeasurementError(error.to_string()))
         };
@@ -6260,7 +6700,7 @@ impl GpuNodeMeasurementBackend {
                 "host warmup timing must be finite and positive".into(),
             ));
         }
-        Ok((mean, spread, samples.len()))
+        Ok((mean, spread, samples.len(), setup_memory))
     }
 
     /// Measure one validated structural dispatch through the shared
@@ -7214,6 +7654,19 @@ impl GpuNodeMeasurementBackend {
 }
 
 impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
+    fn configure_gpu_plan_budgets(
+        &mut self,
+        budgets: &[mxx_runtime::gpu_execution_plan::GpuDeviceBudget],
+    ) -> Result<(), GpuWarmupProfileError> {
+        for worker in &mut self.workers {
+            worker
+                .backend
+                .configure_gpu_plan_budgets(budgets)
+                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     fn register_operation(
         &mut self,
         descriptor: GpuWarmupOperationDescriptor,
@@ -10192,7 +10645,7 @@ mod tests {
         use mxx_dsl::{DslContext, Mat, Ring};
         use mxx_ir_core::node::ConcatAxis;
         use mxx_primitives::poly::dcrt::gpu::{
-            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
+            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
         };
         use mxx_runtime::{
             Backend, RuntimeValue,
@@ -10264,7 +10717,7 @@ mod tests {
                 logical_to_physical_devices: vec![device as usize],
                 device_budgets: vec![GpuDeviceBudget {
                     device: 0,
-                    device_bytes: u64::MAX,
+                    device_bytes: gpu_memory_info(device).expect("query GPU memory").total as u64,
                     pinned_host_bytes: u64::MAX,
                     host_bytes: u64::MAX,
                 }],
@@ -10382,7 +10835,7 @@ mod tests {
         use mxx_dsl::{DslContext, Mat, Ring};
         use mxx_ir_core::node::{ConcatAxis, IndexRange};
         use mxx_primitives::poly::dcrt::gpu::{
-            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
+            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
         };
         use mxx_runtime::{
             Backend, RuntimeValue,
@@ -10471,7 +10924,7 @@ mod tests {
                 logical_to_physical_devices: vec![device as usize],
                 device_budgets: vec![GpuDeviceBudget {
                     device: 0,
-                    device_bytes: u64::MAX,
+                    device_bytes: gpu_memory_info(device).expect("query GPU memory").total as u64,
                     pinned_host_bytes: u64::MAX,
                     host_bytes: u64::MAX,
                 }],

@@ -336,6 +336,13 @@ pub struct GpuMatrixMemoryQuery {
     /// the evidence for admission diagnostics but are never confused with
     /// operation scratch or the new output owner.
     pub input_resident_bytes: usize,
+    /// Exact native allocations of source owners cloned by the operation.
+    /// Each entry is queried from the actual source basis, level, range and
+    /// representation; destination parameters must never be used as a proxy.
+    pub source_allocations: Option<GpuSourceAllocationEvidence>,
+    /// `ModulusSwitch` performs the coefficient-domain conversion clone even
+    /// for a coefficient-domain input.  `ModulusReduce` does not.
+    pub modulus_conversion_round_scale: bool,
     /// Decomposition-only parameters.  They are ignored by other families.
     pub base_bits: u32,
     pub dropped_moduli: usize,
@@ -351,6 +358,22 @@ pub struct GpuMatrixMemoryQuery {
     /// Generic matrix allocation bytes are deliberately insufficient for
     /// these operations.
     pub native_evidence: Option<GpuNativeMemoryEvidence>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuSourceAllocationEvidence {
+    pub allocations: Vec<GpuMatrixAllocationBytes>,
+}
+
+impl GpuSourceAllocationEvidence {
+    fn total_bytes(&self) -> Result<usize, GpuMemoryQueryError> {
+        if self.allocations.is_empty() {
+            return Err(GpuMemoryQueryError::InvalidRange);
+        }
+        self.allocations.iter().try_fold(0usize, |total, allocation| {
+            total.checked_add(allocation.total_bytes).ok_or(GpuMemoryQueryError::ArithmeticOverflow)
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -385,6 +408,8 @@ impl GpuMatrixMemoryQuery {
             output_columns,
             output_is_ntt,
             input_resident_bytes: 0,
+            source_allocations: None,
+            modulus_conversion_round_scale: false,
             base_bits: 0,
             dropped_moduli: 0,
             batch_count: 1,
@@ -410,6 +435,16 @@ impl GpuMatrixMemoryQuery {
         self.output_is_ntt = output_shape.is_ntt;
         self.output_shape = output_shape;
         self.output_range = output_range;
+        self
+    }
+
+    pub fn with_source_allocations(mut self, evidence: GpuSourceAllocationEvidence) -> Self {
+        self.source_allocations = Some(evidence);
+        self
+    }
+
+    pub fn with_modulus_conversion_round_scale(mut self, round_scale: bool) -> Self {
+        self.modulus_conversion_round_scale = round_scale;
         self
     }
 
@@ -1015,9 +1050,7 @@ fn centered_rebase_operation_footprint(
     params: &GpuDCRTPolyParams,
     query: &GpuMatrixMemoryQuery,
 ) -> Result<GpuOperationMemoryFootprint, GpuMemoryQueryError> {
-    if query.shape.level >= params.crt_depth() ||
-        query.output_shape.level >= params.crt_depth() ||
-        query.output_shape.level < query.shape.level ||
+    if query.output_shape.level >= params.crt_depth() ||
         query.shape.rows != query.output_shape.rows ||
         query.output_range.width() != query.shape.range.width()
     {
@@ -1041,17 +1074,14 @@ fn centered_rebase_operation_footprint(
         // `into_coeff_domain` clones the source owner and retains its matrix
         // descriptor/event allocation until the centered-rebase launch has
         // recorded all source consumers.
-        let source = params
-            .matrix_allocation_bytes(
-                query.shape.level,
-                query.shape.rows,
-                query.shape.range.width(),
-                false,
-            )
-            .map_err(GpuMemoryQueryError::Native)?;
+        let source = query
+            .source_allocations
+            .as_ref()
+            .ok_or(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation })?
+            .total_bytes()?;
         footprint.scratch_bytes = footprint
             .scratch_bytes
-            .checked_add(source.total_bytes)
+            .checked_add(source)
             .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
     }
     Ok(footprint)
@@ -1122,6 +1152,67 @@ pub fn query_matrix_operation_memory(
     if query.operation == GpuMemoryOperation::CenteredRebase {
         return centered_rebase_operation_footprint(params, &query)
             .map(GpuOperationMemoryEvidence::Certified);
+    }
+    if query.operation == GpuMemoryOperation::BlockModSwitch {
+        let mut footprint = certified_operation_footprint(params, &query)?;
+        if query.shape.is_ntt {
+            let source = query
+                .source_allocations
+                .as_ref()
+                .ok_or(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation })?
+                .total_bytes()?;
+            footprint.scratch_bytes = footprint
+                .scratch_bytes
+                .checked_add(source)
+                .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+        }
+        return Ok(GpuOperationMemoryEvidence::Certified(footprint));
+    }
+    if query.operation == GpuMemoryOperation::RnsConversion {
+        let mut footprint = certified_operation_footprint(params, &query)?;
+        if query.shape.is_ntt {
+            let source = query
+                .source_allocations
+                .as_ref()
+                .ok_or(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation })?
+                .total_bytes()?;
+            footprint.scratch_bytes = footprint
+                .scratch_bytes
+                .checked_add(source)
+                .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+        }
+        return Ok(GpuOperationMemoryEvidence::Certified(footprint));
+    }
+    if query.operation == GpuMemoryOperation::ModulusConversion {
+        let mut footprint = certified_operation_footprint(params, &query)?;
+        if query.modulus_conversion_round_scale {
+            let source = query
+                .source_allocations
+                .as_ref()
+                .ok_or(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation })?
+                .total_bytes()?;
+            footprint.scratch_bytes = footprint
+                .scratch_bytes
+                .checked_add(source)
+                .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+        }
+        return Ok(GpuOperationMemoryEvidence::Certified(footprint));
+    }
+    if query.operation == GpuMemoryOperation::CrtRecompose {
+        let mut footprint = certified_operation_footprint(params, &query)?;
+        let evidence = query
+            .source_allocations
+            .as_ref()
+            .ok_or(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation })?;
+        if evidence.allocations.len() != query.level_count.max(1) {
+            return Err(GpuMemoryQueryError::MissingNativeEvidence { operation: query.operation });
+        }
+        let source = evidence.total_bytes()?;
+        footprint.scratch_bytes = footprint
+            .scratch_bytes
+            .checked_add(source)
+            .ok_or(GpuMemoryQueryError::ArithmeticOverflow)?;
+        return Ok(GpuOperationMemoryEvidence::Certified(footprint));
     }
     if matches!(query.operation, GpuMemoryOperation::Decompose | GpuMemoryOperation::FusedDecompose)
     {
@@ -1456,8 +1547,11 @@ mod tests {
         assert_eq!(footprint.control_bytes, 0);
 
         let eval_shape = GpuMemoryShape::new(0, 3, 2, true, range).unwrap();
-        let eval_query =
+        let mut eval_query =
             GpuMatrixMemoryQuery::new(GpuMemoryOperation::CenteredRebase, eval_shape, 3, 2, true);
+        eval_query.source_allocations = Some(GpuSourceAllocationEvidence {
+            allocations: vec![params.matrix_allocation_bytes(0, 3, 2, true).unwrap()],
+        });
         let GpuOperationMemoryEvidence::Certified(eval) =
             query_matrix_operation_memory(&params, eval_query).unwrap()
         else {
@@ -1533,10 +1627,41 @@ mod tests {
                     GpuMemoryOperation::FusedPreimageBatch
             )
         }) {
-            let query = GpuMatrixMemoryQuery::new(operation, shape, 2, 4, true)
+            let mut query = GpuMatrixMemoryQuery::new(operation, shape, 2, 4, true)
                 .for_decomposition(2, 0)
                 .with_batch_topology(2, 2)
                 .with_crt_topology(2, 1);
+            // CRT recomposition consumes one separately owned matrix per
+            // logical level. Keep that inventory fixture honest by cloning
+            // the source shape for each level and querying every native owner
+            // from the source basis/format, rather than supplying one generic
+            // allocation as a proxy for the whole level topology.
+            let source_allocations = if operation == GpuMemoryOperation::CrtRecompose {
+                (0..query.level_count.max(1))
+                    .map(|_| {
+                        params.matrix_allocation_bytes(
+                            shape.level,
+                            shape.rows,
+                            shape.range.width(),
+                            shape.is_ntt,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("logical CRT source clone must expose native allocation evidence")
+            } else {
+                vec![
+                    params
+                        .matrix_allocation_bytes(
+                            shape.level,
+                            shape.rows,
+                            shape.range.width(),
+                            shape.is_ntt,
+                        )
+                        .unwrap(),
+                ]
+            };
+            query.source_allocations =
+                Some(GpuSourceAllocationEvidence { allocations: source_allocations });
             let query = match operation {
                 GpuMemoryOperation::FusedDecompose => {
                     query.with_fused_decompose_evidence(fused_decompose.clone())

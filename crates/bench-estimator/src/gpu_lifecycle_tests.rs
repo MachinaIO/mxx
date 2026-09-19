@@ -16,7 +16,7 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use mxx_primitives::poly::dcrt::gpu::{
-    GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
+    GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
 };
 use mxx_runtime::{
     Backend, RuntimeValue,
@@ -317,7 +317,7 @@ fn config(
             logical_to_physical_devices: vec![device as usize],
             device_budgets: vec![GpuDeviceBudget {
                 device: 0,
-                device_bytes: u64::MAX,
+                device_bytes: gpu_memory_info(device).expect("query GPU memory").total as u64,
                 pinned_host_bytes: u64::MAX,
                 host_bytes: u64::MAX,
             }],

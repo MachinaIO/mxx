@@ -1033,6 +1033,55 @@ mod tests {
     }
 
     #[test]
+    fn cpu_compact_rebase_rejects_noncanonical_signed_copy() {
+        let source = DCRTPolyParams::new(8, 1, 7, 2, Some(vec![97]), None);
+        let target = DCRTPolyParams::new(8, 1, 5, 2, Some(vec![17]), None);
+        for value in [40i64, -40] {
+            let coefficient = if value < 0 {
+                BigUint::from(97u64 - value.unsigned_abs())
+            } else {
+                BigUint::from(value as u64)
+            };
+            let matrix = DCRTPolyMatrix::from_poly_vec(
+                &source,
+                vec![vec![DCRTPoly::from_biguints(&source, &vec![coefficient; 8])]],
+            );
+            let compact = CpuSmallMatrix::new(matrix.clone(), BigUint::from(40u8)).unwrap();
+            assert!(compact.centered_rebase(&target).is_err());
+            assert!(SmallPolyMatrix::centered_rebase(&compact, &target).is_err());
+            assert!(
+                matrix.centered_rebase(&target).is_ok(),
+                "full matrix recentering remains supported"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_compact_rebase_shares_centered_range_rule_for_noncontained_basis() {
+        let source = DCRTPolyParams::new(8, 1, 7, 2, Some(vec![97]), None);
+        let target = DCRTPolyParams::new(8, 1, 5, 2, Some(vec![17]), None);
+        let matrix = DCRTPolyMatrix::from_poly_vec(
+            &source,
+            vec![vec![DCRTPoly::from_biguints(
+                &source,
+                &(0..8).map(|_| BigUint::from(7u8)).collect::<Vec<_>>(),
+            )]],
+        );
+
+        // The source basis is not contained in the destination basis, but
+        // bound 8 is still inside the destination centered interval [-8, 8].
+        let allowed = CpuSmallMatrix::new(matrix.clone(), BigUint::from(8u8)).unwrap();
+        assert!(allowed.centered_rebase(&target).is_ok());
+        assert!(SmallPolyMatrix::centered_rebase(&allowed, &target).is_ok());
+
+        // A bound outside that interval must be rejected by the same shared
+        // validator, rather than by a basis-containment shortcut.
+        let rejected = CpuSmallMatrix::new(matrix, BigUint::from(40u8)).unwrap();
+        assert!(rejected.centered_rebase(&target).is_err());
+        assert!(SmallPolyMatrix::centered_rebase(&rejected, &target).is_err());
+    }
+
+    #[test]
     fn cpu_compact_centered_rebase_preserves_signed_values_and_bound_for_nonprefix_basis() {
         let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
         let all = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);

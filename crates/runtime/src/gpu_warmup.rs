@@ -3099,22 +3099,12 @@ fn choose_node_with_candidates(
         } else {
             Vec::new()
         };
-        let wave_phase_count = if column_work {
-            rotation_period / gcd_usize(rotation_period, wave_instances.max(1))
-        } else {
-            1
-        };
+        let wave_phase_count = rotation_period / gcd_usize(rotation_period, wave_instances.max(1));
         // Admission must use the maximum affected-device envelope over every
         // rotation phase that can actually occur in this loop.  In particular,
         // a short tail is not a full sibling wave, and a short loop must not
         // force measurement/lookup of imaginary classes beyond its end.
-        let reachable_phases = if column_work {
-            reachable_wave_phases(loop_count, wave_instances, rotation_period)
-        } else if loop_count == 0 {
-            Vec::new()
-        } else {
-            vec![(0, loop_count.min(wave_instances))]
-        };
+        let reachable_phases = reachable_wave_phases(loop_count, wave_instances, rotation_period);
         let mut job_workspace = vec![GpuResourceCost::zero(); devices];
         let mut storage_by_instance = vec![GpuResourceCost::zero(); devices];
         for (first_slot, phase_instances) in reachable_phases {
@@ -6503,6 +6493,9 @@ pub fn warmup_gpu_from_validated_with_provider_and_execution_config<P: GpuWarmup
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     let input =
         warmup_input_from_validated_with_limit_and_provider(validated, &config, Some(provider))?;
     plan_gpu_warmup(&input)
@@ -6551,6 +6544,9 @@ pub fn warmup_gpu_for_inputs_with_execution_config<
         .ok_or_else(|| {
             GpuWarmupError::ValidatedGraph("backend has no fixed GPU contract".into())
         })?;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     apply_backend_storage_contract(validated, backend, &mut config)?;
     let input =
         warmup_input_from_validated_with_limit_and_provider(validated, &config, Some(provider))?;
@@ -6603,6 +6599,9 @@ pub fn warmup_gpu_for_inputs_with_candidates_with_execution_config<
         .ok_or_else(|| {
             GpuWarmupError::ValidatedGraph("backend has no fixed GPU contract".into())
         })?;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     apply_backend_storage_contract(validated, backend, &mut config)?;
     measure_owner_candidates(validated, &config, device_candidates, owner_candidates, provider)
 }
@@ -6779,6 +6778,9 @@ pub fn warmup_gpu_from_validated_with_resident_and_provider_with_execution_confi
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     let mut input =
         warmup_input_from_validated_with_limit_and_provider(validated, &config, Some(provider))?;
     if resident_bytes.len() != input.contract.logical_to_physical_devices.len() {
@@ -6856,6 +6858,9 @@ pub fn warmup_gpu_from_validated_with_device_candidates_and_provider_with_execut
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     measure_owner_candidates(validated, &config, candidates, &BTreeMap::new(), provider)
 }
 
@@ -6927,6 +6932,9 @@ pub fn warmup_gpu_from_validated_with_device_and_layout_candidates_and_provider_
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
+    provider
+        .configure_gpu_plan_budgets(&config.contract.device_budgets)
+        .map_err(profile_provider_error)?;
     measure_owner_candidates(validated, &config, device_candidates, owner_candidates, provider)
 }
 
@@ -8101,6 +8109,50 @@ mod tests {
                 .iter()
                 .all(|node| node.cost.iter().all(|cost| cost.time.validated_intervals.is_empty()))
         );
+    }
+
+    #[test]
+    fn single_device_stage_checks_later_retained_storage_phases() {
+        let mut retained = layout(1, 2);
+        retained.id = 2;
+        retained.instance_device_stride = 1;
+        retained.owner_intervals = vec![GpuColumnInterval { device: 1, start: 0, end: 1 }];
+        let mut input = GpuWarmupInput {
+            contract: contract(2, 100),
+            layouts: vec![layout(1, 2), retained],
+            loops: vec![GpuWarmupLoop {
+                key: GpuLoopSiteKey { site: 7, shape_class: 0 },
+                loop_count: 2,
+                wave_candidates: vec![1],
+                nested: false,
+            }],
+            nodes: vec![GpuWarmupNode {
+                column_capability: ColumnCapability::SingleDevice,
+                effective_operation: EffectiveGpuOperation::TrapdoorSample,
+                storage_allocations: vec![GpuStorageAllocation {
+                    layout: 2,
+                    resource: GpuResourceCost { live: 60, ..Default::default() },
+                    ..Default::default()
+                }],
+                ..node(
+                    1,
+                    vec![
+                        GpuStageCostModel {
+                            per_output_column: GpuResourceCost {
+                                outputs: 60,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        };
+                        2
+                    ],
+                    vec![1],
+                )
+            }],
+        };
+        assert!(plan_gpu_warmup(&input).is_err(), "the second slot exceeds GPU0's budget");
+        input.loops[0].loop_count = 1;
+        assert!(plan_gpu_warmup(&input).is_ok(), "the initial phase fits on both devices");
     }
 
     #[test]

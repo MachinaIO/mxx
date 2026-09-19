@@ -281,6 +281,14 @@ noncomputable def centeredRebaseRuns {q p n rows columns : Nat}
     (input : ExactMatrix q n rows columns) (output : ExactMatrix p n rows columns) : Prop :=
   1 < p ∧ output = centeredRebase input
 
+/-- Compact rebase preserves the coefficient bound, not a preimage relation
+at the destination modulus. The output is an ordinary bounded matrix. -/
+noncomputable def compactCenteredRebaseRuns {q p n rows columns : Nat}
+    (bound : Nat) (input : ExactMatrix q n rows columns)
+    (output : ExactMatrix p n rows columns) : Prop :=
+  (q ∣ p ∨ bound ≤ p / 2) ∧ PreimageWithin input bound ∧
+    centeredRebaseRuns input output ∧ PreimageWithin output bound
+
 /-- The inverse is taken in the native residue ring, before centered lifting. -/
 noncomputable def rnsInverse (modulus : Nat) (value : Int) : Int :=
   Int.ofNat (((value : ZMod modulus)⁻¹).val)

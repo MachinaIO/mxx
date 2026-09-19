@@ -11,7 +11,7 @@ use std::os::fd::AsRawFd;
 use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fs::{self, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -198,6 +198,8 @@ pub enum FileArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
+    #[error("canonical payload size evidence is unavailable for artifact: {0:?}")]
+    SizeEvidenceUnavailable(ArtifactKey),
 }
 
 /// Durable artifact storage for production runs.
@@ -211,6 +213,9 @@ pub struct FileArtifactStore {
     active_sessions: BTreeSet<ProductionId>,
     locks: BTreeMap<ProductionId, fs::File>,
     loads: BTreeMap<ArtifactKey, usize>,
+    /// One immutable finalized snapshot, bounded to this store's current
+    /// read context. Member reads retain their own descriptor/codec checks.
+    finalized_snapshot: Option<(ProductionId, Manifest)>,
 }
 
 /// Descriptive alias for callers that prefer the storage medium in the name.
@@ -242,6 +247,7 @@ impl FileArtifactStore {
             active_sessions: BTreeSet::new(),
             locks: BTreeMap::new(),
             loads: BTreeMap::new(),
+            finalized_snapshot: None,
         })
     }
 
@@ -317,6 +323,36 @@ impl FileArtifactStore {
         read_stored_file(&path)
     }
 
+    fn validate_manifest_member(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<(), FileArtifactError> {
+        // The common family-read path borrows the validated snapshot rather
+        // than cloning the whole manifest for each member.
+        if let Some((production, manifest)) = &self.finalized_snapshot {
+            if production == &key.production {
+                let actual = manifest
+                    .artifacts
+                    .get(&key.name)
+                    .ok_or_else(|| FileArtifactError::MissingManifestArtifact(key.clone()))?;
+                if actual != descriptor {
+                    return Err(FileArtifactError::DescriptorMismatch(key.clone()));
+                }
+                return Self::validate_key_index(key, descriptor);
+            }
+        }
+        let manifest = self.load_manifest(&key.production)?;
+        let actual = manifest
+            .artifacts
+            .get(&key.name)
+            .ok_or_else(|| FileArtifactError::MissingManifestArtifact(key.clone()))?;
+        if actual != descriptor {
+            return Err(FileArtifactError::DescriptorMismatch(key.clone()));
+        }
+        Self::validate_key_index(key, descriptor)
+    }
+
     fn session(&self, production: &ProductionId) -> Result<FileSession, FileArtifactError> {
         if !self.active_sessions.contains(production) {
             return Err(FileArtifactError::SessionNotOpen(production.clone()));
@@ -340,6 +376,11 @@ impl FileArtifactStore {
         &mut self,
         production: &ProductionId,
     ) -> Result<Manifest, FileArtifactError> {
+        if let Some((id, manifest)) = &self.finalized_snapshot {
+            if id == production {
+                return Ok(manifest.clone());
+            }
+        }
         let session = self.read_session(production)?;
         if session.status != SessionStatus::Finalized {
             return Err(FileArtifactError::SessionNotFinalized(production.clone()));
@@ -374,6 +415,7 @@ impl FileArtifactStore {
         if committed != expected {
             return Err(FileArtifactError::SessionManifestMismatch(production.clone()));
         }
+        self.finalized_snapshot = Some((production.clone(), manifest.clone()));
         Ok(manifest)
     }
 
@@ -565,7 +607,85 @@ impl FileArtifactStore {
 impl ArtifactStore for FileArtifactStore {
     type Error = FileArtifactError;
 
+    fn load_payload_size(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<usize, Self::Error> {
+        self.validate_manifest_member(key, descriptor)?;
+        let path = self.artifact_path(key);
+        let io_error = |source| FileArtifactError::Io { path: path.clone(), source };
+        let decode_error = |message: &str| FileArtifactError::Decode {
+            path: path.clone(),
+            message: message.into(),
+        };
+        let mut file = fs::File::open(&path).map_err(io_error)?;
+        let file_len = file.metadata().map_err(io_error)?.len();
+        let mut raw = [0u8; 8];
+        file.read_exact(&mut raw).map_err(io_error)?;
+        let header_len = u64::from_le_bytes(raw);
+        let payload_start = 8u64
+            .checked_add(header_len)
+            .filter(|end| *end <= file_len)
+            .ok_or_else(|| decode_error("invalid artifact header length"))?;
+        // Deserialize only the existing header; payload bodies are never read.
+        let header: FileStoredHeader =
+            serde_json::from_reader((&mut file).take(header_len)).map_err(|error| {
+                FileArtifactError::Decode { path: path.clone(), message: error.to_string() }
+            })?;
+        if header.artifact_type != descriptor.artifact_type ||
+            header.availability != descriptor.availability ||
+            header.layout != descriptor.layout
+        {
+            return Err(FileArtifactError::DescriptorMismatch(key.clone()));
+        }
+        let length = file_len - payload_start;
+        if matches!(header.artifact_type, ArtifactType::Int) && header.payload_kind == 2 {
+            // Integer canonicality depends on the signed payload bytes.  The
+            // framing header alone cannot prove it, so size-only access must
+            // remain explicit rather than silently materializing the body.
+            return Err(FileArtifactError::SizeEvidenceUnavailable(key.clone()));
+        }
+        let valid_kind = match (&header.artifact_type, header.payload_kind) {
+            (ArtifactType::Matrix(_), 0) |
+            (ArtifactType::SmallMatrix { .. } | ArtifactType::Preimage { .. }, 1) |
+            (ArtifactType::Int, 2) |
+            (ArtifactType::Trapdoor { .. }, 3) |
+            (ArtifactType::TypedBlob { .. }, 4) => true,
+            (ArtifactType::Bytes { length: expected }, 2) => {
+                u64::try_from(*expected).ok() == Some(length)
+            }
+            _ => false,
+        };
+        if !valid_kind {
+            return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
+        }
+        if header.payload_kind == 3 {
+            file.seek(SeekFrom::Start(payload_start)).map_err(io_error)?;
+            file.read_exact(&mut raw).map_err(io_error)?;
+            let public_len = u64::from_le_bytes(raw);
+            let secret_length_at = payload_start
+                .checked_add(8)
+                .and_then(|n| n.checked_add(public_len))
+                .filter(|n| n.checked_add(8).is_some_and(|end| end <= file_len))
+                .ok_or_else(|| decode_error("invalid trapdoor public length"))?;
+            file.seek(SeekFrom::Start(secret_length_at)).map_err(io_error)?;
+            file.read_exact(&mut raw).map_err(io_error)?;
+            if secret_length_at.checked_add(8).and_then(|n| n.checked_add(u64::from_le_bytes(raw))) !=
+                Some(file_len)
+            {
+                return Err(decode_error("invalid trapdoor secret length"));
+            }
+        }
+        usize::try_from(length).map_err(|_| decode_error("artifact payload length overflows usize"))
+    }
+
     fn load_manifest(&mut self, production: &ProductionId) -> Result<Manifest, Self::Error> {
+        if let Some((id, manifest)) = &self.finalized_snapshot {
+            if id == production {
+                return Ok(manifest.clone());
+            }
+        }
         let _lock = self.lock_manifest_read(production)?;
         if self.session_path(production).exists() {
             return self.validate_finalized_session(production);
@@ -578,15 +698,7 @@ impl ArtifactStore for FileArtifactStore {
         key: &ArtifactKey,
         descriptor: &ManifestArtifact,
     ) -> Result<ArtifactPayload, Self::Error> {
-        let manifest = self.load_manifest(&key.production)?;
-        let manifest_artifact = manifest
-            .artifacts
-            .get(&key.name)
-            .ok_or_else(|| FileArtifactError::MissingManifestArtifact(key.clone()))?;
-        if manifest_artifact != descriptor {
-            return Err(FileArtifactError::DescriptorMismatch(key.clone()));
-        }
-        Self::validate_key_index(key, descriptor)?;
+        self.validate_manifest_member(key, descriptor)?;
         let stored = self.read_stored(key)?;
         Self::validate_stored(key, descriptor, &stored)?;
         *self.loads.entry(key.clone()).or_default() += 1;
@@ -727,21 +839,6 @@ impl SessionStore for FileArtifactStore {
         if self.active_sessions.contains(&production) {
             return Err(FileArtifactError::SessionBusy(production));
         }
-        let session_path = self.session_path(&production);
-        let session = if session_path.exists() {
-            let session: FileSession = Self::read_encoded(&session_path)?;
-            if session.descriptor != *descriptor {
-                return Err(FileArtifactError::SessionConflict(production));
-            }
-            session
-        } else {
-            FileSession {
-                descriptor: descriptor.clone(),
-                status: SessionStatus::Running,
-                transcript: Vec::new(),
-                committed_artifacts: Vec::new(),
-            }
-        };
         let lock_path = self.lock_path(&production);
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)
@@ -758,6 +855,24 @@ impl SessionStore for FileArtifactStore {
         {
             return Err(FileArtifactError::SessionBusy(production));
         }
+        // The lock must precede the first session snapshot read: another
+        // writer may have finalized between our preliminary access and this
+        // acquisition. Dropping this local lock also releases it on errors.
+        let session_path = self.session_path(&production);
+        let session = if session_path.exists() {
+            let session: FileSession = Self::read_encoded(&session_path)?;
+            if session.descriptor != *descriptor {
+                return Err(FileArtifactError::SessionConflict(production));
+            }
+            session
+        } else {
+            FileSession {
+                descriptor: descriptor.clone(),
+                status: SessionStatus::Running,
+                transcript: Vec::new(),
+                committed_artifacts: Vec::new(),
+            }
+        };
         if session.status != SessionStatus::Finalized {
             self.store_session(&session)?;
         }
@@ -959,6 +1074,18 @@ fn payload_storage_bytes(payload: &ArtifactPayload) -> Vec<u8> {
             bytes.extend_from_slice(secret_bytes);
             bytes
         }
+    }
+}
+
+fn payload_storage_len(payload: &ArtifactPayload) -> Option<usize> {
+    match payload {
+        ArtifactPayload::Matrix(bytes) |
+        ArtifactPayload::SmallMatrix(bytes) |
+        ArtifactPayload::Bytes(bytes) |
+        ArtifactPayload::TypedBlob(bytes) => Some(bytes.len()),
+        ArtifactPayload::Trapdoor { public_bytes, secret_bytes } => 16usize
+            .checked_add(public_bytes.len())
+            .and_then(|length| length.checked_add(secret_bytes.len())),
     }
 }
 
@@ -1222,6 +1349,8 @@ pub enum MemoryArtifactError {
     MissingManifestArtifact(ArtifactKey),
     #[error("artifact family index is inconsistent with its manifest: {0:?}")]
     FamilyIndexMismatch(ArtifactKey),
+    #[error("canonical payload size evidence is unavailable for artifact: {0:?}")]
+    SizeEvidenceUnavailable(ArtifactKey),
 }
 
 impl MemoryArtifactStore {
@@ -1415,6 +1544,43 @@ impl ArtifactStore for MemoryArtifactStore {
         }
         *self.loads.entry(key.clone()).or_default() += 1;
         Ok(payload.clone())
+    }
+
+    fn load_payload_size(
+        &mut self,
+        key: &ArtifactKey,
+        descriptor: &ManifestArtifact,
+    ) -> Result<usize, Self::Error> {
+        let manifest = self.load_manifest(&key.production)?;
+        let manifest_artifact = manifest
+            .artifacts
+            .get(&key.name)
+            .ok_or_else(|| MemoryArtifactError::MissingManifestArtifact(key.clone()))?;
+        if manifest_artifact != descriptor {
+            return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
+        }
+        FileArtifactStore::validate_key_index(key, descriptor).map_err(|error| match error {
+            FileArtifactError::FamilyIndexMismatch(key) => {
+                MemoryArtifactError::FamilyIndexMismatch(key)
+            }
+            _ => MemoryArtifactError::DescriptorMismatch(key.clone()),
+        })?;
+        let (artifact_type, availability, layout, payload) =
+            self.entries.get(key).ok_or_else(|| MemoryArtifactError::Missing(key.clone()))?;
+        if artifact_type != &descriptor.artifact_type ||
+            *availability != descriptor.availability ||
+            layout != &descriptor.layout
+        {
+            return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
+        }
+        if matches!(artifact_type, ArtifactType::Int) {
+            return Err(MemoryArtifactError::SizeEvidenceUnavailable(key.clone()));
+        }
+        if !payload_matches(artifact_type, payload) {
+            return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
+        }
+        payload_storage_len(payload)
+            .ok_or_else(|| MemoryArtifactError::SizeEvidenceUnavailable(key.clone()))
     }
 
     fn store(
@@ -1899,12 +2065,77 @@ mod tests {
         };
         let member_one = ArtifactKey { production, name: String::from("family"), index: Some(1) };
         fs::remove_file(store.artifact_path(&member_one)).expect("remove unrequested sibling");
+        assert_eq!(store.load_payload_size(&member_zero, &descriptor).unwrap(), 1);
+        assert_eq!(store.load_count(&member_zero), 0);
         assert_eq!(
             store.load(&member_zero, &descriptor).expect("load requested member"),
             ArtifactPayload::Bytes(vec![0])
         );
         assert_eq!(store.load_count(&member_zero), 1);
         assert_eq!(store.load_count(&member_one), 0);
+    }
+
+    #[test]
+    fn memory_size_only_validates_without_incrementing_loads() {
+        let production = production(31);
+        let artifact_type = ArtifactType::Bytes { length: 3 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(String::from("value"), descriptor.clone())]),
+        };
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let mut store = MemoryArtifactStore::default();
+        store
+            .insert(
+                key.clone(),
+                artifact_type,
+                ArtifactAvailability::Transferred,
+                ArtifactPayload::Bytes(vec![1, 2, 3]),
+            )
+            .expect("insert memory artifact");
+        store.store_manifest(manifest).expect("store memory manifest");
+        assert_eq!(store.load_payload_size(&key, &descriptor).unwrap(), 3);
+        assert_eq!(store.load_count(&key), 0);
+    }
+
+    #[test]
+    fn size_only_rejects_integer_without_canonicality_evidence() {
+        let production = production(32);
+        let artifact_type = ArtifactType::Int;
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([(String::from("value"), descriptor.clone())]),
+        };
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let mut store = MemoryArtifactStore::default();
+        store
+            .insert(
+                key.clone(),
+                artifact_type,
+                ArtifactAvailability::Transferred,
+                ArtifactPayload::Bytes(vec![1]),
+            )
+            .expect("insert integer artifact");
+        store.store_manifest(manifest).expect("store integer manifest");
+        assert!(matches!(
+            store.load_payload_size(&key, &descriptor),
+            Err(MemoryArtifactError::SizeEvidenceUnavailable(_))
+        ));
+        assert_eq!(store.load_count(&key), 0);
     }
 
     #[test]

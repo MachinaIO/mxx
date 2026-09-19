@@ -720,14 +720,18 @@ fn validate_node(
                 ConcreteWireType::Matrix(matrix) => {
                     vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..matrix })]
                 }
-                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } => {
-                    vec![ConcreteWireType::SmallMatrix {
-                        matrix: ConcreteMatrixType { modulus, ..matrix },
-                        max_coefficient_bound,
-                    }]
-                }
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
                 ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                    vec![ConcreteWireType::Preimage {
+                    if (&modulus % &matrix.modulus) != BigInt::zero() &&
+                        max_coefficient_bound > (&modulus >> 1)
+                    {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "compact centered rebase does not preserve canonical signed coefficients",
+                        );
+                    }
+                    vec![ConcreteWireType::SmallMatrix {
                         matrix: ConcreteMatrixType { modulus, ..matrix },
                         max_coefficient_bound,
                     }]
@@ -2826,22 +2830,35 @@ mod tests {
     }
 
     #[test]
+    fn compact_centered_rebase_rejects_noncanonical_shrinking() {
+        for (bound, destination, valid) in [(40, 17, false), (8, 17, true), (40, 97 * 17, true)] {
+            for preimage in [false, true] {
+                let rebased = value(
+                    NodeKind::CenteredRebase { modulus: IntExpr::constant(destination) },
+                    vec![bounded_input("source", matrix_type(97, 2, 3), bound, preimage)],
+                    vec![WireType::SmallMatrix {
+                        matrix: matrix_type(destination, 2, 3),
+                        max_coefficient_bound: IntExpr::constant(bound),
+                    }],
+                );
+                assert_eq!(
+                    validate(&graph("compact-domain", rebased), &ParamEnv::default()).is_ok(),
+                    valid
+                );
+            }
+        }
+    }
+
+    #[test]
     fn centered_rebase_preserves_compact_bounds() {
         for preimage in [false, true] {
             let source = bounded_input("source", matrix_type(17, 2, 3), 7, preimage);
             let rebased = value(
                 NodeKind::CenteredRebase { modulus: IntExpr::constant(257) },
                 vec![source],
-                vec![if preimage {
-                    WireType::Preimage {
-                        matrix: matrix_type(257, 2, 3),
-                        max_coefficient_bound: IntExpr::constant(7),
-                    }
-                } else {
-                    WireType::SmallMatrix {
-                        matrix: matrix_type(257, 2, 3),
-                        max_coefficient_bound: IntExpr::constant(7),
-                    }
+                vec![WireType::SmallMatrix {
+                    matrix: matrix_type(257, 2, 3),
+                    max_coefficient_bound: IntExpr::constant(7),
                 }],
             );
             let validated = validate(&graph("compact-rebase", rebased), &ParamEnv::default())

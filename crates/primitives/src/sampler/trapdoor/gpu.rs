@@ -176,6 +176,20 @@ impl GpuDCRTTrapdoor {
         self.d_mat_coeff.wait_until_ready();
     }
 
+    /// Exact retained owner bytes after trapdoor construction.  This is
+    /// intentionally separate from `trapdoor_allocation_evidence`, whose
+    /// certified envelope includes temporary construction products and must
+    /// not be charged as resident setup state.
+    pub fn retained_allocation_bytes(&self) -> Result<usize, String> {
+        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+            .into_iter()
+            .try_fold(0usize, |total, matrix| {
+                total
+                    .checked_add(matrix.allocation_bytes()?.total_bytes)
+                    .ok_or_else(|| "trapdoor retained allocation overflow".into())
+            })
+    }
+
     pub fn new(params: &GpuDCRTPolyParams, size: usize, sigma: f64) -> Self {
         assert_eq!(
             params.dropped_moduli(),

@@ -1506,14 +1506,13 @@ impl Preimage {
         &self.max_coefficient_bound
     }
 
-    /// Re-encodes a bounded compact matrix using the centered integer of its
-    /// complete source CRT basis while retaining its bound and compact wire
-    /// type. No full-DCRT materialization is implied by this DSL operation.
+    /// Re-encodes bounded coefficients, retaining the bound but not a
+    /// preimage relation at the destination modulus.
     #[track_caller]
-    pub fn centered_rebase(self, modulus: impl Into<IntExpr>) -> Self {
+    pub fn centered_rebase(self, modulus: impl Into<IntExpr>) -> SmallMatrix {
         let modulus = modulus.into();
         let matrix_type = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
-        let wire_type = WireType::Preimage {
+        let wire_type = WireType::SmallMatrix {
             matrix: matrix_type.clone(),
             max_coefficient_bound: self.max_coefficient_bound.clone(),
         };
@@ -1522,7 +1521,7 @@ impl Preimage {
             vec![self.value],
             vec![wire_type],
         );
-        Self {
+        SmallMatrix {
             value: node.output(0).expect("centered compact rebase"),
             matrix_type,
             max_coefficient_bound: self.max_coefficient_bound,

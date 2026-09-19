@@ -61,6 +61,7 @@ pub struct PrimitiveNames {
     pub modulus_switch: String,
     pub modulus_reduce: String,
     pub centered_rebase: String,
+    pub compact_centered_rebase: String,
     pub rns_mod_up: String,
     pub rns_mod_down: String,
     pub block_mod_switch: String,
@@ -113,6 +114,7 @@ impl Default for PrimitiveNames {
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
             centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
+            compact_centered_rebase: "MxxRuntime.compactCenteredRebaseRuns".into(),
             rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
             block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
@@ -1432,7 +1434,24 @@ impl<'a> Emitter<'a> {
                 } else {
                     &self.options.primitives.modulus_reduce
                 };
-                relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                if let Some(crate::types::ConcreteWireType::SmallMatrix {
+                    max_coefficient_bound,
+                    ..
+                }) = self.validated.scopes[scope_id]
+                    .wire_types
+                    .get(&WireRef { node: node_id, port: crate::types::Port(0) }) &&
+                    matches!(kind, NodeKind::CenteredRebase { .. })
+                {
+                    relations.push(format!(
+                        "{} {} {} {}",
+                        self.options.primitives.compact_centered_rebase,
+                        max_coefficient_bound,
+                        arg(0)?,
+                        output(0)
+                    ));
+                } else {
+                    relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                }
             }
             NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize } => {
                 append_expression_guards(modulus, env, relations);
@@ -2781,7 +2800,7 @@ mod tests {
         .unwrap();
         let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
-        assert!(artifact.source.contains("centeredRebaseRuns"));
+        assert!(artifact.source.contains("compactCenteredRebaseRuns 7"));
         assert!(artifact.source.contains("ExactMatrix 1649 8 1 1"));
         assert!(artifact.source.contains("ExactMatrix 318257 8 1 1"));
     }

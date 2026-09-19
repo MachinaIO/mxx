@@ -254,6 +254,18 @@ impl GpuProductionCompletion for GpuFleetTrapdoor {
 }
 
 impl GpuDcrtBackend {
+    /// Resolve the registered native parameters without creating a matrix
+    /// owner. Compact preparation and production use the same registry.
+    pub fn parameters(
+        &self,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<&GpuDCRTPolyParams, PolyBackendError> {
+        self.devices
+            .first()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?
+            .1
+            .parameters(matrix_type)
+    }
     fn validate_block_mod_switch_source(
         value: &GpuFleetMatrix,
         source_moduli: &[u64],
@@ -590,6 +602,7 @@ pub enum GpuAllocationEvidenceKind {
 /// the primitive's allocation contract (scratch, staging and assembly).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct GpuAllocationComponents {
+    pub source_allocations: Option<mxx_primitives::gpu_memory::GpuSourceAllocationEvidence>,
     pub fused_decompose_evidence:
         Option<mxx_primitives::gpu_memory::FusedDecomposeAllocationEvidence>,
     pub small_rhs_report:
@@ -982,6 +995,28 @@ impl GpuFleetTrapdoor {
     pub fn wait_until_ready(&self) {
         self.values.iter().for_each(GpuDCRTTrapdoor::wait_until_ready);
     }
+
+    /// Resident trapdoor owners grouped by their physical CUDA context.
+    /// Construction scratch is intentionally excluded; the primitive sampler
+    /// exposes that separate certified envelope for trapdoor operations.
+    pub fn retained_allocation_bytes_by_device(
+        &self,
+    ) -> Result<BTreeMap<i32, usize>, PolyBackendError> {
+        let mut result = BTreeMap::new();
+        for value in &self.values {
+            let device = *value
+                .r
+                .params()
+                .device_ids()
+                .first()
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let bytes =
+                value.retained_allocation_bytes().map_err(PolyBackendError::GpuCalibration)?;
+            let entry = result.entry(device).or_insert(0usize);
+            *entry = entry.checked_add(bytes).ok_or(PolyBackendError::InvalidInteger)?;
+        }
+        Ok(result)
+    }
 }
 
 fn validate_shards<T>(
@@ -1045,6 +1080,47 @@ fn compact_shard_overlaps(
         return Err(PolyBackendError::UnsupportedPlacement);
     }
     Ok(pieces)
+}
+
+/// Classify compact pieces exactly as `small_matrix_piece_on_device` does.
+/// A complete resident shard is borrowed; every other piece is materialized
+/// through the compact import path, including a local slice of a multi-piece
+/// request.  Keeping this decision pure lets resource queries and production
+/// dispatch share one placement contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CompactPieceMaterialization {
+    shard_index: usize,
+    local_start: usize,
+    local_end: usize,
+    materialize: bool,
+}
+
+fn compact_piece_materialization_plan(
+    backend: &DeviceBackend,
+    value: &GpuFleetSmallMatrix,
+    start: usize,
+    end: usize,
+) -> Result<Vec<CompactPieceMaterialization>, PolyBackendError> {
+    let ranges = compact_shard_overlaps(
+        &value
+            .shards
+            .iter()
+            .map(|shard| (shard.global_column_start, shard.value.columns()))
+            .collect::<Vec<_>>(),
+        start,
+        end,
+    )?;
+    let single_piece = ranges.len() == 1;
+    Ok(ranges
+        .into_iter()
+        .map(|(shard_index, local_start, local_end)| CompactPieceMaterialization {
+            shard_index,
+            local_start,
+            local_end,
+            materialize: !(single_piece &&
+                backend.small_matrix_is_on_active_placement(&value.shards[shard_index].value)),
+        })
+        .collect())
 }
 
 fn active_device_indices<'a>(
@@ -1527,31 +1603,45 @@ impl GpuDcrtBackend {
                             .1
                             .small_matrix_is_on_active_placement(&shard.value)
                 });
-                let staging_bytes = if resident {
-                    0
-                } else {
-                    overlapping
-                        .iter()
-                        .map(|shard| {
-                            let start = mapped.range.start.max(shard.global_column_start);
-                            let end = mapped
-                                .range
-                                .end
-                                .min(shard.global_column_start + shard.value.columns());
-                            shard
-                                .value
-                                .column_view(
-                                    start - shard.global_column_start,
-                                    end - shard.global_column_start,
-                                )
-                                .as_ref()
-                                .canonical_payload_bytes()
-                        })
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .try_fold(0usize, usize::checked_add)
-                        .ok_or(PolyBackendError::InvalidInteger)?
-                };
+                let mut source_staging_bytes = 0usize;
+                let mut host_staging_bytes = 0usize;
+                let mut pinned_host_staging_bytes = 0usize;
+                let mut piece_imports = Vec::with_capacity(overlapping.len());
+                for shard in &overlapping {
+                    let start = mapped.range.start.max(shard.global_column_start);
+                    let end =
+                        mapped.range.end.min(shard.global_column_start + shard.value.columns());
+                    let view = shard.value.column_view(
+                        start - shard.global_column_start,
+                        end - shard.global_column_start,
+                    );
+                    let source_bytes = view
+                        .materialization_allocation_bytes()
+                        .map_err(PolyBackendError::GpuCalibration)?
+                        .total_bytes;
+                    let view_ref = view.as_ref();
+                    let target =
+                        self.devices[destination].1.parameters_for_small_matrix(view_ref)?;
+                    let import = GpuSmallMatrix::canonical_import_allocation_evidence(
+                        target,
+                        view_ref.rows_count(),
+                        view_ref.columns_count(),
+                        view_ref.bound(),
+                    )
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                    piece_imports.push((source_bytes, import.clone()));
+                    if !resident {
+                        source_staging_bytes = source_staging_bytes
+                            .checked_add(source_bytes)
+                            .ok_or(PolyBackendError::InvalidInteger)?;
+                        host_staging_bytes = host_staging_bytes
+                            .checked_add(import.pageable_host_bytes)
+                            .ok_or(PolyBackendError::InvalidInteger)?;
+                        pinned_host_staging_bytes = pinned_host_staging_bytes
+                            .checked_add(import.pinned_host_bytes)
+                            .ok_or(PolyBackendError::InvalidInteger)?;
+                    }
+                }
                 let route = if resident {
                     GpuTransferRoute::Resident
                 } else {
@@ -1567,34 +1657,33 @@ impl GpuDcrtBackend {
                     source_compact: true,
                     destination_compact: request.destination_compact,
                     fragment: request.execution.fragment,
-                    source_staging_bytes: staging_bytes,
-                    host_staging_bytes: staging_bytes,
-                    pinned_host_staging_bytes: 0,
+                    source_staging_bytes,
+                    host_staging_bytes,
+                    pinned_host_staging_bytes,
                 });
                 let source_routes = overlapping
                     .iter()
-                    .map(|shard| {
+                    .zip(piece_imports)
+                    .map(|(shard, (bytes, import))| {
                         let start = mapped.range.start.max(shard.global_column_start);
                         let end =
                             mapped.range.end.min(shard.global_column_start + shard.value.columns());
                         let source_range = ColumnRange { start, end };
-                        let bytes = shard
-                            .value
-                            .column_view(
-                                start - shard.global_column_start,
-                                end - shard.global_column_start,
-                            )
-                            .as_ref()
-                            .allocation_bytes()
-                            .map_err(PolyBackendError::GpuCalibration)?
-                            .total_bytes;
                         Ok(crate::gpu_column_policy::GpuExecutionSourceRoute::new(
                             self.route_owner(shard.device_id)?,
                             source_range,
                             route,
                             if route == GpuTransferRoute::Resident { 0 } else { bytes },
-                            if route == GpuTransferRoute::HostStaging { bytes } else { 0 },
-                            0,
+                            if route == GpuTransferRoute::HostStaging {
+                                import.pageable_host_bytes
+                            } else {
+                                0
+                            },
+                            if route == GpuTransferRoute::HostStaging {
+                                import.pinned_host_bytes
+                            } else {
+                                0
+                            },
                         ))
                     })
                     .collect::<Result<Vec<_>, PolyBackendError>>()?;
@@ -1702,8 +1791,7 @@ impl GpuDcrtBackend {
                 let shard = &source.shards[index].value;
                 let view = shard.column_view(local_start, local_end);
                 let source_bytes = view
-                    .as_ref()
-                    .allocation_bytes()
+                    .materialization_allocation_bytes()
                     .map_err(PolyBackendError::GpuCalibration)?
                     .total_bytes;
                 let entry =
@@ -1804,12 +1892,18 @@ impl GpuDcrtBackend {
         for (mapped_index, mapped) in request.execution.inputs.iter().enumerate() {
             if !request.materialize_inputs {
                 let route = resolved_routes[mapped_index];
-                for source in route.source_routes() {
-                    add_resource(source.source_owner, source.source_staging_bytes, 0, 0);
+                let source_is_compact = matches!(
+                    request.sources.get(mapped.operand),
+                    Some(GpuLocalProductionSource::Compact(_))
+                );
+                if !source_is_compact {
+                    for source in route.source_routes() {
+                        add_resource(source.source_owner, source.source_staging_bytes, 0, 0);
+                    }
                 }
                 add_resource(
                     destination_owner,
-                    route.source_staging_bytes,
+                    if source_is_compact { 0 } else { route.source_staging_bytes },
                     route.host_staging_bytes,
                     route.pinned_host_staging_bytes,
                 );
@@ -2172,6 +2266,12 @@ impl GpuDcrtBackend {
         .with_crt_topology(components.level_count.max(1), 1)
         .with_input_residency(input_resident_bytes)
         .for_decomposition(params.base_bits(), params.dropped_moduli());
+        if let Some(evidence) = components.source_allocations.clone() {
+            query = query.with_source_allocations(evidence);
+        }
+        if matches!(domain, CanonicalWarmupProfileDomain::ModulusSwitch) {
+            query = query.with_modulus_conversion_round_scale(true);
+        }
         if let Some(report) = components.small_rhs_report.clone() {
             query = query.with_small_rhs_report(report);
         }
@@ -2335,6 +2435,48 @@ impl GpuDcrtBackend {
         Ok(bytes)
     }
 
+    /// Query the one local source owner materialized for a logical level and
+    /// range.  CRT recomposition may slice that level across several retained
+    /// physical shards, but production concatenates those pieces into one
+    /// local matrix before the recomposition launch.  Physical source and
+    /// transport owners remain separate route evidence.
+    pub fn source_allocation_evidence_for_range(
+        &self,
+        value: &GpuFleetMatrix,
+        local_range: Range<usize>,
+    ) -> Result<mxx_primitives::gpu_memory::GpuSourceAllocationEvidence, GpuAllocationQueryError>
+    {
+        if local_range.start >= local_range.end || local_range.end > value.columns {
+            return Err(GpuAllocationQueryError::InvalidRange);
+        }
+        let mut source_format = None;
+        for shard in &value.shards {
+            let shard_end = shard
+                .global_column_start
+                .checked_add(shard.value.col_size())
+                .ok_or(GpuAllocationQueryError::Overflow)?;
+            let start = local_range.start.max(shard.global_column_start);
+            let end = local_range.end.min(shard_end);
+            if start >= end {
+                continue;
+            }
+            source_format.get_or_insert((
+                shard.value.params(),
+                shard.value.level(),
+                shard.value.is_ntt(),
+            ));
+        }
+        let Some((params, level, is_ntt)) = source_format else {
+            return Err(GpuAllocationQueryError::InvalidRange);
+        };
+        let allocation = params
+            .matrix_allocation_bytes(level, value.rows, local_range.end - local_range.start, is_ntt)
+            .map_err(GpuAllocationQueryError::Backend)?;
+        Ok(mxx_primitives::gpu_memory::GpuSourceAllocationEvidence {
+            allocations: vec![allocation],
+        })
+    }
+
     /// Return the additional owners created when a logical input range is
     /// consumed on `destination_device`.  The production range helpers use a
     /// peer-resident copy when the source shard belongs to another device;
@@ -2474,6 +2616,55 @@ impl GpuDcrtBackend {
         total.ok_or(GpuAllocationQueryError::InvalidRange)
     }
 
+    /// Query the temporary compact owners created by the production piece
+    /// materializer.  A complete resident shard is borrowed; local slices of
+    /// a multi-piece request and every remote import allocate one destination
+    /// owner each.  Pageable/pinned import buffers belong to the route
+    /// descriptor and are deliberately not repeated in this query.
+    pub fn compact_piece_materialization_components(
+        &self,
+        value: &GpuFleetSmallMatrix,
+        local_range: Range<usize>,
+        destination_device: i32,
+    ) -> Result<GpuAllocationComponents, GpuAllocationQueryError> {
+        if local_range.start >= local_range.end || local_range.end > value.columns {
+            return Err(GpuAllocationQueryError::InvalidRange);
+        }
+        let destination = self
+            .devices
+            .iter()
+            .position(|(device, _)| *device == destination_device)
+            .ok_or(GpuAllocationQueryError::InvalidDevice)?;
+        let backend = &self.devices[destination].1;
+        let plan =
+            compact_piece_materialization_plan(backend, value, local_range.start, local_range.end)
+                .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        let mut components = GpuAllocationComponents {
+            evidence: Some(GpuAllocationEvidenceKind::CertifiedAllocationEnvelope),
+            ..GpuAllocationComponents::default()
+        };
+        for piece in plan.into_iter().filter(|piece| piece.materialize) {
+            let view = value.shards[piece.shard_index]
+                .value
+                .column_view(piece.local_start, piece.local_end);
+            let target = backend
+                .parameters_for_small_matrix(view.as_ref())
+                .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+            let view = view.as_ref();
+            let import = GpuSmallMatrix::canonical_import_allocation_evidence(
+                target,
+                view.rows_count(),
+                view.columns_count(),
+                view.bound(),
+            )
+            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+            let bytes = import.device.total_bytes;
+            let entry = components.per_device_bytes.entry(destination_device).or_insert(0);
+            *entry = entry.checked_add(bytes).ok_or(GpuAllocationQueryError::Overflow)?;
+        }
+        Ok(components)
+    }
+
     /// Query the compact-to-compact centered-rebase envelope used by the
     /// production fixed path.  This deliberately stays in the compact owner
     /// vocabulary: source shard residency is queried from each compact owner
@@ -2506,14 +2697,10 @@ impl GpuDcrtBackend {
             .1
             .parameters(output_type)
             .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
-        let source_basis = first.value.params().moduli();
-        let target_basis = target.moduli();
-        if source_basis.len() > 1 && source_basis.iter().any(|prime| !target_basis.contains(prime))
-        {
-            return Err(GpuAllocationQueryError::UnsupportedEvidence {
-                operation: "compact centered rebase destination omits source CRT basis".into(),
-            });
-        }
+        first
+            .value
+            .validate_centered_rebase(target)
+            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
         if first.value.params().ring_dimension() != target.ring_dimension() ||
             first.value.params().execution_owner_id() != target.execution_owner_id()
         {
@@ -2527,24 +2714,35 @@ impl GpuDcrtBackend {
             .copied()
             .try_fold(0usize, usize::checked_add)
             .ok_or(GpuAllocationQueryError::Overflow)?;
-        // All compact shards of one logical value carry the same bound and
-        // payload width. Query the destination allocation once for the full
-        // local job; per-shard output queries would double-count the final
-        // compact concat allocation when a job crosses producer boundaries.
-        let output_allocation = GpuSmallMatrix::allocation_bytes_for_shape(
-            target,
-            output_type.rows,
-            local_range.end - local_range.start,
-            first.value.payload_magnitude_bytes(),
-        )
-        .map_err(GpuAllocationQueryError::Backend)?;
+        // Fixed dispatch preserves each intersecting physical compact piece;
+        // there is no concatenated destination owner. Count every native
+        // allocation, including each piece's descriptor and event lifetime.
+        let mut output_bytes = 0usize;
+        let mut auxiliary_bytes = 0usize;
+        for (index, start, end) in overlaps {
+            let source = &input.shards[index].value;
+            source
+                .validate_centered_rebase(target)
+                .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+            let allocation = GpuSmallMatrix::allocation_bytes_for_shape(
+                target,
+                output_type.rows,
+                end - start,
+                source.payload_magnitude_bytes(),
+            )
+            .map_err(GpuAllocationQueryError::Backend)?;
+            output_bytes = output_bytes
+                .checked_add(allocation.data_bytes)
+                .ok_or(GpuAllocationQueryError::Overflow)?;
+            auxiliary_bytes = auxiliary_bytes
+                .checked_add(allocation.aux_bytes)
+                .and_then(|bytes| bytes.checked_add(allocation.event_bytes))
+                .ok_or(GpuAllocationQueryError::Overflow)?;
+        }
         Ok(GpuAllocationEnvelope {
             input_resident_bytes,
-            output_bytes: output_allocation.data_bytes,
-            auxiliary_bytes: output_allocation
-                .aux_bytes
-                .checked_add(output_allocation.event_bytes)
-                .ok_or(GpuAllocationQueryError::Overflow)?,
+            output_bytes,
+            auxiliary_bytes,
             scratch_bytes: 0,
             transfer_bytes: 0,
             assembly_bytes: 0,
@@ -2581,6 +2779,38 @@ impl GpuDcrtBackend {
             .or_else(|| input.shards.first())
             .ok_or(GpuAllocationQueryError::InvalidRange)?;
         let resident = self.resident_allocation_bytes(input)?;
+        if components.source_allocations.is_none() {
+            let source_clone_required = matches!(
+                domain,
+                CanonicalWarmupProfileDomain::ModulusSwitch |
+                    CanonicalWarmupProfileDomain::CenteredRebase |
+                    CanonicalWarmupProfileDomain::BlockModSwitch |
+                    CanonicalWarmupProfileDomain::RnsModUp |
+                    CanonicalWarmupProfileDomain::RnsModDown
+            );
+            if source_clone_required &&
+                (shard.value.is_ntt() || domain == CanonicalWarmupProfileDomain::ModulusSwitch)
+            {
+                // The clone is made from the original shard before the
+                // production INTT-in-place path.  Preserve its source
+                // representation here; destination/output format is not a
+                // valid proxy for this temporary owner.
+                let allocation = shard
+                    .value
+                    .params()
+                    .matrix_allocation_bytes(
+                        shard.value.level(),
+                        input.rows,
+                        local_range.end - local_range.start,
+                        shard.value.is_ntt(),
+                    )
+                    .map_err(GpuAllocationQueryError::Backend)?;
+                components.source_allocations =
+                    Some(mxx_primitives::gpu_memory::GpuSourceAllocationEvidence {
+                        allocations: vec![allocation],
+                    });
+            }
+        }
         let output_params = self
             .devices
             .first()
@@ -2588,6 +2818,12 @@ impl GpuDcrtBackend {
             .1
             .parameters(output_type)
             .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        if domain == CanonicalWarmupProfileDomain::CenteredRebase {
+            shard
+                .value
+                .validate_centered_rebase_destination(output_params)
+                .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        }
         components.input_shape = Some(
             mxx_primitives::gpu_memory::GpuMemoryShape::new(
                 shard.value.level(),
@@ -2599,11 +2835,16 @@ impl GpuDcrtBackend {
             )
             .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?,
         );
+        let output_is_ntt = if domain == CanonicalWarmupProfileDomain::ModulusReduce {
+            shard.value.is_ntt()
+        } else {
+            true
+        };
         self.allocation_envelope_for_domain(
             domain,
             output_params,
             output_params.crt_depth().saturating_sub(1),
-            shard.value.is_ntt(),
+            output_is_ntt,
             output_type.rows,
             0..output_columns,
             resident,
@@ -3913,6 +4154,14 @@ impl GpuDcrtBackend {
             .collect())
     }
 
+    /// Budgets explicitly installed for the current fixed execution plan.
+    /// Setup-time measurement uses this to admit native compact import peaks
+    /// before constructing any GPU owner; an absent plan has no host/pinned
+    /// budget contract to enforce yet.
+    pub fn configured_plan_budgets(&self) -> Option<&[GpuDeviceBudget]> {
+        self.plan_budgets.as_deref()
+    }
+
     fn runtime_shape_descriptor(
         inputs: &std::collections::BTreeMap<String, RuntimeValue<Self>>,
     ) -> Vec<(String, String)> {
@@ -4258,29 +4507,24 @@ impl GpuDcrtBackend {
         // Transfer every intersecting piece and concatenate in logical column
         // order instead of assuming that one physical shard encloses the
         // complete requested range.
-        let ranges = compact_shard_overlaps(
-            &value
-                .shards
-                .iter()
-                .map(|shard| (shard.global_column_start, shard.value.columns()))
-                .collect::<Vec<_>>(),
-            start,
-            end,
-        )?;
-        if ranges.len() == 1 {
-            let (shard_index, local_start, local_end) = ranges[0];
-            let shard = &value.shards[shard_index].value;
-            if backend.small_matrix_is_on_active_placement(shard) {
+        let plan = compact_piece_materialization_plan(backend, value, start, end)?;
+        if let [piece] = plan.as_slice() {
+            if !piece.materialize {
+                let shard = &value.shards[piece.shard_index].value;
                 // Keep the one-piece case as a borrowed CUDA view.  This is
                 // deliberately not `slice_columns`: slicing allocates and
                 // copies the compact payload even though the consumer can
                 // read the resident range directly.
-                return Ok(vec![CompactRhsPiece::View(shard.column_view(local_start, local_end))]);
+                return Ok(vec![CompactRhsPiece::View(
+                    shard.column_view(piece.local_start, piece.local_end),
+                )]);
             }
         }
-        let mut pieces = Vec::with_capacity(ranges.len());
-        for (shard_index, local_start, local_end) in ranges {
-            let view = value.shards[shard_index].value.column_view(local_start, local_end);
+        let mut pieces = Vec::with_capacity(plan.len());
+        for piece in plan {
+            let view = value.shards[piece.shard_index]
+                .value
+                .column_view(piece.local_start, piece.local_end);
             pieces.push(CompactRhsPiece::Owned(
                 backend.small_matrix_to_active_placement(view.as_ref())?,
             ));
@@ -11446,7 +11690,6 @@ impl Backend for GpuDcrtBackend {
         if value.shards.is_empty() {
             return Err(PolyBackendError::InvalidConstantShape);
         }
-        let source_basis = value.shards[0].value.params().to_crt().0;
         let mut shards = Vec::with_capacity(value.shards.len());
         for shard in &value.shards {
             let (device_id, backend) = self
@@ -11454,16 +11697,7 @@ impl Backend for GpuDcrtBackend {
                 .iter_mut()
                 .find(|(device, _)| *device == shard.device_id)
                 .ok_or(PolyBackendError::UnsupportedPlacement)?;
-            let target = backend.parameters(destination)?;
-            let target_basis = target.to_crt().0;
-            if source_basis.len() > 1 &&
-                source_basis.iter().any(|prime| !target_basis.contains(prime))
-            {
-                return Err(PolyBackendError::BasisConversion(
-                    "multi-limb centered rebase destination must contain the source basis".into(),
-                ));
-            }
-            let output = shard.value.centered_rebase(target).map_err(PolyBackendError::from)?;
+            let output = backend.centered_rebase_small(&shard.value, destination)?;
             shards.push(GpuColumnShard {
                 device_id: *device_id,
                 global_column_start: shard.global_column_start,

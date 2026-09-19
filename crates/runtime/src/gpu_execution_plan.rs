@@ -630,6 +630,52 @@ pub struct GpuDeviceBudget {
     pub host_bytes: u64,
 }
 
+/// Resolve a physical owner in one unambiguous logical device ordering.
+pub fn logical_device_for_physical(devices: &[i32], physical: i32) -> Result<usize, String> {
+    let mut seen = BTreeSet::new();
+    if devices.iter().any(|device| *device < 0 || !seen.insert(*device)) {
+        return Err("invalid or duplicate physical GPU owner".into());
+    }
+    devices
+        .iter()
+        .position(|device| *device == physical)
+        .ok_or_else(|| format!("physical GPU {physical} is absent from the device mapping"))
+}
+
+/// Project fleet budgets into a worker's physical-owner order. Budget device
+/// fields are logical indices in their respective fleet, never CUDA ordinals.
+pub fn project_gpu_device_budgets(
+    fleet: &[i32],
+    worker: &[i32],
+    budgets: &[GpuDeviceBudget],
+) -> Result<Vec<GpuDeviceBudget>, String> {
+    if fleet.is_empty() || worker.is_empty() || budgets.len() != fleet.len() {
+        return Err("GPU budget and device mapping lengths disagree".into());
+    }
+    logical_device_for_physical(fleet, fleet[0])?;
+    logical_device_for_physical(worker, worker[0])?;
+    let mut by_logical = vec![None; fleet.len()];
+    for budget in budgets {
+        let entry = by_logical
+            .get_mut(budget.device)
+            .ok_or_else(|| "GPU budget logical index is out of range".to_owned())?;
+        if entry.replace(budget).is_some() {
+            return Err("duplicate GPU budget logical index".into());
+        }
+    }
+    worker
+        .iter()
+        .enumerate()
+        .map(|(local, physical)| {
+            let global = logical_device_for_physical(fleet, *physical)?;
+            let mut budget =
+                by_logical[global].ok_or_else(|| "missing GPU budget".to_owned())?.clone();
+            budget.device = local;
+            Ok(budget)
+        })
+        .collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct GpuPlanContract {
     pub graph_specification_hash: [u8; 32],
@@ -1084,6 +1130,35 @@ pub enum GpuPlanError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_budget_projection_preserves_physical_identity_and_local_order() {
+        let budgets = vec![
+            GpuDeviceBudget { device: 0, device_bytes: 100, host_bytes: 11, pinned_host_bytes: 12 },
+            GpuDeviceBudget { device: 1, device_bytes: 200, host_bytes: 21, pinned_host_bytes: 22 },
+        ];
+        for worker in [vec![7], vec![2], vec![7, 2], vec![2, 7]] {
+            let projected = project_gpu_device_budgets(&[7, 2], &worker, &budgets).unwrap();
+            for (local, (physical, budget)) in worker.iter().zip(projected).enumerate() {
+                let mut expected =
+                    budgets[logical_device_for_physical(&[7, 2], *physical).unwrap()].clone();
+                expected.device = local;
+                assert_eq!(budget, expected);
+            }
+        }
+        // Replicated workers independently project the same fleet budgets.
+        assert_eq!(project_gpu_device_budgets(&[7, 2], &[7, 2], &budgets).unwrap(), budgets);
+        for (fleet, worker) in
+            [(vec![7, 7], vec![7]), (vec![7, 2], vec![2, 2]), (vec![7, 2], vec![9])]
+        {
+            assert!(project_gpu_device_budgets(&fleet, &worker, &budgets).is_err());
+        }
+        assert!(project_gpu_device_budgets(&[7, 2], &[7], &budgets[..1]).is_err());
+        assert!(
+            project_gpu_device_budgets(&[7, 2], &[7], &[budgets[0].clone(), budgets[0].clone()])
+                .is_err()
+        );
+    }
 
     #[test]
     fn tiny_columns_start_on_four_devices_before_any_finishes() {

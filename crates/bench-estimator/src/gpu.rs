@@ -599,6 +599,9 @@ pub struct GpuNodeMeasurementBackend {
     /// This is populated only after the inclusive production job has returned;
     /// it is never used as a substitute for the measured elapsed time.
     warmup_dispatch_records: Vec<GpuWarmupDispatchRecord>,
+    /// Bounded diagnostic inventory of the most recent host fixture. These
+    /// owners end with measurement and are not production residency deltas.
+    last_host_setup_memory: Option<GpuWarmupMemoryObservations>,
     /// Validated child contracts for host/control nodes, keyed by their
     /// concrete scope site so collected estimator measurements can reuse the
     /// same descriptor as warmup profile requests.
@@ -626,11 +629,24 @@ pub struct GpuWarmupDispatchRecord {
 
 impl GpuNodeMeasurementBackend {
     fn physical_device_ids(&self) -> Vec<i32> {
-        self.workers.iter().flat_map(|worker| worker.backend.physical_device_ids()).collect()
+        let mut seen = HashSet::new();
+        self.workers
+            .iter()
+            .flat_map(|worker| worker.backend.physical_device_ids())
+            .filter(|device| seen.insert(*device))
+            .collect()
+    }
+
+    pub fn last_host_setup_memory(&self) -> Option<&GpuWarmupMemoryObservations> {
+        self.last_host_setup_memory.as_ref()
     }
 
     fn physical_device_index(&self, physical: i32) -> Option<usize> {
-        self.physical_device_ids().into_iter().position(|device| device == physical)
+        mxx_runtime::gpu_execution_plan::logical_device_for_physical(
+            &self.physical_device_ids(),
+            physical,
+        )
+        .ok()
     }
 
     fn worker_index_for_physical_device(&self, physical: i32) -> Option<usize> {
@@ -725,11 +741,12 @@ impl GpuNodeMeasurementBackend {
             backends.iter().all(|(backend, _)| backend.vram_percent() == vram_percent),
             "all GPU measurement contexts must use the same VRAM percentage"
         );
-        let mut owners = backends
+        let mut seen_owners = HashSet::new();
+        let owners = backends
             .iter()
             .flat_map(|(backend, _)| backend.physical_device_ids())
+            .filter(|device| seen_owners.insert(*device))
             .collect::<Vec<_>>();
-        owners.dedup();
         let workers = backends
             .into_iter()
             .map(|(mut backend, device_id)| {
@@ -765,6 +782,7 @@ impl GpuNodeMeasurementBackend {
             warmup_measurement_calls: Arc::new(AtomicUsize::new(0)),
             warmup_measurement_provenances: Vec::new(),
             warmup_dispatch_records: Vec::new(),
+            last_host_setup_memory: None,
             host_control_operations: HashMap::new(),
             pending: HashMap::new(),
             collecting: true,
@@ -2442,12 +2460,13 @@ impl GpuNodeMeasurementBackend {
                     &representative,
                 )
                 .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
+            self.last_host_setup_memory = Some(setup_memory);
             let mut profile = GpuWarmupProfile::measured_with_observation(
                 elapsed,
                 0,
                 WarmupMeasurementKind::HostMeasured,
                 GpuWarmupMemoryObservations::explicit_exact_zero(),
-                Self::setup_residency_delta(&setup_memory),
+                GpuWarmupResidencyDelta::default(),
                 repetitions,
                 spread,
                 GpuWarmupProvenance::ProductionEquivalent,
@@ -2506,12 +2525,13 @@ impl GpuNodeMeasurementBackend {
                 &self.harness,
             )
             .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
+            self.last_host_setup_memory = Some(setup_memory);
             let profile = GpuWarmupProfile::measured_with_observation(
                 elapsed,
                 0,
                 WarmupMeasurementKind::HostMeasured,
                 GpuWarmupMemoryObservations::explicit_exact_zero(),
-                Self::setup_residency_delta(&setup_memory),
+                GpuWarmupResidencyDelta::default(),
                 repetitions,
                 spread,
                 GpuWarmupProvenance::ProductionEquivalent,
@@ -6529,22 +6549,6 @@ impl GpuNodeMeasurementBackend {
         Ok(observations)
     }
 
-    fn setup_residency_delta(memory: &GpuWarmupMemoryObservations) -> GpuWarmupResidencyDelta {
-        // `memory` contains only owners retained beyond setup.  In particular,
-        // canonical import/upload staging is deliberately omitted by the
-        // setup inventories above because those pageable/pinned buffers are
-        // dropped before the timed phase.
-        GpuWarmupResidencyDelta {
-            affected_devices: memory
-                .affected_devices
-                .iter()
-                .map(|(device, bytes)| (device.clone(), *bytes as i64))
-                .collect(),
-            host_bytes: memory.host_bytes as i64,
-            pinned_host_bytes: memory.pinned_host_bytes as i64,
-        }
-    }
-
     fn measure_host_boundary_repeated(
         worker: &mut GpuMeasurementWorker,
         logical_device: usize,
@@ -7658,10 +7662,29 @@ impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
         &mut self,
         budgets: &[mxx_runtime::gpu_execution_plan::GpuDeviceBudget],
     ) -> Result<(), GpuWarmupProfileError> {
-        for worker in &mut self.workers {
+        if self.workers.iter().any(|worker| worker.backend.frozen_plan().is_some()) {
+            return Err(GpuWarmupProfileError::Measurement(
+                "cannot change budgets after installing a frozen plan".into(),
+            ));
+        }
+        let fleet = self.physical_device_ids();
+        // Validate every projection before mutating any worker's setup budget.
+        let projected = self
+            .workers
+            .iter()
+            .map(|worker| {
+                mxx_runtime::gpu_execution_plan::project_gpu_device_budgets(
+                    &fleet,
+                    &worker.backend.physical_device_ids(),
+                    budgets,
+                )
+                .map_err(GpuWarmupProfileError::Measurement)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (worker, budget) in self.workers.iter_mut().zip(projected) {
             worker
                 .backend
-                .configure_gpu_plan_budgets(budgets)
+                .configure_gpu_plan_budgets(&budget)
                 .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
         }
         Ok(())
@@ -7973,9 +7996,9 @@ mod tests {
         backend::{
             GpuWarmupCacheState, GpuWarmupDeviceIdentity, GpuWarmupFragmentClass,
             GpuWarmupOperationDescriptor, GpuWarmupOperationSignature, GpuWarmupProfileProvider,
-            GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupTimingScope,
-            IndexRange as RuntimeIndexRange, MemoryEvidenceKind, poly::PolyBackendError,
-            poly_gpu::gpu_backend,
+            GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupResidencyDelta,
+            GpuWarmupTimingScope, IndexRange as RuntimeIndexRange, MemoryEvidenceKind,
+            poly::PolyBackendError, poly_gpu::gpu_backend,
         },
         gpu_calibration::GpuColumnWidths,
         gpu_column_policy::{
@@ -8363,6 +8386,11 @@ mod tests {
             let profile =
                 provider.measure(&request).expect("host production dispatch must measure");
             assert_eq!(profile.measurement, WarmupMeasurementKind::HostMeasured);
+            assert_eq!(
+                profile.resident_delta,
+                GpuWarmupResidencyDelta::default(),
+                "temporary host fixture owners and aliased inputs are not production cache growth"
+            );
             assert!(profile.time_seconds.is_finite() && profile.time_seconds > 0.0);
             assert_eq!(profile.workspace_bytes, 0);
             assert_eq!(profile.provenance, GpuWarmupProvenance::ProductionEquivalent);
@@ -9041,6 +9069,58 @@ mod tests {
             None,
         );
         assert!(matches!(zero, Err(GpuMeasurementError(_))));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_provider_projects_budgets_for_disjoint_and_replicated_workers() {
+        use mxx_runtime::backend::poly_gpu::gpu_backend_on;
+        let dimension = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let primes = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(
+            dimension, 1, 30, 8, None, None,
+        )
+        .to_crt()
+        .0;
+        let parameters = GpuDCRTPolyParams::new(dimension, primes, 8, None);
+        let devices = mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        for replicated in [false, true] {
+            let backends = devices
+                .iter()
+                .map(|physical| {
+                    let owners = if replicated { devices.clone() } else { vec![*physical] };
+                    (gpu_backend_on([parameters.clone()], owners), *physical)
+                })
+                .collect();
+            let mut provider =
+                GpuNodeMeasurementBackend::new(backends, MeasurementHarnessConfig::default());
+            let budgets = devices
+                .iter()
+                .enumerate()
+                .map(|(logical, _)| GpuDeviceBudget {
+                    device: logical,
+                    device_bytes: 1_000_000 + logical as u64,
+                    host_bytes: 2_000_000 + logical as u64,
+                    pinned_host_bytes: 3_000_000 + logical as u64,
+                })
+                .collect::<Vec<_>>();
+            provider.configure_gpu_plan_budgets(&budgets).unwrap();
+            assert_eq!(provider.physical_device_ids(), devices);
+            for worker in &provider.workers {
+                let expected = mxx_runtime::gpu_execution_plan::project_gpu_device_budgets(
+                    &devices,
+                    &worker.backend.physical_device_ids(),
+                    &budgets,
+                )
+                .unwrap();
+                assert_eq!(worker.backend.configured_plan_budgets(), Some(expected.as_slice()));
+            }
+            assert!(provider.configure_gpu_plan_budgets(&[]).is_err());
+        }
     }
 
     #[test]
@@ -9842,7 +9922,7 @@ mod tests {
                 sigma: RealExpr::from_integer(4),
                 gadget_base: BigInt::from(4),
                 digit_count: 5,
-                preimage_max_coefficient_bound: BigInt::from(0),
+                preimage_max_coefficient_bound: BigInt::from(2),
             }],
             bindings: ParamEnv::default(),
             preimage_sample: false,
@@ -9895,7 +9975,7 @@ mod tests {
                 sigma: RealExpr::from_integer(4),
                 gadget_base: BigInt::from(4),
                 digit_count: params.modulus_digits(),
-                preimage_max_coefficient_bound: BigInt::from(0),
+                preimage_max_coefficient_bound: BigInt::from(2),
             }],
         };
         let prepared = PreparedMeasurement {

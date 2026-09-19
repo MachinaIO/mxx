@@ -7311,6 +7311,45 @@ mod tests {
     use rand::Rng;
 
     #[test]
+    fn gadget_trapdoor_preimages_round_trip_with_the_decomposition_bound() {
+        let dimension = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(8);
+        let parameters = DCRTPolyParams::new(dimension, 1, 20, 4, None, None);
+        let ring =
+            Ring::new(BigInt::from(parameters.modulus().as_ref().clone()), dimension as usize);
+        let base = BigInt::from(1u8) << parameters.base_bits();
+        let digits = parameters.modulus_digits();
+        let trapdoor = ring.gadget_trapdoor(1, base.clone(), digits);
+        let preimage = trapdoor.sample_preimage(ring.zero((1, 2)), (digits, 2));
+        let built = DslContext::new("gadget-preimage-artifact-bound")
+            .transferred_output("transferred", preimage.clone())
+            .unwrap()
+            .cached_output("cached", preimage)
+            .unwrap()
+            .build()
+            .unwrap();
+        let validated = built.validate(&ParamEnv::default()).unwrap();
+        let mut backend = cpu_backend([parameters.clone()]);
+        let mut store = MemoryArtifactStore::default();
+        let mut result =
+            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
+                .unwrap();
+        let expected = backend
+            .gadget_decompose(&DCRTPolyMatrix::zero(&parameters, 1, 2), false, Some(digits))
+            .unwrap();
+        for name in ["transferred", "cached"] {
+            let reopened = result.materialize_output(name, &backend, &mut store).unwrap();
+            let RuntimeValue::Preimage(reopened) = reopened else { panic!("preimage output kind") };
+            assert_eq!(reopened.as_ref(), &expected);
+            assert_eq!(
+                reopened.max_coefficient_bound(),
+                &((&base + 1u8) / 2u8).to_biguint().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn tampered_fixed_plan_wave_above_execution_limit_is_rejected() {
         let choice = GpuLoopChoice {
             key: GpuLoopSiteKey { site: 7, shape_class: 0 },

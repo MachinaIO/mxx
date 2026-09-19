@@ -1425,10 +1425,20 @@ impl GpuDCRTPolyMatrix {
         &self,
         destination: &GpuDCRTPolyParams,
     ) -> Result<(), String> {
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.params.execution_owner_id() != destination.execution_owner_id()
-        {
+        if self.params.execution_owner_id() != destination.execution_owner_id() {
             return Err("centered rebase requires matching dimensions and shared execution".into());
+        }
+        self.validate_centered_rebase_domain(destination)
+    }
+
+    /// Mathematical conversion domain, usable by allocation queries before
+    /// operand transport. Execution-owner equality belongs to local launch.
+    pub fn validate_centered_rebase_domain(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), String> {
+        if self.params.ring_dimension() != destination.ring_dimension() {
+            return Err("centered rebase requires matching ring dimensions".into());
         }
         let source_basis = self.params.moduli();
         let destination_basis = destination.moduli();

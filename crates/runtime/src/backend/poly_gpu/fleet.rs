@@ -345,6 +345,22 @@ impl GpuDcrtBackend {
         self.devices.iter().map(|(device, _)| *device).collect()
     }
 
+    fn parameters_on_physical_device(
+        &self,
+        physical: i32,
+        matrix_type: &ConcreteMatrixType,
+    ) -> Result<&GpuDCRTPolyParams, GpuAllocationQueryError> {
+        let logical = crate::gpu_execution_plan::logical_device_for_physical(
+            &self.physical_device_ids(),
+            physical,
+        )
+        .map_err(GpuAllocationQueryError::Backend)?;
+        self.devices[logical]
+            .1
+            .parameters(matrix_type)
+            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))
+    }
+
     /// Fence every release queue and validate that each CUDA context is still
     /// alive before returning an OOM candidate to warmup.  CUDA failures can
     /// be reported either as a regular `Result` or as the typed panic emitted
@@ -2689,25 +2705,6 @@ impl GpuDcrtBackend {
             local_range.end,
         )
         .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
-        let first = input.shards.get(overlaps[0].0).ok_or(GpuAllocationQueryError::InvalidRange)?;
-        let target = self
-            .devices
-            .first()
-            .ok_or(GpuAllocationQueryError::InvalidDevice)?
-            .1
-            .parameters(output_type)
-            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
-        first
-            .value
-            .validate_centered_rebase(target)
-            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
-        if first.value.params().ring_dimension() != target.ring_dimension() ||
-            first.value.params().execution_owner_id() != target.execution_owner_id()
-        {
-            return Err(GpuAllocationQueryError::UnsupportedEvidence {
-                operation: "compact centered rebase parameter topology mismatch".into(),
-            });
-        }
         let input_resident_bytes = self
             .resident_small_allocation_bytes_by_device(input)?
             .values()
@@ -2720,7 +2717,9 @@ impl GpuDcrtBackend {
         let mut output_bytes = 0usize;
         let mut auxiliary_bytes = 0usize;
         for (index, start, end) in overlaps {
-            let source = &input.shards[index].value;
+            let shard = &input.shards[index];
+            let source = &shard.value;
+            let target = self.parameters_on_physical_device(shard.device_id, output_type)?;
             source
                 .validate_centered_rebase(target)
                 .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
@@ -2811,17 +2810,11 @@ impl GpuDcrtBackend {
                     });
             }
         }
-        let output_params = self
-            .devices
-            .first()
-            .ok_or(GpuAllocationQueryError::InvalidDevice)?
-            .1
-            .parameters(output_type)
-            .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
+        let output_params = self.parameters_on_physical_device(shard.device_id, output_type)?;
         if domain == CanonicalWarmupProfileDomain::CenteredRebase {
             shard
                 .value
-                .validate_centered_rebase_destination(output_params)
+                .validate_centered_rebase_domain(output_params)
                 .map_err(|error| GpuAllocationQueryError::Backend(error.to_string()))?;
         }
         components.input_shape = Some(
@@ -5676,6 +5669,157 @@ mod tests {
     use mxx_ir_core::IntExpr;
     use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
     use num_bigint::BigInt;
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_conversion_queries_resolve_each_physical_owner() {
+        let dimension = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let wide = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(
+            dimension, 1, 40, 8, None, None,
+        )
+        .to_crt()
+        .0[0];
+        let narrow = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(
+            dimension, 1, 30, 8, None, None,
+        )
+        .to_crt()
+        .0[0];
+        let source_params = GpuDCRTPolyParams::new(dimension, vec![wide], 8, None);
+        let destination_params = GpuDCRTPolyParams::new(dimension, vec![narrow, wide], 8, None);
+        let devices = detected_gpu_device_ids();
+        let backend = super::super::gpu_backend_on(
+            [source_params.clone(), destination_params.clone()],
+            devices.iter().copied().rev(),
+        );
+        let source_type = ConcreteMatrixType {
+            modulus: BigInt::from(source_params.modulus().as_ref().clone()),
+            ring_dimension: dimension as usize,
+            rows: 1,
+            columns: 3,
+        };
+        let output_type = ConcreteMatrixType {
+            modulus: BigInt::from(destination_params.modulus().as_ref().clone()),
+            ..source_type.clone()
+        };
+        for (physical, local) in &backend.devices {
+            let source = local.parameters(&source_type).unwrap();
+            let target = local.parameters(&output_type).unwrap();
+            let full = GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(source, 1, 3));
+            assert_eq!(full.shards[0].device_id, *physical);
+            let envelope = backend
+                .matrix_range_allocation_envelope(
+                    CanonicalWarmupProfileDomain::CenteredRebase,
+                    &full,
+                    &output_type,
+                    3,
+                    0..3,
+                    GpuAllocationComponents {
+                        evidence: Some(GpuAllocationEvidenceKind::ExactQuery),
+                        ..GpuAllocationComponents::default()
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                envelope.output_bytes,
+                target.matrix_allocation_bytes(1, 1, 3, false).unwrap().data_bytes
+            );
+            let compact = GpuFleetSmallMatrix::from_matrix(
+                GpuSmallMatrix::from_canonical_coefficients(
+                    source,
+                    1,
+                    3,
+                    7u8.into(),
+                    &vec![0u8; dimension as usize * 3 * 2],
+                )
+                .unwrap(),
+            );
+            let envelope = backend
+                .compact_centered_rebase_allocation_envelope(&compact, &output_type, 0..3)
+                .unwrap();
+            assert_eq!(
+                envelope.output_bytes,
+                GpuSmallMatrix::allocation_bytes_for_shape(target, 1, 3, 1).unwrap().data_bytes
+            );
+            // An unrelated execution owner is admissible for arithmetic size
+            // queries, but must still be rejected at the local launch boundary.
+            let unrelated = destination_params.params_for_device(*physical, None);
+            assert!(full.shards[0].value.validate_centered_rebase_domain(&unrelated).is_ok());
+            assert!(full.shards[0].value.validate_centered_rebase_destination(&unrelated).is_err());
+            assert!(
+                compact.shards[0].value.validate_centered_rebase_destination(&unrelated).is_err()
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_frozen_column_concat_preserves_common_rows() {
+        let dimension = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
+            .map(|value| value.parse::<u32>().unwrap())
+            .unwrap_or(32);
+        let primes = mxx_primitives::poly::dcrt::params::DCRTPolyParams::new(
+            dimension, 2, 30, 8, None, None,
+        )
+        .to_crt()
+        .0;
+        let parameters = GpuDCRTPolyParams::new(dimension, primes, 8, None);
+        let device = detected_gpu_device_ids()[0];
+        let mut backend = super::super::gpu_backend_on([parameters], [device]);
+        let params = backend.devices[0]
+            .1
+            .parameters
+            .iter()
+            .flat_map(|map| map.values())
+            .next()
+            .unwrap()
+            .clone();
+        let left = GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(&params, 2, 2));
+        let right = GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(&params, 2, 1));
+        let key = GpuExecutionSiteKey { site: 905, shape_class: 0, instance_class: 0 };
+        let contract = GpuPlanContract {
+            graph_specification_hash: [0; 32],
+            backend_identity: backend.runtime_backend_identity().unwrap(),
+            logical_to_physical_devices: vec![device as usize],
+            device_budgets: backend.runtime_device_budgets().unwrap(),
+            shape_contract_hash: [1; 32],
+            backend_revision: "concat-regression".into(),
+        };
+        let layout = GpuLayout {
+            id: 1,
+            columns: 3,
+            rows: 2,
+            ring_dimension: dimension as usize,
+            representation: "matrix".into(),
+            instance_device_stride: 0,
+            owner_intervals: vec![GpuColumnInterval { device: 0, start: 0, end: 3 }],
+        };
+        let node = GpuNodeChoice {
+            key,
+            loop_site: None,
+            operation_identity: [95; 32],
+            effective_operation: EffectiveGpuOperation::ConcatColumns,
+            column_capability: ColumnCapability::MappedColumns,
+            output_layouts: vec![1],
+            columns_per_job: vec![2],
+            implementation_variant: "concat-regression".into(),
+            preimage_max_attempts: None,
+        };
+        backend
+            .install_frozen_plan(
+                FrozenGpuPlan::new(contract, vec![layout], vec![], vec![node]).unwrap(),
+            )
+            .unwrap();
+        backend.bind_fixed_node(key).unwrap();
+        let output = backend.concat(&[&left, &right], ConcatAxis::Columns).unwrap();
+        assert_eq!(output.size(), (2, 3));
+        assert!(output.shards.iter().all(|shard| shard.value.row_size() == 2));
+        let empty = GpuFleetMatrix::new(2, 0, Vec::new());
+        assert_eq!(backend.concat(&[&empty, &empty], ConcatAxis::Columns).unwrap().size(), (2, 0));
+        let wrong_rows = GpuFleetMatrix::new(3, 0, Vec::new());
+        assert!(backend.concat(&[&empty, &wrong_rows], ConcatAxis::Columns).is_err());
+    }
 
     #[test]
     fn fixed_fused_union_preserves_port_owners_and_tail_coverage() {
@@ -12192,7 +12336,13 @@ impl Backend for GpuDcrtBackend {
                     }
                     (inputs.iter().map(|value| value.rows).sum(), first.columns)
                 }
-                ConcatAxis::Columns | ConcatAxis::Diagonal => (
+                ConcatAxis::Columns => {
+                    if inputs.iter().any(|value| value.rows != first.rows) {
+                        return Err(PolyBackendError::InvalidConstantShape);
+                    }
+                    (first.rows, inputs.iter().map(|value| value.columns).sum())
+                }
+                ConcatAxis::Diagonal => (
                     inputs.iter().map(|value| value.rows).sum(),
                     inputs.iter().map(|value| value.columns).sum(),
                 ),

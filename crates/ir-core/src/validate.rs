@@ -558,13 +558,14 @@ fn validate_node(
                 return node_error(scope, node.id, "invalid gadget trapdoor dimensions or base");
             }
             let digit_count = matrix.columns / matrix.rows;
+            let preimage_max_coefficient_bound = (&gadget_base + BigInt::one()) / 2;
             vec![ConcreteWireType::Trapdoor {
                 matrix,
                 sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone()))
                     .close(env)?,
                 gadget_base,
                 digit_count,
-                preimage_max_coefficient_bound: BigInt::zero(),
+                preimage_max_coefficient_bound,
             }]
         }
         NodeKind::TrapdoorPublic => {

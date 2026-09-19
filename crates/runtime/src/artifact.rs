@@ -641,10 +641,16 @@ impl ArtifactStore for FileArtifactStore {
         }
         let length = file_len - payload_start;
         if matches!(header.artifact_type, ArtifactType::Int) && header.payload_kind == 2 {
-            // Integer canonicality depends on the signed payload bytes.  The
-            // framing header alone cannot prove it, so size-only access must
-            // remain explicit rather than silently materializing the body.
-            return Err(FileArtifactError::SizeEvidenceUnavailable(key.clone()));
+            // Minimal two's-complement encoding is determined by its final
+            // two bytes. Check that boundary without decoding/materializing
+            // an arbitrarily large integer payload.
+            let tail_len = length.min(2) as usize;
+            let mut tail = [0u8; 2];
+            file.seek(SeekFrom::Start(file_len - tail_len as u64)).map_err(io_error)?;
+            file.read_exact(&mut tail[..tail_len]).map_err(io_error)?;
+            if !canonical_signed_integer_bytes(&tail[..tail_len]) {
+                return Err(FileArtifactError::PayloadTypeMismatch(key.clone()));
+            }
         }
         let valid_kind = match (&header.artifact_type, header.payload_kind) {
             (ArtifactType::Matrix(_), 0) |
@@ -1573,9 +1579,6 @@ impl ArtifactStore for MemoryArtifactStore {
         {
             return Err(MemoryArtifactError::DescriptorMismatch(key.clone()));
         }
-        if matches!(artifact_type, ArtifactType::Int) {
-            return Err(MemoryArtifactError::SizeEvidenceUnavailable(key.clone()));
-        }
         if !payload_matches(artifact_type, payload) {
             return Err(MemoryArtifactError::PayloadTypeMismatch(key.clone()));
         }
@@ -1948,11 +1951,21 @@ impl MemoryArtifactStore {
     }
 }
 
+fn canonical_signed_integer_bytes(bytes: &[u8]) -> bool {
+    match bytes {
+        [] => false,
+        [_] => true,
+        _ => {
+            let last = bytes[bytes.len() - 1];
+            let previous_negative = bytes[bytes.len() - 2] & 0x80 != 0;
+            !((last == 0 && !previous_negative) || (last == 0xff && previous_negative))
+        }
+    }
+}
+
 fn payload_matches(artifact_type: &ArtifactType, payload: &ArtifactPayload) -> bool {
     match (artifact_type, payload) {
-        (ArtifactType::Int, ArtifactPayload::Bytes(bytes)) => {
-            num_bigint::BigInt::from_signed_bytes_le(bytes).to_signed_bytes_le() == *bytes
-        }
+        (ArtifactType::Int, ArtifactPayload::Bytes(bytes)) => canonical_signed_integer_bytes(bytes),
         (ArtifactType::Matrix(_), ArtifactPayload::Matrix(_)) |
         (ArtifactType::SmallMatrix { .. }, ArtifactPayload::SmallMatrix(_)) |
         (ArtifactType::Preimage { .. }, ArtifactPayload::SmallMatrix(_)) |
@@ -2106,7 +2119,7 @@ mod tests {
     }
 
     #[test]
-    fn size_only_rejects_integer_without_canonicality_evidence() {
+    fn size_only_accepts_canonical_integer_without_materializing_it() {
         let production = production(32);
         let artifact_type = ArtifactType::Int;
         let descriptor = ManifestArtifact {
@@ -2131,11 +2144,139 @@ mod tests {
             )
             .expect("insert integer artifact");
         store.store_manifest(manifest).expect("store integer manifest");
-        assert!(matches!(
-            store.load_payload_size(&key, &descriptor),
-            Err(MemoryArtifactError::SizeEvidenceUnavailable(_))
-        ));
+        assert_eq!(store.load_payload_size(&key, &descriptor).unwrap(), 1);
         assert_eq!(store.load_count(&key), 0);
+    }
+
+    #[test]
+    fn integer_size_only_rejects_nonminimal_signed_encoding_without_decoding() {
+        let directory = tempdir().unwrap();
+        let mut store = FileArtifactStore::new(directory.path()).unwrap();
+        let production = production(73);
+        let descriptor = ManifestArtifact {
+            artifact_type: ArtifactType::Int,
+            family_count: Some(3),
+            availability: ArtifactAvailability::Cached,
+            layout: None,
+        };
+        store
+            .store_manifest(Manifest {
+                ir_version: IR_VERSION,
+                production_id: production.clone(),
+                artifacts: BTreeMap::from([("integers".into(), descriptor.clone())]),
+            })
+            .unwrap();
+        for (index, bytes) in [vec![], vec![1, 0], vec![255, 255]].into_iter().enumerate() {
+            let key = ArtifactKey {
+                production: production.clone(),
+                name: "integers".into(),
+                index: Some(index),
+            };
+            // Simulate corrupt external storage bypassing canonical ingress.
+            write_stored_file(
+                &store.artifact_path(&key),
+                &FileStoredArtifact {
+                    artifact_type: ArtifactType::Int,
+                    availability: descriptor.availability,
+                    layout: None,
+                    payload: ArtifactPayload::Bytes(bytes),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                store.load_payload_size(&key, &descriptor),
+                Err(FileArtifactError::PayloadTypeMismatch(_))
+            ));
+            assert_eq!(store.load_count(&key), 0);
+        }
+    }
+
+    #[test]
+    fn integer_size_only_matches_canonical_payloads_for_finalized_scalars_and_families() {
+        fn check<S: SessionStore>(store: &mut S) -> Vec<ArtifactKey>
+        where
+            S::Error: std::fmt::Debug,
+        {
+            let values = [0i64, 1, -1, 127, 128, -128, -129, 65536, -65536];
+            let mut keys = Vec::new();
+            for (case, availability) in
+                [ArtifactAvailability::Transferred, ArtifactAvailability::Cached]
+                    .into_iter()
+                    .enumerate()
+            {
+                let production = production(70 + case as u8);
+                store
+                    .open_session(&SessionDescriptor::new(
+                        production.clone(),
+                        "integer-size",
+                        [case as u8; 32],
+                    ))
+                    .unwrap();
+                let mut artifacts = BTreeMap::new();
+                for family in [false, true] {
+                    for (index, value) in values.iter().enumerate() {
+                        let name =
+                            if family { "family".to_owned() } else { format!("scalar-{index}") };
+                        let descriptor = ManifestArtifact {
+                            artifact_type: ArtifactType::Int,
+                            family_count: family.then_some(values.len()),
+                            availability,
+                            layout: None,
+                        };
+                        artifacts.insert(name.clone(), descriptor);
+                        let key = ArtifactKey {
+                            production: production.clone(),
+                            name,
+                            index: family.then_some(index),
+                        };
+                        store
+                            .store(
+                                key.clone(),
+                                &ArtifactType::Int,
+                                availability,
+                                None,
+                                ArtifactPayload::Bytes(BigInt::from(*value).to_signed_bytes_le()),
+                            )
+                            .unwrap();
+                        store
+                            .commit_artifact(&ArtifactHandle {
+                                key: key.clone(),
+                                artifact_type: ArtifactType::Int,
+                                availability,
+                                layout: None,
+                            })
+                            .unwrap();
+                        keys.push(key);
+                    }
+                }
+                let manifest = Manifest {
+                    ir_version: IR_VERSION,
+                    production_id: production.clone(),
+                    artifacts,
+                };
+                store.finalize_session(manifest.clone()).unwrap();
+                store.release_session(&production).unwrap();
+                for key in keys.iter().filter(|key| key.production == production) {
+                    let index = key.index.unwrap_or_else(|| {
+                        key.name.strip_prefix("scalar-").unwrap().parse().unwrap()
+                    });
+                    assert_eq!(
+                        store.load_payload_size(key, &manifest.artifacts[&key.name]).unwrap(),
+                        BigInt::from(values[index]).to_signed_bytes_le().len()
+                    );
+                }
+            }
+            keys
+        }
+        let mut memory = MemoryArtifactStore::default();
+        for key in check(&mut memory) {
+            assert_eq!(memory.load_count(&key), 0);
+        }
+        let directory = tempdir().unwrap();
+        let mut file = FileArtifactStore::new(directory.path()).unwrap();
+        for key in check(&mut file) {
+            assert_eq!(file.load_count(&key), 0);
+        }
     }
 
     #[test]

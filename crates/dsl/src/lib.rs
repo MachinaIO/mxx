@@ -855,6 +855,9 @@ impl Ring {
     ) -> Trapdoor {
         let rows = rows.into();
         let base = base.into();
+        let preimage_max_coefficient_bound =
+            IntExpr::RoundDiv(Box::new(base.clone()), Box::new(IntExpr::constant(2)))
+                .canonicalize();
         let digit_count = digit_count.into();
         let matrix_type = self.matrix_type(Shape {
             rows: rows.clone(),
@@ -868,7 +871,7 @@ impl Ring {
                 sigma: RealExpr::FromInt(base.clone()),
                 gadget_base: base,
                 digit_count,
-                preimage_max_coefficient_bound: IntExpr::constant(0),
+                preimage_max_coefficient_bound: preimage_max_coefficient_bound.clone(),
             }],
         );
         let public_node = NodeHandle::new(
@@ -883,7 +886,7 @@ impl Ring {
             },
             value: node.output(0).expect("gadget trapdoor output"),
             matrix_type,
-            preimage_max_coefficient_bound: IntExpr::constant(0),
+            preimage_max_coefficient_bound,
         }
     }
 
@@ -2013,6 +2016,23 @@ mod tests {
         assert!(nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixMulSmallRhs)));
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::MatrixScale { .. })));
         assert!(!nodes.iter().any(|node| matches!(node.kind(), NodeKind::GadgetDecompose { .. })));
+    }
+
+    #[test]
+    fn gadget_trapdoor_declares_the_regular_decomposition_bound() {
+        for base in [3, 4, 5] {
+            let ring = Ring::new(97, 8);
+            let trapdoor = ring.gadget_trapdoor(1, base, 4);
+            let expected = ring.zero((1, 1)).decompose(base, 4);
+            assert_eq!(trapdoor.preimage_max_coefficient_bound(), expected.max_coefficient_bound());
+            let output = trapdoor.sample_preimage(ring.zero((1, 1)), (4, 1));
+            let built = DslContext::new("gadget-trapdoor-bound")
+                .output("preimage", output)
+                .unwrap()
+                .build()
+                .unwrap();
+            built.validate(&ParamEnv::default()).unwrap();
+        }
     }
 
     #[test]

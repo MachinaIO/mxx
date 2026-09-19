@@ -193,11 +193,7 @@ no leading zero byte.  The payload follows with exactly
 `coefficient_count * (1 + magnitude_bytes)` bytes under the linear index above.
 The payload need not carry modulus data: the decoder uses the complete expected
 concrete schema and does not recompute modulus products, NTT parameters,
-relation facts, content hashes, or bounds.
-The artifact layer hashes exactly this header plus payload (including
-dimensions and bound) when a public content hash is required; any content-hash
-verification remains the existing artifact-store check and is not repeated by
-the codec.  Public hashes remain allowed and private hashes remain forbidden.
+relation facts, or bounds.
 CPU store/load and
 GPU store/load must produce identical canonical bytes and reject malformed
 input before allocating a large destination.  `encode_artifact` passes the

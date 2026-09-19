@@ -1047,10 +1047,13 @@ mod tests {
                 BTreeMap::from([
                     ("lhs".into(), RuntimeValue::matrix(lhs)),
                     ("rhs".into(), RuntimeValue::matrix(rhs)),
-                    ("rhs-decomposition".into(), RuntimeValue::small_matrix(rhs_decomposition)),
+                    (
+                        "rhs-decomposition".into(),
+                        RuntimeValue::Preimage(std::sync::Arc::new(rhs_decomposition)),
+                    ),
                     (
                         "scalar-decomposition".into(),
-                        RuntimeValue::small_matrix(scalar_decomposition),
+                        RuntimeValue::Preimage(std::sync::Arc::new(scalar_decomposition)),
                     ),
                 ]),
             );

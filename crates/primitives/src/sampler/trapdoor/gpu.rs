@@ -20,6 +20,7 @@ use crate::{
 use digest::Digest;
 use num_bigint::BigUint;
 use std::{
+    num::NonZeroUsize,
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -27,6 +28,70 @@ use std::{
 const SPECTRAL_CONSTANT: f64 = 1.8;
 
 pub(super) type TrapdoorMatrix = GpuDCRTPolyMatrix;
+
+/// Certified allocation evidence for the complete `trapdoor()` production
+/// call. Every matrix component is sized through the native allocator query;
+/// no generic matrix-byte or measured-peak fallback is used.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrapdoorAllocationEvidence {
+    pub trapdoor_r_bytes: usize,
+    pub trapdoor_e_bytes: usize,
+    pub trapdoor_a_coeff_bytes: usize,
+    pub trapdoor_b_coeff_bytes: usize,
+    pub trapdoor_d_coeff_bytes: usize,
+    pub public_a_bar_bytes: usize,
+    pub gadget_bytes: usize,
+    pub identity_bytes: usize,
+    pub a0_assembly_bytes: usize,
+    pub a1_assembly_bytes: usize,
+    pub public_output_bytes: usize,
+    /// Temporary matrix owners live during nested products and conversion.
+    pub scratch_bytes: usize,
+    pub control_bytes: usize,
+    pub cache_bytes: usize,
+    pub host_bytes: usize,
+    pub pinned_host_bytes: usize,
+    pub evidence_kind: PreimageAllocationEvidenceKind,
+}
+
+impl TrapdoorAllocationEvidence {
+    pub fn trapdoor_bytes(&self) -> usize {
+        self.trapdoor_r_bytes
+            .saturating_add(self.trapdoor_e_bytes)
+            .saturating_add(self.trapdoor_a_coeff_bytes)
+            .saturating_add(self.trapdoor_b_coeff_bytes)
+            .saturating_add(self.trapdoor_d_coeff_bytes)
+    }
+
+    pub fn assembly_bytes(&self) -> usize {
+        self.public_a_bar_bytes
+            .saturating_add(self.gadget_bytes)
+            .saturating_add(self.identity_bytes)
+            .saturating_add(self.a0_assembly_bytes)
+            .saturating_add(self.a1_assembly_bytes)
+    }
+
+    pub fn total_device_bytes(&self) -> usize {
+        self.trapdoor_bytes()
+            .saturating_add(self.public_output_bytes)
+            .saturating_add(self.scratch_bytes)
+            .saturating_add(self.assembly_bytes())
+            .saturating_add(self.cache_bytes)
+            .saturating_add(self.control_bytes)
+    }
+}
+
+fn trapdoor_matrix_bytes(
+    params: &GpuDCRTPolyParams,
+    rows: usize,
+    columns: usize,
+    is_ntt: bool,
+) -> Result<usize, SmallMatrixError> {
+    params
+        .matrix_allocation_bytes(params.crt_depth().saturating_sub(1), rows, columns, is_ntt)
+        .map(|allocation| allocation.total_bytes)
+        .map_err(|_| SmallMatrixError::DimensionOverflow)
+}
 
 fn gpu_params_from_cpu(params: &DCRTPolyParams) -> GpuDCRTPolyParams {
     let (moduli, _, _) = params.to_crt();
@@ -219,6 +284,31 @@ fn get_or_create_p1_covariance_cache(
     cache
 }
 
+/// Build the P1 covariance cache for a trapdoor that is about to enter a
+/// fixed preimage job.  The cache is owned by the trapdoor, so keeping that
+/// owner alive is what makes a subsequent warm call reuse the exact native
+/// allocation.  This method intentionally does not sample a preimage or
+/// allocate any tile workspace.
+fn build_p1_covariance_cache(params: &GpuDCRTPolyParams, trapdoor: &GpuDCRTTrapdoor, sigma: f64) {
+    let d = trapdoor.r.row_size();
+    let (c, s, dgg_stddev) = p1_covariance_parameters(params, d, sigma);
+    let _ = get_or_create_p1_covariance_cache(trapdoor, c, s, dgg_stddev);
+}
+
+fn cached_p1_covariance_cache(
+    params: &GpuDCRTPolyParams,
+    trapdoor: &GpuDCRTTrapdoor,
+    sigma: f64,
+) -> Option<Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>> {
+    let d = trapdoor.r.row_size();
+    let (c, s, dgg_stddev) = p1_covariance_parameters(params, d, sigma);
+    let guard = trapdoor.p1_covariance_cache.lock().expect("p1 cache mutex poisoned");
+    guard.as_ref().and_then(|entry| {
+        (entry.c == c && entry.s == s && entry.dgg_stddev == dgg_stddev)
+            .then(|| entry.cache.clone())
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct GpuDCRTPolyTrapdoorSampler {
     sigma: f64,
@@ -253,9 +343,183 @@ enum RetryFailure {
     Exhausted(usize),
 }
 
-#[inline]
-fn residency_fits(required_bytes: usize, budget_bytes: usize) -> bool {
-    required_bytes <= budget_bytes
+/// Whether the first use of a trapdoor covariance cache is part of the
+/// measured operation.  Cold and warm resource envelopes are deliberately
+/// different execution classes: cold setup owns a transient workspace while
+/// warm sampling only sees the retained cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreimageCacheState {
+    Cold,
+    Warm,
+}
+
+/// The representation and ordered CRT basis used by a fixed preimage call.
+/// This is part of the evidence identity; changing either the compact format
+/// or the active modulus order invalidates the evidence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreimageFormatContext {
+    pub active_moduli: Vec<u64>,
+    pub crt_level: usize,
+    pub coefficient_magnitude_bytes: usize,
+    pub compact_output: bool,
+}
+
+/// Identity of the retained P1 covariance cache.  The owner token is tied to
+/// one trapdoor object, while the numeric parameters invalidate evidence when
+/// the sampler configuration changes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PreimageCacheIdentity {
+    pub owner_token: u64,
+    pub c: f64,
+    pub smoothing: f64,
+    pub dgg_stddev: f64,
+}
+
+impl PreimageCacheIdentity {
+    /// Convert native cache ownership and sampler parameters into an opaque
+    /// public identity.  The digest contains no trapdoor/material bytes; it
+    /// only binds the cache owner token, floating-point sampler parameters,
+    /// and the ordered native basis supplied by the caller.
+    pub fn opaque_digest(&self, sampler_parameters: &[u64], ordered_basis: &[u64]) -> [u8; 32] {
+        let mut hasher = keccak_asm::Keccak256::new();
+        hasher.update(b"mxx-preimage-cache-identity-v1");
+        hasher.update(self.owner_token.to_le_bytes());
+        hasher.update(self.c.to_bits().to_le_bytes());
+        hasher.update(self.smoothing.to_bits().to_le_bytes());
+        hasher.update(self.dgg_stddev.to_bits().to_le_bytes());
+        hasher.update((sampler_parameters.len() as u64).to_le_bytes());
+        for value in sampler_parameters {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.update((ordered_basis.len() as u64).to_le_bytes());
+        for value in ordered_basis {
+            hasher.update(value.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+}
+
+/// Context carried with every allocation envelope.  In particular, a result
+/// for width 8 or retry cap 64 is never silently reused for another fixed
+/// production call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreimageEvidenceContext {
+    pub state: PreimageCacheState,
+    pub tile_columns: usize,
+    pub max_attempts: usize,
+    pub max_coefficient_bound: BigUint,
+    pub hard_cutoff_plan_bytes: usize,
+    pub format: PreimageFormatContext,
+    pub source_device_ids: Vec<i32>,
+    pub destination_device_ids: Vec<i32>,
+    pub cache_identity: PreimageCacheIdentity,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreimageAllocationEvidenceKind {
+    /// Every component is returned by an exact native size query or checked
+    /// fixed-call allocation rule.
+    Exact,
+    /// The fixed-call topology is certified, but one or more components are
+    /// conservative bounds rather than byte-for-byte allocator observations.
+    Certified,
+}
+
+/// Exact/certified allocation envelope for one *fixed* production call.
+/// Every component is a live allocation class, not an empirical width slope.
+/// The aggregate peaks are checked sums of these components for the declared
+/// lifetime and state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreimageAllocationEnvelope {
+    pub public_matrix_bytes: usize,
+    pub trapdoor_bytes: usize,
+    pub resident_target_bytes: usize,
+    pub retained_covariance_cache_bytes: usize,
+    pub compact_output_bytes: usize,
+    pub candidate_workspace_bytes: usize,
+    pub perturbation_workspace_bytes: usize,
+    pub scratch_bytes: usize,
+    pub source_device_staging_bytes: usize,
+    pub destination_device_staging_bytes: usize,
+    pub host_staging_bytes: usize,
+    pub device_control_bytes: usize,
+    pub pinned_host_control_bytes: usize,
+    pub sampler_event_bytes: usize,
+    pub cold_transient_workspace_bytes: usize,
+    pub sampler_peak_bytes: usize,
+    pub cold_sampler_peak_bytes: usize,
+    pub evidence_kind: PreimageAllocationEvidenceKind,
+}
+
+impl PreimageAllocationEnvelope {
+    fn checked_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, SmallMatrixError> {
+        values.into_iter().try_fold(0usize, |sum, value| {
+            sum.checked_add(value).ok_or(SmallMatrixError::DimensionOverflow)
+        })
+    }
+
+    pub fn fits_budget(&self, budget_bytes: usize) -> bool {
+        self.cold_sampler_peak_bytes <= budget_bytes
+    }
+}
+
+/// Complete allocation evidence for one fixed width and cache state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreimageAllocationEvidence {
+    pub context: PreimageEvidenceContext,
+    pub envelope: PreimageAllocationEnvelope,
+}
+
+/// The resource choices made by the fleet planner for one preimage job.
+///
+/// A fixed sampler never changes either value in response to an allocation
+/// failure.  In particular, `tile_columns` is not a hint for another search;
+/// it is the upper bound of every tile submitted by the job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FixedPreimageConfig {
+    pub tile_columns: NonZeroUsize,
+    pub max_attempts: NonZeroUsize,
+}
+
+impl FixedPreimageConfig {
+    pub fn new(tile_columns: usize, max_attempts: usize) -> Option<Self> {
+        Some(Self {
+            tile_columns: NonZeroUsize::new(tile_columns)?,
+            max_attempts: NonZeroUsize::new(max_attempts)?,
+        })
+    }
+}
+
+/// Pure accounting for one fixed preimage job.  This query performs no GPU
+/// allocation or submission and deliberately includes the full trapdoor,
+/// public matrix, resident target, compact destination, cutoff, packing and
+/// control/event owners.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PreimageFootprint {
+    pub persistent_bytes: usize,
+    pub compact_output_bytes: usize,
+    pub scratch_bytes: usize,
+    pub device_control_bytes: usize,
+    pub pinned_control_bytes: usize,
+    pub hard_cutoff_plan_bytes: usize,
+    pub packed_staging_bytes: usize,
+    pub sampler_event_bytes: usize,
+    /// Workspace allocated only while the cold covariance cache is built.
+    /// It is released after the precompute event and must not inflate the
+    /// warm steady-state sampler report.
+    pub cold_transient_workspace_bytes: usize,
+    pub sampler_peak_bytes: usize,
+    /// Peak required while creating the cache, including the retained cache
+    /// and the cold transient workspace.
+    pub cold_sampler_peak_bytes: usize,
+    pub tile_columns: usize,
+    pub max_attempts: usize,
+}
+
+impl PreimageFootprint {
+    pub fn fits_budget(&self, budget_bytes: usize) -> bool {
+        self.cold_sampler_peak_bytes <= budget_bytes
+    }
 }
 
 fn bounded_retry<T, F>(attempts: usize, mut attempt: F) -> Result<T, RetryFailure>
@@ -271,27 +535,49 @@ where
 }
 
 impl GpuDCRTPolyTrapdoorSampler {
-    /// Produce the bounded preimage directly in compact GPU storage. Each
-    /// retry expands only one complete K-by-C_s candidate tile.
-    fn bounded_preimage(
+    /// Construct the production covariance cache without running the sampler.
+    /// Warmup uses this as the timed cold/setup operation, then retains the
+    /// trapdoor owner for the corresponding local-job measurement.
+    pub fn build_preimage_covariance_cache(
         &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+    ) {
+        build_p1_covariance_cache(params, trapdoor, self.sigma);
+        // Cache construction is asynchronous in CUDA.  The setup timing
+        // boundary must include completion of the native covariance build.
+        crate::poly::dcrt::gpu::gpu_device_sync();
+    }
+
+    /// Return the already-retained production covariance cache.  Unlike the
+    /// normal sampler entry point this never creates a cache on a miss; this
+    /// makes a warm measurement fail closed instead of silently including cold
+    /// setup work in its local-job timing.
+    pub fn has_retained_preimage_covariance_cache(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+    ) -> bool {
+        cached_p1_covariance_cache(params, trapdoor, self.sigma).is_some()
+    }
+
+    fn validate_preimage_inputs(
         params: &GpuDCRTPolyParams,
         trapdoor: &GpuDCRTTrapdoor,
         public_matrix: &GpuDCRTPolyMatrix,
         target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
-        max_coefficient_bound: BigUint,
-        randomness_seed: [u8; 32],
-    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        max_coefficient_bound: &BigUint,
+    ) -> Result<(usize, usize, usize, usize), SmallMatrixError> {
         let d = public_matrix.row_size();
         let k = public_matrix.col_size();
         let columns = target.col_size();
         if target.row_size() != d || k == 0 || columns == 0 {
             return Err(SmallMatrixError::ShapeMismatch);
         }
-        if public_matrix.params != *params {
-            return Err(SmallMatrixError::ParameterMismatch);
-        }
-        if trapdoor.r.params != *params || trapdoor.e.params != *params {
+        if public_matrix.params != *params ||
+            trapdoor.r.params != *params ||
+            trapdoor.e.params != *params
+        {
             return Err(SmallMatrixError::ParameterMismatch);
         }
         if public_matrix.params.gpu_ids() != params.gpu_ids() ||
@@ -300,15 +586,102 @@ impl GpuDCRTPolyTrapdoorSampler {
         {
             return Err(SmallMatrixError::DeviceMismatch);
         }
-        let budget = params.vram_budget_bytes();
         let magnitude_bytes = usize::try_from(max_coefficient_bound.bits().div_ceil(8))
             .map_err(|_| SmallMatrixError::WidthOverflow)?
             .max(1);
-        let attempts = crate::env::gpu_preimage_max_tile_attempts()
-            .map_err(|_| SmallMatrixError::InvalidConfig)?;
-        let mut tile_columns = columns;
-        let persistent_bytes = [
+        Ok((d, k, columns, magnitude_bytes))
+    }
+
+    fn covariance_cache_footprint(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+    ) -> Result<(usize, usize), SmallMatrixError> {
+        let n = params.ring_dimension() as usize;
+        let cache_rows = trapdoor
+            .a_mat_coeff
+            .row_size()
+            .checked_mul(2)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let factor = n.checked_mul(cache_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let update = factor.checked_mul(cache_rows).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let factor_bytes = factor
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let update_bytes = update
+            .checked_mul(std::mem::size_of::<f64>())
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let retained = factor_bytes
+            .checked_add(update_bytes)
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<usize>()))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        // MatrixTrapdoor.cu allocates a covariance workspace with the same
+        // size as update_coeff while sqrt_var and update_coeff are already
+        // live. It is freed after the precompute event, so this is cold-only.
+        Ok((retained, update_bytes))
+    }
+
+    fn cache_identity(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        d: usize,
+    ) -> PreimageCacheIdentity {
+        let (c, s, dgg_stddev) = p1_covariance_parameters(params, d, self.sigma);
+        PreimageCacheIdentity {
+            // The Arc is owned by the trapdoor and therefore changes when a
+            // compactly decoded/new trapdoor is used.  This is intentionally
+            // an opaque identity rather than a performance-cache key based on
+            // a debug representation of secret material.
+            owner_token: Arc::as_ptr(&trapdoor.p1_covariance_cache) as usize as u64,
+            c,
+            smoothing: s,
+            dgg_stddev,
+        }
+    }
+
+    fn tile_workspace_bytes(
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        d: usize,
+        k: usize,
+        tile_columns: usize,
+        magnitude_bytes: usize,
+    ) -> Result<(usize, usize, usize, usize, usize, usize), SmallMatrixError> {
+        let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
+        let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
+            .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
+        let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
+        let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
+        let packed_staging = k
+            .checked_mul(tile_columns)
+            .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+            .and_then(|value| value.checked_mul(1 + magnitude_bytes))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        Ok((candidate, perturbation, residual, z_hat, target_tile, packed_staging))
+    }
+
+    fn allocation_evidence(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: &BigUint,
+        config: FixedPreimageConfig,
+        state: PreimageCacheState,
+    ) -> Result<PreimageAllocationEvidence, SmallMatrixError> {
+        let (d, k, columns, magnitude_bytes) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
             public_matrix,
+            target,
+            max_coefficient_bound,
+        )?;
+        let public_matrix_bytes =
+            dcrt_matrix_bytes(params, public_matrix.row_size(), public_matrix.col_size())?;
+        let trapdoor_bytes = [
             &trapdoor.r,
             &trapdoor.e,
             &trapdoor.a_mat_coeff,
@@ -318,16 +691,14 @@ impl GpuDCRTPolyTrapdoorSampler {
         .into_iter()
         .map(|matrix| dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size()))
         .try_fold(0usize, |sum, bytes| {
-            let bytes = bytes?;
-            sum.checked_add(bytes).ok_or(SmallMatrixError::DimensionOverflow)
+            sum.checked_add(bytes?).ok_or(SmallMatrixError::DimensionOverflow)
         })?;
         let resident_target_bytes = target.resident_matrix().map_or(Ok(0), |matrix| {
             dcrt_matrix_bytes(params, matrix.row_size(), matrix.col_size())
         })?;
-        let persistent_bytes = persistent_bytes
-            .checked_add(resident_target_bytes)
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let compact_bytes = k
+        let (retained_covariance_cache_bytes, cold_transient_workspace_bytes) =
+            Self::covariance_cache_footprint(params, trapdoor)?;
+        let compact_output_bytes = k
             .checked_mul(columns)
             .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
             .and_then(|value| value.checked_mul(1 + magnitude_bytes))
@@ -350,49 +721,228 @@ impl GpuDCRTPolyTrapdoorSampler {
                     .and_then(|subset| bytes.checked_add(subset))
             })
             .ok_or(SmallMatrixError::DimensionOverflow)?;
-        // The device decision word and its pinned host mirror are explicit;
-        // Device and host control words remain explicit in the allocation
-        // report rather than approximating opaque implementation overhead.
-        let device_acceptance_control_bytes = std::mem::size_of::<i32>();
-        let pinned_host_acceptance_control_bytes = std::mem::size_of::<i32>();
+        let device_control_bytes = std::mem::size_of::<i32>();
+        let pinned_host_control_bytes = std::mem::size_of::<i32>();
         let sampler_event_bytes = 2 * std::mem::size_of::<usize>();
-        while tile_columns > 0 {
-            let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
-            let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
-                .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
-            let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
-            let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
-            let packed_staging = k
-                .checked_mul(tile_columns)
-                .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
-                .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            let live = persistent_bytes
-                .checked_add(compact_bytes)
-                .and_then(|v| v.checked_add(candidate))
-                .and_then(|v| v.checked_add(perturbation))
-                .and_then(|v| v.checked_add(residual))
-                .and_then(|v| v.checked_add(z_hat))
-                .and_then(|v| v.checked_add(target_tile))
-                .and_then(|v| v.checked_add(hard_cutoff_plan_bytes))
-                .and_then(|v| v.checked_add(packed_staging))
-                .and_then(|v| v.checked_add(device_acceptance_control_bytes))
-                .and_then(|v| v.checked_add(pinned_host_acceptance_control_bytes))
-                .and_then(|v| v.checked_add(sampler_event_bytes))
-                .ok_or(SmallMatrixError::DimensionOverflow)?;
-            if residency_fits(live, budget) {
-                break;
-            }
-            tile_columns -= 1;
-        }
-        if tile_columns == 0 {
+        let (
+            candidate_workspace_bytes,
+            perturbation_workspace_bytes,
+            residual,
+            z_hat,
+            target_tile,
+            host_staging_bytes,
+        ) = Self::tile_workspace_bytes(
+            params,
+            trapdoor,
+            d,
+            k,
+            config.tile_columns.get(),
+            magnitude_bytes,
+        )?;
+        let scratch_bytes =
+            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
+        // The fixed native call stages the target tile on the source side and
+        // packs the accepted compact result through host staging.  The output
+        // itself is already represented by compact_output_bytes; don't charge
+        // it a second time as destination staging.
+        let source_device_staging_bytes = target_tile;
+        let destination_device_staging_bytes = 0;
+        let warm_peak = PreimageAllocationEnvelope::checked_sum([
+            public_matrix_bytes,
+            trapdoor_bytes,
+            resident_target_bytes,
+            retained_covariance_cache_bytes,
+            compact_output_bytes,
+            candidate_workspace_bytes,
+            perturbation_workspace_bytes,
+            scratch_bytes,
+            source_device_staging_bytes,
+            destination_device_staging_bytes,
+            host_staging_bytes,
+            device_control_bytes,
+            pinned_host_control_bytes,
+            sampler_event_bytes,
+            hard_cutoff_plan_bytes,
+        ])?;
+        let cold_peak = warm_peak
+            .checked_add(if matches!(state, PreimageCacheState::Cold) {
+                cold_transient_workspace_bytes
+            } else {
+                0
+            })
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        let envelope = PreimageAllocationEnvelope {
+            public_matrix_bytes,
+            trapdoor_bytes,
+            resident_target_bytes,
+            retained_covariance_cache_bytes,
+            compact_output_bytes,
+            candidate_workspace_bytes,
+            perturbation_workspace_bytes,
+            scratch_bytes,
+            source_device_staging_bytes,
+            destination_device_staging_bytes,
+            host_staging_bytes,
+            device_control_bytes,
+            pinned_host_control_bytes,
+            sampler_event_bytes,
+            cold_transient_workspace_bytes: if matches!(state, PreimageCacheState::Cold) {
+                cold_transient_workspace_bytes
+            } else {
+                0
+            },
+            sampler_peak_bytes: warm_peak,
+            cold_sampler_peak_bytes: cold_peak,
+            evidence_kind: PreimageAllocationEvidenceKind::Certified,
+        };
+        let context = PreimageEvidenceContext {
+            state,
+            tile_columns: config.tile_columns.get(),
+            max_attempts: config.max_attempts.get(),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+            hard_cutoff_plan_bytes,
+            format: PreimageFormatContext {
+                active_moduli: params.moduli().to_vec(),
+                crt_level: params.crt_depth().saturating_sub(1),
+                coefficient_magnitude_bytes: magnitude_bytes,
+                compact_output: true,
+            },
+            source_device_ids: params.gpu_ids().to_vec(),
+            destination_device_ids: params.gpu_ids().to_vec(),
+            cache_identity: self.cache_identity(params, trapdoor, d),
+        };
+        Ok(PreimageAllocationEvidence { context, envelope })
+    }
+
+    /// Return the exact/certified envelope for the fixed native call at this
+    /// width.  This query never scales another width's peak and never chooses
+    /// a different tile or retry policy.  Callers must retain the returned
+    /// context with the evidence when freezing a production plan.
+    pub fn preimage_allocation_evidence(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: &BigUint,
+        config: FixedPreimageConfig,
+        state: PreimageCacheState,
+    ) -> Result<PreimageAllocationEvidence, SmallMatrixError> {
+        self.allocation_evidence(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            max_coefficient_bound,
+            config,
+            state,
+        )
+    }
+
+    /// Query the fixed job's complete sampler footprint without allocating or
+    /// submitting any GPU work.  The caller owns the choice of tile width.
+    pub fn preimage_footprint(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: &BigUint,
+        config: FixedPreimageConfig,
+    ) -> Result<PreimageFootprint, SmallMatrixError> {
+        let evidence = self.preimage_allocation_evidence(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            max_coefficient_bound,
+            config,
+            PreimageCacheState::Cold,
+        )?;
+        let envelope = evidence.envelope;
+        let persistent_bytes = PreimageAllocationEnvelope::checked_sum([
+            envelope.public_matrix_bytes,
+            envelope.trapdoor_bytes,
+            envelope.resident_target_bytes,
+            envelope.retained_covariance_cache_bytes,
+        ])?;
+        Ok(PreimageFootprint {
+            persistent_bytes,
+            compact_output_bytes: envelope.compact_output_bytes,
+            scratch_bytes: envelope.scratch_bytes,
+            device_control_bytes: envelope.device_control_bytes,
+            pinned_control_bytes: envelope.pinned_host_control_bytes,
+            hard_cutoff_plan_bytes: evidence.context.hard_cutoff_plan_bytes,
+            packed_staging_bytes: envelope.host_staging_bytes,
+            sampler_event_bytes: envelope.sampler_event_bytes,
+            cold_transient_workspace_bytes: envelope.cold_transient_workspace_bytes,
+            sampler_peak_bytes: envelope.sampler_peak_bytes,
+            cold_sampler_peak_bytes: envelope.cold_sampler_peak_bytes,
+            tile_columns: evidence.context.tile_columns,
+            max_attempts: evidence.context.max_attempts,
+        })
+    }
+
+    /// Execute one previously planned preimage job.  Allocation pressure is a
+    /// hard error; this path never searches for another width or device.
+    pub fn bounded_preimage_with_config(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        config: FixedPreimageConfig,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let footprint = self.preimage_footprint(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+            config,
+        )?;
+        self.execute_preimage_with_config(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            max_coefficient_bound,
+            config,
+            footprint,
+            randomness_seed,
+        )
+    }
+
+    fn execute_preimage_with_config(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        config: FixedPreimageConfig,
+        footprint: PreimageFootprint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let (d, k, columns, magnitude_bytes) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+        )?;
+        let budget = params.vram_budget_bytes();
+        if !footprint.fits_budget(budget) {
             return Err(SmallMatrixError::ResourceExhausted {
-                requested_bytes: budget.saturating_add(1),
+                requested_bytes: footprint.cold_sampler_peak_bytes,
                 budget_bytes: budget,
             });
         }
+        let tile_columns = config.tile_columns.get();
+        let (candidate, perturbation, _residual, _z_hat, target_tile, _packed_staging) =
+            Self::tile_workspace_bytes(params, trapdoor, d, k, tile_columns, magnitude_bytes)?;
         let mut destination = GpuSmallMatrix::new_empty_checked(
             params,
             k,
@@ -402,38 +952,22 @@ impl GpuDCRTPolyTrapdoorSampler {
             budget,
         )?;
         destination.prepare_preimage_hard_cutoff();
-        let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
-        let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
-            .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let residual = dcrt_matrix_bytes(params, d, tile_columns)?;
-        let z_hat = dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?;
-        let target_tile = dcrt_matrix_bytes(params, d, tile_columns)?;
-        let packed_staging = k
-            .checked_mul(tile_columns)
-            .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
-            .and_then(|value| value.checked_mul(1 + magnitude_bytes))
-            .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let check_scratch =
-            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
         let report = destination.sampler_allocation_report(
-            persistent_bytes.checked_add(target_tile).ok_or(SmallMatrixError::DimensionOverflow)?,
+            footprint
+                .persistent_bytes
+                .checked_add(target_tile)
+                .ok_or(SmallMatrixError::DimensionOverflow)?,
             candidate,
             perturbation,
-            check_scratch,
-            hard_cutoff_plan_bytes,
-            packed_staging,
-            // Full-matrix queries include their deterministic handles. These
-            // are the compact owner and decision-event handles only.
-            sampler_event_bytes,
-            device_acceptance_control_bytes,
-            pinned_host_acceptance_control_bytes,
+            footprint.scratch_bytes,
+            footprint.hard_cutoff_plan_bytes,
+            footprint.packed_staging_bytes,
+            footprint.sampler_event_bytes,
+            footprint.device_control_bytes,
+            footprint.pinned_control_bytes,
         )?;
-        if !residency_fits(report.sampler_peak_bytes, budget) {
-            return Err(SmallMatrixError::ResourceExhausted {
-                requested_bytes: report.sampler_peak_bytes,
-                budget_bytes: budget,
-            });
+        if report.sampler_peak_bytes != footprint.sampler_peak_bytes {
+            return Err(SmallMatrixError::InvalidConfig);
         }
         tracing::debug!(
             persistent_bytes = report.persistent_bytes,
@@ -461,7 +995,7 @@ impl GpuDCRTPolyTrapdoorSampler {
                 .checked_add(column_start)
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
             let mut attempt = 0usize;
-            let outcome = bounded_retry(attempts, || {
+            let outcome = bounded_retry(config.max_attempts.get(), || {
                 let candidate = expanded_preimage_candidate(
                     self,
                     params,
@@ -481,8 +1015,6 @@ impl GpuDCRTPolyTrapdoorSampler {
                 )?;
                 drop(candidate);
                 Ok(accepted.then_some(()))
-                // Drop only after the flag decision; the GPU owner releases
-                // rejected storage in stream order before the next attempt.
             });
             match outcome {
                 Ok(()) => {}
@@ -497,6 +1029,121 @@ impl GpuDCRTPolyTrapdoorSampler {
             }
         }
         Ok(destination)
+    }
+
+    /// Legacy/benchmark entry point.  Its resource search is intentionally
+    /// kept here; production callers use `bounded_preimage_with_config`.
+    fn bounded_preimage(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        public_matrix: &GpuDCRTPolyMatrix,
+        target: &dyn PolyMatrixColumnSource<GpuDCRTPolyMatrix>,
+        max_coefficient_bound: BigUint,
+        randomness_seed: [u8; 32],
+    ) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        let (_, _, columns, _) = Self::validate_preimage_inputs(
+            params,
+            trapdoor,
+            public_matrix,
+            target,
+            &max_coefficient_bound,
+        )?;
+        let attempts = crate::env::gpu_preimage_max_tile_attempts()
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        let mut tile_columns = columns;
+        let budget = params.vram_budget_bytes();
+        while tile_columns > 0 {
+            let config = FixedPreimageConfig::new(tile_columns, attempts)
+                .ok_or(SmallMatrixError::InvalidConfig)?;
+            let footprint = self.preimage_footprint(
+                params,
+                trapdoor,
+                public_matrix,
+                target,
+                &max_coefficient_bound,
+                config,
+            )?;
+            if footprint.fits_budget(budget) {
+                return self.execute_preimage_with_config(
+                    params,
+                    trapdoor,
+                    public_matrix,
+                    target,
+                    max_coefficient_bound,
+                    config,
+                    footprint,
+                    randomness_seed,
+                );
+            }
+            tile_columns -= 1;
+        }
+        Err(SmallMatrixError::ResourceExhausted {
+            requested_bytes: budget.saturating_add(1),
+            budget_bytes: budget,
+        })
+    }
+}
+
+impl GpuDCRTPolyTrapdoorSampler {
+    /// Query the complete native allocation topology of `trapdoor()` without
+    /// constructing a trapdoor or submitting CUDA work.
+    pub fn trapdoor_allocation_evidence(
+        params: &GpuDCRTPolyParams,
+        size: usize,
+    ) -> Result<TrapdoorAllocationEvidence, SmallMatrixError> {
+        if size == 0 || params.dropped_moduli() != 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let digits = params.modulus_digits().max(1);
+        let trapdoor_columns =
+            size.checked_mul(digits).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let r = trapdoor_matrix_bytes(params, size, trapdoor_columns, true)?;
+        let e = r;
+        let coeff_product = trapdoor_matrix_bytes(params, size, size, false)?;
+        let eval_product = trapdoor_matrix_bytes(params, size, size, true)?;
+        let transpose = trapdoor_matrix_bytes(params, trapdoor_columns, size, true)?;
+        let a_bar = coeff_product;
+        let gadget = trapdoor_matrix_bytes(params, size, trapdoor_columns, true)?;
+        let identity = coeff_product;
+        let a0 = trapdoor_matrix_bytes(params, size, size.saturating_mul(2), true)?;
+        let a1 = gadget;
+        let public_output = trapdoor_matrix_bytes(
+            params,
+            size,
+            size.checked_mul(2)
+                .and_then(|value| value.checked_add(trapdoor_columns))
+                .ok_or(SmallMatrixError::DimensionOverflow)?,
+            true,
+        )?;
+        // A/B/D generation has one transpose and one product live at a time.
+        // The a1 expression has product, sum, and final subtraction outputs
+        // live together; summing these owners is a certified upper bound for
+        // the native lifetime, not a measured peak.
+        let scratch = transpose
+            .checked_add(eval_product)
+            .and_then(|value| value.checked_add(eval_product.saturating_mul(2)))
+            .and_then(|value| value.checked_add(gadget))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        Ok(TrapdoorAllocationEvidence {
+            trapdoor_r_bytes: r,
+            trapdoor_e_bytes: e,
+            trapdoor_a_coeff_bytes: coeff_product,
+            trapdoor_b_coeff_bytes: coeff_product,
+            trapdoor_d_coeff_bytes: coeff_product,
+            public_a_bar_bytes: a_bar,
+            gadget_bytes: gadget,
+            identity_bytes: identity,
+            a0_assembly_bytes: a0,
+            a1_assembly_bytes: a1,
+            public_output_bytes: public_output,
+            scratch_bytes: scratch,
+            control_bytes: 0,
+            cache_bytes: 0,
+            host_bytes: 0,
+            pinned_host_bytes: 0,
+            evidence_kind: PreimageAllocationEvidenceKind::Certified,
+        })
     }
 }
 
@@ -753,7 +1400,7 @@ mod tests {
         poly::{
             PolyParams,
             dcrt::{
-                gpu::{detected_gpu_device_ids, gpu_device_sync},
+                gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync},
                 params::DCRTPolyParams,
             },
         },
@@ -767,6 +1414,177 @@ mod tests {
     use serial_test::serial as sequential;
 
     const SIGMA: f64 = 4.578;
+
+    #[test]
+    fn fixed_preimage_config_requires_nonzero_choices() {
+        assert_eq!(FixedPreimageConfig::new(0, 1), None);
+        assert_eq!(FixedPreimageConfig::new(1, 0), None);
+        let config = FixedPreimageConfig::new(3, 7).expect("positive fixed choices");
+        assert_eq!(config.tile_columns.get(), 3);
+        assert_eq!(config.max_attempts.get(), 7);
+    }
+
+    #[test]
+    fn preimage_cache_identity_digest_binds_owner_parameters_and_basis_order() {
+        let identity =
+            PreimageCacheIdentity { owner_token: 7, c: 2.0, smoothing: 3.0, dgg_stddev: 4.0 };
+        let baseline = identity.opaque_digest(&[8, 16], &[17, 19, 23]);
+        assert_ne!(baseline, identity.opaque_digest(&[8, 16], &[19, 17, 23]));
+        assert_ne!(baseline, identity.opaque_digest(&[8, 32], &[17, 19, 23]));
+        let owner_changed = PreimageCacheIdentity { owner_token: 8, ..identity };
+        assert_ne!(baseline, owner_changed.opaque_digest(&[8, 16], &[17, 19, 23]));
+    }
+
+    #[test]
+    fn preimage_footprint_separates_cold_covariance_workspace_from_warm_peak() {
+        let footprint = PreimageFootprint {
+            persistent_bytes: 40,
+            compact_output_bytes: 10,
+            scratch_bytes: 20,
+            device_control_bytes: 1,
+            pinned_control_bytes: 1,
+            hard_cutoff_plan_bytes: 2,
+            packed_staging_bytes: 3,
+            sampler_event_bytes: 1,
+            cold_transient_workspace_bytes: 17,
+            sampler_peak_bytes: 78,
+            cold_sampler_peak_bytes: 95,
+            tile_columns: 1,
+            max_attempts: 1,
+        };
+        assert_eq!(footprint.cold_sampler_peak_bytes, footprint.sampler_peak_bytes + 17);
+        assert!(!footprint.fits_budget(94));
+        assert!(footprint.fits_budget(95));
+        assert_eq!(footprint.sampler_peak_bytes, 78);
+    }
+
+    fn evidence_envelope(transient: usize, width: usize) -> PreimageAllocationEvidence {
+        let envelope = PreimageAllocationEnvelope {
+            public_matrix_bytes: 11,
+            trapdoor_bytes: 13,
+            resident_target_bytes: 17,
+            retained_covariance_cache_bytes: 19,
+            compact_output_bytes: width * 23,
+            candidate_workspace_bytes: width * 29,
+            perturbation_workspace_bytes: width * 31,
+            scratch_bytes: width * 37,
+            source_device_staging_bytes: width * 41,
+            destination_device_staging_bytes: 0,
+            host_staging_bytes: width * 43,
+            device_control_bytes: 3,
+            pinned_host_control_bytes: 5,
+            sampler_event_bytes: 7,
+            cold_transient_workspace_bytes: transient,
+            sampler_peak_bytes: 0,
+            cold_sampler_peak_bytes: 0,
+            evidence_kind: PreimageAllocationEvidenceKind::Certified,
+        };
+        let warm = PreimageAllocationEnvelope::checked_sum([
+            envelope.public_matrix_bytes,
+            envelope.trapdoor_bytes,
+            envelope.resident_target_bytes,
+            envelope.retained_covariance_cache_bytes,
+            envelope.compact_output_bytes,
+            envelope.candidate_workspace_bytes,
+            envelope.perturbation_workspace_bytes,
+            envelope.scratch_bytes,
+            envelope.source_device_staging_bytes,
+            envelope.destination_device_staging_bytes,
+            envelope.host_staging_bytes,
+            envelope.device_control_bytes,
+            envelope.pinned_host_control_bytes,
+            envelope.sampler_event_bytes,
+        ])
+        .unwrap();
+        let mut envelope = envelope;
+        envelope.sampler_peak_bytes = warm;
+        envelope.cold_sampler_peak_bytes = warm + transient;
+        PreimageAllocationEvidence {
+            context: PreimageEvidenceContext {
+                state: if transient == 0 {
+                    PreimageCacheState::Warm
+                } else {
+                    PreimageCacheState::Cold
+                },
+                tile_columns: width,
+                max_attempts: 4,
+                max_coefficient_bound: BigUint::from(255u32),
+                hard_cutoff_plan_bytes: 2,
+                format: PreimageFormatContext {
+                    active_moduli: vec![17, 19, 23],
+                    crt_level: 2,
+                    coefficient_magnitude_bytes: 1,
+                    compact_output: true,
+                },
+                source_device_ids: vec![0],
+                destination_device_ids: vec![0],
+                cache_identity: PreimageCacheIdentity {
+                    owner_token: 99,
+                    c: 2.0,
+                    smoothing: 3.0,
+                    dgg_stddev: 4.0,
+                },
+            },
+            envelope,
+        }
+    }
+
+    #[test]
+    fn preimage_allocation_evidence_distinguishes_cold_and_warm() {
+        let cold = evidence_envelope(47, 1);
+        let warm = evidence_envelope(0, 1);
+        assert_eq!(cold.context.tile_columns, warm.context.tile_columns);
+        assert_ne!(cold.context.state, warm.context.state);
+        assert_eq!(cold.envelope.sampler_peak_bytes, warm.envelope.sampler_peak_bytes);
+        assert_eq!(cold.envelope.cold_sampler_peak_bytes, warm.envelope.sampler_peak_bytes + 47);
+        assert_eq!(cold.envelope.retained_covariance_cache_bytes, 19);
+    }
+
+    #[test]
+    fn preimage_allocation_evidence_keeps_direct_width_one_and_eight_points() {
+        let width_one = evidence_envelope(0, 1);
+        let width_eight = evidence_envelope(0, 8);
+        assert_eq!(width_one.context.tile_columns, 1);
+        assert_eq!(width_eight.context.tile_columns, 8);
+        assert_ne!(width_one.envelope.sampler_peak_bytes, width_eight.envelope.sampler_peak_bytes);
+        // A width-8 point carries its own exact envelope; there is no API
+        // operation that multiplies the width-1 point into this value.
+        assert_eq!(width_eight.envelope.compact_output_bytes, 8 * 23);
+    }
+
+    #[test]
+    fn preimage_evidence_context_invalidates_cache_retry_and_cutoff_changes() {
+        let baseline = evidence_envelope(0, 1);
+        let mut retry_changed = baseline.clone();
+        retry_changed.context.max_attempts = 5;
+        let mut cutoff_changed = baseline.clone();
+        cutoff_changed.context.max_coefficient_bound = BigUint::from(511u32);
+        let mut cache_changed = baseline.clone();
+        cache_changed.context.cache_identity.owner_token += 1;
+        assert_ne!(baseline.context, retry_changed.context);
+        assert_ne!(baseline.context, cutoff_changed.context);
+        assert_ne!(baseline.context, cache_changed.context);
+    }
+
+    #[test]
+    #[sequential]
+    fn covariance_cache_builder_is_session_owned_and_idempotent() {
+        let devices = detected_gpu_device_ids();
+        if devices.is_empty() {
+            return;
+        }
+        let params = GpuDCRTPolyParams::new(128, vec![65_537, 67_073], 8, None);
+        let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, SIGMA);
+        let (first, _) = sampler.trapdoor(&params, 1);
+        assert!(!sampler.has_retained_preimage_covariance_cache(&params, &first));
+        sampler.build_preimage_covariance_cache(&params, &first);
+        assert!(sampler.has_retained_preimage_covariance_cache(&params, &first));
+        // A distinct trapdoor owner must enter its own cold/setup path even
+        // when all numerical sampler parameters are identical.
+        let (second, _) = sampler.trapdoor(&params, 1);
+        assert!(!sampler.has_retained_preimage_covariance_cache(&params, &second));
+        gpu_device_sync();
+    }
 
     fn gpu_test_params() -> DCRTPolyParams {
         DCRTPolyParams::new(128, 2, 16, 8, None, None)

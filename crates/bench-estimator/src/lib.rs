@@ -7,15 +7,160 @@ pub mod harness;
 use mxx_ir_core::{
     BenchmarkRole, FrozenGraphScopeId, IntExpr, LivenessSchedule, ParamEnv, RealExpr,
     ValidatedGraph,
-    artifact::ArtifactConfidentiality,
+    artifact::ArtifactAvailability,
     encoding,
     node::NodeKind,
-    types::{ConcreteWireType, NodeId, WireRef, WireType},
+    types::{ConcreteWireType, NodeId, Port, WireRef, WireType},
 };
+use mxx_runtime::{ArtifactKey, ArtifactStore, load_artifact_payload_sizes};
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use thiserror::Error;
+
+/// Exact lengths of canonical artifact payloads captured at an artifact-store
+/// boundary.  This is deliberately not serialized and is kept separate from
+/// the public manifest schema: compact codec lengths are properties of the
+/// persisted payload, not of an artifact's logical type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactPayloadSizes {
+    members: BTreeMap<ArtifactSizeKey, u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
+struct ArtifactSizeKey {
+    production: mxx_ir_core::artifact::ProductionId,
+    name: String,
+    index: Option<usize>,
+}
+
+impl ArtifactPayloadSizes {
+    /// Test-only construction helper. Production callers must use
+    /// [`capture_artifact_payload_sizes`], which reads the canonical payload
+    /// lengths from an [`ArtifactStore`].
+    #[cfg(test)]
+    fn from_entries(
+        entries: impl IntoIterator<
+            Item = (mxx_ir_core::artifact::ProductionId, String, Option<usize>, u64),
+        >,
+    ) -> Self {
+        Self {
+            members: entries
+                .into_iter()
+                .map(|(production, name, index, bytes)| {
+                    (ArtifactSizeKey { production, name, index }, bytes)
+                })
+                .collect(),
+        }
+    }
+
+    fn total_for(
+        &self,
+        production: &mxx_ir_core::artifact::ProductionId,
+        name: &str,
+        family_count: Option<usize>,
+    ) -> Option<u64> {
+        match family_count {
+            None => self
+                .members
+                .get(&ArtifactSizeKey {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: None,
+                })
+                .copied(),
+            Some(count) => (0..count).try_fold(0u64, |total, index| {
+                let size = self.members.get(&ArtifactSizeKey {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: Some(index),
+                })?;
+                total.checked_add(*size)
+            }),
+        }
+    }
+
+    fn require_for(
+        &self,
+        production: &mxx_ir_core::artifact::ProductionId,
+        name: &str,
+        family_count: Option<usize>,
+    ) -> Result<u64, EstimateError> {
+        match family_count {
+            None => self.total_for(production, name, None).ok_or_else(|| {
+                EstimateError::MissingArtifactPayloadSize {
+                    production: production.clone(),
+                    name: name.to_owned(),
+                    index: None,
+                }
+            }),
+            Some(count) => {
+                let mut total = 0u64;
+                for index in 0..count {
+                    let size = self
+                        .members
+                        .get(&ArtifactSizeKey {
+                            production: production.clone(),
+                            name: name.to_owned(),
+                            index: Some(index),
+                        })
+                        .copied()
+                        .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                            production: production.clone(),
+                            name: name.to_owned(),
+                            index: Some(index),
+                        })?;
+                    total =
+                        total.checked_add(size).ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                }
+                Ok(total)
+            }
+        }
+    }
+}
+
+/// Captures exact serialized artifact payload lengths from the store boundary.
+///
+/// The returned context is intentionally opaque: callers cannot manufacture
+/// transport sizes or add entries without reading the corresponding payload
+/// from an [`ArtifactStore`].
+pub fn capture_artifact_payload_sizes<S: ArtifactStore>(
+    validated: &ValidatedGraph,
+    store: &mut S,
+) -> Result<ArtifactPayloadSizes, EstimateError> {
+    let mut captured = ArtifactPayloadSizes { members: BTreeMap::new() };
+    let mut seen = BTreeSet::new();
+    for plan in validated.scopes.values() {
+        for (position, handle) in plan.execution_order.iter().enumerate() {
+            let NodeKind::Input { artifact: Some(artifact), .. } = handle.kind() else {
+                continue;
+            };
+            let wire = WireRef { node: NodeId(position as u64), port: Port(0) };
+            let descriptor = plan.artifact_inputs.get(&wire).ok_or_else(|| {
+                EstimateError::MissingArtifactPayloadSize {
+                    production: artifact.production_id.clone(),
+                    name: artifact.artifact_name.clone(),
+                    index: None,
+                }
+            })?;
+            let key = (artifact.production_id.clone(), artifact.artifact_name.clone());
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            let artifact_key =
+                ArtifactKey { production: key.0.clone(), name: key.1.clone(), index: None };
+            let sizes = load_artifact_payload_sizes(store, &artifact_key, descriptor)
+                .map_err(|error| EstimateError::Backend(error.to_string()))?;
+            for (index, bytes) in sizes {
+                captured.members.insert(
+                    ArtifactSizeKey { production: key.0.clone(), name: key.1.clone(), index },
+                    u64::try_from(bytes).map_err(|_| EstimateError::LogicalByteTotalOverflow)?,
+                );
+            }
+        }
+    }
+    Ok(captured)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NodeMeasurement {
@@ -82,18 +227,40 @@ pub trait MeasurementBackend {
     fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
         match kind {
             NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.confidentiality == ArtifactConfidentiality::Private =>
+                if artifact.availability == ArtifactAvailability::Cached =>
             {
                 0
             }
-            NodeKind::Input { .. } => self.persistent_bytes_for_node(kind, wire_type),
+            NodeKind::Input { .. } => self.artifact_payload_bytes_for_node(kind, wire_type, None),
             _ => 0,
         }
     }
     /// Deterministic data reusable between invocations (for example a keyed
     /// hash/cache entry). It is deliberately separate from transmission.
-    fn cache_bytes_for_node(&self, _kind: &NodeKind, _wire_type: &ConcreteWireType) -> u64 {
-        0
+    fn cache_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
+        match kind {
+            NodeKind::Input { artifact: Some(artifact), .. }
+                if artifact.availability == ArtifactAvailability::Cached =>
+            {
+                self.artifact_payload_bytes_for_node(kind, wire_type, None)
+            }
+            _ => 0,
+        }
+    }
+    /// Size of the canonical serialized artifact payload used at the stage
+    /// boundary. This is deliberately separate from resident/persistent
+    /// storage: compact artifacts are transported in their codec form even
+    /// when the runtime expands them into a full device allocation. Exact
+    /// artifact sizes are supplied by `estimate_with_artifact_sizes`; this
+    /// hook remains for non-artifact synthetic backends.
+    fn artifact_payload_bytes_for_node(
+        &self,
+        kind: &NodeKind,
+        wire_type: &ConcreteWireType,
+        manifest_payload_bytes: Option<u64>,
+    ) -> u64 {
+        manifest_payload_bytes
+            .unwrap_or_else(|| self.persistent_storage_bytes_for_node(kind, wire_type))
     }
     /// Persistent storage required for the complete logical output artifact.
     fn persistent_storage_bytes_for_node(
@@ -213,6 +380,14 @@ pub enum EstimateError {
     LoopIndexDependentCost { scope: FrozenGraphScopeId, node: NodeId },
     #[error("logical byte count exceeds u128")]
     LogicalByteTotalOverflow,
+    #[error(
+        "exact serialized payload size is missing for artifact {production:?}/{name} member {index:?}"
+    )]
+    MissingArtifactPayloadSize {
+        production: mxx_ir_core::artifact::ProductionId,
+        name: String,
+        index: Option<usize>,
+    },
 }
 
 /// Estimates an unlimited-resource DAG schedule. GPU fleet limits are reflected
@@ -221,8 +396,42 @@ pub fn estimate<B: MeasurementBackend>(
     validated: &ValidatedGraph,
     backend: &mut B,
 ) -> Result<CostReport, EstimateError> {
-    let mut estimator =
-        Estimator { validated, backend, cache: HashMap::new(), invocations: BTreeMap::new() };
+    estimate_internal(validated, backend, None)
+}
+
+/// Estimates a graph whose transferred or cached artifact inputs are backed
+/// by exact serialized payload lengths captured from the artifact store.
+pub fn estimate_with_artifact_sizes<B: MeasurementBackend>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    payload_sizes: &ArtifactPayloadSizes,
+) -> Result<CostReport, EstimateError> {
+    estimate_internal(validated, backend, Some(payload_sizes))
+}
+
+/// Estimates a graph using exact payload lengths read from an artifact store.
+/// This is the production entry point for graphs containing artifact inputs.
+pub fn estimate_with_artifact_store<B: MeasurementBackend, S: ArtifactStore>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    store: &mut S,
+) -> Result<CostReport, EstimateError> {
+    let payload_sizes = capture_artifact_payload_sizes(validated, store)?;
+    estimate_with_artifact_sizes(validated, backend, &payload_sizes)
+}
+
+fn estimate_internal<B: MeasurementBackend>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    payload_sizes: Option<&ArtifactPayloadSizes>,
+) -> Result<CostReport, EstimateError> {
+    let mut estimator = Estimator {
+        validated,
+        backend,
+        payload_sizes,
+        cache: HashMap::new(),
+        invocations: BTreeMap::new(),
+    };
     let mut report = estimator.estimate_scope(&FrozenGraphScopeId::Root, &validated.bindings)?;
     estimator.record_child_invocations(&FrozenGraphScopeId::Root, &validated.bindings, 1)?;
     for (key, count) in estimator.invocations {
@@ -301,6 +510,7 @@ impl CacheKey {
 struct Estimator<'a, B: MeasurementBackend> {
     validated: &'a ValidatedGraph,
     backend: &'a mut B,
+    payload_sizes: Option<&'a ArtifactPayloadSizes>,
     cache: HashMap<CacheKey, CostReport>,
     invocations: BTreeMap<CacheKey, usize>,
 }
@@ -485,6 +695,11 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
         let mut completion = BTreeMap::<WireRef, f64>::new();
         let mut scheduled = Vec::with_capacity(plan.execution_order.len());
         let mut allocation_roots = BTreeMap::<WireRef, WireRef>::new();
+        // An input node is a logical read of one artifact key.  Graph aliases
+        // can expose that key more than once, but transmission/cache storage
+        // is charged once per execution boundary.
+        let mut accounted_artifacts =
+            BTreeSet::<(mxx_ir_core::artifact::ProductionId, String)>::new();
 
         for (position, handle) in plan.execution_order.iter().enumerate() {
             let id = NodeId(position as u64);
@@ -566,34 +781,85 @@ impl<B: MeasurementBackend> Estimator<'_, B> {
                 report.expanded_workspace_bytes.max(measurement.workspace_bytes);
             report.chunk_count =
                 report.chunk_count.saturating_add(measurement.independent_wave_count);
+            // An artifact input is a logical read of one persisted key.  A
+            // graph may expose that key through more than one input wire (or
+            // alias a family in several places), but its durable storage must
+            // be charged once, just like transport and cache accounting
+            // below.  Keep the per-member family size supplied by the
+            // backend; only duplicate references are suppressed here.
+            let account_artifact = match node.kind {
+                NodeKind::Input { artifact: Some(artifact), .. } => accounted_artifacts
+                    .insert((artifact.production_id.clone(), artifact.artifact_name.clone())),
+                _ => true,
+            };
             for wire_type in &node.concrete_output_types {
-                report.output_bytes = report
-                    .output_bytes
-                    .checked_add(u128::from(
-                        self.backend.output_bytes_for_node(node.kind, wire_type),
-                    ))
-                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
-                report.persistent_storage_bytes = report
-                    .persistent_storage_bytes
-                    .checked_add(u128::from(
-                        self.backend.persistent_storage_bytes_for_node(node.kind, wire_type),
-                    ))
-                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                if account_artifact {
+                    report.output_bytes = report
+                        .output_bytes
+                        .checked_add(u128::from(
+                            self.backend.output_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                    report.persistent_storage_bytes = report
+                        .persistent_storage_bytes
+                        .checked_add(u128::from(
+                            self.backend.persistent_storage_bytes_for_node(node.kind, wire_type),
+                        ))
+                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                }
             }
             if matches!(node.kind, NodeKind::Input { .. }) {
-                for wire_type in &node.concrete_output_types {
-                    report.transmitted_bytes = report
-                        .transmitted_bytes
-                        .checked_add(u128::from(
-                            self.backend.transmitted_bytes_for_node(node.kind, wire_type),
-                        ))
-                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
-                    report.cache_bytes = report
-                        .cache_bytes
-                        .checked_add(u128::from(
-                            self.backend.cache_bytes_for_node(node.kind, wire_type),
-                        ))
-                        .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                if account_artifact {
+                    for wire_type in &node.concrete_output_types {
+                        let exact_payload_bytes = match node.kind {
+                            NodeKind::Input { artifact: Some(artifact), .. } => {
+                                let descriptor = plan
+                                    .artifact_inputs
+                                    .get(&WireRef { node: id, port: mxx_ir_core::Port(0) })
+                                    .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                                        production: artifact.production_id.clone(),
+                                        name: artifact.artifact_name.clone(),
+                                        index: None,
+                                    })?;
+                                Some(
+                                    self.payload_sizes
+                                        .ok_or_else(|| EstimateError::MissingArtifactPayloadSize {
+                                            production: artifact.production_id.clone(),
+                                            name: artifact.artifact_name.clone(),
+                                            index: None,
+                                        })?
+                                        .require_for(
+                                            &artifact.production_id,
+                                            &artifact.artifact_name,
+                                            descriptor.family_count,
+                                        )?,
+                                )
+                            }
+                            _ => None,
+                        };
+                        let payload_bytes = self.backend.artifact_payload_bytes_for_node(
+                            node.kind,
+                            wire_type,
+                            exact_payload_bytes,
+                        );
+                        match node.kind {
+                            NodeKind::Input { artifact: Some(artifact), .. }
+                                if artifact.availability == ArtifactAvailability::Cached =>
+                            {
+                                report.cache_bytes = report
+                                    .cache_bytes
+                                    .checked_add(u128::from(payload_bytes))
+                                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                            }
+                            NodeKind::Input { .. } => {
+                                report.transmitted_bytes = report
+                                    .transmitted_bytes
+                                    .checked_add(u128::from(payload_bytes))
+                                    .ok_or(EstimateError::LogicalByteTotalOverflow)?;
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             report
@@ -1544,20 +1810,23 @@ mod tests {
     }
 
     #[test]
-    fn private_artifact_inputs_are_local_persistence_not_transport() {
+    fn deterministic_cache_artifact_inputs_are_local_persistence_not_transport() {
         let ring = Ring::new(17, 8);
         let production_id = mxx_ir_core::artifact::ProductionId {
             spec_hash: mxx_ir_core::artifact::SpecHash([7; 32]),
             execution_nonce: [8; 32],
         };
-        let private = ring.artifact_input(
+        // This fixture models a keyed public setup/LUT whose producer is
+        // expected to finalize the deterministic entry before the consumer
+        // runs.  It is intentionally not a sampled secret or trapdoor.
+        let cached_setup = ring.artifact_input(
             production_id.clone(),
-            "private-setup-t",
+            "public-deterministic-setup-lut",
             (1, 1),
-            mxx_ir_core::artifact::ArtifactConfidentiality::Private,
+            mxx_ir_core::artifact::ArtifactAvailability::Cached,
         );
-        let built = DslContext::new("estimate-private-artifact")
-            .output("setup-t", private)
+        let built = DslContext::new("estimate-deterministic-cache-artifact")
+            .output("setup-t", cached_setup)
             .expect("output")
             .build()
             .expect("build");
@@ -1567,7 +1836,7 @@ mod tests {
             artifacts: BTreeMap::new(),
         };
         manifest.artifacts.insert(
-            "private-setup-t".to_owned(),
+            "public-deterministic-setup-lut".to_owned(),
             mxx_ir_core::artifact::ManifestArtifact {
                 artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(
                     mxx_ir_core::types::ConcreteMatrixType {
@@ -1578,19 +1847,148 @@ mod tests {
                     },
                 ),
                 family_count: None,
-                confidentiality: mxx_ir_core::artifact::ArtifactConfidentiality::Private,
-                content_hash: None,
+                availability: mxx_ir_core::artifact::ArtifactAvailability::Cached,
                 layout: None,
             },
         );
         let mut manifests = BTreeMap::new();
-        manifests.insert(production_id, manifest);
+        manifests.insert(production_id.clone(), manifest);
         let validated = built
             .validate_with_manifests(&ParamEnv::default(), &manifests)
-            .expect("private artifact graph validates");
-        let report = estimate(&validated, &mut UnitBackend).expect("estimate");
+            .expect("cached artifact graph validates");
+        let payload_sizes = ArtifactPayloadSizes::from_entries([(
+            production_id,
+            "public-deterministic-setup-lut".to_owned(),
+            None,
+            13,
+        )]);
+        let report = estimate_with_artifact_sizes(&validated, &mut UnitBackend, &payload_sizes)
+            .expect("estimate");
         assert_eq!(report.transmitted_bytes, 0);
         assert!(report.persistent_storage_bytes > 0);
+    }
+
+    #[test]
+    fn repeated_shared_and_family_artifact_inputs_are_accounted_once_per_key() {
+        struct ArtifactAccountingBackend;
+        impl MeasurementBackend for ArtifactAccountingBackend {
+            type Error = Infallible;
+
+            fn measure(
+                &mut self,
+                _graph: &str,
+                _node: &MeasurementNode<'_>,
+                _bindings: &ParamEnv,
+            ) -> Result<NodeMeasurement, Self::Error> {
+                Ok(NodeMeasurement::default())
+            }
+
+            fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
+                match wire_type {
+                    ConcreteWireType::Matrix(_) => 8,
+                    ConcreteWireType::IndexedFamily { element, count } => {
+                        self.persistent_bytes(element).saturating_mul(*count as u64)
+                    }
+                    _ => 0,
+                }
+            }
+        }
+
+        let production_id = mxx_ir_core::artifact::ProductionId {
+            spec_hash: mxx_ir_core::artifact::SpecHash([61; 32]),
+            execution_nonce: [62; 32],
+        };
+        let ring = Ring::new(17, 8);
+        let matrix_type = mxx_ir_core::types::ConcreteMatrixType {
+            modulus: 17.into(),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 1,
+        };
+
+        for availability in [
+            mxx_ir_core::artifact::ArtifactAvailability::Transferred,
+            mxx_ir_core::artifact::ArtifactAvailability::Cached,
+        ] {
+            let shared_a =
+                ring.artifact_input(production_id.clone(), "shared-a", (1, 1), availability);
+            let shared_b = shared_a.clone();
+            let members = ring.family_artifact_input(
+                production_id.clone(),
+                "members",
+                3,
+                (1, 1),
+                availability,
+            );
+            let built = DslContext::new("estimate-shared-family-artifacts")
+                .output("shared-a", shared_a)
+                .expect("first shared output")
+                .output("shared-b", shared_b)
+                .expect("second shared output")
+                .output("members", members)
+                .expect("family output")
+                .build()
+                .expect("build");
+            let descriptor = |family_count| mxx_ir_core::artifact::ManifestArtifact {
+                artifact_type: mxx_ir_core::artifact::ArtifactType::Matrix(matrix_type.clone()),
+                family_count,
+                availability,
+                layout: None,
+            };
+            let manifest = mxx_ir_core::artifact::Manifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: production_id.clone(),
+                artifacts: BTreeMap::from([
+                    ("shared-a".to_owned(), descriptor(None)),
+                    ("members".to_owned(), descriptor(Some(3))),
+                ]),
+            };
+            let validated = built
+                .validate_with_manifests(
+                    &ParamEnv::default(),
+                    &BTreeMap::from([(production_id.clone(), manifest)]),
+                )
+                .expect("artifact graph validates");
+            let payload_sizes = ArtifactPayloadSizes::from_entries(
+                std::iter::once((
+                    production_id.clone(),
+                    "shared-a".to_owned(),
+                    None,
+                    b"shared-matrix".len() as u64,
+                ))
+                .chain((0..3).map(|index| {
+                    (
+                        production_id.clone(),
+                        "members".to_owned(),
+                        Some(index),
+                        b"member".len() as u64,
+                    )
+                })),
+            );
+            let report = estimate_with_artifact_sizes(
+                &validated,
+                &mut ArtifactAccountingBackend,
+                &payload_sizes,
+            )
+            .expect("artifact graph estimates");
+
+            // One shared payload plus three family members: duplicate graph
+            // aliases do not multiply durable storage.  Availability only
+            // changes the boundary split, never the logical stored size.
+            assert_eq!(report.persistent_storage_bytes, 8 + 3 * 8);
+            assert_eq!(report.output_bytes, 8 + 3 * 8);
+            let expected_boundary = b"shared-matrix".len() as u128 + 3 * b"member".len() as u128;
+            match availability {
+                mxx_ir_core::artifact::ArtifactAvailability::Transferred => {
+                    assert_eq!(report.transmitted_bytes, expected_boundary);
+                    assert_eq!(report.cache_bytes, 0);
+                }
+                mxx_ir_core::artifact::ArtifactAvailability::Cached => {
+                    assert_eq!(report.transmitted_bytes, 0);
+                    assert_eq!(report.cache_bytes, expected_boundary);
+                }
+            }
+        }
     }
 
     #[test]

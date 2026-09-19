@@ -26,13 +26,13 @@ fn test_gpu_ring_gsw_round_trip() {
     let ct = scheme.encrypt(&secret, &message).unwrap();
     let gsw = scheme.encrypt_gsw(&secret, &bit).unwrap();
     let encryption = context
-        .public_output("a", ct.a.clone())
+        .transferred_output("a", ct.a.clone())
         .unwrap()
-        .public_output("b", ct.b.clone())
+        .transferred_output("b", ct.b.clone())
         .unwrap()
-        .public_output("ga", gsw.a.clone())
+        .transferred_output("ga", gsw.a.clone())
         .unwrap()
-        .public_output("gb", gsw.b.clone())
+        .transferred_output("gb", gsw.b.clone())
         .unwrap()
         .build()
         .unwrap();
@@ -54,7 +54,7 @@ fn test_gpu_ring_gsw_round_trip() {
     let (keygen_secret, _) = scheme.keygen().unwrap();
     let graph = compile(
         DslContext::new("integration-ring-gsw-keygen")
-            .private_output("sk", keygen_secret)
+            .transferred_output("sk", keygen_secret)
             .unwrap()
             .build()
             .unwrap(),
@@ -109,12 +109,12 @@ fn test_gpu_ring_gsw_round_trip() {
             let phase = &imported.b - &secret * &imported.a;
             let decryption = compile(
                 DslContext::new(format!("integration-ring-gsw-check-{name}"))
-                    .private_output(
+                    .transferred_output(
                         "decoded",
                         scheme.decrypt(&secret, &imported).unwrap().coefficients(),
                     )
                     .unwrap()
-                    .private_output("phase", phase.coefficients())
+                    .transferred_output("phase", phase.coefficients())
                     .unwrap()
                     .build()
                     .unwrap(),

@@ -226,9 +226,12 @@ where
             "built Diamond decryption graph"
         );
         let manifest_started = Instant::now();
+        // Diamond decryption is a production consumer: it may only observe a
+        // finalized session snapshot, never a standalone or in-progress
+        // manifest that could still be mutated by its producer.
         let manifest = self
             .store
-            .load_manifest(&ciphertext.encryption)
+            .load_finalized_manifest(&ciphertext.encryption)
             .map_err(|error| DiamondRuntimeError::Store(error.to_string()))?;
         debug!(
             elapsed_seconds = manifest_started.elapsed().as_secs_f64(),

@@ -40,7 +40,7 @@ the original inputs, not a correction of an incomplete invocation.
 Artifact stores and transcript providers must return intact payloads produced by the matching backend
 codec with the matching schema and parameters. Compact matrix decoding is not an untrusted-data
 parser: malformed or truncated payloads violate its contract and can panic rather than return an
-`ExecutionError`. Private-artifact manifests do not provide a content hash. Applications accepting
+`ExecutionError`. Artifact manifests do not authenticate payload integrity. Applications accepting
 untrusted or potentially damaged storage must establish integrity before passing data to the runtime;
 `Result` on the backend decoder is not a guarantee that all malformed byte strings are recoverable.
 Serialized graphs must originate from the graph serializer and pass graph validation before execution;

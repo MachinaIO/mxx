@@ -985,3 +985,96 @@ extern "C" int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *o
     *out_copied = 1;
     return 0;
 }
+
+extern "C" int gpu_matrix_copy_peer_query(
+    const GpuMatrix *src,
+    const GpuContext *dst_ctx,
+    int *out_compatible)
+{
+    if (!src || !dst_ctx || !out_compatible || !src->ctx)
+    {
+        return set_error("invalid gpu_matrix_copy_peer_query arguments");
+    }
+    *out_compatible = 0;
+
+    // Mirror the destination object produced by gpu_matrix_create.  Keep
+    // this path side-effect free: unlike the copy itself it must not call
+    // cudaSetDevice/cudaDeviceEnablePeerAccess, allocate a matrix, or enqueue
+    // any work.
+    if (src->level < 0 || src->level > dst_ctx->level || src->ctx->N != dst_ctx->N)
+    {
+        return 0;
+    }
+    const size_t active_limbs = static_cast<size_t>(src->level + 1);
+    if (src->ctx->moduli.size() < active_limbs || dst_ctx->moduli.size() < active_limbs ||
+        !std::equal(
+            src->ctx->moduli.begin(),
+            src->ctx->moduli.begin() + active_limbs,
+            dst_ctx->moduli.begin()))
+    {
+        return 0;
+    }
+    if (src->shared_limb_buffers.size() != 1 || src->exec_limb_states.size() != 1 ||
+        src->exec_limb_states[0].empty() || !src->ctx->execution ||
+        src->ctx->execution->release_streams_by_partition.empty() ||
+        !src->ctx->execution->release_streams_by_partition[0] || !dst_ctx->execution)
+    {
+        return 0;
+    }
+
+    MatrixAllocationPlan destination_plan{};
+    const int plan_status = build_matrix_allocation_plan(
+        dst_ctx,
+        src->level,
+        src->rows,
+        src->cols,
+        static_cast<int>(src->format),
+        &destination_plan);
+    if (plan_status != 0)
+    {
+        // The route is incompatible with this context.  Do not turn a
+        // negative admission result into a stale native error for callers.
+        return 0;
+    }
+    if (destination_plan.partitions.size() != 1 ||
+        destination_plan.partitions[0].local_limb_count == 0 ||
+        dst_ctx->execution->compute_streams_by_partition.size() != 1 ||
+        dst_ctx->execution->compute_streams_by_partition[0].empty())
+    {
+        return 0;
+    }
+
+    const auto &source_buffer = src->shared_limb_buffers[0];
+    const auto &destination_partition = destination_plan.partitions[0];
+    if (!source_buffer.ptr || source_buffer.bytes_total != destination_partition.data_bytes ||
+        source_buffer.limb_count != destination_partition.local_limb_count ||
+        source_buffer.bytes_per_poly != destination_partition.bytes_per_poly ||
+        source_buffer.limb_coeff_bytes != destination_partition.limb_coeff_bytes ||
+        source_buffer.limb_offsets_bytes != destination_partition.limb_offsets_bytes)
+    {
+        return 0;
+    }
+
+    const int source_device = source_buffer.device;
+    const int destination_device = destination_partition.partition < dst_ctx->gpu_ids.size()
+        ? dst_ctx->gpu_ids[destination_partition.partition]
+        : -1;
+    if (source_device < 0 || destination_device < 0)
+    {
+        return 0;
+    }
+    if (source_device != destination_device)
+    {
+        int can_access = 0;
+        const cudaError_t error = cudaDeviceCanAccessPeer(
+            &can_access,
+            destination_device,
+            source_device);
+        if (error != cudaSuccess || !can_access)
+        {
+            return 0;
+        }
+    }
+    *out_compatible = 1;
+    return 0;
+}

@@ -77,7 +77,11 @@ use mxx_primitives::{
 
 mod fleet;
 pub use fleet::{
-    GpuColumnShard, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
+    GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEnvelope,
+    GpuAllocationEvidenceKind, GpuAllocationQueryError, GpuColumnShard, GpuDcrtBackend,
+    GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor, GpuLocalProductionInput,
+    GpuLocalProductionJobContext, GpuLocalProductionJobRequest, GpuLocalProductionJobResult,
+    GpuLocalProductionSource, GpuMeasurementError, GpuProductionCompletion,
 };
 
 #[cfg(test)]

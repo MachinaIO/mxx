@@ -27,6 +27,89 @@ use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
 use thiserror::Error;
 
 const SMALL_MATRIX_MAGIC: &[u8; 4] = b"SMR1";
+const SMALL_MATRIX_FORMAT_VERSION: u8 = 1;
+const SUPPORTED_SMALL_MATRIX_FORMAT_VERSIONS: &[u8] = &[SMALL_MATRIX_FORMAT_VERSION];
+
+fn validate_small_matrix_magic(bytes: &[u8], offset: &mut usize) -> Result<(), PolyBackendError> {
+    let magic = take_small_matrix_bytes(bytes, offset, SMALL_MATRIX_MAGIC.len())?;
+    if magic == SMALL_MATRIX_MAGIC {
+        return Ok(());
+    }
+    if magic.get(..3) == Some(&SMALL_MATRIX_MAGIC[..3]) {
+        return Err(PolyBackendError::UnsupportedCompactMatrixVersion {
+            version: magic[3],
+            supported_versions: SUPPORTED_SMALL_MATRIX_FORMAT_VERSIONS,
+        });
+    }
+    Err(PolyBackendError::InvalidSmallMatrixArtifact("magic does not match"))
+}
+
+pub fn canonical_polynomial_values(
+    ty: &ConcreteMatrixType,
+    values: &[BigInt],
+) -> Result<Vec<BigUint>, PolyBackendError> {
+    if !ty.is_scalar() || values.len() != ty.ring_dimension {
+        return Err(PolyBackendError::InvalidInteger);
+    }
+    values
+        .par_iter()
+        .map(|value| {
+            value.mod_floor(&ty.modulus).to_biguint().ok_or(PolyBackendError::InvalidInteger)
+        })
+        .collect()
+}
+
+pub fn pack_polynomial_bits(
+    ty: &ConcreteMatrixType,
+    bits: &[bool],
+    coefficient_bits: usize,
+) -> Result<Vec<BigUint>, PolyBackendError> {
+    if !ty.is_scalar() ||
+        coefficient_bits == 0 ||
+        bits.len() != ty.ring_dimension.saturating_mul(coefficient_bits)
+    {
+        return Err(PolyBackendError::InvalidInteger);
+    }
+    let modulus = ty.modulus.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+    bits.chunks_exact(coefficient_bits)
+        .map(|bits| {
+            let mut value = BigUint::zero();
+            for (position, bit) in bits.iter().copied().enumerate() {
+                if bit {
+                    value |= BigUint::one() << position;
+                }
+            }
+            (value < modulus).then_some(value).ok_or(PolyBackendError::InvalidInteger)
+        })
+        .collect()
+}
+
+pub fn threshold_decode_coefficients(
+    coefficients: Vec<BigUint>,
+    modulus: &BigInt,
+    plaintext_modulus: &BigInt,
+    length: usize,
+) -> Vec<BigInt> {
+    coefficients
+        .into_iter()
+        .take(length)
+        .map(|coefficient| {
+            ((plaintext_modulus * BigInt::from(coefficient) + modulus / 2) / modulus) %
+                plaintext_modulus
+        })
+        .collect()
+}
+
+pub fn polynomial_host_values(values: Vec<BigUint>) -> Vec<BigInt> {
+    values.into_par_iter().map(BigInt::from).collect()
+}
+
+pub fn extract_host_coefficient(
+    values: &[BigUint],
+    position: usize,
+) -> Result<BigInt, PolyBackendError> {
+    values.get(position).cloned().map(BigInt::from).ok_or(PolyBackendError::InvalidInteger)
+}
 
 fn small_matrix_semantic_tag(kind: SmallMatrixSemanticKind) -> u8 {
     match kind {
@@ -91,10 +174,7 @@ pub(super) fn decode_small_matrix_artifact<'a>(
 ) -> Result<(BigUint, &'a [u8]), PolyBackendError> {
     let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
     let mut offset = 0usize;
-    if take_small_matrix_bytes(bytes, &mut offset, SMALL_MATRIX_MAGIC.len())? != SMALL_MATRIX_MAGIC
-    {
-        return Err(PolyBackendError::InvalidSmallMatrixArtifact("magic does not match"));
-    }
+    validate_small_matrix_magic(bytes, &mut offset)?;
     let semantic_kind = take_small_matrix_bytes(bytes, &mut offset, 1)?[0];
     if semantic_kind != small_matrix_semantic_tag(expected_semantic_kind) {
         return Err(PolyBackendError::InvalidSmallMatrixArtifact("semantic kind does not match"));
@@ -249,10 +329,20 @@ pub enum PolyBackendError {
     SmallMatrix(#[from] SmallMatrixError),
     #[error("invalid small-matrix artifact: {0}")]
     InvalidSmallMatrixArtifact(&'static str),
+    #[error("invalid compact matrix artifact: {0}")]
+    InvalidCompactMatrix(&'static str),
+    #[error(
+        "unsupported compact matrix version {version}; supported versions are {supported_versions:?}"
+    )]
+    UnsupportedCompactMatrixVersion { version: u8, supported_versions: &'static [u8] },
     #[error("GPU fleet calibration failed: {0}")]
     GpuCalibration(String),
     #[error("the requested GPU placement is unavailable through a direct device or peer copy")]
     UnsupportedPlacement,
+    #[error(
+        "fixed operation batch contains a request with a different variant; expected {expected}"
+    )]
+    FixedOperationBatchVariantMismatch { expected: &'static str },
     #[error(
         "declared gadget layout base={declared_base}, digits={declared_digits} does not match backend base={backend_base}, digits={backend_digits}"
     )]
@@ -468,20 +558,6 @@ where
         self.preimage_batch_calls
     }
 
-    /// Fleet resharding must remain device-resident. Explicit host staging is
-    /// reserved for artifact and preimage-target ownership transitions.
-    #[cfg(feature = "gpu")]
-    pub(super) fn matrix_to_active_placement_peer_only(
-        &self,
-        value: &M,
-    ) -> Result<M, PolyBackendError> {
-        let target = self.parameters_for_matrix(value)?;
-        if value.params() == target {
-            return Ok(value.clone());
-        }
-        value.copy_to_params_direct(target).ok_or(PolyBackendError::UnsupportedPlacement)
-    }
-
     pub(super) fn parameters(
         &self,
         matrix_type: &ConcreteMatrixType,
@@ -529,7 +605,7 @@ where
         (base, digits)
     }
 
-    fn parameters_for_matrix(
+    pub(super) fn parameters_for_matrix(
         &self,
         matrix: &M,
     ) -> Result<&<M::P as Poly>::Params, PolyBackendError> {
@@ -593,16 +669,8 @@ where
         values: &[BigInt],
         evaluation: bool,
     ) -> Result<Self::Matrix, Self::Error> {
-        if ty.rows != 1 || ty.columns != 1 || values.len() != ty.ring_dimension {
-            return Err(PolyBackendError::InvalidInteger);
-        }
         let parameters = self.parameters(ty)?;
-        let canonical = values
-            .par_iter()
-            .map(|value| {
-                value.mod_floor(&ty.modulus).to_biguint().ok_or(PolyBackendError::InvalidInteger)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let canonical = canonical_polynomial_values(ty, values)?;
         let polynomial = if evaluation {
             M::P::from_biguints_eval(parameters, &canonical)
         } else {
@@ -623,7 +691,7 @@ where
         let polynomial = value.entry(0, 0);
         let output =
             if evaluation { polynomial.evals_biguints() } else { polynomial.coeffs_biguints() };
-        Ok(output.into_par_iter().map(BigInt::from).collect())
+        Ok(polynomial_host_values(output))
     }
 
     fn placement_count(&self) -> usize {
@@ -894,7 +962,12 @@ where
                     vec![vec![M::P::from_biguints(parameters, &coefficients)]],
                 )
             }
-            _ => return Err(PolyBackendError::InvalidConstantShape),
+            ConstantMatrix::Identity |
+            ConstantMatrix::UnitRow { .. } |
+            ConstantMatrix::UnitColumn { .. } |
+            ConstantMatrix::PowerOfBase { .. } |
+            ConstantMatrix::Rotation { .. } |
+            ConstantMatrix::Polynomial { .. } => return Err(PolyBackendError::InvalidConstantShape),
         })
     }
 
@@ -1025,6 +1098,57 @@ where
             .map_err(PolyBackendError::BasisConversion)
     }
 
+    fn centered_rebase_small(
+        &mut self,
+        value: &M::SmallMatrix,
+        destination: &ConcreteMatrixType,
+    ) -> Result<M::SmallMatrix, Self::Error> {
+        let source_basis = value.params().to_crt().0;
+        let target = self.parameters(destination)?;
+        let target_basis = target.to_crt().0;
+        if source_basis.len() > 1 && source_basis.iter().any(|prime| !target_basis.contains(prime))
+        {
+            return Err(PolyBackendError::BasisConversion(
+                "multi-limb centered rebase destination must contain the source basis".into(),
+            ));
+        }
+        let payload = value.to_canonical_coefficients()?;
+        Ok(M::SmallMatrix::from_canonical_coefficients(
+            target,
+            value.rows(),
+            value.columns(),
+            value.max_coefficient_bound().clone(),
+            &payload,
+        )?)
+    }
+
+    fn block_mod_switch(
+        &mut self,
+        value: &M,
+        destination: &ConcreteMatrixType,
+        source_moduli: &[u64],
+        plaintext_modulus: &BigInt,
+    ) -> Result<M, Self::Error> {
+        // The graph carries the complete ordered source CRT basis.  Checking
+        // the sequence (rather than only its product) is important: a
+        // reordered or level-truncated basis changes the correction factors
+        // used by exact block switching and must be rejected before any
+        // destination allocation or native dispatch.
+        if value.params().to_crt().0 != source_moduli {
+            return Err(PolyBackendError::BasisConversion(
+                "BlockModSwitch source CRT basis disagrees with graph".into(),
+            ));
+        }
+        let plaintext_modulus = plaintext_modulus.to_biguint().ok_or_else(|| {
+            PolyBackendError::BasisConversion(
+                "BlockModSwitch plaintext modulus must be positive".into(),
+            )
+        })?;
+        value
+            .block_mod_switch(self.parameters(destination)?, &plaintext_modulus)
+            .map_err(PolyBackendError::BasisConversion)
+    }
+
     fn rns_mod_up(
         &mut self,
         value: &M,
@@ -1091,7 +1215,16 @@ where
         ty: &ConcreteMatrixType,
         bytes: &[u8],
     ) -> Result<M, Self::Error> {
-        Ok(M::from_cpu_staging_bytes(self.parameters(ty)?, bytes))
+        M::try_from_cpu_staging_bytes(self.parameters(ty)?, bytes).map_err(|error| match error {
+            mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions,
+            } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
+            }
+        })
     }
 
     fn preimage_target_from_staging(
@@ -1440,16 +1573,7 @@ where
     }
     fn extract_coefficient(&mut self, value: &M, position: usize) -> Result<BigInt, Self::Error> {
         self.parameters_for_matrix(value)?;
-        let residue = value
-            .entry(0, 0)
-            .coeffs_biguints()
-            .get(position)
-            .cloned()
-            .ok_or(PolyBackendError::InvalidInteger)?;
-        // `Int` values produced by coefficient extraction are used as family
-        // and public-LUT indices. Preserve the canonical ring residue so a
-        // valid coefficient above q/2 does not become a negative index.
-        Ok(BigInt::from_biguint(Sign::Plus, residue))
+        extract_host_coefficient(&value.entry(0, 0).coeffs_biguints(), position)
     }
 
     fn threshold_decode(
@@ -1462,14 +1586,7 @@ where
         let modulus: Arc<BigUint> = parameters.modulus().into();
         let q = BigInt::from_biguint(Sign::Plus, modulus.as_ref().clone());
         let coefficients = value.entry(0, 0).coeffs_biguints();
-        Ok(coefficients
-            .into_iter()
-            .take(length)
-            .map(|coefficient| {
-                let coefficient = BigInt::from_biguint(Sign::Plus, coefficient);
-                ((plaintext_modulus * coefficient + &q / 2) / &q) % plaintext_modulus
-            })
-            .collect())
+        Ok(threshold_decode_coefficients(coefficients, &q, plaintext_modulus, length))
     }
 
     fn pack_polynomial_coefficients(
@@ -1478,28 +1595,8 @@ where
         bits: &[bool],
         coefficient_bits: usize,
     ) -> Result<M, Self::Error> {
-        if !ty.is_scalar() ||
-            coefficient_bits == 0 ||
-            bits.len() != ty.ring_dimension.saturating_mul(coefficient_bits)
-        {
-            return Err(PolyBackendError::InvalidInteger);
-        }
         let parameters = self.parameters(ty)?;
-        let modulus: Arc<BigUint> = parameters.modulus().into();
-        let coefficients = bits
-            .chunks_exact(coefficient_bits)
-            .map(|coefficient_bits| {
-                let mut coefficient = BigUint::zero();
-                for (position, bit) in coefficient_bits.iter().copied().enumerate() {
-                    if bit {
-                        coefficient |= BigUint::one() << position;
-                    }
-                }
-                (coefficient < *modulus)
-                    .then_some(coefficient)
-                    .ok_or(PolyBackendError::InvalidInteger)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let coefficients = pack_polynomial_bits(ty, bits, coefficient_bits)?;
         Ok(M::from_poly_vec_row(parameters, vec![M::P::from_biguints(parameters, &coefficients)]))
     }
 
@@ -1534,7 +1631,31 @@ where
     }
 
     fn matrix_from_bytes(&self, ty: &ConcreteMatrixType, bytes: &[u8]) -> Result<M, Self::Error> {
-        Ok(M::from_compact_bytes(self.parameters(ty)?, bytes))
+        let (rows, columns) = M::compact_shape(bytes).map_err(|error| match error {
+            mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions,
+            } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
+            }
+        })?;
+        if (rows, columns) != (ty.rows, ty.columns) {
+            return Err(PolyBackendError::InvalidCompactMatrix(
+                "serialized compact matrix shape does not match expected type",
+            ));
+        }
+        M::try_from_compact_bytes(self.parameters(ty)?, bytes).map_err(|error| match error {
+            mxx_primitives::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions,
+            } => PolyBackendError::UnsupportedCompactMatrixVersion { version, supported_versions },
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidHeader(message) |
+            mxx_primitives::matrix::CompactMatrixDecodeError::InvalidPayload(message) => {
+                PolyBackendError::InvalidCompactMatrix(message)
+            }
+        })
     }
 
     fn small_matrix_to_bytes(
@@ -1620,11 +1741,7 @@ where
     ) -> Result<M::SmallMatrix, Self::Error> {
         let (bound, magnitude_bytes, coefficient_count) = bounded_schema_parts(expected_schema)?;
         let mut offset = 0usize;
-        if take_small_matrix_bytes(bytes, &mut offset, SMALL_MATRIX_MAGIC.len())? !=
-            SMALL_MATRIX_MAGIC
-        {
-            return Err(PolyBackendError::InvalidSmallMatrixArtifact("magic does not match"));
-        }
+        validate_small_matrix_magic(bytes, &mut offset)?;
         let semantic_kind = *take_small_matrix_bytes(bytes, &mut offset, 1)?
             .first()
             .expect("one-byte slice is nonempty");
@@ -1983,6 +2100,19 @@ mod tests {
         assert_eq!(generic[4], 0);
         assert_eq!(preimage[4], 1);
         assert_eq!(generic[5..], preimage[5..]);
+        let mut unsupported_version = generic.clone();
+        unsupported_version[3] = 2;
+        assert!(matches!(
+            backend.small_matrix_from_bytes(
+                &schema,
+                &unsupported_version,
+                SmallMatrixSemanticKind::Generic,
+            ),
+            Err(PolyBackendError::UnsupportedCompactMatrixVersion {
+                version: 2,
+                supported_versions: SUPPORTED_SMALL_MATRIX_FORMAT_VERSIONS,
+            })
+        ));
         assert_eq!(
             backend
                 .small_matrix_from_bytes(&schema, &generic, SmallMatrixSemanticKind::Generic,)
@@ -2014,6 +2144,25 @@ mod tests {
                 .small_matrix_from_bytes(&schema, &negative_zero, SmallMatrixSemanticKind::Generic,)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn matrix_artifact_decode_rejects_a_valid_payload_with_the_wrong_shape() {
+        let parameters = DCRTPolyParams::new(4, 1, 16, 8, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let source_type =
+            ConcreteMatrixType { modulus: modulus.clone(), ring_dimension: 4, rows: 1, columns: 1 };
+        let wrong_type = ConcreteMatrixType { rows: 2, columns: 2, ..source_type.clone() };
+        let backend = cpu_backend([parameters.clone()]);
+        let value = DCRTPolyMatrix::zero(&parameters, 1, 1);
+        let bytes = backend.matrix_to_bytes(&value);
+        assert_eq!(backend.matrix_from_bytes(&source_type, &bytes).unwrap().size(), (1, 1));
+        assert!(matches!(
+            backend.matrix_from_bytes(&wrong_type, &bytes),
+            Err(PolyBackendError::InvalidCompactMatrix(
+                "serialized compact matrix shape does not match expected type"
+            ))
+        ));
     }
 }
 

@@ -35,6 +35,13 @@ extern "C"
     int gpu_matrix_wait(const GpuMatrix *mat);
     int gpu_matrix_copy(GpuMatrix *dst, const GpuMatrix *src);
     int gpu_matrix_copy_peer(GpuMatrix *dst, const GpuMatrix *src, int *out_copied);
+    // Check whether a matrix created for `dst_ctx` would satisfy the exact
+    // peer-copy contract without allocating a destination, enabling peer
+    // access, enqueueing a copy, or mutating either matrix/context.
+    int gpu_matrix_copy_peer_query(
+        const GpuMatrix *src,
+        const GpuContext *dst_ctx,
+        int *out_compatible);
     int gpu_matrix_copy_block(
         GpuMatrix *out,
         const GpuMatrix *src,

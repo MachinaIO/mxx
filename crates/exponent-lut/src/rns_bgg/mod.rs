@@ -24,9 +24,7 @@ use thiserror::Error;
 use crate::{
     noise_refresh::{
         prf::PrfError,
-        refresh::{
-            RefreshDeclaration, RefreshDigitPlan, RefreshError, RefreshPrfLabelIndex, RefreshSlot,
-        },
+        refresh::{RefreshDeclaration, RefreshError},
         simulation::{RefreshNoiseParameters, RefreshRouteNoiseGains, RefreshTranscriptTopology},
     },
     program::{ExponentLUTProgramLowering, ExponentLutProgramId, WireId},
@@ -1072,28 +1070,15 @@ pub(crate) fn hash_key_commitment(hash_key: &[u8]) -> [u8; 32] {
 pub struct RnsBggRefresh<'a, E: ExponentLUTProgramLowering> {
     lowerer: &'a mut E,
     inputs: BTreeMap<usize, E::Wire>,
-    declaration: &'a RefreshDeclaration,
 }
 
 impl<'a, E: ExponentLUTProgramLowering> RnsBggRefresh<'a, E> {
-    pub fn new(
-        lowerer: &'a mut E,
-        inputs: BTreeMap<usize, E::Wire>,
-        declaration: &'a RefreshDeclaration,
-    ) -> Result<Self, RnsBggError> {
-        if declaration.output_schema().is_empty() || declaration.prf_labels().is_empty() {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
-        }
-        if inputs.len() != declaration.slots().len() ||
-            inputs.keys().copied().ne(0..declaration.slots().len())
-        {
-            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
-        }
-        // RefreshDeclaration owns and validates slots, digits, labels, CRT
-        // divisibility, and the exact structural PRF output mapping.  Keep
-        // only that immutable declaration here; the invocation carries no
-        // second copy of any refresh metadata.
-        Ok(Self { lowerer, inputs, declaration })
+    pub fn new(lowerer: &'a mut E, inputs: BTreeMap<usize, E::Wire>) -> Self {
+        // RefreshDeclaration owns and validates all immutable refresh
+        // metadata. Stage implementations receive it explicitly in
+        // `finish_noise_refresh`; this runtime carrier stores only lowering
+        // state and concrete inputs.
+        Self { lowerer, inputs }
     }
 
     pub(crate) fn lowerer(&mut self) -> &mut E {
@@ -1102,26 +1087,6 @@ impl<'a, E: ExponentLUTProgramLowering> RnsBggRefresh<'a, E> {
 
     pub(crate) fn inputs(&self) -> &BTreeMap<usize, E::Wire> {
         &self.inputs
-    }
-
-    pub(crate) fn slots(&self) -> &[RefreshSlot] {
-        self.declaration.slots()
-    }
-
-    pub(crate) fn digits(&self) -> &RefreshDigitPlan {
-        self.declaration.digits()
-    }
-
-    pub(crate) fn labels(&self) -> &RefreshPrfLabelIndex {
-        self.declaration.labels()
-    }
-
-    pub(crate) fn target_level(&self) -> usize {
-        self.declaration.target_level()
-    }
-
-    pub(crate) fn declaration(&self) -> &RefreshDeclaration {
-        self.declaration
     }
 }
 

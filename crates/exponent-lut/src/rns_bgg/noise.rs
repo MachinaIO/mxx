@@ -2000,9 +2000,6 @@ impl<'a> RnsBggNoiseEvaluator<'a> {
             .ordered_outputs()
             .map(|entry| entry.1)
             .collect::<Vec<_>>();
-        if ordered.len() != outputs.len() || ordered.len() != declaration.prf_labels().len() {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         if inputs.len() != declaration.slots().len() ||
             inputs.keys().copied().ne(0..declaration.slots().len())
         {
@@ -3518,11 +3515,6 @@ impl<'a> RnsNoiseBuild<'a> {
         if evaluator.program.id() != declaration.prepared().program().id() {
             return Err(RnsBggError::Refresh(RefreshError::Commitment));
         }
-        if declaration.prf_labels().len() !=
-            declaration.prepared().declaration().ordered_outputs().count()
-        {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         if self.refresh_prf.is_some() {
             return Err(RnsBggError::Binding("refresh PRF is already bound"));
         }
@@ -3564,9 +3556,6 @@ impl<'a> RnsNoiseBuild<'a> {
             &mut self.environment,
         )
         .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        if outputs.len() != expected.len() {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         expected
             .into_iter()
             .zip(outputs)
@@ -3614,8 +3603,8 @@ impl<'a> RnsNoiseBuild<'a> {
             }
         }
         let output = {
-            let mut refresh = super::RnsBggRefresh::new(evaluator, inputs, declaration)?;
-            crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
+            let mut refresh = super::RnsBggRefresh::new(evaluator, inputs);
+            crate::api::apply_refresh(declaration, &mut refresh, |callback_declaration, _| {
                 let mut per_label =
                     BTreeMap::<PrfLabel, BTreeMap<usize, (WireId, RnsBggNoiseValue)>>::new();
                 for slot in 0..callback_declaration.slots().len() {
@@ -3636,11 +3625,6 @@ impl<'a> RnsNoiseBuild<'a> {
                             .trace
                             .clone(),
                     );
-                }
-                if labels.iter().any(|label| !per_label.contains_key(label)) ||
-                    per_label.len() != labels.len()
-                {
-                    return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
                 }
                 Ok(per_label)
             })
@@ -3687,23 +3671,14 @@ impl NoiseRefresh for super::RnsBggRefresh<'_, RnsBggNoiseEvaluator<'_>> {
     type Output = (WireId, RnsBggNoiseValue);
     type Error = RnsBggError;
 
-    fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error> {
-        Ok(self.declaration().prf_labels().to_vec())
-    }
-
     fn finish_noise_refresh(
         &mut self,
+        declaration: &RefreshDeclaration,
         outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
     ) -> Result<Self::Output, Self::Error> {
-        let labels = self.required_prf_labels()?;
-        if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label))
-        {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
-        let declaration = self.declaration().clone();
         let inputs = self.inputs().clone();
         let evaluator = self.lowerer();
-        let value = evaluator.refresh_raw_target(&inputs, &declaration, &outputs)?;
+        let value = evaluator.refresh_raw_target(&inputs, declaration, &outputs)?;
         Ok((declaration.source_output(), value))
     }
 }

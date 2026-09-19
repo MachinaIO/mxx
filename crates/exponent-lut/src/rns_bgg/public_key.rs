@@ -1098,22 +1098,16 @@ impl PublicKeyLowering<'_> {
         // labels may contribute only to their owning slot; fresh labels must
         // be present in every slot and therefore preserve their shared source.
         let mut sums = vec![None::<RnsBggMatrix>; slot_count];
-        let ordered_wires = declaration
+        let expected_wires = declaration
             .prepared()
             .declaration()
             .ordered_outputs()
-            .map(|(label, wire)| (label.clone(), wire))
+            .map(|(_, wire)| wire)
             .collect::<Vec<_>>();
-        if ordered_wires.len() != declaration.prf_labels().len() {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         for (index, expected_label) in declaration.prf_labels().iter().enumerate() {
-            let (ordered_label, expected_wire) = ordered_wires
+            let expected_wire = expected_wires
                 .get(index)
                 .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
-            if ordered_label != expected_label {
-                return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-            }
             let label = declaration
                 .labels()
                 .label(index)
@@ -1469,22 +1463,26 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
             .evaluator
             .as_mut()
             .ok_or(RnsBggError::Binding("refresh PRF builder was not bound"))?;
-        let expected = declaration
-            .prepared()
-            .declaration()
-            .ordered_outputs()
-            .map(|(label, wire)| (label.clone(), wire))
-            .collect::<Vec<_>>();
         let program = evaluator.program.clone();
         let outputs = lower_program(&program, evaluator, &mut self.families, &mut self.environment)
             .map_err(|error| RnsBggError::Graph(error.to_string()))?;
-        if outputs.len() != expected.len() {
+        let expected_wires = declaration
+            .prepared()
+            .declaration()
+            .ordered_outputs()
+            .map(|(_, wire)| wire)
+            .collect::<Vec<_>>();
+        if outputs.len() != expected_wires.len() {
             return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
         }
-        expected
-            .into_iter()
-            .zip(outputs)
-            .map(|((label, expected_wire), value)| {
+        declaration
+            .prf_labels()
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, label)| {
+                let expected_wire = expected_wires[index];
+                let value = outputs[index].clone();
                 validate_refresh_prf_wire(value.wire, expected_wire)?;
                 Ok((label, value))
             })
@@ -1533,23 +1531,27 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
                 .evaluator
                 .as_mut()
                 .ok_or(RnsBggError::Binding("preprocess builder was not bound"))?;
-            let mut refresh = RnsBggRefresh::new(evaluator, inputs, declaration)?;
+            let mut refresh = RnsBggRefresh::new(evaluator, inputs);
             let mut child_material = Vec::with_capacity(channels.len());
             let output =
                 apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
                     let mut per_label =
                         BTreeMap::<PrfLabel, BTreeMap<usize, RnsBggPublicKey>>::new();
+                    let label_positions = labels
+                        .iter()
+                        .enumerate()
+                        .map(|(index, label)| (label.clone(), index))
+                        .collect::<BTreeMap<_, _>>();
                     for slot in 0..callback_declaration.slots().len() {
                         let child = channels
                             .get_mut(&slot)
                             .ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
                         let outputs = child.lower_refresh_prf(callback_declaration)?;
                         for (label, value) in outputs {
-                            let label_index = declaration
-                                .prf_labels()
-                                .iter()
-                                .position(|expected| expected == &label)
-                                .ok_or(RnsBggError::Refresh(RefreshError::PrfOutputMismatch))?;
+                            let Some(&label_index) = label_positions.get(&label) else {
+                                per_label.entry(label).or_default().insert(slot, value);
+                                continue;
+                            };
                             let refresh_label = declaration
                                 .labels()
                                 .label(label_index)
@@ -1565,32 +1567,6 @@ impl<'a, B: Backend> RnsPreprocessBuild<'a, B> {
                                 return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
                             }
                         }
-                    }
-                    if per_label.len() != labels.len() ||
-                        labels.iter().any(|label| {
-                            let index = declaration
-                                .prf_labels()
-                                .iter()
-                                .position(|expected| expected == label);
-                            let Some(index) = index else { return true };
-                            let Some(refresh_label) = declaration.labels().label(index) else {
-                                return true;
-                            };
-                            let Ok(expected_slots) =
-                                expected_refresh_slots(&refresh_label, declaration.slots().len())
-                            else {
-                                return true;
-                            };
-                            match per_label.get(label) {
-                                Some(values) => {
-                                    values.len() == expected_slots.len() &&
-                                        values.keys().copied().eq(expected_slots.into_iter())
-                                }
-                                None => false,
-                            }
-                        })
-                    {
-                        return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
                     }
                     for (slot, mut child) in std::mem::take(&mut channels) {
                         let evaluator = child
@@ -2034,21 +2010,13 @@ impl NoiseRefresh for RnsBggRefresh<'_, PublicKeyLowering<'_>> {
     type PrfOutput = BTreeMap<usize, RnsBggPublicKey>;
     type Output = RnsBggPublicKey;
     type Error = RnsBggError;
-    fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error> {
-        Ok(self.declaration().prf_labels().to_vec())
-    }
     fn finish_noise_refresh(
         &mut self,
+        declaration: &crate::noise_refresh::refresh::RefreshDeclaration,
         outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
     ) -> Result<Self::Output, Self::Error> {
-        let declaration = self.declaration().clone();
-        let labels = self.required_prf_labels()?;
-        if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label))
-        {
-            return Err(RefreshError::PrfOutputMismatch.into());
-        }
         let inputs = self.inputs().clone();
-        self.lowerer().finish_channel_refresh(&inputs, &declaration, &outputs)
+        self.lowerer().finish_channel_refresh(&inputs, declaration, &outputs)
     }
 }
 

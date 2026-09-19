@@ -6,10 +6,7 @@
 //! input-only and never receives a whole Program.
 
 use crate::{
-    noise_refresh::{
-        NoiseRefresh, RefreshDeclaration,
-        prf::{PrfError, PrfLabel},
-    },
+    noise_refresh::{NoiseRefresh, RefreshDeclaration, prf::PrfLabel},
     program::{
         Environment, ExponentLUTProgramLowering, ExponentLutProgram, FamilyExecution,
         ProgramLowerError, RhsId, WireId, lower_program,
@@ -366,13 +363,11 @@ where
     )?)
 }
 
-/// Dispatch exactly one common `NoiseRefresh` invocation through a callback
-/// that owns the stage-specific PRF lowering and channel mapping.
+/// Dispatch one refresh PRF evaluation and finish the concrete stage.
 ///
-/// The callback receives the immutable declaration and its canonical ordered
-/// labels. No plaintexts or scheme-specific carriers cross this API. The
-/// callback runs inside the one refresh dispatch, and its exact label set is
-/// checked before the concrete refresh implementation consumes the outputs.
+/// The declaration supplies the canonical ordered labels. This function owns
+/// exactly-once callback dispatch and common exact-key-set validation; a
+/// [`NoiseRefresh`] implementation only consumes the validated outputs.
 pub(crate) fn apply_refresh<R, F>(
     declaration: &RefreshDeclaration,
     refresh: &mut R,
@@ -385,30 +380,18 @@ where
         &[PrfLabel],
     ) -> Result<BTreeMap<PrfLabel, R::PrfOutput>, R::Error>,
 {
-    let labels = declaration.prf_labels().to_vec();
+    let labels = declaration.prf_labels();
     let mut unique = std::collections::BTreeSet::new();
     if labels.is_empty() || labels.iter().any(|label| !unique.insert(label.clone())) {
         return Err(RefreshApplicationError::OutputMismatch);
     }
 
-    let mut evaluate_prf = Some(evaluate_prf);
-    refresh
-        .noise_refresh(|labels| {
-            if labels != declaration.prf_labels() {
-                return Err(R::Error::from(PrfError::InvalidSparseLwrBlock));
-            }
-            let callback = evaluate_prf
-                .take()
-                .ok_or_else(|| R::Error::from(PrfError::InvalidSparseLwrBlock))?;
-            let outputs = callback(declaration, labels)?;
-            if outputs.len() != labels.len() ||
-                labels.iter().any(|label| !outputs.contains_key(label))
-            {
-                return Err(R::Error::from(PrfError::InvalidSparseLwrBlock));
-            }
-            Ok(outputs)
-        })
-        .map_err(RefreshApplicationError::Refresh)
+    let outputs = evaluate_prf(declaration, labels).map_err(RefreshApplicationError::Refresh)?;
+    if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label)) {
+        return Err(RefreshApplicationError::OutputMismatch);
+    }
+
+    refresh.finish_noise_refresh(declaration, outputs).map_err(RefreshApplicationError::Refresh)
 }
 
 pub(crate) fn domain_identity(base: [u8; 32], domain: &[u8]) -> [u8; 32] {

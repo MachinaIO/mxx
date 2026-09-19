@@ -3039,11 +3039,6 @@ impl<'a> RnsOnlineBuild<'a> {
             .ordered_outputs()
             .map(|(label, wire)| (label.clone(), wire))
             .collect::<Vec<_>>();
-        if ordered_outputs.len() != labels.len() ||
-            ordered_outputs.iter().map(|(label, _)| label).ne(labels.iter())
-        {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         let mut outputs = BTreeMap::<PrfLabel, BTreeMap<usize, RnsBggEncoding>>::new();
         for (slot, child) in children.iter_mut() {
             let (evaluator, families, environment) = child
@@ -3135,11 +3130,8 @@ impl<'a> RnsOnlineBuild<'a> {
             .evaluator
             .as_mut()
             .ok_or(RnsBggError::Binding("online artifacts are not bound"))?;
-        let mut refresh = RnsBggRefresh::new(evaluator, inputs, declaration)?;
-        let refreshed = apply_refresh(declaration, &mut refresh, |callback_declaration, labels| {
-            if callback_declaration.prf_labels() != labels {
-                return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-            }
+        let mut refresh = RnsBggRefresh::new(evaluator, inputs);
+        let refreshed = apply_refresh(declaration, &mut refresh, |callback_declaration, _| {
             Self::lower_refresh_children(callback_declaration, &mut children)
         })
         .map_err(|error| match error {
@@ -3805,24 +3797,20 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
     type PrfOutput = BTreeMap<usize, RnsBggEncoding>;
     type Output = RnsBggEncoding;
     type Error = RnsBggError;
-    fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error> {
-        Ok(self.declaration().prf_labels().to_vec())
-    }
     fn finish_noise_refresh(
         &mut self,
+        declaration: &RefreshDeclaration,
         outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
     ) -> Result<Self::Output, Self::Error> {
-        let labels = self.required_prf_labels()?;
-        if outputs.len() != labels.len() || labels.iter().any(|label| !outputs.contains_key(label))
-        {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
-        let declaration = self.declaration().clone();
         let inputs = self.inputs().clone();
-        let slots = self.slots().to_vec();
-        let digits = self.digits().clone();
-        let label_count = self.labels().len();
-        let target_level = self.target_level();
+        let slots = declaration.slots();
+        let digits = declaration.digits();
+        let labels = declaration.prf_labels();
+        let label_count = declaration.labels().len();
+        let target_level = declaration.target_level();
+        if inputs.len() != slots.len() || inputs.keys().copied().ne(0..slots.len()) {
+            return Err(RnsBggError::Refresh(RefreshError::InvalidLayout));
+        }
         let source =
             inputs.get(&0).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?.clone();
         let lowerer = self.lowerer();
@@ -3831,7 +3819,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 return Err(RnsBggError::Refresh(RefreshError::TargetMismatch));
             }
         }
-        lowerer.validate_refresh_declaration(&declaration)?;
+        lowerer.validate_refresh_declaration(declaration)?;
         let target_parameters = lowerer.parameters.level(target_level)?;
         let target_ring = lowerer.parameters.ring(target_level)?;
         let target_columns = lowerer.parameters.component_columns(target_level)?;
@@ -3848,7 +3836,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
             return Err(RnsBggError::Refresh(RefreshError::InvalidOutputSchema));
         }
         let mut target_modulus = BigUint::from(1u8);
-        for slot in &slots {
+        for slot in slots {
             target_modulus *= slot
                 .q_t
                 .to_biguint()
@@ -3862,7 +3850,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
         }
 
         let mut channels = Vec::with_capacity(slots.len());
-        for slot in &slots {
+        for slot in slots {
             channels.push((slot.slot, None::<RnsBggRow>));
         }
         let ordered_outputs = declaration
@@ -3871,11 +3859,6 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
             .ordered_outputs()
             .map(|(label, wire)| (label.clone(), wire))
             .collect::<Vec<_>>();
-        if ordered_outputs.len() != labels.len() ||
-            ordered_outputs.iter().map(|(label, _)| label).ne(labels.iter())
-        {
-            return Err(RnsBggError::Refresh(RefreshError::PrfOutputMismatch));
-        }
         for index in 0..label_count {
             let label = declaration
                 .labels()
@@ -3915,7 +3898,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                     }
                 }
                 let terminal =
-                    lowerer.refresh_action_for_label(&declaration, Some(index), slot, "target")?;
+                    lowerer.refresh_action_for_label(declaration, Some(index), slot, "target")?;
                 // The preprocessing action already includes the positional
                 // digit weight (and H for shared fresh error). Applying it to
                 // the row here would weight every PRF digit twice.
@@ -3933,7 +3916,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
         let mut channel_weights = Vec::with_capacity(channels.len());
         for (slot, row) in channels {
             let mut row = row.ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
-            let target = lowerer.refresh_action(&declaration, slot, "target")?;
+            let target = lowerer.refresh_action(declaration, slot, "target")?;
             let input =
                 inputs.get(&slot).ok_or(RnsBggError::Refresh(RefreshError::InvalidLayout))?;
             row = add_encoding_rows(multiply_encoding_action(input.row.clone(), target), row);
@@ -3949,7 +3932,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 .to_biguint()
                 .ok_or(RnsBggError::Refresh(RefreshError::InvalidModulusRelation))?;
             row = mod_down_encoding(row, BigInt::from(producer_modulus));
-            let decoder = lowerer.refresh_decoder(&declaration, slot)?;
+            let decoder = lowerer.refresh_decoder(declaration, slot)?;
             row = add_encoding_rows(row, (-decoder.0, -decoder.1));
             let slot_modulus = slot_metadata.q_t.clone();
             let slot_modulus = slot_modulus
@@ -3961,7 +3944,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
                 BigInt::from(target_modulus.clone()),
             );
             channel_rows.push(row);
-            channel_weights.push(lowerer.refresh_crt_weight(&declaration, slot)?);
+            channel_weights.push(lowerer.refresh_crt_weight(declaration, slot)?);
         }
         let values = Family::pack(channel_rows).map_err(graph)?;
         let coefficients = Family::pack(channel_weights).map_err(graph)?;
@@ -3976,7 +3959,7 @@ impl NoiseRefresh for RnsBggRefresh<'_, EncodingLowering<'_>> {
             )?),
             None => None,
         };
-        let refreshed_public_key = lowerer.refresh_public_target(&declaration, source.wire())?;
+        let refreshed_public_key = lowerer.refresh_public_target(declaration, source.wire())?;
         Ok(RnsBggEncoding::new(refreshed_public_key, result, public_payload))
     }
 }

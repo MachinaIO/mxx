@@ -15,34 +15,22 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-/// Application-owned refresh orchestration around one sparse-LWR PRF pass.
+/// Finish one concrete refresh stage from already validated PRF outputs.
 ///
-/// The callback is deliberately `FnOnce`: a refresh declaration is frozen
-/// before graph construction, so invoking the PRF more than once could
-/// silently duplicate graph nodes or consume incompatible prepared material.
-/// Concrete implementations own label uniqueness, output cardinality and
-/// label-to-output mapping; this trait only coordinates the single pass and
-/// final scheme-specific graph operations.
+/// [`RefreshDeclaration`] is the sole immutable owner of refresh metadata and
+/// canonical PRF labels. The common `api::apply_refresh` orchestration invokes
+/// the PRF exactly once and validates its output key set before calling this
+/// stage-specific operation.
 pub trait NoiseRefresh {
     type PrfOutput;
     type Output;
-    type Error: std::error::Error + From<PrfError> + Send + Sync + 'static;
-
-    fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error>;
+    type Error: std::error::Error + Send + Sync + 'static;
 
     fn finish_noise_refresh(
         &mut self,
+        declaration: &RefreshDeclaration,
         outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
     ) -> Result<Self::Output, Self::Error>;
-
-    fn noise_refresh<F>(&mut self, evaluate_prf: F) -> Result<Self::Output, Self::Error>
-    where
-        F: FnOnce(&[PrfLabel]) -> Result<BTreeMap<PrfLabel, Self::PrfOutput>, Self::Error>,
-    {
-        let labels = self.required_prf_labels()?;
-        let outputs = evaluate_prf(&labels)?;
-        self.finish_noise_refresh(outputs)
-    }
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -51,15 +39,9 @@ pub enum RefreshError {
     #[error("refresh CRT layout is empty or inconsistent")]
     /// CRT slots or reconstruction coefficients are empty or inconsistent.
     InvalidLayout,
-    #[error("refresh slot packages must be in exact CRT slot order")]
-    /// Setup packages are not in canonical zero-based slot order.
-    SlotOrderMismatch,
     #[error("refresh decoder is not bound to the supplied anchor")]
     /// A decoder package is bound to a different anchor or target.
     AnchorMismatch,
-    #[error("all CRT slots must carry the same fresh-error identity")]
-    /// CRT slots do not share one fresh-error source identity.
-    FreshErrorMismatch,
     #[error("refresh PRF output is not bound to its canonical program label or output wire")]
     /// A mask or fresh-error result came from the wrong PRF program or label.
     PrfOutputMismatch,
@@ -97,7 +79,7 @@ pub struct RefreshSlot {
 /// The label contains only refresh instance and coefficient coordinates. It
 /// never contains sparse support, selected buckets, or selector material.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RefreshPrfLabel {
+pub(crate) enum RefreshPrfLabel {
     /// A per-CRT-slot mask digit.
     Mask {
         /// Refresh instance identity chosen by the caller.
@@ -126,7 +108,7 @@ pub enum RefreshPrfLabel {
 
 impl RefreshPrfLabel {
     /// Returns the canonical bytes used for the sparse-LWR PRF output identity.
-    pub fn canonical_bytes(self) -> Vec<u8> {
+    pub(crate) fn canonical_bytes(self) -> Vec<u8> {
         let mut raw = Vec::with_capacity(1 + 32 + 4 * std::mem::size_of::<u64>());
         match self {
             Self::Mask { refresh_id, slot, component, coefficient, digit } => {
@@ -206,7 +188,7 @@ impl RefreshPrfLabelIndex {
     }
 
     /// Returns the canonical label at `index`.
-    pub fn label(&self, index: usize) -> Option<RefreshPrfLabel> {
+    pub(crate) fn label(&self, index: usize) -> Option<RefreshPrfLabel> {
         if index >= self.len() {
             return None;
         }
@@ -243,7 +225,7 @@ impl RefreshPrfLabelIndex {
 
     /// Returns the canonical flat index of `label`, rejecting a label from a
     /// different refresh instance or outside this index's dimensions.
-    pub fn index_of(&self, label: RefreshPrfLabel) -> Option<usize> {
+    pub(crate) fn index_of(&self, label: RefreshPrfLabel) -> Option<usize> {
         let (group_offset, component, coefficient, digit, is_mask) = match label {
             RefreshPrfLabel::Mask { refresh_id, slot, component, coefficient, digit }
                 if refresh_id == self.refresh_id && slot < self.topology.crt_slot_count =>
@@ -616,7 +598,6 @@ mod tests {
     }
 
     struct CallbackRefresh {
-        labels: Vec<PrfLabel>,
         finished: bool,
     }
 
@@ -625,12 +606,9 @@ mod tests {
         type Output = usize;
         type Error = CallbackError;
 
-        fn required_prf_labels(&self) -> Result<Vec<PrfLabel>, Self::Error> {
-            Ok(self.labels.clone())
-        }
-
         fn finish_noise_refresh(
             &mut self,
+            _declaration: &RefreshDeclaration,
             outputs: BTreeMap<PrfLabel, Self::PrfOutput>,
         ) -> Result<Self::Output, Self::Error> {
             self.finished = true;
@@ -639,24 +617,55 @@ mod tests {
     }
 
     #[test]
-    fn noise_refresh_invokes_the_prf_callback_once() {
-        let label = PrfLabel::from_components(&[b"test"]).unwrap();
-        let mut refresh = CallbackRefresh { labels: vec![label.clone()], finished: false };
+    fn apply_refresh_invokes_the_prf_callback_once() {
+        let (_, _, declaration) = test_declaration();
+        let labels = declaration.prf_labels().to_vec();
+        let mut refresh = CallbackRefresh { finished: false };
         let mut callbacks = 0;
-        let output = refresh
-            .noise_refresh(|labels| {
+        let output = crate::api::apply_refresh(
+            &declaration,
+            &mut refresh,
+            |callback_declaration, callback_labels| {
                 callbacks += 1;
-                assert_eq!(labels, &[label.clone()]);
-                Ok(BTreeMap::from([(label.clone(), 7)]))
-            })
-            .unwrap();
+                assert!(std::ptr::eq(callback_declaration, &declaration));
+                assert_eq!(callback_labels, labels.as_slice());
+                Ok(callback_labels.iter().cloned().map(|label| (label, 7)).collect())
+            },
+        )
+        .unwrap();
         assert_eq!(callbacks, 1);
         assert!(refresh.finished);
-        assert_eq!(output, 7);
+        assert_eq!(output, labels.len() * 7);
     }
 
     #[test]
-    fn refresh_declaration_freezes_exact_prf_outputs() {
+    fn apply_refresh_rejects_inexact_prf_output_keys() {
+        let (_, _, declaration) = test_declaration();
+        let labels = declaration.prf_labels().to_vec();
+
+        let mut missing = CallbackRefresh { finished: false };
+        let result = crate::api::apply_refresh(&declaration, &mut missing, |_, _| {
+            Ok(labels.iter().take(1).cloned().map(|label| (label, 1)).collect())
+        });
+        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
+        assert!(!missing.finished);
+
+        let mut extra = CallbackRefresh { finished: false };
+        let undeclared = PrfLabel::from_components(&[b"undeclared"]).unwrap();
+        let result = crate::api::apply_refresh(&declaration, &mut extra, |_, _| {
+            Ok(BTreeMap::from([(labels[0].clone(), 1), (undeclared, 1)]))
+        });
+        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
+        assert!(!extra.finished);
+
+        let mut empty = CallbackRefresh { finished: false };
+        let result =
+            crate::api::apply_refresh(&declaration, &mut empty, |_, _| Ok(BTreeMap::new()));
+        assert!(matches!(result, Err(crate::api::RefreshApplicationError::OutputMismatch)));
+        assert!(!empty.finished);
+    }
+
+    fn test_declaration() -> (ExponentLutProgram, WireId, RefreshDeclaration) {
         let topology = RefreshTranscriptTopology {
             crt_slot_count: 1,
             component_columns: 1,
@@ -705,6 +714,13 @@ mod tests {
             NoiseMomentPolicy::Continuous,
         )
         .unwrap();
+        (source, source_output, declaration)
+    }
+
+    #[test]
+    fn refresh_declaration_freezes_exact_prf_outputs() {
+        let (source, source_output, declaration) = test_declaration();
+        let prf_labels = declaration.prf_labels().to_vec();
         assert_eq!(declaration.prf_labels(), prf_labels.as_slice());
         assert_eq!(declaration.slots()[0].slot, 0);
         assert_eq!(declaration.source_program(), source.id());
@@ -991,7 +1007,7 @@ pub enum DigitPlanError {
 /// representatives with `-(base/2)*S_d`.  The scheme applies any channel
 /// factor such as `H` after this common offset; callers must not supply a
 /// pre-scaled offset.
-pub fn canonical_digit_offset(
+pub(crate) fn canonical_digit_offset(
     base: &BigUint,
     count: usize,
     mask: bool,

@@ -13,6 +13,16 @@ CPU-independent work uses Rayon where iterations are independent. GPU work may
 intentionally use a smaller wave size to respect VRAM limits. DAG construction,
 dependency-ordered traversal, and deterministic reductions remain ordered.
 
+Graph-level GPU execution has one lifecycle: `prepare` measures the production
+primitive routes during warmup, freezes their layouts, budgets, widths, and
+schedule into a plan, and returns a prepared value whose `run` method executes
+that exact plan. A GPU backend is rejected with the CPU plan, and a frozen GPU
+plan is rejected by a non-GPU backend before session or artifact state can be
+mutated. The warmup report on the prepared value is the timing and resource
+estimate for that graph execution. Applications form whole-protocol estimates
+by summing the reports of the prepared protocol steps; reading or serializing a
+report performs no measurement or additional GPU execution.
+
 Artifacts are supplied and returned through the runtime artifact interfaces.
 Final applications decide how artifact payloads are persisted.
 

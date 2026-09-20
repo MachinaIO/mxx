@@ -1,9 +1,6 @@
 #![cfg(feature = "gpu")]
 
 use bigdecimal::BigDecimal;
-use mxx_bench_estimator::{
-    CostReport, estimate, gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig,
-};
 use mxx_bgg::{
     BggPublicKeyCompiler, BggPublicKeySampler, BggPublicKeyWire, BggSamplerLayout,
     BggTallEncodingCompiler, BggTallEncodingSampler, BggTallPlaintext, BggTallSlotLowering,
@@ -30,8 +27,8 @@ use mxx_gadgets::{
 use mxx_ir_core::{
     IntExpr, ParamEnv, RealExpr,
     artifact::{
-        ArtifactAvailability, Manifest as RuntimeManifest, ProductionId, export_validated_manifest,
-        production_id,
+        ArtifactAvailability, Manifest as RuntimeManifest, ProductionId, SpecHash,
+        export_validated_manifest, production_id,
     },
     encoding::spec_hash,
     node::IndexRange,
@@ -51,11 +48,13 @@ use mxx_primitives::{
 };
 use mxx_runtime::{
     ExecutionConfig, ExecutionResult, PreimageProgressConfig, RuntimeValue,
-    artifact::{ArtifactKey, ArtifactPayload, ArtifactStore, MemoryArtifactStore},
+    artifact::{ArtifactKey, ArtifactPayload, MemoryArtifactStore, MemoryFinalizedSessionSnapshot},
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
-    execute_in_session_with_config, execute_with_config,
-    gpu_calibration::FrozenGpuCalibrationRegistry,
-    transcript::SamplingMode,
+    gpu_measurement::{
+        GpuPreparationRequest, GpuWarmupMeasurementConfig, PreparedGpuExecution,
+        prepare as prepare_gpu,
+    },
+    gpu_warmup::GpuWarmupReport,
 };
 use num_bigint::{BigInt, BigUint};
 use num_traits::{FromPrimitive, ToPrimitive, Zero};
@@ -139,8 +138,6 @@ struct TestConfig {
     scale: u64,
     error_sigma: f64,
     trapdoor_sigma: f64,
-    benchmark_warmups: usize,
-    benchmark_iterations: usize,
     run_mode: TallRunMode,
     preimage_progress_interval: usize,
     max_parallel_instances: usize,
@@ -197,8 +194,6 @@ impl TestConfig {
             scale: env_u64("MXX_TALL_NESTED_RNS_SCALE", 1 << 6)?,
             error_sigma: env_f64("MXX_TALL_NESTED_RNS_ERROR_SIGMA", 4.0)?,
             trapdoor_sigma: env_f64("MXX_TALL_NESTED_RNS_TRAPDOOR_SIGMA", 4.578)?,
-            benchmark_warmups: env_usize("MXX_TALL_NESTED_RNS_BENCH_WARMUPS", 1)?,
-            benchmark_iterations: env_usize("MXX_TALL_NESTED_RNS_BENCH_ITERATIONS", 2)?,
             run_mode: TallRunMode::from_env()?,
             // Report exact runtime sampler completion frequently enough to make the long
             // preprocessing phase observable without emitting one line per preimage.
@@ -241,7 +236,6 @@ impl TestConfig {
             !config.error_sigma.is_finite() ||
             config.trapdoor_sigma <= 0.0 ||
             !config.trapdoor_sigma.is_finite() ||
-            config.benchmark_iterations == 0 ||
             config.preimage_progress_interval == 0 ||
             config.max_parallel_instances == 0 ||
             config.preprocessing_parallel_instances == 0 ||
@@ -350,22 +344,21 @@ struct PreparedCandidate {
     layout: BggSamplerLayout,
     preprocessing: BuiltGraph,
     preprocessing_graph_construction: Duration,
-    lookup_preimage_count: usize,
     preprocessing_preimage_count: usize,
     production: ProductionId,
     runtime_manifest: RuntimeManifest,
     lookup_compilers: Vec<mxx_bgg::LweLookupCompiler>,
     rotation_offsets: Vec<u32>,
     anchor_reduce_spec: Option<(u32, Vec<BigUint>)>,
-    encoding_graph: BuiltGraph,
     achieved_security_bits: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PreprocessingCheckpoint {
     hash_key: [u8; 32],
-    manifest: RuntimeManifest,
+    session: MemoryFinalizedSessionSnapshot,
     payloads: Vec<(ArtifactKey, ArtifactPayload)>,
+    preprocessing_report: GpuWarmupReport,
 }
 
 struct EndToEndOutputs {
@@ -373,6 +366,44 @@ struct EndToEndOutputs {
     output_plaintexts: Vec<GpuDCRTPolyMatrix>,
     residuals: Vec<GpuDCRTPolyMatrix>,
     expected_output_slots: Vec<BigUint>,
+}
+
+#[test]
+fn preprocessing_checkpoint_round_trips_exact_warmup_report() {
+    let production = ProductionId { spec_hash: SpecHash([3; 32]), execution_nonce: [4; 32] };
+    let report = GpuWarmupReport {
+        predicted_seconds: 12.5,
+        limiting_stage: None,
+        stages: Vec::new(),
+        reason: "checkpoint-test".to_owned(),
+    };
+    let checkpoint = PreprocessingCheckpoint {
+        hash_key: [5; 32],
+        session: MemoryFinalizedSessionSnapshot {
+            descriptor: mxx_runtime::session::SessionDescriptor::new(
+                production,
+                "checkpoint-test",
+                [6; 32],
+            ),
+            manifest: RuntimeManifest {
+                ir_version: mxx_ir_core::encoding::IR_VERSION,
+                production_id: ProductionId {
+                    spec_hash: SpecHash([3; 32]),
+                    execution_nonce: [4; 32],
+                },
+                artifacts: BTreeMap::new(),
+            },
+            transcript: Vec::new(),
+            committed_artifacts: Vec::new(),
+            aliases: Vec::new(),
+        },
+        payloads: Vec::new(),
+        preprocessing_report: report.clone(),
+    };
+    let encoded = serde_json::to_vec(&checkpoint).expect("serialize checkpoint");
+    let restored: PreprocessingCheckpoint =
+        serde_json::from_slice(&encoded).expect("deserialize checkpoint");
+    assert_eq!(restored.preprocessing_report, report);
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize, String> {
@@ -849,29 +880,6 @@ fn prepare_candidate(
         "constructed Tall nested-RNS candidate graphs"
     );
     debug!(q_moduli = ?parameters.to_crt().0, "candidate CRT moduli");
-    let encoding_construction_started = Instant::now();
-    log_graph_phase("encoding_construction", "start", None);
-    let encoding_graph = build_encoding_graph(
-        &parameters,
-        &circuit,
-        &layout,
-        production.clone(),
-        &lookup_compilers,
-        &rotation_offsets,
-        anchor_reduce_spec.clone(),
-        physical_slots,
-        encoding_crt_depth,
-        config.error_sigma,
-        true,
-    )?;
-    log_graph_phase("encoding_construction", "end", Some(&encoding_construction_started));
-    let manifests = BTreeMap::from([(production.clone(), runtime_manifest.clone())]);
-    let encoding_validate_started = Instant::now();
-    log_graph_phase("encoding_validate", "start", None);
-    encoding_graph
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
-    log_graph_phase("encoding_validate", "end", Some(&encoding_validate_started));
     Ok(PreparedCandidate {
         parameters,
         encoding_ring_dimension,
@@ -882,14 +890,12 @@ fn prepare_candidate(
         layout,
         preprocessing,
         preprocessing_graph_construction,
-        lookup_preimage_count,
         preprocessing_preimage_count,
         production,
         runtime_manifest,
         lookup_compilers,
         rotation_offsets,
         anchor_reduce_spec,
-        encoding_graph,
         achieved_security_bits,
     })
 }
@@ -1266,86 +1272,26 @@ fn prepare_selected_benchmark_candidate(config: &TestConfig) -> Result<PreparedC
     prepare_candidate(parameters, config, achieved_security_bits)
 }
 
-fn log_cost_report(label: &str, report: &CostReport) {
-    info!(
-        label,
-        total_work_seconds = report.total_work_seconds,
-        preimage_sampling_work_seconds = report.preimage_sampling_work_seconds,
-        critical_path_seconds = report.critical_path_seconds,
-        maximum_parallelism = report.maximum_parallelism,
-        workspace_high_water_bytes = report.workspace_high_water_bytes,
-        peak_memory_bytes = report.peak_memory_bytes,
-        "GPU benchmark estimate"
-    );
-    for (scope, cost) in &report.per_subgraph {
-        debug!(label, scope, ?cost, "GPU benchmark subgraph estimate");
-    }
-}
-
-fn benchmark_estimation(
-    selected: &PreparedCandidate,
-    config: &TestConfig,
-    gpu_parameters: &GpuDCRTPolyParams,
-    device_ids: &[i32],
-) -> Result<(CostReport, CostReport, FrozenGpuCalibrationRegistry), String> {
-    info!("stage 2/4: benchmark estimation");
-    let bindings = ParamEnv::default();
-    let manifests =
-        BTreeMap::from([(selected.production.clone(), selected.runtime_manifest.clone())]);
-    let preprocessing_graph =
-        selected.preprocessing.validate(&bindings).map_err(|error| error.to_string())?;
-    let encoding_graph = selected
-        .encoding_graph
-        .validate_with_manifests(&bindings, &manifests)
-        .map_err(|error| error.to_string())?;
-    let harness = MeasurementHarnessConfig {
-        warm_up_iterations: config.benchmark_warmups,
-        measured_iterations: config.benchmark_iterations,
-        memory_poll_interval: Duration::from_millis(1),
-    };
-    info!(
-        gpu_count = device_ids.len(),
-        measurement_workers = device_ids.len(),
-        "fleet-wide benchmark estimator parallelism"
-    );
-    // Keep one production fleet owner for warmup.  Constructing one
-    // single-device backend per worker prevents the inclusive measurement
-    // boundary from materializing source shards on their real owners, so a
-    // cross-device range is incorrectly observed as resident on the
-    // destination.  The fleet backend retains every physical owner and lets
-    // the mapper select Peer/HostStaging exactly as fixed execution does.
-    let measurement_backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
-    let backends = vec![(measurement_backend, device_ids[0])];
-    let mut backend = GpuNodeMeasurementBackend::new(backends, harness);
-    info!("collecting unique GPU measurement shapes");
-    estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;
-    estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
-    let measurement_started = Instant::now();
-    backend.measure_collected().map_err(|error| error.to_string())?;
-    info!(
-        elapsed = ?measurement_started.elapsed(),
-        gpu_count = device_ids.len(),
-        "parallel GPU measurement collection complete"
-    );
-    let preprocessing_started = Instant::now();
-    info!(subgraph = "preprocessing", "benchmark subgraph estimation begin");
-    let preprocessing_report =
-        estimate(&preprocessing_graph, &mut backend).map_err(|error| error.to_string())?;
-    info!(subgraph = "preprocessing", elapsed = ?preprocessing_started.elapsed(), "benchmark subgraph estimation complete");
-    info!(
-        lookup_preimage_count = selected.lookup_preimage_count,
-        total_preimage_count = selected.preprocessing_preimage_count,
-        "estimated lookup preimage sampling"
-    );
-    log_cost_report("TallBggPreprocessing", &preprocessing_report);
-    let encoding_started = Instant::now();
-    info!(subgraph = "encoding", "benchmark subgraph estimation begin");
-    let encoding_report =
-        estimate(&encoding_graph, &mut backend).map_err(|error| error.to_string())?;
-    info!(subgraph = "encoding", elapsed = ?encoding_started.elapsed(), "benchmark subgraph estimation complete");
-    log_cost_report("TallBggEncoding", &encoding_report);
-    let calibration_registry = backend.calibration_registry().freeze();
-    Ok((preprocessing_report, encoding_report, calibration_registry))
+fn prepare_gpu_graph(
+    validated: mxx_ir_core::ValidatedGraph,
+    backend: &mut GpuDcrtBackend,
+    inputs: &BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
+    parameters: &[GpuDCRTPolyParams],
+    execution_config: ExecutionConfig,
+) -> Result<PreparedGpuExecution, String> {
+    let prepared = prepare_gpu(GpuPreparationRequest {
+        validated,
+        backend,
+        inputs,
+        parameters,
+        default_tile_widths: vec![1, 2, 4, 8],
+        implementation_variant: "tall-production-measured".into(),
+        measurement_config: GpuWarmupMeasurementConfig::default(),
+        execution_config,
+    })
+    .map_err(|error| error.to_string())?;
+    prepared.validate_evidence().map_err(|error| error.to_string())?;
+    Ok(prepared)
 }
 
 fn execution_config(
@@ -1366,6 +1312,7 @@ fn execution_config(
             NonZeroUsize::new(config.release_fence_interval)
                 .expect("validated nonzero fence interval"),
         ),
+        ..ExecutionConfig::default()
     })
 }
 
@@ -1394,9 +1341,13 @@ fn matrix_family_output(
 fn save_preprocessing(
     config: &TestConfig,
     store: &MemoryArtifactStore,
-    manifest: &RuntimeManifest,
+    production: &ProductionId,
     hash_key: [u8; 32],
+    preprocessing_report: GpuWarmupReport,
 ) -> Result<PathBuf, String> {
+    let session =
+        store.snapshot_finalized_session(production).map_err(|error| error.to_string())?;
+    let manifest = &session.manifest;
     let payloads = store.snapshot_manifest_payloads(manifest).map_err(|error| error.to_string())?;
     let payload_size = |payload: &ArtifactPayload| match payload {
         ArtifactPayload::Matrix(bytes) |
@@ -1435,7 +1386,12 @@ fn save_preprocessing(
         config.checkpoint_root.join(format!("run-{unique}-{:016x}", rand::random::<u64>()));
     fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
     let path = directory.join("preprocessing.json");
-    let checkpoint = PreprocessingCheckpoint { hash_key, manifest: manifest.clone(), payloads };
+    if !preprocessing_report.predicted_seconds.is_finite() ||
+        preprocessing_report.predicted_seconds < 0.0
+    {
+        return Err("preprocessing warmup report has an invalid predicted duration".to_owned());
+    }
+    let checkpoint = PreprocessingCheckpoint { hash_key, session, payloads, preprocessing_report };
     fs::write(&path, serde_json::to_vec(&checkpoint).map_err(|error| error.to_string())?)
         .map_err(|error| error.to_string())?;
     Ok(path)
@@ -1443,29 +1399,23 @@ fn save_preprocessing(
 
 fn reload_preprocessing(
     path: &PathBuf,
-) -> Result<(MemoryArtifactStore, RuntimeManifest, [u8; 32]), String> {
+) -> Result<(MemoryArtifactStore, RuntimeManifest, [u8; 32], GpuWarmupReport), String> {
     let restored: PreprocessingCheckpoint =
         serde_json::from_slice(&fs::read(path).map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
+    let manifest = restored.session.manifest.clone();
+    let hash_key = restored.hash_key;
+    let preprocessing_report = restored.preprocessing_report.clone();
     let mut reloaded = MemoryArtifactStore::default();
-    for (key, payload) in restored.payloads {
-        let descriptor = restored
-            .manifest
-            .artifacts
-            .get(&key.name)
-            .ok_or_else(|| format!("checkpoint manifest omits {}", key.name))?;
-        reloaded
-            .store(
-                key,
-                &descriptor.artifact_type,
-                descriptor.availability,
-                descriptor.layout.as_deref(),
-                payload,
-            )
-            .map_err(|error| error.to_string())?;
+    reloaded
+        .restore_finalized_session(restored.session, restored.payloads)
+        .map_err(|error| error.to_string())?;
+    if !preprocessing_report.predicted_seconds.is_finite() ||
+        preprocessing_report.predicted_seconds < 0.0
+    {
+        return Err("preprocessing checkpoint contains an invalid warmup report".to_owned());
     }
-    reloaded.store_manifest(restored.manifest.clone()).map_err(|error| error.to_string())?;
-    Ok((reloaded, restored.manifest, restored.hash_key))
+    Ok((reloaded, manifest, hash_key, preprocessing_report))
 }
 
 fn random_operands(selected: &PreparedCandidate, config: &TestConfig) -> Vec<Vec<BigUint>> {
@@ -1754,7 +1704,6 @@ fn end_to_end_processing(
     config: &TestConfig,
     gpu_parameters: &GpuDCRTPolyParams,
     device_ids: &[i32],
-    calibration_registry: Option<&FrozenGpuCalibrationRegistry>,
 ) -> Result<EndToEndOutputs, String> {
     info!("stage 3/4: end-to-end processing");
     info!(
@@ -1773,9 +1722,11 @@ fn end_to_end_processing(
         elapsed = ?selected.preprocessing_graph_construction,
         "timed preprocessing graph construction during selected-candidate preparation"
     );
-    let (mut store, manifest) = if let Some(checkpoint_path) = &config.reuse_checkpoint {
+    let (mut store, manifest, preprocessing_report) = if let Some(checkpoint_path) =
+        &config.reuse_checkpoint
+    {
         let started = Instant::now();
-        let (store, manifest, _) = reload_preprocessing(checkpoint_path)?;
+        let (store, manifest, _, preprocessing_report) = reload_preprocessing(checkpoint_path)?;
         if manifest.production_id != selected.production {
             return Err(
                 "reused checkpoint production id differs from selected parameters".to_owned()
@@ -1786,7 +1737,7 @@ fn end_to_end_processing(
             path = %checkpoint_path.display(),
             "reused preprocessing checkpoint; skipped preprocessing execution"
         );
-        (store, manifest)
+        (store, manifest, preprocessing_report)
     } else {
         let mut hash_key = [0u8; 32];
         rand::rng().fill(&mut hash_key);
@@ -1799,52 +1750,62 @@ fn end_to_end_processing(
         // Preprocessing artifacts are serialized by the store below. Use a dedicated context so
         // the consumer starts without the preprocessing allocator pool and transient preimage
         // buffers still resident on the GPU.
-        let production = {
+        let (production, preprocessing_report) = {
             let mut preprocessing_backend =
                 gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
-            if let Some(registry) = calibration_registry {
-                preprocessing_backend.set_calibration_registry(registry.clone());
-            }
-            let started = Instant::now();
-            let preprocessing_result = execute_in_session_with_config(
-                &preprocessing,
+            let preprocessing_inputs = BTreeMap::from([(
+                HASH_KEY_INPUT.to_owned(),
+                RuntimeValue::Bytes(hash_key.to_vec()),
+            )]);
+            let prepared = prepare_gpu_graph(
+                preprocessing,
                 &mut preprocessing_backend,
-                BTreeMap::from([(
-                    HASH_KEY_INPUT.to_owned(),
-                    RuntimeValue::Bytes(hash_key.to_vec()),
-                )]),
-                &mut preprocessing_store,
-                [0x71; 32],
+                &preprocessing_inputs,
+                std::slice::from_ref(gpu_parameters),
                 producer_execution_config,
-            )
-            .map_err(|error| error.to_string())?;
+            )?;
+            info!(
+                predicted_seconds = prepared.report().predicted_seconds,
+                stages = prepared.report().stages.len(),
+                "prepared Tall preprocessing GPU plan"
+            );
+            let preprocessing_report = prepared.report();
+            let started = Instant::now();
+            let preprocessing_result = prepared
+                .run(
+                    &mut preprocessing_backend,
+                    preprocessing_inputs,
+                    &mut preprocessing_store,
+                    [0x71; 32],
+                )
+                .map_err(|error| error.to_string())?;
+            prepared.assert_measurements_unchanged();
             info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
-            preprocessing_result
+            let production = preprocessing_result
                 .production_id
-                .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?
+                .ok_or_else(|| "preprocessing execution returned no production id".to_owned())?;
+            (production, preprocessing_report)
         };
         if production != selected.production {
             return Err("preprocessing production id differs from the selected manifest".to_owned());
         }
-        let manifest = preprocessing_store
-            .manifest(&production)
-            .cloned()
-            .ok_or_else(|| "preprocessing manifest was not committed".to_owned())?;
-
         let started = Instant::now();
-        let checkpoint_path =
-            save_preprocessing(config, &preprocessing_store, &manifest, hash_key)?;
+        let checkpoint_path = save_preprocessing(
+            config,
+            &preprocessing_store,
+            &selected.production,
+            hash_key,
+            preprocessing_report,
+        )?;
         info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint serialization");
         let started = Instant::now();
-        let (store, manifest, _) = reload_preprocessing(&checkpoint_path)?;
+        let (store, manifest, _, restored_report) = reload_preprocessing(&checkpoint_path)?;
         info!(elapsed = ?started.elapsed(), path = %checkpoint_path.display(), "timed checkpoint reload");
-        (store, manifest)
+        (store, manifest, restored_report)
     };
+    let preprocessing_predicted_seconds = Some(preprocessing_report.predicted_seconds);
     let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
     let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
-    if let Some(registry) = calibration_registry {
-        backend.set_calibration_registry(registry.clone());
-    }
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
@@ -1882,15 +1843,30 @@ fn end_to_end_processing(
         .map_err(|error| error.to_string())?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph validation");
     let started = Instant::now();
-    let mut encoding_result = execute_with_config(
-        &encoding_graph,
+    let prepared_encoding = prepare_gpu_graph(
+        encoding_graph,
         &mut backend,
-        inputs,
-        &mut store,
-        SamplingMode::Fresh,
+        &inputs,
+        std::slice::from_ref(gpu_parameters),
         runtime_execution_config,
-    )
-    .map_err(|error| error.to_string())?;
+    )?;
+    info!(
+        predicted_seconds = prepared_encoding.report().predicted_seconds,
+        stages = prepared_encoding.report().stages.len(),
+        "prepared Tall encoding GPU plan"
+    );
+    let protocol_predicted_seconds = preprocessing_predicted_seconds
+        .map(|preprocessing| preprocessing + prepared_encoding.report().predicted_seconds)
+        .unwrap_or(prepared_encoding.report().predicted_seconds);
+    info!(
+        preprocessing_predicted_seconds,
+        encoding_predicted_seconds = prepared_encoding.report().predicted_seconds,
+        protocol_predicted_seconds,
+        "Tall GPU protocol predicted warmup time"
+    );
+    let mut encoding_result = prepared_encoding
+        .run(&mut backend, inputs, &mut store, [0; 32])
+        .map_err(|error| error.to_string())?;
     let encoding_rows =
         matrix_family_output(&mut encoding_result, "encoding_rows", &mut backend, &mut store)?;
     let output_plaintexts =
@@ -1915,6 +1891,7 @@ fn end_to_end_processing(
         residuals.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     info!(elapsed = ?started.elapsed(), "timed output transfer");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
+    prepared_encoding.assert_measurements_unchanged();
     Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_output_slots })
 }
 
@@ -2313,8 +2290,6 @@ fn noiseless_runtime_config() -> TestConfig {
         // encryption errors: each preimage satisfies its target relation
         // exactly, which this test checks through the final residual.
         trapdoor_sigma: 4.578,
-        benchmark_warmups: 1,
-        benchmark_iterations: 1,
         run_mode: TallRunMode::ZeroNoise,
         // Keep the 31,232-preimage smoke run observable without logging once
         // per preimage (about 122 quantitative progress reports).
@@ -2345,7 +2320,7 @@ fn test_gpu_tall_bgg_nested_rns_noiseless_encoding_matches_ideal_product() {
         selected.parameters.base_bits(),
         None,
     );
-    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids, None)
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
         .expect("small noiseless Tall execution");
     let (maximum_residual, location) =
         measure_runtime_residual(&selected, &gpu_parameters, outputs)
@@ -2430,24 +2405,15 @@ fn test_gpu_tall_bgg_nested_rns_modq_arithmetic() {
         selected.parameters.base_bits(),
         None,
     );
-    let (_preprocessing_report, _encoding_report, calibration_registry) =
-        benchmark_estimation(&selected, &config, &gpu_parameters, &device_ids)
-            .expect("benchmark estimation");
     if requested_mode == TallRunMode::BenchmarkSelected {
         info!(
             correctness_verified = false,
-            "completed Tall benchmark-only mode before preprocessing execution"
+            "completed Tall benchmark-only mode without executing a GPU graph"
         );
         return;
     }
-    let outputs = end_to_end_processing(
-        &selected,
-        &config,
-        &gpu_parameters,
-        &device_ids,
-        Some(&calibration_registry),
-    )
-    .expect("end-to-end processing");
+    let outputs = end_to_end_processing(&selected, &config, &gpu_parameters, &device_ids)
+        .expect("end-to-end processing");
     // Only ZeroNoise reaches execution. No noisy execution may bypass the retired
     // simulator's bound-conformance assertion: it requires a Tall-specific Lean certificate.
     assert_eq!(requested_mode, TallRunMode::ZeroNoise);

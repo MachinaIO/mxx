@@ -5837,11 +5837,15 @@ mod tests {
         let groups32 = (0..16).map(|row| vec![row % 4, row % 4]).collect::<Vec<_>>();
         let mut groups33 = groups32.clone();
         groups33[0].push(0);
+        let small_grouped = vec![vec![0], vec![1, 2], vec![3]];
+        assert_eq!(small_grouped.len(), 3);
+        assert_eq!(small_grouped.iter().map(Vec::len).sum::<usize>(), 4);
         assert_eq!(groups17.len(), 17);
         assert_eq!(groups17.iter().map(Vec::len).sum::<usize>(), 17);
         assert_eq!(groups33.len(), 16);
         assert_eq!(groups33.iter().map(Vec::len).sum::<usize>(), 33);
         for (groups, expected_topology) in [
+            (small_grouped, TensorRowSumImplementation::FusedKernel),
             (groups16, TensorRowSumImplementation::FusedKernel),
             (groups17, TensorRowSumImplementation::MaterializedTensor),
             (groups32, TensorRowSumImplementation::FusedKernel),

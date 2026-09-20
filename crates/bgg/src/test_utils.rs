@@ -12,7 +12,7 @@ use mxx_primitives::{
     },
 };
 use mxx_runtime::{
-    ExecutionResult, RuntimeValue,
+    ExecutionConfig, ExecutionResult, RuntimeValue,
     artifact::MemoryArtifactStore,
     backend::poly::{CpuDcrtBackend, cpu_backend},
     execute,
@@ -58,6 +58,7 @@ pub fn execute_graph(
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig::default(),
     )
     .expect("graph execution")
 }

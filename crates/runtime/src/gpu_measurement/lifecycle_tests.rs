@@ -7,8 +7,29 @@
 
 #![cfg(feature = "gpu")]
 
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::atomic::Ordering, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroUsize,
+    sync::{Arc, atomic::Ordering},
+    time::Duration,
+};
 
+use crate::{
+    Backend, RuntimeValue,
+    artifact::MemoryArtifactStore,
+    backend::{
+        GpuWarmupProvenance,
+        poly_gpu::{GpuDcrtBackend, gpu_backend_on},
+    },
+    executor::{ExecutionConfig, ExecutionPlan, execute},
+    gpu_column_policy::{
+        CanonicalWarmupProfileDomain, EffectiveGpuOperation, FusedWarmupOperation,
+        WarmupMeasurementKind,
+    },
+    gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
+    gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
+    transcript::SamplingMode,
+};
 use mxx_dsl::{DslContext, Family, Mat, Ring};
 use mxx_ir_core::{
     ParamEnv,
@@ -18,25 +39,9 @@ use mxx_ir_core::{
 use mxx_primitives::poly::dcrt::gpu::{
     GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
 };
-use mxx_runtime::{
-    Backend, RuntimeValue,
-    artifact::MemoryArtifactStore,
-    backend::{
-        GpuWarmupProvenance,
-        poly_gpu::{GpuDcrtBackend, gpu_backend_on},
-    },
-    executor::execute_with_gpu_plan,
-    gpu_column_policy::{
-        CanonicalWarmupProfileDomain, EffectiveGpuOperation, FusedWarmupOperation,
-        WarmupMeasurementKind,
-    },
-    gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
-    gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
-    transcript::SamplingMode,
-};
 use num_bigint::{BigInt, Sign};
 
-use crate::{gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig};
+use super::{GpuWarmupMeasurementConfig, ProductionGpuWarmupProvider};
 use mxx_primitives::poly::PolyParams;
 
 #[derive(Clone, Copy, Debug)]
@@ -275,18 +280,10 @@ fn scenario(
             let expected =
                 backend.multiply_small_rhs(&compact_left, &rhs).expect("expected compact product");
             let first = backend
-                .slice(
-                    &expected,
-                    Some(&mxx_runtime::backend::IndexRange { start: 0, end: 1 }),
-                    None,
-                )
+                .slice(&expected, Some(&crate::backend::IndexRange { start: 0, end: 1 }), None)
                 .expect("expected first slice");
             let tail = backend
-                .slice(
-                    &expected,
-                    Some(&mxx_runtime::backend::IndexRange { start: 1, end: 2 }),
-                    None,
-                )
+                .slice(&expected, Some(&crate::backend::IndexRange { start: 1, end: 2 }), None)
                 .expect("expected tail slice");
             Scenario {
                 graph,
@@ -357,16 +354,16 @@ fn dsl_to_fixed_gpu_lifecycle_is_table_driven_and_measured() {
         let mut execution_backend = gpu_backend_on([parameters.clone()], [device]);
         execution_backend.select_operation([0xD0 + case as u8; 32]).expect("select operation");
         let scenario = scenario(case, &parameters, &mut execution_backend);
-        let harness = MeasurementHarnessConfig {
+        let harness = GpuWarmupMeasurementConfig {
             warm_up_iterations: 0,
             measured_iterations: 1,
             memory_poll_interval: Duration::ZERO,
         };
-        let mut provider = GpuNodeMeasurementBackend::new(
+        let mut provider = ProductionGpuWarmupProvider::new(
             vec![(gpu_backend_on([parameters.clone()], [device]), device)],
             harness,
         );
-        let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+        let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
             &scenario.graph,
             &config(&scenario.graph, &parameters, device),
             &mut provider,
@@ -424,13 +421,16 @@ fn dsl_to_fixed_gpu_lifecycle_is_table_driven_and_measured() {
             .expect("runtime contract query")
             .expect("GPU backend contract");
         warmup.plan.validate().expect("frozen plan validation");
-        let output = execute_with_gpu_plan(
+        let output = execute(
             &scenario.graph,
-            &warmup.plan,
             &mut execution_backend,
             scenario.inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig {
+                plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+                ..ExecutionConfig::default()
+            },
         )
         .unwrap_or_else(|error| panic!("{case:?} fixed execution must complete: {error}"));
         for (name, expected) in scenario.expected_outputs {
@@ -467,16 +467,16 @@ fn dsl_preimage_cold_warm_profile_and_fixed_sampling_are_one_lifecycle() {
         .validate(&ParamEnv::default())
         .expect("graph validation");
 
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![(gpu_backend_on([parameters.clone()], [device]), device)],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
         &graph,
         &config(&graph, &parameters, device),
         &mut provider,
@@ -499,7 +499,7 @@ fn dsl_preimage_cold_warm_profile_and_fixed_sampling_are_one_lifecycle() {
     assert!(
         records.iter().any(|record| {
             record.profile_domain == CanonicalWarmupProfileDomain::FusedDecompose &&
-                record.timing_scope == mxx_runtime::backend::GpuWarmupTimingScope::LocalJob &&
+                record.timing_scope == crate::backend::GpuWarmupTimingScope::LocalJob &&
                 record.measurement == WarmupMeasurementKind::GpuMeasured
         }),
         "GadgetTrapdoor-backed preimage must have a measured fused decomposition"
@@ -542,13 +542,16 @@ fn dsl_preimage_cold_warm_profile_and_fixed_sampling_are_one_lifecycle() {
         .expect("runtime contract query")
         .expect("GPU backend contract");
     warmup.plan.validate().expect("frozen preimage plan validation");
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed preimage sampling must complete");
     let RuntimeValue::Preimage(value) = &output.outputs["preimage"] else {
@@ -632,16 +635,16 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
         inputs.insert(format!("bit-{index}"), RuntimeValue::Bool(index % 2 == 0));
     }
 
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![(gpu_backend_on([parameters.clone()], [device]), device)],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
         &graph,
         &config(&graph, &parameters, device),
         &mut provider,
@@ -660,7 +663,7 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
             records.iter().any(|record| {
                 record.profile_domain == domain &&
                     record.measurement == WarmupMeasurementKind::HostMeasured &&
-                    record.timing_scope == mxx_runtime::backend::GpuWarmupTimingScope::LocalJob
+                    record.timing_scope == crate::backend::GpuWarmupTimingScope::LocalJob
             }),
             "{domain:?} lacks measured host execution"
         );
@@ -674,7 +677,7 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
                     CanonicalWarmupProfileDomain::PackPolynomialCoefficients |
                     CanonicalWarmupProfileDomain::PolynomialFromValues |
                     CanonicalWarmupProfileDomain::PolynomialValues
-            ) && record.timing_scope == mxx_runtime::backend::GpuWarmupTimingScope::Transfer
+            ) && record.timing_scope == crate::backend::GpuWarmupTimingScope::Transfer
         }),
         "host-visible boundaries must also measure physical transfer"
     );
@@ -697,13 +700,16 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
         .expect("runtime contract query")
         .expect("GPU backend contract");
     warmup.plan.validate().expect("frozen host plan validation");
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut setup_backend,
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed host boundary execution must complete");
     assert!(matches!(output.outputs["coefficient"], RuntimeValue::Int(_)));

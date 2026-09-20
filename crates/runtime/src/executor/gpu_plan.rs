@@ -102,8 +102,12 @@ mod tests {
     #[serial_test::serial]
     fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
         use crate::{
-            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
-            gpu_calibration::GpuColumnWidths, transcript::SamplingMode,
+            ExecutionConfig, MemoryArtifactStore, RuntimeValue,
+            backend::poly_gpu::gpu_backend,
+            gpu_calibration::GpuColumnWidths,
+            gpu_measurement::{
+                GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare as prepare_gpu,
+            },
         };
         use mxx_primitives::{
             matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
@@ -165,8 +169,20 @@ mod tests {
                 ),
             ]);
             let mut store = MemoryArtifactStore::default();
-            let mut result =
-                execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+            let prepared = prepare_gpu(GpuPreparationRequest {
+                validated: graph,
+                backend: &mut backend,
+                inputs: &inputs,
+                parameters: std::slice::from_ref(&gpu_parameters),
+                default_tile_widths: vec![1, 2, 3, 4, 8],
+                implementation_variant: "runtime-row-sum-test".to_owned(),
+                measurement_config: GpuWarmupMeasurementConfig::default(),
+                execution_config: ExecutionConfig::default(),
+            })
+            .expect("prepare GPU row-sum graph");
+            let mut result = prepared
+                .run(&mut backend, inputs, &mut store, [0; 32])
+                .expect("run GPU row-sum graph");
             let RuntimeValue::Matrix(output) =
                 result.materialize_output("out", &backend, &mut store).unwrap()
             else {

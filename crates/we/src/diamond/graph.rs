@@ -952,8 +952,8 @@ mod tests {
     };
     use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use std::collections::BTreeMap;
 
@@ -1146,9 +1146,15 @@ mod tests {
             .unwrap();
         let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
         let mut store = MemoryArtifactStore::default();
-        let mut result =
-            execute(&graph, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let mut result = execute(
+            &graph,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let RuntimeValue::IndexedFamily(indices) =
             result.materialize_output("indices", &backend, &mut store).unwrap()
         else {
@@ -1179,6 +1185,7 @@ mod tests {
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
+                ExecutionConfig::default(),
             )
             .unwrap();
             matches!(result.outputs.get("valid-parameters"), Some(RuntimeValue::Bool(true)))

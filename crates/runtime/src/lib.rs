@@ -1,12 +1,15 @@
 //! Concrete execution support for `mxx-ir-core`.
 
 pub mod artifact;
+pub mod authority;
 pub mod backend;
 pub mod executor;
 #[cfg(feature = "gpu")]
 pub mod gpu_calibration;
 pub mod gpu_column_policy;
 pub mod gpu_execution_plan;
+#[cfg(feature = "gpu")]
+pub mod gpu_measurement;
 pub mod gpu_schedule;
 pub mod gpu_warmup;
 pub mod host_control;
@@ -16,13 +19,14 @@ pub mod transcript;
 
 pub use artifact::{
     ArtifactKey, ArtifactPayload, ArtifactStore, FileArtifactError, FileArtifactStore,
-    FilesystemArtifactStore, MemoryArtifactStore, load_artifact_payload_sizes,
+    FilesystemArtifactStore, MemoryArtifactStore, MemoryFinalizedSessionSnapshot,
+    load_artifact_payload_sizes,
 };
 pub use backend::{Backend, RuntimeValue};
 pub use executor::{
-    ExecutionConfig, ExecutionError, ExecutionResult, ExecutionTrace, PreimageProgressConfig,
-    StagedFamilyLease, execute, execute_in_session, execute_in_session_with_config,
-    execute_with_config, execute_with_trace,
+    ExecutionConfig, ExecutionError, ExecutionPlan, ExecutionResult, ExecutionTrace,
+    PreimageProgressConfig, StagedFamilyLease, execute, execute_in_session, execute_prepared,
+    execute_with_trace,
 };
 pub use host_control::{
     HostControlBodyAction, HostControlBodyInvocation, HostControlBodyNode, HostControlChild,

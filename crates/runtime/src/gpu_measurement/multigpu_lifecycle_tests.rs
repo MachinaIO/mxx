@@ -10,29 +10,30 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
+    sync::Arc,
     time::Duration,
 };
 
-use mxx_dsl::{DslContext, Ring, parallel};
-use mxx_ir_core::{ParamEnv, node::ConstantMatrix, types::ConcreteMatrixType};
-use mxx_primitives::poly::{
-    PolyParams,
-    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info},
-};
-use mxx_runtime::{
+use crate::{
     Backend, RuntimeValue,
     artifact::MemoryArtifactStore,
     backend::poly_gpu::gpu_backend_on,
-    executor::execute_with_gpu_plan,
+    executor::{ExecutionConfig, ExecutionPlan, execute},
     gpu_column_policy::{EffectiveGpuOperation, GpuTransferRoute},
     gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
     gpu_schedule::GpuColumnInterval,
     gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
     transcript::SamplingMode,
 };
+use mxx_dsl::{DslContext, Ring, parallel};
+use mxx_ir_core::{ParamEnv, node::ConstantMatrix, types::ConcreteMatrixType};
+use mxx_primitives::poly::{
+    PolyParams,
+    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info},
+};
 use num_bigint::{BigInt, Sign};
 
-use crate::{gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig};
+use super::{GpuWarmupMeasurementConfig, ProductionGpuWarmupProvider};
 
 fn matrix_type(parameters: &GpuDCRTPolyParams, rows: usize, columns: usize) -> ConcreteMatrixType {
     ConcreteMatrixType {
@@ -186,12 +187,12 @@ fn dsl_multigpu_nonzero_fragment_and_affected_device_peak_reach_fixed_execution(
         source_owners,
         output_owners,
     );
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![
             (
                 gpu_backend_on([parameters.clone()], [source_device, destination_device]),
@@ -204,12 +205,9 @@ fn dsl_multigpu_nonzero_fragment_and_affected_device_peak_reach_fixed_execution(
         ],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
-        &graph,
-        &config,
-        &mut provider,
-    )
-    .expect("multi-GPU warmup with nonzero fragment must complete");
+    let mut warmup =
+        crate::gpu_warmup::warmup_gpu_from_validated_with_provider(&graph, &config, &mut provider)
+            .expect("multi-GPU warmup with nonzero fragment must complete");
     let records = provider.warmup_dispatch_records();
     assert!(
         records.iter().any(|record| record.range.start >= 2),
@@ -240,13 +238,16 @@ fn dsl_multigpu_nonzero_fragment_and_affected_device_peak_reach_fixed_execution(
     warmup.plan.validate().expect("frozen multi-GPU plan validation");
     drop(provider);
     gpu_device_sync();
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed multi-GPU transpose must complete");
     assert!(matches!(output.outputs["out"], RuntimeValue::Matrix(_)));
@@ -309,12 +310,12 @@ fn dsl_multigpu_owner_candidates_keep_route_evidence_through_selection() {
         source_layout,
         vec![vec![GpuColumnInterval { device: 0, start: 0, end: 4 }], source_owners],
     )]);
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![
             (
                 gpu_backend_on([parameters.clone()], [source_device, destination_device]),
@@ -331,7 +332,7 @@ fn dsl_multigpu_owner_candidates_keep_route_evidence_through_selection() {
     // device 1 must therefore select the worker whose explicit owner is the
     // second physical device, rather than the first backend that contains it.
     assert_eq!(provider.worker_index_for_logical_device(1), Some(1));
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_for_inputs_with_candidates(
+    let mut warmup = crate::gpu_warmup::warmup_gpu_for_inputs_with_candidates(
         &graph,
         &mut backend,
         &inputs,
@@ -360,13 +361,16 @@ fn dsl_multigpu_owner_candidates_keep_route_evidence_through_selection() {
     warmup.plan.validate().expect("selected owner plan validation");
     drop(provider);
     gpu_device_sync();
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed selected-owner execution must complete");
     assert!(matches!(output.outputs["out"], RuntimeValue::Matrix(_)));
@@ -435,12 +439,12 @@ fn dsl_multigpu_rotated_sibling_waves_retain_route_evidence() {
     assert!(config.layouts.iter().any(|layout| layout.rows == 4 &&
         layout.columns == 2 &&
         layout.instance_device_stride == 0));
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![
             (
                 gpu_backend_on([parameters.clone()], [source_device, destination_device]),
@@ -453,12 +457,9 @@ fn dsl_multigpu_rotated_sibling_waves_retain_route_evidence() {
         ],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
-        &graph,
-        &config,
-        &mut provider,
-    )
-    .expect("rotated sibling-wave warmup must complete");
+    let mut warmup =
+        crate::gpu_warmup::warmup_gpu_from_validated_with_provider(&graph, &config, &mut provider)
+            .expect("rotated sibling-wave warmup must complete");
     let distinct_ranges = provider
         .warmup_dispatch_records()
         .iter()
@@ -545,13 +546,16 @@ fn dsl_multigpu_rotated_sibling_waves_retain_route_evidence() {
     warmup.plan.validate().expect("rotated fixed plan validation");
     drop(provider);
     gpu_device_sync();
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         BTreeMap::new(),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed rotated-wave execution must complete");
     let RuntimeValue::IndexedFamily(values) = &output.outputs["out"] else {
@@ -618,12 +622,12 @@ fn dsl_multigpu_global_slot_advances_across_width_one_wave() {
         layout.instance_device_stride = usize::from(layout.rows == 2 && layout.columns == 4);
     }
     config.max_parallel_instances = NonZeroUsize::new(1).expect("one instance wave");
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![
             (
                 gpu_backend_on([parameters.clone()], [source_device, destination_device]),
@@ -636,12 +640,9 @@ fn dsl_multigpu_global_slot_advances_across_width_one_wave() {
         ],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
-        &graph,
-        &config,
-        &mut provider,
-    )
-    .expect("width-one global-slot warmup must complete");
+    let mut warmup =
+        crate::gpu_warmup::warmup_gpu_from_validated_with_provider(&graph, &config, &mut provider)
+            .expect("width-one global-slot warmup must complete");
     let loop_choice = warmup
         .plan
         .loops
@@ -701,13 +702,16 @@ fn dsl_multigpu_global_slot_advances_across_width_one_wave() {
     warmup.plan.validate().expect("global-slot fixed plan validation");
     drop(provider);
     gpu_device_sync();
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         BTreeMap::new(),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed global-slot execution must complete");
     let RuntimeValue::IndexedFamily(values) = &output.outputs["out"] else {

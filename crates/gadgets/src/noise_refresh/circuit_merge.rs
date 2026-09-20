@@ -62,8 +62,8 @@ mod graph_tests {
         },
     };
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::{BigInt, BigUint};
     use std::{collections::BTreeMap, convert::Infallible};
@@ -204,6 +204,7 @@ mod graph_tests {
                 .collect::<BTreeMap<_, _>>(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execute merge Graph IR");
         for index in 0..3 {

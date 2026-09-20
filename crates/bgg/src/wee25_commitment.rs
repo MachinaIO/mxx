@@ -226,7 +226,7 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::{
-        RuntimeValue,
+        ExecutionConfig, RuntimeValue,
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
         execute,
@@ -371,6 +371,7 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         let values = blocks.into_iter().map(|(_, value)| value).collect::<Vec<_>>();

@@ -8,41 +8,62 @@
 //! testable on machines without a GPU and prevents production from silently
 //! re-planning on an OOM or a changed allocator state.
 
+#[cfg(feature = "gpu")]
+use crate::backend::validate_backend_storage_contract;
+#[cfg(any(feature = "gpu", test))]
+use crate::backend::{
+    BackendStorageContract, GpuWarmupCacheState, GpuWarmupEffectiveVariant,
+    GpuWarmupOperationDescriptor, GpuWarmupProfileError, GpuWarmupProfileKey,
+    GpuWarmupProfilePoint, GpuWarmupProfileProvider, GpuWarmupSessionProfileCache,
+    GpuWarmupTimingScope, IndexRange,
+};
+#[cfg(any(feature = "gpu", test))]
+use crate::gpu_column_policy::{
+    CanonicalWarmupProfileDomain, GpuFragmentClass as TypedFragmentClass,
+    capability_for_effective_operation, fused_warmup_profile_domain,
+    map_output_range_to_inputs_with_output,
+};
+#[cfg(any(feature = "gpu", test))]
+use crate::gpu_execution_plan::scope_shape_class;
+#[cfg(any(feature = "gpu", test))]
+use crate::host_control::{
+    HostControlBodyNode, HostControlChild, HostControlCoverage, HostControlError,
+};
 use crate::{
     backend::{
-        BackendStorageContract, BackendStorageDescriptor, BackendStorageRepresentation,
-        GpuWarmupCacheState, GpuWarmupDeviceIdentity, GpuWarmupEffectiveVariant,
-        GpuWarmupFragmentClass, GpuWarmupOperationDescriptor, GpuWarmupOperationSignature,
-        GpuWarmupProfile, GpuWarmupProfileError, GpuWarmupProfileKey, GpuWarmupProfilePoint,
-        GpuWarmupProfileProvider, GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupRoute,
-        GpuWarmupRouteResolverData, GpuWarmupSessionProfileCache, GpuWarmupStorageLayout,
-        GpuWarmupTimingScope, IndexRange, MemoryEvidenceKind, validate_backend_storage_contract,
+        BackendStorageDescriptor, BackendStorageRepresentation, GpuWarmupDeviceIdentity,
+        GpuWarmupFragmentClass, GpuWarmupOperationSignature, GpuWarmupProfile,
+        GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupRoute, GpuWarmupRouteResolverData,
+        GpuWarmupStorageLayout, MemoryEvidenceKind,
     },
     gpu_column_policy::{
-        CanonicalWarmupProfileDomain, ColumnCapability, ColumnRange, EffectiveGpuOperation,
-        FusedWarmupOperation, GpuExecutionRouteDescriptor, GpuFragmentClass as TypedFragmentClass,
-        WarmupMeasurementKind, capability_for_effective_operation, effective_gpu_operation,
-        fused_warmup_profile_domain, map_output_range_to_inputs_with_output,
+        ColumnCapability, ColumnRange, EffectiveGpuOperation, FusedWarmupOperation,
+        GpuExecutionRouteDescriptor, WarmupMeasurementKind, effective_gpu_operation,
     },
     gpu_execution_plan::{
         FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuFusedUnionJob, GpuLayout,
         GpuLoopChoice, GpuLoopSiteKey, GpuNodeChoice, GpuPlanContract, LayoutId,
-        fused_union_jobs_for_wave, scope_shape_class,
+        fused_union_jobs_for_wave,
     },
     gpu_schedule::{GpuColumnInterval, GpuColumnJob, GpuColumnSchedule, GpuScheduleError},
-    host_control::{HostControlBodyNode, HostControlChild, HostControlCoverage, HostControlError},
 };
-#[cfg(not(feature = "gpu"))]
+#[cfg(all(not(feature = "gpu"), test))]
 use mxx_ir_core::encoding;
+#[cfg(any(feature = "gpu", test))]
+use mxx_ir_core::encoding::spec_hash;
+#[cfg(any(feature = "gpu", test))]
+use mxx_ir_core::types::Port;
 use mxx_ir_core::{
     ValidatedGraph,
-    encoding::spec_hash,
     graph::FrozenGraphScopeId,
     node::NodeKind,
-    types::{ConcreteWireType, NodeId, Port, WireRef},
+    types::{ConcreteWireType, NodeId, WireRef},
 };
+#[cfg(any(feature = "gpu", test))]
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -241,6 +262,7 @@ pub struct GpuWarmupJobProfileKey {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "gpu", test))]
 struct GpuWarmupJobQuery {
     device: usize,
     source_interval: usize,
@@ -276,12 +298,8 @@ pub fn resolve_warmup_route_request(
 ) -> Result<GpuWarmupProfileRequest, GpuWarmupError> {
     if !route_descriptor.validate() {
         return Err(GpuWarmupError::InvalidPlan(format!(
-            "resolved GPU warmup route descriptor is invalid for {:?}: {:?}, source {:?}, destination {:?}, owners {:?}",
-            unresolved.request.signature,
-            route_descriptor.route,
-            route_descriptor.source_range,
-            route_descriptor.destination_range,
-            route_descriptor.source_routes()
+            "resolved GPU warmup route descriptor is invalid for {:?}: {:?}",
+            unresolved.request.signature, route_descriptor,
         )));
     }
     if route_descriptor.source_range != unresolved.source_range ||
@@ -309,6 +327,7 @@ pub fn resolve_warmup_route_request(
     Ok(GpuWarmupProfileRequest { route, route_descriptor, ..unresolved.request })
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn resolve_request_from_route_resolver(
     request: GpuWarmupProfileRequest,
     resolver: &GpuWarmupRouteResolverData,
@@ -350,32 +369,22 @@ pub fn route_response_matches_resolver(
     if expected_owners != observed_owners {
         return false;
     }
-    // A cross-device route may split one logical range across several source
-    // owners. Validate coverage of the union rather than requiring every
-    // owner fragment to cover the complete request. Larger authoritative
-    // fragments are accepted; only their intersection with the requested
-    // range contributes to this coverage check.
-    let mut intervals = route
-        .source_routes()
-        .iter()
-        .filter_map(|source| {
-            let start = source.source_range.start.max(resolver.source_range.start);
-            let end = source.source_range.end.min(resolver.source_range.end);
-            (start < end).then_some((start, end))
+    // Distinct mapped operands share a column coordinate but need not cover
+    // every column between their extrema. Preserve those sparse production
+    // fragments exactly; require their bounds and every fragment to stay
+    // inside the logical resolver envelope without inventing gap coverage.
+    let observed_bounds = route.source_routes().iter().fold(None, |bounds, source| {
+        Some(bounds.map_or(source.source_range, |bounds: ColumnRange| ColumnRange {
+            start: bounds.start.min(source.source_range.start),
+            end: bounds.end.max(source.source_range.end),
+        }))
+    });
+    if observed_bounds != Some(resolver.source_range) ||
+        route.source_routes().iter().any(|source| {
+            source.source_range.start < resolver.source_range.start ||
+                source.source_range.end > resolver.source_range.end
         })
-        .collect::<Vec<_>>();
-    intervals.sort_unstable();
-    let mut covered_until = resolver.source_range.start;
-    for (start, end) in intervals {
-        if start > covered_until {
-            return false;
-        }
-        covered_until = covered_until.max(end);
-        if covered_until >= resolver.source_range.end {
-            break;
-        }
-    }
-    if covered_until < resolver.source_range.end {
+    {
         return false;
     }
     let cross_device =
@@ -393,6 +402,7 @@ pub fn route_response_matches_resolver(
 /// the complete route descriptor, not just by transfer direction and width,
 /// so every source owner and range participates in profile identity.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg(any(feature = "gpu", test))]
 struct GpuWarmupTransferWork {
     kind: crate::gpu_column_policy::WarmupTransferKind,
     request: GpuWarmupProfileRequest,
@@ -402,6 +412,7 @@ struct GpuWarmupTransferWork {
 /// trapdoor/value pairs may share a device while owning different covariance
 /// state, and sampler settings can invalidate an otherwise equal cache.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[cfg(any(feature = "gpu", test))]
 struct PreimageCacheSetupKey {
     device: GpuWarmupDeviceIdentity,
     cache_identity: [u8; 32],
@@ -865,6 +876,7 @@ pub struct GpuValidatedWarmupConfig {
     pub max_parallel_instances: NonZeroUsize,
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn valid_storage_descriptor(descriptor: &BackendStorageDescriptor) -> bool {
     descriptor.representation.is_known() &&
         !descriptor.ordered_crt_basis.is_empty() &&
@@ -872,6 +884,7 @@ fn valid_storage_descriptor(descriptor: &BackendStorageDescriptor) -> bool {
         descriptor.limb_bytes > 0
 }
 
+#[cfg(feature = "gpu")]
 fn validated_storage_wire_types(validated: &ValidatedGraph) -> BTreeSet<ConcreteWireType> {
     fn visit(ty: &ConcreteWireType, types: &mut BTreeSet<ConcreteWireType>) {
         types.insert(ty.clone());
@@ -889,6 +902,7 @@ fn validated_storage_wire_types(validated: &ValidatedGraph) -> BTreeSet<Concrete
     types
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn caller_storage_metadata_matches(
     config: &GpuValidatedWarmupConfig,
     wire_types: &BTreeSet<ConcreteWireType>,
@@ -926,6 +940,7 @@ fn caller_storage_metadata_matches(
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
 fn apply_backend_storage_contract<B: crate::Backend>(
     validated: &ValidatedGraph,
     backend: &B,
@@ -940,17 +955,22 @@ fn apply_backend_storage_contract<B: crate::Backend>(
     }
     let contract = backend
         .gpu_physical_storage_contract(&storage_types)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?
+        .map_err(|error| {
+            GpuWarmupError::ValidatedGraph(format!(
+                "gpu_physical_storage_contract: {error}"
+            ))
+        })?
         .ok_or_else(|| {
             GpuWarmupError::ValidatedGraph(
-                "backend has no authoritative GPU physical storage contract".into(),
+                "gpu_physical_storage_contract: backend has no authoritative GPU physical storage contract"
+                    .into(),
             )
         })?;
     validate_backend_storage_contract(&storage_types, &contract)
         .map_err(GpuWarmupError::ValidatedGraph)?;
-    backend
-        .validate_gpu_physical_storage_contract(&storage_types, &contract)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?;
+    backend.validate_gpu_physical_storage_contract(&storage_types, &contract).map_err(|error| {
+        GpuWarmupError::ValidatedGraph(format!("validate_gpu_physical_storage_contract: {error}"))
+    })?;
     caller_storage_metadata_matches(config, &wire_types, &contract)
         .map_err(GpuWarmupError::ValidatedGraph)?;
 
@@ -969,6 +989,7 @@ fn apply_backend_storage_contract<B: crate::Backend>(
     Ok(())
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn validated_wire_bytes(
     ty: &ConcreteWireType,
     descriptors: &BTreeMap<ConcreteWireType, BackendStorageDescriptor>,
@@ -1023,6 +1044,80 @@ fn validated_wire_bytes(
     }
 }
 
+/// Return whether warmup must retain storage metadata for a wire. Scalar
+/// values are host-only, but nonzero byte payloads remain tracked because
+/// `validated_wire_bytes` accounts for them in transfer/output contracts.
+/// Matrix-like values, byte payloads, and families containing either retain
+/// their ownership contract; zero-sized matrices remain tracked for routing.
+#[cfg(any(feature = "gpu", test))]
+fn needs_storage_tracking(ty: &ConcreteWireType) -> bool {
+    match ty {
+        ConcreteWireType::Matrix { .. } |
+        ConcreteWireType::SmallMatrix { .. } |
+        ConcreteWireType::Preimage { .. } |
+        ConcreteWireType::Trapdoor { .. } => true,
+        ConcreteWireType::Bytes { length } => *length > 0,
+        ConcreteWireType::IndexedFamily { element, .. } => needs_storage_tracking(element),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct WarmupTestCounters {
+    scope_preselections: usize,
+    storage_candidate_visits: usize,
+    temporary_entries: usize,
+    report_lookups: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WARMUP_TEST_COUNTERS: RefCell<WarmupTestCounters> = RefCell::new(WarmupTestCounters::default());
+}
+
+#[cfg(test)]
+fn reset_warmup_test_counters() {
+    WARMUP_TEST_COUNTERS.with(|counters| *counters.borrow_mut() = WarmupTestCounters::default());
+}
+
+#[cfg(test)]
+fn warmup_test_counters() -> WarmupTestCounters {
+    WARMUP_TEST_COUNTERS.with(|counters| *counters.borrow())
+}
+
+#[cfg(test)]
+fn bump_scope_preselection() {
+    WARMUP_TEST_COUNTERS.with(|counters| counters.borrow_mut().scope_preselections += 1);
+}
+
+#[cfg(all(feature = "gpu", not(test)))]
+fn bump_scope_preselection() {}
+
+#[cfg(test)]
+fn bump_storage_candidate_visit() {
+    WARMUP_TEST_COUNTERS.with(|counters| counters.borrow_mut().storage_candidate_visits += 1);
+}
+
+#[cfg(all(feature = "gpu", not(test)))]
+fn bump_storage_candidate_visit() {}
+
+#[cfg(test)]
+fn bump_temporary_entry() {
+    WARMUP_TEST_COUNTERS.with(|counters| counters.borrow_mut().temporary_entries += 1);
+}
+
+#[cfg(all(feature = "gpu", not(test)))]
+fn bump_temporary_entry() {}
+
+#[cfg(test)]
+fn bump_report_lookup() {
+    WARMUP_TEST_COUNTERS.with(|counters| counters.borrow_mut().report_lookups += 1);
+}
+
+#[cfg(not(test))]
+fn bump_report_lookup() {}
+
 #[cfg(feature = "gpu")]
 fn validated_operation_identity(
     kind: &NodeKind,
@@ -1034,7 +1129,7 @@ fn validated_operation_identity(
         .map_err(GpuWarmupError::ValidatedGraph)
 }
 
-#[cfg(not(feature = "gpu"))]
+#[cfg(all(not(feature = "gpu"), test))]
 fn validated_operation_identity(
     kind: &NodeKind,
     arguments: &[ConcreteWireType],
@@ -1045,9 +1140,15 @@ fn validated_operation_identity(
         .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpuStageReport {
     pub key: GpuExecutionSiteKey,
+    pub operation_identity: [u8; 32],
+    pub effective_operation: EffectiveGpuOperation,
+    pub column_capability: ColumnCapability,
+    pub output_layouts: Vec<LayoutId>,
+    pub loop_site: Option<GpuLoopSiteKey>,
+    pub implementation_variant: String,
     pub wave_instances: usize,
     pub columns_per_job: Vec<usize>,
     pub peak: Vec<GpuResourceCost>,
@@ -1055,7 +1156,7 @@ pub struct GpuStageReport {
     pub provenance: GpuProfileProvenance,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpuWarmupReport {
     pub predicted_seconds: f64,
     pub limiting_stage: Option<GpuExecutionSiteKey>,
@@ -1156,6 +1257,7 @@ fn candidate_values(values: &[usize], max: usize) -> Vec<usize> {
 /// Default planner anchors for one local output range.  These are the only
 /// widths that a normal plan may select; narrower tail/fragment widths are
 /// resolved by the measured point table after the schedule is known.
+#[cfg(any(feature = "gpu", test))]
 fn planned_width_anchors(max_width: usize) -> Vec<usize> {
     if max_width == 0 {
         return Vec::new();
@@ -1185,6 +1287,7 @@ fn planned_width_anchors(max_width: usize) -> Vec<usize> {
 /// width larger than the interval it owns.  Keep the power-of-two probes, but
 /// always include each device's local Cmax so a non-power-of-two placement is
 /// represented exactly.
+#[cfg(any(feature = "gpu", test))]
 fn planned_width_anchors_for_layout(
     layout: &GpuLayout,
     columns: usize,
@@ -1242,6 +1345,7 @@ fn layout_for(layout: &GpuLayout, devices: usize) -> GpuLayout {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn layout_contract_matches(layout: &GpuLayout, ty: &ConcreteWireType) -> bool {
     let Some(matrix) = ty.matrix_type() else {
         return layout.columns == 0 && layout.rows == 0 && layout.ring_dimension == 0;
@@ -1250,6 +1354,17 @@ fn layout_contract_matches(layout: &GpuLayout, ty: &ConcreteWireType) -> bool {
         layout.rows == matrix.rows &&
         layout.ring_dimension == matrix.ring_dimension &&
         layout.representation == format!("{ty:?}")
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn layout_contract_key(ty: &ConcreteWireType) -> (usize, usize, usize, String) {
+    let matrix = ty.matrix_type();
+    (
+        matrix.map_or(0, |matrix| matrix.rows),
+        matrix.map_or(0, |matrix| matrix.columns),
+        matrix.map_or(0, |matrix| matrix.ring_dimension),
+        format!("{ty:?}"),
+    )
 }
 
 fn schedule_owned_byte_shares(
@@ -1287,25 +1402,27 @@ fn schedule_owned_byte_shares(
     Ok(shares)
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn merge_storage_allocation(
     allocations: &mut Vec<GpuStorageAllocation>,
+    indices: &mut BTreeMap<(LayoutId, bool, Option<GpuStorageIdentity>), usize>,
     layout: LayoutId,
     resource: GpuResourceCost,
     wave_shared: bool,
     storage_identity: Option<GpuStorageIdentity>,
 ) -> Result<(), GpuWarmupError> {
-    if let Some(existing) = allocations.iter_mut().find(|allocation| {
-        allocation.layout == layout &&
-            allocation.wave_shared == wave_shared &&
-            allocation.storage_identity == storage_identity
-    }) {
-        existing.resource = existing.resource.saturating_add(resource);
+    let key = (layout, wave_shared, storage_identity);
+    if let Some(&index) = indices.get(&key) {
+        allocations[index].resource = allocations[index].resource.saturating_add(resource);
     } else {
+        let index = allocations.len();
         allocations.push(GpuStorageAllocation { layout, resource, wave_shared, storage_identity });
+        indices.insert(key, index);
     }
     Ok(())
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn resolve_storage_wire(
     aliases: &BTreeMap<(u64, WireRef), WireRef>,
     shape_class: u64,
@@ -1448,6 +1565,7 @@ fn width_vectors(
 /// representative is retained for each wave class, so this stays symbolic for
 /// very large column counts while still preserving every owner interval,
 /// global start/end, and tail width that production can submit.
+#[cfg(any(feature = "gpu", test))]
 fn bounded_job_queries_for_layout(
     layout: &GpuLayout,
     devices: usize,
@@ -1659,6 +1777,7 @@ fn bounded_job_queries_for_layout(
 /// union lowering is intentionally shared with the executor: every boundary
 /// split, source interval, owner, and logical wave comes from
 /// `fused_union_jobs_for_wave`, rather than a second warmup-only merge.
+#[cfg(any(feature = "gpu", test))]
 fn bounded_fused_union_job_queries_for_layouts(
     layouts: &[&GpuLayout],
     devices: usize,
@@ -1904,6 +2023,7 @@ fn gcd_usize(mut left: usize, mut right: usize) -> usize {
 /// Return one concrete global slot for every owner-rotation class reachable by
 /// the fixed executor.  The period is D/gcd(D,stride), and a short loop only
 /// needs the prefix of that period it can actually execute.
+#[cfg(any(feature = "gpu", test))]
 fn rotation_slots_for_strides(
     strides: &[usize],
     devices: usize,
@@ -2015,6 +2135,7 @@ fn schedules_for_wave(
 /// to produce the same actual local width.  The actual width is useful for
 /// looking up measurement representatives, but planned width, fragment, and
 /// route identity remain part of the production job identity.
+#[cfg(any(feature = "gpu", test))]
 fn merge_job_query_candidates(
     maps: impl IntoIterator<Item = BTreeMap<usize, Vec<GpuWarmupJobQuery>>>,
 ) -> BTreeMap<usize, Vec<GpuWarmupJobQuery>> {
@@ -2068,6 +2189,7 @@ fn merge_job_query_candidates(
 /// planner and the native estimator.  Explicit source ownership is retained
 /// (it may require a peer/staged route); an absent owner map means the value
 /// is resident on that production owner, never a synthetic balanced split.
+#[cfg(any(feature = "gpu", test))]
 fn bounded_single_device_job_query(
     layout: &GpuLayout,
     source_layouts: &[GpuWarmupStorageLayout],
@@ -2142,6 +2264,7 @@ fn bounded_single_device_job_query(
 /// Return every physical owner fragment intersecting `range`, in global
 /// column order.  This is intentionally strict: callers must not substitute
 /// `job.device` when no interval contains a requested source range.
+#[cfg(any(feature = "gpu", test))]
 fn source_owner_fragments_for_range(
     source_layouts: &[GpuWarmupStorageLayout],
     range: ColumnRange,
@@ -2184,6 +2307,7 @@ fn rotated_storage_layout(
     rotated
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn warmup_storage_layout(layout: &GpuLayout) -> GpuWarmupStorageLayout {
     let representation = match layout.representation.as_str() {
         "full_dcrt" | "matrix" => BackendStorageRepresentation::FullDcrt,
@@ -2207,6 +2331,7 @@ fn warmup_storage_layout(layout: &GpuLayout) -> GpuWarmupStorageLayout {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn warmup_route_resolver_for_layouts(
     source_layouts: &[GpuWarmupStorageLayout],
     output_layout: &GpuWarmupStorageLayout,
@@ -3218,7 +3343,15 @@ fn choose_node_with_candidates(
                     .checked_add(without_output)
                     .ok_or(GpuWarmupError::ArithmeticOverflow)?;
             }
-            let _predicted_job = stage_cost.time.checked_job_seconds(widths[device])?;
+            // Provider-backed stages resolve timing from the exact measured
+            // job class (planned width, actual range, owner phase, fragment,
+            // route, and binding port) below.  `widths[device]` is the
+            // planned local capacity, not necessarily the actual range of a
+            // sparse/tail job, so probing the compact width model here can
+            // reject a valid class before its exact profile is consulted.
+            if !measured_jobs {
+                stage_cost.time.checked_job_seconds(widths[device])?;
+            }
             if !stage_cost.time.wave_overhead_seconds.is_finite() ||
                 stage_cost.time.wave_overhead_seconds < 0.0
             {
@@ -3428,6 +3561,12 @@ fn choose_node_with_candidates(
         seconds,
         report: GpuStageReport {
             key: node.key,
+            operation_identity: node.operation_identity,
+            effective_operation: node.effective_operation,
+            column_capability: node.column_capability,
+            output_layouts: node.output_layouts.clone(),
+            loop_site: node.loop_site,
+            implementation_variant: node.implementation_variant.clone(),
             wave_instances,
             columns_per_job: widths,
             peak,
@@ -3437,6 +3576,7 @@ fn choose_node_with_candidates(
     })
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn loop_context(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
@@ -3466,6 +3606,7 @@ fn loop_context(
     Ok(Some((GpuLoopSiteKey { site: owner.0, shape_class }, count, nested)))
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn graph_loop_wave_candidates(
     count: usize,
     devices: usize,
@@ -3493,6 +3634,7 @@ fn graph_loop_wave_candidates(
 /// the fleet's concurrent owner count cannot improve dispatch concurrency;
 /// per-instance resource terms can tighten that bound further. This keeps a
 /// billion-iteration loop symbolic instead of allocating billion schedules.
+#[cfg(any(feature = "gpu", test))]
 fn bound_loop_wave_candidates(
     loop_input: &GpuWarmupLoop,
     nodes: &[GpuWarmupNode],
@@ -3539,6 +3681,7 @@ fn bound_loop_wave_candidates(
 /// identity as production (when GPU support is enabled), and graph liveness,
 /// retained outputs, artifact transfers, and effective variant metadata are
 /// folded into the profile before candidate selection.
+#[cfg(any(feature = "gpu", test))]
 fn profile_provider_error(error: GpuWarmupProfileError) -> GpuWarmupError {
     match error {
         GpuWarmupProfileError::MissingProfile(request) => {
@@ -3556,9 +3699,20 @@ fn profile_provider_error(error: GpuWarmupProfileError) -> GpuWarmupError {
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
+fn annotate_warmup_phase(phase: &str, error: GpuWarmupError) -> GpuWarmupError {
+    match error {
+        GpuWarmupError::ValidatedGraph(message) => {
+            GpuWarmupError::ValidatedGraph(format!("{phase}: {message}"))
+        }
+        other => other,
+    }
+}
+
 /// Preserve the measured point table for planning.  There is deliberately no
 /// regression here: exact points are looked up directly and only an interior
 /// query is resolved by the bounded affine segment in `GpuTimeModel::job_seconds`.
+#[cfg(any(feature = "gpu", test))]
 fn measured_time_model(samples: &[(usize, f64)]) -> Result<GpuTimeModel, GpuWarmupError> {
     let mut deduped = BTreeMap::new();
     for &(width, time) in samples {
@@ -3578,11 +3732,13 @@ fn measured_time_model(samples: &[(usize, f64)]) -> Result<GpuTimeModel, GpuWarm
     Ok(GpuTimeModel { measured_time_points: measured, ..Default::default() })
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn common_memory_evidence(profiles: &[GpuWarmupProfile]) -> Option<MemoryEvidenceKind> {
     let first = profiles.first()?.memory.evidence;
     profiles.iter().all(|profile| profile.memory.evidence == first).then_some(first)
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn resident_resource_cost(profile: &GpuWarmupProfile) -> GpuResourceCost {
     GpuResourceCost {
         live: profile
@@ -3696,7 +3852,10 @@ fn fused_warmup_operation_for_site(
     scope_id: &FrozenGraphScopeId,
     node_id: NodeId,
     kind: &NodeKind,
+    lowering: Option<&crate::executor::GpuScopeLowering<'_>>,
 ) -> Option<FusedWarmupOperation> {
+    #[cfg(not(any(feature = "gpu", test)))]
+    let _ = lowering;
     let scope = validated.source.scope(scope_id)?;
     let handle = scope.node(node_id)?;
     if matches!(kind, NodeKind::PreimageSample { .. }) {
@@ -3715,23 +3874,49 @@ fn fused_warmup_operation_for_site(
             FusedWarmupOperation::PreimageBatch
         });
     }
-    crate::executor::gpu_fused_operation_for_site(validated, scope_id, node_id)
+    #[cfg(any(feature = "gpu", test))]
+    if let Some(lowering) = lowering {
+        return lowering.fused_operation(node_id);
+    }
+    {
+        #[cfg(any(feature = "gpu", test))]
+        {
+            crate::executor::gpu_fused_operation_for_site(validated, scope_id, node_id)
+        }
+        #[cfg(not(any(feature = "gpu", test)))]
+        {
+            None
+        }
+    }
 }
 
 /// Return the operation that the production lowering will actually dispatch
 /// for a graph site, including GadgetTrapdoor-backed preimage decomposition.
+#[cfg(all(test, feature = "gpu"))]
 pub(crate) fn effective_gpu_operation_for_site(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     node_id: NodeId,
     kind: &NodeKind,
 ) -> EffectiveGpuOperation {
+    effective_gpu_operation_for_site_with_lowering(validated, scope_id, node_id, kind, None)
+}
+
+/// Return the effective operation while reusing an execution-local lowering
+/// snapshot. Fixed dispatch must not rebuild scope metadata for each node.
+pub(crate) fn effective_gpu_operation_for_site_with_lowering(
+    validated: &ValidatedGraph,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    kind: &NodeKind,
+    lowering: Option<&crate::executor::GpuScopeLowering<'_>>,
+) -> EffectiveGpuOperation {
     // `EffectiveGpuOperation` describes the validated IR classification; the
     // fused profile domain is carried separately by warmup.  The one fused
     // site whose effective IR operation changes is a GadgetTrapdoor-backed
     // preimage, which production dispatches through gadget decomposition.
     if matches!(kind, NodeKind::PreimageSample { .. }) &&
-        fused_warmup_operation_for_site(validated, scope_id, node_id, kind) ==
+        fused_warmup_operation_for_site(validated, scope_id, node_id, kind, lowering) ==
             Some(FusedWarmupOperation::Decompose)
     {
         EffectiveGpuOperation::GadgetDecompose
@@ -3740,14 +3925,16 @@ pub(crate) fn effective_gpu_operation_for_site(
     }
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn profile_descriptor_for_site(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     node_id: NodeId,
     kind: &NodeKind,
     default_variant: &str,
+    lowering: Option<&crate::executor::GpuScopeLowering<'_>>,
 ) -> (CanonicalWarmupProfileDomain, Option<FusedWarmupOperation>, String) {
-    let fused = fused_warmup_operation_for_site(validated, scope_id, node_id, kind);
+    let fused = fused_warmup_operation_for_site(validated, scope_id, node_id, kind, lowering);
     if let Some(operation) = fused {
         let domain = fused_warmup_profile_domain(operation);
         // Keep the variant stable and distinct from the ordinary NodeKind
@@ -3761,6 +3948,7 @@ fn profile_descriptor_for_site(
 /// Copy the validated structural child contract into the setup descriptor.
 /// Providers receive the exact child scope, bindings, and body selected by
 /// graph validation, including nested structural children.
+#[cfg(any(feature = "gpu", test))]
 fn host_control_descriptor(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
@@ -3848,6 +4036,7 @@ fn measured_cost_from_provider(
     )
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn make_profile_request(
     descriptor: Option<&GpuWarmupOperationDescriptor>,
     signature: GpuWarmupOperationSignature,
@@ -3917,6 +4106,7 @@ fn make_profile_request(
 /// physical copy/staging envelope and uses bytes as its interpolation
 /// coordinate.  A route with no physical host transfer has no transfer work
 /// to submit (peer/device-local work is already represented by the GPU point).
+#[cfg(any(feature = "gpu", test))]
 fn transfer_work_for_request(
     descriptor: &GpuWarmupOperationDescriptor,
     request: &GpuWarmupProfileRequest,
@@ -3950,6 +4140,7 @@ fn transfer_work_for_request(
     Some(GpuWarmupTransferWork { kind, request: transfer_request })
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn canonical_job_route_descriptor(
     mut route: GpuExecutionRouteDescriptor,
     fragment: GpuWarmupFragmentClass,
@@ -3965,6 +4156,7 @@ fn canonical_job_route_descriptor(
     route
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn merge_transfer_memory(
     local: &GpuWarmupProfile,
     transfer: &GpuWarmupProfile,
@@ -4027,6 +4219,7 @@ fn measured_cost_from_provider_registered(
 /// state: an exact point already imported into this session is reused, while
 /// every new point is measured once and immediately imported into the same
 /// canonical table.
+#[cfg(any(feature = "gpu", test))]
 fn measure_profile_for_session(
     provider: &mut dyn GpuWarmupProfileProvider,
     session: &mut GpuWarmupSessionProfileCache,
@@ -4165,6 +4358,7 @@ fn measure_profile_for_session(
     Ok(profile)
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn adopt_profile_route(
     request: &mut GpuWarmupProfileRequest,
     profile: &GpuWarmupProfile,
@@ -4197,6 +4391,7 @@ fn adopt_profile_route(
 /// all-or-nothing execution candidate: retaining its successful tail/local
 /// point after a whole, extra-route, or transfer OOM would let planning admit
 /// a dispatch that was never proven executable on this device.
+#[cfg(any(feature = "gpu", test))]
 fn discard_infeasible_width(
     width: usize,
     device_successes: &mut BTreeMap<usize, GpuWarmupProfile>,
@@ -4218,6 +4413,7 @@ fn discard_infeasible_width(
     });
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn measured_cost_from_profile_provider(
     provider: &mut dyn GpuWarmupProfileProvider,
     session: &mut GpuWarmupSessionProfileCache,
@@ -4955,6 +5151,7 @@ fn measured_cost_from_profile_provider(
         .collect()
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn canonical_profile_key_with_context(
     descriptor: &GpuWarmupOperationDescriptor,
     request: &GpuWarmupProfileRequest,
@@ -5042,6 +5239,7 @@ fn canonical_profile_key_with_context(
 /// Width, range ends, and staging byte totals belong to the profile coordinate
 /// and its measured resource evidence; owners, route/conversion class, and
 /// global starts remain part of the class so equal-width jobs cannot collide.
+#[cfg(any(feature = "gpu", test))]
 fn normalized_route_descriptor_for_key(
     mut route_descriptor: GpuExecutionRouteDescriptor,
 ) -> GpuExecutionRouteDescriptor {
@@ -5061,6 +5259,7 @@ fn normalized_route_descriptor_for_key(
     route_descriptor
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn record_canonical_point(
     session: &mut GpuWarmupSessionProfileCache,
     descriptor: Option<&GpuWarmupOperationDescriptor>,
@@ -5118,6 +5317,7 @@ fn warmup_input_from_validated_with_limit(
     warmup_input_from_validated_with_limit_and_provider(validated, config, None)
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn warmup_input_from_validated_with_limit_and_provider(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
@@ -5126,6 +5326,7 @@ fn warmup_input_from_validated_with_limit_and_provider(
     warmup_input_for_owner_placement(validated, config, profile_provider, &BTreeMap::new())
 }
 
+#[cfg(any(feature = "gpu", test))]
 fn warmup_input_for_owner_placement(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
@@ -5170,6 +5371,29 @@ fn warmup_input_for_owner_placement(
             layout.owner_intervals = intervals.clone();
         }
     }
+    let mut layout_indices = layouts
+        .iter()
+        .enumerate()
+        .map(|(index, layout)| (layout.id, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut layout_contract_indices = layouts
+        .iter()
+        .map(|layout| {
+            (
+                (layout.rows, layout.columns, layout.ring_dimension, layout.representation.clone()),
+                layout.id,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut layout_columns =
+        layouts.iter().map(|layout| (layout.columns, layout.id)).collect::<BTreeMap<_, _>>();
+    let mut next_layout_id = layouts
+        .iter()
+        .map(|layout| layout.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(GpuWarmupError::ArithmeticOverflow)?;
     let fallback_layout = layouts.first().map(|layout| layout.id).ok_or_else(|| {
         GpuWarmupError::ValidatedGraph("validated warmup requires one output layout".into())
     })?;
@@ -5182,6 +5406,7 @@ fn warmup_input_for_owner_placement(
     // alias proof.
     let mut wire_aliases = BTreeMap::<(u64, WireRef), WireRef>::new();
     for (scope_id, checked) in &validated.scopes {
+        bump_scope_preselection();
         let shape_class = scope_shape_class(validated, scope_id)
             .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?;
         let loop_info = loop_context(validated, scope_id)?;
@@ -5198,8 +5423,10 @@ fn warmup_input_for_owner_placement(
         let scope = validated.source.scope(scope_id).ok_or_else(|| {
             GpuWarmupError::ValidatedGraph(format!("missing graph scope {scope_id:?}"))
         })?;
-        let lowered_aliases = crate::executor::gpu_alias_facts(validated, scope_id);
-        let fused_result_owners = crate::executor::gpu_fused_result_owners(validated, scope_id);
+        let lowering = crate::executor::GpuScopeLowering::new(validated, scope_id)
+            .map_err(GpuWarmupError::ValidatedGraph)?;
+        let lowered_aliases = lowering.alias_facts();
+        let fused_result_owners = lowering.fused_result_owners();
         let fused_result_views =
             fused_result_owners.values().flatten().copied().collect::<BTreeSet<_>>();
         for wire in scope.inputs() {
@@ -5209,38 +5436,51 @@ fn warmup_input_for_owner_placement(
             let ty = checked.wire_types.get(wire).ok_or_else(|| {
                 GpuWarmupError::ValidatedGraph(format!("missing scope input type for {wire:?}"))
             })?;
-            let id = if let Some(layout) =
-                layouts.iter().find(|layout| layout_contract_matches(layout, ty))
-            {
-                layout.id
-            } else {
-                let matrix = ty.matrix_type();
-                let columns = matrix.map_or(0, |matrix| matrix.columns);
-                let template = layouts.iter().find(|layout| layout.columns == columns).cloned();
-                let id = layouts
-                    .iter()
-                    .map(|layout| layout.id)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or(GpuWarmupError::ArithmeticOverflow)?;
-                layouts.push(GpuLayout {
-                    id,
-                    columns,
-                    rows: matrix.map_or(0, |matrix| matrix.rows),
-                    ring_dimension: matrix.map_or(0, |matrix| matrix.ring_dimension),
-                    representation: format!("{ty:?}"),
-                    instance_device_stride: template
-                        .as_ref()
-                        .map_or(0, |layout| layout.instance_device_stride),
-                    owner_intervals: template
-                        .map_or_else(Vec::new, |layout| layout.owner_intervals),
-                });
-                id
-            };
+            let id =
+                if let Some(id) = layout_contract_indices.get(&layout_contract_key(ty)).copied() {
+                    id
+                } else {
+                    let matrix = ty.matrix_type();
+                    let columns = matrix.map_or(0, |matrix| matrix.columns);
+                    let template = layout_columns
+                        .get(&columns)
+                        .and_then(|id| layout_indices.get(id))
+                        .and_then(|index| layouts.get(*index))
+                        .cloned();
+                    let id = next_layout_id;
+                    next_layout_id =
+                        next_layout_id.checked_add(1).ok_or(GpuWarmupError::ArithmeticOverflow)?;
+                    let layout_index = layouts.len();
+                    layouts.push(GpuLayout {
+                        id,
+                        columns,
+                        rows: matrix.map_or(0, |matrix| matrix.rows),
+                        ring_dimension: matrix.map_or(0, |matrix| matrix.ring_dimension),
+                        representation: format!("{ty:?}"),
+                        instance_device_stride: template
+                            .as_ref()
+                            .map_or(0, |layout| layout.instance_device_stride),
+                        owner_intervals: template
+                            .map_or_else(Vec::new, |layout| layout.owner_intervals),
+                    });
+                    layout_indices.insert(id, layout_index);
+                    layout_contract_indices.insert(
+                        (
+                            layouts[layout_index].rows,
+                            columns,
+                            layouts[layout_index].ring_dimension,
+                            layouts[layout_index].representation.clone(),
+                        ),
+                        id,
+                    );
+                    layout_columns.entry(columns).or_insert(id);
+                    id
+                };
             if let Some(intervals) = owners.get(&id) {
-                layouts.iter_mut().find(|layout| layout.id == id).unwrap().owner_intervals =
-                    intervals.clone();
+                let layout_index = *layout_indices
+                    .get(&id)
+                    .ok_or_else(|| GpuWarmupError::InvalidPlan(format!("missing layout {id}")))?;
+                layouts[layout_index].owner_intervals = intervals.clone();
             }
             wire_layouts.insert((shape_class, *wire), id);
         }
@@ -5297,6 +5537,9 @@ fn warmup_input_for_owner_placement(
                 else {
                     return Ok(None);
                 };
+                if !needs_storage_tracking(ty) {
+                    return Ok(None);
+                }
                 let layout = wire_layouts
                     .get(&(wire_shape, resolved))
                     .or_else(|| wire_layouts.get(&(wire_shape, wire)))
@@ -5321,6 +5564,45 @@ fn warmup_input_for_owner_placement(
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        // Scalar liveness is host-only and must not be reconsidered at every
+        // site.  Select storage-bearing candidates once for this scope; the
+        // site loop below still applies position-sensitive last-use checks,
+        // fused owner expansion, and alias deduplication to this reduced set.
+        let storage_last_use = checked
+            .liveness
+            .last_use
+            .iter()
+            .filter(|(wire, _)| !scope.inputs().contains(wire))
+            .filter_map(|(wire, last_use)| {
+                checked.wire_types.get(wire).is_some_and(needs_storage_tracking).then(|| {
+                    bump_storage_candidate_visit();
+                    (*wire, *last_use)
+                })
+            })
+            .collect::<Vec<_>>();
+        let storage_retained = checked
+            .liveness
+            .retained
+            .iter()
+            .filter(|wire| !scope.inputs().contains(wire))
+            .filter_map(|wire| {
+                checked.wire_types.get(wire).is_some_and(needs_storage_tracking).then(|| {
+                    bump_storage_candidate_visit();
+                    *wire
+                })
+            })
+            .collect::<Vec<_>>();
+        let storage_outputs = scope
+            .outputs()
+            .iter()
+            .filter(|wire| !scope.inputs().contains(wire))
+            .filter_map(|wire| {
+                checked.wire_types.get(wire).is_some_and(needs_storage_tracking).then(|| {
+                    bump_storage_candidate_visit();
+                    *wire
+                })
+            })
+            .collect::<Vec<_>>();
         for (position, handle) in checked.execution_order.iter().enumerate() {
             let node_id = NodeId(position as u64);
             let arguments = scope.arguments(handle).ok_or_else(|| {
@@ -5331,8 +5613,7 @@ fn warmup_input_for_owner_placement(
             let argument_types =
                 arguments.iter().map(|wire| checked.wire_types[wire].clone()).collect::<Vec<_>>();
             let (output_types, effective_identity) =
-                crate::executor::gpu_effective_site_metadata(validated, scope_id, node_id)
-                    .map_err(GpuWarmupError::ValidatedGraph)?;
+                lowering.site_metadata(node_id).map_err(GpuWarmupError::ValidatedGraph)?;
             let ordinary_identity = validated_operation_identity(
                 handle.kind(),
                 &argument_types,
@@ -5351,8 +5632,13 @@ fn warmup_input_for_owner_placement(
                 .copied()
                 .unwrap_or_else(|| effective_gpu_operation(handle.kind()));
             let effective_operation = if matches!(handle.kind(), NodeKind::PreimageSample { .. }) &&
-                fused_warmup_operation_for_site(validated, scope_id, node_id, handle.kind()) ==
-                    Some(FusedWarmupOperation::Decompose)
+                fused_warmup_operation_for_site(
+                    validated,
+                    scope_id,
+                    node_id,
+                    handle.kind(),
+                    Some(&lowering),
+                ) == Some(FusedWarmupOperation::Decompose)
             {
                 // GadgetTrapdoor-backed preimage is a fixed gadget
                 // decomposition, not a sampled preimage operation. Keep the
@@ -5399,34 +5685,21 @@ fn warmup_input_for_owner_placement(
             // once per storage owner rather than once per wire.
             let mut live_wires = BTreeSet::<WireRef>::new();
             live_wires.extend(
-                checked
-                    .liveness
-                    .last_use
+                storage_last_use
                     .iter()
                     // The current node's outputs are charged once in
                     // `outputs`; excluding them here avoids treating an output
                     // that is also retained as two allocations at the boundary.
                     .filter(|(wire, _)| (wire.node.0 as usize) < position)
                     .filter(|(wire, _)| !scope.inputs().contains(wire))
-                    .filter(|(_, last_use)| **last_use >= position)
+                    .filter(|(_, last_use)| *last_use >= position)
                     .map(|(wire, _)| *wire),
             );
             live_wires.extend(
-                checked
-                    .liveness
-                    .retained
-                    .iter()
-                    .filter(|wire| (wire.node.0 as usize) < position)
-                    .filter(|wire| !scope.inputs().contains(wire))
-                    .copied(),
+                storage_retained.iter().filter(|wire| (wire.node.0 as usize) < position).copied(),
             );
             live_wires.extend(
-                scope
-                    .outputs()
-                    .iter()
-                    .filter(|wire| (wire.node.0 as usize) < position)
-                    .filter(|wire| !scope.inputs().contains(wire))
-                    .copied(),
+                storage_outputs.iter().filter(|wire| (wire.node.0 as usize) < position).copied(),
             );
             let mut seen_live_storage = BTreeSet::<GpuStorageIdentity>::new();
             let live_allocations = live_wires
@@ -5440,6 +5713,7 @@ fn warmup_input_for_owner_placement(
                     if !seen_live_storage.insert(storage_identity) {
                         return Ok(None);
                     }
+                    bump_temporary_entry();
                     let ty = checked
                         .wire_types
                         .get(&resolved)
@@ -5479,6 +5753,7 @@ fn warmup_input_for_owner_placement(
             let output_allocations = output_types
                 .iter()
                 .enumerate()
+                .filter(|(_, ty)| needs_storage_tracking(ty))
                 .map(|(port, ty)| {
                     (
                         validated_wire_bytes(
@@ -5501,6 +5776,7 @@ fn warmup_input_for_owner_placement(
             let input_transfer_allocations = arguments
                 .iter()
                 .filter(|wire| checked.artifact_inputs.contains_key(wire))
+                .filter(|wire| checked.wire_types.get(wire).is_some_and(needs_storage_tracking))
                 .map(|wire| -> Result<_, GpuWarmupError> {
                     let layout =
                         wire_layouts.get(&(shape_class, *wire)).copied().ok_or_else(|| {
@@ -5552,19 +5828,15 @@ fn warmup_input_for_owner_placement(
                         .max()
                 })
                 .unwrap_or_else(|| {
-                    layouts
-                        .iter()
-                        .find(|layout| layout.id == layout_id)
-                        .map_or(0, |layout| layout.columns)
+                    layout_indices.get(&layout_id).map_or(0, |index| layouts[*index].columns)
                 });
             let capability =
                 capability_for_effective_operation(effective_operation, &argument_types);
             // Each output has its own concrete layout. A profile layout supplies
             // placement only when its width matches; it cannot supply the shape.
-            let template = layouts
-                .iter()
-                .find(|layout| layout.id == layout_id)
-                .cloned()
+            let template = layout_indices
+                .get(&layout_id)
+                .map(|index| layouts[*index].clone())
                 .ok_or_else(|| GpuWarmupError::InvalidPlan("missing profile layout".into()))?;
             let mut output_layouts = Vec::new();
             for (port, ty) in output_types.iter().enumerate() {
@@ -5588,15 +5860,15 @@ fn warmup_input_for_owner_placement(
                 };
                 let source_layout = argument_layouts
                     .get(inherited_operand)
-                    .and_then(|id| layouts.iter().find(|layout| layout.id == *id));
+                    .and_then(|id| layout_indices.get(id).map(|index| &layouts[*index]));
                 // A producer with no matrix argument (for example a constant
                 // or artifact materialization) still needs an owner layout.
                 // The profile/template layout is the authoritative initial
                 // placement; subsequent column-preserving stages inherit it.
                 let owner_source_layout = source_layout.or_else(|| {
-                    layouts
-                        .iter()
-                        .find(|layout| layout.id == layout_id && layout.columns == port_columns)
+                    layout_indices.get(&layout_id).and_then(|index| {
+                        (layouts[*index].columns == port_columns).then_some(&layouts[*index])
+                    })
                 });
                 let preserve_owners = owner_source_layout.is_some() &&
                     (!matches!(
@@ -5608,18 +5880,10 @@ fn warmup_input_for_owner_placement(
                 let id = if preserve_owners && same_contract {
                     source_layout.map_or(layout_id, |layout| layout.id)
                 } else {
-                    layouts
-                        .iter()
-                        .map(|layout| layout.id)
-                        .max()
-                        .unwrap_or(0)
-                        .checked_add(1)
-                        .ok_or_else(|| {
-                            GpuWarmupError::InvalidPlan(format!(
-                                "layout id exhausted; max={:?}",
-                                layouts.iter().map(|layout| layout.id).max()
-                            ))
-                        })?
+                    let id = next_layout_id;
+                    next_layout_id =
+                        next_layout_id.checked_add(1).ok_or(GpuWarmupError::ArithmeticOverflow)?;
+                    id
                 };
                 let stride = if capability == ColumnCapability::GeneratedColumns &&
                     loop_info.is_some() &&
@@ -5637,10 +5901,11 @@ fn warmup_input_for_owner_placement(
                     (shape_class, WireRef { node: node_id, port: Port(port as u32) }),
                     stride,
                 );
-                if layouts.iter().any(|layout| layout.id == id) {
+                if layout_indices.contains_key(&id) {
                     output_layouts.push(id);
                     continue;
                 }
+                let layout_index = layouts.len();
                 layouts.push(GpuLayout {
                     id,
                     columns: port_columns,
@@ -5666,13 +5931,17 @@ fn warmup_input_for_owner_placement(
                         Vec::new()
                     },
                 });
+                layout_indices.insert(id, layout_index);
                 output_layouts.push(id);
             }
             if output_layouts.is_empty() {
                 continue;
             }
             for id in &output_layouts {
-                let layout = layouts.iter_mut().find(|layout| layout.id == *id).unwrap();
+                let layout_index = *layout_indices
+                    .get(id)
+                    .ok_or_else(|| GpuWarmupError::InvalidPlan(format!("missing layout {id}")))?;
+                let layout = &mut layouts[layout_index];
                 if capability == ColumnCapability::SingleDevice {
                     layout.owner_intervals = gpu0_owner_intervals(layout.columns);
                     layout.instance_device_stride = 0;
@@ -5709,7 +5978,7 @@ fn warmup_input_for_owner_placement(
                 // not a valid local measurement coordinate when ownership is
                 // sharded across devices.  These anchors remain distinct
                 // from schedule-induced tail/fragment queries.
-                if let Some(layout) = layouts.iter().find(|layout| layout.id == layout_id) {
+                if let Some(layout) = layout_indices.get(&layout_id).map(|index| &layouts[*index]) {
                     candidate_widths
                         .extend(planned_width_anchors_for_layout(layout, columns, devices));
                 } else {
@@ -5717,7 +5986,7 @@ fn warmup_input_for_owner_placement(
                 }
                 candidate_widths.sort_unstable();
                 candidate_widths.dedup();
-                if let Some(layout) = layouts.iter().find(|layout| layout.id == layout_id) {
+                if let Some(layout) = layout_indices.get(&layout_id).map(|index| &layouts[*index]) {
                     let intervals = if layout.owner_intervals.is_empty() {
                         balanced_intervals(columns, devices)
                     } else {
@@ -5738,16 +6007,13 @@ fn warmup_input_for_owner_placement(
                     node_id,
                     handle.kind(),
                     &config.default_implementation_variant,
+                    Some(&lowering),
                 );
             let operation_signature =
                 GpuWarmupOperationSignature { operation: identity, shape_class, instance_class: 0 };
-            let effective_inputs = crate::executor::gpu_effective_inputs(
-                validated,
-                scope_id,
-                node_id,
-                &validated.bindings,
-            )
-            .map_err(GpuWarmupError::ValidatedGraph)?;
+            let effective_inputs = lowering
+                .effective_inputs(node_id, &validated.bindings)
+                .map_err(GpuWarmupError::ValidatedGraph)?;
             let effective_argument_types = effective_inputs
                 .origins
                 .iter()
@@ -5756,12 +6022,14 @@ fn warmup_input_for_owner_placement(
             let effective_source_layouts = effective_inputs
                 .origins
                 .iter()
-                .filter_map(|wire| {
+                .zip(effective_argument_types.iter())
+                .filter(|(_, ty)| needs_storage_tracking(ty))
+                .filter_map(|(wire, _)| {
                     let resolved = resolve_storage_wire(&wire_aliases, shape_class, *wire);
                     wire_layouts
                         .get(&(shape_class, resolved))
                         .or_else(|| wire_layouts.get(&(shape_class, *wire)))
-                        .and_then(|id| layouts.iter().find(|layout| layout.id == *id))
+                        .and_then(|id| layout_indices.get(id).map(|index| &layouts[*index]))
                         .map(warmup_storage_layout)
                 })
                 .collect::<Vec<_>>();
@@ -5772,7 +6040,9 @@ fn warmup_input_for_owner_placement(
             let effective_source_layout_ids = effective_inputs
                 .origins
                 .iter()
-                .filter_map(|wire| {
+                .zip(effective_argument_types.iter())
+                .filter(|(_, ty)| needs_storage_tracking(ty))
+                .filter_map(|(wire, _)| {
                     let resolved = resolve_storage_wire(&wire_aliases, shape_class, *wire);
                     wire_layouts
                         .get(&(shape_class, resolved))
@@ -5780,6 +6050,22 @@ fn warmup_input_for_owner_placement(
                         .copied()
                 })
                 .collect::<BTreeSet<_>>();
+            // A shared TensorRowSums dispatch returns the concatenation of all
+            // grouped row outputs before executor splitting. Keep that
+            // physical intermediate in the warmup storage contract instead of
+            // charging only the leader's output shape.
+            let grouped_output_rows = (!effective_inputs.row_sum_groups.is_empty()).then(|| {
+                effective_inputs.row_sum_groups.iter().map(|groups| groups.len()).sum::<usize>()
+            });
+            let output_layout = layout_indices
+                .get(&layout_id)
+                .map(|index| warmup_storage_layout(&layouts[*index]))
+                .map(|mut layout| {
+                    if let Some(rows) = grouped_output_rows {
+                        layout.rows = rows;
+                    }
+                    layout
+                });
             let operation_descriptor = GpuWarmupOperationDescriptor {
                 signature: operation_signature,
                 scope: scope_id.clone(),
@@ -5794,18 +6080,18 @@ fn warmup_input_for_owner_placement(
                 fused_operation,
                 implementation_variant,
                 source_layouts: effective_source_layouts.clone(),
-                output_layout: layouts
-                    .iter()
-                    .find(|layout| layout.id == layout_id)
-                    .map(warmup_storage_layout),
-                route_resolver: layouts.iter().find(|layout| layout.id == layout_id).and_then(
-                    |output_layout| {
-                        let source_layouts = effective_source_layouts.clone();
-                        warmup_route_resolver_for_layouts(
-                            &source_layouts,
-                            &warmup_storage_layout(output_layout),
-                            devices,
-                        )
+                output_layout: output_layout.clone(),
+                route_resolver: layout_indices.get(&layout_id).and_then(|_| {
+                    let source_layouts = effective_source_layouts.clone();
+                    output_layout
+                        .as_ref()
+                        .and_then(|output_layout| {
+                            warmup_route_resolver_for_layouts(
+                                &source_layouts,
+                                output_layout,
+                                devices,
+                            )
+                        })
                         .map(|mut resolver| {
                             let is_compact = |ty: &ConcreteWireType| {
                                 fn nested(ty: &ConcreteWireType) -> bool {
@@ -5824,8 +6110,7 @@ fn warmup_input_for_owner_placement(
                             resolver.destination_compact = output_types.iter().any(is_compact);
                             resolver
                         })
-                    },
-                ),
+                }),
                 host_control: host_control_descriptor(validated, &scope_id, node_id),
             };
             let true_zero_work = columns == 0 &&
@@ -5840,7 +6125,7 @@ fn warmup_input_for_owner_placement(
                     ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
                 )
             {
-                if let Some(layout) = layouts.iter().find(|layout| layout.id == layout_id) {
+                if let Some(layout) = layout_indices.get(&layout_id).map(|index| &layouts[*index]) {
                     // A layout without an explicit owner map still follows
                     // the production balanced mapper.  Build that map before
                     // deriving tails/fragments so the provider measures the
@@ -5872,9 +6157,9 @@ fn warmup_input_for_owner_placement(
                 // devices remain idle slots in the per-device cost vector.
                 (0..devices).map(|device| usize::from(device == 0) * columns).collect()
             } else {
-                layouts
-                    .iter()
-                    .find(|layout| layout.id == layout_id)
+                layout_indices
+                    .get(&layout_id)
+                    .map(|index| &layouts[*index])
                     .map(|layout| {
                         let intervals = if layout.owner_intervals.is_empty() {
                             balanced_intervals(columns, devices)
@@ -5907,9 +6192,9 @@ fn warmup_input_for_owner_placement(
                 // in the query so the provider measures/admit the actual
                 // owner and physical envelope rather than a synthetic [0,1)
                 // column.
-                layouts
-                    .iter()
-                    .find(|layout| layout.id == layout_id)
+                layout_indices
+                    .get(&layout_id)
+                    .map(|index| &layouts[*index])
                     .map(|layout| {
                         bounded_single_device_job_query(
                             layout,
@@ -5929,11 +6214,13 @@ fn warmup_input_for_owner_placement(
                 let output_layout_refs = output_layouts
                     .iter()
                     .map(|layout_id| {
-                        layouts.iter().find(|layout| layout.id == *layout_id).ok_or_else(|| {
-                            GpuWarmupError::InvalidPlan(format!(
-                                "missing fused output layout {layout_id}"
-                            ))
-                        })
+                        layout_indices.get(layout_id).map(|index| &layouts[*index]).ok_or_else(
+                            || {
+                                GpuWarmupError::InvalidPlan(format!(
+                                    "missing fused output layout {layout_id}"
+                                ))
+                            },
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let instance_count = loop_info.as_ref().map_or(1, |(_, count, _)| *count);
@@ -6277,14 +6564,17 @@ fn warmup_input_for_owner_placement(
             );
             let key = GpuExecutionSiteKey { site: node_id.0, shape_class, instance_class: 0 };
             let mut storage_allocations = Vec::<GpuStorageAllocation>::new();
+            let mut storage_allocation_indices =
+                BTreeMap::<(LayoutId, bool, Option<GpuStorageIdentity>), usize>::new();
             for (layout_id, bytes, storage_identity) in live_allocations {
-                if !layouts.iter().any(|layout| layout.id == layout_id) {
+                if !layout_indices.contains_key(&layout_id) {
                     return Err(GpuWarmupError::InvalidPlan(format!(
                         "missing live storage layout {layout_id}"
                     )));
                 }
                 merge_storage_allocation(
                     &mut storage_allocations,
+                    &mut storage_allocation_indices,
                     layout_id,
                     GpuResourceCost { live: bytes, ..Default::default() },
                     false,
@@ -6292,13 +6582,14 @@ fn warmup_input_for_owner_placement(
                 )?;
             }
             for &(layout_id, bytes, storage_identity) in &scope_capture_allocations {
-                if !layouts.iter().any(|layout| layout.id == layout_id) {
+                if !layout_indices.contains_key(&layout_id) {
                     return Err(GpuWarmupError::InvalidPlan(format!(
                         "missing capture storage layout {layout_id}"
                     )));
                 }
                 merge_storage_allocation(
                     &mut storage_allocations,
+                    &mut storage_allocation_indices,
                     layout_id,
                     GpuResourceCost { live: bytes, ..Default::default() },
                     true,
@@ -6313,11 +6604,15 @@ fn warmup_input_for_owner_placement(
                     continue;
                 }
                 if let Some(layout_id) = output_layouts.get(port).copied() {
+                    if !needs_storage_tracking(&output_types[port]) {
+                        continue;
+                    }
                     let retained_output = checked.liveness.retained.contains(&output_wire) ||
                         scope.outputs().contains(&output_wire);
                     if retained_output {
                         merge_storage_allocation(
                             &mut storage_allocations,
+                            &mut storage_allocation_indices,
                             layout_id,
                             GpuResourceCost { live: bytes, ..Default::default() },
                             false,
@@ -6326,6 +6621,7 @@ fn warmup_input_for_owner_placement(
                     } else {
                         merge_storage_allocation(
                             &mut storage_allocations,
+                            &mut storage_allocation_indices,
                             layout_id,
                             GpuResourceCost { outputs: bytes, ..Default::default() },
                             false,
@@ -6355,13 +6651,14 @@ fn warmup_input_for_owner_placement(
                             wire: resolve_storage_wire(&wire_aliases, shape_class, *wire),
                         })
                     });
-                if !layouts.iter().any(|layout| layout.id == transfer_layout_id) {
+                if !layout_indices.contains_key(&transfer_layout_id) {
                     return Err(GpuWarmupError::InvalidPlan(format!(
                         "missing transfer storage layout {transfer_layout_id}"
                     )));
                 }
                 merge_storage_allocation(
                     &mut storage_allocations,
+                    &mut storage_allocation_indices,
                     transfer_layout_id,
                     GpuResourceCost { transfers: transfer_bytes, ..Default::default() },
                     false,
@@ -6373,6 +6670,7 @@ fn warmup_input_for_owner_placement(
                 {
                     merge_storage_allocation(
                         &mut storage_allocations,
+                        &mut storage_allocation_indices,
                         source_layout,
                         GpuResourceCost::zero(),
                         true,
@@ -6417,7 +6715,7 @@ fn warmup_input_for_owner_placement(
 
 /// Build the pure planner input using the default execution wave limit.
 #[cfg(test)]
-pub fn warmup_input_from_validated(
+fn warmup_input_from_validated(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
 ) -> Result<GpuWarmupInput, GpuWarmupError> {
@@ -6427,7 +6725,7 @@ pub fn warmup_input_from_validated(
 
 /// Build the pure planner input using the exact execution wave limit.
 #[cfg(test)]
-pub fn warmup_input_from_validated_with_execution_config(
+fn warmup_input_from_validated_with_execution_config(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     execution_config: &crate::executor::ExecutionConfig,
@@ -6448,7 +6746,7 @@ fn warmup_gpu_from_validated_with_limit(
 
 /// Build and freeze a production plan directly from validated graph metadata.
 #[cfg(test)]
-pub fn warmup_gpu_from_validated(
+pub(crate) fn warmup_gpu_from_validated(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
@@ -6461,7 +6759,7 @@ pub fn warmup_gpu_from_validated(
 /// planning, so a later executor cannot silently narrow an already admitted
 /// wave.
 #[cfg(test)]
-pub fn warmup_gpu_from_validated_with_execution_config(
+pub(crate) fn warmup_gpu_from_validated_with_execution_config(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     execution_config: &crate::executor::ExecutionConfig,
@@ -6471,7 +6769,8 @@ pub fn warmup_gpu_from_validated_with_execution_config(
     warmup_gpu_from_validated_with_limit(validated, &config)
 }
 
-pub fn warmup_gpu_from_validated_with_provider<P: GpuWarmupProfileProvider>(
+#[cfg(all(feature = "gpu", test))]
+pub(crate) fn warmup_gpu_from_validated_with_provider<P: GpuWarmupProfileProvider>(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     provider: &mut P,
@@ -6485,7 +6784,10 @@ pub fn warmup_gpu_from_validated_with_provider<P: GpuWarmupProfileProvider>(
     )
 }
 
-pub fn warmup_gpu_from_validated_with_provider_and_execution_config<P: GpuWarmupProfileProvider>(
+#[cfg(all(feature = "gpu", test))]
+pub(crate) fn warmup_gpu_from_validated_with_provider_and_execution_config<
+    P: GpuWarmupProfileProvider,
+>(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     provider: &mut P,
@@ -6504,7 +6806,8 @@ pub fn warmup_gpu_from_validated_with_provider_and_execution_config<P: GpuWarmup
 /// Backend-backed warmup that collects missing operation profiles through the
 /// setup-only provider. The provider is consumed before planning; fixed
 /// execution receives only the resulting value-only plan.
-pub fn warmup_gpu_for_inputs<B: crate::Backend, P: GpuWarmupProfileProvider>(
+#[cfg(all(feature = "gpu", test))]
+pub(crate) fn warmup_gpu_for_inputs<B: crate::Backend, P: GpuWarmupProfileProvider>(
     validated: &ValidatedGraph,
     backend: &mut B,
     inputs: &BTreeMap<String, crate::RuntimeValue<B>>,
@@ -6522,7 +6825,8 @@ pub fn warmup_gpu_for_inputs<B: crate::Backend, P: GpuWarmupProfileProvider>(
     )
 }
 
-pub fn warmup_gpu_for_inputs_with_execution_config<
+#[cfg(feature = "gpu")]
+pub(crate) fn warmup_gpu_for_inputs_with_execution_config<
     B: crate::Backend,
     P: GpuWarmupProfileProvider,
 >(
@@ -6535,25 +6839,35 @@ pub fn warmup_gpu_for_inputs_with_execution_config<
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
-    backend
-        .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?;
+    backend.configure_gpu_plan_budgets(&config.contract.device_budgets).map_err(|error| {
+        GpuWarmupError::ValidatedGraph(format!("backend.configure_gpu_plan_budgets: {error}"))
+    })?;
     config.contract = backend
         .gpu_runtime_contract(validated, inputs)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?
+        .map_err(|error| {
+            GpuWarmupError::ValidatedGraph(format!("backend.gpu_runtime_contract: {error}"))
+        })?
         .ok_or_else(|| {
-            GpuWarmupError::ValidatedGraph("backend has no fixed GPU contract".into())
+            GpuWarmupError::ValidatedGraph(
+                "backend.gpu_runtime_contract: backend has no fixed GPU contract".into(),
+            )
         })?;
     provider
         .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(profile_provider_error)?;
-    apply_backend_storage_contract(validated, backend, &mut config)?;
+        .map_err(profile_provider_error)
+        .map_err(|error| annotate_warmup_phase("provider.configure_gpu_plan_budgets", error))?;
+    apply_backend_storage_contract(validated, backend, &mut config)
+        .map_err(|error| annotate_warmup_phase("apply_backend_storage_contract", error))?;
     let input =
         warmup_input_from_validated_with_limit_and_provider(validated, &config, Some(provider))?;
     plan_gpu_warmup(&input)
 }
 
-pub fn warmup_gpu_for_inputs_with_candidates<B: crate::Backend, P: GpuWarmupProfileProvider>(
+#[cfg(all(feature = "gpu", test))]
+pub(crate) fn warmup_gpu_for_inputs_with_candidates<
+    B: crate::Backend,
+    P: GpuWarmupProfileProvider,
+>(
     validated: &ValidatedGraph,
     backend: &mut B,
     inputs: &BTreeMap<String, crate::RuntimeValue<B>>,
@@ -6575,7 +6889,8 @@ pub fn warmup_gpu_for_inputs_with_candidates<B: crate::Backend, P: GpuWarmupProf
     )
 }
 
-pub fn warmup_gpu_for_inputs_with_candidates_with_execution_config<
+#[cfg(all(feature = "gpu", test))]
+pub(crate) fn warmup_gpu_for_inputs_with_candidates_with_execution_config<
     B: crate::Backend,
     P: GpuWarmupProfileProvider,
 >(
@@ -6590,29 +6905,32 @@ pub fn warmup_gpu_for_inputs_with_candidates_with_execution_config<
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
-    backend
-        .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?;
+    backend.configure_gpu_plan_budgets(&config.contract.device_budgets).map_err(|error| {
+        GpuWarmupError::ValidatedGraph(format!("backend.configure_gpu_plan_budgets: {error}"))
+    })?;
     config.contract = backend
         .gpu_runtime_contract(validated, inputs)
-        .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?
+        .map_err(|error| {
+            GpuWarmupError::ValidatedGraph(format!("backend.gpu_runtime_contract: {error}"))
+        })?
         .ok_or_else(|| {
-            GpuWarmupError::ValidatedGraph("backend has no fixed GPU contract".into())
+            GpuWarmupError::ValidatedGraph(
+                "backend.gpu_runtime_contract: backend has no fixed GPU contract".into(),
+            )
         })?;
     provider
         .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(profile_provider_error)?;
-    apply_backend_storage_contract(validated, backend, &mut config)?;
+        .map_err(profile_provider_error)
+        .map_err(|error| annotate_warmup_phase("provider.configure_gpu_plan_budgets", error))?;
+    apply_backend_storage_contract(validated, backend, &mut config)
+        .map_err(|error| annotate_warmup_phase("apply_backend_storage_contract", error))?;
     measure_owner_candidates(validated, &config, device_candidates, owner_candidates, provider)
 }
 
+#[cfg(all(feature = "gpu", test))]
 const OWNER_CANDIDATE_SEARCH_BUDGET: usize = 4096;
 
-/// Visit ownership candidates lazily in deterministic map/choice order.  The
-/// old implementation materialized the complete Cartesian product before it
-/// measured the first route, which made a large but mostly infeasible search
-/// consume unbounded memory.  The boolean return reports whether the explicit
-/// finite search budget truncated the candidate set.
+#[cfg(all(feature = "gpu", test))]
 fn visit_owner_candidate_variants(
     candidates: &[(LayoutId, &Vec<Vec<GpuColumnInterval>>)],
     index: usize,
@@ -6644,8 +6962,7 @@ fn visit_owner_candidate_variants(
     Ok(false)
 }
 
-/// Resolve and measure each ownership candidate before admission. A route's
-/// timing and allocation proof belong to that placement, not merely its width.
+#[cfg(all(feature = "gpu", test))]
 fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
@@ -6708,27 +7025,9 @@ fn measure_owner_candidates<P: GpuWarmupProfileProvider>(
     best.ok_or_else(|| failure.unwrap_or(GpuWarmupError::EmptyFleet))
 }
 
-/// Variant used when the backend has measured resident allocations separately
-/// from operation profiles. Resident bytes are charged to every stage peak;
-/// they are never converted into a new runtime width.
-#[cfg(test)]
-pub fn warmup_gpu_from_validated_with_resident(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    resident_bytes: &[u64],
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_resident_with_execution_config(
-        validated,
-        config,
-        resident_bytes,
-        &execution_config,
-    )
-}
-
 /// Resident-aware warmup with the exact execution wave limit.
 #[cfg(test)]
-pub fn warmup_gpu_from_validated_with_resident_with_execution_config(
+fn warmup_gpu_from_validated_with_resident_with_execution_config(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     resident_bytes: &[u64],
@@ -6751,73 +7050,9 @@ pub fn warmup_gpu_from_validated_with_resident_with_execution_config(
     plan_gpu_warmup(&input)
 }
 
-pub fn warmup_gpu_from_validated_with_resident_and_provider<P: GpuWarmupProfileProvider>(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    resident_bytes: &[u64],
-    provider: &mut P,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_resident_and_provider_with_execution_config(
-        validated,
-        config,
-        resident_bytes,
-        provider,
-        &execution_config,
-    )
-}
-
-pub fn warmup_gpu_from_validated_with_resident_and_provider_with_execution_config<
-    P: GpuWarmupProfileProvider,
->(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    resident_bytes: &[u64],
-    provider: &mut P,
-    execution_config: &crate::executor::ExecutionConfig,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let mut config = config.clone();
-    config.max_parallel_instances = execution_config.max_parallel_instances;
-    provider
-        .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(profile_provider_error)?;
-    let mut input =
-        warmup_input_from_validated_with_limit_and_provider(validated, &config, Some(provider))?;
-    if resident_bytes.len() != input.contract.logical_to_physical_devices.len() {
-        return Err(GpuWarmupError::DeviceCount {
-            expected: input.contract.logical_to_physical_devices.len(),
-            actual: resident_bytes.len(),
-        });
-    }
-    for node in &mut input.nodes {
-        for (device, cost) in node.cost.iter_mut().enumerate() {
-            cost.fixed.live = cost.fixed.live.saturating_add(resident_bytes[device]);
-        }
-    }
-    plan_gpu_warmup(&input)
-}
-
-/// Production entry point for a heterogeneous fleet. Width candidates are
-/// supplied per execution site and logical device, while graph-derived range
-/// and liveness metadata still comes from [`warmup_input_from_validated`].
-#[cfg(test)]
-pub fn warmup_gpu_from_validated_with_device_candidates(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_device_candidates_with_execution_config(
-        validated,
-        config,
-        candidates,
-        &execution_config,
-    )
-}
-
 /// Device-candidate warmup with the exact execution wave limit.
 #[cfg(test)]
-pub fn warmup_gpu_from_validated_with_device_candidates_with_execution_config(
+fn warmup_gpu_from_validated_with_device_candidates_with_execution_config(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
@@ -6829,65 +7064,9 @@ pub fn warmup_gpu_from_validated_with_device_candidates_with_execution_config(
     plan_gpu_warmup_with_device_candidates(&input, candidates)
 }
 
-pub fn warmup_gpu_from_validated_with_device_candidates_and_provider<
-    P: GpuWarmupProfileProvider,
->(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-    provider: &mut P,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_device_candidates_and_provider_with_execution_config(
-        validated,
-        config,
-        candidates,
-        provider,
-        &execution_config,
-    )
-}
-
-pub fn warmup_gpu_from_validated_with_device_candidates_and_provider_with_execution_config<
-    P: GpuWarmupProfileProvider,
->(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-    provider: &mut P,
-    execution_config: &crate::executor::ExecutionConfig,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let mut config = config.clone();
-    config.max_parallel_instances = execution_config.max_parallel_instances;
-    provider
-        .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(profile_provider_error)?;
-    measure_owner_candidates(validated, &config, candidates, &BTreeMap::new(), provider)
-}
-
-/// Production entry point for a heterogeneous fleet whose owner placement is
-/// also a warmup choice. The candidate map is keyed by layout id and contains
-/// complete, ordered owner intervals for that layout. Width and owner choices
-/// are evaluated together against the same dispatch schedule and budgets.
-#[cfg(test)]
-pub fn warmup_gpu_from_validated_with_device_and_layout_candidates(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    device_candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-    owner_candidates: &BTreeMap<LayoutId, Vec<Vec<GpuColumnInterval>>>,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_device_and_layout_candidates_with_execution_config(
-        validated,
-        config,
-        device_candidates,
-        owner_candidates,
-        &execution_config,
-    )
-}
-
 /// Device/owner-candidate warmup with the exact execution wave limit.
 #[cfg(test)]
-pub fn warmup_gpu_from_validated_with_device_and_layout_candidates_with_execution_config(
+fn warmup_gpu_from_validated_with_device_and_layout_candidates_with_execution_config(
     validated: &ValidatedGraph,
     config: &GpuValidatedWarmupConfig,
     device_candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
@@ -6898,44 +7077,6 @@ pub fn warmup_gpu_from_validated_with_device_and_layout_candidates_with_executio
     config.max_parallel_instances = execution_config.max_parallel_instances;
     let input = warmup_input_from_validated_with_limit(validated, &config)?;
     plan_gpu_warmup_with_device_and_layout_candidates(&input, device_candidates, owner_candidates)
-}
-
-pub fn warmup_gpu_from_validated_with_device_and_layout_candidates_and_provider<
-    P: GpuWarmupProfileProvider,
->(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    device_candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-    owner_candidates: &BTreeMap<LayoutId, Vec<Vec<GpuColumnInterval>>>,
-    provider: &mut P,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let execution_config = crate::executor::ExecutionConfig::default();
-    warmup_gpu_from_validated_with_device_and_layout_candidates_and_provider_with_execution_config(
-        validated,
-        config,
-        device_candidates,
-        owner_candidates,
-        provider,
-        &execution_config,
-    )
-}
-
-pub fn warmup_gpu_from_validated_with_device_and_layout_candidates_and_provider_with_execution_config<
-    P: GpuWarmupProfileProvider,
->(
-    validated: &ValidatedGraph,
-    config: &GpuValidatedWarmupConfig,
-    device_candidates: &BTreeMap<GpuExecutionSiteKey, Vec<Vec<usize>>>,
-    owner_candidates: &BTreeMap<LayoutId, Vec<Vec<GpuColumnInterval>>>,
-    provider: &mut P,
-    execution_config: &crate::executor::ExecutionConfig,
-) -> Result<GpuWarmupResult, GpuWarmupError> {
-    let mut config = config.clone();
-    config.max_parallel_instances = execution_config.max_parallel_instances;
-    provider
-        .configure_gpu_plan_budgets(&config.contract.device_budgets)
-        .map_err(profile_provider_error)?;
-    measure_owner_candidates(validated, &config, device_candidates, owner_candidates, provider)
 }
 
 /// Construct a fixed plan from pure profiles.  The objective is predicted
@@ -7259,11 +7400,20 @@ fn plan_gpu_warmup_with_overrides(
             },
         });
     }
+    let reports_by_key = reports
+        .iter()
+        .enumerate()
+        .map(|(index, report)| (report.key, index))
+        .collect::<BTreeMap<_, _>>();
+    if reports_by_key.len() != reports.len() {
+        return Err(GpuWarmupError::InvalidPlan("duplicate warmup report site".into()));
+    }
     let mut nodes = Vec::with_capacity(input.nodes.len());
     for node in &input.nodes {
-        let report = reports
-            .iter()
-            .find(|report| report.key == node.key)
+        bump_report_lookup();
+        let report = reports_by_key
+            .get(&node.key)
+            .and_then(|index| reports.get(*index))
             .ok_or(GpuWarmupError::NoNodeCandidate(node.key))?;
         nodes.push(GpuNodeChoice {
             key: node.key,
@@ -7293,12 +7443,6 @@ fn plan_gpu_warmup_with_overrides(
             reason: "minimum predicted protocol time under fixed resource budgets".into(),
         },
     })
-}
-
-/// Short alias used by runtime callers.  It remains pure and does not imply
-/// that a production execution may invoke it after the plan is frozen.
-pub fn warmup_gpu(input: &GpuWarmupInput) -> Result<GpuWarmupResult, GpuWarmupError> {
-    plan_gpu_warmup(input)
 }
 
 impl fmt::Display for GpuProfileProvenance {
@@ -7816,6 +7960,159 @@ mod tests {
     }
 
     #[test]
+    fn storage_tracking_distinguishes_scalar_payload_and_zero_sized_matrix() {
+        let scalar =
+            ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count: 8 };
+        let zero_sized_matrix = ConcreteWireType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
+            modulus: BigInt::from(97u64),
+            ring_dimension: 8,
+            rows: 1,
+            columns: 0,
+        });
+        assert!(!needs_storage_tracking(&ConcreteWireType::Int));
+        assert!(!needs_storage_tracking(&scalar));
+        let bytes = ConcreteWireType::Bytes { length: 7 };
+        assert!(needs_storage_tracking(&bytes));
+        assert!(needs_storage_tracking(&ConcreteWireType::IndexedFamily {
+            element: Box::new(bytes.clone()),
+            count: 2,
+        }));
+        assert_eq!(validated_wire_bytes(&bytes, &BTreeMap::new(), 1, 8), 7);
+        assert!(needs_storage_tracking(&zero_sized_matrix));
+        assert_eq!(validated_wire_bytes(&zero_sized_matrix, &BTreeMap::new(), 1, 8), 0);
+
+        let scalar_fan_in = (0..1024)
+            .map(|_| ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count: 4,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(scalar_fan_in.iter().filter(|ty| needs_storage_tracking(ty)).count(), 0);
+    }
+
+    #[test]
+    fn validated_scalar_family_pack_has_zero_storage_and_scales_linearly() {
+        use mxx_dsl::{DslContext, Family, Int};
+        use mxx_ir_core::ParamEnv;
+
+        fn storage_counts(count: usize) -> (usize, usize, WarmupTestCounters) {
+            let context = DslContext::new(format!("scalar-family-pack-{count}"));
+            let source = context.int_family_input("scalar-family", count);
+            let packed =
+                Family::pack((0..count).map(|index| source.at(Int::constant(index))).collect())
+                    .expect("family pack");
+            let graph = context
+                .output("value", packed)
+                .unwrap()
+                .build()
+                .unwrap()
+                .validate(&ParamEnv::default())
+                .unwrap();
+            let config = GpuValidatedWarmupConfig {
+                contract: contract(1, 1 << 20),
+                layouts: vec![layout(1, 1)],
+                default_tile_widths: vec![1],
+                default_cost: vec![GpuStageCostModel::default()],
+                default_implementation_variant: "scalar-fan-in-test".into(),
+                profiles: BTreeMap::new(),
+                effective_operation_identities: BTreeMap::new(),
+                effective_operations: BTreeMap::new(),
+                storage_descriptors: BTreeMap::new(),
+                active_crt_towers: 1,
+                crt_limb_bytes: 8,
+                max_parallel_instances: NonZeroUsize::new(64).unwrap(),
+            };
+            reset_warmup_test_counters();
+            let input = warmup_input_from_validated(&graph, &config).unwrap();
+            let node_count = input.nodes.len();
+            let allocation_count =
+                input.nodes.iter().map(|node| node.storage_allocations.len()).sum();
+            plan_gpu_warmup(&input).expect("scalar family pack warmup");
+            (node_count, allocation_count, warmup_test_counters())
+        }
+
+        let (small_nodes, small_allocations, small_counters) = storage_counts(8);
+        let (large_nodes, large_allocations, large_counters) = storage_counts(16);
+        assert_eq!(small_allocations, 0);
+        assert_eq!(large_allocations, 0);
+        assert_eq!(small_counters.storage_candidate_visits, 0);
+        assert_eq!(large_counters.storage_candidate_visits, 0);
+        assert_eq!(small_counters.temporary_entries, 0);
+        assert_eq!(large_counters.temporary_entries, 0);
+        assert!(small_counters.scope_preselections > 0);
+        assert!(large_counters.scope_preselections > 0);
+        assert!(large_nodes <= small_nodes.saturating_mul(2).saturating_add(8));
+        assert!(
+            large_counters.report_lookups <=
+                small_counters.report_lookups.saturating_mul(2).saturating_add(8)
+        );
+    }
+
+    #[test]
+    fn storage_allocation_merge_is_linear_and_identity_aware() {
+        let identity_a =
+            GpuStorageIdentity { shape_class: 1, wire: WireRef { node: NodeId(2), port: Port(0) } };
+        let identity_b =
+            GpuStorageIdentity { shape_class: 1, wire: WireRef { node: NodeId(3), port: Port(0) } };
+        let mut allocations = Vec::new();
+        let mut indices = BTreeMap::new();
+        merge_storage_allocation(
+            &mut allocations,
+            &mut indices,
+            7,
+            GpuResourceCost { live: 11, ..Default::default() },
+            false,
+            Some(identity_a),
+        )
+        .unwrap();
+        merge_storage_allocation(
+            &mut allocations,
+            &mut indices,
+            7,
+            GpuResourceCost { live: 13, ..Default::default() },
+            false,
+            Some(identity_a),
+        )
+        .unwrap();
+        merge_storage_allocation(
+            &mut allocations,
+            &mut indices,
+            7,
+            GpuResourceCost { live: 17, ..Default::default() },
+            false,
+            Some(identity_b),
+        )
+        .unwrap();
+        merge_storage_allocation(
+            &mut allocations,
+            &mut indices,
+            7,
+            GpuResourceCost { live: 19, ..Default::default() },
+            true,
+            Some(identity_a),
+        )
+        .unwrap();
+        merge_storage_allocation(
+            &mut allocations,
+            &mut indices,
+            9,
+            GpuResourceCost::zero(),
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(allocations.len(), 4);
+        assert_eq!(allocations[0].resource.live, 24);
+        assert_eq!(allocations[1].resource.live, 17);
+        assert_eq!(allocations[2].resource.live, 19);
+        assert_eq!(allocations[0].storage_identity, Some(identity_a));
+        assert_eq!(allocations[1].storage_identity, Some(identity_b));
+        assert!(allocations[2].wave_shared);
+        assert_eq!(allocations[3].layout, 9);
+        assert!(allocations[3].wave_shared);
+    }
+
+    #[test]
     fn backend_storage_contract_replaces_empty_and_rejects_one_tower_spoof() {
         let matrix = mxx_ir_core::types::ConcreteMatrixType {
             modulus: BigInt::from(97u64),
@@ -8211,7 +8508,8 @@ mod tests {
                     &graph,
                     &FrozenGraphScopeId::Root,
                     NodeId(index as u64),
-                    handle.kind()
+                    handle.kind(),
+                    None,
                 ),
                 (!additional_consumer).then_some(FusedWarmupOperation::RowBlockAdd)
             );
@@ -9450,6 +9748,85 @@ mod tests {
                 "admission must resolve memory from the same job-class point as time"
             );
         }
+    }
+
+    #[test]
+    fn measured_tail_profile_does_not_require_planned_width_time_projection() {
+        let output = layout(6, 1);
+        let route = |start, end, fragment| {
+            GpuExecutionRouteDescriptor::device_local(0, ColumnRange { start, end }, fragment)
+        };
+        let profile = |seconds, bytes| {
+            GpuWarmupProfile::measured_with_observation(
+                seconds,
+                0,
+                WarmupMeasurementKind::GpuMeasured,
+                crate::backend::GpuWarmupMemoryObservations {
+                    affected_devices: BTreeMap::from([(
+                        GpuWarmupDeviceIdentity::new(0, "test-device", "test-revision"),
+                        bytes,
+                    )]),
+                    evidence: MemoryEvidenceKind::ExactQuery,
+                    ..Default::default()
+                },
+                crate::backend::GpuWarmupResidencyDelta::default(),
+                1,
+                0.0,
+                GpuWarmupProvenance::ProductionEquivalent,
+                GpuWarmupCacheState::Warm,
+                GpuWarmupTimingScope::LocalJob,
+            )
+        };
+        let mut cost = GpuStageCostModel {
+            // This projection is intentionally unusable. Provider-backed
+            // timing must resolve the exact whole/tail job profiles below
+            // instead of probing this compact model.
+            time: GpuTimeModel { fixed_seconds: f64::INFINITY, ..Default::default() },
+            ..Default::default()
+        };
+        for (start, end, seconds, bytes, fragment) in [
+            (0, 4, 3.0, 10, GpuWarmupFragmentClass::Whole),
+            (4, 6, 5.0, 50, GpuWarmupFragmentClass::Tail),
+        ] {
+            let key = GpuWarmupJobProfileKey {
+                planned_width: 4,
+                instance_slot: 0,
+                rotation_class: 0,
+                width: end - start,
+                global_start: start,
+                global_end: end,
+                fragment,
+                binding_port: None,
+                route_descriptor: route(
+                    start,
+                    end,
+                    match fragment {
+                        GpuWarmupFragmentClass::Whole => TypedFragmentClass::Full,
+                        GpuWarmupFragmentClass::Tail => TypedFragmentClass::Tail,
+                        _ => unreachable!(),
+                    },
+                ),
+            };
+            cost.job_profile_keys.entry((0, 0, start, end, None)).or_default().push(key.clone());
+            cost.profiles_by_job.insert(
+                key,
+                profile(seconds, bytes).expect("test profile has valid measured metadata"),
+            );
+        }
+        let node = node(6, vec![cost], vec![4]);
+        let layouts = BTreeMap::from([(output.id, &output)]);
+        let selection = choose_node_with_candidates(
+            &node,
+            &[&output],
+            &layouts,
+            1,
+            &contract(1, 1_000).device_budgets,
+            1,
+            1,
+            None,
+        )
+        .expect("exact measured whole/tail profiles should admit the planned width");
+        assert_eq!(selection.seconds, 8.0);
     }
 
     #[test]

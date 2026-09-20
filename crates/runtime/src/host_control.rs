@@ -644,33 +644,20 @@ pub fn measure_runtime_container_primitive<B: Backend>(
                 }
                 std::hint::black_box(RuntimeValue::IndexedFamily(family_inputs.to_vec()));
             }
-            NodeKind::FamilyGetStatic { index } => {
-                let index = index
-                    .evaluate(environment)
-                    .map_err(|error| expression_error(error.to_string()))?
-                    .to_usize()
-                    .ok_or_else(|| expression_error("family index does not fit usize".into()))?;
+            NodeKind::FamilyGetStatic { .. } => {
                 let Some(RuntimeValue::IndexedFamily(values)) = family_inputs.first() else {
                     return Err(expression_error("family input is not indexed".into()));
                 };
-                let value = values.get(index).ok_or_else(|| {
-                    expression_error(format!("family index {index} is out of range"))
-                })?;
+                let value =
+                    runtime_family_get_value(node, kind, environment, values, dynamic_index)?;
                 std::hint::black_box(value.clone());
             }
             NodeKind::FamilyGetDynamic => {
                 let Some(RuntimeValue::IndexedFamily(values)) = family_inputs.first() else {
                     return Err(expression_error("family input is not indexed".into()));
                 };
-                let Some(RuntimeValue::Int(index)) = dynamic_index else {
-                    return Err(expression_error("dynamic family index is not an integer".into()));
-                };
-                let Some(index) = index.to_usize() else {
-                    return Err(expression_error("dynamic family index does not fit usize".into()));
-                };
-                let value = values.get(index).ok_or_else(|| {
-                    expression_error(format!("family index {index} is out of range"))
-                })?;
+                let value =
+                    runtime_family_get_value(node, kind, environment, values, dynamic_index)?;
                 std::hint::black_box(value.clone());
             }
             NodeKind::Select { count } => {
@@ -692,6 +679,59 @@ pub fn measure_runtime_container_primitive<B: Backend>(
             }
             _ => return Err(expression_error("node is not a container primitive".into())),
         }
+    }
+    Ok(started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE))
+}
+
+fn runtime_family_get_value<'a, B: Backend>(
+    node: NodeId,
+    kind: &NodeKind,
+    environment: &ParamEnv,
+    values: &'a [RuntimeValue<B>],
+    dynamic_index: Option<&RuntimeValue<B>>,
+) -> Result<&'a RuntimeValue<B>, RuntimeValueAccessError> {
+    let expression_error = |error: String| RuntimeValueAccessError::TypeMismatch {
+        name: format!("node {node:?}: {error}"),
+    };
+    let index = match kind {
+        NodeKind::FamilyGetStatic { index } => index
+            .evaluate(environment)
+            .map_err(|error| expression_error(error.to_string()))?
+            .to_usize()
+            .ok_or_else(|| expression_error("family index does not fit usize".into()))?,
+        NodeKind::FamilyGetDynamic => {
+            let Some(RuntimeValue::Int(index)) = dynamic_index else {
+                return Err(expression_error("dynamic family index is not an integer".into()));
+            };
+            index
+                .to_usize()
+                .ok_or_else(|| expression_error("dynamic family index does not fit usize".into()))?
+        }
+        _ => return Err(expression_error("node is not a family selection".into())),
+    };
+    values
+        .get(index)
+        .ok_or_else(|| expression_error(format!("family index {index} is out of range")))
+}
+
+/// Time a family selection against an already materialized family slice. This
+/// shares the exact index evaluation and bounds checks with the owned runtime
+/// container helper, while avoiding a per-call clone of the family vector.
+pub fn measure_runtime_family_get_primitive<B: Backend>(
+    node: NodeId,
+    kind: &NodeKind,
+    environment: &ParamEnv,
+    values: &[RuntimeValue<B>],
+    dynamic_index: Option<&RuntimeValue<B>>,
+    repetitions: usize,
+) -> Result<f64, RuntimeValueAccessError> {
+    if repetitions == 0 {
+        return Err(RuntimeValueAccessError::MissingInput { name: format!("node {node:?}") });
+    }
+    let started = Instant::now();
+    for _ in 0..repetitions {
+        let value = runtime_family_get_value(node, kind, environment, values, dynamic_index)?;
+        std::hint::black_box(value.clone());
     }
     Ok(started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE))
 }
@@ -1303,6 +1343,54 @@ mod tests {
         });
         let elapsed = measure_host_control(NodeId(7), &kind, &ParamEnv::default(), None).unwrap();
         assert!(elapsed.is_finite() && elapsed > 0.0);
+    }
+
+    #[test]
+    fn family_selection_matches_for_owned_and_shared_storage() {
+        use crate::backend::{RuntimeValue, poly::CpuDcrtBackend};
+
+        fn signature(
+            result: Result<&RuntimeValue<CpuDcrtBackend>, RuntimeValueAccessError>,
+        ) -> Result<&'static str, String> {
+            result
+                .map(|value| match value {
+                    RuntimeValue::Int(_) => "int",
+                    _ => "other",
+                })
+                .map_err(|error| error.to_string())
+        }
+
+        let owned = vec![
+            RuntimeValue::<CpuDcrtBackend>::Int(BigInt::from(10)),
+            RuntimeValue::Int(BigInt::from(20)),
+            RuntimeValue::Int(BigInt::from(30)),
+        ];
+        let shared = Arc::new(owned.clone());
+        let environment = ParamEnv::default();
+        let cases = [
+            (NodeKind::FamilyGetStatic { index: IntExpr::constant(1) }, None),
+            (NodeKind::FamilyGetStatic { index: IntExpr::constant(2) }, None),
+            (NodeKind::FamilyGetStatic { index: IntExpr::constant(3) }, None),
+            (NodeKind::FamilyGetDynamic, Some(RuntimeValue::Int(BigInt::from(2)))),
+            (NodeKind::FamilyGetDynamic, Some(RuntimeValue::Int(BigInt::from(3)))),
+        ];
+        for (kind, dynamic_index) in cases {
+            let owned_result = signature(runtime_family_get_value(
+                NodeId(91),
+                &kind,
+                &environment,
+                &owned,
+                dynamic_index.as_ref(),
+            ));
+            let shared_result = signature(runtime_family_get_value(
+                NodeId(91),
+                &kind,
+                &environment,
+                shared.as_slice(),
+                dynamic_index.as_ref(),
+            ));
+            assert_eq!(owned_result, shared_result, "family selection diverged for {kind:?}");
+        }
     }
 
     #[test]

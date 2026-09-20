@@ -13,8 +13,8 @@ use crate::{
 };
 #[cfg(any(feature = "gpu", test))]
 use rayon::prelude::*;
-use serde::Serialize;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Shared bounded dispatcher: all jobs returned for one owner are consumed,
 /// while only distinct owners execute concurrently. The callback owns the
@@ -811,7 +811,8 @@ impl FrozenGpuPlan {
         key: GpuExecutionSiteKey,
         ports: &[GpuOutputPortContract],
     ) -> Result<(), GpuPlanError> {
-        let node = self.node_choice(key).ok_or(GpuPlanError::MissingNodeSite(key))?;
+        let index = FrozenGpuPlanIndex::build(self)?;
+        let node = index.node_choice(self, key).ok_or(GpuPlanError::MissingNodeSite(key))?;
         if ports.len() != node.output_layouts.len() {
             return Err(GpuPlanError::OutputPortCount {
                 site: key,
@@ -824,11 +825,11 @@ impl FrozenGpuPlan {
             if !seen.insert(port.port) {
                 return Err(GpuPlanError::DuplicateOutputPort { site: key, port: port.port });
             }
-            let index = usize::try_from(port.port)
+            let port_index = usize::try_from(port.port)
                 .map_err(|_| GpuPlanError::InvalidOutputPort { site: key, port: port.port })?;
             let expected_layout = node
                 .output_layouts
-                .get(index)
+                .get(port_index)
                 .ok_or(GpuPlanError::InvalidOutputPort { site: key, port: port.port })?;
             if *expected_layout != port.layout {
                 return Err(GpuPlanError::OutputPortLayoutMismatch {
@@ -838,8 +839,8 @@ impl FrozenGpuPlan {
                     actual: port.layout,
                 });
             }
-            let layout = self
-                .layout(port.layout)
+            let layout = index
+                .layout(self, port.layout)
                 .ok_or(GpuPlanError::UnknownLayout { site: key, layout: port.layout })?;
             if (layout.rows, layout.columns, layout.ring_dimension) !=
                 (port.rows, port.columns, port.ring_dimension)
@@ -854,7 +855,7 @@ impl FrozenGpuPlan {
             }
             if let Some(source) = port.source_layout {
                 let source_layout =
-                    self.layout(source).ok_or(GpuPlanError::UnknownSourceLayout {
+                    index.layout(self, source).ok_or(GpuPlanError::UnknownSourceLayout {
                         site: key,
                         port: port.port,
                         source_layout: source,
@@ -871,7 +872,7 @@ impl FrozenGpuPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct GpuLoopSiteKey {
     pub site: u64,
     pub shape_class: u64,
@@ -901,7 +902,7 @@ impl GpuLoopChoice {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct GpuExecutionSiteKey {
     pub site: u64,
     pub shape_class: u64,
@@ -979,6 +980,89 @@ pub struct FrozenGpuPlan {
     pub nodes: Vec<GpuNodeChoice>,
 }
 
+/// Preparation/execution-local indexes for a frozen plan. The serialized plan
+/// intentionally remains the public ordered vectors; callers that perform
+/// repeated lookups build this immutable index once and share it locally.
+#[derive(Clone, Debug)]
+pub(crate) struct FrozenGpuPlanIndex {
+    layouts: BTreeMap<LayoutId, usize>,
+    loops: BTreeMap<GpuLoopSiteKey, usize>,
+    nodes: BTreeMap<GpuExecutionSiteKey, usize>,
+}
+
+impl FrozenGpuPlanIndex {
+    pub(crate) fn build(plan: &FrozenGpuPlan) -> Result<Self, GpuPlanError> {
+        let mut layouts = BTreeMap::new();
+        for (index, layout) in plan.layouts.iter().enumerate() {
+            if layouts.insert(layout.id, index).is_some() {
+                return Err(GpuPlanError::DuplicateLayout(layout.id));
+            }
+        }
+        let mut loops = BTreeMap::new();
+        for (index, choice) in plan.loops.iter().enumerate() {
+            if loops.insert(choice.key, index).is_some() {
+                return Err(GpuPlanError::DuplicateLoopSite(choice.key));
+            }
+        }
+        let mut nodes = BTreeMap::new();
+        for (index, choice) in plan.nodes.iter().enumerate() {
+            if nodes.insert(choice.key, index).is_some() {
+                return Err(GpuPlanError::DuplicateNodeSite(choice.key));
+            }
+        }
+        Ok(Self { layouts, loops, nodes })
+    }
+
+    fn validate_for(&self, plan: &FrozenGpuPlan) -> Result<(), GpuPlanError> {
+        let layouts_valid = self.layouts.len() == plan.layouts.len() &&
+            self.layouts.values().all(|index| {
+                plan.layouts
+                    .get(*index)
+                    .is_some_and(|layout| self.layouts.get(&layout.id) == Some(index))
+            });
+        let loops_valid = self.loops.len() == plan.loops.len() &&
+            self.loops.values().all(|index| {
+                plan.loops
+                    .get(*index)
+                    .is_some_and(|choice| self.loops.get(&choice.key) == Some(index))
+            });
+        let nodes_valid = self.nodes.len() == plan.nodes.len() &&
+            self.nodes.values().all(|index| {
+                plan.nodes
+                    .get(*index)
+                    .is_some_and(|choice| self.nodes.get(&choice.key) == Some(index))
+            });
+        if !layouts_valid || !loops_valid || !nodes_valid {
+            return Err(GpuPlanError::StalePlanIndex);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn layout<'a>(
+        &self,
+        plan: &'a FrozenGpuPlan,
+        id: LayoutId,
+    ) -> Option<&'a GpuLayout> {
+        self.layouts.get(&id).and_then(|index| plan.layouts.get(*index))
+    }
+
+    pub(crate) fn loop_choice<'a>(
+        &self,
+        plan: &'a FrozenGpuPlan,
+        key: GpuLoopSiteKey,
+    ) -> Option<&'a GpuLoopChoice> {
+        self.loops.get(&key).and_then(|index| plan.loops.get(*index))
+    }
+
+    pub(crate) fn node_choice<'a>(
+        &self,
+        plan: &'a FrozenGpuPlan,
+        key: GpuExecutionSiteKey,
+    ) -> Option<&'a GpuNodeChoice> {
+        self.nodes.get(&key).and_then(|index| plan.nodes.get(*index))
+    }
+}
+
 impl FrozenGpuPlan {
     pub fn new(
         contract: GpuPlanContract,
@@ -992,28 +1076,29 @@ impl FrozenGpuPlan {
     }
 
     pub fn validate(&self) -> Result<(), GpuPlanError> {
+        let index = FrozenGpuPlanIndex::build(self)?;
+        self.validate_with_index(&index)
+    }
+
+    pub(crate) fn validate_with_index(
+        &self,
+        index: &FrozenGpuPlanIndex,
+    ) -> Result<(), GpuPlanError> {
         self.contract.validate()?;
         let device_count = self.contract.logical_to_physical_devices.len();
-        let mut layouts = BTreeSet::new();
+        index.validate_for(self)?;
+        let layouts = index.layouts.keys().copied().collect::<BTreeSet<_>>();
         for layout in &self.layouts {
-            if !layouts.insert(layout.id) {
-                return Err(GpuPlanError::DuplicateLayout(layout.id));
-            }
             layout.validate(device_count)?;
         }
-        let mut loops = BTreeSet::new();
         for choice in &self.loops {
             choice.validate()?;
-            if !loops.insert(choice.key) {
-                return Err(GpuPlanError::DuplicateLoopSite(choice.key));
-            }
         }
-        let mut nodes = BTreeSet::new();
         for choice in &self.nodes {
             choice.validate(&self.contract, &layouts)?;
             for id in &choice.output_layouts {
-                let layout = self
-                    .layout(*id)
+                let layout = index
+                    .layout(self, *id)
                     .ok_or(GpuPlanError::UnknownLayout { site: choice.key, layout: *id })?;
                 let classes = if layout.instance_device_stride == 0 { 1 } else { device_count };
                 for instance in 0..classes {
@@ -1021,9 +1106,6 @@ impl FrozenGpuPlan {
                         .schedule(&choice.columns_per_job, instance)
                         .map_err(GpuPlanError::InvalidLayoutSchedule)?;
                 }
-            }
-            if !nodes.insert(choice.key) {
-                return Err(GpuPlanError::DuplicateNodeSite(choice.key));
             }
         }
         Ok(())
@@ -1068,6 +1150,8 @@ pub enum GpuPlanError {
     BudgetDeviceMismatch { logical: usize, budget_device: usize },
     #[error("layout {0} occurs more than once")]
     DuplicateLayout(LayoutId),
+    #[error("frozen GPU plan index does not match its plan")]
+    StalePlanIndex,
     #[error("layout schedule is invalid: {0}")]
     InvalidLayoutSchedule(GpuScheduleError),
     #[error("layout {layout} has an empty representation")]
@@ -1350,6 +1434,57 @@ mod tests {
         assert_eq!(plan.node_choice(key0).unwrap().columns_per_job, vec![2, 2]);
         assert_eq!(plan.node_choice(key1).unwrap().columns_per_job, vec![4, 4]);
         assert_eq!(plan.layout(1).unwrap().owner_intervals[0].start, 0);
+    }
+
+    #[test]
+    fn frozen_plan_index_matches_ordered_lookup_and_rejects_duplicates() {
+        let key = GpuExecutionSiteKey { site: 17, shape_class: 2, instance_class: 1 };
+        let loop_key = GpuLoopSiteKey { site: 18, shape_class: 2 };
+        let node = GpuNodeChoice {
+            key,
+            loop_site: Some(loop_key),
+            operation_identity: [9; 32],
+            effective_operation: EffectiveGpuOperation::MatrixAdd,
+            column_capability: ColumnCapability::SameColumns,
+            output_layouts: vec![1],
+            columns_per_job: vec![2, 2],
+            implementation_variant: "indexed".into(),
+            preimage_max_attempts: None,
+        };
+        let plan = FrozenGpuPlan {
+            contract: contract(2),
+            layouts: vec![layout()],
+            loops: vec![GpuLoopChoice {
+                key: loop_key,
+                loop_count: 4,
+                wave_instances: 2,
+                tail_instances: 0,
+            }],
+            nodes: vec![node],
+        };
+        let index = FrozenGpuPlanIndex::build(&plan).expect("unique plan entries");
+        assert_eq!(index.layout(&plan, 1), plan.layout(1));
+        assert_eq!(index.loop_choice(&plan, loop_key), plan.loop_choice(loop_key));
+        assert_eq!(index.node_choice(&plan, key), plan.node_choice(key));
+
+        let mut duplicate_layout = plan.clone();
+        duplicate_layout.layouts.push(layout());
+        assert!(matches!(
+            FrozenGpuPlanIndex::build(&duplicate_layout),
+            Err(GpuPlanError::DuplicateLayout(1))
+        ));
+        let mut duplicate_loop = plan.clone();
+        duplicate_loop.loops.push(duplicate_loop.loops[0].clone());
+        assert!(matches!(
+            FrozenGpuPlanIndex::build(&duplicate_loop),
+            Err(GpuPlanError::DuplicateLoopSite(key)) if key == loop_key
+        ));
+        let mut duplicate_node = plan;
+        duplicate_node.nodes.push(duplicate_node.nodes[0].clone());
+        assert!(matches!(
+            FrozenGpuPlanIndex::build(&duplicate_node),
+            Err(GpuPlanError::DuplicateNodeSite(site)) if site == key
+        ));
     }
 
     #[test]

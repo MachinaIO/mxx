@@ -920,9 +920,10 @@ pub struct GpuExecutionRouteDescriptor {
     pub source_staging_bytes: usize,
     pub host_staging_bytes: usize,
     pub pinned_host_staging_bytes: usize,
-    /// Ordered, de-duplicated source ownership and per-source physical
-    /// transfer facts.  The legacy scalar fields above remain aggregate
-    /// convenience values; profile identity and cache validation use this
+    /// Ordered, normalized source fragments and per-source physical transfer
+    /// facts. A physical owner may occur more than once when distinct mapped
+    /// operands leave a real gap in the shared column coordinate. The legacy scalar fields above
+    /// remain aggregate convenience values; profile identity and cache validation use this
     /// complete inventory.
     pub source_route_count: u8,
     pub source_routes: [GpuExecutionSourceRoute; GPU_ROUTE_MAX_SOURCES],
@@ -1014,9 +1015,10 @@ impl GpuExecutionRouteDescriptor {
     }
 
     /// Replace the single-source convenience route with the complete ordered
-    /// source inventory. Repeated owners are merged in first-seen order so a
-    /// profile cannot differ merely because the same shard was encountered
-    /// twice while lowering a concat/tensor input.
+    /// source inventory. Repeated owners are merged in first-seen order only
+    /// when their intervals overlap, touch, or another retained owner covers
+    /// the gap. A genuinely sparse same-owner mapping remains as distinct
+    /// fragments so the descriptor never invents physical coverage.
     pub fn with_source_routes(
         mut self,
         routes: impl IntoIterator<Item = GpuExecutionSourceRoute>,
@@ -1027,10 +1029,41 @@ impl GpuExecutionRouteDescriptor {
             if route.source_range.is_empty() {
                 return None;
             }
-            if let Some(index) = merged[..count]
-                .iter()
-                .position(|existing| existing.source_owner == route.source_owner)
-            {
+            if let Some(index) = merged[..count].iter().position(|existing| {
+                if existing.source_owner != route.source_owner {
+                    return false;
+                }
+                // A source route stores one contiguous global interval. It is
+                // safe to bridge a gap only when another retained owner
+                // already covers that gap; otherwise min/max would invent
+                // physical coverage that the route does not provide.
+                if existing.source_range.end >= route.source_range.start &&
+                    route.source_range.end >= existing.source_range.start
+                {
+                    return true;
+                }
+                let (gap_start, gap_end) = if existing.source_range.end < route.source_range.start {
+                    (existing.source_range.end, route.source_range.start)
+                } else {
+                    (route.source_range.end, existing.source_range.start)
+                };
+                let mut cursor = gap_start;
+                while cursor < gap_end {
+                    let Some(next) = merged[..count]
+                        .iter()
+                        .filter(|other| other.source_owner != route.source_owner)
+                        .filter(|other| {
+                            other.source_range.start <= cursor && other.source_range.end > cursor
+                        })
+                        .map(|other| other.source_range.end)
+                        .max()
+                    else {
+                        return false;
+                    };
+                    cursor = next.min(gap_end);
+                }
+                true
+            }) {
                 let existing = &mut merged[index];
                 existing.source_range = ColumnRange {
                     start: existing.source_range.start.min(route.source_range.start),
@@ -1083,32 +1116,28 @@ impl GpuExecutionRouteDescriptor {
 
     pub fn validate(&self) -> bool {
         let source_routes = self.source_routes();
-        let source_coverage = {
-            let mut fragments =
-                source_routes.iter().map(|route| route.source_range).collect::<Vec<_>>();
-            fragments.sort_unstable_by_key(|range| (range.start, range.end));
-            let mut cursor = self.source_range.start;
-            for fragment in fragments {
-                if fragment.end <= cursor {
-                    continue;
-                }
-                if fragment.start > cursor {
-                    break;
-                }
-                cursor = cursor.max(fragment.end);
-            }
-            cursor >= self.source_range.end
-        };
+        let source_bounds = source_routes.iter().fold(None, |bounds, route| {
+            Some(bounds.map_or(route.source_range, |bounds: ColumnRange| ColumnRange {
+                start: bounds.start.min(route.source_range.start),
+                end: bounds.end.max(route.source_range.end),
+            }))
+        });
         self.source_range.start <= self.source_range.end &&
             self.destination_range.start <= self.destination_range.end &&
             self.source_route_count > 0 &&
             usize::from(self.source_route_count) <= GPU_ROUTE_MAX_SOURCES &&
-            source_coverage &&
+            source_bounds == Some(self.source_range) &&
             source_routes.iter().enumerate().all(|(index, route)| {
                 !route.source_range.is_empty() &&
+                    route.source_range.start >= self.source_range.start &&
+                    route.source_range.end <= self.source_range.end &&
                     source_routes[..index]
                         .iter()
-                        .all(|prior| prior.source_owner != route.source_owner)
+                        .filter(|prior| prior.source_owner == route.source_owner)
+                        .all(|prior| {
+                            prior.source_range.end < route.source_range.start ||
+                                route.source_range.end < prior.source_range.start
+                        })
             }) &&
             match self.route {
                 GpuTransferRoute::Resident => {
@@ -2622,6 +2651,47 @@ mod tests {
         assert_eq!(descriptor.source_routes()[0].source_range, ColumnRange { start: 0, end: 8 });
         assert_eq!(descriptor.source_staging_bytes, 35);
         assert_eq!(descriptor.host_staging_bytes, 20);
+    }
+
+    #[test]
+    fn route_identity_preserves_sparse_same_owner_fragments() {
+        let descriptor = resolve_gpu_route(GpuRouteResolutionInput {
+            source_device: Some(0),
+            destination_device: Some(0),
+            source_range: ColumnRange { start: 0, end: 3 },
+            destination_range: ColumnRange { start: 2, end: 3 },
+            source_is_resident: true,
+            peer_available: false,
+            source_compact: false,
+            destination_compact: false,
+            fragment: GpuFragmentClass::Mapped,
+            source_staging_bytes: 0,
+            host_staging_bytes: 0,
+            pinned_host_staging_bytes: 0,
+        })
+        .with_source_routes([
+            GpuExecutionSourceRoute::new(
+                0,
+                ColumnRange { start: 0, end: 1 },
+                GpuTransferRoute::Resident,
+                0,
+                0,
+                0,
+            ),
+            GpuExecutionSourceRoute::new(
+                0,
+                ColumnRange { start: 2, end: 3 },
+                GpuTransferRoute::Resident,
+                0,
+                0,
+                0,
+            ),
+        ])
+        .expect("sparse route inventory");
+        assert!(descriptor.validate());
+        assert_eq!(descriptor.source_routes().len(), 2);
+        assert_eq!(descriptor.source_routes()[0].source_range, ColumnRange { start: 0, end: 1 });
+        assert_eq!(descriptor.source_routes()[1].source_range, ColumnRange { start: 2, end: 3 });
     }
 
     #[test]

@@ -5,15 +5,15 @@ use crate::{
         FixedCompactUnaryOperation, FixedGadgetDecomposeRequest, FixedGenerationOutput,
         FixedGenerationRequest, FixedOperationBatchRequest, FixedTrapdoorRequest,
         FixedUnaryOperation, FusedBatchOutput, FusedBatchRequest, IndexRange as RuntimeIndexRange,
-        MatrixMulAccumulateRequest, PlannedNodeBatchRequest, PlannedOperandMetadata,
-        PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange,
+        MatrixMulAccumulateRequest, PlannedNodeBatchRequest, PreimageRequest, RuntimeValue,
+        SampleRange as RuntimeSampleRange,
     },
     gpu_column_policy::{
         ColumnCapability, EffectiveGpuOperation, column_capability, effective_gpu_operation,
     },
     gpu_execution_plan::{
-        FrozenGpuPlan, GpuExecutionSiteKey, GpuLoopChoice, GpuLoopSiteKey, GpuNodeChoice,
-        scope_shape_class,
+        FrozenGpuPlan, FrozenGpuPlanIndex, GpuExecutionSiteKey, GpuLoopChoice, GpuLoopSiteKey,
+        GpuNodeChoice, scope_shape_class,
     },
     host_control::{
         HostPrimitiveError, HostPrimitiveValue, clone_typed_runtime_input, dispatch_host_primitive,
@@ -26,7 +26,7 @@ use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{
         ArtifactAvailability, ArtifactType, ConcreteBoundedMatrixSchema, ManifestArtifact,
-        ProductionId, SmallMatrixSemanticKind,
+        ProductionId, SmallMatrixSemanticKind, SpecHash,
     },
     graph::{FrozenGraphScopeId, GraphScope},
     node::{ConstantMatrix, HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind},
@@ -46,11 +46,19 @@ use std::{
 use thiserror::Error;
 use tracing::info;
 
+mod gpu_metadata;
 #[cfg(feature = "gpu")]
 mod gpu_plan;
+pub(crate) use gpu_metadata::{GpuScopeLowering, GpuScopeLoweringCache};
 mod plan_cache;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExecutionPlan {
+    Cpu,
+    FrozenGpu(Arc<FrozenGpuPlan>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionConfig {
     /// Maximum number of sibling loop-body instances executed in one wave.
     ///
@@ -65,6 +73,7 @@ pub struct ExecutionConfig {
     /// When set, also drain pending releases before returning. With `None`,
     /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
+    pub plan: ExecutionPlan,
 }
 
 impl Default for ExecutionConfig {
@@ -73,6 +82,7 @@ impl Default for ExecutionConfig {
             max_parallel_instances: NonZeroUsize::new(64).expect("64 is nonzero"),
             preimage_progress: None,
             release_fence_interval: None,
+            plan: ExecutionPlan::Cpu,
         }
     }
 }
@@ -109,6 +119,11 @@ struct RootBlockAliases {
     decompositions: BTreeMap<NodeId, NodeId>,
     compact_products: BTreeMap<NodeId, (NodeId, WireRef, Vec<Vec<WireRef>>)>,
     row_sums: BTreeMap<NodeId, RootRowSumPlan>,
+    /// Row-sum outputs sharing one tensor source. The first output is the
+    /// single fused dispatch leader; the remaining outputs consume its
+    /// multi-output result.
+    tensor_row_sum_groups: BTreeMap<NodeId, Vec<NodeId>>,
+    tensor_row_sum_leaders: BTreeMap<NodeId, NodeId>,
     row_sum_interiors: BTreeSet<NodeId>,
     row_sum_captures: BTreeMap<NodeId, Vec<NodeId>>,
     // A whole root composed only of resident inputs and one fused row sum.
@@ -144,6 +159,8 @@ pub struct RootRowSumPlan {
     pub tensor_operands: Option<[WireRef; 2]>,
     pub rows: Vec<Vec<usize>>,
     interiors: BTreeSet<NodeId>,
+    /// Leader output for a shared tensor-row-sum dispatch, when present.
+    pub tensor_group: Option<NodeId>,
 }
 
 #[doc(hidden)]
@@ -256,6 +273,7 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                     tensor_operands: None,
                     rows: groups,
                     interiors,
+                    tensor_group: None,
                 },
             );
         }
@@ -325,6 +343,7 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
                         tensor_operands: None,
                         rows: vec![vec![start]],
                         interiors: BTreeSet::new(),
+                        tensor_group: None,
                     },
                 );
             }
@@ -363,21 +382,33 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
         plans.remove(&parent);
         plans.extend(children);
     }
-    // A single row-sum consumer can read tensor products directly. Keep the
-    // tensor boundary whenever another plan or observable consumer needs it.
-    let sources = plans.values().map(|plan| plan.source).collect::<Vec<_>>();
-    for plan in plans.values_mut() {
-        let source = plan.source;
-        if sources.iter().filter(|wire| **wire == source).count() != 1 ||
-            checked.liveness.retained.contains(&source) ||
+    // A tensor may feed several row-sum outputs in a composite graph. Fuse
+    // those outputs as one multi-output TensorRowSum only when the union of
+    // their interiors covers every source consumer. This preserves the
+    // source's single production launch while retaining the materialized
+    // fallback whenever an observable/external consumer exists.
+    let mut groups = BTreeMap::<WireRef, Vec<NodeId>>::new();
+    for (node, plan) in &plans {
+        groups.entry(plan.source).or_default().push(*node);
+    }
+    for (source, mut outputs) in groups {
+        if checked.liveness.retained.contains(&source) ||
             scope.outputs().contains(&source) ||
             !matches!(
                 scope.node(source.node).expect("validated source").kind(),
                 NodeKind::Tensor
-            ) ||
-            !uses
-                .get(&source)
-                .is_some_and(|users| users.iter().all(|user| plan.interiors.contains(user)))
+            )
+        {
+            continue;
+        }
+        outputs.sort_unstable();
+        let mut union_interiors = BTreeSet::new();
+        for output in &outputs {
+            union_interiors.extend(plans[output].interiors.iter().copied());
+        }
+        if !uses
+            .get(&source)
+            .is_some_and(|users| users.iter().all(|user| union_interiors.contains(user)))
         {
             continue;
         }
@@ -389,8 +420,13 @@ pub fn root_row_sum_plans(validated: &ValidatedGraph) -> BTreeMap<NodeId, RootRo
         {
             continue;
         }
-        plan.tensor_operands = Some([arguments[0], arguments[1]]);
-        plan.interiors.insert(source.node);
+        let leader = outputs[0];
+        for output in &outputs {
+            let plan = plans.get_mut(output).expect("row sum group output");
+            plan.tensor_operands = Some([arguments[0], arguments[1]]);
+            plan.tensor_group = Some(leader);
+            plan.interiors.insert(source.node);
+        }
     }
     plans
 }
@@ -421,6 +457,15 @@ fn build_root_block_aliases(validated: &ValidatedGraph) -> RootBlockAliases {
         .map(|node| scope.arguments(node).expect("validated arguments"))
         .collect();
     plan.row_sums = root_row_sum_plans(validated);
+    for (output, row_sum) in &plan.row_sums {
+        if let Some(leader) = row_sum.tensor_group {
+            plan.tensor_row_sum_groups.entry(leader).or_default().push(*output);
+            plan.tensor_row_sum_leaders.insert(*output, leader);
+        }
+    }
+    for outputs in plan.tensor_row_sum_groups.values_mut() {
+        outputs.sort_unstable();
+    }
     let mut reserved = BTreeSet::new();
     for (output, row_sum) in &plan.row_sums {
         reserved.insert(*output);
@@ -766,6 +811,8 @@ pub enum ExecutionError {
     UnsupportedGpuOperation { site: GpuExecutionSiteKey },
     #[error("invalid frozen GPU plan: {0}")]
     InvalidGpuPlan(String),
+    #[error("execution plan/backend mismatch: frozen_gpu={plan_gpu}, backend_gpu={backend_gpu}")]
+    GpuPlanBackendMismatch { plan_gpu: bool, backend_gpu: bool },
     #[error("backend returned an invalid parallel batch length at node {0:?}")]
     InvalidBatch(NodeId),
     #[error("preimage public matrix does not match the trapdoor public matrix at node {0:?}")]
@@ -813,33 +860,13 @@ pub fn execute<B, S>(
     inputs: BTreeMap<String, RuntimeValue<B>>,
     artifact_store: &mut S,
     sampling_mode: SamplingMode<'_>,
-) -> Result<ExecutionResult<B>, ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
-    execute_with_config(
-        validated,
-        backend,
-        inputs,
-        artifact_store,
-        sampling_mode,
-        ExecutionConfig::default(),
-    )
-}
-
-pub fn execute_with_config<B, S>(
-    validated: &ValidatedGraph,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    sampling_mode: SamplingMode<'_>,
     config: ExecutionConfig,
 ) -> Result<ExecutionResult<B>, ExecutionError>
 where
     B: Backend,
     S: SessionStore,
 {
+    let preflight = execution_preflight(validated, backend, &inputs, &config, false)?;
     execute_internal(
         validated,
         backend,
@@ -850,83 +877,7 @@ where
         None,
         false,
         config,
-        None,
-    )
-    .map(|(result, _)| result)
-}
-
-/// Executes a graph through a previously frozen GPU plan. Every effective GPU
-/// site must be present in the plan; this entry point never starts calibration
-/// or a runtime pilot when a choice is absent.
-pub fn execute_with_gpu_plan<B, S>(
-    validated: &ValidatedGraph,
-    plan: &FrozenGpuPlan,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    sampling_mode: SamplingMode<'_>,
-) -> Result<ExecutionResult<B>, ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
-    execute_internal(
-        validated,
-        backend,
-        inputs,
-        artifact_store,
-        sampling_mode,
-        false,
-        None,
-        false,
-        ExecutionConfig::default(),
-        Some(Arc::new(plan.clone())),
-    )
-    .map(|(result, _)| result)
-}
-
-/// Short spelling used by callers that expose GPU warmup and production as a
-/// pair. It intentionally delegates to the same fixed-plan entry point.
-pub fn execute_gpu<B, S>(
-    validated: &ValidatedGraph,
-    plan: &FrozenGpuPlan,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    sampling_mode: SamplingMode<'_>,
-) -> Result<ExecutionResult<B>, ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
-    execute_with_gpu_plan(validated, plan, backend, inputs, artifact_store, sampling_mode)
-}
-
-/// Configured variant of [`execute_with_gpu_plan`].
-pub fn execute_with_gpu_plan_and_config<B, S>(
-    validated: &ValidatedGraph,
-    plan: &FrozenGpuPlan,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    sampling_mode: SamplingMode<'_>,
-    config: ExecutionConfig,
-) -> Result<ExecutionResult<B>, ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
-    execute_internal(
-        validated,
-        backend,
-        inputs,
-        artifact_store,
-        sampling_mode,
-        false,
-        None,
-        false,
-        config,
-        Some(Arc::new(plan.clone())),
+        preflight,
     )
     .map(|(result, _)| result)
 }
@@ -940,38 +891,16 @@ pub fn execute_in_session<B, S>(
     inputs: BTreeMap<String, RuntimeValue<B>>,
     artifact_store: &mut S,
     execution_nonce: [u8; 32],
-) -> Result<ExecutionResult<B>, ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
-    execute_in_session_with_config(
-        validated,
-        backend,
-        inputs,
-        artifact_store,
-        execution_nonce,
-        ExecutionConfig::default(),
-    )
-}
-
-/// Configured session execution with the same input and nonce contract as [`execute_in_session`].
-pub fn execute_in_session_with_config<B, S>(
-    validated: &ValidatedGraph,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    execution_nonce: [u8; 32],
     config: ExecutionConfig,
 ) -> Result<ExecutionResult<B>, ExecutionError>
 where
     B: Backend,
     S: SessionStore,
 {
-    let spec_hash = mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
-        .map_err(|error| ExecutionError::Manifest(error.to_string()))?;
-    let production = mxx_ir_core::artifact::production_id(spec_hash, execution_nonce);
+    let preflight = execution_preflight(validated, backend, &inputs, &config, false)?;
     let input_digest = runtime_inputs_digest(validated, backend, &inputs)?;
+    let spec_hash = preflight.spec_hash.clone();
+    let production = mxx_ir_core::artifact::production_id(spec_hash, execution_nonce);
     let descriptor = SessionDescriptor::new(
         production.clone(),
         validated.source.name().to_owned(),
@@ -990,13 +919,38 @@ where
         Some(production.clone()),
         session_status == SessionStatus::Finalized,
         config,
-        None,
+        preflight,
     ) {
         Ok((result, _)) => Ok(result),
         Err(error) => {
             let _ = artifact_store.release_session(&production);
             Err(error)
         }
+    }
+}
+
+/// Executes a prepared graph through the transaction semantics declared by
+/// its validated artifact outputs. Producer graphs open a durable session;
+/// transient graphs (including artifact consumers) remain non-session
+/// executions so GPU inputs are never serialized merely to obtain a nonce.
+pub fn execute_prepared<B, S>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    inputs: BTreeMap<String, RuntimeValue<B>>,
+    artifact_store: &mut S,
+    execution_nonce: [u8; 32],
+    config: ExecutionConfig,
+) -> Result<ExecutionResult<B>, ExecutionError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let produces_artifacts =
+        validated.source.outputs().values().any(|output| output.availability.is_some());
+    if produces_artifacts {
+        execute_in_session(validated, backend, inputs, artifact_store, execution_nonce, config)
+    } else {
+        execute(validated, backend, inputs, artifact_store, SamplingMode::Fresh, config)
     }
 }
 
@@ -1009,11 +963,13 @@ pub fn execute_with_trace<B, S>(
     inputs: BTreeMap<String, RuntimeValue<B>>,
     artifact_store: &mut S,
     sampling_mode: SamplingMode<'_>,
+    config: ExecutionConfig,
 ) -> Result<(ExecutionResult<B>, ExecutionTrace<B>), ExecutionError>
 where
     B: Backend,
     S: SessionStore,
 {
+    let preflight = execution_preflight(validated, backend, &inputs, &config, true)?;
     execute_internal(
         validated,
         backend,
@@ -1023,8 +979,8 @@ where
         true,
         None,
         false,
-        ExecutionConfig::default(),
-        None,
+        config,
+        preflight,
     )
 }
 
@@ -1055,22 +1011,35 @@ fn validate_fixed_plan_operation_binding(
     Ok(())
 }
 
-fn execute_internal<B, S>(
-    validated: &ValidatedGraph,
-    backend: &mut B,
-    inputs: BTreeMap<String, RuntimeValue<B>>,
-    artifact_store: &mut S,
-    sampling_mode: SamplingMode<'_>,
-    capture_trace: bool,
-    session: Option<ProductionId>,
-    finalized_session_replay: bool,
-    config: ExecutionConfig,
+struct ExecutionPreflight {
+    spec_hash: SpecHash,
     gpu_plan: Option<Arc<FrozenGpuPlan>>,
-) -> Result<(ExecutionResult<B>, ExecutionTrace<B>), ExecutionError>
-where
-    B: Backend,
-    S: SessionStore,
-{
+}
+
+/// Validate all graph, input-shape, backend-contract, and fixed-plan invariants
+/// that must hold before execution can acquire durable session state.
+fn execution_preflight<B: Backend>(
+    validated: &ValidatedGraph,
+    backend: &B,
+    inputs: &BTreeMap<String, RuntimeValue<B>>,
+    config: &ExecutionConfig,
+    capture_trace: bool,
+) -> Result<ExecutionPreflight, ExecutionError> {
+    let gpu_plan = match &config.plan {
+        ExecutionPlan::Cpu => None,
+        ExecutionPlan::FrozenGpu(plan) => Some(plan.clone()),
+    };
+    let runtime_contract = backend
+        .gpu_runtime_contract(validated, inputs)
+        .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+    let plan_is_gpu = gpu_plan.is_some();
+    let backend_is_gpu = runtime_contract.is_some();
+    if plan_is_gpu != backend_is_gpu {
+        return Err(ExecutionError::GpuPlanBackendMismatch {
+            plan_gpu: plan_is_gpu,
+            backend_gpu: backend_is_gpu,
+        });
+    }
     if let Some(plan) = &gpu_plan {
         plan.validate().map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
         for choice in &plan.loops {
@@ -1088,10 +1057,7 @@ where
                 "graph specification hash does not match the frozen plan".to_owned(),
             ));
         }
-        if let Some(runtime_contract) = backend
-            .gpu_runtime_contract(validated, &inputs)
-            .map_err(|error| ExecutionError::Backend(error.to_string()))?
-        {
+        if let Some(runtime_contract) = runtime_contract {
             if runtime_contract != plan.contract {
                 return Err(ExecutionError::InvalidGpuPlan(
                     "backend runtime contract does not match the frozen plan".to_owned(),
@@ -1101,6 +1067,35 @@ where
         backend
             .validate_frozen_gpu_plan(plan)
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
+    }
+    Ok(ExecutionPreflight { spec_hash, gpu_plan })
+}
+
+fn execute_internal<B, S>(
+    validated: &ValidatedGraph,
+    backend: &mut B,
+    inputs: BTreeMap<String, RuntimeValue<B>>,
+    artifact_store: &mut S,
+    sampling_mode: SamplingMode<'_>,
+    capture_trace: bool,
+    session: Option<ProductionId>,
+    finalized_session_replay: bool,
+    config: ExecutionConfig,
+    preflight: ExecutionPreflight,
+) -> Result<(ExecutionResult<B>, ExecutionTrace<B>), ExecutionError>
+where
+    B: Backend,
+    S: SessionStore,
+{
+    let ExecutionPreflight { spec_hash, gpu_plan } = preflight;
+    let gpu_plan_index = gpu_plan
+        .as_deref()
+        .map(FrozenGpuPlanIndex::build)
+        .transpose()
+        .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
+    let release_fence_requested = config.release_fence_interval.is_some();
+    let preimage_progress = config.preimage_progress.map(PreimageProgress::new);
+    if let Some(plan) = &gpu_plan {
         backend
             .install_frozen_gpu_plan(plan)
             .map_err(|error| ExecutionError::Backend(error.to_string()))?;
@@ -1121,13 +1116,15 @@ where
         scratch_production: None,
         staged_families: BTreeMap::new(),
         artifact_payload_cache: BTreeMap::new(),
-        preimage_progress: config.preimage_progress.map(PreimageProgress::new),
+        preimage_progress,
         executed_node_count: 0,
         last_release_fence_node_count: 0,
         has_pending_releases: false,
         execution_started: Instant::now(),
         last_progress_report: None,
         gpu_plan,
+        gpu_plan_index,
+        gpu_lowerings: GpuScopeLoweringCache::new(validated, capture_trace),
     };
     let inputs = inputs
         .into_iter()
@@ -1179,7 +1176,7 @@ where
             });
         }
     }
-    if config.release_fence_interval.is_some() {
+    if release_fence_requested {
         executor.fence_pending_releases()?;
     }
     info!(
@@ -1222,6 +1219,8 @@ struct Executor<'a, B: Backend, S: SessionStore> {
     execution_started: Instant,
     last_progress_report: Option<Instant>,
     gpu_plan: Option<Arc<FrozenGpuPlan>>,
+    gpu_plan_index: Option<FrozenGpuPlanIndex>,
+    gpu_lowerings: GpuScopeLoweringCache<'a>,
 }
 
 struct PreimageProgress {
@@ -1283,38 +1282,13 @@ impl PreimageProgress {
     }
 }
 
-/// Describe the actual fused outputs rather than the elided logical concat.
+#[cfg(all(test, feature = "gpu"))]
 fn gpu_effective_site_metadata_cached(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     node: NodeId,
 ) -> Result<GpuEffectiveSiteMetadata, String> {
-    let checked = validated.scope(scope_id).ok_or_else(|| "missing GPU scope".to_owned())?;
-    let aliases = root_block_aliases(validated, scope_id, false);
-    let output_types = if let Some((_, _, groups)) = aliases.compact_products.get(&node) {
-        groups
-            .iter()
-            .map(|aliases| {
-                aliases
-                    .first()
-                    .and_then(|wire| checked.wire_types.get(wire))
-                    .cloned()
-                    .ok_or_else(|| "missing fused output type".to_owned())
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    } else {
-        checked
-            .wire_types
-            .iter()
-            .filter(|(wire, _)| wire.node == node)
-            .map(|(_, ty)| ty.clone())
-            .collect()
-    };
-    #[cfg(feature = "gpu")]
-    let effective_identity = aliases.calibration.get(&node).cloned().transpose()?.flatten();
-    #[cfg(not(feature = "gpu"))]
-    let effective_identity = None;
-    Ok(GpuEffectiveSiteMetadata { aliases, output_types, effective_identity })
+    GpuScopeLowering::new(validated, scope_id)?.metadata(node)
 }
 
 /// Return the effective GPU operation identity and concrete output layouts
@@ -1324,218 +1298,50 @@ pub fn gpu_effective_site_metadata(
     scope_id: &FrozenGraphScopeId,
     node: NodeId,
 ) -> Result<(Vec<ConcreteWireType>, Option<[u8; 32]>), String> {
-    let metadata = gpu_effective_site_metadata_cached(validated, scope_id, node)?;
-    Ok((metadata.output_types, metadata.effective_identity))
+    GpuScopeLowering::new(validated, scope_id)?.site_metadata(node)
 }
 
-/// Return only aliases proven safe by the dispatch lowering. Warmup consumes
-/// these facts instead of re-deriving aliases from graph shape.
+/// Return only aliases proven safe by the dispatch lowering.
+#[cfg(test)]
 pub(crate) fn gpu_alias_facts(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
 ) -> BTreeMap<WireRef, WireRef> {
-    let aliases = root_block_aliases(validated, scope_id, false);
-    let mut facts = BTreeMap::new();
-    for pairs in aliases.concats.values() {
-        for (output, source) in pairs {
-            facts.insert(*output, *source);
-        }
-    }
-    for (_, _, groups) in aliases.compact_products.values() {
-        for outputs in groups {
-            // Each result block owns a new product allocation. Only duplicate
-            // views of that same result may alias; multiplicands never do.
-            if let Some((owner, views)) = outputs.split_first() {
-                for view in views {
-                    facts.insert(*view, *owner);
-                }
-            }
-        }
-    }
-    facts
+    GpuScopeLowering::new(validated, scope_id)
+        .map(|lowering| lowering.alias_facts())
+        .unwrap_or_default()
 }
 
 /// Storage owners of the result blocks created by fused multiplication.
-/// The logical concatenated product is represented by these allocations.
+#[cfg(test)]
 pub(crate) fn gpu_fused_result_owners(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
 ) -> BTreeMap<WireRef, Vec<WireRef>> {
-    root_block_aliases(validated, scope_id, false)
-        .compact_products
-        .iter()
-        .map(|(node, (_, _, groups))| {
-            (
-                WireRef { node: *node, port: Port(0) },
-                groups.iter().filter_map(|group| group.first().copied()).collect(),
-            )
-        })
-        .collect()
+    GpuScopeLowering::new(validated, scope_id)
+        .map(|lowering| lowering.fused_result_owners())
+        .unwrap_or_default()
 }
 
 /// The production lowering is the sole authority for fused profile selection.
+#[cfg(any(feature = "gpu", test))]
 pub(crate) fn gpu_fused_operation_for_site(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     node: NodeId,
 ) -> Option<crate::gpu_column_policy::FusedWarmupOperation> {
-    use crate::gpu_column_policy::FusedWarmupOperation;
-    let aliases = root_block_aliases(validated, scope_id, false);
-    if let Some(plan) = aliases.row_sums.get(&node) {
-        Some(if plan.tensor_operands.is_some() {
-            FusedWarmupOperation::TensorRowSum
-        } else {
-            FusedWarmupOperation::RowSum
-        })
-    } else if aliases.compact_products.contains_key(&node) {
-        Some(FusedWarmupOperation::CompactProduct)
-    } else if aliases.decompositions.contains_key(&node) {
-        Some(FusedWarmupOperation::Decompose)
-    } else if aliases.adds.contains_key(&node) {
-        Some(FusedWarmupOperation::RowBlockAdd)
-    } else {
-        None
-    }
+    GpuScopeLowering::new(validated, scope_id).ok()?.fused_operation(node)
 }
 
-fn canonical_gpu_effective_source_wires(
-    scope: &GraphScope,
-    node: NodeId,
-    aliases: &RootBlockAliases,
-) -> Result<Vec<WireRef>, String> {
-    let concat_arguments = |concat: NodeId| {
-        let handle = scope.node(concat).ok_or_else(|| "missing fused concat".to_owned())?;
-        scope.arguments(handle).ok_or_else(|| "missing fused concat arguments".to_owned())
-    };
-    if let Some((concat, rhs, _)) = aliases.compact_products.get(&node) {
-        let mut wires = concat_arguments(*concat)?.to_vec();
-        wires.push(*rhs);
-        return Ok(wires);
-    }
-    if let Some(concat) = aliases.decompositions.get(&node) {
-        return Ok(concat_arguments(*concat)?.to_vec());
-    }
-    if let Some((concat, right)) = aliases.adds.get(&node) {
-        let mut wires = concat_arguments(*concat)?.to_vec();
-        wires.push(*right);
-        return Ok(wires);
-    }
-    if let Some(row_sum) = aliases.row_sums.get(&node) {
-        return Ok(row_sum
-            .tensor_operands
-            .map(|operands| operands.to_vec())
-            .unwrap_or_else(|| vec![row_sum.source]));
-    }
-    scope
-        .node(node)
-        .and_then(|handle| scope.arguments(handle))
-        .map(|arguments| arguments.to_vec())
-        .ok_or_else(|| "missing GPU node arguments".to_owned())
-}
-
-/// Derive physical inputs once from the same lowering used by execution.
-/// Both warmup descriptors and fixed request metadata use this function.
+/// Derive physical inputs from the same lowering used by execution.
+/// Preparation reuses a scope snapshot; this single-call API validates it anew.
 pub fn gpu_effective_inputs(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
     node: NodeId,
     bindings: &ParamEnv,
 ) -> Result<crate::backend::GpuEffectiveInputs, String> {
-    let scope = validated.source.scope(scope_id).ok_or("missing GPU scope")?;
-    let metadata = gpu_effective_site_metadata_cached(validated, scope_id, node)?;
-    let origins = canonical_gpu_effective_source_wires(scope, node, &metadata.aliases)?;
-    // A preimage fed by GadgetTrapdoor is lowered by production to the
-    // target-only fixed gadget decomposition path.  The public matrix and
-    // trapdoor handle are validation/runtime metadata, not operands of that
-    // kernel. Keep the effective request identical to
-    // `fixed_gadget_decompose_batch`, otherwise warmup would profile a
-    // sampled-trapdoor preimage call and fixed dispatch would receive stale
-    // source/layout metadata.
-    if matches!(scope.node(node).map(|handle| handle.kind()), Some(NodeKind::PreimageSample { .. })) &&
-        origins
-            .get(1)
-            .and_then(|wire| scope.node(wire.node))
-            .is_some_and(|producer| matches!(producer.kind(), NodeKind::GadgetTrapdoor { .. }))
-    {
-        let target = *origins.get(2).ok_or("preimage node has no target operand")?;
-        let declaration = scope
-            .node(target.node)
-            .and_then(|producer| producer.output_types().get(target.port.0 as usize))
-            .ok_or("missing preimage target declaration")?;
-        let ty = mxx_ir_core::concretize_wire_type(declaration, bindings, scope_id, node)
-            .map_err(|error| error.to_string())?;
-        let matrix = ty.matrix_type();
-        let layout = crate::backend::PlannedLayoutMetadata {
-            layout_id: None,
-            rows: matrix.map_or(0, |matrix| matrix.rows),
-            columns: matrix.map_or(0, |matrix| matrix.columns),
-            ring_dimension: matrix.map_or(0, |matrix| matrix.ring_dimension),
-            representation: format!("{ty:?}"),
-        };
-        return Ok(crate::backend::GpuEffectiveInputs {
-            origins: vec![target],
-            source_layouts: vec![layout.clone()],
-            operands: vec![PlannedOperandMetadata::RowBlock {
-                logical_operand: 0,
-                block_index: 0,
-                origin: target,
-                layout,
-            }],
-            row_groups: Vec::new(),
-        });
-    }
-    let mut result = crate::backend::GpuEffectiveInputs {
-        origins: origins.clone(),
-        row_groups: metadata
-            .aliases
-            .row_sums
-            .get(&node)
-            .map(|plan| plan.rows.clone())
-            .unwrap_or_default(),
-        ..Default::default()
-    };
-    let compact = metadata.aliases.compact_products.contains_key(&node);
-    let blocks = if compact || metadata.aliases.adds.contains_key(&node) {
-        origins.len().saturating_sub(1)
-    } else if metadata.aliases.decompositions.contains_key(&node) {
-        origins.len()
-    } else {
-        0
-    };
-    for (index, origin) in origins.iter().enumerate() {
-        let declaration = scope
-            .node(origin.node)
-            .and_then(|producer| producer.output_types().get(origin.port.0 as usize))
-            .ok_or("missing effective input declaration")?;
-        let ty = mxx_ir_core::concretize_wire_type(declaration, bindings, scope_id, node)
-            .map_err(|error| error.to_string())?;
-        let matrix = ty.matrix_type();
-        let layout = crate::backend::PlannedLayoutMetadata {
-            layout_id: None,
-            rows: matrix.map_or(0, |matrix| matrix.rows),
-            columns: matrix.map_or(0, |matrix| matrix.columns),
-            ring_dimension: matrix.map_or(0, |matrix| matrix.ring_dimension),
-            representation: format!("{ty:?}"),
-        };
-        if index < blocks {
-            result.operands.push(PlannedOperandMetadata::RowBlock {
-                logical_operand: 0,
-                block_index: index,
-                origin: *origin,
-                layout: layout.clone(),
-            });
-        } else if compact {
-            result.operands.push(PlannedOperandMetadata::CompactRhs {
-                logical_operand: 1,
-                origin: *origin,
-                layout: layout.clone(),
-            });
-        }
-        if !compact || index < blocks {
-            result.source_layouts.push(layout);
-        }
-    }
-    Ok(result)
+    GpuScopeLowering::new(validated, scope_id)?.effective_inputs(node, bindings)
 }
 
 /// Resolve the fixed backend slot for one production instance.  The executor
@@ -1580,7 +1386,11 @@ where
             shape_class: scope_shape_class(self.validated, scope_id)
                 .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?,
         };
-        let choice = plan.loop_choice(key).ok_or(ExecutionError::MissingLoopPlan { site: key })?;
+        let choice = self
+            .gpu_plan_index
+            .as_ref()
+            .and_then(|index| index.loop_choice(plan, key))
+            .ok_or(ExecutionError::MissingLoopPlan { site: key })?;
         validate_gpu_plan_wave_limit(choice, self.config.max_parallel_instances.get())?;
         // Nested parallel loops share the outer wave's live budget. They are
         // intentionally bounded to one body instance, while column
@@ -1628,7 +1438,7 @@ where
     }
 
     fn fixed_node_batch_request(
-        &self,
+        &mut self,
         scope_id: &FrozenGraphScopeId,
         node: NodeId,
         instance_indices: &[usize],
@@ -1647,7 +1457,11 @@ where
             ));
         }
         let key = self.fixed_execution_site_key(scope_id, node)?;
-        let choice = plan.node_choice(key).ok_or(ExecutionError::MissingSitePlan { site: key })?;
+        let choice = self
+            .gpu_plan_index
+            .as_ref()
+            .and_then(|index| index.node_choice(plan, key))
+            .ok_or(ExecutionError::MissingSitePlan { site: key })?;
         let scope = self
             .validated
             .source
@@ -1702,8 +1516,8 @@ where
                 }
             }
         }
-        let effective_metadata = gpu_effective_site_metadata_cached(self.validated, scope_id, node)
-            .map_err(ExecutionError::InvalidGpuPlan)?;
+        let lowering = self.gpu_lowerings.get(scope_id).map_err(ExecutionError::InvalidGpuPlan)?;
+        let effective_metadata = lowering.metadata(node).map_err(ExecutionError::InvalidGpuPlan)?;
         let effective_types = &effective_metadata.output_types;
         let effective_identity = effective_metadata.effective_identity;
         #[cfg(feature = "gpu")]
@@ -1730,12 +1544,14 @@ where
         #[cfg(not(feature = "gpu"))]
         let ordinary_identity = None;
         let warmup_identity = effective_identity.or(ordinary_identity);
-        let actual_effective_operation = crate::gpu_warmup::effective_gpu_operation_for_site(
-            self.validated,
-            scope_id,
-            node,
-            handle.kind(),
-        );
+        let actual_effective_operation =
+            crate::gpu_warmup::effective_gpu_operation_for_site_with_lowering(
+                self.validated,
+                scope_id,
+                node,
+                handle.kind(),
+                Some(lowering),
+            );
         // A fixed plan is a binding to the exact warmup site, not merely to
         // the root alias transcript.  Child/loop/subgraph scopes deliberately
         // have no root calibration metadata, so this check must remain
@@ -1753,9 +1569,13 @@ where
         let mut output_layout_metadata = Vec::with_capacity(effective_types.len());
         for (ty, id) in effective_types.iter().zip(&choice.output_layouts) {
             if let Some(matrix) = ty.matrix_type() {
-                let layout = plan.layout(*id).ok_or_else(|| {
-                    ExecutionError::InvalidGpuPlan("missing output layout".into())
-                })?;
+                let layout = self
+                    .gpu_plan_index
+                    .as_ref()
+                    .and_then(|index| index.layout(plan, *id))
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidGpuPlan("missing output layout".into())
+                    })?;
                 if (layout.rows, layout.columns, layout.ring_dimension) !=
                     (matrix.rows, matrix.columns, matrix.ring_dimension)
                 {
@@ -1786,13 +1606,9 @@ where
                 });
             }
         }
-        let inputs = gpu_effective_inputs(
-            self.validated,
-            scope_id,
-            node,
-            &instance_envs[*instance_indices.first().unwrap_or(&0)],
-        )
-        .map_err(ExecutionError::InvalidGpuPlan)?;
+        let inputs = lowering
+            .effective_inputs(node, &instance_envs[*instance_indices.first().unwrap_or(&0)])
+            .map_err(ExecutionError::InvalidGpuPlan)?;
         let output_ports = if effective_ports == 0 { output_ports } else { effective_ports };
         let mut request = PlannedNodeBatchRequest::for_lowered_operation(
             key,
@@ -1884,7 +1700,9 @@ where
             ExecutionError::MissingSubgraph { node: NodeId(0), name: format!("{scope_id:?}") }
         })?;
         let schedule = &validated_scope.liveness;
-        let block_aliases = root_block_aliases(self.validated, scope_id, self.trace.is_some());
+        let block_aliases = Arc::clone(
+            self.gpu_lowerings.get(scope_id).map_err(ExecutionError::InvalidGpuPlan)?.aliases(),
+        );
         if envs.len() == 1 &&
             self.config.release_fence_interval.is_none() &&
             !tracing::enabled!(tracing::Level::INFO)
@@ -2086,14 +1904,21 @@ where
             if let Some(outputs) = block_aliases.row_sum_captures.get(&node.id) {
                 for index in 0..envs.len() {
                     self.set_placement(placements[index])?;
+                    let mut captured_tensor = None;
                     for output in outputs {
                         let row_sum = &block_aliases.row_sums[output];
                         let matrices = if let Some([left, right]) = row_sum.tensor_operands {
-                            // Materialize in the original Tensor argument order,
-                            // before its unchanged liveness releases either input.
-                            let left = self.matrix(&mut values[index], left)?;
-                            let right = self.matrix(&mut values[index], right)?;
-                            (left, Some(right))
+                            // Materialize tensor operands once for a shared
+                            // multi-output group; the fused backend call below
+                            // performs the tensor product exactly once.
+                            if let Some((left, right)) = captured_tensor.clone() {
+                                (left, Some(right))
+                            } else {
+                                let left = self.matrix(&mut values[index], left)?;
+                                let right = self.matrix(&mut values[index], right)?;
+                                captured_tensor = Some((left.clone(), right.clone()));
+                                (left, Some(right))
+                            }
                         } else {
                             (self.matrix(&mut values[index], row_sum.source)?, None)
                         };
@@ -2277,7 +2102,108 @@ where
                         handle.output_types().len(),
                     )?;
                 }
-                if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
+                if block_aliases
+                    .tensor_row_sum_leaders
+                    .get(&node.id)
+                    .is_some_and(|leader| *leader != node.id)
+                {
+                    // The leader dispatch below installs every output in the
+                    // shared group. This structural row-sum node has no
+                    // second backend launch.
+                } else if let Some(group) = block_aliases.tensor_row_sum_groups.get(&node.id) {
+                    let outputs = if self.gpu_plan.is_some() {
+                        let mut requests = Vec::with_capacity(indices.len());
+                        for &index in indices {
+                            let metadata = self
+                                .fixed_node_batch_request(
+                                    scope_id,
+                                    node.id,
+                                    &[index],
+                                    &[paths[index].clone()],
+                                    envs,
+                                    handle.output_types().len(),
+                                )?
+                                .ok_or_else(|| {
+                                    ExecutionError::InvalidGpuPlan(
+                                        "fixed fused request has no plan metadata".into(),
+                                    )
+                                })?;
+                            let (source, right) = row_sum_sources[index]
+                                .remove(&node.id)
+                                .expect("shared row sum source survives until leader");
+                            let Some(right) = right else {
+                                return Err(ExecutionError::InvalidBatch(node.id));
+                            };
+                            requests.push(FusedBatchRequest::TensorRowSums {
+                                metadata,
+                                source,
+                                right,
+                                rows: group
+                                    .iter()
+                                    .map(|output| block_aliases.row_sums[output].rows.clone())
+                                    .collect(),
+                            });
+                        }
+                        self.backend.fixed_fused_batch(requests)
+                    } else {
+                        let mut requests = Vec::with_capacity(indices.len());
+                        for &index in indices {
+                            let (source, right) = row_sum_sources[index]
+                                .remove(&node.id)
+                                .expect("shared row sum source survives until leader");
+                            let Some(right) = right else {
+                                return Err(ExecutionError::InvalidBatch(node.id));
+                            };
+                            requests.push(DynamicFusedBatchRequest::TensorRowSums {
+                                source,
+                                right,
+                                rows: group
+                                    .iter()
+                                    .map(|output| block_aliases.row_sums[output].rows.clone())
+                                    .collect(),
+                            });
+                        }
+                        self.backend.fused_batch(requests)
+                    }
+                    .map_err(Self::backend_error)?;
+                    if outputs.len() != indices.len() {
+                        return Err(ExecutionError::InvalidBatch(node.id));
+                    }
+                    for (&index, output) in indices.iter().zip(outputs) {
+                        // Followers were captured only to preserve liveness
+                        // until the group dispatch. Drop every group's
+                        // remaining source ownership now; retaining follower
+                        // entries would keep GPU inputs alive past the single
+                        // shared TensorRowSum launch.
+                        for output_node in group {
+                            row_sum_sources[index].remove(output_node);
+                        }
+                        let FusedBatchOutput::Matrices(output) = output else {
+                            return Err(ExecutionError::InvalidBatch(node.id));
+                        };
+                        if output.len() != 1 {
+                            return Err(ExecutionError::InvalidBatch(node.id));
+                        }
+                        let fused = output.into_iter().next().expect("one flattened output");
+                        let mut start = 0usize;
+                        for output_node in group.iter().copied() {
+                            let rows = block_aliases.row_sums[&output_node].rows.len();
+                            let end = start.saturating_add(rows);
+                            let matrix = self
+                                .backend
+                                .slice(&fused, Some(&RuntimeIndexRange { start, end }), None)
+                                .map_err(Self::backend_error)?;
+                            self.put(
+                                &mut values[index],
+                                output_node,
+                                0,
+                                RuntimeValue::matrix(matrix),
+                            );
+                            start = end;
+                        }
+                        self.has_pending_releases = true;
+                    }
+                } else if let Some(row_sum) = block_aliases.row_sums.get(&node.id) {
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
@@ -7290,8 +7216,9 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::{
-        artifact::MemoryArtifactStore,
+        artifact::{FileArtifactStore, MemoryArtifactStore},
         backend::poly::{CpuDcrtBackend, cpu_backend},
+        gpu_execution_plan::{GpuDeviceBudget, GpuPlanContract},
     };
     use mxx_dsl::{DslContext, Family, HashTag, Int, MatType, Ring, Subgraph, iterate, parallel};
     use mxx_ir_core::{
@@ -7309,6 +7236,7 @@ mod tests {
     use num_bigint::{BigInt, Sign};
     use num_traits::ToPrimitive;
     use rand::Rng;
+    use std::{fs, path::Path};
 
     #[test]
     fn gadget_trapdoor_preimages_round_trip_with_the_decomposition_bound() {
@@ -7332,9 +7260,15 @@ mod tests {
         let validated = built.validate(&ParamEnv::default()).unwrap();
         let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
-        let mut result =
-            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let mut result = execute(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let expected = backend
             .gadget_decompose(&DCRTPolyMatrix::zero(&parameters, 1, 2), false, Some(digits))
             .unwrap();
@@ -7362,6 +7296,249 @@ mod tests {
             Err(ExecutionError::InvalidGpuPlan(message)) if message.contains("exceeding execution limit 64")
         ));
         assert!(validate_gpu_plan_wave_limit(&choice, 65).is_ok());
+    }
+
+    fn invalid_fixed_plan_config() -> ExecutionConfig {
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(FrozenGpuPlan {
+                contract: GpuPlanContract {
+                    graph_specification_hash: [0; 32],
+                    backend_identity: "invalid-test-backend".to_owned(),
+                    logical_to_physical_devices: vec![0],
+                    device_budgets: vec![GpuDeviceBudget {
+                        device: 0,
+                        device_bytes: 0,
+                        pinned_host_bytes: 0,
+                        host_bytes: 0,
+                    }],
+                    shape_contract_hash: [0; 32],
+                    backend_revision: "invalid-test-revision".to_owned(),
+                },
+                layouts: Vec::new(),
+                loops: vec![GpuLoopChoice {
+                    key: GpuLoopSiteKey { site: 0, shape_class: 0 },
+                    loop_count: 0,
+                    wave_instances: 0,
+                    tail_instances: 0,
+                }],
+                nodes: Vec::new(),
+            })),
+            ..ExecutionConfig::default()
+        }
+    }
+
+    fn preflight_session_graph() -> ValidatedGraph {
+        DslContext::new("runtime-session-plan-preflight")
+            .output("value", Int::constant(7))
+            .expect("constant output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation")
+    }
+
+    fn probe_gpu_contract() -> GpuPlanContract {
+        GpuPlanContract {
+            graph_specification_hash: [0; 32],
+            backend_identity: "probe-gpu".to_owned(),
+            logical_to_physical_devices: vec![0],
+            device_budgets: vec![GpuDeviceBudget {
+                device: 0,
+                device_bytes: 1,
+                pinned_host_bytes: 1,
+                host_bytes: 1,
+            }],
+            shape_contract_hash: [0; 32],
+            backend_revision: "probe".to_owned(),
+        }
+    }
+
+    fn invalid_plan_probe_backend() -> PlacementProbeBackend {
+        PlacementProbeBackend { gpu_contract: Some(probe_gpu_contract()), ..Default::default() }
+    }
+
+    #[test]
+    fn gpu_plan_backend_mismatch_is_rejected_before_session_mutation() {
+        let graph = preflight_session_graph();
+        let nonce = [0xA0; 32];
+        let production = mxx_ir_core::artifact::production_id(
+            mxx_ir_core::encoding::spec_hash(&graph.source, &graph.bindings).unwrap(),
+            nonce,
+        );
+
+        let mut store = MemoryArtifactStore::default();
+        let mut gpu_backend = PlacementProbeBackend {
+            gpu_contract: Some(probe_gpu_contract()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut gpu_backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                ExecutionConfig::default(),
+            ),
+            Err(ExecutionError::GpuPlanBackendMismatch { plan_gpu: false, backend_gpu: true })
+        ));
+        assert_eq!(store.session_status(&production), None);
+        assert_eq!(store.manifest(&production), None);
+
+        let mut cpu_backend = PlacementProbeBackend::default();
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut cpu_backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                invalid_fixed_plan_config(),
+            ),
+            Err(ExecutionError::GpuPlanBackendMismatch { plan_gpu: true, backend_gpu: false })
+        ));
+        assert_eq!(store.session_status(&production), None);
+        assert_eq!(store.manifest(&production), None);
+        assert_eq!(cpu_backend.frozen_plan_installs.get(), 0);
+    }
+
+    fn snapshot_tree(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+        fn visit(root: &Path, path: &Path, snapshot: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(path).expect("read snapshot directory") {
+                let entry = entry.expect("snapshot directory entry");
+                let path = entry.path();
+                if path.is_dir() {
+                    visit(root, &path, snapshot);
+                } else {
+                    snapshot.insert(
+                        path.strip_prefix(root).expect("snapshot path under root").to_owned(),
+                        fs::read(path).expect("read snapshot file"),
+                    );
+                }
+            }
+        }
+        let mut snapshot = BTreeMap::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    #[test]
+    fn invalid_fixed_plan_does_not_mutate_existing_memory_session_or_backend() {
+        let graph = preflight_session_graph();
+        let nonce = [0xA1; 32];
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let production = mxx_ir_core::artifact::production_id(
+            mxx_ir_core::encoding::spec_hash(&graph.source, &graph.bindings).unwrap(),
+            nonce,
+        );
+        let mut store = MemoryArtifactStore::default();
+        let mut backend = invalid_plan_probe_backend();
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                invalid_fixed_plan_config(),
+            ),
+            Err(ExecutionError::InvalidGpuPlan(_))
+        ));
+        assert_eq!(store.session_status(&production), None);
+        assert_eq!(store.manifest(&production), None);
+        assert_eq!(backend.frozen_plan_installs.get(), 0);
+        execute_in_session(
+            &graph,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+            ExecutionConfig::default(),
+        )
+        .expect("initial memory session");
+        let status = store.session_status(&production);
+        let manifest = store.manifest(&production).cloned();
+        let mut backend = invalid_plan_probe_backend();
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                invalid_fixed_plan_config(),
+            ),
+            Err(ExecutionError::InvalidGpuPlan(_))
+        ));
+        assert_eq!(store.session_status(&production), status);
+        assert_eq!(store.manifest(&production).cloned(), manifest);
+        assert_eq!(backend.frozen_plan_installs.get(), 0);
+        execute_in_session(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+            ExecutionConfig::default(),
+        )
+        .expect("session remains resumable after rejected plan");
+    }
+
+    #[test]
+    fn invalid_fixed_plan_does_not_mutate_existing_file_session_or_backend() {
+        let graph = preflight_session_graph();
+        let nonce = [0xA2; 32];
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let directory = tempfile::tempdir().expect("temporary artifact directory");
+        let mut store = FileArtifactStore::new(directory.path()).expect("create file store");
+        let before_empty = snapshot_tree(directory.path());
+        let mut backend = invalid_plan_probe_backend();
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                invalid_fixed_plan_config(),
+            ),
+            Err(ExecutionError::InvalidGpuPlan(_))
+        ));
+        assert_eq!(snapshot_tree(directory.path()), before_empty);
+        assert_eq!(backend.frozen_plan_installs.get(), 0);
+        execute_in_session(
+            &graph,
+            &mut cpu_backend([parameters.clone()]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+            ExecutionConfig::default(),
+        )
+        .expect("initial file session");
+        let before = snapshot_tree(directory.path());
+        let mut backend = invalid_plan_probe_backend();
+        assert!(matches!(
+            execute_in_session(
+                &graph,
+                &mut backend,
+                BTreeMap::new(),
+                &mut store,
+                nonce,
+                invalid_fixed_plan_config(),
+            ),
+            Err(ExecutionError::InvalidGpuPlan(_))
+        ));
+        assert_eq!(snapshot_tree(directory.path()), before);
+        assert_eq!(backend.frozen_plan_installs.get(), 0);
+        execute_in_session(
+            &graph,
+            &mut cpu_backend([parameters]),
+            BTreeMap::new(),
+            &mut store,
+            nonce,
+            ExecutionConfig::default(),
+        )
+        .expect("file session remains resumable after rejected plan");
     }
 
     #[test]
@@ -7685,11 +7862,24 @@ mod tests {
         ]);
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
-        let optimized =
-            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
-        let (reference, _) =
-            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let optimized = execute(
+            &graph,
+            &mut backend,
+            inputs.clone(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let (reference, _) = execute_with_trace(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         for name in ["top", "twice", "bottom"] {
             assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
         }
@@ -7753,11 +7943,24 @@ mod tests {
         ]);
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
-        let optimized =
-            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
-        let (reference, _) =
-            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let optimized = execute(
+            &graph,
+            &mut backend,
+            inputs.clone(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let (reference, _) = execute_with_trace(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
         let middle = &matrices[1] + &matrices[2];
         let expected = matrices[0].concat_rows(&[&middle, &matrices[3]]);
@@ -7849,10 +8052,16 @@ mod tests {
                 ("right".to_owned(), RuntimeValue::matrix(right.clone())),
             ]);
             let mut store = MemoryArtifactStore::default();
-            let optimized =
-                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
-                    .unwrap();
-            let fenced = execute_with_config(
+            let optimized = execute(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let fenced = execute(
                 &graph,
                 &mut backend,
                 inputs.clone(),
@@ -7865,14 +8074,97 @@ mod tests {
             )
             .unwrap();
             assert_eq!(matrix_output(&fenced, "sum"), &expected);
-            let (reference, _) =
-                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                    .unwrap();
+            let (reference, _) = execute_with_trace(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
             assert_eq!(matrix_output(&optimized, "sum"), &expected);
             for name in reference.outputs.keys() {
                 assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
             }
         }
+    }
+
+    #[test]
+    fn shared_tensor_row_sum_group_executes_tensor_once_and_matches_trace() {
+        use mxx_dsl::Mat;
+        use mxx_ir_core::node::{ConcatAxis, IndexRange};
+        let parameters = DCRTPolyParams::new(8, 1, 20, 4, None, None);
+        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
+        let scalar = |value: u8| {
+            DCRTPolyMatrix::from_poly_vec_row(
+                &parameters,
+                vec![DCRTPoly::from_biguints(&parameters, &[value.into()])],
+            )
+        };
+        let left = scalar(2).concat_rows(&[&scalar(3)]);
+        let right = scalar(5).concat_rows(&[&scalar(7)]);
+        let ring = Ring::new(modulus, 8usize);
+        let tensor = ring.input("left", (2, 1)).tensor(ring.input("right", (2, 1)));
+        let row = |index: usize| {
+            tensor
+                .clone()
+                .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
+        };
+        let leading = Mat::concat(ConcatAxis::Rows, vec![row(0)]);
+        let carry = Mat::concat(ConcatAxis::Rows, vec![row(1) + row(2), row(3)]);
+        let graph = DslContext::new("shared-tensor-row-sum")
+            .output("leading", leading)
+            .unwrap()
+            .output("carry", carry)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plan = root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
+        assert_eq!(plan.tensor_row_sum_groups.len(), 1);
+        assert_eq!(plan.tensor_row_sum_groups.values().next().unwrap().len(), 2);
+        let leader = *plan.tensor_row_sum_groups.keys().next().unwrap();
+        let lowering = GpuScopeLowering::new(&graph, &FrozenGraphScopeId::Root).unwrap();
+        let effective = lowering.effective_inputs(leader, &graph.bindings).unwrap();
+        assert_eq!(effective.row_sum_groups.len(), 2);
+        assert_eq!(effective.row_sum_groups.iter().map(Vec::len).sum::<usize>(), 3);
+        assert_eq!(
+            lowering.fused_operation(leader),
+            Some(crate::gpu_column_policy::FusedWarmupOperation::TensorRowSum)
+        );
+        let expected = left.tensor(&right);
+        let expected_leading = expected.sum_rows(&[vec![0]]);
+        let expected_carry = expected.sum_rows(&[vec![1, 2], vec![3]]);
+        let inputs = BTreeMap::from([
+            ("left".to_owned(), RuntimeValue::matrix(left)),
+            ("right".to_owned(), RuntimeValue::matrix(right)),
+        ]);
+        let mut backend = cpu_backend([parameters]);
+        let mut store = MemoryArtifactStore::default();
+        let optimized = execute(
+            &graph,
+            &mut backend,
+            inputs.clone(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        let (reference, _) = execute_with_trace(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
+        assert_eq!(matrix_output(&optimized, "leading"), &expected_leading);
+        assert_eq!(matrix_output(&optimized, "carry"), &expected_carry);
+        assert_eq!(matrix_output(&optimized, "leading"), matrix_output(&reference, "leading"));
+        assert_eq!(matrix_output(&optimized, "carry"), matrix_output(&reference, "carry"));
     }
 
     #[test]
@@ -7977,12 +8269,24 @@ mod tests {
             let inputs = BTreeMap::from([("source".to_owned(), RuntimeValue::matrix(source))]);
             let mut backend = cpu_backend([parameters]);
             let mut store = MemoryArtifactStore::default();
-            let optimized =
-                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
-                    .unwrap();
-            let (reference, _) =
-                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                    .unwrap();
+            let optimized = execute(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let (reference, _) = execute_with_trace(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
             for name in optimized.outputs.keys() {
                 assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
             }
@@ -8065,12 +8369,24 @@ mod tests {
             ]);
             let mut backend = cpu_backend([parameters]);
             let mut store = MemoryArtifactStore::default();
-            let optimized =
-                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
-                    .unwrap();
-            let (reference, _) =
-                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                    .unwrap();
+            let optimized = execute(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let (reference, _) = execute_with_trace(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
             assert_eq!(matrix_output(&optimized, "sum"), matrix_output(&reference, "sum"));
             if retain_concat {
                 assert_eq!(
@@ -8200,17 +8516,21 @@ mod tests {
         let plan = crate::gpu_warmup::warmup_gpu_from_validated(graph, &config)
             .expect("validated DSL graph warmup")
             .plan;
-        let mut fixed_backend = cpu_backend([parameters.clone()]);
-        let mut fixed_store = MemoryArtifactStore::default();
-        let fixed = execute_with_gpu_plan(
+        // The planner output is validated independently below; execution uses
+        // the CPU contract here. A frozen GPU plan must never be accepted by a
+        // CPU backend merely to make this comparison test pass.
+        assert!(plan.validate().is_ok(), "validated DSL graph produced an invalid plan");
+        let mut cpu_execution_backend = cpu_backend([parameters.clone()]);
+        let mut cpu_store = MemoryArtifactStore::default();
+        let cpu = execute(
             graph,
-            &plan,
-            &mut fixed_backend,
+            &mut cpu_execution_backend,
             inputs.clone(),
-            &mut fixed_store,
+            &mut cpu_store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
-        .expect("fixed execution");
+        .expect("CPU execution");
         let mut trace_backend = cpu_backend([parameters]);
         let mut trace_store = MemoryArtifactStore::default();
         let (trace, _) = execute_with_trace(
@@ -8219,11 +8539,151 @@ mod tests {
             inputs,
             &mut trace_store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("trace execution");
         for name in output_names {
-            assert_eq!(matrix_output(&fixed, name), matrix_output(&trace, name));
+            assert_eq!(matrix_output(&cpu, name), matrix_output(&trace, name));
         }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn fixed_dispatch_requests_reuse_one_lowering_snapshot_per_scope() {
+        use crate::gpu_execution_plan::{GpuLayout, LayoutId};
+        use mxx_dsl::Ring;
+
+        let ring = Ring::new(97u64, 8usize);
+        let left = ring.input("left", (1, 1));
+        let right = ring.input("right", (1, 1));
+        let child_add = Subgraph::define(
+            "fixed-dispatch-child-add",
+            (MatType(ring.matrix_type((1, 1))), MatType(ring.matrix_type((1, 1)))),
+            |(left, right)| Ok(left + right),
+        )
+        .expect("child definition");
+        let graph = DslContext::new("fixed-dispatch-snapshot-count")
+            .output("root_first", left.clone() + right.clone())
+            .expect("root first output")
+            .output("root_second", right.clone() + left.clone())
+            .expect("root second output")
+            .output("child", child_add.call((left.clone(), right.clone())).expect("child call"))
+            .expect("child output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validation");
+
+        let mut nodes = Vec::new();
+        for (scope_id, checked) in &graph.scopes {
+            let scope = graph.source.scope(scope_id).expect("scope");
+            let shape_class = scope_shape_class(&graph, scope_id).expect("shape class");
+            for (position, handle) in checked.execution_order.iter().enumerate() {
+                if !matches!(handle.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) {
+                    continue;
+                }
+                let node = NodeId(position as u64);
+                let arguments = scope.arguments(handle).expect("arguments");
+                let argument_types = arguments
+                    .iter()
+                    .map(|wire| checked.wire_types[wire].clone())
+                    .collect::<Vec<_>>();
+                let output_types = (0..handle.output_types().len())
+                    .map(|port| {
+                        checked.wire_types[&WireRef { node, port: Port(port as u32) }].clone()
+                    })
+                    .collect::<Vec<_>>();
+                let operation = effective_gpu_operation(handle.kind());
+                nodes.push(GpuNodeChoice {
+                    key: GpuExecutionSiteKey { site: node.0, shape_class, instance_class: 0 },
+                    loop_site: None,
+                    operation_identity: crate::gpu_calibration::gpu_calibration_operation_identity(
+                        handle.kind(),
+                        &argument_types,
+                        &output_types,
+                        &graph.bindings,
+                    )
+                    .expect("operation identity"),
+                    effective_operation: operation,
+                    column_capability: crate::gpu_column_policy::capability_for_effective_operation(
+                        operation,
+                        &argument_types,
+                    ),
+                    output_layouts: vec![1 as LayoutId],
+                    columns_per_job: vec![1],
+                    implementation_variant: "fixed-dispatch-test".into(),
+                    preimage_max_attempts: None,
+                });
+            }
+        }
+        assert_eq!(nodes.len(), 3, "expected two root and one child add sites");
+        let matrix = graph
+            .root_scope()
+            .wire_types
+            .values()
+            .find_map(|ty| ty.matrix_type())
+            .expect("matrix type");
+        let plan = FrozenGpuPlan {
+            contract: probe_gpu_contract(),
+            layouts: vec![GpuLayout {
+                id: 1,
+                columns: matrix.columns,
+                rows: matrix.rows,
+                ring_dimension: matrix.ring_dimension,
+                representation: format!("{:?}", ConcreteWireType::Matrix(matrix.clone())),
+                instance_device_stride: 0,
+                owner_intervals: Vec::new(),
+            }],
+            loops: Vec::new(),
+            nodes,
+        };
+        let gpu_plan_index = FrozenGpuPlanIndex::build(&plan).expect("plan index");
+
+        let mut backend = PlacementProbeBackend::default();
+        let mut store = MemoryArtifactStore::default();
+        let mut executor = Executor {
+            validated: &graph,
+            backend: &mut backend,
+            artifact_store: &mut store,
+            sampling_mode: SamplingMode::Fresh,
+            trace: None,
+            session: None,
+            finalized_session_replay: false,
+            config: ExecutionConfig::default(),
+            production: ProductionId { spec_hash: SpecHash([0; 32]), execution_nonce: [0; 32] },
+            scratch_production: None,
+            staged_families: BTreeMap::new(),
+            artifact_payload_cache: BTreeMap::new(),
+            preimage_progress: None,
+            executed_node_count: 0,
+            last_release_fence_node_count: 0,
+            has_pending_releases: false,
+            execution_started: Instant::now(),
+            last_progress_report: None,
+            gpu_plan: Some(Arc::new(plan)),
+            gpu_plan_index: Some(gpu_plan_index),
+            gpu_lowerings: GpuScopeLoweringCache::new(&graph, false),
+        };
+        let env = ParamEnv::default();
+        let empty_path = vec![Vec::new()];
+        let envs = vec![env];
+        for (scope_id, checked) in &graph.scopes {
+            for (position, handle) in checked.execution_order.iter().enumerate() {
+                if matches!(handle.kind(), NodeKind::MatrixBinary(MatrixBinaryOp::Add)) {
+                    executor
+                        .prepare_fixed_node_batch(
+                            scope_id,
+                            NodeId(position as u64),
+                            &[0],
+                            &empty_path,
+                            &envs,
+                            1,
+                        )
+                        .expect("fixed request");
+                }
+            }
+        }
+        assert_eq!(executor.gpu_lowerings.construction_count(), graph.scopes.len());
     }
 
     #[cfg(feature = "gpu")]
@@ -8583,8 +9043,9 @@ mod tests {
         let (add_node, (concat_node, logical_rhs)) =
             aliases.adds.iter().next().expect("row-block add lowering");
         let scope = graph.source.scope(&FrozenGraphScopeId::Root).expect("root graph scope");
-        let effective_wires = canonical_gpu_effective_source_wires(scope, *add_node, &aliases)
-            .expect("canonical row-block sources");
+        let effective_wires =
+            gpu_metadata::canonical_gpu_effective_source_wires(scope, *add_node, &aliases)
+                .expect("canonical row-block sources");
         assert_eq!(effective_wires.len(), 3);
         assert_eq!(effective_wires.last(), Some(logical_rhs));
         assert_eq!(
@@ -8608,13 +9069,16 @@ mod tests {
             .expect("frozen row-block output layout");
         assert_eq!((output_layout.rows, output_layout.columns), (3, 3));
 
-        let output = execute_with_gpu_plan(
+        let output = execute(
             &graph,
-            &warmup.plan,
             &mut backend,
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig {
+                plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("fixed GPU execution");
         let RuntimeValue::Matrix(actual) = &output.outputs["out"] else {
@@ -8689,6 +9153,33 @@ mod tests {
                 row_aliases.calibration[node].as_ref().unwrap().clone()
             );
         }
+
+        // BGV's unrelinearized product keeps three output rows: product row
+        // 0, rows 1+2, and row 3. This exact shape must retain the tensor
+        // operands in the immutable warmup lowering.
+        let product = ring.input("bgv-left", (2, 1)).tensor(ring.input("bgv-right", (2, 1)));
+        let bgv_output = Mat::concat(
+            ConcatAxis::Rows,
+            vec![row(&product, 0), row(&product, 1) + row(&product, 2), row(&product, 3)],
+        );
+        let bgv_graph = DslContext::new("identity-bgv-quadratic-row-sum")
+            .output("out", bgv_output)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let bgv_lowering = GpuScopeLowering::new(&bgv_graph, &FrozenGraphScopeId::Root).unwrap();
+        let bgv_node = bgv_lowering
+            .aliases()
+            .row_sums
+            .iter()
+            .find_map(|(node, plan)| plan.tensor_operands.is_some().then_some(*node))
+            .expect("BGV quadratic tensor row-sum site");
+        assert_eq!(
+            bgv_lowering.fused_operation(bgv_node),
+            Some(crate::gpu_column_policy::FusedWarmupOperation::TensorRowSum)
+        );
     }
 
     #[test]
@@ -8775,12 +9266,24 @@ mod tests {
             ]);
             let mut backend = cpu_backend([parameters]);
             let mut store = MemoryArtifactStore::default();
-            let optimized =
-                execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh)
-                    .unwrap();
-            let (reference, _) =
-                execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                    .unwrap();
+            let optimized = execute(
+                &graph,
+                &mut backend,
+                inputs.clone(),
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
+            let (reference, _) = execute_with_trace(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
             for name in ["first", "second"] {
                 assert_eq!(matrix_output(&optimized, name), matrix_output(&reference, name));
             }
@@ -8900,9 +9403,11 @@ mod tests {
     struct PlacementProbeBackend {
         active: usize,
         encoded: std::cell::RefCell<Vec<(SmallMatrixSemanticKind, usize, usize)>>,
+        frozen_plan_installs: std::cell::Cell<usize>,
         fail_broadcast_preparation: bool,
         fail_move_at: Option<usize>,
         fail_at: Option<(SmallMatrixSemanticKind, usize)>,
+        gpu_contract: Option<GpuPlanContract>,
     }
 
     macro_rules! unused_probe_operation {
@@ -8917,6 +9422,29 @@ mod tests {
         type SmallMatrix = PlacementProbeSmallMatrix;
         type Trapdoor = ();
         type Error = PlacementProbeError;
+
+        fn install_frozen_gpu_plan(&mut self, plan: &FrozenGpuPlan) -> Result<(), Self::Error> {
+            assert!(plan.validate().is_ok(), "placement probe received an invalid GPU plan");
+            self.frozen_plan_installs.set(self.frozen_plan_installs.get() + 1);
+            Ok(())
+        }
+
+        fn gpu_runtime_contract(
+            &self,
+            validated: &ValidatedGraph,
+            inputs: &BTreeMap<String, RuntimeValue<Self>>,
+        ) -> Result<Option<GpuPlanContract>, Self::Error> {
+            Ok(self.gpu_contract.clone().map(|mut contract| {
+                contract.graph_specification_hash =
+                    mxx_ir_core::encoding::spec_hash(&validated.source, &validated.bindings)
+                        .expect("validated placement-probe graph has a canonical hash")
+                        .0;
+                contract.shape_contract_hash =
+                    mxx_ir_core::encoding::hash_canonical(&inputs.keys().collect::<Vec<_>>())
+                        .expect("placement-probe input names have a canonical hash");
+                contract
+            }))
+        }
 
         fn polynomial_from_values(
             &mut self,
@@ -9425,7 +9953,7 @@ mod tests {
         };
         let mut backend = PlacementProbeBackend::default();
         let mut store = MemoryArtifactStore::default();
-        let result = execute_with_config(
+        let result = execute(
             &validated,
             &mut backend,
             BTreeMap::from([
@@ -9466,7 +9994,7 @@ mod tests {
             ..PlacementProbeBackend::default()
         };
         assert!(matches!(
-            execute_with_config(
+            execute(
                 &validated,
                 &mut failing_backend,
                 BTreeMap::from([
@@ -9491,7 +10019,7 @@ mod tests {
         let mut preparation_failing_backend =
             PlacementProbeBackend { fail_move_at: Some(1), ..PlacementProbeBackend::default() };
         assert!(matches!(
-            execute_with_config(
+            execute(
                 &validated,
                 &mut preparation_failing_backend,
                 BTreeMap::from([
@@ -9518,7 +10046,7 @@ mod tests {
             ..PlacementProbeBackend::default()
         };
         assert!(matches!(
-            execute_with_config(
+            execute(
                 &validated,
                 &mut broadcast_failing_backend,
                 BTreeMap::from([
@@ -9578,6 +10106,7 @@ mod tests {
             BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(input_matrix.clone()))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "reconstructed"), &input_matrix);
@@ -9610,6 +10139,7 @@ mod tests {
             )]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "lifted"), matrix_output(&result, "expected"));
@@ -9631,7 +10161,7 @@ mod tests {
         let validated = built.validate(&ParamEnv::default()).expect("validation");
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
-        let mut result = execute_with_config(
+        let mut result = execute(
             &validated,
             &mut backend,
             BTreeMap::new(),
@@ -9684,9 +10214,15 @@ mod tests {
             .expect("validation");
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
-        let mut result =
-            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .expect("execution");
+        let mut result = execute(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .expect("execution");
         let gathered = result
             .materialize_output("gathered", &backend, &mut store)
             .expect("materialized gathered family")
@@ -9781,6 +10317,7 @@ mod tests {
             ]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         // Same literal bytes as the Lean completeHashTag zero regression: integer marker,
@@ -9862,6 +10399,7 @@ mod tests {
             BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32]))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         // Literal protocol bytes exercise the executor against the existing primitive sampler.
@@ -9919,6 +10457,7 @@ mod tests {
                 BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x5a; 32]))]),
                 store,
                 SamplingMode::Fresh,
+                ExecutionConfig::default(),
             )
             .expect("dynamic hash execution");
             let RuntimeValue::IndexedFamily(values) =
@@ -9977,6 +10516,7 @@ mod tests {
             BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(vec![0x39; 32]))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "product"), matrix_output(&result, "plain"));
@@ -10011,6 +10551,7 @@ mod tests {
             ]),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert_eq!(matrix_output(&result, "product"), &identity);
@@ -10043,6 +10584,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("import execution");
         assert_eq!(matrix_output(&imported_result, "product"), &identity);
@@ -10057,6 +10599,7 @@ mod tests {
                 ]),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
+                ExecutionConfig::default()
             ),
             Err(ExecutionError::ValueKind(_))
         ));
@@ -10077,6 +10620,7 @@ mod tests {
             ),
             &mut session_store,
             session_nonce,
+            ExecutionConfig::default(),
         )
         .expect("initial compact-input session");
         let zero = CpuSmallMatrix::new(DCRTPolyMatrix::zero(&parameters, 1, 1), 1u8.into())
@@ -10088,6 +10632,7 @@ mod tests {
                 session_inputs(zero),
                 &mut session_store,
                 session_nonce,
+                ExecutionConfig::default(),
             ),
             Err(ExecutionError::Artifact(_))
         ));
@@ -10171,7 +10716,7 @@ mod tests {
             .expect("validation");
         let mut backend = cpu_backend([parameters.clone()]);
         let mut store = MemoryArtifactStore::default();
-        let result = execute_with_config(
+        let result = execute(
             &validated,
             &mut backend,
             BTreeMap::from([(
@@ -10298,6 +10843,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("import execution");
         assert_eq!(
@@ -10341,6 +10887,7 @@ mod tests {
                 BTreeMap::new(),
                 &mut store,
                 SamplingMode::Fresh,
+                ExecutionConfig::default()
             ),
             Err(ExecutionError::PreimagePublicMismatch(_))
         ));
@@ -10369,6 +10916,7 @@ mod tests {
                 BTreeMap::new(),
                 &mut store,
                 SamplingMode::Fresh,
+                ExecutionConfig::default()
             ),
             Err(ExecutionError::PreimagePublicMismatch(_))
         ));
@@ -10403,6 +10951,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Record(&mut recorder),
+            ExecutionConfig::default(),
         )
         .expect("recorded preimage execution");
         let replayer = recorder.into_replayer();
@@ -10418,6 +10967,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Replay(&replayer),
+            ExecutionConfig::default(),
         )
         .expect("replayed preimage execution");
         assert_eq!(matrix_output(&recorded, "product"), matrix_output(&recorded, "target"));
@@ -10498,6 +11048,7 @@ mod tests {
                 ]),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
+                ExecutionConfig::default(),
             )
             .expect("composite execution");
             for prefix in ["selected", "iterated"] {
@@ -10560,6 +11111,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Record(&mut recorder),
+            ExecutionConfig::default(),
         )
         .expect("record lexical samples");
         assert_eq!(
@@ -10581,6 +11133,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Replay(&replayer),
+            ExecutionConfig::default(),
         )
         .expect("replay lexical samples");
         for index in 0..3 {
@@ -10626,6 +11179,7 @@ mod tests {
             )]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert!(
@@ -10647,6 +11201,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert!(
@@ -10668,9 +11223,15 @@ mod tests {
             .expect("validation");
         let mut backend = cpu_backend([DCRTPolyParams::new(8, 1, 20, 4, None, None)]);
         let mut store = MemoryArtifactStore::default();
-        let mut result =
-            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .expect("execution");
+        let mut result = execute(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
         // Resolve the family through the public API before checking its values.
         let RuntimeValue::IndexedFamily(state) =
@@ -10723,6 +11284,7 @@ mod tests {
             )]),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         // Integer loop outputs can be staged now that Int is an artifact type.
@@ -10766,7 +11328,7 @@ mod tests {
             .build()
             .expect("build");
         let validated = built.validate(&ParamEnv::default()).expect("validation");
-        let result = execute_with_config(
+        let result = execute(
             &validated,
             &mut cpu_backend([parameters.clone()]),
             BTreeMap::new(),
@@ -10812,6 +11374,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         match &result.outputs["values"] {
@@ -10883,9 +11446,15 @@ mod tests {
         let validated = built.validate(&ParamEnv::default()).expect("validation");
         let mut backend = cpu_backend([parameters]);
         let mut store = MemoryArtifactStore::default();
-        let result =
-            execute(&validated, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .expect("execution");
+        let result = execute(
+            &validated,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .expect("execution");
         let bytes = |value: &RuntimeValue<_>| match value {
             RuntimeValue::Matrix(matrix) => backend.matrix_to_bytes(matrix),
             _ => panic!("expected matrix"),
@@ -10936,6 +11505,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Record(&mut recorder),
+            ExecutionConfig::default(),
         )
         .expect("recorded execution");
         assert_eq!(recorder.iter().count(), 1);
@@ -10948,6 +11518,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Replay(&replayer),
+            ExecutionConfig::default(),
         )
         .expect("replayed execution");
         assert_eq!(matrix_output(&recorded, "sample"), matrix_output(&replayed, "sample"));
@@ -10974,6 +11545,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             nonce,
+            ExecutionConfig::default(),
         )
         .expect("first session execution");
         let second = execute_in_session(
@@ -10982,6 +11554,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             nonce,
+            ExecutionConfig::default(),
         )
         .expect("resumed session execution");
         assert_eq!(first.production_id, second.production_id);
@@ -11004,6 +11577,7 @@ mod tests {
             BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(zero))]),
             &mut input_store,
             [53u8; 32],
+            ExecutionConfig::default(),
         )
         .expect("initial input session");
         let one = DCRTPolyMatrix::identity(&parameters, 1, None);
@@ -11014,6 +11588,7 @@ mod tests {
                 BTreeMap::from([("input".to_owned(), RuntimeValue::matrix(one))]),
                 &mut input_store,
                 [53u8; 32],
+                ExecutionConfig::default(),
             ),
             Err(ExecutionError::Artifact(_))
         ));
@@ -11055,6 +11630,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             nonce,
+            ExecutionConfig::default(),
         )
         .expect("producer session execution");
         assert_eq!(produced.artifact_handles["shared"].len(), 1);
@@ -11123,6 +11699,7 @@ mod tests {
             BTreeMap::new(),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("consumer execution");
         assert_eq!(matrix_output(&consumed, "shared"), matrix_output(&produced, "shared"));
@@ -11227,6 +11804,7 @@ mod tests {
             BTreeMap::new(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execution");
         assert!(
@@ -11273,6 +11851,7 @@ mod tests {
                 BTreeMap::new(),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
+                ExecutionConfig::default()
             ),
             Err(ExecutionError::DivisionByZero(_))
         ));
@@ -11305,6 +11884,7 @@ mod tests {
             BTreeMap::from([("index".to_owned(), RuntimeValue::matrix(index_value(1)))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("selected execution");
         let expected = DCRTPolyMatrix::from_poly_vec(
@@ -11319,7 +11899,7 @@ mod tests {
                 &mut cpu_backend([parameters.clone()]),
                 BTreeMap::from([("index".to_owned(), RuntimeValue::matrix(index_value(2)))]),
                 &mut MemoryArtifactStore::default(),
-                SamplingMode::Fresh,
+                SamplingMode::Fresh, ExecutionConfig::default()
             ),
             Err(ExecutionError::SelectIndexOutOfRange { index, count: 2, .. }) if index == BigInt::from(2)
         ));
@@ -11362,6 +11942,7 @@ mod tests {
                 ]),
                 &mut MemoryArtifactStore::default(),
                 SamplingMode::Fresh,
+                ExecutionConfig::default(),
             )
             .unwrap();
             for (index, expected) in
@@ -11424,6 +12005,7 @@ mod tests {
             BTreeMap::from([("matrix".to_owned(), RuntimeValue::matrix(input))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         assert_eq!(matrix_output(&result, "combined"), &expected_combined);
@@ -11462,6 +12044,7 @@ mod tests {
             BTreeMap::from([("integer".to_owned(), RuntimeValue::Int(integer.clone()))]),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         for name in ["neg-owned", "neg-borrowed"] {

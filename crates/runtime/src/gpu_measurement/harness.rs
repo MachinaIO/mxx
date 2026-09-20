@@ -1,4 +1,4 @@
-use crate::NodeMeasurement;
+use super::NodeMeasurement;
 use std::{
     hint::black_box,
     sync::{
@@ -11,36 +11,36 @@ use std::{
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MeasurementHarnessConfig {
+pub struct GpuWarmupMeasurementConfig {
     pub warm_up_iterations: usize,
     pub measured_iterations: usize,
     pub memory_poll_interval: Duration,
 }
 
-impl Default for MeasurementHarnessConfig {
+impl Default for GpuWarmupMeasurementConfig {
     fn default() -> Self {
         Self {
-            warm_up_iterations: 2,
-            measured_iterations: 5,
+            warm_up_iterations: 1,
+            measured_iterations: 3,
             memory_poll_interval: Duration::from_millis(1),
         }
     }
 }
 
-pub trait MemoryProbe: Sync {
+pub(super) trait MemoryProbe: Sync {
     type Error: std::error::Error + Send;
 
     fn current_bytes(&self) -> Result<u64, Self::Error>;
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct BatchMeasurement {
-    pub batch_size: usize,
-    pub measurement: NodeMeasurement,
+pub(super) struct BatchMeasurement {
+    pub(super) batch_size: usize,
+    pub(super) measurement: NodeMeasurement,
 }
 
 #[derive(Debug, Error)]
-pub enum MeasurementHarnessError<E: std::error::Error> {
+pub(super) enum MeasurementHarnessError<E: std::error::Error> {
     #[error("measured iteration count must be positive")]
     EmptyMeasurement,
     #[error("batch size must be positive")]
@@ -52,8 +52,8 @@ pub enum MeasurementHarnessError<E: std::error::Error> {
 /// Measures the production batch entry point itself. The callback receives the
 /// complete representative batch size on every warm-up and measured
 /// invocation; no single-item timing is extrapolated.
-pub fn measure_batch_operation<P, F, R>(
-    config: &MeasurementHarnessConfig,
+pub(super) fn measure_batch_operation<P, F, R>(
+    config: &GpuWarmupMeasurementConfig,
     probe: &P,
     batch_size: usize,
     mut operation: F,
@@ -73,8 +73,8 @@ where
 /// memory high-water mark. GPU callers must include their ordinary per-stream
 /// completion fence in `operation`; this harness never performs a device-wide
 /// synchronization.
-pub fn measure_operation<P, F, R>(
-    config: &MeasurementHarnessConfig,
+pub(super) fn measure_operation<P, F, R>(
+    config: &GpuWarmupMeasurementConfig,
     probe: &P,
     mut operation: F,
 ) -> Result<NodeMeasurement, MeasurementHarnessError<P::Error>>
@@ -149,6 +149,13 @@ mod tests {
         observed_high: AtomicBool,
     }
 
+    #[test]
+    fn default_measurement_count_is_one_warmup_and_three_samples() {
+        let config = GpuWarmupMeasurementConfig::default();
+        assert_eq!(config.warm_up_iterations, 1);
+        assert_eq!(config.measured_iterations, 3);
+    }
+
     impl MemoryProbe for Probe {
         type Error = Infallible;
 
@@ -171,7 +178,7 @@ mod tests {
         };
         let calls = AtomicUsize::new(0);
         let measurement = measure_operation(
-            &MeasurementHarnessConfig {
+            &GpuWarmupMeasurementConfig {
                 warm_up_iterations: 2,
                 measured_iterations: 3,
                 memory_poll_interval: Duration::ZERO,
@@ -193,7 +200,7 @@ mod tests {
             observed_high: AtomicBool::new(false),
         };
         let measurement = measure_operation(
-            &MeasurementHarnessConfig {
+            &GpuWarmupMeasurementConfig {
                 warm_up_iterations: 0,
                 measured_iterations: 1,
                 memory_poll_interval: Duration::ZERO,
@@ -223,7 +230,7 @@ mod tests {
         };
         assert!(matches!(
             measure_operation(
-                &MeasurementHarnessConfig {
+                &GpuWarmupMeasurementConfig {
                     warm_up_iterations: 0,
                     measured_iterations: 0,
                     memory_poll_interval: Duration::ZERO,
@@ -244,7 +251,7 @@ mod tests {
         };
         let observed = Mutex::new(Vec::new());
         let measurement = measure_batch_operation(
-            &MeasurementHarnessConfig {
+            &GpuWarmupMeasurementConfig {
                 warm_up_iterations: 1,
                 measured_iterations: 2,
                 memory_poll_interval: Duration::ZERO,
@@ -257,7 +264,7 @@ mod tests {
         assert_eq!(measurement.batch_size, 7);
         assert_eq!(*observed.lock().expect("observed batch lock"), vec![7, 7, 7]);
         assert!(matches!(
-            measure_batch_operation(&MeasurementHarnessConfig::default(), &probe, 0, |_| (),),
+            measure_batch_operation(&GpuWarmupMeasurementConfig::default(), &probe, 0, |_| (),),
             Err(MeasurementHarnessError::EmptyBatch)
         ));
     }

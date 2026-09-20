@@ -5,7 +5,7 @@
 //! for the legacy dynamic backend; they are deliberately not part of the
 //! fixed-plan calibration contract.
 
-use crate::gpu_execution_plan::{FrozenGpuPlan, GpuExecutionSiteKey};
+use crate::gpu_execution_plan::{FrozenGpuPlan, FrozenGpuPlanIndex, GpuExecutionSiteKey};
 use mxx_ir_core::{
     FrozenGraphScopeId, IntExpr, ParamEnv, concretize_wire_type, encoding,
     node::{ConcatAxis, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind},
@@ -852,7 +852,10 @@ impl GpuCalibrationProfile {
     ) -> Result<Vec<usize>, GpuCalibrationError> {
         plan.validate()
             .map_err(|error| GpuCalibrationError::InvalidFrozenPlan(error.to_string()))?;
-        let choice = plan.node_choice(site).ok_or(GpuCalibrationError::MissingPlanSite(site))?;
+        let index = FrozenGpuPlanIndex::build(plan)
+            .map_err(|error| GpuCalibrationError::InvalidFrozenPlan(error.to_string()))?;
+        let choice =
+            index.node_choice(plan, site).ok_or(GpuCalibrationError::MissingPlanSite(site))?;
         if choice.columns_per_job.is_empty() ||
             choice.columns_per_job.iter().all(|width| *width == 0)
         {

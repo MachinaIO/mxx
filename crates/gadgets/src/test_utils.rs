@@ -23,8 +23,8 @@ use mxx_primitives::{
     },
 };
 use mxx_runtime::{
-    RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-    transcript::SamplingMode,
+    ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+    execute, transcript::SamplingMode,
 };
 use num_bigint::{BigInt, BigUint};
 use std::{collections::BTreeMap, convert::Infallible, sync::Arc};
@@ -383,6 +383,7 @@ pub fn execute_circuit_with_shape(
             .collect::<BTreeMap<_, _>>(),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig::default(),
     )
     .expect("execute runtime unit-test graph");
     (0..circuit.output_gate_ids().len())

@@ -188,9 +188,12 @@ A dirty working tree must be identified when associating measurements with code.
 
 ## Timing and comparison scope
 
-mxx measures host elapsed time around production `execute`, GPU-resident output
-retrieval, and result-event completion. This includes runtime dispatch and
-operation allocations. Measured graphs keep their inputs and outputs on the
+mxx first performs the canonical measured warmup for each graph, freezes the
+resulting plan, and measures host elapsed time around the prepared production
+`run`, GPU-resident output retrieval, and result-event completion. This includes
+runtime dispatch and operation allocations. The same prepared value supplies a
+pure `GpuWarmupReport`; protocol predicted time is the sum of the reports for
+its prepared steps, with no reporting-only GPU execution. Measured graphs keep their inputs and outputs on the
 GPU; output serialization, transfers, and persisted-artifact round trips are
 excluded to match the Phantom measurement boundary. A backend release fence
 before starting the timer completes deferred cleanup from the preceding
@@ -204,8 +207,8 @@ remain queued after a default execution returns, and errors arising only during
 reclamation may be observed at a later explicit release fence. Persisted-output timings
 from earlier development runs are excluded from the primary comparison.
 Graph construction/validation, input generation, key generation, encryption,
-decryption, and correctness diagnostics are outside evaluation timing. A warmup
-precedes each series. mxx does not currently expose an aggregate CUDA-event time
+decryption, and correctness diagnostics are outside evaluation timing. The
+prepared plan is reused for every sample in a series. mxx does not currently expose an aggregate CUDA-event time
 for this runtime path: report `gpu_event_seconds` is null, not an estimate.
 
 PhantomFHE measures both host completion and CUDA-event elapsed time around its

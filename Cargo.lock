@@ -445,24 +445,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
-name = "mxx-bench-estimator"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "mxx-dsl",
- "mxx-ir-core",
- "mxx-primitives",
- "mxx-runtime",
- "num-bigint",
- "num-traits",
- "rayon",
- "serde",
- "serial_test",
- "thiserror",
- "tracing",
-]
-
-[[package]]
 name = "mxx-bgg"
 version = "0.1.0"
 dependencies = [
@@ -523,7 +505,6 @@ dependencies = [
  "digest",
  "itertools",
  "keccak-asm",
- "mxx-bench-estimator",
  "mxx-bgg",
  "mxx-dsl",
  "mxx-ir-core",
@@ -613,7 +594,6 @@ name = "mxx-we"
 version = "0.1.0"
 dependencies = [
  "keccak-asm",
- "mxx-bench-estimator",
  "mxx-bgg",
  "mxx-dsl",
  "mxx-gadgets",

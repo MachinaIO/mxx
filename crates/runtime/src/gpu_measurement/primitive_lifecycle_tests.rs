@@ -16,6 +16,18 @@ use std::{
     time::Duration,
 };
 
+use crate::{
+    Backend, RuntimeValue,
+    artifact::MemoryArtifactStore,
+    backend::{GpuWarmupProvenance, poly::cpu_backend, poly_gpu::gpu_backend_on},
+    executor::{ExecutionConfig, ExecutionPlan, execute},
+    gpu_column_policy::{
+        CanonicalWarmupProfileDomain, WarmupMeasurementKind, canonical_warmup_profile_domain,
+    },
+    gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
+    gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
+    transcript::SamplingMode,
+};
 use mxx_dsl::{DslContext, Family, Ring};
 use mxx_ir_core::{
     ParamEnv,
@@ -30,21 +42,10 @@ use mxx_primitives::poly::{
         params::DCRTPolyParams,
     },
 };
-use mxx_runtime::{
-    Backend, RuntimeValue,
-    artifact::MemoryArtifactStore,
-    backend::{GpuWarmupProvenance, poly::cpu_backend, poly_gpu::gpu_backend_on},
-    executor::execute_with_gpu_plan,
-    gpu_column_policy::{
-        CanonicalWarmupProfileDomain, WarmupMeasurementKind, canonical_warmup_profile_domain,
-    },
-    gpu_execution_plan::{GpuDeviceBudget, GpuLayout, GpuPlanContract, LayoutId},
-    gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
-    transcript::SamplingMode,
-};
 use num_bigint::{BigInt, Sign};
+use std::sync::Arc;
 
-use crate::{gpu::GpuNodeMeasurementBackend, harness::MeasurementHarnessConfig};
+use super::{GpuWarmupMeasurementConfig, ProductionGpuWarmupProvider};
 
 fn layouts(graph: &mxx_ir_core::ValidatedGraph) -> Vec<GpuLayout> {
     let mut by_type = BTreeMap::<ConcreteMatrixType, LayoutId>::new();
@@ -326,7 +327,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         .expect("ordinary primitive lifecycle requires a detected GPU");
     let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
     let graph = ordinary_graph(&parameters);
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
@@ -349,7 +350,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         Some(&parameters),
         None,
     );
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         vec![(
             gpu_backend_on(
                 [source_parameters, block_parameters.clone(), parameters.clone()],
@@ -359,7 +360,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         )],
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
         &graph,
         &config(&graph, &parameters, device),
         &mut provider,
@@ -438,13 +439,16 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         .expect("runtime contract")
         .expect("GPU contract");
     warmup.plan.validate().expect("frozen plan validation");
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32]))]),
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed execution must use the frozen measured plan");
 
@@ -461,7 +465,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         .iter()
         .filter(|node| {
             node.effective_operation ==
-                mxx_runtime::gpu_column_policy::EffectiveGpuOperation::SingleDeviceConstant
+                crate::gpu_column_policy::EffectiveGpuOperation::SingleDeviceConstant
         })
         .count();
     assert!(
@@ -475,7 +479,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
             .iter()
             .filter(|node| {
                 node.effective_operation ==
-                    mxx_runtime::gpu_column_policy::EffectiveGpuOperation::TrapdoorSample
+                    crate::gpu_column_policy::EffectiveGpuOperation::TrapdoorSample
             })
             .count(),
         1,
@@ -673,12 +677,12 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
     for layout in &mut warmup_config.layouts {
         layout.instance_device_stride = 1;
     }
-    let harness = MeasurementHarnessConfig {
+    let harness = GpuWarmupMeasurementConfig {
         warm_up_iterations: 0,
         measured_iterations: 1,
         memory_poll_interval: Duration::ZERO,
     };
-    let mut provider = GpuNodeMeasurementBackend::new(
+    let mut provider = ProductionGpuWarmupProvider::new(
         devices
             .iter()
             .map(|id| {
@@ -690,7 +694,7 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
             .collect(),
         harness,
     );
-    let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
         &graph,
         &warmup_config,
         &mut provider,
@@ -761,13 +765,16 @@ fn dsl_multilimb_centered_rebase_compact_and_block_switch_are_fixed_and_exact() 
             ownership_schedule.waves().any(|jobs| jobs.iter().any(|job| job.end - job.start < 2))
         );
     }
-    let output = execute_with_gpu_plan(
+    let output = execute(
         &graph,
-        &warmup.plan,
         &mut backend,
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig {
+            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
+            ..ExecutionConfig::default()
+        },
     )
     .expect("fixed multi-limb centered-rebase execution");
     let RuntimeValue::Matrix(actual_matrix) = &output.outputs["matrix"] else {

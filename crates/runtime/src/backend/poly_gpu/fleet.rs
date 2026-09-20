@@ -21,8 +21,8 @@ use crate::{
         map_output_range_to_inputs_with_output, resolve_gpu_route,
     },
     gpu_execution_plan::{
-        FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuFusedUnionJob, GpuNodeChoice,
-        GpuPlanContract, fused_union_waves_lazy,
+        FrozenGpuPlan, FrozenGpuPlanIndex, GpuDeviceBudget, GpuExecutionSiteKey, GpuFusedUnionJob,
+        GpuNodeChoice, GpuPlanContract, fused_union_waves_lazy,
     },
     gpu_schedule::{GpuColumnInterval, GpuColumnJob, GpuColumnSchedule},
 };
@@ -1177,6 +1177,7 @@ pub struct GpuDcrtBackend {
     /// Installing one never turns a cache miss into a runtime pilot; fixed
     /// dispatch consumes only its value-only metadata.
     frozen_plan: Option<Arc<FrozenGpuPlan>>,
+    frozen_plan_index: Option<Arc<FrozenGpuPlanIndex>>,
     fixed_node: Option<GpuNodeChoice>,
     fixed_instance_slots: Vec<usize>,
     execution_identity: u64,
@@ -2039,6 +2040,7 @@ impl GpuDcrtBackend {
             matrix_replicas: HashMap::new(),
             measurement_owners: None,
             frozen_plan: None,
+            frozen_plan_index: None,
             fixed_node: None,
             fixed_instance_slots: Vec::new(),
             plan_budgets: None,
@@ -2059,6 +2061,8 @@ impl GpuDcrtBackend {
     /// performed here; those are warmup responsibilities.
     pub fn install_frozen_plan(&mut self, plan: FrozenGpuPlan) -> Result<(), PolyBackendError> {
         plan.validate().map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        let plan_index = FrozenGpuPlanIndex::build(&plan)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
         let mapped = plan
             .contract
             .logical_to_physical_devices
@@ -2069,6 +2073,7 @@ impl GpuDcrtBackend {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
         self.frozen_plan = Some(Arc::new(plan));
+        self.frozen_plan_index = Some(Arc::new(plan_index));
         self.fixed_node = None;
         self.pending_profile = None;
         self.pending_pilot = None;
@@ -2077,6 +2082,7 @@ impl GpuDcrtBackend {
 
     pub fn clear_frozen_plan(&mut self) {
         self.frozen_plan = None;
+        self.frozen_plan_index = None;
         self.fixed_node = None;
     }
 
@@ -2107,7 +2113,10 @@ impl GpuDcrtBackend {
     /// remains the existing backend hook.
     pub fn bind_fixed_node(&mut self, key: GpuExecutionSiteKey) -> Result<(), PolyBackendError> {
         let plan = self.frozen_plan.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let node = plan.node_choice(key).cloned().ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let index =
+            self.frozen_plan_index.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let node =
+            index.node_choice(plan, key).cloned().ok_or(PolyBackendError::UnsupportedPlacement)?;
         // Fixed execution receives widths from the frozen value plan, not
         // from a runtime calibration/pilot.  Bind them together with the
         // site so fused entry points that launch their first wave before an
@@ -3608,8 +3617,9 @@ impl GpuDcrtBackend {
     ) -> Option<GpuColumnSchedule> {
         let node = self.fixed_node.as_ref()?;
         let plan = self.frozen_plan.as_ref()?;
+        let index = self.frozen_plan_index.as_ref()?;
         let layout_id = *node.output_layouts.get(output_port)?;
-        let layout = plan.layout(layout_id)?;
+        let layout = index.layout(plan, layout_id)?;
         if layout.columns != columns {
             return None;
         }
@@ -3636,10 +3646,14 @@ impl GpuDcrtBackend {
         slots: &[usize],
     ) -> Result<Vec<GpuColumnSchedule>, PolyBackendError> {
         let node = self.fixed_node.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let index =
+            self.frozen_plan_index.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
         let layout = self
             .frozen_plan
             .as_ref()
-            .and_then(|plan| node.output_layouts.get(output_port).and_then(|id| plan.layout(*id)))
+            .and_then(|plan| {
+                node.output_layouts.get(output_port).and_then(|id| index.layout(plan, *id))
+            })
             .ok_or(PolyBackendError::UnsupportedPlacement)?;
         if layout.columns != columns {
             return Err(PolyBackendError::InvalidConstantShape);
@@ -3694,6 +3708,8 @@ impl GpuDcrtBackend {
         node: &GpuNodeChoice,
         plan: &FrozenGpuPlan,
     ) -> Result<Vec<crate::gpu_execution_plan::GpuLayout>, PolyBackendError> {
+        let index =
+            self.frozen_plan_index.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
         let ids = if let Some(metadata) = metadata {
             if metadata.operation_identity != node.operation_identity ||
                 metadata.implementation_variant != node.implementation_variant ||
@@ -3723,7 +3739,8 @@ impl GpuDcrtBackend {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             for (declared, id) in metadata.output_layout_metadata.iter().zip(&ids) {
-                let layout = plan.layout(*id).ok_or(PolyBackendError::UnsupportedPlacement)?;
+                let layout =
+                    index.layout(plan, *id).ok_or(PolyBackendError::UnsupportedPlacement)?;
                 let scalar_port =
                     declared.rows == 0 && declared.columns == 0 && declared.ring_dimension == 0;
                 if declared.layout_id != Some(*id) ||
@@ -3737,12 +3754,32 @@ impl GpuDcrtBackend {
                     return Err(PolyBackendError::UnsupportedPlacement);
                 }
             }
+            if !metadata.grouped_output_layout_metadata.is_empty() {
+                if metadata.grouped_output_layout_metadata.len() != 1 || ids.len() != 1 {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+                let grouped = &metadata.grouped_output_layout_metadata[0];
+                let mut layout = index
+                    .layout(plan, ids[0])
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?
+                    .clone();
+                if grouped.layout_id != Some(ids[0]) ||
+                    grouped.columns != layout.columns ||
+                    grouped.ring_dimension != layout.ring_dimension ||
+                    grouped.representation != layout.representation ||
+                    grouped.rows == 0
+                {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                layout.rows = grouped.rows;
+                return Ok(vec![layout]);
+            }
             ids
         } else {
             node.output_layouts.clone()
         };
         ids.into_iter()
-            .map(|id| plan.layout(id).cloned().ok_or(PolyBackendError::UnsupportedPlacement))
+            .map(|id| index.layout(plan, id).cloned().ok_or(PolyBackendError::UnsupportedPlacement))
             .collect()
     }
 
@@ -4910,6 +4947,8 @@ impl GpuDcrtBackend {
                 sources.extend(right.iter().map(Arc::as_ref));
                 self.validate_fixed_source_metadata(Some(metadata), &sources)
             }
+            FusedBatchRequest::TensorRowSums { source, right, metadata, .. } => self
+                .validate_fixed_source_metadata(Some(metadata), &[source.as_ref(), right.as_ref()]),
             FusedBatchRequest::Decompose { blocks, metadata, .. } => self
                 .validate_fixed_effective_row_blocks_metadata(
                     metadata,
@@ -4952,6 +4991,7 @@ impl GpuDcrtBackend {
         self.validate_fused_sources(&request)?;
         let metadata = match &request {
             FusedBatchRequest::RowSum { metadata, .. } |
+            FusedBatchRequest::TensorRowSums { metadata, .. } |
             FusedBatchRequest::Decompose { metadata, .. } |
             FusedBatchRequest::SmallProduct { metadata, .. } |
             FusedBatchRequest::Add { metadata, .. } => metadata,
@@ -5064,6 +5104,41 @@ impl GpuDcrtBackend {
                     backend.sum_rows(&source, rows)?
                 };
                 Ok(FusedBatchOutput::Matrices(vec![value]))
+            }
+            FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => {
+                let mapped = map_binding(&NodeKind::Tensor, &[source, right])?;
+                let mut pieces = Vec::new();
+                for pair in mapped.chunks_exact(2) {
+                    let left_piece = Self::matrix_piece_on_device(
+                        backend,
+                        source,
+                        pair[0].range.start,
+                        pair[0].range.end,
+                    )?;
+                    let right_piece = Self::matrix_piece_on_device(
+                        backend,
+                        right,
+                        pair[1].range.start,
+                        pair[1].range.end,
+                    )?;
+                    let groups = rows.iter().flatten().cloned().collect::<Vec<_>>();
+                    pieces.push(vec![backend.tensor_sum_rows(
+                        &left_piece,
+                        &right_piece,
+                        &groups,
+                    )?]);
+                }
+                let first = pieces.first().ok_or(PolyBackendError::InvalidConstantShape)?;
+                let mut values = first.clone();
+                for piece in pieces.into_iter().skip(1) {
+                    if piece.len() != values.len() {
+                        return Err(PolyBackendError::InvalidConstantShape);
+                    }
+                    for (value, next) in values.iter_mut().zip(piece) {
+                        *value = value.clone().concat_columns_owned(vec![next]);
+                    }
+                }
+                Ok(FusedBatchOutput::Matrices(values))
             }
             FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => {
                 let refs = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
@@ -5459,9 +5534,11 @@ impl GpuDcrtBackend {
     ) -> Result<Vec<GpuColumnShard<T>>, PolyBackendError> {
         let node = self.fixed_node.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
         let plan = self.frozen_plan.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let index =
+            self.frozen_plan_index.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
         let layout_id =
             *node.output_layouts.first().ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let layout = plan.layout(layout_id).ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let layout = index.layout(plan, layout_id).ok_or(PolyBackendError::UnsupportedPlacement)?;
         if layout.columns != columns {
             return Err(PolyBackendError::InvalidConstantShape);
         }
@@ -5662,9 +5739,10 @@ impl GpuDcrtBackend {
 mod tests {
     use super::*;
     use crate::{
-        backend::PlannedLayoutMetadata,
+        backend::{GpuEffectiveInputs, PlannedLayoutMetadata},
         gpu_column_policy::{ColumnCapability, EffectiveGpuOperation},
         gpu_execution_plan::{GpuLayout, build_fused_union_jobs, fused_union_waves},
+        gpu_measurement::{GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare},
     };
     use mxx_ir_core::IntExpr;
     use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
@@ -6085,6 +6163,7 @@ mod tests {
             source_layouts: block_layouts,
             effective_operands,
             output_layout_metadata,
+            grouped_output_layout_metadata: Vec::new(),
             columns_per_job: columns_per_job.to_vec(),
             instance_slots: vec![slot],
             instance_paths: vec![Vec::new()],
@@ -6092,6 +6171,59 @@ mod tests {
             randomness_seeds: vec![None],
             output_ports: output_layouts.len(),
         }
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_fixed_tensor_row_sums_uses_native_grouped_selector() {
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
+        let device = detected_gpu_device_ids()[0];
+        let mut backend = super::super::gpu_backend_on([parameters], [device]);
+        let params = backend.devices[0]
+            .1
+            .parameters
+            .iter()
+            .flat_map(|map| map.values())
+            .next()
+            .expect("fleet test has matrix parameters");
+        let left = Arc::new(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(params, 2, 1)));
+        let right = Arc::new(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(params, 2, 1)));
+        let rows = vec![vec![vec![0]], vec![vec![1, 2], vec![3]]];
+        let groups = rows.iter().flatten().cloned().collect::<Vec<_>>();
+        assert_eq!(groups, vec![vec![0], vec![1, 2], vec![3]]);
+        assert_eq!(
+            GpuDCRTPolyMatrix::tensor_sum_rows_implementation(&groups),
+            mxx_primitives::gpu_memory::TensorRowSumImplementation::FusedKernel
+        );
+        let metadata = PlannedNodeBatchRequest::for_lowered_operation(
+            GpuExecutionSiteKey { site: 1, shape_class: 0, instance_class: 0 },
+            [7; 32],
+            "fleet-test-fixed-tensor-row-sums".into(),
+            GpuEffectiveInputs::default(),
+            vec![PlannedLayoutMetadata {
+                layout_id: None,
+                rows: groups.len(),
+                columns: 1,
+                ring_dimension: 32,
+                representation: "test".into(),
+            }],
+            vec![1],
+        );
+        let request = FusedBatchRequest::TensorRowSums { metadata, source: left, right, rows };
+        let output = GpuDcrtBackend::execute_fused_range(
+            &mut backend.devices[0].1,
+            &request,
+            ColumnRange { start: 0, end: 1 },
+            1,
+            None,
+        )
+        .expect("fixed TensorRowSums range executes");
+        let FusedBatchOutput::Matrices(values) = output else {
+            panic!("fixed TensorRowSums returned a non-matrix output");
+        };
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].row_size(), groups.len());
+        assert_eq!(values[0].col_size(), 1);
     }
 
     #[test]
@@ -6628,13 +6760,12 @@ mod tests {
 
     #[test]
     #[serial_test::serial(gpu_context)]
-    fn test_gpu_compact_block_graph_matches_traced_execution() {
+    fn test_gpu_compact_block_graph_matches_repeated_fixed_execution() {
         use crate::{
-            MemoryArtifactStore, RuntimeValue, execute, execute_with_trace,
+            MemoryArtifactStore, RuntimeValue,
             gpu_calibration::{
                 gpu_calibration_operation_identity, gpu_operation_is_column_separable_for_types,
             },
-            transcript::SamplingMode,
         };
         use mxx_dsl::{DslContext, Mat, Ring};
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -6725,11 +6856,22 @@ mod tests {
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut store = MemoryArtifactStore::default();
-        let optimized =
-            execute(&graph, &mut backend, inputs.clone(), &mut store, SamplingMode::Fresh).unwrap();
-        let (reference, _) =
-            execute_with_trace(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let mut run = |inputs: std::collections::BTreeMap<String, RuntimeValue<GpuDcrtBackend>>| {
+            let prepared = prepare(GpuPreparationRequest {
+                validated: graph.clone(),
+                backend: &mut backend,
+                inputs: &inputs,
+                parameters: std::slice::from_ref(&parameters),
+                default_tile_widths: vec![1, 2, 3, 4, 8],
+                implementation_variant: "runtime-gpu-fleet-test".to_owned(),
+                measurement_config: GpuWarmupMeasurementConfig::default(),
+                execution_config: crate::ExecutionConfig::default(),
+            })
+            .expect("prepare GPU fleet graph");
+            prepared.run(&mut backend, inputs, &mut store, [0; 32]).expect("run GPU fleet graph")
+        };
+        let optimized = run(inputs.clone());
+        let reference = run(inputs);
         for name in ["first", "second"] {
             let RuntimeValue::Matrix(actual) = &optimized.outputs[name] else {
                 panic!("resident output")
@@ -7175,6 +7317,7 @@ mod tests {
                 loops: Vec::new(),
                 nodes: Vec::new(),
             })),
+            frozen_plan_index: None,
             fixed_node: None,
             fixed_instance_slots: Vec::new(),
             measurement_owners: None,
@@ -9746,6 +9889,29 @@ impl GpuDcrtBackend {
                     )?;
                 }
             }
+            DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => {
+                let row_limit =
+                    source.rows.checked_mul(right.rows).ok_or(PolyBackendError::InvalidInteger)?;
+                if source.columns == 0 ||
+                    right.columns == 0 ||
+                    rows.iter().flatten().flatten().any(|row| *row >= row_limit)
+                {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+                let output_columns = source
+                    .columns
+                    .checked_mul(right.columns)
+                    .ok_or(PolyBackendError::InvalidInteger)?;
+                let arguments =
+                    [Self::policy_matrix_type(source)?, Self::policy_matrix_type(right)?];
+                Self::fixed_policy_ranges_for_wires(
+                    &NodeKind::Tensor,
+                    &arguments,
+                    output_columns,
+                    0,
+                    output_columns,
+                )?;
+            }
             DynamicFusedBatchRequest::Decompose { blocks, small, digits } => {
                 if blocks.is_empty() || *digits == 0 {
                     return Err(PolyBackendError::InvalidConstantShape);
@@ -9839,6 +10005,11 @@ impl GpuDcrtBackend {
                             None => self.sum_rows(&source, &rows)?,
                         };
                         Ok(FusedBatchOutput::Matrices(vec![value]))
+                    }
+                    DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => {
+                        let groups = rows.into_iter().flatten().collect::<Vec<_>>();
+                        self.tensor_sum_rows(&source, &right, &groups)
+                            .map(|value| FusedBatchOutput::Matrices(vec![value]))
                     }
                     DynamicFusedBatchRequest::Decompose { blocks, small, digits } => self
                         .gadget_decompose_row_blocks(
@@ -10111,6 +10282,11 @@ impl Backend for GpuDcrtBackend {
                         }?;
                         Ok(FusedBatchOutput::Matrices(vec![value]))
                     }
+                    FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => {
+                        let groups = rows.into_iter().flatten().collect::<Vec<_>>();
+                        self.tensor_sum_rows(&source, &right, &groups)
+                            .map(|value| FusedBatchOutput::Matrices(vec![value]))
+                    }
                     FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => self
                         .gadget_decompose_row_blocks(
                             &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -10144,6 +10320,7 @@ impl Backend for GpuDcrtBackend {
             .first()
             .map(|request| match request {
                 FusedBatchRequest::RowSum { metadata, .. } |
+                FusedBatchRequest::TensorRowSums { metadata, .. } |
                 FusedBatchRequest::Decompose { metadata, .. } |
                 FusedBatchRequest::SmallProduct { metadata, .. } |
                 FusedBatchRequest::Add { metadata, .. } => metadata,
@@ -10159,6 +10336,7 @@ impl Backend for GpuDcrtBackend {
         for request in &requests {
             let request_metadata = match request {
                 FusedBatchRequest::RowSum { metadata, .. } |
+                FusedBatchRequest::TensorRowSums { metadata, .. } |
                 FusedBatchRequest::Decompose { metadata, .. } |
                 FusedBatchRequest::SmallProduct { metadata, .. } |
                 FusedBatchRequest::Add { metadata, .. } => metadata,
@@ -10185,6 +10363,7 @@ impl Backend for GpuDcrtBackend {
             .map(|request| {
                 let metadata = match request {
                     FusedBatchRequest::RowSum { metadata, .. } |
+                    FusedBatchRequest::TensorRowSums { metadata, .. } |
                     FusedBatchRequest::Decompose { metadata, .. } |
                     FusedBatchRequest::SmallProduct { metadata, .. } |
                     FusedBatchRequest::Add { metadata, .. } => metadata,
@@ -10273,6 +10452,20 @@ impl Backend for GpuDcrtBackend {
                             if let Some(port_range) = port_job.clipped_range {
                                 Self::fixed_policy_ranges(
                                     &kind,
+                                    &values,
+                                    layouts[port].columns,
+                                    port_range.start,
+                                    port_range.end,
+                                )?;
+                            }
+                        }
+                    }
+                    FusedBatchRequest::TensorRowSums { source, right, .. } => {
+                        let values = [source.as_ref(), right.as_ref()];
+                        for (port, port_job) in job.port_jobs.iter().enumerate() {
+                            if let Some(port_range) = port_job.clipped_range {
+                                Self::fixed_policy_ranges(
+                                    &NodeKind::Tensor,
                                     &values,
                                     layouts[port].columns,
                                     port_range.start,

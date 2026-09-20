@@ -1,36 +1,22 @@
 #![cfg(feature = "gpu")]
 
-use keccak_asm::Keccak256;
-use mxx_bench_estimator::harness::MeasurementHarnessConfig;
 use mxx_gadgets::circuit::{
     BooleanCircuitData, BooleanCircuitShape, BooleanGateData, BooleanGateKind,
 };
-use mxx_primitives::{
-    matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix,
-    poly::{
-        PolyParams,
-        dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
-    },
-    sampler::{
-        gpu::{GpuDCRTPolyHashSampler, GpuDCRTPolyUniformSampler},
-        trapdoor::GpuDCRTPolyTrapdoorSampler,
-    },
+use mxx_primitives::poly::{
+    PolyParams,
+    dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
 };
-use mxx_runtime::{ExecutionConfig, artifact::MemoryArtifactStore};
-use mxx_we::diamond::{
-    DiamondGpuMeasurementBackend, DiamondParameterSearch, DiamondWeRuntime, estimate_diamond_cost,
+use mxx_runtime::{
+    artifact::MemoryArtifactStore, authority::GpuExecution,
+    gpu_measurement::GpuWarmupMeasurementConfig,
 };
-use std::{env, num::NonZeroUsize, time::Instant};
+use mxx_we::diamond::{DiamondParameterSearch, DiamondWeRuntime};
+use std::{env, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-type GpuDiamondWeRuntime = DiamondWeRuntime<
-    GpuDCRTPolyMatrix,
-    GpuDCRTPolyUniformSampler,
-    GpuDCRTPolyHashSampler<Keccak256>,
-    GpuDCRTPolyTrapdoorSampler,
-    MemoryArtifactStore,
->;
+type GpuDiamondWeRuntime = DiamondWeRuntime<GpuExecution, MemoryArtifactStore>;
 
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
@@ -54,9 +40,9 @@ fn and_circuit() -> BooleanCircuitData {
 /// The small defaults are intentionally only a smoke configuration. All search, measurement, and
 /// execution settings are environment-overridable for a larger benchmark invocation.
 #[test]
-#[ignore = "explicit GPU Diamond WE parameter search, cost estimation, and round trip"]
+#[ignore = "explicit GPU Diamond WE parameter search and round trip"]
 #[serial_test::serial]
-fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
+fn test_gpu_diamond_we_parameter_search_and_round_trip() {
     install_tracing();
     let total_started = Instant::now();
     let device_ids = detected_gpu_device_ids();
@@ -106,73 +92,33 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         None,
         None,
     );
-    let warm_up_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_WARMUPS", 1);
-    let measured_iterations = env_usize("MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS", 1);
-    assert!(measured_iterations > 0, "MXX_DIAMOND_WE_GPU_MEASUREMENT_ITERATIONS must be positive");
     let runtime_started = Instant::now();
+    let backend = mxx_runtime::backend::poly_gpu::gpu_backend_on(
+        [gpu_parameters.clone()],
+        device_ids.iter().copied(),
+    );
     let mut runtime = GpuDiamondWeRuntime::new(
         selected.compiler,
-        gpu_parameters.clone(),
+        GpuExecution::new(
+            backend,
+            [gpu_parameters.clone()],
+            GpuWarmupMeasurementConfig::default(),
+            "diamond-production-measured",
+        ),
         MemoryArtifactStore::default(),
     )
-    .expect("GPU Diamond WE runtime construction")
-    .with_execution_config(ExecutionConfig {
-        max_parallel_instances: NonZeroUsize::new(effective_parallel_width)
-            .expect("effective parallel width is nonzero"),
-        ..ExecutionConfig::default()
-    });
+    .expect("GPU Diamond WE runtime construction");
     let circuit = and_circuit();
     let instance = [true];
     let witness = [true];
     let message = true;
     let encrypt_started = Instant::now();
-    let ciphertext =
-        runtime.encrypt(&circuit, &instance, message).expect("GPU Diamond WE encryption");
+    let ciphertext = runtime
+        .encrypt(&circuit, &instance, message, [0x2a; 32])
+        .expect("GPU Diamond WE encryption");
     info!(
         elapsed_seconds = encrypt_started.elapsed().as_secs_f64(),
         "completed GPU Diamond WE encryption"
-    );
-    let estimate_started = Instant::now();
-    let mut measurement_backend = DiamondGpuMeasurementBackend::new(
-        gpu_parameters.clone(),
-        &device_ids,
-        MeasurementHarnessConfig {
-            warm_up_iterations,
-            measured_iterations,
-            ..MeasurementHarnessConfig::default()
-        },
-    );
-    let estimate = estimate_diamond_cost(
-        &runtime.compiler,
-        &mut measurement_backend,
-        &ciphertext.encryption,
-        &mut runtime.store,
-    )
-    .expect("GPU Diamond WE graph cost estimation");
-    info!(
-        encryption_work_seconds = estimate.encryption.total_work_seconds,
-        encryption_critical_path_seconds = estimate.encryption.critical_path_seconds,
-        decryption_work_seconds = estimate.decryption.total_work_seconds,
-        decryption_critical_path_seconds = estimate.decryption.critical_path_seconds,
-        payload_peak_bytes =
-            estimate.encryption.peak_memory_bytes.max(estimate.decryption.peak_memory_bytes),
-        workspace_bytes_unmeasured = true,
-        elapsed_seconds = estimate_started.elapsed().as_secs_f64(),
-        "completed GPU Diamond WE analytical cost estimation"
-    );
-    assert!(estimate.encryption.total_work_seconds > 0.0);
-    assert!(estimate.decryption.total_work_seconds > 0.0);
-    assert!(
-        estimate
-            .encryption
-            .persistent_bytes_over_time
-            .iter()
-            .chain(estimate.decryption.persistent_bytes_over_time.iter())
-            .copied()
-            .max()
-            .unwrap_or_default() >
-            0,
-        "the analytical matrix/trapdoor payload estimate must be nonzero"
     );
     let decrypt_started = Instant::now();
     let decoded = runtime
@@ -184,6 +130,25 @@ fn test_gpu_diamond_we_parameter_search_estimate_and_round_trip() {
         "completed GPU Diamond WE decryption"
     );
     assert_eq!(decoded, message, "GPU Diamond WE round trip must preserve the message");
+    let preparations = runtime.execution.preparations();
+    assert_eq!(preparations.len(), 2, "Diamond encrypt/decrypt each prepare once");
+    let predicted_seconds =
+        preparations.iter().map(|prepared| prepared.report().predicted_seconds).sum::<f64>();
+    let measurement_counts =
+        preparations.iter().map(|prepared| prepared.measurement_count()).collect::<Vec<_>>();
+    for prepared in preparations {
+        let report = prepared.report();
+        assert_eq!(report, prepared.report(), "GPU warmup report reads are pure");
+        let evidence = prepared.evidence();
+        assert_eq!(evidence, prepared.evidence(), "GPU warmup evidence reads are pure");
+        prepared.assert_measurements_unchanged();
+    }
+    assert_eq!(
+        measurement_counts,
+        preparations.iter().map(|prepared| prepared.measurement_count()).collect::<Vec<_>>(),
+        "GPU measurement counters remain unchanged after production runs"
+    );
+    info!(predicted_seconds, "Diamond GPU protocol predicted warmup time");
     info!(
         elapsed_seconds = total_started.elapsed().as_secs_f64(),
         "completed GPU Diamond WE integration test"

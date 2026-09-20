@@ -1064,8 +1064,8 @@ mod tests {
     fn test_bgv_staged_evaluator_without_secret_input() {
         use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
         use mxx_runtime::{
-            RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-            transcript::SamplingMode,
+            ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore,
+            backend::poly::cpu_backend, execute, transcript::SamplingMode,
         };
         use num_traits::ToPrimitive;
         let common = common();
@@ -1106,6 +1106,7 @@ mod tests {
             BTreeMap::from([("slots".into(), int_input(&message))]),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         let RuntimeValue::Int(exported_encryption_noise) = &encrypted.outputs["noise"] else {
@@ -1151,9 +1152,15 @@ mod tests {
             .validate_with_manifests(&env, &manifests)
             .unwrap();
         // The evaluator imports only the ciphertext and public evaluation key.
-        let evaluation =
-            execute(&evaluator, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let evaluation = execute(
+            &evaluator,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let RuntimeValue::Int(exported_factor) = &evaluation.outputs["factor"] else {
             panic!("public factor integer")
         };
@@ -1192,9 +1199,15 @@ mod tests {
             .unwrap()
             .validate_with_manifests(&env, &manifests)
             .unwrap();
-        let mut result =
-            execute(&decryption, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let mut result = execute(
+            &decryption,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         result.materialize_output("plaintext", &backend, &mut store).unwrap();
         let mut expected = vec![BigInt::from(0); n];
         expected[0] = BigInt::from(9);
@@ -1633,7 +1646,8 @@ mod benchmarks {
     use mxx_dsl::DslContext;
     use mxx_ir_core::ParamEnv;
     use mxx_runtime::{
-        MemoryArtifactStore, backend::poly::cpu_backend, execute, transcript::SamplingMode,
+        ExecutionConfig, MemoryArtifactStore, backend::poly::cpu_backend, execute,
+        transcript::SamplingMode,
     };
     use std::{collections::BTreeMap, time::Instant};
     #[test]
@@ -1658,9 +1672,15 @@ mod benchmarks {
             .unwrap();
         let mut backend = cpu_backend(bgv.runtime_parameters().unwrap());
         let mut store = MemoryArtifactStore::default();
-        let mut prepared =
-            execute(&preparation, &mut backend, BTreeMap::new(), &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let mut prepared = execute(
+            &preparation,
+            &mut backend,
+            BTreeMap::new(),
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let key = prepared.materialize_output("key", &backend, &mut store).unwrap().clone();
         let value = prepared.materialize_output("value", &backend, &mut store).unwrap().clone();
         let (kp, width) = bgv.key_switch_parameters(level).unwrap();
@@ -1683,8 +1703,15 @@ mod benchmarks {
             let inputs =
                 BTreeMap::from([("key".into(), key.clone()), ("value".into(), value.clone())]);
             let start = Instant::now();
-            let mut output =
-                execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+            let mut output = execute(
+                &graph,
+                &mut backend,
+                inputs,
+                &mut store,
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .unwrap();
             output.materialize_output("switched", &backend, &mut store).unwrap();
             let elapsed = start.elapsed().as_secs_f64();
             output.cleanup_staged(&mut store).unwrap();

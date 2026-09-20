@@ -103,6 +103,10 @@ pub struct PlannedNodeBatchRequest {
     /// for that operation, never an ambiguous logical `(concat, rhs)` pair.
     pub effective_operands: Vec<PlannedOperandMetadata>,
     pub output_layout_metadata: Vec<PlannedLayoutMetadata>,
+    /// Physical output shape of a grouped TensorRowSums intermediate. Empty
+    /// for ordinary nodes; the executor splits this intermediate into the
+    /// original logical row-sum outputs.
+    pub grouped_output_layout_metadata: Vec<PlannedLayoutMetadata>,
     pub columns_per_job: Vec<usize>,
     pub instance_slots: Vec<usize>,
     pub instance_paths: Vec<Vec<InstantiationFrame>>,
@@ -165,6 +169,13 @@ impl PlannedNodeBatchRequest {
     ) -> Self {
         let output_layouts =
             outputs.iter().filter_map(|output| output.layout_id).collect::<Vec<_>>();
+        let grouped_output_layout_metadata = if inputs.row_sum_groups.is_empty() {
+            Vec::new()
+        } else {
+            let mut layout = outputs.first().cloned().expect("grouped output has a port");
+            layout.rows = inputs.row_sum_groups.iter().map(Vec::len).sum();
+            vec![layout]
+        };
         Self {
             site: key.site,
             shape_class: key.shape_class,
@@ -181,6 +192,7 @@ impl PlannedNodeBatchRequest {
             effective_operands: inputs.operands,
             output_ports: outputs.len(),
             output_layout_metadata: outputs,
+            grouped_output_layout_metadata,
             columns_per_job,
             instance_slots: vec![0],
             instance_paths: vec![Vec::new()],
@@ -327,6 +339,16 @@ pub enum FusedBatchRequest<M, S> {
         right: Option<Arc<M>>,
         rows: Vec<Vec<usize>>,
     },
+    TensorRowSums {
+        metadata: PlannedNodeBatchRequest,
+        source: Arc<M>,
+        right: Arc<M>,
+        /// Groups are concatenated in order into one matrix result. The
+        /// executor splits that result back into the original output nodes;
+        /// this keeps one fixed-plan output port while avoiding a second
+        /// tensor-product launch for a shared source.
+        rows: Vec<Vec<Vec<usize>>>,
+    },
     Decompose {
         metadata: PlannedNodeBatchRequest,
         blocks: Vec<Arc<M>>,
@@ -354,6 +376,9 @@ impl<M, S> FusedBatchRequest<M, S> {
             Self::RowSum { right: Some(_), .. } => {
                 fused_warmup_profile_domain(FusedWarmupOperation::TensorRowSum)
             }
+            Self::TensorRowSums { .. } => {
+                fused_warmup_profile_domain(FusedWarmupOperation::TensorRowSum)
+            }
             Self::RowSum { right: None, .. } => {
                 fused_warmup_profile_domain(FusedWarmupOperation::RowSum)
             }
@@ -373,6 +398,9 @@ impl<M, S> DynamicFusedBatchRequest<M, S> {
     pub fn canonical_profile_domain(&self) -> CanonicalWarmupProfileDomain {
         match self {
             Self::RowSum { right: Some(_), .. } => {
+                fused_warmup_profile_domain(FusedWarmupOperation::TensorRowSum)
+            }
+            Self::TensorRowSums { .. } => {
                 fused_warmup_profile_domain(FusedWarmupOperation::TensorRowSum)
             }
             Self::RowSum { right: None, .. } => {
@@ -399,6 +427,7 @@ pub const fn preimage_batch_profile_domain() -> CanonicalWarmupProfileDomain {
 /// manufacture a fixed request with absent plan metadata.
 pub enum DynamicFusedBatchRequest<M, S> {
     RowSum { source: Arc<M>, right: Option<Arc<M>>, rows: Vec<Vec<usize>> },
+    TensorRowSums { source: Arc<M>, right: Arc<M>, rows: Vec<Vec<Vec<usize>>> },
     Decompose { blocks: Vec<Arc<M>>, small: bool, digits: usize },
     SmallProduct { blocks: Vec<Arc<M>>, rhs: Arc<S> },
     Add { blocks: Vec<Arc<M>>, right: Arc<M> },
@@ -835,6 +864,9 @@ pub struct GpuEffectiveInputs {
     pub source_layouts: Vec<PlannedLayoutMetadata>,
     pub operands: Vec<PlannedOperandMetadata>,
     pub row_groups: Vec<Vec<usize>>,
+    /// Complete row-group inventory for a shared TensorRowSums dispatch.
+    /// Empty means the ordinary single-output fused row sum contract.
+    pub row_sum_groups: Vec<Vec<Vec<usize>>>,
 }
 
 /// Value-only physical layout facts used by setup-time warmup.  The owner
@@ -928,8 +960,8 @@ impl GpuWarmupRouteResolverData {
         // the fixed materializer, while source_routes retain each owner's
         // physical fragment and are part of the profile key.
         let fragments = self.source_fragments_for_range(source_range);
-        let source_is_fully_covered = range_is_fully_covered(source_range, &fragments);
-        let source_is_resident = source_is_fully_covered &&
+        let source_bounds_match = range_bounds_match(source_range, &fragments);
+        let source_is_resident = source_bounds_match &&
             !fragments.is_empty() &&
             fragments.iter().all(|(owner, _)| *owner == self.destination_owner);
         let source_owner = fragments
@@ -937,7 +969,7 @@ impl GpuWarmupRouteResolverData {
             .find(|(owner, _)| *owner != self.destination_owner)
             .or_else(|| fragments.first())
             .map(|(owner, _)| *owner)
-            .filter(|_| source_is_fully_covered)
+            .filter(|_| source_bounds_match)
             .or_else(|| (!fragments.is_empty()).then(|| fragments[0].0));
         let descriptor = resolve_gpu_route(GpuRouteResolutionInput {
             source_device: source_owner,
@@ -1054,24 +1086,20 @@ impl GpuWarmupRouteResolverData {
     }
 }
 
-fn range_is_fully_covered(range: ColumnRange, fragments: &[(usize, ColumnRange)]) -> bool {
+fn range_bounds_match(range: ColumnRange, fragments: &[(usize, ColumnRange)]) -> bool {
     if range.is_empty() || fragments.is_empty() {
         return false;
     }
-    let mut cursor = range.start;
-    for (_, fragment) in fragments {
-        if fragment.end <= cursor {
-            continue;
-        }
-        if fragment.start > cursor {
-            return false;
-        }
-        cursor = cursor.max(fragment.end);
-        if cursor >= range.end {
-            return true;
-        }
-    }
-    cursor >= range.end
+    let bounds = fragments.iter().fold(None, |bounds, (_, fragment)| {
+        Some(bounds.map_or(*fragment, |bounds: ColumnRange| ColumnRange {
+            start: bounds.start.min(fragment.start),
+            end: bounds.end.max(fragment.end),
+        }))
+    });
+    bounds == Some(range) &&
+        fragments
+            .iter()
+            .all(|(_, fragment)| fragment.start >= range.start && fragment.end <= range.end)
 }
 
 impl GpuWarmupOperationDescriptor {
@@ -2649,6 +2677,11 @@ pub trait Backend {
                     }?;
                     Ok(FusedBatchOutput::Matrices(vec![output]))
                 }
+                DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => {
+                    let groups = rows.into_iter().flatten().collect::<Vec<_>>();
+                    self.tensor_sum_rows(&source, &right, &groups)
+                        .map(|value| FusedBatchOutput::Matrices(vec![value]))
+                }
                 DynamicFusedBatchRequest::Decompose { blocks, small, digits } => self
                     .gadget_decompose_row_blocks(
                         &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -2684,6 +2717,11 @@ pub trait Backend {
                         None => self.sum_rows(&source, &rows),
                     }?;
                     Ok(FusedBatchOutput::Matrices(vec![output]))
+                }
+                FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => {
+                    let groups = rows.into_iter().flatten().collect::<Vec<_>>();
+                    self.tensor_sum_rows(&source, &right, &groups)
+                        .map(|value| FusedBatchOutput::Matrices(vec![value]))
                 }
                 FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => self
                     .gadget_decompose_row_blocks(

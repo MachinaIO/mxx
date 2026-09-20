@@ -1759,7 +1759,7 @@ mod tests {
     };
     use mxx_runtime::{
         ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-        execute, execute_with_config, transcript::SamplingMode,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::BigUint;
     use std::num::NonZeroUsize;
@@ -2004,7 +2004,7 @@ mod tests {
         let execute_once = |parameters: &DCRTPolyParams| {
             let mut backend = cpu_backend([parameters.clone()]);
             let mut store = MemoryArtifactStore::default();
-            let mut result = execute_with_config(
+            let mut result = execute(
                 &validated,
                 &mut backend,
                 BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x6d; 32]))]),
@@ -2225,9 +2225,15 @@ mod tests {
         }
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
-        let produced =
-            execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let produced = execute(
+            &producer,
+            &mut backend,
+            producer_inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let production_id = produced.production_id.expect("helper artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
         let mut v1_manifest = manifest.clone();
@@ -2374,8 +2380,15 @@ mod tests {
                 &BTreeMap::from([(production_id, manifest)]),
             )
             .unwrap();
-        let result =
-            execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+        let result = execute(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let outputs = [1usize, 1, 1, 0];
         for slot in 0..slots {
             let index = indices[slot];

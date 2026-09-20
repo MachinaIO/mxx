@@ -430,8 +430,8 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::{BigInt, BigUint};
     use std::collections::{BTreeMap, HashMap};
@@ -802,6 +802,7 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
 
@@ -910,6 +911,7 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         let RuntimeValue::Matrix(actual) = &result.outputs["residual"] else { panic!("matrix") };

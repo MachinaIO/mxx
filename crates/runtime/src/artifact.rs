@@ -1298,6 +1298,18 @@ pub struct MemoryArtifactStore {
     read_sessions: BTreeSet<ProductionId>,
 }
 
+/// Durable value-only authority for one finalized in-memory production.
+/// Applications can serialize this snapshot beside payloads and restore it
+/// without manufacturing a standalone manifest that bypasses session checks.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MemoryFinalizedSessionSnapshot {
+    pub descriptor: SessionDescriptor,
+    pub manifest: Manifest,
+    pub transcript: Vec<(DrawSite, RecordedValue)>,
+    pub committed_artifacts: Vec<ArtifactHandle>,
+    pub aliases: Vec<(SessionAliasDescriptor, [u8; 32])>,
+}
+
 #[derive(Clone, Debug)]
 struct MemorySession {
     descriptor: SessionDescriptor,
@@ -1438,6 +1450,182 @@ impl MemoryArtifactStore {
 
     pub fn transcript_len(&self, production: &ProductionId) -> Option<usize> {
         self.sessions.get(production).map(|session| session.transcript.len())
+    }
+
+    pub fn snapshot_finalized_session(
+        &self,
+        production: &ProductionId,
+    ) -> Result<MemoryFinalizedSessionSnapshot, MemoryArtifactError> {
+        let manifest = self.validated_manifest_snapshot(production)?;
+        let session = self
+            .sessions
+            .get(production)
+            .ok_or_else(|| MemoryArtifactError::SessionNotOpen(production.clone()))?;
+        if session.status != SessionStatus::Finalized {
+            return Err(MemoryArtifactError::SessionNotFinalized(production.clone()));
+        }
+        let committed_artifacts = session
+            .committed_artifacts
+            .iter()
+            .map(|(key, (artifact_type, availability, layout))| ArtifactHandle {
+                key: key.clone(),
+                artifact_type: artifact_type.clone(),
+                availability: *availability,
+                layout: layout.clone(),
+            })
+            .collect();
+        let aliases = self
+            .session_aliases
+            .iter()
+            .filter(|(_, (descriptor, nonce))| {
+                production.execution_nonce == *nonce && descriptor.spec_hash == production.spec_hash
+            })
+            .map(|(_, (descriptor, nonce))| (descriptor.clone(), *nonce))
+            .collect();
+        Ok(MemoryFinalizedSessionSnapshot {
+            descriptor: session.descriptor.clone(),
+            manifest,
+            transcript: session
+                .transcript
+                .iter()
+                .map(|(site, value)| (site.clone(), value.clone()))
+                .collect(),
+            committed_artifacts,
+            aliases,
+        })
+    }
+
+    pub fn restore_finalized_session(
+        &mut self,
+        snapshot: MemoryFinalizedSessionSnapshot,
+        payloads: Vec<(ArtifactKey, ArtifactPayload)>,
+    ) -> Result<(), MemoryArtifactError> {
+        let production = snapshot.manifest.production_id.clone();
+        if snapshot.descriptor.production_id != production ||
+            snapshot.manifest.production_id != production
+        {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production));
+        }
+        validate_manifest(&snapshot.manifest)
+            .map_err(|error| MemoryArtifactError::InvalidManifest(error.to_string()))?;
+        let mut manifest_expected = BTreeMap::new();
+        for (name, descriptor) in &snapshot.manifest.artifacts {
+            let indices: Box<dyn Iterator<Item = Option<usize>>> = match descriptor.family_count {
+                Some(count) => Box::new((0..count).map(Some)),
+                None => Box::new(std::iter::once(None)),
+            };
+            for index in indices {
+                manifest_expected.insert(
+                    ArtifactKey { production: production.clone(), name: name.clone(), index },
+                    (
+                        descriptor.artifact_type.clone(),
+                        descriptor.availability,
+                        descriptor.layout.clone(),
+                    ),
+                );
+            }
+        }
+        let mut expected = BTreeMap::new();
+        for handle in &snapshot.committed_artifacts {
+            if handle.key.production != production ||
+                expected
+                    .insert(
+                        handle.key.clone(),
+                        (handle.artifact_type.clone(), handle.availability, handle.layout.clone()),
+                    )
+                    .is_some()
+            {
+                return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+            }
+        }
+        if expected != manifest_expected {
+            return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+        }
+
+        let mut incoming = BTreeMap::new();
+        for (key, payload) in payloads {
+            if key.production != production {
+                return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+            }
+            let Some((artifact_type, _, _)) = expected.get(&key) else {
+                return Err(MemoryArtifactError::MissingManifestArtifact(key));
+            };
+            if !payload_matches(artifact_type, &payload) {
+                return Err(MemoryArtifactError::PayloadTypeMismatch(key));
+            }
+            if incoming.insert(key.clone(), payload).is_some() {
+                return Err(MemoryArtifactError::ArtifactConflict(key));
+            }
+        }
+        for key in expected.keys() {
+            if !incoming.contains_key(key) {
+                return Err(MemoryArtifactError::Missing(key.clone()));
+            }
+        }
+
+        for (descriptor, nonce) in &snapshot.aliases {
+            if *nonce != production.execution_nonce || descriptor.spec_hash != production.spec_hash
+            {
+                return Err(MemoryArtifactError::SessionManifestMismatch(production.clone()));
+            }
+            if let Some((existing, existing_nonce)) = self.session_aliases.get(&descriptor.name) {
+                if existing != descriptor || *existing_nonce != *nonce {
+                    return Err(MemoryArtifactError::SessionAliasConflict(descriptor.name.clone()));
+                }
+            }
+        }
+
+        if self.active_sessions.contains(&production) {
+            return Err(MemoryArtifactError::SessionBusy(production));
+        }
+        if let Some(existing) = self.manifests.get(&production) {
+            if existing != &snapshot.manifest {
+                return Err(MemoryArtifactError::ManifestConflict(production.clone()));
+            }
+        }
+        let transcript = snapshot.transcript.iter().cloned().collect::<BTreeMap<_, _>>();
+        if let Some(existing) = self.sessions.get(&production) {
+            if existing.descriptor != snapshot.descriptor ||
+                existing.status != SessionStatus::Finalized ||
+                existing.transcript != transcript ||
+                existing.committed_artifacts != expected
+            {
+                return Err(MemoryArtifactError::SessionConflict(production.clone()));
+            }
+        }
+        for (key, payload) in &incoming {
+            let (artifact_type, availability, layout) = expected
+                .get(key)
+                .expect("incoming payloads were checked against committed artifacts");
+            if let Some(existing) = self.entries.get(key) {
+                let expected_entry =
+                    (artifact_type.clone(), *availability, layout.clone(), payload.clone());
+                if existing != &expected_entry {
+                    return Err(MemoryArtifactError::ArtifactConflict(key.clone()));
+                }
+            }
+        }
+
+        for (key, payload) in incoming {
+            let (artifact_type, availability, layout) = expected
+                .get(&key)
+                .expect("incoming payloads were checked against committed artifacts");
+            self.store(key, artifact_type, *availability, layout.as_deref(), payload)?;
+        }
+        self.manifests.insert(production.clone(), snapshot.manifest);
+        self.sessions.insert(
+            production.clone(),
+            MemorySession {
+                descriptor: snapshot.descriptor,
+                status: SessionStatus::Finalized,
+                transcript,
+                committed_artifacts: expected,
+            },
+        );
+        for (descriptor, nonce) in snapshot.aliases {
+            self.session_aliases.insert(descriptor.name.clone(), (descriptor, nonce));
+        }
+        Ok(())
     }
 
     /// Session-backed manifests are only visible through the final artifact
@@ -2566,6 +2754,72 @@ mod tests {
         assert!(matches!(
             store.resolve_session_nonce(&changed),
             Err(MemoryArtifactError::SessionAliasConflict(name)) if name == "diamond-we"
+        ));
+    }
+
+    #[test]
+    fn memory_restore_rejects_conflicting_preexisting_session_and_artifact() {
+        let production = production(46);
+        let artifact_type = ArtifactType::Bytes { length: 1 };
+        let descriptor = ManifestArtifact {
+            artifact_type: artifact_type.clone(),
+            family_count: None,
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let key = ArtifactKey { production: production.clone(), name: "value".into(), index: None };
+        let manifest = Manifest {
+            ir_version: IR_VERSION,
+            production_id: production.clone(),
+            artifacts: BTreeMap::from([("value".into(), descriptor.clone())]),
+        };
+        let handle = ArtifactHandle {
+            key: key.clone(),
+            artifact_type: artifact_type.clone(),
+            availability: ArtifactAvailability::Transferred,
+            layout: None,
+        };
+        let snapshot = MemoryFinalizedSessionSnapshot {
+            descriptor: SessionDescriptor::new(production.clone(), "restore", [1; 32]),
+            manifest,
+            transcript: Vec::new(),
+            committed_artifacts: vec![handle],
+            aliases: Vec::new(),
+        };
+        let mut store = MemoryArtifactStore::default();
+        store
+            .store(
+                key.clone(),
+                &artifact_type,
+                ArtifactAvailability::Transferred,
+                None,
+                ArtifactPayload::Bytes(vec![2]),
+            )
+            .expect("seed conflicting artifact");
+        assert!(matches!(
+            store.restore_finalized_session(
+                snapshot.clone(),
+                vec![(key.clone(), ArtifactPayload::Bytes(vec![1]))],
+            ),
+            Err(MemoryArtifactError::ArtifactConflict(actual)) if actual == key
+        ));
+        assert_eq!(store.manifest(&production), None);
+
+        let mut restored = MemoryArtifactStore::default();
+        restored
+            .restore_finalized_session(
+                snapshot.clone(),
+                vec![(key.clone(), ArtifactPayload::Bytes(vec![1]))],
+            )
+            .expect("restore initial finalized session");
+        let mut conflicting = snapshot;
+        conflicting.descriptor.input_digest = [9; 32];
+        assert!(matches!(
+            restored.restore_finalized_session(
+                conflicting,
+                vec![(key, ArtifactPayload::Bytes(vec![1]))],
+            ),
+            Err(MemoryArtifactError::SessionConflict(actual)) if actual == production
         ));
     }
 

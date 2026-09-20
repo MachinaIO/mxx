@@ -4,43 +4,9 @@
 //! backend operations as the runtime. It measures operation cost; it is not a
 //! second graph executor and does not define node semantics.
 
-#[cfg(test)]
-#[path = "gpu_lifecycle_tests.rs"]
-mod gpu_lifecycle_tests;
-#[cfg(test)]
-#[path = "gpu_multigpu_lifecycle_tests.rs"]
-mod gpu_multigpu_lifecycle_tests;
-#[cfg(test)]
-#[path = "gpu_primitive_lifecycle_tests.rs"]
-mod gpu_primitive_lifecycle_tests;
-
+pub use self::harness::GpuWarmupMeasurementConfig;
+use self::harness::{MemoryProbe, measure_batch_operation};
 use crate::{
-    MeasurementBackend, MeasurementNode, NodeMeasurement,
-    harness::{MeasurementHarnessConfig, MemoryProbe, measure_batch_operation},
-};
-use mxx_ir_core::{
-    ParamEnv,
-    artifact::{ArtifactAvailability, ArtifactType},
-    encoding,
-    node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
-    types::{ConcreteMatrixType, ConcreteWireType},
-};
-use mxx_primitives::{
-    gpu_memory::{GpuMemoryRange, GpuMemoryShape},
-    matrix::{PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
-    poly::{
-        PolyParams,
-        dcrt::gpu::{
-            GpuOutOfMemory, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
-            gpu_device_memory_usage, gpu_device_runtime_identity, gpu_memory_info,
-        },
-    },
-    sampler::trapdoor::gpu::{
-        PreimageAllocationEvidence, PreimageCacheIdentity as NativePreimageCacheIdentity,
-        PreimageCacheState,
-    },
-};
-use mxx_runtime::{
     Backend,
     backend::{
         GpuWarmupCacheState, GpuWarmupDeviceIdentity, GpuWarmupEffectiveVariant,
@@ -49,7 +15,7 @@ use mxx_runtime::{
         GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupResidencyDelta, GpuWarmupRoute,
         GpuWarmupTimingScope, IndexRange, MatrixMulAccumulateRequest, MemoryEvidenceKind,
         PreimageCacheIdentity, PreimageRequest, RuntimeValue, SampleRange,
-        poly::PolyBackendError,
+        poly::{PolyBackendError, gpu::gpu_backend_on},
         poly_gpu::{
             GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEvidenceKind,
             GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
@@ -57,11 +23,9 @@ use mxx_runtime::{
             GpuProductionCompletion,
         },
     },
+    executor::{ExecutionConfig, ExecutionError, ExecutionPlan, ExecutionResult, execute_prepared},
     gpu_calibration::{
-        GpuCalibrationKey, GpuCalibrationProfile, GpuCalibrationRegistry, GpuColumnWidths,
-        GpuDeviceCalibration, GpuDeviceMemory, gpu_calibration_environment,
-        gpu_calibration_operation_identity, gpu_capped_waterfill_columns,
-        gpu_matrix_multiply_scales_left,
+        GpuCalibrationProfile, GpuColumnWidths, GpuDeviceMemory, gpu_matrix_multiply_scales_left,
     },
     gpu_column_policy::{
         CanonicalWarmupProfileDomain, ColumnCapability, ColumnRange, FusedWarmupOperation,
@@ -71,9 +35,13 @@ use mxx_runtime::{
         column_capability, effective_gpu_operation, fused_warmup_profile_domain,
         gpu_execution_range, map_output_range_to_inputs_with_output,
     },
-    gpu_execution_plan::{FrozenGpuPlan, GpuExecutionSiteKey},
+    gpu_execution_plan::{
+        FrozenGpuPlan, FrozenGpuPlanIndex, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout,
+        LayoutId,
+    },
     gpu_warmup::{
-        GpuPreimageFootprint, GpuProfileProvenance, GpuResourceCost, GpuTimeModel,
+        GpuPreimageFootprint, GpuProfileProvenance, GpuResourceCost, GpuStageCostModel,
+        GpuTimeModel, GpuValidatedWarmupConfig, GpuWarmupError, GpuWarmupReport,
         gpu_non_column_batch_wave_time,
     },
     host_control::{
@@ -81,12 +49,33 @@ use mxx_runtime::{
         dispatch_pack_polynomial_coefficients, dispatch_polynomial_from_values,
         dispatch_polynomial_values, dispatch_threshold_decode, measure_host_container_primitive,
         measure_host_control_with, measure_host_primitive, measure_runtime_container_primitive,
-        measure_trapdoor_public, measure_typed_runtime_input,
+        measure_runtime_family_get_primitive, measure_trapdoor_public, measure_typed_runtime_input,
+    },
+    session::SessionStore,
+};
+use mxx_ir_core::{
+    ParamEnv, ValidatedGraph, encoding,
+    node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
+    types::{ConcreteMatrixType, ConcreteWireType},
+};
+use mxx_primitives::{
+    gpu_memory::{GpuMemoryRange, GpuMemoryShape},
+    matrix::{PolyMatrix, PolyMatrixColumnSource, SmallPolyMatrix, gpu_dcrt_poly::GpuSmallMatrix},
+    poly::{
+        PolyParams,
+        dcrt::gpu::{
+            GpuDCRTPolyParams, GpuOutOfMemory, gpu_default_mempool_reset_high_water,
+            gpu_default_mempool_usage, gpu_device_memory_usage, gpu_device_runtime_identity,
+            gpu_memory_info,
+        },
+    },
+    sampler::trapdoor::gpu::{
+        PreimageAllocationEvidence, PreimageCacheIdentity as NativePreimageCacheIdentity,
+        PreimageCacheState,
     },
 };
 use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
-use rayon::prelude::*;
 use serde::Serialize;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -97,7 +86,36 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
-use tracing::{debug, info};
+
+#[path = "gpu_measurement/harness.rs"]
+mod harness;
+#[path = "gpu_measurement/lifecycle_tests.rs"]
+#[cfg(test)]
+mod lifecycle_tests;
+#[path = "gpu_measurement/multigpu_lifecycle_tests.rs"]
+#[cfg(test)]
+mod multigpu_lifecycle_tests;
+#[path = "gpu_measurement/primitive_lifecycle_tests.rs"]
+#[cfg(test)]
+mod primitive_lifecycle_tests;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct NodeMeasurement {
+    work_seconds: f64,
+    latency_seconds: f64,
+    cumulative_wave_seconds: f64,
+    independent_wave_count: usize,
+    measured_wave_workspace_bytes: u64,
+    workspace_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct MeasurementNode<'a> {
+    id: mxx_ir_core::NodeId,
+    kind: &'a NodeKind,
+    concrete_argument_types: Vec<ConcreteWireType>,
+    concrete_output_types: Vec<ConcreteWireType>,
+}
 
 #[derive(Debug)]
 pub struct GpuMeasurementError(String);
@@ -120,6 +138,17 @@ impl GpuMeasurementError {
     fn is_out_of_memory(&self) -> bool {
         self.0.starts_with(GPU_OOM_ERROR_PREFIX)
     }
+}
+
+fn warmup_node_phase_error(
+    phase: &str,
+    node: &MeasurementNode<'_>,
+    error: impl fmt::Display,
+) -> GpuMeasurementError {
+    GpuMeasurementError(format!(
+        "GPU warmup {phase} phase failed: node={:?} kind={:?}: {error}",
+        node.id, node.kind
+    ))
 }
 
 struct GpuMemoryProbe {
@@ -235,60 +264,14 @@ struct PreparedHostPrimitive {
     trapdoor: Option<RuntimeValue<GpuDcrtBackend>>,
     scalar_inputs: Vec<HostPrimitiveValue>,
     family_inputs: Vec<RuntimeValue<GpuDcrtBackend>>,
+    /// Shared scalar-family storage used by FamilyGet sites. Keeping the
+    /// family behind Arc avoids cloning its O(count) vector per measured site.
+    family_fixture: Option<Arc<Vec<RuntimeValue<GpuDcrtBackend>>>>,
     dynamic_index: Option<RuntimeValue<GpuDcrtBackend>>,
     choices: Vec<RuntimeValue<GpuDcrtBackend>>,
 }
 
 impl PreparedMeasurement {
-    fn merge(mut self, other: Self) -> Self {
-        for (target, value) in self.arguments.iter_mut().zip(other.arguments) {
-            if target.is_none() {
-                *target = value;
-            }
-        }
-        for (target, value) in self.small_arguments.iter_mut().zip(other.small_arguments) {
-            if target.is_none() {
-                *target = value;
-            }
-        }
-        if self.preimage_trapdoor.is_none() {
-            self.preimage_trapdoor = other.preimage_trapdoor;
-        }
-        if self.preimage_target.is_none() {
-            self.preimage_target = other.preimage_target;
-        }
-        self
-    }
-
-    fn merge_for_representative(
-        self,
-        scaled: Self,
-        fixed_arguments: &[bool],
-    ) -> Result<Self, GpuMeasurementError> {
-        if self.arguments.len() == scaled.arguments.len() &&
-            self.small_arguments.len() == scaled.small_arguments.len()
-        {
-            return Ok(self.merge(scaled));
-        }
-        let fixed_is_empty = self.arguments.iter().all(Option::is_none) &&
-            self.small_arguments.iter().all(Option::is_none) &&
-            self.preimage_trapdoor.is_none() &&
-            self.preimage_target.is_none();
-        if fixed_arguments.len() == scaled.arguments.len() &&
-            fixed_arguments.iter().all(|fixed| !fixed) &&
-            fixed_is_empty
-        {
-            return Ok(scaled);
-        }
-        Err(GpuMeasurementError(format!(
-            "fixed/scaled representative arity mismatch (fixed matrices={}, fixed compact={}, scaled matrices={}, scaled compact={}, ownership={fixed_arguments:?})",
-            self.arguments.len(),
-            self.small_arguments.len(),
-            scaled.arguments.len(),
-            scaled.small_arguments.len()
-        )))
-    }
-
     fn finish(&self) {
         self.arguments.iter().flatten().for_each(|value| value.wait_until_ready());
         self.small_arguments.iter().flatten().for_each(|value| value.wait_until_ready());
@@ -341,12 +324,34 @@ struct GpuMeasurementWorker {
     /// the job to a bare duration; warmup admission needs every physical
     /// owner (including host/pinned staging), not just the callback device.
     last_production_job: Option<ProductionJobObservation>,
+    /// One reusable host-family fixture for this worker. The cache is
+    /// deliberately scalar-only: matrix/compact/trapdoor payloads retain
+    /// their ordinary setup ownership and are never cached here. Replacing
+    /// the entry on any key change keeps worker/context ownership explicit and
+    /// makes dropping the provider drop the fixture and its evidence too.
+    scalar_family_cache: Option<ScalarFamilyFixture>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ScalarFamilyCacheKey {
+    element_type: ConcreteWireType,
+    count: usize,
+    bindings: ParamEnv,
+    logical_device: usize,
+    worker_device_id: i32,
+    worker_devices: Vec<i32>,
+}
+
+#[derive(Clone)]
+struct ScalarFamilyFixture {
+    key: ScalarFamilyCacheKey,
+    values: Arc<Vec<RuntimeValue<GpuDcrtBackend>>>,
+    setup_memory: Arc<GpuWarmupMemoryObservations>,
 }
 
 #[derive(Clone, Debug)]
 struct ProductionJobObservation {
-    elapsed: std::time::Duration,
-    routes: Vec<mxx_runtime::gpu_column_policy::GpuExecutionRouteDescriptor>,
+    routes: Vec<crate::gpu_column_policy::GpuExecutionRouteDescriptor>,
     resources: Vec<GpuAffectedResourceEnvelope>,
 }
 
@@ -369,18 +374,6 @@ fn authoritative_production_route(
             observed.iter().all(|route| route.destination_device == Some(*destination))
         })
         .or(requested.destination_device);
-    let route = if observed.iter().any(|route| route.route == GpuTransferRoute::HostStaging) {
-        GpuTransferRoute::HostStaging
-    } else if observed.iter().any(|route| route.route == GpuTransferRoute::Peer) {
-        GpuTransferRoute::Peer
-    } else {
-        GpuTransferRoute::Resident
-    };
-    let source_device = observed
-        .iter()
-        .find_map(|route| route.source_device.filter(|source| Some(*source) != destination))
-        .or_else(|| observed.iter().find_map(|route| route.source_device))
-        .or(requested.source_device);
     let source_range = observed.iter().fold(first.source_range, |range, route| ColumnRange {
         start: range.start.min(route.source_range.start),
         end: range.end.max(route.source_range.end),
@@ -391,8 +384,6 @@ fn authoritative_production_route(
             end: range.end.max(route.destination_range.end),
         });
     let mut aggregate = first;
-    aggregate.route = route;
-    aggregate.source_device = source_device;
     aggregate.destination_device = destination;
     aggregate.source_range = source_range;
     aggregate.destination_range = destination_range;
@@ -404,26 +395,52 @@ fn authoritative_production_route(
         observed.iter().map(|route| route.pinned_host_staging_bytes).sum();
     let source_routes = observed.iter().flat_map(|route| route.source_routes().iter().copied());
     aggregate = aggregate.with_source_routes(source_routes)?;
+    // The per-source physical fragments are the production authority. An
+    // outer descriptor may carry a provisional cross-device class while all
+    // materialized fragments for this bounded job are resident. Derive the
+    // aggregate class from the retained fragments so a zero-byte provisional
+    // HostStaging envelope cannot override actual resident execution.
+    aggregate.route = if aggregate
+        .source_routes()
+        .iter()
+        .any(|route| route.route == GpuTransferRoute::HostStaging)
+    {
+        GpuTransferRoute::HostStaging
+    } else if aggregate.source_routes().iter().any(|route| route.route == GpuTransferRoute::Peer) {
+        GpuTransferRoute::Peer
+    } else {
+        GpuTransferRoute::Resident
+    };
+    aggregate.source_device = if aggregate.route == GpuTransferRoute::Resident {
+        aggregate.destination_device
+    } else {
+        aggregate
+            .source_routes()
+            .iter()
+            .find_map(|route| {
+                (Some(route.source_owner) != aggregate.destination_device)
+                    .then_some(route.source_owner)
+            })
+            .or_else(|| aggregate.source_routes().first().map(|route| route.source_owner))
+    };
     aggregate.validate().then_some(aggregate)
 }
 
 #[derive(Clone)]
 struct PendingMeasurement {
     warmup: Option<GpuWarmupOperationDescriptor>,
-    key: [u8; 32],
     scope: mxx_ir_core::FrozenGraphScopeId,
     id: mxx_ir_core::types::NodeId,
     kind: NodeKind,
     concrete_argument_types: Vec<ConcreteWireType>,
     concrete_output_types: Vec<ConcreteWireType>,
     bindings: ParamEnv,
-    preimage_sample: bool,
 }
 
 struct RepresentativeMeasurement {
-    inputs: mxx_runtime::backend::GpuEffectiveInputs,
-    source_layouts: Vec<mxx_runtime::backend::GpuWarmupStorageLayout>,
-    fixed_metadata: Option<mxx_runtime::backend::PlannedNodeBatchRequest>,
+    inputs: crate::backend::GpuEffectiveInputs,
+    source_layouts: Vec<crate::backend::GpuWarmupStorageLayout>,
+    fixed_metadata: Option<crate::backend::PlannedNodeBatchRequest>,
     retry_cap: Option<usize>,
     kind: NodeKind,
     concrete_argument_types: Vec<ConcreteWireType>,
@@ -439,125 +456,29 @@ fn family_leaf_type(wire_type: &ConcreteWireType) -> &ConcreteWireType {
     }
 }
 
-fn family_leaf_type_mut(wire_type: &mut ConcreteWireType) -> &mut ConcreteWireType {
-    match wire_type {
-        ConcreteWireType::IndexedFamily { element, .. } => family_leaf_type_mut(element),
-        _ => wire_type,
-    }
-}
-
 fn matrix_leaf_type(wire_type: &ConcreteWireType) -> Option<&ConcreteMatrixType> {
     family_leaf_type(wire_type).matrix_type()
 }
 
-fn matrix_leaf_type_mut(wire_type: &mut ConcreteWireType) -> Option<&mut ConcreteMatrixType> {
-    match family_leaf_type_mut(wire_type) {
-        ConcreteWireType::Matrix(matrix) |
-        ConcreteWireType::SmallMatrix { matrix, .. } |
-        ConcreteWireType::Preimage { matrix, .. } |
-        ConcreteWireType::Trapdoor { matrix, .. } => Some(matrix),
-        _ => None,
+/// Return the row topology consumed by the native tensor row-sum allocation
+/// query.  A shared dispatch concatenates every logical output's row groups
+/// into one physical result, while an ordinary tensor row sum has only the
+/// leader's `row_groups` inventory.
+fn tensor_row_sum_allocation_groups(
+    inputs: &crate::backend::GpuEffectiveInputs,
+) -> Option<Vec<Vec<usize>>> {
+    if !inputs.row_sum_groups.is_empty() {
+        Some(inputs.row_sum_groups.iter().flatten().cloned().collect())
+    } else if !inputs.row_groups.is_empty() {
+        Some(inputs.row_groups.clone())
+    } else {
+        None
     }
 }
 
-impl RepresentativeMeasurement {
-    fn measured_columns(&self) -> Option<usize> {
-        self.output_range
-            .as_ref()
-            .map(|range| range.end - range.start)
-            .or_else(|| {
-                self.concrete_output_types
-                    .iter()
-                    .find_map(GpuNodeMeasurementBackend::matrix_columns)
-            })
-            .or_else(|| {
-                self.concrete_argument_types
-                    .iter()
-                    .find_map(GpuNodeMeasurementBackend::matrix_columns)
-            })
-            .filter(|columns| *columns > 0)
-    }
-}
-
-fn extrapolate_fleet_waves(full_wave: &NodeMeasurement, wave_count: usize) -> NodeMeasurement {
-    NodeMeasurement {
-        work_seconds: full_wave.work_seconds * wave_count as f64,
-        latency_seconds: full_wave.latency_seconds,
-        cumulative_wave_seconds: full_wave.latency_seconds * wave_count as f64,
-        independent_wave_count: wave_count,
-        measured_wave_workspace_bytes: full_wave.measured_wave_workspace_bytes,
-        // Workspace is the peak of one bounded wave.  Independent waves are
-        // sequential in the production schedule; multiplying a one-wave
-        // peak by their count is an empirical resource extrapolation and
-        // over-admits no real concurrent allocation.
-        workspace_bytes: full_wave.workspace_bytes,
-    }
-}
-
-fn aggregate_fleet_wave(
-    measurements: impl IntoIterator<Item = NodeMeasurement>,
-    fleet_latency_seconds: f64,
-) -> NodeMeasurement {
-    measurements.into_iter().fold(NodeMeasurement::default(), |mut fleet, device| {
-        // Work and workspace are aggregate fleet resources. Fleet latency is measured around the
-        // coordinated enqueue/completion join and is installed after aggregating device work.
-        fleet.work_seconds += device.work_seconds;
-        fleet.latency_seconds = fleet_latency_seconds;
-        fleet.cumulative_wave_seconds = fleet_latency_seconds;
-        fleet.measured_wave_workspace_bytes = fleet
-            .measured_wave_workspace_bytes
-            .saturating_add(device.measured_wave_workspace_bytes);
-        fleet.workspace_bytes = fleet.workspace_bytes.saturating_add(device.workspace_bytes);
-        fleet
-    })
-}
-
-impl PendingMeasurement {
-    fn representative_bytes(&self) -> u128 {
-        fn wire_bytes(wire_type: &ConcreteWireType) -> u128 {
-            match wire_type {
-                ConcreteWireType::Matrix(matrix) => (matrix.rows as u128)
-                    .saturating_mul(matrix.columns as u128)
-                    .saturating_mul(matrix.ring_dimension as u128)
-                    .saturating_mul(8),
-                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                    compact_matrix_bytes_u128(matrix, max_coefficient_bound)
-                }
-                ConcreteWireType::Trapdoor { matrix, .. } => (matrix.rows as u128)
-                    .saturating_mul(matrix.columns as u128)
-                    .saturating_mul(matrix.ring_dimension as u128)
-                    .saturating_mul(8),
-                ConcreteWireType::IndexedFamily { element, count } => {
-                    wire_bytes(element).saturating_mul(*count as u128)
-                }
-                ConcreteWireType::Bytes { length } => *length as u128,
-                ConcreteWireType::TypedBlob { .. } |
-                ConcreteWireType::ConstantInt |
-                ConcreteWireType::ConstantReal |
-                ConcreteWireType::ConstantBool |
-                ConcreteWireType::Int |
-                ConcreteWireType::Real |
-                ConcreteWireType::Bool => 0,
-            }
-        }
-
-        self.concrete_argument_types
-            .iter()
-            .chain(&self.concrete_output_types)
-            .map(wire_bytes)
-            .max()
-            .unwrap_or(0)
-    }
-}
-
-pub struct GpuNodeMeasurementBackend {
+pub struct ProductionGpuWarmupProvider {
     workers: Vec<GpuMeasurementWorker>,
-    harness: MeasurementHarnessConfig,
-    /// Setup-time snapshot. Measurement and calibration must not reread process environment.
-    vram_percent: u32,
-    calibration_registry: GpuCalibrationRegistry,
-    measurements: HashMap<[u8; 32], NodeMeasurement>,
+    harness: GpuWarmupMeasurementConfig,
     /// Preimage retry metadata is not part of the generic profile point.  It
     /// is retained only as validated sampler metadata, keyed by the same
     /// canonical execution class as the point table.
@@ -607,8 +528,6 @@ pub struct GpuNodeMeasurementBackend {
     /// same descriptor as warmup profile requests.
     host_control_operations:
         HashMap<(mxx_ir_core::FrozenGraphScopeId, mxx_ir_core::types::NodeId), HostControlChild>,
-    pending: HashMap<[u8; 32], PendingMeasurement>,
-    collecting: bool,
 }
 
 /// One successful warmup dispatch through the public production range API.
@@ -622,12 +541,12 @@ pub struct GpuWarmupDispatchRecord {
     pub range: IndexRange,
     pub timing_scope: GpuWarmupTimingScope,
     pub measurement: WarmupMeasurementKind,
-    pub inputs: mxx_runtime::backend::GpuEffectiveInputs,
+    pub inputs: crate::backend::GpuEffectiveInputs,
     pub argument_types: Vec<ConcreteWireType>,
     pub output_types: Vec<ConcreteWireType>,
 }
 
-impl GpuNodeMeasurementBackend {
+impl ProductionGpuWarmupProvider {
     fn physical_device_ids(&self) -> Vec<i32> {
         let mut seen = HashSet::new();
         self.workers
@@ -642,7 +561,7 @@ impl GpuNodeMeasurementBackend {
     }
 
     fn physical_device_index(&self, physical: i32) -> Option<usize> {
-        mxx_runtime::gpu_execution_plan::logical_device_for_physical(
+        crate::gpu_execution_plan::logical_device_for_physical(
             &self.physical_device_ids(),
             physical,
         )
@@ -715,8 +634,8 @@ impl GpuNodeMeasurementBackend {
             .checked_mul(limbs)
             .and_then(|count| count.checked_mul(size_of::<u64>()))
             .ok_or_else(|| GpuMeasurementError("boundary transfer size overflows".into()))?;
-        Ok(mxx_runtime::gpu_column_policy::resolve_gpu_route(
-            mxx_runtime::gpu_column_policy::GpuRouteResolutionInput {
+        Ok(crate::gpu_column_policy::resolve_gpu_route(
+            crate::gpu_column_policy::GpuRouteResolutionInput {
                 source_device: Some(0),
                 destination_device: Some(0),
                 source_range: ColumnRange { start: 0, end: 1 },
@@ -734,7 +653,7 @@ impl GpuNodeMeasurementBackend {
     }
 
     /// Creates a representative GPU measurement backend for validated IR nodes.
-    pub fn new(backends: Vec<(GpuDcrtBackend, i32)>, harness: MeasurementHarnessConfig) -> Self {
+    pub fn new(backends: Vec<(GpuDcrtBackend, i32)>, harness: GpuWarmupMeasurementConfig) -> Self {
         assert!(!backends.is_empty(), "GPU measurement requires at least one backend");
         let vram_percent = backends[0].0.vram_percent();
         assert!(
@@ -753,23 +672,24 @@ impl GpuNodeMeasurementBackend {
                 backend
                     .set_measurement_owners(owners.clone())
                     .expect("validated measurement owners");
-                GpuMeasurementWorker { backend, device_id, last_production_job: None }
+                GpuMeasurementWorker {
+                    backend,
+                    device_id,
+                    last_production_job: None,
+                    scalar_family_cache: None,
+                }
             })
             .collect();
-        Self::from_workers(workers, harness, vram_percent)
+        Self::from_workers(workers, harness)
     }
 
     fn from_workers(
         workers: Vec<GpuMeasurementWorker>,
-        harness: MeasurementHarnessConfig,
-        vram_percent: u32,
+        harness: GpuWarmupMeasurementConfig,
     ) -> Self {
         Self {
             workers,
             harness,
-            vram_percent,
-            calibration_registry: GpuCalibrationRegistry::new(),
-            measurements: HashMap::new(),
             preimage_profile_metadata: HashMap::new(),
             preimage_footprints: HashMap::new(),
             preimage_memory: HashMap::new(),
@@ -784,15 +704,7 @@ impl GpuNodeMeasurementBackend {
             warmup_dispatch_records: Vec::new(),
             last_host_setup_memory: None,
             host_control_operations: HashMap::new(),
-            pending: HashMap::new(),
-            collecting: true,
         }
-    }
-
-    /// Returns the setup-time profiles populated by measurement. Runtime may reuse the
-    /// same registry and recompute widths from its then-current GPU residency.
-    pub fn calibration_registry(&self) -> GpuCalibrationRegistry {
-        self.calibration_registry.clone()
     }
 
     /// Number of actual setup-time profile measurements performed by this
@@ -825,8 +737,18 @@ impl GpuNodeMeasurementBackend {
         &mut self,
         request: &GpuWarmupProfileRequest,
         domain: CanonicalWarmupProfileDomain,
-        fused_operation: Option<FusedWarmupOperation>,
+        _fused_operation: Option<FusedWarmupOperation>,
     ) {
+        // The registered descriptor is the production dispatch authority. Do
+        // not reconstruct the fusion kind from a parallel signature index:
+        // an execution-class cache lookup may share a signature while the
+        // descriptor carries the exact ordinary/fused lowering selected for
+        // this site.
+        let fused_operation = self
+            .warmup_operations
+            .get(&request.signature)
+            .and_then(|pending| pending.warmup.as_ref())
+            .and_then(|descriptor| descriptor.fused_operation);
         self.warmup_dispatch_records.push(GpuWarmupDispatchRecord {
             profile_domain: domain,
             fused_operation,
@@ -970,6 +892,8 @@ impl GpuNodeMeasurementBackend {
         struct ProfileContext<'a> {
             effective_operation: &'a str,
             row_groups: &'a [Vec<usize>],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            row_sum_groups: Option<&'a [Vec<Vec<usize>>]>,
             arguments: Vec<ProfileType>,
             outputs: Vec<ProfileType>,
             bindings: &'a ParamEnv,
@@ -977,6 +901,8 @@ impl GpuNodeMeasurementBackend {
         let hash = encoding::hash_canonical(&ProfileContext {
             effective_operation: &descriptor.effective_operation,
             row_groups: &descriptor.inputs.row_groups,
+            row_sum_groups: (!descriptor.inputs.row_sum_groups.is_empty())
+                .then_some(descriptor.inputs.row_sum_groups.as_slice()),
             arguments: descriptor.concrete_argument_types.iter().map(profile_type).collect(),
             outputs: descriptor.concrete_output_types.iter().map(profile_type).collect(),
             bindings: &descriptor.bindings,
@@ -1001,13 +927,9 @@ impl GpuNodeMeasurementBackend {
             GpuWarmupRoute::HostOnly
         } else {
             match request.route_descriptor.route {
-                mxx_runtime::gpu_column_policy::GpuTransferRoute::Resident => {
-                    GpuWarmupRoute::DeviceLocal
-                }
-                mxx_runtime::gpu_column_policy::GpuTransferRoute::Peer => {
-                    GpuWarmupRoute::PeerToPeer
-                }
-                mxx_runtime::gpu_column_policy::GpuTransferRoute::HostStaging => {
+                crate::gpu_column_policy::GpuTransferRoute::Resident => GpuWarmupRoute::DeviceLocal,
+                crate::gpu_column_policy::GpuTransferRoute::Peer => GpuWarmupRoute::PeerToPeer,
+                crate::gpu_column_policy::GpuTransferRoute::HostStaging => {
                     GpuWarmupRoute::HostStaging
                 }
             }
@@ -1410,13 +1332,8 @@ impl GpuNodeMeasurementBackend {
             .ok_or_else(|| GpuMeasurementError("preimage evidence device is unavailable".into()))?;
         let representative = Self::representative_at(&descriptor, request.range.start, width);
         let node = MeasurementNode {
-            scope: &descriptor.scope,
             id: descriptor.id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
@@ -1427,7 +1344,7 @@ impl GpuNodeMeasurementBackend {
         } else {
             Self::prepare(&mut worker.backend, &node, &descriptor.bindings, None)?
         };
-        let (public, trapdoor, sigma, _gadget_base, _digit_count, bound) =
+        let (public, trapdoor, sigma, _, _, bound) =
             prepared.preimage_trapdoor.as_ref().ok_or_else(|| {
                 GpuMeasurementError("preimage trapdoor preparation is missing".into())
             })?;
@@ -1627,7 +1544,12 @@ impl GpuNodeMeasurementBackend {
                     Some(mxx_primitives::gpu_memory::GpuSourceAllocationEvidence { allocations });
             }
             if domain == CanonicalWarmupProfileDomain::FusedTensorRowSum {
-                let groups = representative.inputs.row_groups.clone();
+                let groups =
+                    tensor_row_sum_allocation_groups(&representative.inputs).ok_or_else(|| {
+                        GpuMeasurementError(
+                            "tensor row-sum allocation query lacks row-group topology".into(),
+                        )
+                    })?;
                 let rhs = prepared.arguments.get(1).and_then(Option::as_ref).ok_or_else(|| {
                     GpuMeasurementError(
                         "tensor row-sum allocation query lacks its rhs owner".into(),
@@ -2086,7 +2008,7 @@ impl GpuNodeMeasurementBackend {
 
     /// Measures and stores one exact setup-time candidate through the
     /// device-local production range path. This is deliberately separate from
-    /// [`Self::measure_collected`]: warmup may request several nonlinear `b`
+    /// warmup may request several nonlinear `b`
     /// candidates, while fixed execution has no access to this method.
     /// Convert every typed or returned CUDA OOM from the setup measurement
     /// into an infeasible candidate only after the same recovery boundary used
@@ -2298,15 +2220,13 @@ impl GpuNodeMeasurementBackend {
                 ))
             })?;
             let fragment = match request.fragment {
-                mxx_runtime::backend::GpuWarmupFragmentClass::Whole => TypedFragmentClass::Full,
-                mxx_runtime::backend::GpuWarmupFragmentClass::Tail => TypedFragmentClass::Tail,
-                mxx_runtime::backend::GpuWarmupFragmentClass::Mapped => TypedFragmentClass::Mapped,
-                mxx_runtime::backend::GpuWarmupFragmentClass::Fragmented => {
+                crate::backend::GpuWarmupFragmentClass::Whole => TypedFragmentClass::Full,
+                crate::backend::GpuWarmupFragmentClass::Tail => TypedFragmentClass::Tail,
+                crate::backend::GpuWarmupFragmentClass::Mapped => TypedFragmentClass::Mapped,
+                crate::backend::GpuWarmupFragmentClass::Fragmented => {
                     TypedFragmentClass::CompactFragment
                 }
-                mxx_runtime::backend::GpuWarmupFragmentClass::SingleDevice => {
-                    TypedFragmentClass::Full
-                }
+                crate::backend::GpuWarmupFragmentClass::SingleDevice => TypedFragmentClass::Full,
             };
             let expected_route = resolver.resolve_for(
                 request.route_descriptor.source_range,
@@ -2316,7 +2236,7 @@ impl GpuNodeMeasurementBackend {
                 request.route_descriptor.destination_compact,
             );
             if expected_route != request.route_descriptor &&
-                !mxx_runtime::gpu_warmup::route_response_matches_resolver(
+                !crate::gpu_warmup::route_response_matches_resolver(
                     request.route_descriptor,
                     resolver,
                 )
@@ -2338,12 +2258,6 @@ impl GpuNodeMeasurementBackend {
         if self.harness.measured_iterations == 0 {
             return Err(GpuWarmupProfileError::Measurement(
                 "warmup measurement requires at least one measured repetition".into(),
-            ));
-        }
-        if !self.collecting {
-            return Err(GpuWarmupProfileError::Measurement(
-                "GPU warmup production measurement is setup-only and its collection window is closed"
-                    .into(),
             ));
         }
         // This function is the provider's actual measurement boundary.  The
@@ -2390,7 +2304,6 @@ impl GpuNodeMeasurementBackend {
                 self.host_control_operations.get(&(descriptor.scope.clone(), descriptor.id));
             let (elapsed, spread, repetitions) = Self::measure_host_control_repeated(
                 &self.harness,
-                &descriptor.scope,
                 descriptor.id,
                 &descriptor.kind,
                 &descriptor.bindings,
@@ -2454,7 +2367,6 @@ impl GpuNodeMeasurementBackend {
                     &mut self.workers[selected_device],
                     selected_device,
                     &self.harness,
-                    &descriptor.scope,
                     descriptor.id,
                     &descriptor.bindings,
                     &representative,
@@ -2505,15 +2417,15 @@ impl GpuNodeMeasurementBackend {
             self.workers[selected_device]
                 .backend
                 .select_operation(request.signature.operation)
-                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
+                .map_err(|error| {
+                    GpuWarmupProfileError::Measurement(format!(
+                        "GPU warmup scalar operation selection failed: signature={:?} device={} tile_width=1: {error}",
+                        request.signature, selected_device
+                    ))
+                })?;
             let node = MeasurementNode {
-                scope: &descriptor.scope,
                 id: descriptor.id,
                 kind: &descriptor.kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
                 concrete_argument_types: descriptor.concrete_argument_types.clone(),
                 concrete_output_types: descriptor.concrete_output_types.clone(),
             };
@@ -2607,8 +2519,8 @@ impl GpuNodeMeasurementBackend {
             .unwrap_or_default();
         representative.retry_cap = request.retry_cap;
         representative.fixed_metadata =
-            Some(mxx_runtime::backend::PlannedNodeBatchRequest::for_lowered_operation(
-                mxx_runtime::gpu_execution_plan::GpuExecutionSiteKey {
+            Some(crate::backend::PlannedNodeBatchRequest::for_lowered_operation(
+                crate::gpu_execution_plan::GpuExecutionSiteKey {
                     site: descriptor.id.0,
                     shape_class: request.signature.shape_class,
                     instance_class: request.signature.instance_class,
@@ -2621,7 +2533,7 @@ impl GpuNodeMeasurementBackend {
                     .iter()
                     .enumerate()
                     .map(|(port, ty)| {
-                        mxx_runtime::backend::PlannedLayoutMetadata::for_type(ty, Some(port as u32))
+                        crate::backend::PlannedLayoutMetadata::for_type(ty, Some(port as u32))
                     })
                     .collect(),
                 vec![request.tile_width],
@@ -2709,7 +2621,10 @@ impl GpuNodeMeasurementBackend {
                         {
                             GpuMeasurementError::out_of_memory(message)
                         } else {
-                            GpuMeasurementError(message)
+                            GpuMeasurementError(format!(
+                                "GPU warmup operation selection failed: signature={:?} device={} tile_width={} range={:?}: {message}",
+                                request.signature, device, request.tile_width, request.range
+                            ))
                         }
                     })?;
             }
@@ -2741,7 +2656,6 @@ impl GpuNodeMeasurementBackend {
                     Self::measure_transfer_representative(
                         &mut self.workers[device],
                         &self.harness,
-                        &descriptor.scope,
                         descriptor.id,
                         &descriptor.bindings,
                         &representative,
@@ -2751,7 +2665,6 @@ impl GpuNodeMeasurementBackend {
                         Some(fused) => Self::measure_fused_representative(
                             &mut self.workers[device],
                             &self.harness,
-                            &descriptor.scope,
                             descriptor.id,
                             &descriptor.bindings,
                             &representative,
@@ -2762,7 +2675,6 @@ impl GpuNodeMeasurementBackend {
                         None => Self::measure_representative(
                             &mut self.workers[device],
                             &self.harness,
-                            &descriptor.scope,
                             descriptor.id,
                             &descriptor.bindings,
                             &representative,
@@ -2820,13 +2732,8 @@ impl GpuNodeMeasurementBackend {
             // lift, transfer and range paths alike; preimage has already
             // installed its sampler-specific exact envelope above.
             let query_node = MeasurementNode {
-                scope: &descriptor.scope,
                 id: descriptor.id,
                 kind: &representative.kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
                 concrete_argument_types: representative.concrete_argument_types.clone(),
                 concrete_output_types: representative.concrete_output_types.clone(),
             };
@@ -3003,20 +2910,23 @@ impl GpuNodeMeasurementBackend {
         site: GpuExecutionSiteKey,
         model: &[GpuTimeModel],
     ) -> Result<f64, GpuMeasurementError> {
-        let node = plan
-            .node_choice(site)
+        let index = FrozenGpuPlanIndex::build(plan)
+            .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        let node = index
+            .node_choice(plan, site)
             .ok_or_else(|| GpuMeasurementError(format!("missing fixed plan site {site:?}")))?;
         let layout_id = *node
             .output_layouts
             .first()
             .ok_or_else(|| GpuMeasurementError("fixed plan site has no output layout".into()))?;
-        let layout = plan
-            .layout(layout_id)
+        let layout = index
+            .layout(plan, layout_id)
             .ok_or_else(|| GpuMeasurementError(format!("missing fixed plan layout {layout_id}")))?;
         let instances = node
             .loop_site
             .map(|key| {
-                plan.loop_choice(key)
+                index
+                    .loop_choice(plan, key)
                     .map(|choice| choice.wave_instances.min(choice.loop_count))
                     .ok_or_else(|| GpuMeasurementError("missing loop choice".into()))
             })
@@ -3039,7 +2949,7 @@ impl GpuNodeMeasurementBackend {
                 node.output_layouts
                     .iter()
                     .map(|id| {
-                        let layout = plan.layout(*id).ok_or_else(|| {
+                        let layout = index.layout(plan, *id).ok_or_else(|| {
                             GpuMeasurementError("missing output port layout".into())
                         })?;
                         layout
@@ -3049,45 +2959,13 @@ impl GpuNodeMeasurementBackend {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        mxx_runtime::gpu_warmup::gpu_multi_output_batch_wave_time(&schedules, model)
+        crate::gpu_warmup::gpu_multi_output_batch_wave_time(&schedules, model)
             .map_err(|error| GpuMeasurementError(error.to_string()))
-    }
-
-    /// Measures every collected shape as one fleet operation. Column-separable nodes use all
-    /// workers for the same primitive instead of assigning unrelated primitives to different GPUs.
-    pub fn measure_collected(&mut self) -> Result<(), GpuMeasurementError> {
-        self.collecting = false;
-        let mut requests = std::mem::take(&mut self.pending).into_values().collect::<Vec<_>>();
-        requests.sort_by(|left, right| {
-            right
-                .preimage_sample
-                .cmp(&left.preimage_sample)
-                .then_with(|| right.representative_bytes().cmp(&left.representative_bytes()))
-        });
-        let measurement_count = requests.len();
-        info!(
-            measurement_workers = self.workers.len(),
-            measurement_count, "measuring collected GPU node shapes in parallel"
-        );
-        for request in requests {
-            debug!(
-                scope = ?request.scope,
-                node = request.id.0,
-                kind = ?request.kind,
-                concrete_argument_types = ?request.concrete_argument_types,
-                concrete_output_types = ?request.concrete_output_types,
-                measurement_key = ?request.key,
-                "starting GPU node measurement"
-            );
-            let measurement = self.measure_fleet_request(&request)?;
-            self.measurements.insert(request.key, measurement);
-        }
-        Ok(())
     }
 
     #[cfg(test)]
     fn column_separable(kind: &NodeKind) -> bool {
-        mxx_runtime::gpu_calibration::gpu_operation_is_column_separable(kind)
+        crate::gpu_calibration::gpu_operation_is_column_separable(kind)
     }
 
     fn matrix_columns(wire_type: &ConcreteWireType) -> Option<usize> {
@@ -3156,11 +3034,6 @@ impl GpuNodeMeasurementBackend {
             NodeKind::Concat { axis: ConcatAxis::Diagonal } => true,
             _ => false,
         }
-    }
-
-    #[cfg(test)]
-    fn argument_is_fixed(node: &MeasurementNode<'_>, index: usize) -> bool {
-        Self::argument_is_fixed_for(node.kind, &node.concrete_argument_types, index)
     }
 
     fn fixed_arguments(kind: &NodeKind, concrete_argument_types: &[ConcreteWireType]) -> Vec<bool> {
@@ -3295,146 +3168,19 @@ impl GpuNodeMeasurementBackend {
         Ok(())
     }
 
-    fn request_columns(request: &PendingMeasurement) -> Option<usize> {
-        let capability = column_capability(&request.kind, &request.concrete_argument_types);
-        if matches!(capability, ColumnCapability::HostOrControl | ColumnCapability::SingleDevice) {
-            return None;
-        }
-        let columns = request
-            .concrete_output_types
-            .iter()
-            .find_map(Self::matrix_columns)
-            .or_else(|| request.concrete_argument_types.iter().find_map(Self::matrix_columns))
-            .filter(|columns| *columns > 0)?;
-        let output = request.concrete_output_types.iter().find_map(ConcreteWireType::matrix_type);
-        match (&request.kind, output) {
-            (NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. }, Some(matrix))
-                if matrix.rows != matrix.columns =>
-            {
-                None
-            }
-            (
-                NodeKind::ConstantMatrix { value: ConstantMatrix::UnitRow { .. }, .. },
-                Some(matrix),
-            ) if matrix.rows != 1 => None,
-            (
-                NodeKind::ConstantMatrix { value: ConstantMatrix::Gadget { .. }, .. },
-                Some(matrix),
-            ) if matrix.rows == 0 || !matrix.columns.is_multiple_of(matrix.rows) => None,
-            // These constants are single-device production calls.  They must
-            // be measured as the complete operation, even when the planner
-            // is probing a width candidate for neighbouring column-separable
-            // nodes.
-            (
-                NodeKind::ConstantMatrix {
-                    value:
-                        ConstantMatrix::PowerOfBase { .. } |
-                        ConstantMatrix::Rotation { .. } |
-                        ConstantMatrix::Polynomial { .. },
-                    ..
-                },
-                _,
-            ) => None,
-            (NodeKind::GadgetTrapdoor { .. }, Some(matrix))
-                if matrix.rows == 0 || !matrix.columns.is_multiple_of(matrix.rows) =>
-            {
-                None
-            }
-            _ => Some(columns),
-        }
-    }
-
-    /// Return whether a representative is expected to execute one production
-    /// output-column range.  Keep this in the estimator beside
-    /// `representative_at`: the runtime policy is the authority for the
-    /// classification, while this helper makes it impossible for a newly
-    /// ranged primitive to silently fall back to a full-operation pilot.
-    fn is_range_capable(request: &PendingMeasurement) -> bool {
-        !matches!(
-            column_capability(&request.kind, &request.concrete_argument_types),
-            ColumnCapability::HostOrControl |
-                ColumnCapability::SingleDevice |
-                ColumnCapability::Unsupported
-        )
-    }
-
-    fn calibration_representative(request: &PendingMeasurement) -> RepresentativeMeasurement {
-        if let NodeKind::ConstantMatrix { value: ConstantMatrix::UnitRow { index }, .. } =
-            &request.kind
-        {
-            if let Some(index) =
-                index.evaluate(&request.bindings).ok().and_then(|value| value.to_usize())
-            {
-                return Self::representative_at(request, index, 1);
-            }
-        }
-        if matches!(request.kind, NodeKind::Concat { axis: ConcatAxis::Columns }) {
-            let input_columns = request
-                .concrete_argument_types
-                .iter()
-                .filter_map(Self::matrix_columns)
-                .collect::<Vec<_>>();
-            let total_columns = input_columns.iter().sum::<usize>();
-            if total_columns > 1 {
-                let mut boundary = 0usize;
-                let first_boundary = input_columns.into_iter().find_map(|columns| {
-                    boundary = boundary.checked_add(columns)?;
-                    (boundary > 0 && boundary < total_columns).then_some(boundary)
-                });
-                if let Some(boundary) = first_boundary {
-                    // A one-column prefix sees only one concat piece.  Straddle a real input
-                    // boundary so calibration includes the location-dependent piece/launch cost
-                    // without materializing the complete concatenation.
-                    return Self::representative_at(request, boundary - 1, 2);
-                }
-            }
-        }
-        // Calibration must execute a genuinely small production shape.  The
-        // normal ranged representative intentionally retains full validated
-        // wire types and relies on the range mapper, but a pilot has no
-        // mapper-owned source shards yet.  Shape the pilot to one column and
-        // retain fixed-operand ownership from the original request.
-        let node = MeasurementNode {
-            scope: &request.scope,
-            id: request.id,
-            kind: &request.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: request.concrete_argument_types.clone(),
-            concrete_output_types: request.concrete_output_types.clone(),
-        };
-        let (kind, concrete_argument_types, concrete_output_types, _, _) =
-            Self::representative_node(&node, 1);
-        RepresentativeMeasurement {
-            source_layouts: Vec::new(),
-            fixed_metadata: None,
-            retry_cap: None,
-            inputs: Default::default(),
-            kind,
-            concrete_argument_types,
-            concrete_output_types,
-            fixed_arguments: Self::fixed_arguments(&request.kind, &request.concrete_argument_types),
-            output_range: Self::is_range_capable(request)
-                .then_some(IndexRange { start: 0, end: 1 }),
-        }
-    }
-
     fn representative_at(
         request: &PendingMeasurement,
         global_column_start: usize,
         columns: usize,
     ) -> RepresentativeMeasurement {
-        // A representative is a production request at a particular global
-        // range, not a synthetic local graph.  Keep the validated global
-        // wire types and node parameters intact: the fleet mapper is the
-        // single owner of converting that range into physical local pieces
-        // (including tensor boundaries, concat fragments, and peer/staged
-        // copies).  Mixing local types with global coordinates makes non-zero
-        // ranges silently address the wrong input on non-zero devices.
         let global_column_end =
             global_column_start.checked_add(columns).expect("representative column range overflow");
+        let range_capable = !matches!(
+            column_capability(&request.kind, &request.concrete_argument_types),
+            ColumnCapability::HostOrControl |
+                ColumnCapability::SingleDevice |
+                ColumnCapability::Unsupported
+        );
         RepresentativeMeasurement {
             source_layouts: Vec::new(),
             fixed_metadata: None,
@@ -3444,22 +3190,10 @@ impl GpuNodeMeasurementBackend {
             concrete_argument_types: request.concrete_argument_types.clone(),
             concrete_output_types: request.concrete_output_types.clone(),
             fixed_arguments: Self::fixed_arguments(&request.kind, &request.concrete_argument_types),
-            output_range: (Self::is_range_capable(request) ||
+            output_range: (range_capable ||
                 matches!(request.kind, NodeKind::GadgetTrapdoor { .. }))
             .then_some(IndexRange { start: global_column_start, end: global_column_end }),
         }
-    }
-
-    fn calibration_operation_key(
-        request: &PendingMeasurement,
-    ) -> Result<[u8; 32], GpuMeasurementError> {
-        gpu_calibration_operation_identity(
-            &request.kind,
-            &request.concrete_argument_types,
-            &request.concrete_output_types,
-            &request.bindings,
-        )
-        .map_err(GpuMeasurementError)
     }
 
     fn device_memory(device_id: i32) -> Result<(GpuDeviceMemory, usize), GpuMeasurementError> {
@@ -3568,844 +3302,6 @@ impl GpuNodeMeasurementBackend {
             },
         })
     }
-
-    fn measure_fleet_request(
-        &mut self,
-        request: &PendingMeasurement,
-    ) -> Result<NodeMeasurement, GpuMeasurementError> {
-        let Some(total_columns) = Self::request_columns(request) else {
-            if matches!(
-                request.kind,
-                NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)
-            ) {
-                let child = self.host_control_operations.get(&(request.scope.clone(), request.id));
-                let (seconds, _, _) = Self::measure_host_control_repeated(
-                    &self.harness,
-                    &request.scope,
-                    request.id,
-                    &request.kind,
-                    &request.bindings,
-                    child,
-                )?;
-                return Ok(NodeMeasurement {
-                    work_seconds: seconds,
-                    latency_seconds: seconds,
-                    cumulative_wave_seconds: seconds,
-                    independent_wave_count: 1,
-                    measured_wave_workspace_bytes: 0,
-                    workspace_bytes: 0,
-                });
-            }
-            let representative = RepresentativeMeasurement {
-                source_layouts: Vec::new(),
-                fixed_metadata: None,
-                retry_cap: None,
-                inputs: Default::default(),
-                kind: request.kind.clone(),
-                concrete_argument_types: request.concrete_argument_types.clone(),
-                concrete_output_types: request.concrete_output_types.clone(),
-                fixed_arguments: Self::fixed_arguments(
-                    &request.kind,
-                    &request.concrete_argument_types,
-                ),
-                output_range: None,
-            };
-            return Self::measure_representative(
-                &mut self.workers[0],
-                &self.harness,
-                &request.scope,
-                request.id,
-                &request.bindings,
-                &representative,
-                None,
-            );
-        };
-
-        let initial_device_states = self
-            .workers
-            .iter()
-            .map(|worker| Self::device_memory(worker.device_id))
-            .collect::<Result<Vec<_>, _>>()?;
-        let vram_percent = self.vram_percent;
-        let representative_device =
-            mxx_primitives::poly::dcrt::gpu::gpu_device_identity(self.workers[0].device_id)
-                .map_err(GpuMeasurementError)?;
-        let operation = Self::calibration_operation_key(request)?;
-        let calibration_key = GpuCalibrationKey::new(
-            operation.as_slice(),
-            gpu_calibration_environment(&representative_device, self.workers.len(), vram_percent),
-        );
-        if let Some((worker, (_, live_contexts))) =
-            self.workers.iter().zip(&initial_device_states).find(|(worker, (_, contexts))| {
-                *contexts != worker.backend.owned_context_count(worker.device_id)
-            })
-        {
-            return Err(GpuMeasurementError(format!(
-                "GPU {} has {live_contexts} live mxx contexts; fleet calibration requires exclusive CUDA mempool measurement",
-                worker.device_id
-            )));
-        }
-        let profile = if let Some(profile) = self.calibration_registry.get(&calibration_key) {
-            profile
-        } else {
-            let pilot = Self::calibration_representative(request);
-            let pilot_columns = pilot.measured_columns().ok_or_else(|| {
-                GpuMeasurementError("GPU calibration pilot has no matrix columns".to_owned())
-            })?;
-            let calibrated_roles = self.workers.len().min(2);
-            let barrier = Arc::new(Barrier::new(calibrated_roles));
-            let pilot_measurements = self.workers[..calibrated_roles]
-                .par_iter_mut()
-                .map(|worker| {
-                    Self::calibrate_representative(
-                        worker,
-                        &request.scope,
-                        request.id,
-                        &request.bindings,
-                        &pilot,
-                        operation,
-                        pilot_columns,
-                        Some(barrier.as_ref()),
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let calibration = |measurement: &NodeMeasurement| {
-                GpuDeviceCalibration::from_pilot(pilot_columns, measurement.workspace_bytes)
-                    .map_err(|error| GpuMeasurementError(error.to_string()))
-            };
-            let profile = GpuCalibrationProfile {
-                gpu0: calibration(&pilot_measurements[0])?,
-                nonzero: pilot_measurements.get(1).map(calibration).transpose()?,
-            };
-            self.calibration_registry
-                .insert(calibration_key.clone(), profile)
-                .map_err(|error| GpuMeasurementError(error.to_string()))?;
-            let profile = self
-                .calibration_registry
-                .get(&calibration_key)
-                .expect("new GPU calibration profile must be present");
-            profile
-        };
-
-        // Derive role widths from the production baseline: every column-independent operand is
-        // staged and complete, while column-scaled inputs, outputs, and workspaces are absent.
-        // Keep these owners live until after the snapshots so async release cannot understate the
-        // planned resident set.  Fleet measurement prepares its own operands after width selection.
-        let baseline_representative = Self::calibration_representative(request);
-        let fixed_inputs = self
-            .workers
-            .par_iter_mut()
-            .map(|worker| {
-                worker.backend.set_column_widths_for_operation(
-                    operation,
-                    GpuColumnWidths { gpu0: 1, nonzero: None },
-                );
-                worker
-                    .backend
-                    .select_operation(operation)
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                let node = MeasurementNode {
-                    scope: &request.scope,
-                    id: request.id,
-                    kind: &baseline_representative.kind,
-                    arguments: &[],
-                    argument_kinds: &[],
-                    argument_types: &[],
-                    output_types: &[],
-                    concrete_argument_types: baseline_representative
-                        .concrete_argument_types
-                        .clone(),
-                    concrete_output_types: baseline_representative.concrete_output_types.clone(),
-                };
-                let prepared = Self::prepare(
-                    &mut worker.backend,
-                    &node,
-                    &request.bindings,
-                    Some((&baseline_representative.fixed_arguments, true)),
-                )?;
-                prepared.finish();
-                Ok(prepared)
-            })
-            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-        let device_memories = self
-            .workers
-            .par_iter_mut()
-            .map(|worker| {
-                // The pilot has been dropped; make its queued frees reusable before admitting
-                // a full fleet wave against the pool's effective available memory.
-                worker
-                    .backend
-                    .fence_released_memory()
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                Self::device_memory(worker.device_id)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let gpu0_memory = device_memories[0].0;
-        let nonzero_memory = device_memories.get(1).map(|(memory, _)| *memory);
-        let widths = profile
-            .derive_widths(gpu0_memory, nonzero_memory, vram_percent)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        let fleet_columns = widths
-            .columns_per_wave(self.workers.len())
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        let wave_count = total_columns.div_ceil(fleet_columns);
-        let assigned_columns =
-            gpu_capped_waterfill_columns(widths, self.workers.len(), total_columns)
-                .map_err(|error| GpuMeasurementError(error.to_string()))?;
-
-        for (index, worker) in self.workers.iter().enumerate() {
-            let physical = gpu_memory_info(worker.device_id).map_err(GpuMeasurementError)?;
-            let pool = gpu_default_mempool_usage(worker.device_id).map_err(GpuMeasurementError)?;
-            let memory = device_memories[index].0;
-            let calibration =
-                if index == 0 { profile.gpu0 } else { profile.nonzero.unwrap_or(profile.gpu0) };
-            info!(
-                scope = ?request.scope, node = request.id.0, device_id = worker.device_id,
-                physical_total_bytes = physical.total, physical_free_bytes = physical.free,
-                pool_used_bytes = pool.used_current, pool_reserved_bytes = pool.reserved_current,
-                effective_resident_bytes = memory.resident_bytes,
-                budget_bytes = u128::from(memory.total_bytes) * u128::from(vram_percent) / 100,
-                pilot_columns = calibration.pilot_columns(),
-                pilot_peak_bytes = calibration.pilot_peak_bytes(),
-                bytes_per_column = calibration.bytes_per_column(),
-                assigned_columns = assigned_columns[index],
-                "GPU fleet calibration memory snapshot"
-            );
-        }
-
-        info!(
-            scope = ?request.scope,
-            node = request.id.0,
-            gpu_count = self.workers.len(),
-            gpu0_columns = widths.gpu0,
-            nonzero_gpu_columns = widths.nonzero,
-            fleet_wave_columns = fleet_columns,
-            total_columns,
-            wave_count,
-            vram_percent,
-            "derived GPU fleet column widths"
-        );
-
-        let mut global_column_start = 0;
-        let representatives = assigned_columns
-            .into_iter()
-            .map(|columns| {
-                let start = global_column_start;
-                global_column_start += columns;
-                (columns > 0).then(|| Self::representative_at(request, start, columns))
-            })
-            .collect();
-        let (measurements, fleet_latency_seconds) = Self::measure_fleet_wave(
-            &mut self.workers,
-            &self.harness,
-            &request.scope,
-            request.id,
-            &request.bindings,
-            operation,
-            representatives,
-            fixed_inputs,
-        )
-        .map_err(|error| {
-            GpuMeasurementError(format!(
-                "calibrated GPU fleet width verification failed (gpu0={}, nonzero={:?}): {error}",
-                widths.gpu0, widths.nonzero
-            ))
-        })?;
-        for (worker, measurement) in self.workers.iter().zip(&measurements) {
-            if let Some(measurement) = measurement {
-                debug!(
-                    device_id = worker.device_id,
-                    kind = ?request.kind,
-                    arguments = ?request.concrete_argument_types,
-                    outputs = ?request.concrete_output_types,
-                    measurement = ?measurement,
-                    "GPU representative measurement complete"
-                );
-                info!(
-                    device_id = worker.device_id,
-                    workspace_bytes = measurement.workspace_bytes,
-                    latency_seconds = measurement.latency_seconds,
-                    "measured GPU fleet device wave"
-                );
-            }
-        }
-        let full_wave =
-            aggregate_fleet_wave(measurements.into_iter().flatten(), fleet_latency_seconds);
-        let measurement = extrapolate_fleet_waves(&full_wave, wave_count);
-        info!(
-            scope = ?request.scope, node = request.id.0, kind = ?request.kind,
-            wave_count, fleet_wave_latency_seconds = full_wave.latency_seconds,
-            work_seconds = measurement.work_seconds,
-            cumulative_wave_seconds = measurement.cumulative_wave_seconds,
-            fleet_wave_workspace_bytes = full_wave.workspace_bytes,
-            "measured independent GPU fleet waves"
-        );
-        if request.preimage_sample {
-            info!(
-                scope = ?request.scope,
-                node = request.id.0,
-                work_seconds = measurement.work_seconds,
-                dependency_latency_seconds = measurement.latency_seconds,
-                cumulative_wave_seconds = measurement.cumulative_wave_seconds,
-                measured_wave_workspace_bytes = measurement.measured_wave_workspace_bytes,
-                ideal_concurrent_workspace_bytes = measurement.workspace_bytes,
-                "estimated fleet-wide GPU preimage sampler from measured waves"
-            );
-        }
-        Ok(measurement)
-    }
-
-    fn measurement_key(
-        node: &MeasurementNode<'_>,
-        bindings: &ParamEnv,
-    ) -> Result<[u8; 32], GpuMeasurementError> {
-        #[derive(Serialize)]
-        struct MeasurementCacheKey<'a> {
-            operation: [u8; 32],
-            concrete_argument_types: &'a [ConcreteWireType],
-            concrete_output_types: &'a [ConcreteWireType],
-        }
-
-        let operation = gpu_calibration_operation_identity(
-            node.kind,
-            &node.concrete_argument_types,
-            &node.concrete_output_types,
-            bindings,
-        )
-        .map_err(GpuMeasurementError)?;
-        encoding::hash_canonical(&MeasurementCacheKey {
-            operation,
-            concrete_argument_types: &node.concrete_argument_types,
-            concrete_output_types: &node.concrete_output_types,
-        })
-        .map_err(|error| GpuMeasurementError(error.to_string()))
-    }
-
-    fn representative_node<'a>(
-        node: &'a MeasurementNode<'a>,
-        column_limit: usize,
-    ) -> (NodeKind, Vec<ConcreteWireType>, Vec<ConcreteWireType>, f64, Option<usize>) {
-        assert!(column_limit > 0, "GPU representative column count must be nonzero");
-        let capped_columns = |matrix: &ConcreteMatrixType| {
-            (matrix.columns > column_limit).then(|| {
-                let representative_columns = column_limit;
-                let full_waves = matrix.columns / representative_columns;
-                let remainder_columns = matrix.columns % representative_columns;
-                (
-                    representative_columns,
-                    full_waves as f64,
-                    (remainder_columns > 0).then_some(remainder_columns),
-                )
-            })
-        };
-        let mut kind = node.kind.clone();
-        let mut argument_types = node.concrete_argument_types.clone();
-        let mut output_types = node.concrete_output_types.clone();
-        let mut scale = 1.0;
-        let mut remainder_columns = None;
-
-        match &mut kind {
-            NodeKind::ConstantMatrix { matrix_type, .. } => {
-                let Some(output) = output_types.iter_mut().find_map(matrix_leaf_type_mut) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    output.columns = representative_columns;
-                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::GadgetTrapdoor { matrix_type, .. } |
-            NodeKind::TrapdoorSample { matrix_type, .. } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } |
-                    ConcreteWireType::Trapdoor { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    output.columns = representative_columns;
-                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::UniformResidueSample { matrix_type } |
-            NodeKind::UniformIntervalSample { matrix_type, .. } |
-            NodeKind::GaussianSample { matrix_type, .. } |
-            NodeKind::HashSample { matrix_type, .. } |
-            NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::SmallMatrix { matrix, .. } |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    output.columns = representative_columns;
-                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::Slice { rows, columns } => {
-                let Some(output) = output_types.iter_mut().find_map(matrix_leaf_type_mut) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                let Some(input) =
-                    argument_types.first_mut().and_then(|wire_type| match wire_type {
-                        ConcreteWireType::Matrix(matrix) |
-                        ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                        _ => None,
-                    })
-                else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    input.rows = output.rows;
-                    input.columns = representative_columns;
-                    output.columns = representative_columns;
-                    if let Some(range) = rows {
-                        range.start = mxx_ir_core::IntExpr::constant(0);
-                        range.end = mxx_ir_core::IntExpr::constant(output.rows);
-                    }
-                    if let Some(range) = columns {
-                        range.start = mxx_ir_core::IntExpr::constant(0);
-                        range.end = mxx_ir_core::IntExpr::constant(representative_columns);
-                    }
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::Transpose => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    let Some(input) =
-                        argument_types.first_mut().and_then(|wire_type| match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        })
-                    else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    input.rows = representative_columns;
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::Tensor => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if capped_columns(output).is_some() {
-                    let original_output_columns = output.columns;
-                    let [left_wire, right_wire, ..] = argument_types.as_mut_slice() else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    let Some(left) = (match left_wire {
-                        ConcreteWireType::Matrix(matrix) |
-                        ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                        _ => None,
-                    }) else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    let Some(right) = (match right_wire {
-                        ConcreteWireType::Matrix(matrix) |
-                        ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                        _ => None,
-                    }) else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    // Production splits output ranges at original C_r boundaries. Preserve C_r
-                    // and measure enough complete left-column groups to cover the requested W;
-                    // the final group may conservatively include the range's partial segment.
-                    if column_limit < right.columns {
-                        left.columns = 1;
-                        right.columns = column_limit;
-                    } else {
-                        left.columns =
-                            left.columns.min(column_limit.div_ceil(right.columns).max(1));
-                    }
-                    output.columns = left.columns * right.columns;
-                    scale = original_output_columns.div_ceil(output.columns) as f64;
-                }
-            }
-            NodeKind::Concat { axis: ConcatAxis::Rows } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    for wire_type in &mut argument_types {
-                        let Some(input) = (match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        }) else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        input.columns = representative_columns;
-                    }
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::Concat { axis: ConcatAxis::Columns } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if capped_columns(output).is_some() {
-                    let original_columns = output.columns;
-                    let target_columns = original_columns.min(column_limit);
-                    let mut representative_columns = 0usize;
-                    let mut remaining_columns = target_columns;
-                    let mut representative_arguments = Vec::new();
-                    for mut wire_type in std::mem::take(&mut argument_types) {
-                        if remaining_columns == 0 {
-                            break;
-                        }
-                        let Some(input) = (match &mut wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        }) else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        input.columns = remaining_columns.min(input.columns);
-                        remaining_columns -= input.columns;
-                        representative_columns =
-                            representative_columns.saturating_add(input.columns);
-                        representative_arguments.push(wire_type);
-                    }
-                    argument_types = representative_arguments;
-                    output.columns = representative_columns;
-                    scale = original_columns.div_ceil(representative_columns.max(1)) as f64;
-                }
-            }
-            NodeKind::GadgetDecompose { .. } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    let Some(input) =
-                        argument_types.first_mut().and_then(|wire_type| match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        })
-                    else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    input.columns = representative_columns;
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::MatrixScale { .. } |
-            NodeKind::RingAutomorphism { .. } |
-            NodeKind::ModulusSwitch { .. } |
-            NodeKind::ModulusReduce { .. } |
-            NodeKind::CenteredRebase { .. } |
-            NodeKind::BlockModSwitch { .. } |
-            NodeKind::RnsModUp { .. } |
-            NodeKind::RnsModDown { .. } |
-            NodeKind::MatrixNegate => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    let Some(input) =
-                        argument_types.first_mut().and_then(|wire_type| match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        })
-                    else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    input.columns = representative_columns;
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::MatrixBinary(operation) => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                match operation {
-                    MatrixBinaryOp::Add | MatrixBinaryOp::Subtract => {
-                        if let Some((representative_columns, column_scale, column_remainder)) =
-                            capped_columns(output)
-                        {
-                            for index in [0, 1] {
-                                let Some(input) =
-                                    argument_types.get_mut(index).and_then(|wire_type| {
-                                        match wire_type {
-                                            ConcreteWireType::Matrix(matrix) |
-                                            ConcreteWireType::Preimage { matrix, .. } => {
-                                                Some(matrix)
-                                            }
-                                            _ => None,
-                                        }
-                                    })
-                                else {
-                                    return (
-                                        kind,
-                                        argument_types,
-                                        output_types,
-                                        scale,
-                                        remainder_columns,
-                                    );
-                                };
-                                input.columns = representative_columns;
-                            }
-                            output.columns = representative_columns;
-                            scale = column_scale;
-                            remainder_columns = column_remainder;
-                        }
-                    }
-                    MatrixBinaryOp::Multiply => {
-                        let scalable_argument =
-                            Self::matrix_multiply_scaled_argument(&argument_types);
-                        let Some(scalable) = argument_types
-                            .get_mut(scalable_argument)
-                            .and_then(matrix_leaf_type_mut)
-                        else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        if let Some((representative_columns, column_scale, column_remainder)) =
-                            capped_columns(output)
-                        {
-                            scalable.columns = representative_columns;
-                            output.columns = representative_columns;
-                            scale = column_scale;
-                            remainder_columns = column_remainder;
-                        }
-                    }
-                }
-            }
-            NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
-                let Some(output) = output_types.iter_mut().find_map(matrix_leaf_type_mut) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    for product in 0..coefficients.len() {
-                        let left = matrix_leaf_type(&argument_types[2 * product]).unwrap();
-                        let right = matrix_leaf_type(&argument_types[2 * product + 1]).unwrap();
-                        let scalable_index = if gpu_matrix_multiply_scales_left(
-                            left.rows,
-                            left.columns,
-                            right.rows,
-                            right.columns,
-                        ) {
-                            2 * product
-                        } else {
-                            2 * product + 1
-                        };
-                        let Some(scalable) =
-                            argument_types.get_mut(scalable_index).and_then(matrix_leaf_type_mut)
-                        else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        scalable.columns = representative_columns;
-                    }
-                    if *has_bias {
-                        let Some(bias) = argument_types
-                            .get_mut(2 * coefficients.len())
-                            .and_then(matrix_leaf_type_mut)
-                        else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        bias.columns = representative_columns;
-                    }
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::MatrixMulSmallRhs => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::SmallMatrix { matrix, .. } |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                let Some(rhs) = argument_types.get_mut(1).and_then(|wire_type| match wire_type {
-                    ConcreteWireType::SmallMatrix { matrix, .. } |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    rhs.columns = representative_columns;
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::PreimageSample { matrix_type, .. } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    let Some(target) =
-                        argument_types.get_mut(2).and_then(|wire_type| match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        })
-                    else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    target.columns = representative_columns;
-                    output.columns = representative_columns;
-                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::CrtRecompose { .. } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    for wire_type in &mut argument_types {
-                        let Some(input) = (match wire_type {
-                            ConcreteWireType::Matrix(matrix) |
-                            ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                            _ => None,
-                        }) else {
-                            return (kind, argument_types, output_types, scale, remainder_columns);
-                        };
-                        input.columns = representative_columns;
-                    }
-                    output.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::ExtractCoefficient { .. } | NodeKind::ThresholdDecode { .. } => {
-                let Some(input) =
-                    argument_types.first_mut().and_then(|wire_type| match wire_type {
-                        ConcreteWireType::Matrix(matrix) |
-                        ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                        _ => None,
-                    })
-                else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(input)
-                {
-                    input.columns = representative_columns;
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            NodeKind::PackPolynomialCoefficients { matrix_type, .. } => {
-                let Some(output) = output_types.iter_mut().find_map(|wire_type| match wire_type {
-                    ConcreteWireType::Matrix(matrix) |
-                    ConcreteWireType::Preimage { matrix, .. } => Some(matrix),
-                    _ => None,
-                }) else {
-                    return (kind, argument_types, output_types, scale, remainder_columns);
-                };
-                if let Some((representative_columns, column_scale, column_remainder)) =
-                    capped_columns(output)
-                {
-                    let original_columns = output.columns;
-                    let Some(ConcreteWireType::IndexedFamily { count, .. }) =
-                        argument_types.first_mut()
-                    else {
-                        return (kind, argument_types, output_types, scale, remainder_columns);
-                    };
-                    *count = count.div_ceil(original_columns);
-                    output.columns = representative_columns;
-                    matrix_type.columns = mxx_ir_core::IntExpr::constant(representative_columns);
-                    scale = column_scale;
-                    remainder_columns = column_remainder;
-                }
-            }
-            _ => {}
-        }
-        (kind, argument_types, output_types, scale, remainder_columns)
-    }
-
     fn prepare(
         backend: &mut GpuDcrtBackend,
         node: &MeasurementNode<'_>,
@@ -4655,13 +3551,8 @@ impl GpuNodeMeasurementBackend {
             ));
         }
         let node = MeasurementNode {
-            scope: &descriptor.scope,
             id: descriptor.id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
@@ -4674,165 +3565,6 @@ impl GpuNodeMeasurementBackend {
         }
         self.preimage_session_inputs.insert(key, prepared.clone());
         Ok(prepared)
-    }
-
-    fn run_fleet_iteration(
-        workers: &mut [GpuMeasurementWorker],
-        scope: &mxx_ir_core::FrozenGraphScopeId,
-        id: mxx_ir_core::types::NodeId,
-        bindings: &ParamEnv,
-        prepared: &[Option<(RepresentativeMeasurement, PreparedMeasurement)>],
-    ) -> Result<(Vec<Option<f64>>, f64), GpuMeasurementError> {
-        let active_workers = prepared.iter().flatten().count();
-        if active_workers == 0 {
-            return Err(GpuMeasurementError("GPU fleet wave has no active device".to_owned()));
-        }
-        let barrier = Arc::new(Barrier::new(active_workers));
-        // Start before Rayon enqueues the fleet work and stop only after every active worker has
-        // observed its output completion event and joined. This is the fleet wall latency, not a
-        // maximum assembled from independently timed device runs.
-        let fleet_started = std::time::Instant::now();
-        let device_seconds = workers
-            .par_iter_mut()
-            .zip(prepared.par_iter())
-            .map(|(worker, prepared)| {
-                let Some((representative, prepared)) = prepared else {
-                    return Ok(None);
-                };
-                let node = MeasurementNode {
-                    scope,
-                    id,
-                    kind: &representative.kind,
-                    arguments: &[],
-                    argument_kinds: &[],
-                    argument_types: &[],
-                    output_types: &[],
-                    concrete_argument_types: representative.concrete_argument_types.clone(),
-                    concrete_output_types: representative.concrete_output_types.clone(),
-                };
-                barrier.wait();
-                let device_started = std::time::Instant::now();
-                Self::execute_local_production_measurement(
-                    worker,
-                    &node,
-                    bindings,
-                    representative,
-                    prepared,
-                    1,
-                    None,
-                    None,
-                    false,
-                )?;
-                Ok(Some(device_started.elapsed().as_secs_f64()))
-            })
-            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-        Ok((device_seconds, fleet_started.elapsed().as_secs_f64()))
-    }
-
-    fn measure_fleet_wave(
-        workers: &mut [GpuMeasurementWorker],
-        harness: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
-        id: mxx_ir_core::types::NodeId,
-        bindings: &ParamEnv,
-        operation: [u8; 32],
-        representatives: Vec<Option<RepresentativeMeasurement>>,
-        fixed_inputs: Vec<PreparedMeasurement>,
-    ) -> Result<(Vec<Option<NodeMeasurement>>, f64), GpuMeasurementError> {
-        if harness.measured_iterations == 0 {
-            return Err(GpuMeasurementError("measured iteration count must be positive".to_owned()));
-        }
-        let prepared = workers
-            .par_iter_mut()
-            .zip(representatives.into_par_iter())
-            .zip(fixed_inputs.into_par_iter())
-            .map(|((worker, representative), fixed)| {
-                representative
-                    .map(|representative| {
-                        let columns = representative.measured_columns().ok_or_else(|| {
-                            GpuMeasurementError(
-                                "fleet representative has no matrix columns".to_owned(),
-                            )
-                        })?;
-                        worker.backend.set_column_widths_for_operation(
-                            operation,
-                            GpuColumnWidths { gpu0: columns, nonzero: None },
-                        );
-                        worker
-                            .backend
-                            .select_operation(operation)
-                            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                        let node = MeasurementNode {
-                            scope,
-                            id,
-                            kind: &representative.kind,
-                            arguments: &[],
-                            argument_kinds: &[],
-                            argument_types: &[],
-                            output_types: &[],
-                            concrete_argument_types: representative.concrete_argument_types.clone(),
-                            concrete_output_types: representative.concrete_output_types.clone(),
-                        };
-                        let scaled = Self::prepare(
-                            &mut worker.backend,
-                            &node,
-                            bindings,
-                            Some((&representative.fixed_arguments, false)),
-                        )?;
-                        let prepared = fixed
-                            .merge_for_representative(scaled, &representative.fixed_arguments)?;
-                        Ok((representative, prepared))
-                    })
-                    .transpose()
-            })
-            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-
-        for _ in 0..harness.warm_up_iterations {
-            let _ = Self::run_fleet_iteration(workers, scope, id, bindings, &prepared)?;
-        }
-        let baselines = workers
-            .par_iter_mut()
-            .zip(prepared.par_iter())
-            .map(|(worker, prepared)| {
-                if prepared.is_none() {
-                    return Ok(None);
-                }
-                begin_gpu_memory_measurement(worker).map(Some)
-            })
-            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-
-        let mut device_seconds = vec![0.0; workers.len()];
-        let mut fleet_seconds = 0.0;
-        for _ in 0..harness.measured_iterations {
-            let (iteration_devices, iteration_fleet) =
-                Self::run_fleet_iteration(workers, scope, id, bindings, &prepared)?;
-            for (total, elapsed) in device_seconds.iter_mut().zip(iteration_devices) {
-                *total += elapsed.unwrap_or(0.0);
-            }
-            fleet_seconds += iteration_fleet;
-        }
-        let iterations = harness.measured_iterations as f64;
-        let measurements = workers
-            .par_iter()
-            .zip(baselines.into_par_iter())
-            .zip(device_seconds.into_par_iter())
-            .map(|((worker, baseline), seconds)| {
-                let Some(baseline) = baseline else {
-                    return Ok(None);
-                };
-                let workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
-                let seconds = seconds / iterations;
-                Ok(Some(NodeMeasurement {
-                    work_seconds: seconds,
-                    latency_seconds: seconds,
-                    cumulative_wave_seconds: seconds,
-                    independent_wave_count: 1,
-                    measured_wave_workspace_bytes: workspace_bytes,
-                    workspace_bytes,
-                }))
-            })
-            .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-        Ok((measurements, fleet_seconds / iterations))
     }
 
     fn place_prepared_sources(
@@ -4892,8 +3624,7 @@ impl GpuNodeMeasurementBackend {
 
     fn measure_representative(
         worker: &mut GpuMeasurementWorker,
-        harness: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
+        harness: &GpuWarmupMeasurementConfig,
         id: mxx_ir_core::types::NodeId,
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
@@ -4903,18 +3634,15 @@ impl GpuNodeMeasurementBackend {
             barrier.wait();
         }
         let node = MeasurementNode {
-            scope,
             id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
-        let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)?;
-        let prepared = Self::place_prepared_sources(worker, representative, prepared)?;
+        let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)
+            .map_err(|error| warmup_node_phase_error("representative preparation", &node, error))?;
+        let prepared = Self::place_prepared_sources(worker, representative, prepared)
+            .map_err(|error| warmup_node_phase_error("source placement", &node, error))?;
         let baseline = begin_gpu_memory_measurement(worker)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
@@ -5021,15 +3749,26 @@ impl GpuNodeMeasurementBackend {
                                     "missing validated row groups".into(),
                                 ));
                             }
-                            mxx_runtime::backend::FusedBatchRequest::RowSum {
-                                metadata,
-                                source: matrix(0)?,
-                                right: if fused == FusedWarmupOperation::TensorRowSum {
-                                    Some(matrix(1)?)
-                                } else {
-                                    None
-                                },
-                                rows: representative.inputs.row_groups.clone(),
+                            if fused == FusedWarmupOperation::TensorRowSum &&
+                                !representative.inputs.row_sum_groups.is_empty()
+                            {
+                                crate::backend::FusedBatchRequest::TensorRowSums {
+                                    metadata,
+                                    source: matrix(0)?,
+                                    right: matrix(1)?,
+                                    rows: representative.inputs.row_sum_groups.clone(),
+                                }
+                            } else {
+                                crate::backend::FusedBatchRequest::RowSum {
+                                    metadata,
+                                    source: matrix(0)?,
+                                    right: if fused == FusedWarmupOperation::TensorRowSum {
+                                        Some(matrix(1)?)
+                                    } else {
+                                        None
+                                    },
+                                    rows: representative.inputs.row_groups.clone(),
+                                }
                             }
                         }
                         FusedWarmupOperation::RowBlockAdd => {
@@ -5037,7 +3776,7 @@ impl GpuNodeMeasurementBackend {
                             let right = blocks
                                 .pop()
                                 .ok_or_else(|| GpuMeasurementError("missing fused RHS".into()))?;
-                            mxx_runtime::backend::FusedBatchRequest::Add { metadata, blocks, right }
+                            crate::backend::FusedBatchRequest::Add { metadata, blocks, right }
                         }
                         FusedWarmupOperation::Decompose => {
                             let (small, digits) = match &representative.kind {
@@ -5094,7 +3833,7 @@ impl GpuNodeMeasurementBackend {
                                     ))
                                 }
                             };
-                            mxx_runtime::backend::FusedBatchRequest::Decompose {
+                            crate::backend::FusedBatchRequest::Decompose {
                                 metadata,
                                 blocks: blocks(),
                                 small,
@@ -5108,7 +3847,7 @@ impl GpuNodeMeasurementBackend {
                                 .and_then(Option::as_ref)
                                 .cloned()
                                 .ok_or_else(|| GpuMeasurementError("missing compact RHS".into()))?;
-                            mxx_runtime::backend::FusedBatchRequest::SmallProduct {
+                            crate::backend::FusedBatchRequest::SmallProduct {
                                 metadata,
                                 blocks: blocks(),
                                 rhs,
@@ -5124,10 +3863,10 @@ impl GpuNodeMeasurementBackend {
                         )
                         .map_err(|error| GpuMeasurementError(error.to_string()))?
                     {
-                        mxx_runtime::backend::FusedBatchOutput::Matrices(values) => {
+                        crate::backend::FusedBatchOutput::Matrices(values) => {
                             outputs.extend(values.into_iter().map(GpuMeasurementOutput::matrix))
                         }
-                        mxx_runtime::backend::FusedBatchOutput::Small(value) => {
+                        crate::backend::FusedBatchOutput::Small(value) => {
                             outputs.push(GpuMeasurementOutput::SmallMatrix(value))
                         }
                     }
@@ -5374,6 +4113,48 @@ impl GpuNodeMeasurementBackend {
                 Some(_)
             ),
         };
+        let source_placement = sources
+            .iter()
+            .map(|source| match source {
+                GpuLocalProductionSource::Matrix(value) => format!(
+                    "matrix {}x{} {:?}",
+                    value.size().0,
+                    value.size().1,
+                    value
+                        .shards()
+                        .iter()
+                        .map(|shard| (
+                            shard.device_id,
+                            shard.global_column_start,
+                            shard.value.col_size()
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+                GpuLocalProductionSource::Compact(value) => format!(
+                    "compact {}x{} {:?}",
+                    value.size().0,
+                    value.size().1,
+                    value
+                        .shards()
+                        .iter()
+                        .map(|shard| (
+                            shard.device_id,
+                            shard.global_column_start,
+                            shard.value.columns()
+                        ))
+                        .collect::<Vec<_>>()
+                ),
+            })
+            .collect::<Vec<_>>();
+        let operation_context = representative.fixed_metadata.as_ref().map(|metadata| {
+            (
+                metadata.site,
+                metadata.shape_class,
+                metadata.instance_class,
+                metadata.operation_identity,
+                metadata.implementation_variant.as_str(),
+            )
+        });
         let result = worker
             .backend
             .execute_local_production_job(request, |backend, context| {
@@ -5491,21 +4272,20 @@ impl GpuNodeMeasurementBackend {
                 {
                     GpuMeasurementError::out_of_memory(message)
                 } else {
-                    GpuMeasurementError(message)
+                    GpuMeasurementError(format!(
+                        "GPU warmup production failed: node={:?} kind={:?} operation={operation_context:?} destination={} output={:?} inputs={:?} sources={source_placement:?}: {message}",
+                        node.id, node.kind, worker.device_id, execution.output, execution.inputs,
+                    ))
                 }
             })?;
-        worker.last_production_job = Some(ProductionJobObservation {
-            elapsed: result.elapsed,
-            routes: result.routes,
-            resources: result.resources,
-        });
+        worker.last_production_job =
+            Some(ProductionJobObservation { routes: result.routes, resources: result.resources });
         Ok(())
     }
 
     fn measure_fused_representative(
         worker: &mut GpuMeasurementWorker,
-        harness: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
+        harness: &GpuWarmupMeasurementConfig,
         id: mxx_ir_core::types::NodeId,
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
@@ -5514,18 +4294,13 @@ impl GpuNodeMeasurementBackend {
         session_prepared: Option<&PreparedMeasurement>,
     ) -> Result<NodeMeasurement, GpuMeasurementError> {
         let node = MeasurementNode {
-            scope,
             id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
         let prepared = match session_prepared {
-            Some(prepared) => prepared.clone(),
+            Some(prepared) => Ok(prepared.clone()),
             None if fused == FusedWarmupOperation::Decompose &&
                 matches!(representative.kind, NodeKind::PreimageSample { .. }) =>
             {
@@ -5537,11 +4312,13 @@ impl GpuNodeMeasurementBackend {
                     &node,
                     bindings,
                     Some((&representative.fixed_arguments, false)),
-                )?
+                )
             }
-            None => Self::prepare(&mut worker.backend, &node, bindings, None)?,
-        };
-        let prepared = Self::place_prepared_sources(worker, representative, prepared)?;
+            None => Self::prepare(&mut worker.backend, &node, bindings, None),
+        }
+        .map_err(|error| warmup_node_phase_error("fused preparation", &node, error))?;
+        let prepared = Self::place_prepared_sources(worker, representative, prepared)
+            .map_err(|error| warmup_node_phase_error("source placement", &node, error))?;
         let baseline = begin_gpu_memory_measurement(worker)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
@@ -5579,24 +4356,19 @@ impl GpuNodeMeasurementBackend {
     /// included in the point while kernel/assembly work is not.
     fn measure_transfer_representative(
         worker: &mut GpuMeasurementWorker,
-        harness: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
+        harness: &GpuWarmupMeasurementConfig,
         id: mxx_ir_core::types::NodeId,
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
     ) -> Result<NodeMeasurement, GpuMeasurementError> {
         let node = MeasurementNode {
-            scope,
             id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
-        let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)?;
+        let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)
+            .map_err(|error| warmup_node_phase_error("transfer preparation", &node, error))?;
         let boundary = Self::is_host_backend_boundary(node.kind);
         let boundary_type = representative
             .concrete_output_types
@@ -5607,7 +4379,8 @@ impl GpuNodeMeasurementBackend {
             vec![num_bigint::BigUint::from(0u8); boundary_type.map_or(0, |ty| ty.ring_dimension)];
         let boundary_route =
             if boundary { Some(Self::boundary_route(worker, representative)?) } else { None };
-        let prepared = Self::place_prepared_sources(worker, representative, prepared)?;
+        let prepared = Self::place_prepared_sources(worker, representative, prepared)
+            .map_err(|error| warmup_node_phase_error("transfer source placement", &node, error))?;
         let baseline = begin_gpu_memory_measurement(worker)?;
         let probe = GpuMemoryProbe { device_id: worker.device_id };
         let mut operation_error = None;
@@ -5616,7 +4389,6 @@ impl GpuNodeMeasurementBackend {
                 return;
             }
             if let Some(route) = boundary_route {
-                let started = std::time::Instant::now();
                 let result = (|| -> Result<(), GpuMeasurementError> {
                     for _ in 0..batch_size {
                         match node.kind {
@@ -5668,7 +4440,6 @@ impl GpuNodeMeasurementBackend {
                     return;
                 }
                 worker.last_production_job = Some(ProductionJobObservation {
-                    elapsed: started.elapsed(),
                     routes: vec![route],
                     resources: vec![GpuAffectedResourceEnvelope {
                         device_index: 0,
@@ -5702,80 +4473,6 @@ impl GpuNodeMeasurementBackend {
         measurement.workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
         measurement.measured_wave_workspace_bytes = measurement.workspace_bytes;
         Ok(measurement)
-    }
-
-    fn calibrate_representative(
-        worker: &mut GpuMeasurementWorker,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
-        id: mxx_ir_core::types::NodeId,
-        bindings: &ParamEnv,
-        representative: &RepresentativeMeasurement,
-        operation: [u8; 32],
-        pilot_columns: usize,
-        barrier: Option<&Barrier>,
-    ) -> Result<NodeMeasurement, GpuMeasurementError> {
-        if let Some(barrier) = barrier {
-            barrier.wait();
-        }
-        let node = MeasurementNode {
-            scope,
-            id,
-            kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: representative.concrete_argument_types.clone(),
-            concrete_output_types: representative.concrete_output_types.clone(),
-        };
-        worker.backend.set_column_widths_for_operation(
-            operation,
-            GpuColumnWidths { gpu0: pilot_columns, nonzero: None },
-        );
-        worker
-            .backend
-            .select_operation(operation)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        let fixed = Self::prepare(
-            &mut worker.backend,
-            &node,
-            bindings,
-            Some((&representative.fixed_arguments, true)),
-        )?;
-        let baseline = begin_gpu_memory_measurement(worker)?;
-        let scaled = Self::prepare(
-            &mut worker.backend,
-            &node,
-            bindings,
-            Some((&representative.fixed_arguments, false)),
-        )?;
-        let prepared = fixed.merge(scaled);
-        Self::execute_local_production_measurement(
-            worker,
-            &node,
-            bindings,
-            representative,
-            &prepared,
-            1,
-            None,
-            None,
-            false,
-        )?;
-        let latency_seconds = worker
-            .last_production_job
-            .as_ref()
-            .ok_or_else(|| GpuMeasurementError("production job returned no observation".into()))?
-            .elapsed
-            .as_secs_f64();
-        let workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
-        Ok(NodeMeasurement {
-            work_seconds: latency_seconds,
-            latency_seconds,
-            cumulative_wave_seconds: latency_seconds,
-            independent_wave_count: 1,
-            measured_wave_workspace_bytes: workspace_bytes,
-            workspace_bytes,
-        })
     }
 
     /// Measure a scalar host primitive through the same dispatch used by the
@@ -5848,6 +4545,7 @@ impl GpuNodeMeasurementBackend {
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
                 Ok(RuntimeValue::Trapdoor {
                     secret: Some(Arc::new(secret)),
+
                     public: Arc::new(public),
                     matrix_type: matrix.clone(),
                     sigma,
@@ -5899,6 +4597,123 @@ impl GpuNodeMeasurementBackend {
             ));
         }
         Ok(*count)
+    }
+
+    fn scalar_family_element(wire_type: &ConcreteWireType) -> bool {
+        matches!(
+            wire_type,
+            ConcreteWireType::ConstantInt |
+                ConcreteWireType::ConstantReal |
+                ConcreteWireType::ConstantBool |
+                ConcreteWireType::Int |
+                ConcreteWireType::Real |
+                ConcreteWireType::Bool |
+                ConcreteWireType::Bytes { .. } |
+                ConcreteWireType::TypedBlob { .. }
+        )
+    }
+
+    /// Resolve the complete family shape and validate the selected index
+    /// before consulting the cache. This keeps static nonzero/last accesses
+    /// equivalent to the ordinary production helper and prevents an invalid
+    /// request from populating a fixture.
+    fn scalar_family_request(
+        node: &MeasurementNode<'_>,
+        bindings: &ParamEnv,
+    ) -> Result<Option<(ConcreteWireType, usize)>, GpuMeasurementError> {
+        if !matches!(node.kind, NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic) {
+            return Ok(None);
+        }
+        let family = node
+            .concrete_argument_types
+            .first()
+            .cloned()
+            .or_else(|| {
+                let output = node.concrete_output_types.first()?.clone();
+                let count = match node.kind {
+                    NodeKind::FamilyGetStatic { index } => index
+                        .evaluate(bindings)
+                        .ok()
+                        .and_then(|value| value.to_usize())
+                        .and_then(|value| value.checked_add(1))
+                        .unwrap_or(1),
+                    NodeKind::FamilyGetDynamic => 1,
+                    _ => 1,
+                };
+                Some(ConcreteWireType::IndexedFamily { element: Box::new(output), count })
+            })
+            .ok_or_else(|| GpuMeasurementError("family selection has no family input".into()))?;
+        let ConcreteWireType::IndexedFamily { element, count } = &family else {
+            return Ok(None);
+        };
+        if *count == 0 {
+            return Err(GpuMeasurementError(
+                "host family representative cannot use an empty family".into(),
+            ));
+        }
+        if !Self::scalar_family_element(element) {
+            return Ok(None);
+        }
+        let selected_index = match node.kind {
+            NodeKind::FamilyGetStatic { index } => index
+                .evaluate(bindings)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                .to_usize()
+                .ok_or_else(|| GpuMeasurementError("family index does not fit usize".into()))?,
+            NodeKind::FamilyGetDynamic => 0,
+            _ => unreachable!(),
+        };
+        if selected_index >= *count {
+            return Err(GpuMeasurementError(format!(
+                "family representative index {selected_index} is out of range for {count} members"
+            )));
+        }
+        Ok(Some((element.as_ref().clone(), *count)))
+    }
+
+    fn ensure_scalar_family_cache(
+        worker: &mut GpuMeasurementWorker,
+        node: &MeasurementNode<'_>,
+        bindings: &ParamEnv,
+        logical_device: usize,
+    ) -> Result<Option<ScalarFamilyFixture>, GpuMeasurementError> {
+        let Some((element_type, count)) = Self::scalar_family_request(node, bindings)? else {
+            return Ok(None);
+        };
+        let key = ScalarFamilyCacheKey {
+            element_type: element_type.clone(),
+            count,
+            bindings: bindings.clone(),
+            logical_device,
+            worker_device_id: worker.device_id,
+            worker_devices: worker.backend.physical_device_ids(),
+        };
+        if let Some(cached) = worker.scalar_family_cache.as_ref() {
+            if cached.key == key {
+                return Ok(Some(cached.clone()));
+            }
+        }
+
+        // Scalar values have no GPU payload. The only O(count) allocation is
+        // the complete container fixture that the production family helper
+        // indexes/clones; no matrix, compact matrix, or trapdoor is retained.
+        let exemplar =
+            Self::representative_runtime_value(&mut worker.backend, &element_type, bindings)?;
+        let values = Arc::new((0..count).map(|_| exemplar.clone()).collect::<Vec<_>>());
+        let prepared = PreparedHostPrimitive {
+            typed_inputs: None,
+            trapdoor: None,
+            scalar_inputs: Vec::new(),
+            family_inputs: vec![RuntimeValue::IndexedFamily((*values).clone())],
+            family_fixture: None,
+            dynamic_index: None,
+            choices: Vec::new(),
+        };
+        let setup_memory =
+            Arc::new(Self::host_setup_memory(&worker.backend, &prepared, logical_device)?);
+        let fixture = ScalarFamilyFixture { key, values, setup_memory };
+        worker.scalar_family_cache = Some(fixture.clone());
+        Ok(Some(fixture))
     }
 
     fn run_host_primitive(
@@ -5956,10 +4771,11 @@ impl GpuNodeMeasurementBackend {
         elapsed.map(|_| ()).map_err(|error| GpuMeasurementError(error.to_string()))
     }
 
-    fn prepare_host_primitive(
+    fn prepare_host_primitive_inner(
         backend: &mut GpuDcrtBackend,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
+        scalar_family_fixture: Option<&ScalarFamilyFixture>,
     ) -> Result<PreparedHostPrimitive, GpuMeasurementError> {
         let mut compact_types = Vec::new();
         match node.kind {
@@ -6015,6 +4831,7 @@ impl GpuNodeMeasurementBackend {
             trapdoor: None,
             scalar_inputs: Vec::new(),
             family_inputs: Vec::new(),
+            family_fixture: None,
             dynamic_index: None,
             choices: Vec::new(),
         };
@@ -6083,7 +4900,6 @@ impl GpuNodeMeasurementBackend {
                 let ConcreteWireType::IndexedFamily { element, .. } = &family else {
                     unreachable!("evaluated_family_count validated indexed family");
                 };
-                let exemplar = Self::representative_family_member(backend, element, bindings)?;
                 let selected_index = match node.kind {
                     NodeKind::FamilyGetStatic { index } => index
                         .evaluate(bindings)
@@ -6104,8 +4920,13 @@ impl GpuNodeMeasurementBackend {
                 // complete family shape: production clones/accesses a real
                 // indexed container, and replacing unselected nested values
                 // with scalar sentinels would measure a different operation.
-                let family_values = (0..count).map(|_| exemplar.clone()).collect::<Vec<_>>();
-                prepared.family_inputs.push(RuntimeValue::IndexedFamily(family_values));
+                if let Some(fixture) = scalar_family_fixture {
+                    prepared.family_fixture = Some(Arc::clone(&fixture.values));
+                } else {
+                    let exemplar = Self::representative_family_member(backend, element, bindings)?;
+                    let family_values = (0..count).map(|_| exemplar.clone()).collect::<Vec<_>>();
+                    prepared.family_inputs.push(RuntimeValue::IndexedFamily(family_values));
+                }
                 if matches!(node.kind, NodeKind::FamilyGetDynamic) {
                     // Index zero is valid for every nonempty family and is
                     // deliberately independent of the generic Int exemplar.
@@ -6217,6 +5038,18 @@ impl GpuNodeMeasurementBackend {
                 NodeKind::FamilyGetDynamic |
                 NodeKind::Select { .. }
         ) {
+            if let Some(values) = prepared.family_fixture.as_ref() {
+                return measure_runtime_family_get_primitive(
+                    node.id,
+                    node.kind,
+                    bindings,
+                    values,
+                    prepared.dynamic_index.as_ref(),
+                    1,
+                )
+                .map(|_| ())
+                .map_err(|error| GpuMeasurementError(error.to_string()));
+            }
             return measure_runtime_container_primitive(
                 node.id,
                 node.kind,
@@ -6262,15 +5095,26 @@ impl GpuNodeMeasurementBackend {
         logical_device: usize,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-        harness: &MeasurementHarnessConfig,
+        harness: &GpuWarmupMeasurementConfig,
     ) -> Result<(f64, f64, usize, GpuWarmupMemoryObservations), GpuMeasurementError> {
         if harness.measured_iterations == 0 {
             return Err(GpuMeasurementError(
                 "host warmup measurement requires at least one measured repetition".into(),
             ));
         }
-        let prepared = Self::prepare_host_primitive(&mut worker.backend, node, bindings)?;
-        let setup_memory = Self::host_setup_memory(&worker.backend, &prepared, logical_device)?;
+        let scalar_family_fixture =
+            Self::ensure_scalar_family_cache(worker, node, bindings, logical_device)?;
+        let prepared = Self::prepare_host_primitive_inner(
+            &mut worker.backend,
+            node,
+            bindings,
+            scalar_family_fixture.as_ref(),
+        )?;
+        let setup_memory = if let Some(fixture) = scalar_family_fixture.as_ref() {
+            (*fixture.setup_memory).clone()
+        } else {
+            Self::host_setup_memory(&worker.backend, &prepared, logical_device)?
+        };
         for _ in 0..harness.warm_up_iterations {
             Self::run_prepared_host_primitive(node, bindings, &prepared)?;
         }
@@ -6456,6 +5300,7 @@ impl GpuNodeMeasurementBackend {
             .flat_map(|(inputs, _, _)| inputs.values())
             .chain(prepared.trapdoor.iter())
             .chain(prepared.family_inputs.iter())
+            .chain(prepared.family_fixture.iter().flat_map(|values| values.iter()))
             .chain(prepared.choices.iter())
         {
             visit(
@@ -6552,8 +5397,7 @@ impl GpuNodeMeasurementBackend {
     fn measure_host_boundary_repeated(
         worker: &mut GpuMeasurementWorker,
         logical_device: usize,
-        config: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
+        config: &GpuWarmupMeasurementConfig,
         id: mxx_ir_core::types::NodeId,
         bindings: &ParamEnv,
         representative: &RepresentativeMeasurement,
@@ -6564,13 +5408,8 @@ impl GpuNodeMeasurementBackend {
             ));
         }
         let node = MeasurementNode {
-            scope,
             id,
             kind: &representative.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: representative.concrete_argument_types.clone(),
             concrete_output_types: representative.concrete_output_types.clone(),
         };
@@ -6634,7 +5473,7 @@ impl GpuNodeMeasurementBackend {
                 .ok_or_else(|| GpuMeasurementError("boundary dimension overflows".into()))
         };
         let run_host = || -> Result<(), GpuMeasurementError> {
-            use mxx_runtime::backend::poly::{
+            use crate::backend::poly::{
                 canonical_polynomial_values, extract_host_coefficient, pack_polynomial_bits,
                 polynomial_host_values, threshold_decode_coefficients,
             };
@@ -6711,7 +5550,6 @@ impl GpuNodeMeasurementBackend {
     /// production/warmup walker.  The walker owns loop binding and child
     /// traversal; this callback only executes the leaf host primitive.
     fn measure_host_control_once(
-        _scope: &mxx_ir_core::FrozenGraphScopeId,
         id: mxx_ir_core::types::NodeId,
         kind: &NodeKind,
         bindings: &ParamEnv,
@@ -6721,15 +5559,14 @@ impl GpuNodeMeasurementBackend {
             // Structural control walkers do not own the GPU backend; their
             // concrete leaf timing is charged by the enclosing production
             // node path. Keep traversal here side-effect free.
-            let _ = invocation;
+            debug_assert!(invocation.coverage.is_complete());
             Ok::<_, GpuMeasurementError>(HostControlBodyAction::VisitChildren)
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))
     }
 
     fn measure_host_control_repeated(
-        config: &MeasurementHarnessConfig,
-        scope: &mxx_ir_core::FrozenGraphScopeId,
+        config: &GpuWarmupMeasurementConfig,
         id: mxx_ir_core::types::NodeId,
         kind: &NodeKind,
         bindings: &ParamEnv,
@@ -6741,13 +5578,11 @@ impl GpuNodeMeasurementBackend {
             ));
         }
         for _ in 0..config.warm_up_iterations {
-            std::hint::black_box(Self::measure_host_control_once(
-                scope, id, kind, bindings, child,
-            )?);
+            std::hint::black_box(Self::measure_host_control_once(id, kind, bindings, child)?);
         }
         let mut samples = Vec::with_capacity(config.measured_iterations);
         for _ in 0..config.measured_iterations {
-            samples.push(Self::measure_host_control_once(scope, id, kind, bindings, child)?);
+            samples.push(Self::measure_host_control_once(id, kind, bindings, child)?);
         }
         let mean = samples.iter().sum::<f64>() / samples.len() as f64;
         let spread = if samples.len() > 1 {
@@ -7647,7 +6482,8 @@ impl GpuNodeMeasurementBackend {
             NodeKind::FamilyGetDynamic |
             NodeKind::Select { .. } => Ok(Vec::new()),
             NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
-                measure_host_control_with(node.id, node.kind, bindings, None, |_invocation| {
+                measure_host_control_with(node.id, node.kind, bindings, None, |invocation| {
+                    debug_assert!(invocation.coverage.is_complete());
                     Ok::<_, GpuMeasurementError>(HostControlBodyAction::VisitChildren)
                 })
                 .map_err(|error| GpuMeasurementError(error.to_string()))?;
@@ -7657,10 +6493,10 @@ impl GpuNodeMeasurementBackend {
     }
 }
 
-impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
+impl GpuWarmupProfileProvider for ProductionGpuWarmupProvider {
     fn configure_gpu_plan_budgets(
         &mut self,
-        budgets: &[mxx_runtime::gpu_execution_plan::GpuDeviceBudget],
+        budgets: &[crate::gpu_execution_plan::GpuDeviceBudget],
     ) -> Result<(), GpuWarmupProfileError> {
         if self.workers.iter().any(|worker| worker.backend.frozen_plan().is_some()) {
             return Err(GpuWarmupProfileError::Measurement(
@@ -7673,7 +6509,7 @@ impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
             .workers
             .iter()
             .map(|worker| {
-                mxx_runtime::gpu_execution_plan::project_gpu_device_budgets(
+                crate::gpu_execution_plan::project_gpu_device_budgets(
                     &fleet,
                     &worker.backend.physical_device_ids(),
                     budgets,
@@ -7753,25 +6589,18 @@ impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
                 ));
             }
         }
-        // A PreimageSample IR node backed by GadgetTrapdoor is lowered to
-        // fixed gadget decomposition and must not inherit sampler-specific
-        // retry/cache admission or wave accounting. Only the sampled
-        // trapdoor lowering is a preimage sampler.
-        let preimage_sample = fused_operation == Some(FusedWarmupOperation::PreimageBatch);
         if let Some(host_control) = descriptor.host_control.clone() {
             self.host_control_operations
                 .insert((descriptor.scope.clone(), descriptor.node), host_control);
         }
         let pending = PendingMeasurement {
             warmup: Some(descriptor.clone()),
-            key: signature.operation,
             scope: descriptor.scope,
             id: descriptor.node,
             kind: descriptor.kind,
             concrete_argument_types: descriptor.concrete_argument_types,
             concrete_output_types: descriptor.concrete_output_types,
             bindings: descriptor.bindings,
-            preimage_sample,
         };
         self.warmup_operations.insert(signature, pending);
         self.warmup_profile_domains.insert(signature, profile_domain);
@@ -7788,145 +6617,396 @@ impl GpuWarmupProfileProvider for GpuNodeMeasurementBackend {
     }
 }
 
-impl MeasurementBackend for GpuNodeMeasurementBackend {
-    type Error = GpuMeasurementError;
+/// Exact inputs for one canonical GPU preparation. Preparation derives the
+/// backend contract, layouts, storage descriptors, and finite resource
+/// budgets from the graph/backend pair. Callers supply only graph-independent
+/// policy and measurement inputs.
+pub struct GpuPreparationRequest<'a> {
+    pub validated: ValidatedGraph,
+    pub backend: &'a mut GpuDcrtBackend,
+    pub inputs: &'a BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
+    pub parameters: &'a [GpuDCRTPolyParams],
+    pub default_tile_widths: Vec<usize>,
+    pub implementation_variant: String,
+    pub measurement_config: GpuWarmupMeasurementConfig,
+    pub execution_config: ExecutionConfig,
+}
 
-    fn measure(
-        &mut self,
-        _graph: &str,
-        node: &MeasurementNode<'_>,
-        bindings: &ParamEnv,
-    ) -> Result<NodeMeasurement, Self::Error> {
-        let measurement_key = Self::measurement_key(node, bindings)?;
-        if let Some(measurement) = self.measurements.get(&measurement_key) {
-            return Ok(measurement.clone());
-        }
-        if !self.collecting {
-            return Err(GpuMeasurementError(format!(
-                "GPU node shape at {:?} node {:?} was not collected before measurement",
-                node.scope, node.id
-            )));
-        }
-        self.pending.entry(measurement_key).or_insert_with(|| PendingMeasurement {
-            warmup: None,
-            key: measurement_key,
-            scope: node.scope.clone(),
-            id: node.id,
-            kind: node.kind.clone(),
-            concrete_argument_types: node.concrete_argument_types.clone(),
-            concrete_output_types: node.concrete_output_types.clone(),
-            bindings: bindings.clone(),
-            preimage_sample: matches!(node.kind, NodeKind::PreimageSample { .. }),
-        });
-        Ok(NodeMeasurement::default())
-    }
+#[derive(Clone, Debug)]
+pub struct GpuPreparationEvidence {
+    pub measurement_calls: usize,
+    pub provenances: Vec<GpuWarmupProvenance>,
+    pub dispatches: Vec<GpuWarmupDispatchRecord>,
+    /// The provider's live observation token.  Keeping this Arc in the
+    /// prepared value lets callers prove that no setup measurement happened
+    /// after preparation, even though the provider itself has been dropped.
+    measurement_counter: Arc<AtomicUsize>,
+    measurement_baseline: usize,
+}
 
-    fn persistent_bytes(&self, wire_type: &ConcreteWireType) -> u64 {
-        match wire_type {
-            ConcreteWireType::Matrix(matrix) | ConcreteWireType::Trapdoor { matrix, .. } => {
-                // Missing ring metadata cannot be represented as a cheap zero-byte
-                // buffer. Actual execution will report the registry error.
-                self.workers
-                    .first()
-                    .and_then(|worker| worker.backend.ring_crt_depth(matrix).ok())
-                    .map_or(u64::MAX, |depth| matrix_bytes(matrix, depth))
-            }
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                compact_matrix_bytes(matrix, max_coefficient_bound)
-            }
-            ConcreteWireType::IndexedFamily { element, count } => self
-                .persistent_bytes(element)
-                .saturating_mul(u64::try_from(*count).unwrap_or(u64::MAX)),
-            ConcreteWireType::Bytes { length } => u64::try_from(*length).unwrap_or(u64::MAX),
-            ConcreteWireType::TypedBlob { .. } => 0,
-            ConcreteWireType::ConstantInt |
-            ConcreteWireType::ConstantReal |
-            ConcreteWireType::ConstantBool |
-            ConcreteWireType::Int |
-            ConcreteWireType::Real |
-            ConcreteWireType::Bool => 0,
-        }
-    }
-    fn persistent_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
-        if matches!(kind, NodeKind::ParallelLoop(_)) &&
-            matches!(
-                wire_type,
-                ConcreteWireType::IndexedFamily { element, .. }
-                    if ArtifactType::from_wire_type(element).is_some()
-            )
-        {
-            // Runtime stages each artifact-compatible lane after its bounded loop wave. The
-            // live lane values are accounted in the child peak, not as one resident family.
-            return 0;
-        }
-        if matches!(kind, NodeKind::Input { artifact: Some(_), .. }) &&
-            matches!(wire_type, ConcreteWireType::IndexedFamily { .. })
-        {
-            // Artifact families remain store-backed descriptors; consumers materialize only
-            // their selected members.
-            0
-        } else {
-            self.persistent_bytes(wire_type)
-        }
-    }
-
-    fn persistent_storage_bytes_for_node(
-        &self,
-        _kind: &NodeKind,
-        wire_type: &ConcreteWireType,
-    ) -> u64 {
-        match wire_type {
-            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
-            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
-                compact_artifact_bytes(matrix, max_coefficient_bound)
-            }
-            _ => self.persistent_bytes(wire_type),
-        }
-    }
-
-    fn transmitted_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
-        match kind {
-            NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.availability == ArtifactAvailability::Cached =>
-            {
-                0
-            }
-            NodeKind::Input { .. } => self.persistent_storage_bytes_for_node(kind, wire_type),
-            _ => 0,
-        }
-    }
-
-    fn cache_bytes_for_node(&self, kind: &NodeKind, wire_type: &ConcreteWireType) -> u64 {
-        match kind {
-            NodeKind::Input { artifact: Some(artifact), .. }
-                if artifact.availability == ArtifactAvailability::Cached =>
-            {
-                self.persistent_storage_bytes_for_node(kind, wire_type)
-            }
-            _ => 0,
-        }
-    }
-
-    fn artifact_payload_bytes_for_node(
-        &self,
-        _kind: &NodeKind,
-        _wire_type: &ConcreteWireType,
-        manifest_payload_bytes: Option<u64>,
-    ) -> u64 {
-        // Production artifact inputs are rejected by the estimator before
-        // reaching this hook when no exact store-captured size is available.
-        // Keeping this hook total preserves the measurement-backend trait for
-        // non-artifact synthetic inputs without reintroducing a resident-byte
-        // or modulus-bit approximation as production authority.
-        manifest_payload_bytes.unwrap_or(0)
-    }
-
-    fn persistent_alias_argument(&self, kind: &NodeKind, output_port: usize) -> Option<usize> {
-        (output_port == 0 && matches!(kind, NodeKind::GadgetDecompose { .. })).then_some(0)
+impl PartialEq for GpuPreparationEvidence {
+    fn eq(&self, other: &Self) -> bool {
+        self.measurement_calls == other.measurement_calls &&
+            self.provenances == other.provenances &&
+            self.dispatches == other.dispatches &&
+            self.measurement_baseline == other.measurement_baseline &&
+            Arc::ptr_eq(&self.measurement_counter, &other.measurement_counter)
     }
 }
 
+impl GpuPreparationEvidence {
+    pub fn measurement_count(&self) -> usize {
+        self.measurement_counter.load(Ordering::SeqCst)
+    }
+
+    pub fn assert_measurements_unchanged(&self) {
+        assert_eq!(
+            self.measurement_count(),
+            self.measurement_baseline,
+            "GPU measurement provider was invoked after preparation"
+        );
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GpuPreparationError {
+    #[error("GPU warmup preparation failed: {0}")]
+    Warmup(#[from] GpuWarmupError),
+    #[error("GPU warmup preparation input is invalid: {0}")]
+    InvalidInput(String),
+    #[error("GPU warmup preparation evidence is invalid: {0}")]
+    InvalidEvidence(String),
+    #[error("prepared GPU execution failed: {0}")]
+    Execution(#[from] ExecutionError),
+}
+
+/// The immutable result of canonical setup.  Reports and evidence are copied
+/// values: calling accessors cannot invoke a provider, backend, or allocator.
+#[derive(Clone, Debug)]
+pub struct PreparedGpuExecution {
+    validated: Arc<ValidatedGraph>,
+    plan: Arc<FrozenGpuPlan>,
+    plan_index: FrozenGpuPlanIndex,
+    report: GpuWarmupReport,
+    report_stages_by_key: BTreeMap<GpuExecutionSiteKey, usize>,
+    execution_config: ExecutionConfig,
+    evidence: GpuPreparationEvidence,
+}
+
+impl PreparedGpuExecution {
+    pub fn validated(&self) -> &ValidatedGraph {
+        &self.validated
+    }
+
+    pub fn plan(&self) -> &FrozenGpuPlan {
+        &self.plan
+    }
+
+    pub fn report(&self) -> GpuWarmupReport {
+        self.report.clone()
+    }
+
+    pub fn evidence(&self) -> GpuPreparationEvidence {
+        self.evidence.clone()
+    }
+
+    pub fn measurement_count(&self) -> usize {
+        self.evidence.measurement_count()
+    }
+
+    pub fn assert_measurements_unchanged(&self) {
+        self.evidence.assert_measurements_unchanged();
+    }
+
+    pub fn execution_config(&self) -> ExecutionConfig {
+        self.execution_config.clone()
+    }
+
+    /// Validate the immutable evidence captured during setup.  This is kept as
+    /// a separate check so callers can reject a tampered or incomplete value
+    /// before handing it to the production executor.
+    pub fn validate_evidence(&self) -> Result<(), GpuPreparationError> {
+        self.plan
+            .validate_with_index(&self.plan_index)
+            .map_err(|error| GpuPreparationError::InvalidEvidence(error.to_string()))?;
+
+        let executable = !self.plan.nodes.is_empty();
+        if executable && self.evidence.measurement_calls == 0 {
+            return Err(GpuPreparationError::InvalidEvidence(
+                "executable GPU plan has no setup measurements".into(),
+            ));
+        }
+        let live_measurements = self.evidence.measurement_count();
+        if live_measurements != self.evidence.measurement_baseline ||
+            live_measurements != self.evidence.measurement_calls
+        {
+            return Err(GpuPreparationError::InvalidEvidence(format!(
+                "measurement counter changed: live {}, baseline {}, captured {}",
+                live_measurements,
+                self.evidence.measurement_baseline,
+                self.evidence.measurement_calls
+            )));
+        }
+        if self.evidence.provenances.len() != self.evidence.measurement_calls {
+            return Err(GpuPreparationError::InvalidEvidence(format!(
+                "measurement provenance count {} does not match measurement count {}",
+                self.evidence.provenances.len(),
+                self.evidence.measurement_calls
+            )));
+        }
+        if self
+            .evidence
+            .provenances
+            .iter()
+            .any(|provenance| *provenance != GpuWarmupProvenance::ProductionEquivalent)
+        {
+            return Err(GpuPreparationError::InvalidEvidence(
+                "setup measurement is not production-equivalent".into(),
+            ));
+        }
+        if self
+            .report
+            .stages
+            .iter()
+            .any(|stage| stage.provenance == GpuProfileProvenance::ConservativeEstimate)
+        {
+            return Err(GpuPreparationError::InvalidEvidence(
+                "warmup report contains a conservative estimate".into(),
+            ));
+        }
+        match &self.execution_config.plan {
+            ExecutionPlan::FrozenGpu(plan) if plan.as_ref() == self.plan.as_ref() => {}
+            ExecutionPlan::FrozenGpu(_) => {
+                return Err(GpuPreparationError::InvalidEvidence(
+                    "execution configuration plan differs from prepared plan".into(),
+                ));
+            }
+            ExecutionPlan::Cpu => {
+                return Err(GpuPreparationError::InvalidEvidence(
+                    "prepared GPU execution has no frozen GPU plan".into(),
+                ));
+            }
+        }
+
+        if self.report.stages.len() != self.plan.nodes.len() {
+            return Err(GpuPreparationError::InvalidEvidence(format!(
+                "warmup report has {} stages but frozen plan has {} nodes",
+                self.report.stages.len(),
+                self.plan.nodes.len()
+            )));
+        }
+        if self.report_stages_by_key.len() != self.report.stages.len() {
+            return Err(GpuPreparationError::InvalidEvidence(
+                "warmup report contains duplicate plan sites".into(),
+            ));
+        }
+        for node in &self.plan.nodes {
+            let Some(stage) = self
+                .report_stages_by_key
+                .get(&node.key)
+                .and_then(|index| self.report.stages.get(*index))
+            else {
+                return Err(GpuPreparationError::InvalidEvidence(format!(
+                    "warmup report is missing plan node {:?}",
+                    node.key
+                )));
+            };
+            if stage.operation_identity != node.operation_identity ||
+                stage.effective_operation != node.effective_operation ||
+                stage.column_capability != node.column_capability ||
+                stage.output_layouts != node.output_layouts ||
+                stage.loop_site != node.loop_site ||
+                stage.columns_per_job != node.columns_per_job ||
+                stage.implementation_variant != node.implementation_variant
+            {
+                return Err(GpuPreparationError::InvalidEvidence(format!(
+                    "warmup report identity differs from frozen plan at {:?}",
+                    node.key
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Execute the already prepared graph using the frozen production plan.
+    /// Artifact-producing graphs are recognized from their validated output
+    /// declarations and use the session path; transient and artifact-consumer
+    /// graphs stay transient. Sampling and the execution configuration are
+    /// intentionally fixed by this value.
+    pub fn run<S>(
+        &self,
+        backend: &mut GpuDcrtBackend,
+        inputs: BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
+        artifact_store: &mut S,
+        execution_nonce: [u8; 32],
+    ) -> Result<ExecutionResult<GpuDcrtBackend>, GpuPreparationError>
+    where
+        S: SessionStore,
+    {
+        self.validate_evidence()?;
+        self.evidence.assert_measurements_unchanged();
+        let result = execute_prepared(
+            &self.validated,
+            backend,
+            inputs,
+            artifact_store,
+            execution_nonce,
+            self.execution_config.clone(),
+        )?;
+        self.evidence.assert_measurements_unchanged();
+        Ok(result)
+    }
+}
+
+/// Prepare one exact production GPU execution.  Measurement is performed at
+/// most once here; all returned state is detached from the provider and is
+/// safe to reuse for fixed execution and pure reporting.
+pub fn prepare(
+    request: GpuPreparationRequest<'_>,
+) -> Result<PreparedGpuExecution, GpuPreparationError> {
+    let device_ids = request.backend.physical_device_ids();
+    if device_ids.is_empty() {
+        return Err(GpuPreparationError::InvalidInput("GPU fleet is empty".into()));
+    }
+    if request.parameters.is_empty() {
+        return Err(GpuPreparationError::InvalidInput(
+            "GPU preparation requires at least one native parameter set".into(),
+        ));
+    }
+    if request.parameters.iter().any(|parameters| parameters.device_ids() != device_ids) {
+        return Err(GpuPreparationError::InvalidInput(
+            "native parameter device ownership disagrees with the production fleet".into(),
+        ));
+    }
+    let mut contract = request
+        .backend
+        .gpu_runtime_contract(&request.validated, request.inputs)
+        .map_err(|error| GpuPreparationError::InvalidInput(error.to_string()))?
+        .ok_or_else(|| {
+            GpuPreparationError::InvalidInput("backend has no fixed GPU contract".into())
+        })?;
+    let available_host = std::fs::read_to_string("/proc/meminfo")
+        .map_err(|error| {
+            GpuPreparationError::InvalidInput(format!("host memory information: {error}"))
+        })?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MemAvailable:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+                .and_then(|value| value.checked_mul(1024))
+        })
+        .ok_or_else(|| {
+            GpuPreparationError::InvalidInput("available host memory is unavailable".into())
+        })?;
+    contract.device_budgets = contract
+        .logical_to_physical_devices
+        .iter()
+        .enumerate()
+        .map(|(device, physical)| {
+            Ok(GpuDeviceBudget {
+                device,
+                device_bytes: gpu_memory_info(*physical as i32)
+                    .map_err(GpuPreparationError::InvalidInput)?
+                    .free as u64,
+                pinned_host_bytes: available_host.min(1 << 30),
+                host_bytes: available_host.min(8 << 30),
+            })
+        })
+        .collect::<Result<Vec<_>, GpuPreparationError>>()?;
+    let mut matrices = BTreeMap::<mxx_ir_core::types::ConcreteMatrixType, LayoutId>::new();
+    for scope in request.validated.scopes.values() {
+        for wire in scope.wire_types.values() {
+            if let Some(matrix) = wire.matrix_type() {
+                let id = matrices.len() as LayoutId + 1;
+                matrices.entry(matrix.clone()).or_insert(id);
+            }
+        }
+    }
+    let layouts = matrices
+        .into_iter()
+        .map(|(matrix, id)| GpuLayout {
+            id,
+            columns: matrix.columns,
+            rows: matrix.rows,
+            ring_dimension: matrix.ring_dimension,
+            representation: format!("{matrix:?}"),
+            instance_device_stride: 0,
+            owner_intervals: Vec::new(),
+        })
+        .collect();
+    let device_count = contract.logical_to_physical_devices.len();
+    let warmup_config = GpuValidatedWarmupConfig {
+        contract,
+        layouts,
+        default_tile_widths: request.default_tile_widths,
+        default_cost: vec![GpuStageCostModel::default(); device_count],
+        default_implementation_variant: request.implementation_variant,
+        profiles: BTreeMap::new(),
+        effective_operation_identities: BTreeMap::new(),
+        effective_operations: BTreeMap::new(),
+        storage_descriptors: BTreeMap::new(),
+        active_crt_towers: 0,
+        crt_limb_bytes: 0,
+        max_parallel_instances: request.execution_config.max_parallel_instances,
+    };
+    let measurement_backends = device_ids
+        .iter()
+        .map(|device| {
+            (
+                gpu_backend_on(request.parameters.iter().cloned(), device_ids.iter().copied()),
+                *device,
+            )
+        })
+        .collect();
+    let mut provider =
+        ProductionGpuWarmupProvider::new(measurement_backends, request.measurement_config);
+    let measurement_counter = provider.warmup_measurement_counter();
+    let warmup = crate::gpu_warmup::warmup_gpu_for_inputs_with_execution_config(
+        &request.validated,
+        request.backend,
+        request.inputs,
+        &warmup_config,
+        &mut provider,
+        &request.execution_config,
+    )?;
+    let evidence = GpuPreparationEvidence {
+        measurement_calls: provider.warmup_measurement_call_count(),
+        provenances: provider.warmup_measurement_provenances().to_vec(),
+        dispatches: provider.warmup_dispatch_records().to_vec(),
+        measurement_baseline: provider.warmup_measurement_call_count(),
+        measurement_counter,
+    };
+    drop(provider);
+    let plan = Arc::new(warmup.plan);
+    let plan_index = FrozenGpuPlanIndex::build(&plan)
+        .map_err(|error| GpuPreparationError::InvalidEvidence(error.to_string()))?;
+    let mut report_stages_by_key = BTreeMap::new();
+    for (index, stage) in warmup.report.stages.iter().enumerate() {
+        if report_stages_by_key.insert(stage.key, index).is_some() {
+            return Err(GpuPreparationError::InvalidEvidence(
+                "warmup report contains duplicate plan sites".into(),
+            ));
+        }
+    }
+    let execution_config = ExecutionConfig {
+        plan: ExecutionPlan::FrozenGpu(Arc::clone(&plan)),
+        ..request.execution_config
+    };
+    let prepared = PreparedGpuExecution {
+        validated: Arc::new(request.validated),
+        plan,
+        plan_index,
+        report: warmup.report,
+        report_stages_by_key,
+        execution_config,
+        evidence,
+    };
+    prepared.validate_evidence()?;
+    Ok(prepared)
+}
+
+#[cfg(test)]
 fn matrix_bytes(matrix: &ConcreteMatrixType, crt_depth: usize) -> u64 {
     u64::try_from(matrix.rows)
         .unwrap_or(u64::MAX)
@@ -7936,10 +7016,12 @@ fn matrix_bytes(matrix: &ConcreteMatrixType, crt_depth: usize) -> u64 {
         .saturating_mul(8)
 }
 
+#[cfg(test)]
 fn compact_matrix_bytes(matrix: &ConcreteMatrixType, max_coefficient_bound: &BigInt) -> u64 {
     u64::try_from(compact_matrix_bytes_u128(matrix, max_coefficient_bound)).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
 fn compact_matrix_bytes_u128(matrix: &ConcreteMatrixType, max_coefficient_bound: &BigInt) -> u128 {
     let magnitude_bytes = max_coefficient_bound
         .to_biguint()
@@ -7951,54 +7033,22 @@ fn compact_matrix_bytes_u128(matrix: &ConcreteMatrixType, max_coefficient_bound:
         .saturating_mul(1u128.saturating_add(magnitude_bytes))
 }
 
-fn compact_artifact_bytes(matrix: &ConcreteMatrixType, max_coefficient_bound: &BigInt) -> u64 {
-    let bound_bytes = max_coefficient_bound
-        .to_biguint()
-        .map(|bound| bound.to_bytes_le().len().max(1))
-        .unwrap_or(0);
-    let framing = 4usize
-        .saturating_add(1)
-        .saturating_add(8)
-        .saturating_add(8)
-        .saturating_add(8)
-        .saturating_add(4)
-        .saturating_add(bound_bytes)
-        .saturating_add(4)
-        .saturating_add(8);
-    compact_matrix_bytes(matrix, max_coefficient_bound)
-        .saturating_add(u64::try_from(framing).unwrap_or(u64::MAX))
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuMeasurementError, GpuMeasurementOutput, GpuNodeMeasurementBackend, PendingMeasurement,
-        PreparedMeasurement, aggregate_fleet_wave, authoritative_production_route,
-        compact_matrix_bytes, extrapolate_fleet_waves, gpu_capped_waterfill_columns, matrix_bytes,
-        require_exclusive_measurement_context, select_worker_index_for_physical,
+        GpuMeasurementError, GpuMeasurementOutput, GpuMeasurementWorker, MeasurementNode,
+        PendingMeasurement, PreparedMeasurement, ProductionGpuWarmupProvider, ScalarFamilyCacheKey,
+        ScalarFamilyFixture, authoritative_production_route, compact_matrix_bytes,
+        harness::GpuWarmupMeasurementConfig, matrix_bytes, require_exclusive_measurement_context,
+        select_worker_index_for_physical, tensor_row_sum_allocation_groups,
     };
-    use crate::{MeasurementNode, NodeMeasurement, harness::MeasurementHarnessConfig};
-    use mxx_ir_core::{
-        FrozenGraphScopeId, IntExpr, ParamEnv, RealExpr,
-        node::{ConcatAxis, ConstantMatrix, HashVariant, IndexRange, MatrixBinaryOp, NodeKind},
-        types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
-    };
-    use mxx_primitives::{
-        matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
-        poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
-        sampler::trapdoor::gpu::{
-            PreimageAllocationEnvelope, PreimageAllocationEvidence, PreimageAllocationEvidenceKind,
-            PreimageCacheIdentity, PreimageCacheState, PreimageEvidenceContext,
-            PreimageFormatContext,
-        },
-    };
-    use mxx_runtime::{
+    use crate::{
         backend::{
-            GpuWarmupCacheState, GpuWarmupDeviceIdentity, GpuWarmupFragmentClass,
-            GpuWarmupOperationDescriptor, GpuWarmupOperationSignature, GpuWarmupProfileProvider,
-            GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupResidencyDelta,
-            GpuWarmupTimingScope, IndexRange as RuntimeIndexRange, MemoryEvidenceKind,
-            poly::PolyBackendError, poly_gpu::gpu_backend,
+            GpuEffectiveInputs, GpuWarmupCacheState, GpuWarmupDeviceIdentity,
+            GpuWarmupFragmentClass, GpuWarmupOperationDescriptor, GpuWarmupOperationSignature,
+            GpuWarmupProfileProvider, GpuWarmupProfileRequest, GpuWarmupProvenance,
+            GpuWarmupResidencyDelta, GpuWarmupTimingScope, IndexRange as RuntimeIndexRange,
+            MemoryEvidenceKind, poly::PolyBackendError, poly_gpu::gpu_backend,
         },
         gpu_calibration::GpuColumnWidths,
         gpu_column_policy::{
@@ -8013,8 +7063,355 @@ mod tests {
         gpu_schedule::GpuColumnInterval,
         gpu_warmup::{GpuResourceCost, GpuTimeModel},
     };
+    use mxx_ir_core::{
+        FrozenGraphScopeId, IntExpr, ParamEnv, RealExpr,
+        node::{ConcatAxis, ConstantMatrix, IndexRange, NodeKind},
+        types::{ConcreteMatrixType, ConcreteWireType, MatrixType, NodeId},
+    };
+    use mxx_primitives::{
+        gpu_memory::TensorRowSumImplementation,
+        matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
+        poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams},
+        sampler::trapdoor::gpu::{
+            PreimageAllocationEnvelope, PreimageAllocationEvidence, PreimageAllocationEvidenceKind,
+            PreimageCacheIdentity, PreimageCacheState, PreimageEvidenceContext,
+            PreimageFormatContext,
+        },
+    };
     use num_bigint::{BigInt, BigUint};
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, sync::Arc};
+
+    #[test]
+    fn grouped_tensor_row_sum_allocation_uses_every_output_group() {
+        let small_grouped = vec![vec![0], vec![1, 2], vec![3]];
+        assert_eq!(
+            TensorRowSumImplementation::for_groups(&small_grouped),
+            TensorRowSumImplementation::FusedKernel
+        );
+
+        let first_output = (0..16).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let second_output = (0..17).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let inputs = GpuEffectiveInputs {
+            row_groups: first_output.clone(),
+            row_sum_groups: vec![first_output.clone(), second_output],
+            ..Default::default()
+        };
+        let groups = tensor_row_sum_allocation_groups(&inputs).expect("grouped topology");
+        assert_eq!(groups.len(), 33);
+        assert_eq!(groups.iter().map(Vec::len).sum::<usize>(), 33);
+        // The native allocation query uses this same topology to choose the
+        // reduction implementation and account its workspace. All grouped
+        // outputs therefore cross the materialized-reduction threshold,
+        // whereas the leader-only topology does not.
+        assert_eq!(
+            TensorRowSumImplementation::for_groups(&groups),
+            TensorRowSumImplementation::MaterializedTensor
+        );
+        assert_eq!(
+            TensorRowSumImplementation::for_groups(&inputs.row_groups),
+            TensorRowSumImplementation::FusedKernel
+        );
+    }
+
+    #[test]
+    fn grouped_tensor_row_sum_topology_is_part_of_profile_context() {
+        let leader = vec![vec![0], vec![1]];
+        let make_descriptor = |row_sum_groups| GpuWarmupOperationDescriptor {
+            inputs: GpuEffectiveInputs {
+                row_groups: leader.clone(),
+                row_sum_groups,
+                ..Default::default()
+            },
+            signature: GpuWarmupOperationSignature {
+                operation: [0x42; 32],
+                shape_class: 0,
+                instance_class: 0,
+            },
+            scope: FrozenGraphScopeId::Root,
+            node: NodeId(0),
+            kind: NodeKind::Tensor,
+            concrete_argument_types: Vec::new(),
+            concrete_output_types: Vec::new(),
+            bindings: ParamEnv::default(),
+            effective_operation: "fused_tensor_row_sum".into(),
+            profile_domain: CanonicalWarmupProfileDomain::FusedTensorRowSum,
+            fused_operation: Some(FusedWarmupOperation::TensorRowSum),
+            implementation_variant: "test".into(),
+            source_layouts: Vec::new(),
+            output_layout: None,
+            route_resolver: None,
+            host_control: None,
+        };
+        let first = make_descriptor(vec![leader.clone(), vec![vec![2]]]);
+        let changed_follower = make_descriptor(vec![leader.clone(), vec![vec![3]]]);
+        let identical = make_descriptor(first.inputs.row_sum_groups.clone());
+
+        let first_context = ProductionGpuWarmupProvider::profile_context_words(&first).unwrap();
+        let changed_context =
+            ProductionGpuWarmupProvider::profile_context_words(&changed_follower).unwrap();
+        let identical_context =
+            ProductionGpuWarmupProvider::profile_context_words(&identical).unwrap();
+        assert_ne!(first_context, changed_context);
+        assert_eq!(first_context, identical_context);
+    }
+
+    #[test]
+    fn scalar_family_request_preserves_nonzero_tail_and_rejects_out_of_range() {
+        let family =
+            ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count: 4 };
+        let nonzero_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(2) };
+        let nonzero = MeasurementNode {
+            id: NodeId(1),
+            kind: &nonzero_kind,
+            concrete_argument_types: vec![family.clone()],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert_eq!(
+            ProductionGpuWarmupProvider::scalar_family_request(&nonzero, &ParamEnv::default())
+                .expect("valid static family index"),
+            Some((ConcreteWireType::Int, 4))
+        );
+        let tail_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(3) };
+        let tail = MeasurementNode {
+            id: NodeId(1),
+            kind: &tail_kind,
+            concrete_argument_types: vec![family.clone()],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert_eq!(
+            ProductionGpuWarmupProvider::scalar_family_request(&tail, &ParamEnv::default())
+                .expect("valid tail family index"),
+            Some((ConcreteWireType::Int, 4))
+        );
+        let out_of_range_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(4) };
+        let out_of_range = MeasurementNode {
+            id: NodeId(1),
+            kind: &out_of_range_kind,
+            concrete_argument_types: vec![family.clone()],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert!(
+            ProductionGpuWarmupProvider::scalar_family_request(&out_of_range, &ParamEnv::default())
+                .is_err()
+        );
+        let dynamic_kind = NodeKind::FamilyGetDynamic;
+        let dynamic = MeasurementNode {
+            id: NodeId(2),
+            kind: &dynamic_kind,
+            concrete_argument_types: vec![family.clone()],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert_eq!(
+            ProductionGpuWarmupProvider::scalar_family_request(&dynamic, &ParamEnv::default())
+                .expect("valid dynamic family index"),
+            Some((ConcreteWireType::Int, 4))
+        );
+        let nested_kind = NodeKind::FamilyGetDynamic;
+        let nested = MeasurementNode {
+            id: NodeId(3),
+            kind: &nested_kind,
+            concrete_argument_types: vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(family),
+                count: 2,
+            }],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert_eq!(
+            ProductionGpuWarmupProvider::scalar_family_request(&nested, &ParamEnv::default())
+                .expect("nested family is valid but not scalar-only"),
+            None
+        );
+    }
+
+    #[test]
+    fn scalar_family_cache_key_replacement_keeps_setup_evidence_immutable() {
+        let key = ScalarFamilyCacheKey {
+            element_type: ConcreteWireType::Int,
+            count: 4,
+            bindings: ParamEnv::default(),
+            logical_device: 0,
+            worker_device_id: 0,
+            worker_devices: vec![0, 1],
+        };
+        let setup_memory = Arc::new(crate::backend::GpuWarmupMemoryObservations::default());
+        let fixture = ScalarFamilyFixture {
+            key: key.clone(),
+            values: Arc::new(Vec::new()),
+            setup_memory: Arc::clone(&setup_memory),
+        };
+        let reused = fixture.clone();
+        assert_eq!(reused.key, key);
+        assert!(Arc::ptr_eq(&reused.setup_memory, &setup_memory));
+
+        let mut replaced_key = key;
+        replaced_key.count = 5;
+        assert_ne!(replaced_key, reused.key);
+        replaced_key.element_type = ConcreteWireType::Real;
+        assert_ne!(replaced_key, reused.key);
+        replaced_key.worker_device_id = 1;
+        assert_ne!(replaced_key, reused.key);
+        let mut bindings = ParamEnv::default();
+        bindings.integers.insert("n".into(), 7.into());
+        replaced_key.bindings = bindings;
+        assert_ne!(replaced_key, reused.key);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn scalar_family_fixture_cache_reuses_evidence_and_replaces_on_shape_or_worker_change() {
+        use crate::backend::poly_gpu::gpu_backend_on;
+        use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
+
+        let device = detected_gpu_device_ids()
+            .into_iter()
+            .next()
+            .expect("GPU feature tests require one detected device");
+        let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
+        let mut worker = GpuMeasurementWorker {
+            backend: gpu_backend_on([parameters], [device]),
+            device_id: device,
+            last_production_job: None,
+            scalar_family_cache: None,
+        };
+        let family =
+            |element, count| ConcreteWireType::IndexedFamily { element: Box::new(element), count };
+        let bindings = ParamEnv::default();
+        let static_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(1) };
+        let node = MeasurementNode {
+            id: NodeId(10),
+            kind: &static_kind,
+            concrete_argument_types: vec![family(ConcreteWireType::Int, 4)],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        let first = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &node,
+            &bindings,
+            0,
+        )
+        .expect("scalar family cache setup")
+        .expect("scalar family must be cached");
+        assert_eq!(first.values.len(), 4);
+        assert_eq!(first.setup_memory.evidence, MemoryEvidenceKind::ExactQuery);
+        let tail_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(3) };
+        let tail = MeasurementNode {
+            id: NodeId(11),
+            kind: &tail_kind,
+            concrete_argument_types: node.concrete_argument_types.clone(),
+            concrete_output_types: node.concrete_output_types.clone(),
+        };
+        let reused = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &tail,
+            &bindings,
+            0,
+        )
+        .expect("scalar family cache reuse")
+        .expect("scalar family must remain cached");
+        assert!(Arc::ptr_eq(&first.values, &reused.values));
+        assert!(Arc::ptr_eq(&first.setup_memory, &reused.setup_memory));
+        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
+            &mut worker.backend,
+            &tail,
+            &bindings,
+            Some(&first),
+        )
+        .expect("cached family preparation");
+        assert!(prepared.family_inputs.is_empty());
+        assert!(Arc::ptr_eq(
+            prepared.family_fixture.as_ref().expect("shared family fixture"),
+            &first.values
+        ));
+        let (elapsed, spread, repetitions, evidence) =
+            ProductionGpuWarmupProvider::measure_scalar_host_repeated(
+                &mut worker,
+                0,
+                &tail,
+                &bindings,
+                &GpuWarmupMeasurementConfig::default(),
+            )
+            .expect("cached family must use the production host helper");
+        assert!(elapsed.is_finite() && elapsed > 0.0);
+        assert!(spread.is_finite());
+        assert_eq!(repetitions, 3, "default warmup keeps the 1+3 measurement contract");
+        assert_eq!(evidence.evidence, MemoryEvidenceKind::ExactQuery);
+
+        let changed_count_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(4) };
+        let changed_count = MeasurementNode {
+            id: NodeId(12),
+            kind: &changed_count_kind,
+            concrete_argument_types: vec![family(ConcreteWireType::Int, 5)],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        let replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &changed_count,
+            &bindings,
+            0,
+        )
+        .expect("changed count cache replacement")
+        .expect("changed count must remain scalar");
+        assert_eq!(replacement.values.len(), 5);
+        assert!(!Arc::ptr_eq(&first.values, &replacement.values));
+
+        let changed_type_kind = NodeKind::FamilyGetDynamic;
+        let changed_type = MeasurementNode {
+            id: NodeId(13),
+            kind: &changed_type_kind,
+            concrete_argument_types: vec![family(ConcreteWireType::Real, 5)],
+            concrete_output_types: vec![ConcreteWireType::Real],
+        };
+        let type_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &changed_type,
+            &bindings,
+            0,
+        )
+        .expect("changed type cache replacement")
+        .expect("changed type must remain scalar");
+        assert!(!Arc::ptr_eq(&replacement.values, &type_replacement.values));
+
+        let mut changed_bindings = ParamEnv::default();
+        changed_bindings.integers.insert("family_count".into(), 5.into());
+        let binding_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &changed_type,
+            &changed_bindings,
+            0,
+        )
+        .expect("changed bindings cache replacement")
+        .expect("changed bindings must remain scalar");
+        assert!(!Arc::ptr_eq(&type_replacement.values, &binding_replacement.values));
+
+        worker.device_id = device.saturating_add(1);
+        let worker_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+            &mut worker,
+            &changed_type,
+            &changed_bindings,
+            0,
+        )
+        .expect("changed worker cache replacement")
+        .expect("changed worker must remain scalar");
+        assert!(!Arc::ptr_eq(&binding_replacement.values, &worker_replacement.values));
+
+        let invalid_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(5) };
+        let invalid = MeasurementNode {
+            id: NodeId(14),
+            kind: &invalid_kind,
+            concrete_argument_types: vec![family(ConcreteWireType::Int, 5)],
+            concrete_output_types: vec![ConcreteWireType::Int],
+        };
+        assert!(
+            ProductionGpuWarmupProvider::ensure_scalar_family_cache(
+                &mut worker,
+                &invalid,
+                &changed_bindings,
+                0,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn worker_selection_prefers_explicit_owner_in_replicated_full_fleet() {
@@ -8049,7 +7446,7 @@ mod tests {
 
     #[test]
     fn canonical_profile_inventory_is_closed_and_provider_rejects_domain_drift() {
-        use mxx_runtime::gpu_column_policy::{
+        use crate::gpu_column_policy::{
             CanonicalWarmupProfileDomain, WarmupMeasurementKind, WarmupTransferKind,
         };
 
@@ -8093,10 +7490,9 @@ mod tests {
                 route_resolver: None,
                 host_control: None,
             };
-        let mut provider = GpuNodeMeasurementBackend::from_workers(
+        let mut provider = ProductionGpuWarmupProvider::from_workers(
             Vec::new(),
-            MeasurementHarnessConfig::default(),
-            0,
+            GpuWarmupMeasurementConfig::default(),
         );
         provider
             .register_operation(descriptor(CanonicalWarmupProfileDomain::Input))
@@ -8156,6 +7552,32 @@ mod tests {
         assert!(resolved.validate());
     }
 
+    #[test]
+    fn production_route_response_uses_physical_fragments_over_provisional_envelope() {
+        let requested = GpuExecutionRouteDescriptor::device_local(
+            0,
+            ColumnRange { start: 0, end: 3 },
+            GpuFragmentClass::Tail,
+        );
+        let first = GpuExecutionRouteDescriptor::device_local(
+            0,
+            ColumnRange { start: 0, end: 1 },
+            GpuFragmentClass::Tail,
+        );
+        let mut last = GpuExecutionRouteDescriptor::device_local(
+            0,
+            ColumnRange { start: 2, end: 3 },
+            GpuFragmentClass::Tail,
+        );
+        last.route = GpuTransferRoute::HostStaging;
+        let resolved = authoritative_production_route(requested, &[first, last])
+            .expect("physical resident fragments form a valid sparse route");
+        assert_eq!(resolved.route, GpuTransferRoute::Resident);
+        assert_eq!(resolved.source_range, ColumnRange { start: 0, end: 3 });
+        assert_eq!(resolved.source_routes().len(), 2);
+        assert!(resolved.validate());
+    }
+
     /// Exercise every host/control profile through the real setup provider.
     /// The table deliberately carries the concrete node variant and wire
     /// contract for each case; a profile-only fake would not execute these
@@ -8165,6 +7587,10 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn real_provider_dispatches_all_host_control_inventory_variants() {
+        use crate::{
+            backend::{GpuWarmupProfileProvider, GpuWarmupRoute, poly_gpu::gpu_backend_on},
+            gpu_column_policy::GpuFragmentClass,
+        };
         use mxx_ir_core::{
             expr::RealExpr,
             node::{
@@ -8176,10 +7602,6 @@ mod tests {
         use mxx_primitives::poly::dcrt::gpu::{
             GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
         };
-        use mxx_runtime::{
-            backend::{GpuWarmupProfileProvider, GpuWarmupRoute, poly_gpu::gpu_backend_on},
-            gpu_column_policy::GpuFragmentClass,
-        };
         use num_bigint::BigInt;
         use std::time::Duration;
 
@@ -8188,14 +7610,14 @@ mod tests {
             .next()
             .expect("GPU feature tests require one detected device");
         let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
-        let harness = MeasurementHarnessConfig {
+        let harness = GpuWarmupMeasurementConfig {
             warm_up_iterations: 0,
             measured_iterations: 1,
             memory_poll_interval: Duration::ZERO,
         };
         let measurement_backend = gpu_backend_on([parameters], [device]);
         let mut provider =
-            GpuNodeMeasurementBackend::new(vec![(measurement_backend, device)], harness);
+            ProductionGpuWarmupProvider::new(vec![(measurement_backend, device)], harness);
         let int = ConcreteWireType::Int;
         let real = ConcreteWireType::Real;
         let bool_ = ConcreteWireType::Bool;
@@ -8407,10 +7829,10 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn host_family_representatives_use_valid_indices_and_bounded_payloads() {
+        use crate::backend::{RuntimeValue, poly_gpu::gpu_backend_on};
         use mxx_primitives::poly::dcrt::gpu::{
             GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
         };
-        use mxx_runtime::backend::{RuntimeValue, poly_gpu::gpu_backend_on};
         use num_bigint::Sign;
 
         let device = detected_gpu_device_ids()
@@ -8427,7 +7849,6 @@ mod tests {
                 columns,
             })
         };
-        let scope = FrozenGraphScopeId::Root;
         let mut backend = gpu_backend_on([parameters.clone()], [device]);
         backend.select_operation([0xD1; 32]).expect("select setup operation");
         for (id, count) in [1usize, 2, 7, 8].into_iter().enumerate() {
@@ -8437,20 +7858,16 @@ mod tests {
             let outputs = [matrix(1)];
             let kind = NodeKind::FamilyGetDynamic;
             let node = MeasurementNode {
-                scope: &scope,
                 id: NodeId(10 + id as u64),
                 kind: &kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
                 concrete_argument_types: arguments.to_vec(),
                 concrete_output_types: outputs.to_vec(),
             };
-            let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+            let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
                 &mut backend,
                 &node,
                 &ParamEnv::default(),
+                None,
             )
             .expect("nonempty dynamic family must prepare");
             assert!(matches!(
@@ -8469,20 +7886,16 @@ mod tests {
         let dynamic_outputs = [matrix(64)];
         let dynamic_kind = NodeKind::FamilyGetDynamic;
         let dynamic_node = MeasurementNode {
-            scope: &scope,
             id: NodeId(1),
             kind: &dynamic_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: dynamic_arguments.to_vec(),
             concrete_output_types: dynamic_outputs.to_vec(),
         };
-        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
             &mut backend,
             &dynamic_node,
             &ParamEnv::default(),
+            None,
         )
         .expect("nonempty dynamic family must prepare");
         assert!(matches!(
@@ -8512,20 +7925,16 @@ mod tests {
             }];
             let nested_kind = NodeKind::FamilyGetDynamic;
             let nested_node = MeasurementNode {
-                scope: &scope,
                 id: NodeId(100 + nested_count as u64),
                 kind: &nested_kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
                 concrete_argument_types: nested_arguments.to_vec(),
                 concrete_output_types: nested_outputs.to_vec(),
             };
-            let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+            let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
                 &mut backend,
                 &nested_node,
                 &ParamEnv::default(),
+                None,
             )
             .expect("nested family representative must prepare");
             let Some(RuntimeValue::IndexedFamily(outer_values)) = prepared.family_inputs.first()
@@ -8557,20 +7966,16 @@ mod tests {
         let select_kind = NodeKind::Select { count: IntExpr::constant(2) };
         let select_outputs = [matrix(64)];
         let select_node = MeasurementNode {
-            scope: &scope,
             id: NodeId(2),
             kind: &select_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: Vec::new(),
             concrete_output_types: select_outputs.to_vec(),
         };
-        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
             &mut backend,
             &select_node,
             &ParamEnv::default(),
+            None,
         )
         .expect("nonempty select must prepare");
         assert!(matches!(
@@ -8589,20 +7994,16 @@ mod tests {
         let pack_outputs =
             [ConcreteWireType::IndexedFamily { element: Box::new(matrix(64)), count: 64 }];
         let pack_node = MeasurementNode {
-            scope: &scope,
             id: NodeId(3),
             kind: &pack_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: Vec::new(),
             concrete_output_types: pack_outputs.to_vec(),
         };
-        let prepared = GpuNodeMeasurementBackend::prepare_host_primitive(
+        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
             &mut backend,
             &pack_node,
             &ParamEnv::default(),
+            None,
         )
         .expect("family pack must prepare");
         assert_eq!(prepared.family_inputs.len(), 64);
@@ -8619,21 +8020,17 @@ mod tests {
         let empty_kind = NodeKind::Select { count: IntExpr::constant(0) };
         let empty_outputs = [ConcreteWireType::Int];
         let empty_node = MeasurementNode {
-            scope: &scope,
             id: NodeId(4),
             kind: &empty_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: Vec::new(),
             concrete_output_types: empty_outputs.to_vec(),
         };
         assert!(
-            GpuNodeMeasurementBackend::prepare_host_primitive(
+            ProductionGpuWarmupProvider::prepare_host_primitive_inner(
                 &mut backend,
                 &empty_node,
                 &ParamEnv::default(),
+                None,
             )
             .is_err()
         );
@@ -8644,6 +8041,13 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn real_provider_dispatches_gpu_inventory_cases_with_ranges() {
+        use crate::{
+            backend::{
+                GpuWarmupProfileProvider, GpuWarmupRoute, GpuWarmupRouteResolverData,
+                poly_gpu::gpu_backend_on,
+            },
+            gpu_column_policy::GpuFragmentClass,
+        };
         use mxx_ir_core::{
             expr::RealExpr,
             node::{
@@ -8653,13 +8057,6 @@ mod tests {
         };
         use mxx_primitives::poly::dcrt::gpu::{
             GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
-        };
-        use mxx_runtime::{
-            backend::{
-                GpuWarmupProfileProvider, GpuWarmupRoute, GpuWarmupRouteResolverData,
-                poly_gpu::gpu_backend_on,
-            },
-            gpu_column_policy::GpuFragmentClass,
         };
         use num_bigint::{BigInt, Sign};
         use std::time::Duration;
@@ -8700,14 +8097,14 @@ mod tests {
             matrix: ConcreteMatrixType { rows: 3, ..concrete.clone() },
             max_coefficient_bound: BigInt::from(255),
         };
-        let harness = MeasurementHarnessConfig {
+        let harness = GpuWarmupMeasurementConfig {
             warm_up_iterations: 0,
             measured_iterations: 1,
             memory_poll_interval: Duration::ZERO,
         };
         let measurement_backend = gpu_backend_on([parameters], [device]);
         let mut provider =
-            GpuNodeMeasurementBackend::new(vec![(measurement_backend, device)], harness);
+            ProductionGpuWarmupProvider::new(vec![(measurement_backend, device)], harness);
         let resolver = GpuWarmupRouteResolverData {
             source_layouts: Vec::new(),
             output_layout: None,
@@ -9038,15 +8435,13 @@ mod tests {
             bindings: Vec::new(),
             canonical_input_exclusive_uppers: Vec::new(),
         });
-        let scope = FrozenGraphScopeId::Root;
         let bindings = ParamEnv::default();
-        let one = GpuNodeMeasurementBackend::measure_host_control_repeated(
-            &MeasurementHarnessConfig {
+        let one = ProductionGpuWarmupProvider::measure_host_control_repeated(
+            &GpuWarmupMeasurementConfig {
                 warm_up_iterations: 0,
                 measured_iterations: 1,
                 memory_poll_interval: std::time::Duration::ZERO,
             },
-            &scope,
             NodeId(0),
             &kind,
             &bindings,
@@ -9056,13 +8451,12 @@ mod tests {
         assert_eq!(one.2, 1);
         assert!(one.0.is_finite() && one.0 > 0.0);
         assert_eq!(one.1, 0.0);
-        let zero = GpuNodeMeasurementBackend::measure_host_control_repeated(
-            &MeasurementHarnessConfig {
+        let zero = ProductionGpuWarmupProvider::measure_host_control_repeated(
+            &GpuWarmupMeasurementConfig {
                 warm_up_iterations: 0,
                 measured_iterations: 0,
                 memory_poll_interval: std::time::Duration::ZERO,
             },
-            &scope,
             NodeId(0),
             &kind,
             &bindings,
@@ -9074,7 +8468,7 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_provider_projects_budgets_for_disjoint_and_replicated_workers() {
-        use mxx_runtime::backend::poly_gpu::gpu_backend_on;
+        use crate::backend::poly_gpu::gpu_backend_on;
         let dimension = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
             .map(|value| value.parse::<u32>().unwrap())
             .unwrap_or(32);
@@ -9097,7 +8491,7 @@ mod tests {
                 })
                 .collect();
             let mut provider =
-                GpuNodeMeasurementBackend::new(backends, MeasurementHarnessConfig::default());
+                ProductionGpuWarmupProvider::new(backends, GpuWarmupMeasurementConfig::default());
             let budgets = devices
                 .iter()
                 .enumerate()
@@ -9111,7 +8505,7 @@ mod tests {
             provider.configure_gpu_plan_budgets(&budgets).unwrap();
             assert_eq!(provider.physical_device_ids(), devices);
             for worker in &provider.workers {
-                let expected = mxx_runtime::gpu_execution_plan::project_gpu_device_budgets(
+                let expected = crate::gpu_execution_plan::project_gpu_device_budgets(
                     &devices,
                     &worker.backend.physical_device_ids(),
                     &budgets,
@@ -9121,28 +8515,6 @@ mod tests {
             }
             assert!(provider.configure_gpu_plan_budgets(&[]).is_err());
         }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn gpu_backend_keeps_the_setup_time_vram_percentage() {
-        let name = "MXX_GPU_VRAM_PERCENT";
-        let original = std::env::var_os(name);
-        unsafe { std::env::set_var(name, "37") };
-        let backend = GpuNodeMeasurementBackend::from_workers(
-            Vec::new(),
-            crate::harness::MeasurementHarnessConfig::default(),
-            37,
-        );
-
-        unsafe { std::env::set_var(name, "91") };
-        let captured = backend.vram_percent;
-        match original {
-            Some(value) => unsafe { std::env::set_var(name, value) },
-            None => unsafe { std::env::remove_var(name) },
-        }
-
-        assert_eq!(captured, 37);
     }
 
     #[test]
@@ -9187,9 +8559,8 @@ mod tests {
                 key: site,
                 loop_site: None,
                 operation_identity: [3; 32],
-                effective_operation:
-                    mxx_runtime::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
-                column_capability: mxx_runtime::gpu_column_policy::ColumnCapability::SameColumns,
+                effective_operation: crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: crate::gpu_column_policy::ColumnCapability::SameColumns,
                 output_layouts: vec![1],
                 columns_per_job: vec![2, 4],
                 implementation_variant: "test".into(),
@@ -9198,14 +8569,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            GpuNodeMeasurementBackend::fixed_plan_widths(&plan, site).unwrap(),
+            ProductionGpuWarmupProvider::fixed_plan_widths(&plan, site).unwrap(),
             GpuColumnWidths { gpu0: 2, nonzero: Some(4) }
         );
         assert_eq!(
-            GpuNodeMeasurementBackend::fixed_plan_wave_seconds(
+            ProductionGpuWarmupProvider::fixed_plan_wave_seconds(
                 &plan,
                 site,
-                &vec![mxx_runtime::gpu_warmup::GpuTimeModel::default(); 2],
+                &vec![crate::gpu_warmup::GpuTimeModel::default(); 2],
             )
             .unwrap(),
             0.0
@@ -9269,9 +8640,8 @@ mod tests {
                 key: site,
                 loop_site: Some(GpuLoopSiteKey { site: 7, shape_class: 0 }),
                 operation_identity: [3; 32],
-                effective_operation:
-                    mxx_runtime::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
-                column_capability: mxx_runtime::gpu_column_policy::ColumnCapability::SameColumns,
+                effective_operation: crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: crate::gpu_column_policy::ColumnCapability::SameColumns,
                 output_layouts: vec![1, 2],
                 columns_per_job: vec![2, 2],
                 implementation_variant: "test".into(),
@@ -9289,7 +8659,7 @@ mod tests {
         // four-second waves for the sibling batch, rather than independently
         // summing one schedule per output port.
         assert_eq!(
-            GpuNodeMeasurementBackend::fixed_plan_wave_seconds(&plan, site, &model).unwrap(),
+            ProductionGpuWarmupProvider::fixed_plan_wave_seconds(&plan, site, &model).unwrap(),
             8.0
         );
     }
@@ -9306,63 +8676,6 @@ mod tests {
     }
 
     #[test]
-    fn fleet_wave_extrapolation_uses_conservative_full_waves() {
-        let full_wave = NodeMeasurement {
-            work_seconds: 38.0,
-            latency_seconds: 39.0,
-            cumulative_wave_seconds: 39.0,
-            independent_wave_count: 1,
-            measured_wave_workspace_bytes: 56,
-            workspace_bytes: 56,
-        };
-        let measurement = extrapolate_fleet_waves(&full_wave, 7);
-
-        assert_eq!(measurement.work_seconds, 266.0);
-        assert_eq!(measurement.latency_seconds, 39.0);
-        assert_eq!(measurement.cumulative_wave_seconds, 273.0);
-        assert_eq!(measurement.independent_wave_count, 7);
-        assert_eq!(measurement.workspace_bytes, 56);
-        assert_eq!(measurement.measured_wave_workspace_bytes, 56);
-
-        // A synthetic large wave count must not scale one-wave latency or scratch.
-        let packed = extrapolate_fleet_waves(&full_wave, 1usize << 40);
-        assert_eq!(packed.latency_seconds, 39.0);
-        assert_eq!(packed.measured_wave_workspace_bytes, 56);
-        assert_eq!(packed.cumulative_wave_seconds, 39.0 * ((1u64 << 40) as f64));
-        assert_eq!(packed.work_seconds, 38.0 * ((1u64 << 40) as f64));
-    }
-
-    #[test]
-    fn fleet_wave_sums_work_and_workspace_and_uses_measured_wall_latency() {
-        let measurement = aggregate_fleet_wave(
-            [
-                NodeMeasurement {
-                    work_seconds: 2.0,
-                    latency_seconds: 2.0,
-                    cumulative_wave_seconds: 2.0,
-                    independent_wave_count: 1,
-                    measured_wave_workspace_bytes: 30,
-                    workspace_bytes: 30,
-                },
-                NodeMeasurement {
-                    work_seconds: 3.0,
-                    latency_seconds: 3.0,
-                    cumulative_wave_seconds: 3.0,
-                    independent_wave_count: 1,
-                    measured_wave_workspace_bytes: 20,
-                    workspace_bytes: 20,
-                },
-            ],
-            3.25,
-        );
-
-        assert_eq!(measurement.work_seconds, 5.0);
-        assert_eq!(measurement.latency_seconds, 3.25);
-        assert_eq!(measurement.cumulative_wave_seconds, 3.25);
-        assert_eq!(measurement.workspace_bytes, 50);
-    }
-
-    #[test]
     fn only_production_range_operations_are_fleet_separable() {
         let matrix_type = MatrixType {
             rows: IntExpr::constant(8),
@@ -9371,196 +8684,22 @@ mod tests {
             modulus: IntExpr::constant(257),
         };
 
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::ConstantMatrix {
             matrix_type: matrix_type.clone(),
             value: ConstantMatrix::Identity
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Transpose));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Concat {
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::Transpose));
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::Concat {
             axis: mxx_ir_core::node::ConcatAxis::Columns,
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Tensor));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::Concat {
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::Tensor));
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::Concat {
             axis: mxx_ir_core::node::ConcatAxis::Diagonal,
         }));
-        assert!(GpuNodeMeasurementBackend::column_separable(&NodeKind::ConstantMatrix {
+        assert!(ProductionGpuWarmupProvider::column_separable(&NodeKind::ConstantMatrix {
             matrix_type: MatrixType { rows: 1.into(), columns: 1.into(), ..matrix_type },
             value: ConstantMatrix::Rotation { exponent: IntExpr::constant(1) },
         }));
-    }
-
-    #[test]
-    fn indexed_constant_preserves_production_variant() {
-        let matrix_type = MatrixType {
-            rows: IntExpr::constant(8),
-            columns: IntExpr::constant(8),
-            ring_dimension: IntExpr::constant(32),
-            modulus: IntExpr::constant(257),
-        };
-        let kind = NodeKind::ConstantMatrix { matrix_type, value: ConstantMatrix::Identity };
-        let concrete = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 8,
-            columns: 8,
-            ring_dimension: 32,
-            modulus: BigInt::from(257u16),
-        });
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![],
-            concrete_output_types: vec![concrete],
-        };
-
-        let (representative, _, outputs, _, _) =
-            GpuNodeMeasurementBackend::representative_node(&node, 3);
-        assert!(matches!(
-            representative,
-            NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. }
-        ));
-        assert_eq!(outputs[0].matrix_type().expect("matrix output").columns, 3);
-
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(1),
-            kind: kind.clone(),
-            concrete_argument_types: vec![],
-            concrete_output_types: vec![ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows: 8,
-                columns: 8,
-                ring_dimension: 32,
-                modulus: BigInt::from(257u16),
-            })],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-        let ranged = GpuNodeMeasurementBackend::representative_at(&request, 3, 2);
-        assert!(matches!(
-            ranged.kind,
-            NodeKind::ConstantMatrix { value: ConstantMatrix::Identity, .. }
-        ));
-        assert_eq!(ranged.concrete_output_types[0].matrix_type().unwrap().columns, 8);
-        assert_eq!(ranged.output_range.map(|range| (range.start, range.end)), Some((3, 5)));
-
-        let unit_row_request = PendingMeasurement {
-            warmup: None,
-            kind: NodeKind::ConstantMatrix {
-                matrix_type: MatrixType {
-                    rows: IntExpr::constant(1),
-                    columns: IntExpr::constant(8),
-                    ring_dimension: IntExpr::constant(32),
-                    modulus: IntExpr::constant(257),
-                },
-                value: ConstantMatrix::UnitRow { index: IntExpr::constant(6) },
-            },
-            concrete_output_types: vec![ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows: 1,
-                columns: 8,
-                ring_dimension: 32,
-                modulus: BigInt::from(257u16),
-            })],
-            ..request
-        };
-        let unit_row_pilot =
-            GpuNodeMeasurementBackend::calibration_representative(&unit_row_request);
-        assert_eq!(unit_row_pilot.output_range.map(|range| (range.start, range.end)), Some((6, 7)));
-    }
-
-    #[test]
-    fn transpose_and_column_concat_preserve_column_work_units() {
-        let matrix = |rows, columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows,
-                columns,
-                ring_dimension: 32,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let transpose = NodeKind::Transpose;
-        let transpose_node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &transpose,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix(11, 7)],
-            concrete_output_types: vec![matrix(7, 11)],
-        };
-        let (_, inputs, outputs, _, _) =
-            GpuNodeMeasurementBackend::representative_node(&transpose_node, 3);
-        assert_eq!(inputs[0].matrix_type().expect("transpose input").rows, 3);
-        assert_eq!(outputs[0].matrix_type().expect("transpose output").columns, 3);
-
-        let concat = NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Columns };
-        let concat_node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(2),
-            kind: &concat,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix(2, 2), matrix(2, 5)],
-            concrete_output_types: vec![matrix(2, 7)],
-        };
-        let (_, inputs, outputs, _, _) =
-            GpuNodeMeasurementBackend::representative_node(&concat_node, 3);
-        assert_eq!(inputs.len(), 2);
-        assert_eq!(inputs[0].matrix_type().expect("first concat input").columns, 2);
-        assert_eq!(inputs[1].matrix_type().expect("second concat input").columns, 1);
-        assert_eq!(outputs[0].matrix_type().expect("concat output").columns, 3);
-    }
-
-    #[test]
-    fn diagonal_concat_representative_keeps_every_row_block() {
-        let matrix = |rows, columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows,
-                columns,
-                ring_dimension: 32,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let kind = NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Diagonal };
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope,
-            id: NodeId(1),
-            kind,
-            concrete_argument_types: vec![matrix(2, 8), matrix(3, 13), matrix(5, 21)],
-            concrete_output_types: vec![matrix(10, 42)],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-
-        let representative = GpuNodeMeasurementBackend::representative_at(&request, 9, 1);
-        assert_eq!(representative.concrete_argument_types.len(), 3);
-        assert_eq!(
-            representative
-                .concrete_argument_types
-                .iter()
-                .map(|input| input.matrix_type().unwrap().columns)
-                .collect::<Vec<_>>(),
-            vec![8, 13, 21]
-        );
-        assert_eq!(representative.concrete_output_types[0].matrix_type().unwrap().columns, 42);
-        assert_eq!(
-            representative.output_range.as_ref().map(|range| (range.start, range.end)),
-            Some((9, 10))
-        );
-        assert_eq!(representative.measured_columns(), Some(1));
     }
 
     #[test]
@@ -9589,357 +8728,6 @@ mod tests {
     }
 
     #[test]
-    fn measurement_cache_key_uses_semantics_not_node_identity() {
-        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 2,
-            columns: 3,
-            ring_dimension: 8,
-            modulus: BigInt::from(257u16),
-        });
-        let kind = NodeKind::MatrixNegate;
-        let root = FrozenGraphScopeId::Root;
-        let subgraph = FrozenGraphScopeId::Subgraph { canonical_name: "other".to_owned() };
-        let first = MeasurementNode {
-            scope: &root,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix.clone()],
-            concrete_output_types: vec![matrix.clone()],
-        };
-        let second = MeasurementNode {
-            scope: &subgraph,
-            id: NodeId(99),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix.clone()],
-            concrete_output_types: vec![matrix],
-        };
-
-        let first_key = GpuNodeMeasurementBackend::measurement_key(&first, &ParamEnv::default())
-            .expect("cache key");
-        let second_key = GpuNodeMeasurementBackend::measurement_key(&second, &ParamEnv::default())
-            .expect("cache key");
-
-        assert_eq!(first_key, second_key);
-    }
-
-    #[test]
-    fn measurement_cache_key_ignores_loop_index_values() {
-        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 80,
-            columns: 80,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        });
-        let kind = NodeKind::HashSample {
-            matrix_type: MatrixType {
-                rows: IntExpr::constant(80),
-                columns: IntExpr::constant(80),
-                ring_dimension: IntExpr::constant(65_536),
-                modulus: IntExpr::constant(257),
-            },
-            variant: HashVariant::Decomposed,
-            tag_prefix: Vec::new(),
-            tag_components: vec![mxx_ir_core::node::HashTagComponent::Integer(IntExpr::LoopIndex(
-                0,
-            ))],
-            base: Some(IntExpr::constant(16_384)),
-            digit_count: Some(IntExpr::constant(80)),
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: vec![matrix],
-        };
-        let mut first_bindings = ParamEnv::default();
-        first_bindings.loop_indices.insert(0, BigInt::from(1));
-        let mut second_bindings = ParamEnv::default();
-        second_bindings.loop_indices.insert(0, BigInt::from(3_720));
-
-        let first_key = GpuNodeMeasurementBackend::measurement_key(&node, &first_bindings)
-            .expect("first cache key");
-        let second_key = GpuNodeMeasurementBackend::measurement_key(&node, &second_bindings)
-            .expect("second cache key");
-
-        assert_eq!(first_key, second_key);
-    }
-
-    #[test]
-    fn measurement_cache_key_ignores_ring_automorphism_index() {
-        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 2,
-            columns: 3,
-            ring_dimension: 8,
-            modulus: BigInt::from(257u16),
-        });
-        let first_kind = NodeKind::RingAutomorphism { index: IntExpr::constant(3) };
-        let second_kind = NodeKind::RingAutomorphism { index: IntExpr::constant(5) };
-        let scope = FrozenGraphScopeId::Root;
-        let node = |kind| MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix.clone()],
-            concrete_output_types: vec![matrix.clone()],
-        };
-
-        let first_key =
-            GpuNodeMeasurementBackend::measurement_key(&node(&first_kind), &ParamEnv::default())
-                .expect("first cache key");
-        let second_key =
-            GpuNodeMeasurementBackend::measurement_key(&node(&second_kind), &ParamEnv::default())
-                .expect("second cache key");
-
-        assert_eq!(first_key, second_key);
-    }
-
-    #[test]
-    fn ring_automorphism_measurement_uses_bounded_column_representative() {
-        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 2,
-            columns: 10,
-            ring_dimension: 8,
-            modulus: BigInt::from(257u16),
-        });
-        let kind = NodeKind::RingAutomorphism { index: IntExpr::constant(3) };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![matrix.clone()],
-            concrete_output_types: vec![matrix],
-        };
-
-        let (representative_kind, arguments, outputs, scale, remainder_columns) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-
-        assert_eq!(representative_kind, kind);
-        assert_eq!(node.kind, &NodeKind::RingAutomorphism { index: IntExpr::constant(3) });
-        assert_eq!(arguments[0].matrix_type().unwrap().columns, 4);
-        assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
-        assert_eq!(scale, 2.0);
-        assert_eq!(remainder_columns, Some(2));
-    }
-
-    #[test]
-    fn matrix_multiply_representatives_follow_scalar_runtime_semantics() {
-        let matrix = |rows, columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows,
-                columns,
-                ring_dimension: 8,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let kind = NodeKind::MatrixBinary(MatrixBinaryOp::Multiply);
-        let scope = FrozenGraphScopeId::Root;
-        let cases = [
-            ([matrix(1, 1), matrix(1, 10)], matrix(1, 10), [1, 4], 0),
-            ([matrix(2, 10), matrix(1, 1)], matrix(2, 10), [4, 1], 1),
-            ([matrix(2, 3), matrix(3, 10)], matrix(2, 10), [3, 4], 0),
-        ];
-
-        for (arguments, output, expected_columns, fixed_argument) in cases {
-            let node = MeasurementNode {
-                scope: &scope,
-                id: NodeId(1),
-                kind: &kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
-                concrete_argument_types: arguments.into(),
-                concrete_output_types: vec![output],
-            };
-            let (_, arguments, outputs, scale, remainder_columns) =
-                GpuNodeMeasurementBackend::representative_node(&node, 4);
-
-            assert_eq!(arguments[0].matrix_type().unwrap().columns, expected_columns[0]);
-            assert_eq!(arguments[1].matrix_type().unwrap().columns, expected_columns[1]);
-            assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
-            assert_eq!(scale, 2.0);
-            assert_eq!(remainder_columns, Some(2));
-            assert!(GpuNodeMeasurementBackend::argument_is_fixed(&node, fixed_argument));
-            assert!(!GpuNodeMeasurementBackend::argument_is_fixed(&node, 1 - fixed_argument));
-        }
-    }
-
-    #[test]
-    fn matrix_multiply_fixed_ownership_survives_one_column_calibration() {
-        let matrix = |rows, columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows,
-                columns,
-                ring_dimension: 8,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(7),
-            kind: NodeKind::MatrixBinary(MatrixBinaryOp::Multiply),
-            concrete_argument_types: vec![matrix(2, 1), matrix(1, 176)],
-            concrete_output_types: vec![matrix(2, 176)],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-
-        let pilot = GpuNodeMeasurementBackend::calibration_representative(&request);
-        assert_eq!(pilot.concrete_argument_types[0].matrix_type().unwrap().columns, 1);
-        assert_eq!(pilot.concrete_argument_types[1].matrix_type().unwrap().columns, 1);
-        assert_eq!(pilot.concrete_output_types[0].matrix_type().unwrap().columns, 1);
-        assert_eq!(pilot.fixed_arguments, vec![true, false]);
-
-        // The shaped pilot alone is ambiguous: it looks like a scalar-right product.  Fixed
-        // ownership must therefore remain the decision made from the unshaped request.
-        let pilot_node = MeasurementNode {
-            scope: &request.scope,
-            id: request.id,
-            kind: &pilot.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: pilot.concrete_argument_types.clone(),
-            concrete_output_types: pilot.concrete_output_types.clone(),
-        };
-        assert_eq!(
-            (0..2)
-                .map(|index| GpuNodeMeasurementBackend::argument_is_fixed(&pilot_node, index))
-                .collect::<Vec<_>>(),
-            vec![false, true]
-        );
-
-        let gpu_representative = GpuNodeMeasurementBackend::representative_at(&request, 0, 88);
-        assert_eq!(gpu_representative.concrete_argument_types[0].matrix_type().unwrap().columns, 1);
-        assert_eq!(
-            gpu_representative.concrete_argument_types[1].matrix_type().unwrap().columns,
-            176
-        );
-        assert_eq!(gpu_representative.concrete_output_types[0].matrix_type().unwrap().columns, 176);
-        assert_eq!(gpu_representative.fixed_arguments, vec![true, false]);
-    }
-
-    #[test]
-    fn fused_multiply_with_scalar_rhs_uses_left_column_representative() {
-        let matrix = |rows, columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows,
-                columns,
-                ring_dimension: 8,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(1),
-            kind: NodeKind::MatrixMulAccumulate {
-                coefficients: vec![IntExpr::constant(1)],
-                has_bias: false,
-            },
-            concrete_argument_types: vec![matrix(2, 10), matrix(1, 1)],
-            concrete_output_types: vec![matrix(2, 10)],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-
-        assert_eq!(GpuNodeMeasurementBackend::request_columns(&request), Some(10));
-        let node = MeasurementNode {
-            scope: &request.scope,
-            id: request.id,
-            kind: &request.kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: request.concrete_argument_types.clone(),
-            concrete_output_types: request.concrete_output_types.clone(),
-        };
-        let (_, arguments, outputs, scale, remainder) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        assert_eq!(arguments[0].matrix_type().unwrap().columns, 4);
-        assert_eq!(arguments[1].matrix_type().unwrap().columns, 1);
-        assert_eq!(outputs[0].matrix_type().unwrap().columns, 4);
-        assert_eq!(scale, 2.0);
-        assert_eq!(remainder, Some(2));
-        assert!(!GpuNodeMeasurementBackend::argument_is_fixed(&node, 0));
-        assert!(GpuNodeMeasurementBackend::argument_is_fixed(&node, 1));
-    }
-
-    #[test]
-    fn gadget_trapdoor_ranged_representative_preserves_full_identity() {
-        let concrete = ConcreteMatrixType {
-            rows: 2,
-            columns: 10,
-            ring_dimension: 8,
-            modulus: BigInt::from(257u16),
-        };
-        let kind = NodeKind::GadgetTrapdoor {
-            matrix_type: MatrixType {
-                rows: IntExpr::constant(2),
-                columns: IntExpr::constant(10),
-                ring_dimension: IntExpr::constant(8),
-                modulus: IntExpr::constant(257),
-            },
-            base: IntExpr::constant(4),
-        };
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(1),
-            kind: kind.clone(),
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: vec![ConcreteWireType::Trapdoor {
-                matrix: concrete,
-                sigma: RealExpr::from_integer(4),
-                gadget_base: BigInt::from(4),
-                digit_count: 5,
-                preimage_max_coefficient_bound: BigInt::from(2),
-            }],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-
-        assert!(GpuNodeMeasurementBackend::column_separable(&kind));
-        let representative = GpuNodeMeasurementBackend::representative_at(&request, 3, 4);
-        let NodeKind::GadgetTrapdoor { matrix_type, .. } = &representative.kind else {
-            panic!("gadget trapdoor representative kind");
-        };
-        assert_eq!(matrix_type.columns, IntExpr::constant(10));
-        assert_eq!(representative.concrete_output_types[0].matrix_type().unwrap().columns, 10);
-        assert_eq!(representative.measured_columns(), Some(4));
-        assert_eq!(representative.output_range.map(|range| (range.start, range.end)), Some((3, 7)));
-    }
-
-    #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_gadget_trapdoor_ranged_measurement_matches_full_gadget_slice() {
         let params = GpuDCRTPolyParams::new(32, vec![131_009], 2, None);
@@ -9960,15 +8748,9 @@ mod tests {
             },
             base: IntExpr::constant(4),
         };
-        let scope = FrozenGraphScopeId::Root;
         let node = MeasurementNode {
-            scope: &scope,
             id: NodeId(1),
             kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
             concrete_argument_types: Vec::new(),
             concrete_output_types: vec![ConcreteWireType::Trapdoor {
                 matrix: full_ty.clone(),
@@ -9984,7 +8766,7 @@ mod tests {
             preimage_trapdoor: None,
             preimage_target: None,
         };
-        let range = mxx_runtime::backend::IndexRange { start: 7, end: 12 };
+        let range = crate::backend::IndexRange { start: 7, end: 12 };
         let operation = [73u8; 32];
         let mut backend = gpu_backend([params.clone()]);
         backend.set_column_widths_for_operation(
@@ -10020,7 +8802,7 @@ mod tests {
             ));
         }
 
-        let mut outputs = GpuNodeMeasurementBackend::run_node(
+        let mut outputs = ProductionGpuWarmupProvider::run_node(
             &mut backend,
             &node,
             &ParamEnv::default(),
@@ -10037,187 +8819,6 @@ mod tests {
         let expected = GpuDCRTPolyMatrix::gadget_matrix(actual.params(), rows, None)
             .slice_columns(range.start, range.end);
         assert_eq!(actual.to_cpu_matrix(), expected.to_cpu_matrix());
-    }
-
-    #[test]
-    fn measurement_cache_key_ignores_hash_tag_values() {
-        let matrix = ConcreteWireType::Matrix(ConcreteMatrixType {
-            rows: 80,
-            columns: 80,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        });
-        let hash_kind = |tag_prefix, tag_expression| NodeKind::HashSample {
-            matrix_type: MatrixType {
-                rows: IntExpr::constant(80),
-                columns: IntExpr::constant(80),
-                ring_dimension: IntExpr::constant(65_536),
-                modulus: IntExpr::constant(257),
-            },
-            variant: HashVariant::Decomposed,
-            tag_prefix,
-            tag_components: vec![mxx_ir_core::node::HashTagComponent::Integer(tag_expression)],
-            base: Some(IntExpr::constant(16_384)),
-            digit_count: Some(IntExpr::constant(80)),
-        };
-        let first_kind = hash_kind(vec![1, 2, 3], IntExpr::constant(7));
-        let second_kind = hash_kind(vec![9, 8, 7], IntExpr::constant(3_720));
-        let scope = FrozenGraphScopeId::Root;
-        let node = |kind| MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: vec![matrix.clone()],
-        };
-
-        let first = node(&first_kind);
-        let second = node(&second_kind);
-        let first_key = GpuNodeMeasurementBackend::measurement_key(&first, &ParamEnv::default())
-            .expect("first cache key");
-        let second_key = GpuNodeMeasurementBackend::measurement_key(&second, &ParamEnv::default())
-            .expect("second cache key");
-
-        assert_eq!(first_key, second_key);
-    }
-
-    #[test]
-    fn oversized_hash_measurement_is_representative_and_scaled() {
-        let concrete = ConcreteMatrixType {
-            rows: 1,
-            columns: 8_722,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let symbolic = MatrixType {
-            rows: IntExpr::constant(concrete.rows),
-            columns: IntExpr::constant(concrete.columns),
-            ring_dimension: IntExpr::constant(concrete.ring_dimension),
-            modulus: IntExpr::constant(concrete.modulus.clone()),
-        };
-        let kind = NodeKind::HashSample {
-            matrix_type: symbolic,
-            variant: HashVariant::Plain,
-            tag_prefix: Vec::new(),
-            tag_components: Vec::new(),
-            base: None,
-            digit_count: None,
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: vec![ConcreteWireType::Matrix(concrete)],
-        };
-
-        let (kind, _, output_types, scale, remainder_columns) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        let NodeKind::HashSample { matrix_type, .. } = kind else {
-            panic!("hash representative kind");
-        };
-        let ConcreteWireType::Matrix(output) = &output_types[0] else {
-            panic!("hash representative output");
-        };
-        assert_eq!((output.rows, output.columns), (1, 4));
-        assert_eq!(matrix_type.columns, IntExpr::constant(4));
-        assert_eq!(scale, 2_180.0);
-        assert_eq!(remainder_columns, Some(2));
-    }
-
-    #[test]
-    fn single_column_sampler_preserves_all_rows() {
-        let concrete = ConcreteMatrixType {
-            rows: 2_621_440,
-            columns: 1,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let symbolic = MatrixType {
-            rows: IntExpr::constant(concrete.rows),
-            columns: IntExpr::constant(concrete.columns),
-            ring_dimension: IntExpr::constant(concrete.ring_dimension),
-            modulus: IntExpr::constant(concrete.modulus.clone()),
-        };
-        let kind = NodeKind::UniformIntervalSample {
-            matrix_type: symbolic,
-            range: mxx_ir_core::node::SampleRange {
-                minimum: IntExpr::constant(-1),
-                maximum: IntExpr::constant(1),
-            },
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: vec![ConcreteWireType::Matrix(concrete)],
-        };
-
-        let (kind, _, output_types, scale, _) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        let NodeKind::UniformIntervalSample { matrix_type, .. } = kind else {
-            panic!("uniform representative kind");
-        };
-        let ConcreteWireType::Matrix(output) = &output_types[0] else {
-            panic!("uniform representative output");
-        };
-        assert_eq!((output.rows, output.columns), (2_621_440, 1));
-        assert_eq!(matrix_type.rows, IntExpr::constant(2_621_440));
-        assert_eq!(scale, 1.0);
-    }
-
-    #[test]
-    fn slice_measurement_uses_representative_column_limit() {
-        let matrix = |columns| ConcreteMatrixType {
-            rows: 1,
-            columns,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let kind = NodeKind::Slice {
-            rows: None,
-            columns: Some(IndexRange { start: IntExpr::constant(80), end: IntExpr::constant(160) }),
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![ConcreteWireType::Matrix(matrix(8_720))],
-            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(80))],
-        };
-
-        let (kind, argument_types, _, scale, _) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        let NodeKind::Slice { columns: Some(columns), .. } = kind else {
-            panic!("slice representative kind");
-        };
-        let ConcreteWireType::Matrix(input) = &argument_types[0] else {
-            panic!("slice representative input");
-        };
-        assert_eq!((input.rows, input.columns), (1, 4));
-        assert_eq!(columns.start, IntExpr::constant(0));
-        assert_eq!(columns.end, IntExpr::constant(4));
-        assert_eq!(scale, 20.0);
     }
 
     #[test]
@@ -10238,14 +8839,12 @@ mod tests {
         };
         let pending = |kind, arguments, outputs| PendingMeasurement {
             warmup: None,
-            key: [0; 32],
             scope: FrozenGraphScopeId::Root,
             id: NodeId(1),
             kind,
             concrete_argument_types: arguments,
             concrete_output_types: outputs,
             bindings: ParamEnv::default(),
-            preimage_sample: false,
         };
         let start = 13;
         let width = 4;
@@ -10255,7 +8854,7 @@ mod tests {
             Vec::new(),
             vec![matrix(2, 64)],
         );
-        let representative = GpuNodeMeasurementBackend::representative_at(&sampler, start, width);
+        let representative = ProductionGpuWarmupProvider::representative_at(&sampler, start, width);
         assert_eq!(
             representative.output_range,
             Some(RuntimeIndexRange { start, end: start + width })
@@ -10273,7 +8872,7 @@ mod tests {
             vec![matrix(3, 128)],
             vec![matrix(3, 64)],
         );
-        let representative = GpuNodeMeasurementBackend::representative_at(&slice, start, width);
+        let representative = ProductionGpuWarmupProvider::representative_at(&slice, start, width);
         assert_eq!(
             representative.output_range,
             Some(RuntimeIndexRange { start, end: start + width })
@@ -10288,7 +8887,8 @@ mod tests {
         );
 
         let transpose = pending(NodeKind::Transpose, vec![matrix(64, 3)], vec![matrix(3, 64)]);
-        let representative = GpuNodeMeasurementBackend::representative_at(&transpose, start, width);
+        let representative =
+            ProductionGpuWarmupProvider::representative_at(&transpose, start, width);
         assert_eq!(
             representative.output_range,
             Some(RuntimeIndexRange { start, end: start + width })
@@ -10302,7 +8902,7 @@ mod tests {
             vec![matrix(5, 64)],
         );
         let representative =
-            GpuNodeMeasurementBackend::representative_at(&row_concat, start, width);
+            ProductionGpuWarmupProvider::representative_at(&row_concat, start, width);
         assert_eq!(
             representative.output_range,
             Some(RuntimeIndexRange { start, end: start + width })
@@ -10318,343 +8918,7 @@ mod tests {
     }
 
     #[test]
-    fn tensor_fleet_representative_measures_exact_assigned_range() {
-        let matrix = |rows, columns| ConcreteMatrixType {
-            rows,
-            columns,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let kind = NodeKind::Tensor;
-        let scope = FrozenGraphScopeId::Root;
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope,
-            id: NodeId(1),
-            kind,
-            concrete_argument_types: vec![
-                ConcreteWireType::Matrix(matrix(2, 2)),
-                ConcreteWireType::Matrix(matrix(3, 40)),
-            ],
-            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(6, 80))],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
 
-        let representative = GpuNodeMeasurementBackend::representative_at(&request, 35, 45);
-        let ConcreteWireType::Matrix(left) = &representative.concrete_argument_types[0] else {
-            panic!("tensor representative left input");
-        };
-        let ConcreteWireType::Matrix(right) = &representative.concrete_argument_types[1] else {
-            panic!("tensor representative right input");
-        };
-        let ConcreteWireType::Matrix(output) = &representative.concrete_output_types[0] else {
-            panic!("tensor representative output");
-        };
-        assert_eq!((left.columns, right.columns), (2, 40));
-        assert_eq!(output.columns, 80);
-        assert_eq!(representative.measured_columns(), Some(45));
-        assert_eq!(
-            representative.output_range.as_ref().map(|range| (range.start, range.end)),
-            Some((35, 80))
-        );
-    }
-
-    #[test]
-    fn column_concat_fleet_representative_uses_actual_global_intersections() {
-        let matrix = |columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                rows: 2,
-                columns,
-                ring_dimension: 32,
-                modulus: BigInt::from(257u16),
-            })
-        };
-        let request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(1),
-            kind: NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Columns },
-            concrete_argument_types: vec![matrix(2), matrix(100), matrix(3)],
-            concrete_output_types: vec![matrix(105)],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-
-        let representative = GpuNodeMeasurementBackend::representative_at(&request, 50, 4);
-        assert_eq!(representative.concrete_argument_types.len(), 3);
-        assert_eq!(
-            representative
-                .concrete_argument_types
-                .iter()
-                .map(|input| input.matrix_type().unwrap().columns)
-                .collect::<Vec<_>>(),
-            vec![2, 100, 3]
-        );
-        assert_eq!(representative.measured_columns(), Some(4));
-
-        let crossing = GpuNodeMeasurementBackend::representative_at(&request, 1, 4);
-        assert_eq!(crossing.concrete_argument_types.len(), 3);
-        assert_eq!(
-            crossing
-                .concrete_argument_types
-                .iter()
-                .map(|input| input.matrix_type().unwrap().columns)
-                .collect::<Vec<_>>(),
-            vec![2, 100, 3]
-        );
-        assert_eq!(crossing.measured_columns(), Some(4));
-
-        let pilot = GpuNodeMeasurementBackend::calibration_representative(&request);
-        assert_eq!(pilot.measured_columns(), Some(2));
-        assert_eq!(pilot.concrete_argument_types.len(), 3);
-        assert_eq!(
-            pilot
-                .concrete_argument_types
-                .iter()
-                .map(|input| input.matrix_type().unwrap().columns)
-                .collect::<Vec<_>>(),
-            vec![2, 100, 3]
-        );
-
-        let two_column_request = PendingMeasurement {
-            warmup: None,
-            key: [0; 32],
-            scope: FrozenGraphScopeId::Root,
-            id: NodeId(4),
-            kind: NodeKind::Concat { axis: mxx_ir_core::node::ConcatAxis::Columns },
-            concrete_argument_types: vec![matrix(1), matrix(1)],
-            concrete_output_types: vec![matrix(2)],
-            bindings: ParamEnv::default(),
-            preimage_sample: false,
-        };
-        let assignments =
-            gpu_capped_waterfill_columns(GpuColumnWidths { gpu0: 1154, nonzero: Some(1154) }, 2, 2)
-                .unwrap();
-        assert_eq!(assignments, vec![1, 1]);
-        let mut start = 0;
-        for columns in assignments {
-            let representative =
-                GpuNodeMeasurementBackend::representative_at(&two_column_request, start, columns);
-            assert_eq!(representative.concrete_argument_types.len(), 2);
-            assert_eq!(representative.fixed_arguments, vec![false, false]);
-            assert_eq!(
-                representative.output_range.as_ref().map(|range| (range.start, range.end)),
-                Some((start, start + 1))
-            );
-            let node = MeasurementNode {
-                scope: &two_column_request.scope,
-                id: two_column_request.id,
-                kind: &representative.kind,
-                arguments: &[],
-                argument_kinds: &[],
-                argument_types: &[],
-                output_types: &[],
-                concrete_argument_types: representative.concrete_argument_types.clone(),
-                concrete_output_types: representative.concrete_output_types.clone(),
-            };
-            GpuNodeMeasurementBackend::verify_concat_representative(
-                &node,
-                mxx_ir_core::node::ConcatAxis::Columns,
-                representative.output_range.as_ref(),
-            )
-            .unwrap();
-
-            let empty_prepared = |arguments| PreparedMeasurement {
-                arguments: (0..arguments).map(|_| None).collect(),
-                small_arguments: (0..arguments).map(|_| None).collect(),
-                preimage_trapdoor: None,
-                preimage_target: None,
-            };
-            let merged = empty_prepared(2)
-                .merge_for_representative(empty_prepared(2), &representative.fixed_arguments)
-                .unwrap();
-            assert_eq!(merged.arguments.len(), 2);
-            start += columns;
-        }
-        assert_eq!(start, 2);
-    }
-
-    #[test]
-    fn column_separable_measurements_do_not_materialize_full_digit_matrices() {
-        let matrix = |rows, columns| ConcreteMatrixType {
-            rows,
-            columns,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let gadget_kind = NodeKind::GadgetDecompose {
-            base: IntExpr::constant(16_384),
-            small: false,
-            digit_count: IntExpr::constant(80),
-        };
-        let gadget_node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &gadget_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
-            concrete_output_types: vec![ConcreteWireType::Preimage {
-                matrix: matrix(80, 80),
-                max_coefficient_bound: BigInt::from(8_192),
-            }],
-        };
-        let (_, gadget_arguments, gadget_outputs, gadget_scale, _) =
-            GpuNodeMeasurementBackend::representative_node(&gadget_node, 4);
-        let ConcreteWireType::Matrix(gadget_input) = &gadget_arguments[0] else {
-            panic!("gadget representative input");
-        };
-        let ConcreteWireType::Preimage { matrix: gadget_output, max_coefficient_bound } =
-            &gadget_outputs[0]
-        else {
-            panic!("gadget representative output");
-        };
-        assert_eq!((gadget_input.rows, gadget_input.columns), (1, 4));
-        assert_eq!((gadget_output.rows, gadget_output.columns), (80, 4));
-        assert_eq!(max_coefficient_bound, &BigInt::from(8_192));
-        assert_eq!(gadget_scale, 20.0);
-
-        let multiply_kind = NodeKind::MatrixBinary(MatrixBinaryOp::Multiply);
-        let multiply_node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(2),
-            kind: &multiply_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![
-                ConcreteWireType::Matrix(matrix(1, 80)),
-                ConcreteWireType::Matrix(matrix(80, 80)),
-            ],
-            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
-        };
-        let (_, multiply_arguments, multiply_outputs, multiply_scale, _) =
-            GpuNodeMeasurementBackend::representative_node(&multiply_node, 4);
-        let ConcreteWireType::Matrix(rhs) = &multiply_arguments[1] else {
-            panic!("multiply representative rhs");
-        };
-        let ConcreteWireType::Matrix(product) = &multiply_outputs[0] else {
-            panic!("multiply representative output");
-        };
-        assert_eq!((rhs.rows, rhs.columns), (80, 4));
-        assert_eq!((product.rows, product.columns), (1, 4));
-        assert_eq!(multiply_scale, 20.0);
-
-        let accumulate_kind = NodeKind::MatrixMulAccumulate {
-            coefficients: vec![IntExpr::constant(1), IntExpr::constant(3)],
-            has_bias: true,
-        };
-        let accumulate_node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(3),
-            kind: &accumulate_kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![
-                ConcreteWireType::Matrix(matrix(1, 82)),
-                ConcreteWireType::Matrix(matrix(82, 80)),
-                ConcreteWireType::Matrix(matrix(1, 80)),
-                ConcreteWireType::Matrix(matrix(80, 80)),
-                ConcreteWireType::Matrix(matrix(1, 80)),
-            ],
-            concrete_output_types: vec![ConcreteWireType::Matrix(matrix(1, 80))],
-        };
-        let (_, accumulate_arguments, accumulate_outputs, accumulate_scale, _) =
-            GpuNodeMeasurementBackend::representative_node(&accumulate_node, 4);
-        for index in [1, 3, 4] {
-            let ConcreteWireType::Matrix(matrix) = &accumulate_arguments[index] else {
-                panic!("multiply-accumulate representative matrix input");
-            };
-            assert_eq!(matrix.columns, 4);
-        }
-        let ConcreteWireType::Matrix(accumulate_output) = &accumulate_outputs[0] else {
-            panic!("multiply-accumulate representative output");
-        };
-        assert_eq!((accumulate_output.rows, accumulate_output.columns), (1, 4));
-        assert_eq!(accumulate_scale, 20.0);
-    }
-
-    #[test]
-    fn preimage_measurement_uses_representative_column_limit() {
-        let matrix = |rows, columns| ConcreteMatrixType {
-            rows,
-            columns,
-            ring_dimension: 65_536,
-            modulus: BigInt::from(257u16),
-        };
-        let symbolic = MatrixType {
-            rows: IntExpr::constant(82),
-            columns: IntExpr::constant(80),
-            ring_dimension: IntExpr::constant(65_536),
-            modulus: IntExpr::constant(257),
-        };
-        let kind = NodeKind::PreimageSample {
-            matrix_type: symbolic,
-            max_coefficient_bound: IntExpr::constant(100),
-        };
-        let scope = FrozenGraphScopeId::Root;
-        let node = MeasurementNode {
-            scope: &scope,
-            id: NodeId(1),
-            kind: &kind,
-            arguments: &[],
-            argument_kinds: &[],
-            argument_types: &[],
-            output_types: &[],
-            concrete_argument_types: vec![
-                ConcreteWireType::Matrix(matrix(1, 82)),
-                ConcreteWireType::Bytes { length: 0 },
-                ConcreteWireType::Matrix(matrix(1, 80)),
-            ],
-            concrete_output_types: vec![ConcreteWireType::Preimage {
-                matrix: matrix(82, 80),
-                max_coefficient_bound: BigInt::from(100),
-            }],
-        };
-
-        let (kind, arguments, outputs, scale, remainder_columns) =
-            GpuNodeMeasurementBackend::representative_node(&node, 4);
-        let NodeKind::PreimageSample { matrix_type, .. } = kind else {
-            panic!("preimage representative kind");
-        };
-        let ConcreteWireType::Matrix(target) = &arguments[2] else {
-            panic!("preimage representative target");
-        };
-        let ConcreteWireType::Preimage { matrix: output, max_coefficient_bound } = &outputs[0]
-        else {
-            panic!("preimage representative output");
-        };
-        assert_eq!(target.columns, 4);
-        assert_eq!((output.rows, output.columns), (82, 4));
-        assert_eq!(matrix_type.columns, IntExpr::constant(4));
-        assert_eq!(max_coefficient_bound, &BigInt::from(100));
-        assert_eq!(scale, 20.0);
-        assert_eq!(remainder_columns, None);
-
-        let (_, arguments, outputs, scale, remainder_columns) =
-            GpuNodeMeasurementBackend::representative_node(&node, 12);
-        let ConcreteWireType::Matrix(target) = &arguments[2] else {
-            panic!("preimage representative target");
-        };
-        let ConcreteWireType::Preimage { matrix: output, .. } = &outputs[0] else {
-            panic!("preimage representative output");
-        };
-        assert_eq!(target.columns, 12);
-        assert_eq!((output.rows, output.columns), (82, 12));
-        assert_eq!(scale, 6.0);
-        assert_eq!(remainder_columns, Some(8));
-    }
-
-    #[test]
     fn preimage_evidence_maps_fixed_width_classes_without_scaling() {
         let evidence = PreimageAllocationEvidence {
             context: PreimageEvidenceContext {
@@ -10699,7 +8963,7 @@ mod tests {
                 evidence_kind: PreimageAllocationEvidenceKind::Certified,
             },
         };
-        let footprint = GpuNodeMeasurementBackend::preimage_footprint_from_evidence(&evidence)
+        let footprint = ProductionGpuWarmupProvider::preimage_footprint_from_evidence(&evidence)
             .expect("native fixed-width evidence should map");
         assert_eq!(footprint.certified_tile_width, Some(4));
         assert_eq!(footprint.persistent.live, 60);
@@ -10722,18 +8986,18 @@ mod tests {
     #[test]
     #[serial_test::serial(gpu_context)]
     fn real_provider_freezes_fused_add_plan_and_fixed_gpu_execution_is_read_only() {
+        use crate::{
+            Backend, RuntimeValue,
+            artifact::MemoryArtifactStore,
+            backend::{GpuWarmupProvenance, poly_gpu::gpu_backend_on},
+            executor::{ExecutionConfig, ExecutionPlan, execute},
+            gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
+            transcript::SamplingMode,
+        };
         use mxx_dsl::{DslContext, Mat, Ring};
         use mxx_ir_core::node::ConcatAxis;
         use mxx_primitives::poly::dcrt::gpu::{
             GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
-        };
-        use mxx_runtime::{
-            Backend, RuntimeValue,
-            artifact::MemoryArtifactStore,
-            backend::{GpuWarmupProvenance, poly_gpu::gpu_backend_on},
-            executor::execute_with_gpu_plan,
-            gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
-            transcript::SamplingMode,
         };
         use num_bigint::{BigInt, Sign};
         use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
@@ -10782,14 +9046,14 @@ mod tests {
         // Keep setup measurement and fixed execution sequential. The provider
         // owns the only live measurement backend while sampling; it is dropped
         // before creating the production execution backend.
-        let harness = MeasurementHarnessConfig {
+        let harness = GpuWarmupMeasurementConfig {
             warm_up_iterations: 0,
             measured_iterations: 1,
             memory_poll_interval: Duration::ZERO,
         };
         let measurement_backend = gpu_backend_on([parameters.clone()], [device]);
         let mut provider =
-            GpuNodeMeasurementBackend::new(vec![(measurement_backend, device)], harness);
+            ProductionGpuWarmupProvider::new(vec![(measurement_backend, device)], harness);
         let config = GpuValidatedWarmupConfig {
             contract: GpuPlanContract {
                 graph_specification_hash: [0; 32],
@@ -10819,7 +9083,7 @@ mod tests {
             crt_limb_bytes: 8,
             max_parallel_instances: NonZeroUsize::new(1).unwrap(),
         };
-        let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
+        let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
             &graph,
             &config,
             &mut provider,
@@ -10888,13 +9152,16 @@ mod tests {
             .unwrap()
             .expect("execution backend must expose a GPU contract");
         warmup.plan.validate().unwrap();
-        let output = execute_with_gpu_plan(
+        let output = execute(
             &graph,
-            &warmup.plan,
             &mut backend,
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig {
+                plan: ExecutionPlan::FrozenGpu(std::sync::Arc::new(warmup.plan.clone())),
+                ..ExecutionConfig::default()
+            },
         )
         .expect("frozen plan must execute through the real GPU backend");
         let RuntimeValue::Matrix(actual) = &output.outputs["out"] else {
@@ -10906,210 +9173,5 @@ mod tests {
             provider_measurement_counter.load(std::sync::atomic::Ordering::SeqCst),
             provider_measurement_count
         );
-    }
-
-    #[cfg(feature = "gpu")]
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn real_provider_freezes_preimage_rhs_compact_product_and_fixed_outputs() {
-        use mxx_dsl::{DslContext, Mat, Ring};
-        use mxx_ir_core::node::{ConcatAxis, IndexRange};
-        use mxx_primitives::poly::dcrt::gpu::{
-            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync, gpu_memory_info,
-        };
-        use mxx_runtime::{
-            Backend, RuntimeValue,
-            artifact::MemoryArtifactStore,
-            backend::poly_gpu::gpu_backend_on,
-            executor::execute_with_gpu_plan,
-            gpu_warmup::{GpuProfileProvenance, GpuStageCostModel, GpuValidatedWarmupConfig},
-            transcript::SamplingMode,
-        };
-        use num_bigint::{BigInt, Sign};
-        use std::{collections::BTreeMap, num::NonZeroUsize, time::Duration};
-
-        let device = detected_gpu_device_ids()
-            .into_iter()
-            .next()
-            .expect("GPU feature tests require one detected device");
-        let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
-        let ring = Ring::new(modulus, 8usize);
-        let digits = parameters.modulus_digits();
-        let compact_input = Mat::concat(
-            ConcatAxis::Rows,
-            vec![ring.input("compact-a", (1, 2)), ring.input("compact-b", (2, 2))],
-        );
-        let compact_left = Mat::concat(
-            ConcatAxis::Rows,
-            vec![
-                ring.input("compact-x", (1, 3 * digits)),
-                ring.input("compact-y", (1, 3 * digits)),
-            ],
-        );
-        let compact_product = compact_input
-            .decompose(1u64 << parameters.base_bits(), digits)
-            .mul_small_rhs(compact_left);
-        let graph = DslContext::new("bench-real-provider-preimage-rhs-product")
-            .output(
-                "first",
-                compact_product
-                    .clone()
-                    .slice(Some(IndexRange { start: 0.into(), end: 1.into() }), None),
-            )
-            .unwrap()
-            .output(
-                "tail",
-                compact_product.slice(Some(IndexRange { start: 1.into(), end: 2.into() }), None),
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .validate(&ParamEnv::default())
-            .unwrap();
-
-        let mut layouts = BTreeMap::<ConcreteMatrixType, LayoutId>::new();
-        for checked in graph.scopes.values() {
-            for ty in checked.wire_types.values() {
-                if let Some(matrix) = ty.matrix_type() {
-                    let id = layouts.len() as LayoutId + 1;
-                    layouts.entry(matrix.clone()).or_insert(id);
-                }
-            }
-        }
-        let frozen_layouts = layouts
-            .iter()
-            .map(|(matrix, id)| GpuLayout {
-                id: *id,
-                columns: matrix.columns,
-                rows: matrix.rows,
-                ring_dimension: matrix.ring_dimension,
-                representation: format!("{:?}", ConcreteWireType::Matrix(matrix.clone())),
-                instance_device_stride: 0,
-                owner_intervals: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        let harness = MeasurementHarnessConfig {
-            warm_up_iterations: 0,
-            measured_iterations: 1,
-            memory_poll_interval: Duration::ZERO,
-        };
-        let measurement_backend = gpu_backend_on([parameters.clone()], [device]);
-        let mut provider =
-            GpuNodeMeasurementBackend::new(vec![(measurement_backend, device)], harness);
-        let config = GpuValidatedWarmupConfig {
-            contract: GpuPlanContract {
-                graph_specification_hash: [0; 32],
-                backend_identity: "bench-real-provider-placeholder".into(),
-                logical_to_physical_devices: vec![device as usize],
-                device_budgets: vec![GpuDeviceBudget {
-                    device: 0,
-                    device_bytes: gpu_memory_info(device).expect("query GPU memory").total as u64,
-                    pinned_host_bytes: u64::MAX,
-                    host_bytes: u64::MAX,
-                }],
-                shape_contract_hash: [0; 32],
-                backend_revision: "bench-real-provider-placeholder".into(),
-            },
-            layouts: frozen_layouts,
-            default_tile_widths: vec![1, 2],
-            default_cost: vec![GpuStageCostModel::default()],
-            default_implementation_variant: "bench-real-provider-placeholder".into(),
-            profiles: BTreeMap::new(),
-            effective_operation_identities: BTreeMap::new(),
-            effective_operations: BTreeMap::new(),
-            storage_descriptors: BTreeMap::new(),
-            active_crt_towers: 2,
-            crt_limb_bytes: 8,
-            max_parallel_instances: NonZeroUsize::new(1).unwrap(),
-        };
-        let mut warmup = mxx_runtime::gpu_warmup::warmup_gpu_from_validated_with_provider(
-            &graph,
-            &config,
-            &mut provider,
-        )
-        .expect("real provider must measure preimage-RHS compact product");
-        assert!(
-            warmup
-                .report
-                .stages
-                .iter()
-                .all(|stage| stage.provenance != GpuProfileProvenance::ConservativeEstimate)
-        );
-        assert!(
-            provider.warmup_dispatch_records().iter().any(|record| record.profile_domain ==
-                CanonicalWarmupProfileDomain::FusedCompactProduct &&
-                record.fused_operation == Some(FusedWarmupOperation::CompactProduct) &&
-                record.measurement == WarmupMeasurementKind::GpuMeasured &&
-                record.range.start < record.range.end),
-            "compact-product warmup must enter the fused production range API"
-        );
-        let provider_measurement_count = provider.calibration_registry().len();
-        let provider_registry = provider.calibration_registry();
-        drop(provider);
-        gpu_device_sync();
-
-        let mut backend = gpu_backend_on([parameters.clone()], [device]);
-        // Seed direct setup inputs through the normal pilot path; fixed graph
-        // execution is installed only after all expected values are built.
-        backend.select_operation([0xA6; 32]).unwrap();
-        let mut matrix = |rows: usize, columns: usize, seed: u8| {
-            backend
-                .sample_hash(
-                    &ConcreteMatrixType {
-                        modulus: BigInt::from_biguint(
-                            Sign::Plus,
-                            parameters.modulus().as_ref().clone(),
-                        ),
-                        ring_dimension: parameters.ring_dimension() as usize,
-                        rows,
-                        columns,
-                    },
-                    [seed; 32],
-                    b"bench-compact-input",
-                )
-                .unwrap()
-        };
-        let compact_a = matrix(1, 2, 3);
-        let compact_b = matrix(2, 2, 17);
-        let compact_x = matrix(1, 3 * digits, 31);
-        let compact_y = matrix(1, 3 * digits, 47);
-        let compact_input = backend.concat(&[&compact_a, &compact_b], ConcatAxis::Rows).unwrap();
-        let compact_left = backend.concat(&[&compact_x, &compact_y], ConcatAxis::Rows).unwrap();
-        let rhs = backend.gadget_decompose(&compact_input, false, Some(digits)).unwrap();
-        let expected = backend.multiply_small_rhs(&compact_left, &rhs).unwrap();
-        let expected_first =
-            backend.slice(&expected, Some(&RuntimeIndexRange { start: 0, end: 1 }), None).unwrap();
-        let expected_tail =
-            backend.slice(&expected, Some(&RuntimeIndexRange { start: 1, end: 2 }), None).unwrap();
-        let inputs = BTreeMap::from([
-            ("compact-a".to_owned(), RuntimeValue::matrix(compact_a)),
-            ("compact-b".to_owned(), RuntimeValue::matrix(compact_b)),
-            ("compact-x".to_owned(), RuntimeValue::matrix(compact_x)),
-            ("compact-y".to_owned(), RuntimeValue::matrix(compact_y)),
-        ]);
-        warmup.plan.contract = backend
-            .gpu_runtime_contract(&graph, &inputs)
-            .unwrap()
-            .expect("execution backend must expose a GPU contract");
-        warmup.plan.validate().unwrap();
-        let output = execute_with_gpu_plan(
-            &graph,
-            &warmup.plan,
-            &mut backend,
-            inputs,
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-        )
-        .expect("frozen compact product plan must execute on GPU");
-        let RuntimeValue::Matrix(first) = &output.outputs["first"] else {
-            panic!("compact first output is not a matrix");
-        };
-        let RuntimeValue::Matrix(tail) = &output.outputs["tail"] else {
-            panic!("compact tail output is not a matrix");
-        };
-        assert_eq!(backend.matrix_to_bytes(first), backend.matrix_to_bytes(&expected_first));
-        assert_eq!(backend.matrix_to_bytes(tail), backend.matrix_to_bytes(&expected_tail));
-        assert_eq!(provider_registry.len(), provider_measurement_count);
     }
 }

@@ -19,7 +19,7 @@ use mxx_gadgets::{
 };
 use mxx_ir_core::{
     IntExpr,
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
     types::MatrixType,
 };
 use num_bigint::{BigInt, BigUint, Sign};
@@ -692,10 +692,10 @@ impl LweLookupCompiler {
         names: &LweLookupArtifactNames,
     ) -> Result<DslContext, LweLookupCompileError> {
         Ok(context
-            .public_output(names.output_public_key.clone(), wires.output_public_key)?
-            .public_output(names.low_matrices.clone(), wires.low_matrices)?
-            .public_output(names.high_matrices.clone(), wires.high_matrices)?
-            .public_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
+            .transferred_output(names.output_public_key.clone(), wires.output_public_key)?
+            .transferred_output(names.low_matrices.clone(), wires.low_matrices)?
+            .transferred_output(names.high_matrices.clone(), wires.high_matrices)?
+            .transferred_output(names.output_plaintexts.clone(), wires.output_plaintexts)?)
     }
 
     pub fn import_artifacts(
@@ -714,7 +714,7 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.low_matrix_type),
                 balanced_bound(self.gadget_base.clone()),
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
             ),
             high_matrices: ring.preimage_family_artifact_input(
                 artifacts.production_id.clone(),
@@ -722,14 +722,14 @@ impl LweLookupCompiler {
                 artifacts.table_length,
                 shape(&self.high_matrix_type),
                 self.preimage_max_coefficient_bound.clone(),
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
             ),
             output_plaintexts: ring.family_artifact_input(
                 artifacts.production_id.clone(),
                 names.output_plaintexts,
                 artifacts.table_length,
                 shape(&ring.matrix_type((1, 1))),
-                ArtifactConfidentiality::Public,
+                ArtifactAvailability::Transferred,
             ),
         })
     }
@@ -739,7 +739,7 @@ impl LweLookupCompiler {
             artifacts.production_id.clone(),
             LweLookupArtifactNames::for_compiler(self).output_public_key,
             shape(&self.public_key_type),
-            ArtifactConfidentiality::Public,
+            ArtifactAvailability::Transferred,
         )
     }
 
@@ -1746,7 +1746,7 @@ mod tests {
     use mxx_gadgets::circuit::{LutExpr, PolyCircuit, PublicLutProgram};
     use mxx_ir_core::{
         FrozenGraphScopeId, ParamEnv,
-        artifact::{ArtifactConfidentiality, ProductionId, SpecHash},
+        artifact::{ArtifactAvailability, ProductionId, SpecHash},
         node::{IntBinaryOp, LoopInputMode, MatrixBinaryOp, NodeKind},
         types::WireType,
     };
@@ -1759,7 +1759,7 @@ mod tests {
     };
     use mxx_runtime::{
         ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
-        execute, execute_with_config, transcript::SamplingMode,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::BigUint;
     use std::num::NonZeroUsize;
@@ -1892,14 +1892,18 @@ mod tests {
         let NodeKind::ParallelLoop(spec) = loops[0].kind() else { unreachable!() };
         assert_eq!(spec.count, IntExpr::constant(3));
         assert_eq!(loops[0].output_types().len(), 2);
-        assert!(loops[0].output_types().iter().all(|output| {
-            matches!(
-                output,
-                WireType::IndexedFamily { element, count }
-                    if matches!(element.as_ref(), WireType::SmallMatrix { .. } | WireType::Preimage { .. }) &&
-                        count == &IntExpr::constant(3)
-            )
-        }));
+        assert!(matches!(
+            loops[0].output_types().first(),
+            Some(WireType::IndexedFamily { element, count })
+                if matches!(element.as_ref(), WireType::SmallMatrix { .. }) &&
+                    count == &IntExpr::constant(3)
+        ));
+        assert!(matches!(
+            loops[0].output_types().get(1),
+            Some(WireType::IndexedFamily { element, count })
+                if matches!(element.as_ref(), WireType::Preimage { .. }) &&
+                    count == &IntExpr::constant(3)
+        ));
 
         for node in built.graph.scopes().values().flat_map(|scope| scope.nodes()) {
             assert!(!matches!(node.kind(), NodeKind::FamilyGetStatic { .. }));
@@ -1988,7 +1992,7 @@ mod tests {
         })
         .unwrap();
         let validated = DslContext::new("shuffled-logical-lwe-preprocessing")
-            .public_output("low", wires.low_matrices)
+            .transferred_output("low", wires.low_matrices)
             .unwrap()
             .output("residual", residuals)
             .unwrap()
@@ -2000,7 +2004,7 @@ mod tests {
         let execute_once = |parameters: &DCRTPolyParams| {
             let mut backend = cpu_backend([parameters.clone()]);
             let mut store = MemoryArtifactStore::default();
-            let mut result = execute_with_config(
+            let mut result = execute(
                 &validated,
                 &mut backend,
                 BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x6d; 32]))]),
@@ -2199,13 +2203,13 @@ mod tests {
                     .iter()
                     .cloned()
                     .map(|value| {
-                        RuntimeValue::small_matrix(
+                        RuntimeValue::Preimage(std::sync::Arc::new(
                             mxx_primitives::matrix::CpuSmallMatrix::new(
                                 value,
                                 BigUint::from(1_000_000u32),
                             )
                             .unwrap(),
-                        )
+                        ))
                     })
                     .collect(),
             ),
@@ -2221,9 +2225,15 @@ mod tests {
         }
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
-        let produced =
-            execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let produced = execute(
+            &producer,
+            &mut backend,
+            producer_inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let production_id = produced.production_id.expect("helper artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
         let mut v1_manifest = manifest.clone();
@@ -2370,8 +2380,15 @@ mod tests {
                 &BTreeMap::from([(production_id, manifest)]),
             )
             .unwrap();
-        let result =
-            execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
+        let result = execute(
+            &graph,
+            &mut backend,
+            inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let outputs = [1usize, 1, 1, 0];
         for slot in 0..slots {
             let index = indices[slot];
@@ -2448,17 +2465,17 @@ mod tests {
         let (other_rows, other_plaintexts) = third.call(third_inputs).unwrap();
         let context = DslContext::new("tall-lookup-kernel-cache");
         let built = context
-            .public_output("rows", rows)
+            .transferred_output("rows", rows)
             .unwrap()
-            .public_output("plaintexts", plaintexts)
+            .transferred_output("plaintexts", plaintexts)
             .unwrap()
-            .public_output("second-rows", second_rows)
+            .transferred_output("second-rows", second_rows)
             .unwrap()
-            .public_output("second-plaintexts", second_plaintexts)
+            .transferred_output("second-plaintexts", second_plaintexts)
             .unwrap()
-            .public_output("other-rows", other_rows)
+            .transferred_output("other-rows", other_rows)
             .unwrap()
-            .public_output("other-plaintexts", other_plaintexts)
+            .transferred_output("other-plaintexts", other_plaintexts)
             .unwrap()
             .build()
             .unwrap();
@@ -3076,7 +3093,7 @@ mod tests {
         };
         assert_eq!(artifact.production_id, production_id);
         assert_eq!(artifact.artifact_name, output_public_key_artifact);
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+        assert_eq!(artifact.availability, ArtifactAvailability::Transferred);
 
         let NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) = right.node().kind() else {
             panic!("lookup signal right side must end with a gadget multiplication")
@@ -3108,7 +3125,7 @@ mod tests {
             artifact.artifact_name,
             LweLookupArtifactNames::for_compiler(&lookup).output_plaintexts
         );
-        assert_eq!(artifact.confidentiality, ArtifactConfidentiality::Public);
+        assert_eq!(artifact.availability, ArtifactAvailability::Transferred);
         let NodeKind::ExtractCoefficient { position, .. } = output_selector.node().kind() else {
             panic!("lookup output plaintext selector must be the input coefficient")
         };

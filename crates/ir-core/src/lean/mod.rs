@@ -61,8 +61,10 @@ pub struct PrimitiveNames {
     pub modulus_switch: String,
     pub modulus_reduce: String,
     pub centered_rebase: String,
+    pub compact_centered_rebase: String,
     pub rns_mod_up: String,
     pub rns_mod_down: String,
+    pub block_mod_switch: String,
     pub ring_automorphism: String,
     pub pack_polynomial: String,
     pub polynomial_from_values: String,
@@ -112,8 +114,10 @@ impl Default for PrimitiveNames {
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
             centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
+            compact_centered_rebase: "MxxRuntime.compactCenteredRebaseRuns".into(),
             rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
+            block_mod_switch: "MxxRuntime.blockModSwitchRuns".into(),
             ring_automorphism: "MxxRuntime.ringAutomorphismRuns".into(),
             pack_polynomial: "MxxRuntime.packPolynomial".into(),
             polynomial_from_values: "MxxRuntime.polynomialFromValues".into(),
@@ -1430,7 +1434,24 @@ impl<'a> Emitter<'a> {
                 } else {
                     &self.options.primitives.modulus_reduce
                 };
-                relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                if let Some(crate::types::ConcreteWireType::SmallMatrix {
+                    max_coefficient_bound,
+                    ..
+                }) = self.validated.scopes[scope_id]
+                    .wire_types
+                    .get(&WireRef { node: node_id, port: crate::types::Port(0) }) &&
+                    matches!(kind, NodeKind::CenteredRebase { .. })
+                {
+                    relations.push(format!(
+                        "{} {} {} {}",
+                        self.options.primitives.compact_centered_rebase,
+                        max_coefficient_bound,
+                        arg(0)?,
+                        output(0)
+                    ));
+                } else {
+                    relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
+                }
             }
             NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize } => {
                 append_expression_guards(modulus, env, relations);
@@ -1454,6 +1475,20 @@ impl<'a> Emitter<'a> {
                 relations.push(format!(
                     "{} [{}] ({}) {} {}",
                     self.options.primitives.rns_mod_down,
+                    basis,
+                    env.expr(plaintext_modulus),
+                    arg(0)?,
+                    output(0)
+                ));
+            }
+            NodeKind::BlockModSwitch { modulus, source_moduli, plaintext_modulus } => {
+                append_expression_guards(modulus, env, relations);
+                append_expression_guards(plaintext_modulus, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                let basis = source_moduli.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+                relations.push(format!(
+                    "{} [{}] ({}) {} {}",
+                    self.options.primitives.block_mod_switch,
                     basis,
                     env.expr(plaintext_modulus),
                     arg(0)?,
@@ -2501,7 +2536,7 @@ mod tests {
             let (graph, _) = Graph::freeze(
                 "supported-expression",
                 vec![],
-                BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+                BTreeMap::from([("value".into(), GraphOutput { value, availability: None })]),
                 vec![],
                 vec![],
                 BTreeMap::new(),
@@ -2524,8 +2559,8 @@ mod tests {
             "boundary",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: x.clone(), confidentiality: None }),
-                ("alias".into(), GraphOutput { value: x, confidentiality: None }),
+                ("first".into(), GraphOutput { value: x.clone(), availability: None }),
+                ("alias".into(), GraphOutput { value: x, availability: None }),
             ]),
             vec![retained],
             vec![],
@@ -2610,7 +2645,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "refresh_transforms",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2667,7 +2702,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "rns_conversions",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2677,6 +2712,97 @@ mod tests {
         let artifact = export(&validated, &ExportOptions::default()).unwrap();
         assert!(artifact.source.contains("rnsModUpRuns [17] 1 false"));
         assert!(artifact.source.contains("rnsModDownRuns [17, 97] (2)"));
+    }
+
+    #[test]
+    fn test_export_block_mod_switch_preserves_basis_and_correction_factor() {
+        let matrix = |modulus| MatrixType {
+            modulus: IntExpr::constant(modulus),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix(17 * 97), value: ConstantMatrix::Zero },
+            vec![],
+            vec![WireType::Matrix(matrix(17 * 97))],
+        )
+        .output(0)
+        .unwrap();
+        let switched = NodeHandle::new(
+            NodeKind::BlockModSwitch {
+                modulus: IntExpr::constant(97),
+                source_moduli: vec![17, 97],
+                plaintext_modulus: IntExpr::constant(3),
+            },
+            vec![source],
+            vec![WireType::Matrix(matrix(97))],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "block_mod_switch",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: switched, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("blockModSwitchRuns [17, 97] (3)"));
+    }
+
+    #[test]
+    fn test_export_centered_rebase_preserves_multi_limb_compact_contract() {
+        let matrix = |modulus| MatrixType {
+            modulus: IntExpr::constant(modulus),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let source_ty = WireType::SmallMatrix {
+            matrix: matrix(17 * 97),
+            max_coefficient_bound: IntExpr::constant(7),
+        };
+        let source = NodeHandle::new(
+            NodeKind::Input {
+                name: "compact_source".into(),
+                wire_type: source_ty.clone(),
+                artifact: None,
+            },
+            vec![],
+            vec![source_ty],
+        )
+        .output(0)
+        .unwrap();
+        // The destination contains both source CRT limbs and adds a third limb.  This exercises
+        // the exact whole-source centered representative relation rather than a per-limb rebase.
+        let rebased = NodeHandle::new(
+            NodeKind::CenteredRebase { modulus: IntExpr::constant(17 * 97 * 193) },
+            vec![source],
+            vec![WireType::SmallMatrix {
+                matrix: matrix(17 * 97 * 193),
+                max_coefficient_bound: IntExpr::constant(7),
+            }],
+        )
+        .output(0)
+        .unwrap();
+        let (graph, _) = Graph::freeze(
+            "centered_rebase_multi_limb_compact",
+            vec![],
+            BTreeMap::from([("out".into(), GraphOutput { value: rebased, availability: None })]),
+            vec![],
+            vec![],
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let validated = crate::validate(&graph, &ParamEnv::default()).unwrap();
+        let artifact = export(&validated, &ExportOptions::default()).unwrap();
+        assert!(artifact.source.contains("compactCenteredRebaseRuns 7"));
+        assert!(artifact.source.contains("ExactMatrix 1649 8 1 1"));
+        assert!(artifact.source.contains("ExactMatrix 318257 8 1 1"));
     }
 
     #[test]
@@ -2708,7 +2834,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "constants",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2734,7 +2860,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "ssa",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: y, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2783,7 +2909,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "matrix",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: y, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: y, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2837,10 +2963,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "parallel",
             vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: parallel, confidentiality: None },
-            )]),
+            BTreeMap::from([("out".into(), GraphOutput { value: parallel, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -2896,10 +3019,7 @@ mod tests {
             let (graph, _) = Graph::freeze(
                 "prefix",
                 vec![],
-                BTreeMap::from([(
-                    "out".into(),
-                    GraphOutput { value: output, confidentiality: None },
-                )]),
+                BTreeMap::from([("out".into(), GraphOutput { value: output, availability: None })]),
                 vec![],
                 vec![],
                 BTreeMap::new(),
@@ -2943,7 +3063,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "root-child-inputs",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: call, availability: None })]),
             vec![],
             vec![root_input],
             BTreeMap::new(),
@@ -2979,7 +3099,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "lazy_select",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3031,7 +3151,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "formal-order",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: call, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: call, availability: None })]),
             vec![],
             vec![first, second],
             BTreeMap::new(),
@@ -3095,8 +3215,8 @@ mod tests {
             "hash-binders",
             vec![],
             BTreeMap::from([
-                ("plain".into(), GraphOutput { value: call, confidentiality: None }),
-                ("sampled".into(), GraphOutput { value: sampled, confidentiality: None }),
+                ("plain".into(), GraphOutput { value: call, availability: None }),
+                ("sampled".into(), GraphOutput { value: sampled, availability: None }),
             ]),
             vec![],
             vec![],
@@ -3143,8 +3263,8 @@ mod tests {
             "two-bindings",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                ("first".into(), GraphOutput { value: first, availability: None }),
+                ("second".into(), GraphOutput { value: second, availability: None }),
             ]),
             vec![],
             vec![],
@@ -3205,8 +3325,8 @@ mod tests {
                     kind: crate::graph::CompileParameterKind::Integer,
                 }],
                 BTreeMap::from([
-                    ("gadget".into(), GraphOutput { value, confidentiality: None }),
-                    ("second".into(), GraphOutput { value: second, confidentiality: None }),
+                    ("gadget".into(), GraphOutput { value, availability: None }),
+                    ("second".into(), GraphOutput { value: second, availability: None }),
                 ]),
                 vec![],
                 vec![],
@@ -3278,7 +3398,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index}"), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) =
@@ -3305,7 +3425,7 @@ mod tests {
                 )
                 .output(0)
                 .unwrap();
-                (format!("out{index:02}"), GraphOutput { value, confidentiality: None })
+                (format!("out{index:02}"), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) = Graph::freeze(
@@ -3349,7 +3469,7 @@ mod tests {
                 name: "den".into(),
                 kind: crate::graph::CompileParameterKind::Integer,
             }],
-            BTreeMap::from([("out".into(), GraphOutput { value, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3383,7 +3503,7 @@ mod tests {
                 });
                 let value =
                     NodeHandle::subgraph_call(child, vec![], vec![], vec![]).output(0).unwrap();
-                (name.to_owned(), GraphOutput { value, confidentiality: None })
+                (name.to_owned(), GraphOutput { value, availability: None })
             })
             .collect();
         let (graph, _) =
@@ -3432,7 +3552,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "slice_projections",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: result, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: result, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3496,7 +3616,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "invalid-slice",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: slice, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: slice, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3540,8 +3660,8 @@ mod tests {
             "sequential",
             vec![],
             BTreeMap::from([
-                ("first".into(), GraphOutput { value: first_output, confidentiality: None }),
-                ("second".into(), GraphOutput { value: second_output, confidentiality: None }),
+                ("first".into(), GraphOutput { value: first_output, availability: None }),
+                ("second".into(), GraphOutput { value: second_output, availability: None }),
             ]),
             vec![],
             vec![],
@@ -3625,10 +3745,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "preimage",
             vec![],
-            BTreeMap::from([(
-                "out".into(),
-                GraphOutput { value: preimage, confidentiality: None },
-            )]),
+            BTreeMap::from([("out".into(), GraphOutput { value: preimage, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),
@@ -3738,7 +3855,7 @@ mod tests {
         let (graph, _) = Graph::freeze(
             "mismatched-preimage",
             vec![],
-            BTreeMap::from([("out".into(), GraphOutput { value: out, confidentiality: None })]),
+            BTreeMap::from([("out".into(), GraphOutput { value: out, availability: None })]),
             vec![],
             vec![],
             BTreeMap::new(),

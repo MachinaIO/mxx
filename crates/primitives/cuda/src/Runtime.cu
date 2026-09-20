@@ -212,6 +212,12 @@ namespace
         return 1;
     }
 
+    int set_error(cudaError_t err)
+    {
+        last_error = cudaGetErrorString(err);
+        return err == cudaErrorMemoryAllocation ? GPU_STATUS_OUT_OF_MEMORY : 1;
+    }
+
     int set_error(const std::exception &e)
     {
         return set_error(e.what());
@@ -248,7 +254,7 @@ namespace
             cudaError_t err = cudaSetDevice(device);
             if (err != cudaSuccess)
             {
-                return set_error(cudaGetErrorString(err));
+                return set_error(err);
             }
             cudaEvent_t epoch = nullptr;
             err = cudaEventCreateWithFlags(&epoch, cudaEventDisableTiming);
@@ -266,7 +272,7 @@ namespace
             }
             if (err != cudaSuccess)
             {
-                return set_error(cudaGetErrorString(err));
+                return set_error(err);
             }
         }
         return 0;
@@ -767,7 +773,7 @@ namespace
                 const cudaError_t status = release ? cudaFreeAsync(pointer, release) : cudaFree(pointer);
                 if (status != cudaSuccess)
                 {
-                    set_error(cudaGetErrorString(status));
+                    set_error(status);
                 }
             }
         }
@@ -927,6 +933,11 @@ GpuExecutionOwner::~GpuExecutionOwner()
 extern "C" int gpu_set_last_error(const char *msg)
 {
     return set_error(msg);
+}
+
+extern "C" int gpu_set_last_error_cuda(int cuda_error)
+{
+    return set_error(static_cast<cudaError_t>(cuda_error));
 }
 
 extern "C"
@@ -1314,7 +1325,7 @@ extern "C"
                 completion = nullptr;
             }
             ctx->execution->pinned_host_reclaimer->record_uncertain(cudaGetErrorString(error));
-            return set_error(cudaGetErrorString(error));
+            return set_error(error);
         }
 
         const int enqueue_status =
@@ -1364,7 +1375,7 @@ extern "C"
         cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         uint64_t used_current = 0;
         uint64_t used_high = 0;
@@ -1372,17 +1383,17 @@ extern "C"
         err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemCurrent, &used_current);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &used_high);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         err = cudaMemPoolGetAttribute(pool, cudaMemPoolAttrReservedMemCurrent, &reserved_current);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         if (used_current > std::numeric_limits<size_t>::max() ||
             used_high > std::numeric_limits<size_t>::max() ||
@@ -1431,13 +1442,13 @@ extern "C"
         cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         uint64_t reset = 0;
         err = cudaMemPoolSetAttribute(pool, cudaMemPoolAttrUsedMemHigh, &reset);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         return 0;
     }
@@ -1446,12 +1457,19 @@ extern "C"
         int device,
         char *out_name,
         size_t name_capacity,
+        char *out_uuid,
+        size_t uuid_capacity,
         int *out_compute_major,
         int *out_compute_minor,
-        size_t *out_total_global_memory)
+        size_t *out_total_global_memory,
+        int *out_driver_version,
+        int *out_runtime_version,
+        uint64_t *out_context_generation)
     {
         if (device < 0 || !out_name || name_capacity == 0 || !out_compute_major ||
-            !out_compute_minor || !out_total_global_memory)
+            !out_uuid || uuid_capacity < 33 || !out_compute_minor ||
+            !out_total_global_memory || !out_driver_version || !out_runtime_version ||
+            !out_context_generation)
         {
             return set_error("invalid gpu_device_get_identity arguments");
         }
@@ -1459,12 +1477,35 @@ extern "C"
         cudaError_t err = cudaGetDeviceProperties(&properties, device);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         const size_t source_length = strnlen(properties.name, sizeof(properties.name));
         const size_t copied = std::min(source_length, name_capacity - 1);
         memcpy(out_name, properties.name, copied);
         out_name[copied] = '\0';
+        const auto *uuid_bytes = reinterpret_cast<const unsigned char *>(&properties.uuid);
+        static constexpr char hex[] = "0123456789abcdef";
+        for (size_t index = 0; index < sizeof(properties.uuid); ++index)
+        {
+            out_uuid[index * 2] = hex[(uuid_bytes[index] >> 4) & 0xf];
+            out_uuid[index * 2 + 1] = hex[uuid_bytes[index] & 0xf];
+        }
+        out_uuid[sizeof(properties.uuid) * 2] = '\0';
+        err = cudaDriverGetVersion(out_driver_version);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        err = cudaRuntimeGetVersion(out_runtime_version);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        size_t live_contexts = 0;
+        if (gpu_device_context_state(device, &live_contexts, out_context_generation) != 0)
+        {
+            return 1;
+        }
         *out_compute_major = properties.major;
         *out_compute_minor = properties.minor;
         *out_total_global_memory = properties.totalGlobalMem;
@@ -1482,12 +1523,12 @@ extern "C"
             cudaError_t err = cudaSetDevice(entry.device);
             if (err != cudaSuccess)
             {
-                return set_error(cudaGetErrorString(err));
+                return set_error(err);
             }
             err = cudaEventSynchronize(entry.event);
             if (err != cudaSuccess)
             {
-                return set_error(cudaGetErrorString(err));
+                return set_error(err);
             }
         }
         return 0;
@@ -1513,7 +1554,7 @@ extern "C"
         }
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+            return set_error(err);
         }
         *out_count = count;
         return 0;
@@ -1529,12 +1570,12 @@ extern "C"
         cudaError_t err = cudaGetDevice(&current);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+            return set_error(err);
         }
         err = cudaSetDevice(device);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+            return set_error(err);
         }
         size_t free_bytes = 0;
         size_t total_bytes = 0;
@@ -1542,11 +1583,11 @@ extern "C"
         cudaError_t restore_err = cudaSetDevice(current);
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+            return set_error(err);
         }
         if (restore_err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(restore_err));
+            return set_error(restore_err);
         }
         *out_free = free_bytes;
         *out_total = total_bytes;
@@ -1558,7 +1599,7 @@ extern "C"
         cudaError_t err = cudaDeviceSynchronize();
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         return 0;
     }
@@ -1568,7 +1609,7 @@ extern "C"
         cudaError_t err = cudaDeviceReset();
         if (err != cudaSuccess)
         {
-            return set_error(cudaGetErrorString(err));
+        return set_error(err);
         }
         return 0;
     }
@@ -1590,7 +1631,7 @@ extern "C"
             cudaError_t err = cudaMallocHost(&ptr, bytes);
             if (err != cudaSuccess)
             {
-                set_error(cudaGetErrorString(err));
+                set_error(err);
                 return nullptr;
             }
             return ptr;
@@ -1616,7 +1657,7 @@ extern "C"
         cudaError_t err = cudaFreeHost(ptr);
         if (err != cudaSuccess)
         {
-            set_error(cudaGetErrorString(err));
+        set_error(err);
         }
     }
 }

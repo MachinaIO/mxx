@@ -240,7 +240,7 @@ mod tests {
         let compiler = BggPublicKeyCompiler { ring, base: 2.into(), digit_count: 2.into() };
         let output = compiler.mul(&lhs, &rhs);
         let built = DslContext::new("bgg-public-key-mul")
-            .public_output("output", output.matrix)
+            .transferred_output("output", output.matrix)
             .expect("output")
             .build()
             .expect("build");

@@ -97,8 +97,8 @@ fn render(n: usize, l: usize, m: usize) -> String {
     .output(0)
     .unwrap();
     let mut outputs = BTreeMap::from([
-        ("family".into(), GraphOutput { value: family.clone(), confidentiality: None }),
-        ("output".into(), GraphOutput { value: sequence, confidentiality: None }),
+        ("family".into(), GraphOutput { value: family.clone(), availability: None }),
+        ("output".into(), GraphOutput { value: sequence, availability: None }),
     ]);
     if n > 0 {
         let selected = NodeHandle::new(
@@ -108,7 +108,7 @@ fn render(n: usize, l: usize, m: usize) -> String {
         )
         .output(0)
         .unwrap();
-        outputs.insert("gathered".into(), GraphOutput { value: selected, confidentiality: None });
+        outputs.insert("gathered".into(), GraphOutput { value: selected, availability: None });
     }
     let graph = Graph::freeze(
         format!("structural-loops-{n}-{m}-{l}"),

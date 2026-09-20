@@ -109,7 +109,7 @@ use mxx_dsl::BuiltGraph;
 use mxx_ir_core::{ParamEnv, node::SampleRange};
 #[cfg(test)]
 use mxx_runtime::{
-    ExecutionResult, MemoryArtifactStore, RuntimeValue,
+    ExecutionConfig, ExecutionResult, MemoryArtifactStore, RuntimeValue,
     backend::poly::{CpuDcrtBackend, cpu_backend},
     execute,
     transcript::SamplingMode,
@@ -169,8 +169,15 @@ pub(crate) fn execute_graph(
     parameters.extend_from_slice(extra_parameters);
     let mut backend = cpu_backend(parameters);
     let mut store = MemoryArtifactStore::default();
-    let mut result = execute(&validated, &mut backend, inputs, &mut store, SamplingMode::Fresh)
-        .expect("FHE graph execution");
+    let mut result = execute(
+        &validated,
+        &mut backend,
+        inputs,
+        &mut store,
+        SamplingMode::Fresh,
+        ExecutionConfig::default(),
+    )
+    .expect("FHE graph execution");
     // Structural families may be lazy staged outputs. Materialize them before
     // dropping the memory store so assertions observe actual runtime values.
     for name in result.outputs.keys().cloned().collect::<Vec<_>>() {

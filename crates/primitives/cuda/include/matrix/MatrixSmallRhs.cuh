@@ -1,6 +1,7 @@
 #pragma once
 
 #include "matrix/Matrix.cuh"
+#include "matrix/MatrixData.cuh"
 
 #ifdef __cplusplus
 extern "C"
@@ -32,9 +33,19 @@ int gpu_small_matrix_create(
     const uint64_t *bound_words,
     size_t bound_word_count,
     GpuSmallMatrix **out);
+// Side-effect-free exact size query for the compact owner created by
+// gpu_small_matrix_create.  This uses the same native payload-size helper as
+// the allocating path and deliberately performs no CUDA allocation.
+int gpu_small_matrix_query_allocation_bytes(
+    const GpuContext *ctx,
+    size_t rows,
+    size_t cols,
+    size_t magnitude_bytes,
+    GpuMatrixAllocationBytes *out);
 void gpu_small_matrix_destroy(GpuSmallMatrix *mat);
 int gpu_small_matrix_wait(const GpuSmallMatrix *mat);
 int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src);
+int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const GpuSmallMatrix *src);
 int gpu_small_matrix_copy_columns(
     GpuSmallMatrix *out,
     const GpuSmallMatrix *src,

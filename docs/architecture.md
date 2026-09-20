@@ -7,7 +7,6 @@ on the crate that owns an abstraction.
 
 ```text
 mxx-runtime              -> mxx-ir-core, mxx-primitives
-mxx-bench-estimator      -> mxx-ir-core, mxx-runtime; optional mxx-primitives
 mxx-dsl                  -> mxx-ir-core
 mxx-gadgets              -> mxx-dsl, mxx-ir-core, mxx-primitives, mxx-runtime
 mxx-bgg                  -> mxx-dsl, mxx-gadgets, mxx-ir-core, mxx-primitives
@@ -60,7 +59,9 @@ structural loops; lexical reads become explicit core dependencies with inferred 
 ### `mxx-runtime`
 
 Executes validated schedules on CPU or GPU primitive backends and owns runtime values, sampling
-transcripts, sessions, artifacts, and bounded parallel waves.
+transcripts, sessions, artifacts, bounded parallel waves, and production-equivalent GPU warmup.
+The warmup that freezes a GPU execution plan is also the sole source of its timing and resource
+report; reporting never launches a second measurement run.
 
 ### `mxx-gadgets` and `mxx-bgg`
 

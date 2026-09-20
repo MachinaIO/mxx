@@ -1,4 +1,36 @@
-use std::{env, path::PathBuf};
+use std::{
+    collections::hash_map::DefaultHasher,
+    env, fs,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+};
+
+fn native_kernel_build_revision(cuda_dir: &Path, cuda_arch: &str, debug_build: bool) -> String {
+    let mut paths = Vec::new();
+    fn collect(path: &Path, paths: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(path) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect(&path, paths);
+            } else {
+                paths.push(path);
+            }
+        }
+    }
+    collect(cuda_dir, &mut paths);
+    paths.sort();
+    let mut hasher = DefaultHasher::new();
+    cuda_arch.hash(&mut hasher);
+    debug_build.hash(&mut hasher);
+    for path in paths {
+        path.strip_prefix(cuda_dir).unwrap_or(&path).to_string_lossy().hash(&mut hasher);
+        if let Ok(contents) = fs::read(&path) {
+            contents.hash(&mut hasher);
+        }
+    }
+    format!("cuda-native-build-{:016x}", hasher.finish())
+}
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
@@ -63,6 +95,10 @@ fn main() {
         let cuda_lib_dir =
             env::var("CUDA_LIB_DIR").unwrap_or_else(|_| format!("{cuda_home}/lib64"));
         let debug_build = env::var("DEBUG").is_ok_and(|debug| debug == "true");
+        println!(
+            "cargo::rustc-env=MXX_NATIVE_KERNEL_BUILD_REVISION={}",
+            native_kernel_build_revision(Path::new("cuda"), &cuda_arch, debug_build)
+        );
         if env::var("NVCC").is_err() {
             let nvcc_path = format!("{cuda_home}/bin/nvcc");
             if PathBuf::from(&nvcc_path).exists() {

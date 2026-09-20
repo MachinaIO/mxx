@@ -3,7 +3,7 @@ use crate::{
     transcript::{DrawSite, RecordedValue},
 };
 use mxx_ir_core::{
-    artifact::{ArtifactConfidentiality, ArtifactType, Manifest, ProductionId, SpecHash},
+    artifact::{ArtifactAvailability, ArtifactType, Manifest, ProductionId, SpecHash},
     encoding::IR_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ pub enum SessionStatus {
 pub struct ArtifactHandle {
     pub key: ArtifactKey,
     pub artifact_type: ArtifactType,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
     pub layout: Option<String>,
 }
 
@@ -113,4 +113,18 @@ pub trait SessionStore: ArtifactStore {
     fn commit_artifact(&mut self, handle: &ArtifactHandle) -> Result<(), Self::Error>;
 
     fn finalize_session(&mut self, manifest: Manifest) -> Result<(), Self::Error>;
+
+    /// Read the immutable manifest of a finalized production.  This method
+    /// never opens, creates, or resumes a session.
+    fn load_finalized_manifest(
+        &mut self,
+        production: &ProductionId,
+    ) -> Result<Manifest, Self::Error>;
+
+    /// Resolve an existing named session and read its finalized manifest.
+    /// Implementations must not allocate a nonce when the alias is missing.
+    fn load_finalized_named_manifest(
+        &mut self,
+        expected: &SessionAliasDescriptor,
+    ) -> Result<Manifest, Self::Error>;
 }

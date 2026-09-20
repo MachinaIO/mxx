@@ -38,8 +38,8 @@ target; shape and coefficient bounds alone do not establish that binding.
 ## Runtime storage and execution
 
 `FileArtifactStore` complements the memory store with persistent artifacts,
-family members and resumable sessions. Existing schema and hash validation remain
-part of loading and committing artifacts.
+family members and resumable sessions. Existing schema and production-identity
+checks remain part of loading and committing artifacts.
 
 GPU preimage targets are staged from existing shards without first assembling a
 full device matrix. The column source loads the requested output range. This bounds

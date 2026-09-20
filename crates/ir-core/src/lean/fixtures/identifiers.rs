@@ -31,7 +31,7 @@ fn export_keyword_identifier_fixture() {
     let (graph, _) = Graph::freeze(
         "keyword-parameters",
         vec![CompileParameter { name: "match".into(), kind: CompileParameterKind::Integer }],
-        BTreeMap::from([("value".into(), GraphOutput { value, confidentiality: None })]),
+        BTreeMap::from([("value".into(), GraphOutput { value, availability: None })]),
         vec![],
         vec![],
         BTreeMap::new(),

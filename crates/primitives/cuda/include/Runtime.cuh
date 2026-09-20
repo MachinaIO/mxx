@@ -16,6 +16,11 @@
 extern "C" {
 #endif
 
+// Status returned by the CUDA C ABI for a device allocation that cannot be
+// satisfied.  Keep this distinct from the generic failure status so Rust can
+// classify allocation failure without inspecting the human-readable message.
+#define GPU_STATUS_OUT_OF_MEMORY 2
+
 typedef struct GpuContext GpuContext;
 typedef struct GpuEventSet GpuEventSet;
 
@@ -48,9 +53,14 @@ int gpu_device_get_identity(
     int device,
     char *out_name,
     size_t name_capacity,
+    char *out_uuid,
+    size_t uuid_capacity,
     int *out_compute_major,
     int *out_compute_minor,
-    size_t *out_total_global_memory);
+    size_t *out_total_global_memory,
+    int *out_driver_version,
+    int *out_runtime_version,
+    uint64_t *out_context_generation);
 
 /// Transfers ownership of pinned host pointers to the context-owned
 /// reclaimer. The reclaimer records a completion event on `stream`, waits
@@ -72,6 +82,11 @@ int gpu_device_synchronize();
 int gpu_device_reset();
 
 const char *gpu_last_error();
+
+// Store a CUDA runtime error and return its stable ABI status.  In particular,
+// cudaErrorMemoryAllocation maps to GPU_STATUS_OUT_OF_MEMORY; all other CUDA
+// errors remain generic failures.
+int gpu_set_last_error_cuda(int cuda_error);
 
 void *gpu_pinned_alloc(size_t bytes);
 void gpu_pinned_free(void *ptr);

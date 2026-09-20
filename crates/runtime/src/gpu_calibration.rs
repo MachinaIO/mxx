@@ -1,11 +1,11 @@
 //! Setup-time calibration shared by the GPU estimator and runtime scheduler.
 //!
-//! A profile records only the column-scaled allocation cost observed by a
-//! pilot operation. The scheduler combines that reusable cost with the
-//! current resident allocation on each device role. GPU 0 is deliberately
-//! separate because it may own setup data that is absent from the other,
-//! otherwise-identical GPUs.
+//! The fixed planner consumes measured points scoped to one concrete device
+//! and execution context.  Older role-based pilot helpers remain below only
+//! for the legacy dynamic backend; they are deliberately not part of the
+//! fixed-plan calibration contract.
 
+use crate::gpu_execution_plan::{FrozenGpuPlan, FrozenGpuPlanIndex, GpuExecutionSiteKey};
 use mxx_ir_core::{
     FrozenGraphScopeId, IntExpr, ParamEnv, concretize_wire_type, encoding,
     node::{ConcatAxis, ConstantMatrix, IndexRange, MatrixBinaryOp, NodeKind},
@@ -94,6 +94,35 @@ pub fn gpu_calibration_environment(
     encoded.into()
 }
 
+/// Build an environment identity for a concrete device/context.
+///
+/// The old [`gpu_calibration_environment`] helper intentionally shared a
+/// representative nonzero-GPU role.  That is unsuitable for fixed planning:
+/// device identity, native implementation revision, and CUDA context
+/// generation are all part of the evidence that makes a measurement usable.
+/// Keep those facts in the key instead of deriving a bytes-per-column slope
+/// from another device.
+pub fn gpu_device_calibration_environment(
+    device: &GpuDeviceIdentity,
+    device_id: i32,
+    backend_revision: &str,
+    context_generation: u64,
+    vram_percent: u32,
+) -> Arc<[u8]> {
+    let mut encoded = b"mxx-gpu-device-calibration-environment-v3".to_vec();
+    encoded.extend_from_slice(&device_id.to_le_bytes());
+    encoded.extend_from_slice(&(backend_revision.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(backend_revision.as_bytes());
+    encoded.extend_from_slice(&context_generation.to_le_bytes());
+    encoded.extend_from_slice(&(device.name.len() as u64).to_le_bytes());
+    encoded.extend_from_slice(device.name.as_bytes());
+    encoded.extend_from_slice(&device.compute_major.to_le_bytes());
+    encoded.extend_from_slice(&device.compute_minor.to_le_bytes());
+    encoded.extend_from_slice(&(device.total_global_memory as u64).to_le_bytes());
+    encoded.extend_from_slice(&vram_percent.to_le_bytes());
+    encoded.into()
+}
+
 pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
     matches!(
         kind,
@@ -111,6 +140,7 @@ pub fn gpu_operation_is_column_separable(kind: &NodeKind) -> bool {
             NodeKind::ModulusSwitch { .. } |
             NodeKind::ModulusReduce { .. } |
             NodeKind::CenteredRebase { .. } |
+            NodeKind::BlockModSwitch { .. } |
             NodeKind::RnsModUp { .. } |
             NodeKind::RnsModDown { .. } |
             NodeKind::MatrixBinary(_) |
@@ -300,6 +330,7 @@ pub fn gpu_calibration_operation_identity(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::BlockModSwitch { .. } |
         NodeKind::RnsModUp { .. } |
         NodeKind::RnsModDown { .. } |
         NodeKind::MatrixNegate => {
@@ -498,6 +529,14 @@ impl GpuCalibrationKey {
     pub fn environment(&self) -> &[u8] {
         &self.environment
     }
+
+    /// Construct a lookup key only from complete measured-context provenance.
+    /// The legacy two-byte-slice constructor remains for dynamic callers, but
+    /// fixed planning should prefer this form so operation and environment
+    /// cannot be accidentally detached from their device context.
+    pub fn from_context(context: &GpuCalibrationContext) -> Self {
+        Self::new(context.operation.clone(), context.environment.clone())
+    }
 }
 
 impl fmt::Debug for GpuCalibrationKey {
@@ -510,7 +549,191 @@ impl fmt::Debug for GpuCalibrationKey {
     }
 }
 
-/// Column-scaled memory cost measured by one pilot execution on one device.
+/// Provenance attached to a measured memory point used by fixed planning.
+///
+/// This is intentionally device-specific.  In particular, there is no
+/// `Gpu0`/`Nonzero` role in this type: two devices may only share evidence if
+/// their complete contexts are equal and the caller explicitly reuses the
+/// same key.  A native revision or context-generation change invalidates the
+/// evidence through ordinary typed equality.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct GpuCalibrationContext {
+    operation: Arc<[u8]>,
+    environment: Arc<[u8]>,
+    device_id: i32,
+    backend_revision: Arc<[u8]>,
+    context_generation: u64,
+}
+
+impl GpuCalibrationContext {
+    pub fn new(
+        operation: impl AsRef<[u8]>,
+        environment: impl AsRef<[u8]>,
+        device_id: i32,
+        backend_revision: impl AsRef<[u8]>,
+        context_generation: u64,
+    ) -> Self {
+        Self {
+            operation: Arc::from(operation.as_ref()),
+            environment: Arc::from(environment.as_ref()),
+            device_id,
+            backend_revision: Arc::from(backend_revision.as_ref()),
+            context_generation,
+        }
+    }
+
+    pub fn operation(&self) -> &[u8] {
+        &self.operation
+    }
+
+    pub fn environment(&self) -> &[u8] {
+        &self.environment
+    }
+
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    pub fn backend_revision(&self) -> &[u8] {
+        &self.backend_revision
+    }
+
+    pub fn context_generation(&self) -> u64 {
+        self.context_generation
+    }
+
+    pub fn key(&self) -> GpuCalibrationKey {
+        GpuCalibrationKey::from_context(self)
+    }
+}
+
+/// One measured incremental memory observation at a positive local width.
+///
+/// `peak_bytes` is tied to the exact execution class in the surrounding
+/// [`GpuCalibrationContext`].  It is not a per-column slope and must never be
+/// multiplied from one pilot to manufacture another width.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMeasuredMemoryPoint {
+    pub columns: usize,
+    pub peak_bytes: u64,
+}
+
+/// Point-first memory evidence for one device and execution context.
+///
+/// The table retains every measured anchor.  A query at an interior width may
+/// use bounded affine interpolation for ranking/reporting, but a hard memory
+/// admission decision must use a directly measured anchor (or an independent
+/// exact allocation bound).  There is deliberately no origin scaling,
+/// quadratic term, or cross-device role fallback here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuMeasuredMemoryProfile {
+    context: GpuCalibrationContext,
+    points: Arc<[GpuMeasuredMemoryPoint]>,
+}
+
+impl GpuMeasuredMemoryProfile {
+    pub fn from_points(
+        context: GpuCalibrationContext,
+        points: impl IntoIterator<Item = GpuMeasuredMemoryPoint>,
+    ) -> Result<Self, GpuCalibrationError> {
+        let points = points.into_iter().collect::<Vec<_>>();
+        if points.is_empty() {
+            return Err(GpuCalibrationError::NoMeasuredMemoryPoints);
+        }
+        let mut previous = None;
+        for point in &points {
+            if point.columns == 0 {
+                return Err(GpuCalibrationError::ZeroMeasuredMemoryColumns);
+            }
+            if point.peak_bytes == 0 {
+                return Err(GpuCalibrationError::ZeroMeasuredMemoryPeak);
+            }
+            if previous.is_some_and(|columns| point.columns <= columns) {
+                return Err(GpuCalibrationError::UnsortedMeasuredMemoryPoints);
+            }
+            previous = Some(point.columns);
+        }
+        Ok(Self { context, points: points.into() })
+    }
+
+    pub fn context(&self) -> &GpuCalibrationContext {
+        &self.context
+    }
+
+    pub fn points(&self) -> &[GpuMeasuredMemoryPoint] {
+        &self.points
+    }
+
+    pub fn measured_anchor(&self, columns: usize) -> Option<GpuMeasuredMemoryPoint> {
+        self.points.iter().copied().find(|point| point.columns == columns)
+    }
+
+    /// Resolve a bounded memory estimate at `columns` using direct lookup or
+    /// affine interpolation between adjacent measured anchors.  Extrapolation
+    /// is rejected so an invalid context cannot silently look usable.
+    pub fn estimate_bytes(&self, columns: usize) -> Result<u64, GpuCalibrationError> {
+        if columns == 0 {
+            return Err(GpuCalibrationError::ZeroMeasuredMemoryColumns);
+        }
+        if let Some(point) = self.measured_anchor(columns) {
+            return Ok(point.peak_bytes);
+        }
+        let upper = self.points.iter().find(|point| point.columns > columns);
+        let lower = self.points.iter().rev().find(|point| point.columns < columns);
+        let (Some(lower), Some(upper)) = (lower, upper) else {
+            return Err(GpuCalibrationError::MeasuredMemoryExtrapolation { columns });
+        };
+        let x = u128::try_from(columns).map_err(|_| GpuCalibrationError::ArithmeticOverflow)?;
+        let x0 =
+            u128::try_from(lower.columns).map_err(|_| GpuCalibrationError::ArithmeticOverflow)?;
+        let x1 =
+            u128::try_from(upper.columns).map_err(|_| GpuCalibrationError::ArithmeticOverflow)?;
+        let y0 = u128::from(lower.peak_bytes);
+        let y1 = u128::from(upper.peak_bytes);
+        let denominator = x1 - x0;
+        let base = y0.checked_mul(denominator).ok_or(GpuCalibrationError::ArithmeticOverflow)?;
+        let delta = if y1 >= y0 {
+            (y1 - y0).checked_mul(x - x0).ok_or(GpuCalibrationError::ArithmeticOverflow)?
+        } else {
+            (y0 - y1).checked_mul(x - x0).ok_or(GpuCalibrationError::ArithmeticOverflow)?
+        };
+        let numerator = if y1 >= y0 { base.checked_add(delta) } else { base.checked_sub(delta) }
+            .ok_or(GpuCalibrationError::ArithmeticOverflow)?;
+        let rounded = numerator
+            .checked_add(denominator - 1)
+            .ok_or(GpuCalibrationError::ArithmeticOverflow)? /
+            denominator;
+        u64::try_from(rounded).map_err(|_| GpuCalibrationError::ArithmeticOverflow)
+    }
+
+    /// Return the largest directly measured anchor that fits the current
+    /// budget.  Interpolated resource values are intentionally not accepted
+    /// as a hard admission certificate.
+    pub fn largest_fitting_anchor(
+        &self,
+        memory: GpuDeviceMemory,
+        vram_percent: u32,
+    ) -> Result<usize, GpuCalibrationError> {
+        memory.validate()?;
+        if !(1..=100).contains(&vram_percent) {
+            return Err(GpuCalibrationError::InvalidVramPercent(vram_percent));
+        }
+        let budget = (u128::from(memory.total_bytes) * u128::from(vram_percent)) / 100;
+        let available = budget.saturating_sub(u128::from(memory.resident_bytes));
+        self.points
+            .iter()
+            .filter(|point| u128::from(point.peak_bytes) <= available)
+            .map(|point| point.columns)
+            .max()
+            .ok_or(GpuCalibrationError::NoFittingMeasuredMemoryAnchor)
+    }
+}
+
+/// Legacy single-pilot memory cost used only by the dynamic backend.
+///
+/// Fixed planning must use [`GpuMeasuredMemoryProfile`] instead.  This type
+/// remains source-compatible for the dynamic compatibility path, but its
+/// `bytes_per_column` value is not valid evidence for a fixed plan.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct GpuDeviceCalibration {
     pilot_columns: usize,
@@ -608,7 +831,11 @@ pub enum GpuDeviceRole {
     Nonzero,
 }
 
-/// Reusable pilot results for GPU 0 and the representative nonzero GPU.
+/// Legacy role-based pilot results for the dynamic backend.
+///
+/// Fixed planning must not reuse the `nonzero` role as a representative for
+/// another physical device; use one [`GpuMeasuredMemoryProfile`] per concrete
+/// device/context instead.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GpuCalibrationProfile {
     pub gpu0: GpuDeviceCalibration,
@@ -616,6 +843,49 @@ pub struct GpuCalibrationProfile {
 }
 
 impl GpuCalibrationProfile {
+    /// Return every per-device width frozen for a site. This is the preferred
+    /// adapter for heterogeneous fleets; unlike calibration it never queries
+    /// current resident memory.
+    pub fn fixed_columns_for_plan(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<Vec<usize>, GpuCalibrationError> {
+        plan.validate()
+            .map_err(|error| GpuCalibrationError::InvalidFrozenPlan(error.to_string()))?;
+        let index = FrozenGpuPlanIndex::build(plan)
+            .map_err(|error| GpuCalibrationError::InvalidFrozenPlan(error.to_string()))?;
+        let choice =
+            index.node_choice(plan, site).ok_or(GpuCalibrationError::MissingPlanSite(site))?;
+        if choice.columns_per_job.is_empty() ||
+            choice.columns_per_job.iter().all(|width| *width == 0)
+        {
+            return Err(GpuCalibrationError::ZeroPlanWidth(site));
+        }
+        Ok(choice.columns_per_job.clone())
+    }
+
+    /// Return the widths already frozen in a plan. Production callers must
+    /// use this adapter instead of applying the legacy calibration slope to
+    /// current allocator residency; residency-dependent [`Self::derive_widths`]
+    /// is retained only for the dynamic compatibility backend.
+    pub fn fixed_widths_for_plan(
+        plan: &FrozenGpuPlan,
+        site: GpuExecutionSiteKey,
+    ) -> Result<GpuColumnWidths, GpuCalibrationError> {
+        let columns = Self::fixed_columns_for_plan(plan, site)?;
+        let gpu0 = columns[0];
+        let nonzero = columns.get(1).copied();
+        if let Some(expected) = nonzero {
+            if columns[1..].iter().any(|width| *width != expected) {
+                return Err(GpuCalibrationError::PlanNonzeroWidthMismatch(site));
+            }
+        }
+        if gpu0 == 0 && nonzero.is_none_or(|width| width == 0) {
+            return Err(GpuCalibrationError::ZeroPlanWidth(site));
+        }
+        Ok(GpuColumnWidths { gpu0, nonzero })
+    }
+
     pub fn derive_widths(
         &self,
         gpu0_memory: GpuDeviceMemory,
@@ -747,6 +1017,18 @@ pub fn gpu_capped_waterfill_columns(
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum GpuCalibrationError {
+    #[error("fixed calibration has no measured memory points")]
+    NoMeasuredMemoryPoints,
+    #[error("fixed calibration memory points must use positive columns")]
+    ZeroMeasuredMemoryColumns,
+    #[error("fixed calibration memory points must use positive peaks")]
+    ZeroMeasuredMemoryPeak,
+    #[error("fixed calibration memory points must be strictly sorted")]
+    UnsortedMeasuredMemoryPoints,
+    #[error("no measured memory anchor can fit the requested budget")]
+    NoFittingMeasuredMemoryAnchor,
+    #[error("fixed calibration cannot extrapolate memory at {columns} columns")]
+    MeasuredMemoryExtrapolation { columns: usize },
     #[error("GPU calibration pilot must contain at least one column")]
     ZeroPilotColumns,
     #[error("GPU calibration pilot observed no additional device memory")]
@@ -780,6 +1062,14 @@ pub enum GpuCalibrationError {
     InvalidOperationIdentityLength(usize),
     #[error("GPU calibration registry is frozen")]
     RegistryFrozen,
+    #[error("frozen GPU plan has no node site {0:?}")]
+    MissingPlanSite(GpuExecutionSiteKey),
+    #[error("frozen GPU plan has no active column width at node site {0:?}")]
+    ZeroPlanWidth(GpuExecutionSiteKey),
+    #[error("frozen GPU plan has different nonzero widths at node site {0:?}")]
+    PlanNonzeroWidthMismatch(GpuExecutionSiteKey),
+    #[error("frozen GPU plan is invalid: {0}")]
+    InvalidFrozenPlan(String),
 }
 
 #[derive(Default)]
@@ -866,6 +1156,13 @@ impl FrozenGpuCalibrationRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        gpu_execution_plan::{
+            FrozenGpuPlan, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout, GpuNodeChoice,
+            GpuPlanContract,
+        },
+        gpu_schedule::GpuColumnInterval,
+    };
     use mxx_ir_core::types::ConcreteMatrixType;
     use num_bigint::BigInt;
 
@@ -913,6 +1210,62 @@ mod tests {
             gpu_tensor_sum_rows_operation_identity(&left, &right, &output, &[vec![2, 0]]).unwrap()
         );
         assert_ne!(identity, gpu_sum_rows_operation_identity(&source, &output, &rows).unwrap());
+    }
+
+    #[test]
+    fn fixed_plan_widths_never_read_current_residency() {
+        let contract = GpuPlanContract {
+            graph_specification_hash: [1; 32],
+            backend_identity: "test".into(),
+            logical_to_physical_devices: vec![0, 1],
+            device_budgets: vec![
+                GpuDeviceBudget {
+                    device: 0,
+                    device_bytes: 100,
+                    pinned_host_bytes: 100,
+                    host_bytes: 100,
+                },
+                GpuDeviceBudget {
+                    device: 1,
+                    device_bytes: 100,
+                    pinned_host_bytes: 100,
+                    host_bytes: 100,
+                },
+            ],
+            shape_contract_hash: [2; 32],
+            backend_revision: "test".into(),
+        };
+        let site = GpuExecutionSiteKey { site: 4, shape_class: 0, instance_class: 0 };
+        let plan = FrozenGpuPlan::new(
+            contract,
+            vec![GpuLayout {
+                id: 1,
+                columns: 8,
+                rows: 1,
+                ring_dimension: 1,
+                representation: "matrix".into(),
+                instance_device_stride: 0,
+                owner_intervals: vec![
+                    GpuColumnInterval { device: 0, start: 0, end: 4 },
+                    GpuColumnInterval { device: 1, start: 4, end: 8 },
+                ],
+            }],
+            vec![],
+            vec![GpuNodeChoice {
+                loop_site: None,
+                key: site,
+                operation_identity: [3; 32],
+                effective_operation: crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd,
+                column_capability: crate::gpu_column_policy::ColumnCapability::SameColumns,
+                output_layouts: vec![1],
+                columns_per_job: vec![3, 5],
+                implementation_variant: "test".into(),
+                preimage_max_attempts: None,
+            }],
+        )
+        .unwrap();
+        let widths = GpuCalibrationProfile::fixed_widths_for_plan(&plan, site).unwrap();
+        assert_eq!(widths, GpuColumnWidths { gpu0: 3, nonzero: Some(5) });
     }
 
     #[test]
@@ -968,6 +1321,119 @@ mod tests {
         assert_ne!(
             baseline,
             gpu_calibration_environment(&device("Other GPU", 8, 9, 24 << 30), 2, 80)
+        );
+    }
+
+    #[test]
+    fn fixed_memory_profile_keeps_all_anchors_and_affine_intercept() {
+        let device = device("Example GPU", 8, 9, 24 << 30);
+        let context = GpuCalibrationContext::new(
+            [7; 32],
+            gpu_device_calibration_environment(&device, 3, "native-r42", 11, 80),
+            3,
+            "native-r42",
+            11,
+        );
+        let profile = GpuMeasuredMemoryProfile::from_points(
+            context,
+            [
+                GpuMeasuredMemoryPoint { columns: 2, peak_bytes: 13 },
+                GpuMeasuredMemoryPoint { columns: 5, peak_bytes: 31 },
+                GpuMeasuredMemoryPoint { columns: 9, peak_bytes: 56 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(profile.points().len(), 3);
+        assert_eq!(profile.estimate_bytes(5).unwrap(), 31);
+        // 2 -> 13 and 5 -> 31 gives 19 at width 3.  Origin scaling would
+        // incorrectly produce 19.5 (rounded to 20), proving the intercept is
+        // retained by the bounded affine resolver.
+        assert_eq!(profile.estimate_bytes(3).unwrap(), 19);
+        assert_eq!(profile.estimate_bytes(7).unwrap(), 44);
+        assert_eq!(
+            profile.estimate_bytes(1),
+            Err(GpuCalibrationError::MeasuredMemoryExtrapolation { columns: 1 })
+        );
+        assert_eq!(
+            profile.estimate_bytes(10),
+            Err(GpuCalibrationError::MeasuredMemoryExtrapolation { columns: 10 })
+        );
+    }
+
+    #[test]
+    fn fixed_memory_profile_rejects_bad_anchor_tables() {
+        let context = GpuCalibrationContext::new([1; 32], [2; 32], 0, "rev", 1);
+        assert_eq!(
+            GpuMeasuredMemoryProfile::from_points(context.clone(), []),
+            Err(GpuCalibrationError::NoMeasuredMemoryPoints)
+        );
+        assert_eq!(
+            GpuMeasuredMemoryProfile::from_points(
+                context.clone(),
+                [
+                    GpuMeasuredMemoryPoint { columns: 2, peak_bytes: 1 },
+                    GpuMeasuredMemoryPoint { columns: 2, peak_bytes: 2 }
+                ],
+            ),
+            Err(GpuCalibrationError::UnsortedMeasuredMemoryPoints)
+        );
+        assert_eq!(
+            GpuMeasuredMemoryProfile::from_points(
+                context,
+                [GpuMeasuredMemoryPoint { columns: 0, peak_bytes: 1 }],
+            ),
+            Err(GpuCalibrationError::ZeroMeasuredMemoryColumns)
+        );
+    }
+
+    #[test]
+    fn fixed_memory_admission_uses_measured_anchors_only() {
+        let context = GpuCalibrationContext::new([1; 32], [2; 32], 0, "rev", 1);
+        let profile = GpuMeasuredMemoryProfile::from_points(
+            context,
+            [
+                GpuMeasuredMemoryPoint { columns: 1, peak_bytes: 40 },
+                GpuMeasuredMemoryPoint { columns: 4, peak_bytes: 100 },
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            profile
+                .largest_fitting_anchor(
+                    GpuDeviceMemory { total_bytes: 100, resident_bytes: 0 },
+                    80,
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            profile.largest_fitting_anchor(
+                GpuDeviceMemory { total_bytes: 100, resident_bytes: 100 },
+                80,
+            ),
+            Err(GpuCalibrationError::NoFittingMeasuredMemoryAnchor)
+        );
+    }
+
+    #[test]
+    fn fixed_context_invalidates_device_revision_and_context_generation() {
+        let gpu = device("Example GPU", 8, 9, 24 << 30);
+        let environment = gpu_device_calibration_environment(&gpu, 0, "native-r42", 1, 80);
+        assert_ne!(environment, gpu_device_calibration_environment(&gpu, 1, "native-r42", 1, 80));
+        let same = GpuCalibrationContext::new([7; 32], environment.clone(), 0, "native-r42", 1);
+        assert_ne!(
+            same,
+            GpuCalibrationContext::new([7; 32], environment.clone(), 1, "native-r42", 1)
+        );
+        assert_ne!(
+            same,
+            GpuCalibrationContext::new([7; 32], environment.clone(), 0, "native-r43", 1)
+        );
+        assert_ne!(same, GpuCalibrationContext::new([7; 32], environment, 0, "native-r42", 2));
+        let changed_device = device("Other GPU", 8, 9, 24 << 30);
+        assert_ne!(
+            same.environment(),
+            gpu_device_calibration_environment(&changed_device, 0, "native-r42", 1, 80).as_ref()
         );
     }
 

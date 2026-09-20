@@ -1,5 +1,6 @@
 use crate::{
     element::PolyElem,
+    gpu_memory::TensorRowSumImplementation,
     matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallMatrixError, SmallPolyMatrix},
     parallel_iter,
     poly::{
@@ -8,13 +9,14 @@ use crate::{
             gpu::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
-                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixOpaque, GpuP1CovarianceCacheOpaque,
-                GpuRngSeed, GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixOpaque,
-                PinnedHostBuffer, check_status, gpu_event_set_destroy, gpu_event_set_wait,
-                gpu_matrix_add, gpu_matrix_add_block, gpu_matrix_add_row_blocks,
-                gpu_matrix_binary_batch, gpu_matrix_centered_rebase, gpu_matrix_convert_modulus,
-                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
+                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixAllocationBytes, GpuMatrixOpaque,
+                GpuP1CovarianceCacheOpaque, GpuRngSeed, GpuSmallMatrixAllocationReportRaw,
+                GpuSmallMatrixOpaque, PinnedHostBuffer, check_status, gpu_event_set_destroy,
+                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
+                gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_block_mod_switch,
+                gpu_matrix_centered_rebase, gpu_matrix_convert_modulus, gpu_matrix_copy,
+                gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_copy_peer_query,
+                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
@@ -32,10 +34,10 @@ use crate::{
                 gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
                 gpu_matrix_sum_rows, gpu_matrix_tensor, gpu_matrix_tensor_sum_rows,
                 gpu_matrix_transpose, gpu_matrix_wait, gpu_small_matrix_copy,
-                gpu_small_matrix_copy_columns, gpu_small_matrix_create,
-                gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
+                gpu_small_matrix_copy_columns, gpu_small_matrix_copy_cross_context,
+                gpu_small_matrix_create, gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
                 gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
-                gpu_small_matrix_store_coefficients,
+                gpu_small_matrix_query_allocation_bytes, gpu_small_matrix_store_coefficients,
                 gpu_small_matrix_try_pack_preimage_hard_cutoff_tile, gpu_small_matrix_view_columns,
                 gpu_small_matrix_wait,
             },
@@ -72,6 +74,97 @@ pub struct GpuDCRTPolyMatrix {
     raw: *mut GpuMatrixOpaque,
 }
 
+/// Fully validated metadata and payload for the GPU compact matrix codec.
+/// This is shared by the device decoder and fleet sharding path so the latter
+/// cannot bypass version, width, format, or payload-length checks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuCompactMatrixEncoding {
+    pub format: u8,
+    pub level: usize,
+    pub rows: usize,
+    pub columns: usize,
+    pub max_coeff_bits: u16,
+    pub bytes_per_coeff: u16,
+    pub payload: Vec<u8>,
+}
+
+pub fn decode_compact_matrix_bytes(
+    params: &GpuDCRTPolyParams,
+    bytes: &[u8],
+) -> Result<GpuCompactMatrixEncoding, crate::matrix::CompactMatrixDecodeError> {
+    let (
+        (version, format_tag, level_u32, rows, columns, max_coeff_bits, bytes_per_coeff, payload),
+        consumed,
+    ): ((u8, u8, u32, usize, usize, u16, u16, Vec<u8>), usize) =
+        bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+            crate::matrix::CompactMatrixDecodeError::InvalidHeader("cannot decode compact matrix")
+        })?;
+    if consumed != bytes.len() {
+        return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+            "trailing compact matrix bytes",
+        ));
+    }
+    if version != 1 {
+        return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+            version,
+            supported_versions: &[1],
+        });
+    }
+    if format_tag != GPU_POLY_FORMAT_COEFF as u8 && format_tag != GPU_POLY_FORMAT_EVAL as u8 {
+        return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+            "invalid compact matrix format",
+        ));
+    }
+    let level = usize::try_from(level_u32).map_err(|_| {
+        crate::matrix::CompactMatrixDecodeError::InvalidHeader("compact matrix level overflows")
+    })?;
+    if level >= params.crt_depth() {
+        return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+            "invalid compact matrix level",
+        ));
+    }
+    if max_coeff_bits == 0 {
+        if bytes_per_coeff != 0 || !payload.is_empty() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "zero-width compact matrix must have an empty payload",
+            ));
+        }
+    } else {
+        let expected_bytes_per_coeff = ((max_coeff_bits as usize).div_ceil(8)) as u16;
+        if bytes_per_coeff != expected_bytes_per_coeff {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "compact matrix bytes-per-coefficient mismatch",
+            ));
+        }
+    }
+    let coeff_count = rows
+        .checked_mul(columns)
+        .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
+        .ok_or(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+            "compact matrix shape overflows",
+        ))?;
+    let expected_payload_len = coeff_count
+        .checked_mul(max_coeff_bits as usize)
+        .map(|bits| bits.div_ceil(8))
+        .ok_or(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+            "compact matrix payload length overflows",
+        ))?;
+    if payload.len() != expected_payload_len {
+        return Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+            "compact matrix payload length mismatch",
+        ));
+    }
+    Ok(GpuCompactMatrixEncoding {
+        format: format_tag,
+        level,
+        rows,
+        columns,
+        max_coeff_bits,
+        bytes_per_coeff,
+        payload,
+    })
+}
+
 /// Compact, semantic-kind-free owner for a bounded matrix on a GPU.
 ///
 /// The CUDA object owns the packed coefficient buffer and any stream-ordered
@@ -85,6 +178,17 @@ pub struct GpuSmallMatrix {
     resident_payload_bytes: usize,
     max_coefficient_bound: BigUint,
     raw: *mut GpuSmallMatrixOpaque,
+}
+
+/// Exact resources required by the canonical compact importer.  The native
+/// loader uses one pageable payload and one `cudaHostAlloc` staging payload;
+/// keeping these values beside the importer prevents warmup from inventing a
+/// separate compact fixture representation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuSmallMatrixImportAllocationEvidence {
+    pub device: GpuMatrixAllocationBytes,
+    pub pageable_host_bytes: usize,
+    pub pinned_host_bytes: usize,
 }
 
 /// Accounting for one compact-RHS multiplication. `lhs_eval_bytes` and
@@ -339,11 +443,182 @@ impl AsRef<GpuSmallMatrix> for GpuSmallMatrixColumnView<'_> {
     }
 }
 
+impl GpuSmallMatrixColumnView<'_> {
+    /// Query the compact owner allocation that would be created if this
+    /// borrowed range were materialized.  The view itself keeps the parent
+    /// owner's resident payload so multiplication accounting continues to
+    /// describe borrowed residency; temporary-owner accounting must instead
+    /// use this range-sized query.
+    pub fn materialization_allocation_bytes(&self) -> Result<GpuMatrixAllocationBytes, String> {
+        GpuSmallMatrix::allocation_bytes_for_shape(
+            &self.value.params,
+            self.value.rows,
+            self.value.columns,
+            self.value.magnitude_bytes,
+        )
+    }
+
+    /// Return canonical import resources for this range without charging the
+    /// source owner's full resident payload.  This is the descriptor used by
+    /// host-staged compact materialization and warmup admission.
+    pub fn canonical_import_allocation_evidence(
+        &self,
+    ) -> Result<GpuSmallMatrixImportAllocationEvidence, SmallMatrixError> {
+        GpuSmallMatrix::canonical_import_allocation_evidence(
+            &self.value.params,
+            self.value.rows,
+            self.value.columns,
+            &self.value.max_coefficient_bound,
+        )
+    }
+}
+
 impl GpuSmallMatrix {
     /// Wait only for this compact owner's last write event.
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_small_matrix_wait(self.raw) };
         check_status(status, "gpu_small_matrix_wait");
+    }
+
+    /// Return the exact device allocation owned by this compact matrix.
+    ///
+    /// Compact RHS values intentionally use a byte-stream allocation rather
+    /// than the regular matrix allocator.  The native owner has no auxiliary
+    /// device slab: its only device allocation is `resident_payload_bytes`;
+    /// CUDA event handles and the bound metadata are host-side state.  Keep
+    /// this query in the primitive owner so fleet resource accounting does
+    /// not approximate compact residency from a regular matrix shape.
+    pub fn allocation_bytes(&self) -> Result<GpuMatrixAllocationBytes, String> {
+        Ok(GpuMatrixAllocationBytes {
+            data_bytes: self.resident_payload_bytes,
+            aux_bytes: 0,
+            event_bytes: 0,
+            total_bytes: self.resident_payload_bytes,
+        })
+    }
+
+    /// Query the exact compact owner allocation used by a centered rebase.
+    /// The operation preserves the compact payload width and coefficient
+    /// bound; only the destination parameter context changes.  Keeping this
+    /// query beside the native owner avoids charging the full DCRT matrix
+    /// allocator for compact-to-compact D2D/alias dispatch.
+    pub fn centered_rebase_allocation_bytes(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<GpuMatrixAllocationBytes, String> {
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.execution_owner_id() != destination.execution_owner_id() ||
+            self.params.device_ids() != destination.device_ids()
+        {
+            return Err("compact centered rebase parameter placement mismatch".into());
+        }
+        <Self as SmallPolyMatrix>::validate_centered_rebase(self, destination)
+            .map_err(|error| error.to_string())?;
+        Self::allocation_bytes_for_shape(destination, self.rows, self.columns, self.magnitude_bytes)
+    }
+
+    /// Query the exact compact-owner allocation for a shape before creating
+    /// the owner. The native query shares the payload-size helper with
+    /// `gpu_small_matrix_create`, so callers do not mirror its byte layout.
+    pub fn allocation_bytes_for_shape(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        magnitude_bytes: usize,
+    ) -> Result<GpuMatrixAllocationBytes, String> {
+        let mut allocation = GpuMatrixAllocationBytes::default();
+        let status = unsafe {
+            gpu_small_matrix_query_allocation_bytes(
+                params.ctx_raw(),
+                rows,
+                columns,
+                magnitude_bytes,
+                &mut allocation,
+            )
+        };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(allocation)
+    }
+
+    pub fn canonical_import_allocation_evidence(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        bound: &BigUint,
+    ) -> Result<GpuSmallMatrixImportAllocationEvidence, SmallMatrixError> {
+        let magnitude_bytes = Self::magnitude_bytes(bound)?;
+        let payload_bytes =
+            Self::payload_len(rows, columns, params.ring_dimension(), magnitude_bytes)?;
+        let device = Self::allocation_bytes_for_shape(params, rows, columns, magnitude_bytes)
+            .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        Ok(GpuSmallMatrixImportAllocationEvidence {
+            device,
+            pageable_host_bytes: payload_bytes,
+            pinned_host_bytes: payload_bytes,
+        })
+    }
+
+    /// Return the exact canonical coefficient payload length without reading
+    /// the compact matrix back from the device.  This is the same descriptor
+    /// calculation used by the native compact owner and by
+    /// `to_canonical_coefficients` when it allocates its staging buffer.
+    pub fn canonical_payload_bytes(&self) -> Result<usize, SmallMatrixError> {
+        Self::payload_len(
+            self.rows,
+            self.columns,
+            self.params.ring_dimension(),
+            self.magnitude_bytes,
+        )
+    }
+
+    /// Number of payload bytes used for one signed coefficient magnitude.
+    /// This is exposed for native allocation queries that need to size a
+    /// destination compact owner without materializing it.
+    pub fn payload_magnitude_bytes(&self) -> usize {
+        self.magnitude_bytes
+    }
+
+    /// Extend a canonical compact owner directly on the device.  Because the
+    /// compact ingress has already checked source-modulus canonicality, an
+    /// included destination basis preserves the same signed coefficients and
+    /// bound; only the compact payload owner changes when contexts differ.
+    pub fn centered_rebase(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<Self, SmallMatrixError> {
+        self.validate_centered_rebase_destination(destination)?;
+        if self.params.device_ids() != destination.device_ids() {
+            return Err(SmallMatrixError::DeviceMismatch);
+        }
+        let output = Self::new_empty(
+            destination,
+            self.rows,
+            self.columns,
+            self.max_coefficient_bound.clone(),
+        )?;
+        let status = if self.params == *destination {
+            unsafe { gpu_small_matrix_copy(output.raw, self.raw) }
+        } else {
+            unsafe { gpu_small_matrix_copy_cross_context(output.raw, self.raw) }
+        };
+        check_status(status, "gpu_small_matrix_centered_rebase");
+        Ok(output)
+    }
+
+    /// Validate the public centered-rebase domain without allocating or
+    /// touching CUDA state.  Warmup sizing and production execution share
+    /// this validator so a query cannot certify a parameter topology that
+    /// the native operation would reject.
+    pub fn validate_centered_rebase_destination(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), SmallMatrixError> {
+        if self.params.execution_owner_id() != destination.execution_owner_id() {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        <Self as SmallPolyMatrix>::validate_centered_rebase(self, destination)
     }
 
     pub fn slice_columns(&self, start: usize, end: usize) -> Self {
@@ -716,6 +991,10 @@ impl GpuSmallMatrix {
 
 impl SmallPolyMatrix for GpuSmallMatrix {
     type Params = GpuDCRTPolyParams;
+
+    fn centered_rebase(&self, destination: &Self::Params) -> Result<Self, SmallMatrixError> {
+        GpuSmallMatrix::centered_rebase(self, destination)
+    }
 
     fn params(&self) -> &Self::Params {
         &self.params
@@ -1132,6 +1411,50 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Return the exact native topology selected by `tensor_sum_rows` for
+    /// the supplied row groups.  Warmup allocation queries call this same
+    /// decision so a fallback can never be advertised as output-only.
+    pub fn tensor_sum_rows_implementation(rows: &[Vec<usize>]) -> TensorRowSumImplementation {
+        TensorRowSumImplementation::for_groups(rows)
+    }
+
+    /// Validate the public centered-rebase domain without allocating or
+    /// touching CUDA state. Warmup sizing and production execution share this
+    /// validator so a query cannot certify an invalid source basis.
+    pub fn validate_centered_rebase_destination(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), String> {
+        if self.params.execution_owner_id() != destination.execution_owner_id() {
+            return Err("centered rebase requires matching dimensions and shared execution".into());
+        }
+        self.validate_centered_rebase_domain(destination)
+    }
+
+    /// Mathematical conversion domain, usable by allocation queries before
+    /// operand transport. Execution-owner equality belongs to local launch.
+    pub fn validate_centered_rebase_domain(
+        &self,
+        destination: &GpuDCRTPolyParams,
+    ) -> Result<(), String> {
+        if self.params.ring_dimension() != destination.ring_dimension() {
+            return Err("centered rebase requires matching ring dimensions".into());
+        }
+        let source_basis = self.params.moduli();
+        let destination_basis = destination.moduli();
+        if source_basis.len() > 1 &&
+            source_basis
+                .iter()
+                .take(self.level + 1)
+                .any(|prime| !destination_basis.contains(prime))
+        {
+            return Err(
+                "multi-limb centered rebase destination must contain the source basis".into()
+            );
+        }
+        Ok(())
+    }
+
     fn convert_modulus(&self, destination: &GpuDCRTPolyParams, round_scale: bool) -> Self {
         assert_eq!(
             self.params.ring_dimension(),
@@ -1383,11 +1706,42 @@ impl GpuDCRTPolyMatrix {
         Ok(out)
     }
 
-    pub(crate) fn level(&self) -> usize {
+    /// Number of dropped CRT towers in this matrix's current representation.
+    pub fn level(&self) -> usize {
         self.level
     }
 
-    pub(crate) fn is_ntt(&self) -> bool {
+    /// Return the exact native allocation envelope for this matrix owner.
+    /// This delegates to the CUDA size query used by `new_empty_with_state`,
+    /// so callers do not need to duplicate data/auxiliary/event alignment
+    /// rules when constructing a warmup resource envelope.
+    pub fn allocation_bytes(
+        &self,
+    ) -> Result<crate::poly::dcrt::gpu::GpuMatrixAllocationBytes, String> {
+        self.params.matrix_allocation_bytes(self.level, self.nrow, self.ncol, self.is_ntt)
+    }
+
+    /// Check whether the production direct-copy route can target `params`
+    /// without allocating a destination or mutating CUDA state.  The native
+    /// query compares the complete matrix representation and allocation
+    /// descriptor, then checks peer capability for cross-device routes.  A
+    /// successful result is therefore safe for admission; the copy itself
+    /// remains the operation that creates and populates the destination.
+    pub fn can_copy_to_params_direct(&self, params: &GpuDCRTPolyParams) -> Result<bool, String> {
+        if self.params.ctx_raw() == params.ctx_raw() {
+            return Ok(true);
+        }
+        let mut compatible = 0i32;
+        let status =
+            unsafe { gpu_matrix_copy_peer_query(self.raw, params.ctx_raw(), &mut compatible) };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        Ok(compatible != 0)
+    }
+
+    /// Whether the resident coefficients are in the evaluation domain.
+    pub fn is_ntt(&self) -> bool {
         self.is_ntt
     }
 
@@ -3306,46 +3660,106 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             .expect("Failed to serialize matrix to compact bytes")
     }
 
-    fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let (version, format_tag, level_u32, nrow, ncol, max_coeff_bits, bytes_per_coeff, payload): (
-            u8,
-            u8,
-            u32,
-            usize,
-            usize,
-            u16,
-            u16,
-            Vec<u8>,
-        ) =
-            bincode::decode_from_slice(bytes, bincode::config::standard())
-                .expect("Failed to deserialize matrix from compact bytes")
-                .0;
-        assert_eq!(version, 1, "Unsupported compact matrix version: {version}");
-        let format = match format_tag {
-            x if x == GPU_POLY_FORMAT_COEFF as u8 => GPU_POLY_FORMAT_COEFF,
-            x if x == GPU_POLY_FORMAT_EVAL as u8 => GPU_POLY_FORMAT_EVAL,
-            _ => panic!("Invalid compact matrix format tag: {format_tag}"),
-        };
-        let level = level_u32 as usize;
-        assert!(level < params.crt_depth(), "invalid compact matrix level: {level}");
-        let expected_bytes_per_coeff = ((max_coeff_bits as usize).div_ceil(8)) as u16;
-        assert_eq!(
-            bytes_per_coeff, expected_bytes_per_coeff,
-            "compact bytes_per_coeff mismatch: got {bytes_per_coeff}, expected {expected_bytes_per_coeff}"
-        );
+    fn validate_compact_bytes(bytes: &[u8]) -> Result<(), crate::matrix::CompactMatrixDecodeError> {
+        let (
+            (version, format_tag, _level, _rows, _columns, max_bits, bytes_per_coeff, payload),
+            consumed,
+        ): ((u8, u8, u32, usize, usize, u16, u16, Vec<u8>), usize) =
+            bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+                crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                    "cannot decode compact matrix",
+                )
+            })?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing compact matrix bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        if format_tag != GPU_POLY_FORMAT_COEFF as u8 && format_tag != GPU_POLY_FORMAT_EVAL as u8 {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "invalid compact matrix format",
+            ));
+        }
+        if max_bits == 0 {
+            if bytes_per_coeff != 0 || !payload.is_empty() {
+                return Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                    "zero-width compact matrix must have an empty payload",
+                ));
+            }
+        } else if bytes_per_coeff != ((max_bits as usize).div_ceil(8)) as u16 {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "compact matrix bytes-per-coefficient mismatch",
+            ));
+        }
+        Ok(())
+    }
 
-        let mut out = Self::new_empty_with_state(params, nrow, ncol, level, false, None);
+    fn compact_shape(
+        bytes: &[u8],
+    ) -> Result<(usize, usize), crate::matrix::CompactMatrixDecodeError> {
+        let (
+            (version, _format, _level, rows, columns, _max_bits, _bytes_per_coeff, _payload),
+            consumed,
+        ): ((u8, u8, u32, usize, usize, u16, u16, Vec<u8>), usize) =
+            bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+                crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                    "cannot decode compact matrix",
+                )
+            })?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing compact matrix bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        Ok((rows, columns))
+    }
+
+    fn from_compact_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
+        Self::try_from_compact_bytes(params, bytes).expect("validated compact matrix")
+    }
+
+    fn try_from_compact_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, crate::matrix::CompactMatrixDecodeError> {
+        let decoded = decode_compact_matrix_bytes(params, bytes)?;
+
+        let mut out = Self::new_empty_with_state(
+            params,
+            decoded.rows,
+            decoded.columns,
+            decoded.level,
+            false,
+            None,
+        );
         let status = unsafe {
-            gpu_matrix_load_compact_bytes(out.raw, payload.as_ptr(), payload.len(), max_coeff_bits)
+            gpu_matrix_load_compact_bytes(
+                out.raw,
+                decoded.payload.as_ptr(),
+                decoded.payload.len(),
+                decoded.max_coeff_bits,
+            )
         };
         check_status(status, "gpu_matrix_load_compact_bytes");
         out.is_ntt = false;
-        if format == GPU_POLY_FORMAT_EVAL {
+        if decoded.format == GPU_POLY_FORMAT_EVAL as u8 {
             let status = unsafe { gpu_matrix_ntt_all(out.raw) };
             check_status(status, "gpu_matrix_ntt_all");
             out.is_ntt = true;
         }
-        out
+        Ok(out)
     }
 
     fn into_cpu_staging_bytes(self) -> Vec<u8> {
@@ -3371,24 +3785,74 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         start: usize,
         end: usize,
     ) -> Self {
+        Self::try_from_cpu_staging_columns(params, bytes, start, end)
+            .expect("validated GPU RNS staging artifact")
+    }
+
+    fn try_from_cpu_staging_columns(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+        start: usize,
+        end: usize,
+    ) -> Result<Self, crate::matrix::CompactMatrixDecodeError> {
         let ((version, nrow, ncol, level, is_ntt, bytes_per_poly, payload), consumed): (
             (u8, usize, usize, usize, bool, usize, &[u8]),
             usize,
-        ) = bincode::borrow_decode_from_slice(bytes, bincode::config::standard())
-            .expect("Failed to deserialize GPU matrix RNS staging bytes");
-        assert_eq!(consumed, bytes.len(), "trailing RNS staging bytes");
-        assert_eq!(version, 1, "unsupported RNS staging version");
-        assert!(start <= end && end <= ncol, "invalid staging column interval");
-        assert!(level < params.crt_depth(), "invalid RNS staging level");
-        assert_eq!(bytes_per_poly, rns_bytes_len_for_level(params, level));
-        let full_bytes = nrow
-            .checked_mul(ncol)
-            .and_then(|n| n.checked_mul(bytes_per_poly))
-            .expect("RNS staging byte length overflow");
-        assert_eq!(payload.len(), full_bytes, "RNS staging payload length mismatch");
+        ) = bincode::borrow_decode_from_slice(bytes, bincode::config::standard()).map_err(
+            |_| {
+                crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                    "cannot decode RNS staging artifact",
+                )
+            },
+        )?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing RNS staging bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        if start > end || end > ncol {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "invalid staging column interval",
+            ));
+        }
+        if level >= params.crt_depth() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "invalid RNS staging level",
+            ));
+        }
+        let expected_bytes_per_poly = rns_bytes_len_for_level(params, level);
+        if bytes_per_poly != expected_bytes_per_poly {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "RNS staging bytes-per-polynomial mismatch",
+            ));
+        }
+        let full_bytes = nrow.checked_mul(ncol).and_then(|n| n.checked_mul(bytes_per_poly)).ok_or(
+            crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS staging byte length overflows",
+            ),
+        )?;
+        if payload.len() != full_bytes {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS staging payload length mismatch",
+            ));
+        }
         let columns = end - start;
-        let row_bytes = columns.checked_mul(bytes_per_poly).expect("RNS tile row overflow");
-        let tile_bytes = nrow.checked_mul(row_bytes).expect("RNS tile byte length overflow");
+        let row_bytes = columns.checked_mul(bytes_per_poly).ok_or(
+            crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS tile row length overflows",
+            ),
+        )?;
+        let tile_bytes = nrow.checked_mul(row_bytes).ok_or(
+            crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS tile byte length overflows",
+            ),
+        )?;
         let mut tile = PinnedHostBuffer::zeroed(tile_bytes);
         // The serialized RNS payload is polynomial-major and row-major. Only
         // selected columns enter pinned staging and device storage.
@@ -3398,7 +3862,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 target.copy_from_slice(&payload[offset..offset + row_bytes]);
             });
         }
-        Self::from_rns_snapshot(
+        Ok(Self::from_rns_snapshot(
             params,
             &GpuDCRTMatrixRnsSnapshot {
                 nrow,
@@ -3408,22 +3872,58 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 bytes_per_poly,
                 bytes: tile,
             },
-        )
+        ))
     }
 
     fn from_cpu_staging_bytes(params: &<Self::P as Poly>::Params, bytes: &[u8]) -> Self {
-        let (version, nrow, ncol, level, is_ntt, bytes_per_poly, payload): (
-            u8,
+        Self::try_from_cpu_staging_bytes(params, bytes).expect("validated GPU RNS staging artifact")
+    }
+
+    fn try_from_cpu_staging_bytes(
+        params: &<Self::P as Poly>::Params,
+        bytes: &[u8],
+    ) -> Result<Self, crate::matrix::CompactMatrixDecodeError> {
+        let ((version, nrow, ncol, level, is_ntt, bytes_per_poly, payload), consumed): (
+            (u8, usize, usize, usize, bool, usize, Vec<u8>),
             usize,
-            usize,
-            usize,
-            bool,
-            usize,
-            Vec<u8>,
-        ) = bincode::decode_from_slice(bytes, bincode::config::standard())
-            .expect("Failed to deserialize GPU matrix RNS staging bytes")
-            .0;
-        assert_eq!(version, 1, "Unsupported GPU matrix RNS staging version: {version}");
+        ) = bincode::decode_from_slice(bytes, bincode::config::standard()).map_err(|_| {
+            crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "cannot decode RNS staging artifact",
+            )
+        })?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing RNS staging bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        if level >= params.crt_depth() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "invalid RNS staging level",
+            ));
+        }
+        let expected_bytes_per_poly = rns_bytes_len_for_level(params, level);
+        if bytes_per_poly != expected_bytes_per_poly {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "RNS staging bytes-per-polynomial mismatch",
+            ));
+        }
+        let expected_len = nrow
+            .checked_mul(ncol)
+            .and_then(|count| count.checked_mul(bytes_per_poly))
+            .ok_or(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS staging byte length overflows",
+            ))?;
+        if payload.len() != expected_len {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "RNS staging payload length mismatch",
+            ));
+        }
         let snapshot = GpuDCRTMatrixRnsSnapshot {
             nrow,
             ncol,
@@ -3432,7 +3932,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             bytes_per_poly,
             bytes: PinnedHostBuffer::from_slice(&payload),
         };
-        Self::from_rns_snapshot(params, &snapshot)
+        Ok(Self::from_rns_snapshot(params, &snapshot))
     }
 
     fn copy_to_params_direct(&self, params: &<Self::P as Poly>::Params) -> Option<Self> {
@@ -3652,10 +4152,10 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         debug_assert_eq!(self.level, rhs.level, "tensor row sums require same level");
         debug_assert_eq!(self.is_ntt, rhs.is_ntt, "tensor row sums require same domain");
         let columns = self.ncol.checked_mul(rhs.ncol).expect("tensor columns overflow");
-        let terms = rows.iter().map(Vec::len).sum::<usize>();
-        if rows.len() > 16 || terms > 32 {
+        if Self::tensor_sum_rows_implementation(rows).is_materialized() {
             return self.tensor(rhs).sum_rows(rows);
         }
+        let terms = rows.iter().map(Vec::len).sum::<usize>();
         let out = Self::new_empty_with_state(
             &self.params,
             rows.len(),
@@ -3854,13 +4354,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String> {
-        if self.params.ring_dimension() != destination.ring_dimension() ||
-            self.params.crt_depth() != 1 ||
-            self.level != 0 ||
-            self.params.execution_owner_id() != destination.execution_owner_id()
-        {
-            return Err("centered rebase requires matching dimensions, shared execution, and one source CRT limb".into());
-        }
+        self.validate_centered_rebase_destination(destination)?;
         let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
         let source = coefficients.as_ref().unwrap_or(self);
         let mut output = Self::new_empty_with_state(
@@ -3872,6 +4366,50 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             None,
         );
         let status = unsafe { gpu_matrix_centered_rebase(output.raw, source.raw) };
+        if status != 0 {
+            return Err(crate::poly::dcrt::gpu::last_error_string());
+        }
+        output.ntt_all_in_place();
+        Ok(output)
+    }
+
+    fn block_mod_switch(
+        &self,
+        destination: &<Self::P as Poly>::Params,
+        plaintext_modulus: &BigUint,
+    ) -> Result<Self, String> {
+        if self.params.ring_dimension() != destination.ring_dimension() ||
+            self.params.execution_owner_id() != destination.execution_owner_id()
+        {
+            return Err("BlockModSwitch requires matching dimensions and shared execution".into());
+        }
+        if plaintext_modulus.is_zero() {
+            return Err("BlockModSwitch plaintext modulus must be positive".into());
+        }
+        let source_basis = self.params.moduli();
+        let destination_basis = destination.moduli();
+        if destination_basis.len() >= self.level + 1 ||
+            destination_basis.iter().any(|prime| !source_basis.contains(prime))
+        {
+            return Err("BlockModSwitch destination must be a strict source subset".into());
+        }
+        let words = plaintext_modulus.to_u64_digits();
+        if words.is_empty() {
+            return Err("BlockModSwitch plaintext modulus must be positive".into());
+        }
+        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
+        let source = coefficients.as_ref().unwrap_or(self);
+        let mut output = Self::new_empty_with_state(
+            destination,
+            self.nrow,
+            self.ncol,
+            destination.crt_depth() - 1,
+            false,
+            None,
+        );
+        let status = unsafe {
+            gpu_matrix_block_mod_switch(output.raw, source.raw, words.as_ptr(), words.len())
+        };
         if status != 0 {
             return Err(crate::poly::dcrt::gpu::last_error_string());
         }
@@ -4025,6 +4563,36 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
 }
 
 impl GpuDCRTPolyMatrix {
+    /// Validate the version and framing of an RNS staging artifact without
+    /// opening a CUDA context. Parameter-dependent width/level checks remain
+    /// in `try_from_cpu_staging_bytes`.
+    pub fn validate_cpu_staging_bytes(
+        bytes: &[u8],
+    ) -> Result<(), crate::matrix::CompactMatrixDecodeError> {
+        let ((version, _nrow, _ncol, _level, _is_ntt, _bytes_per_poly, _payload), consumed): (
+            (u8, usize, usize, usize, bool, usize, &[u8]),
+            usize,
+        ) = bincode::borrow_decode_from_slice(bytes, bincode::config::standard()).map_err(
+            |_| {
+                crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                    "cannot decode RNS staging artifact",
+                )
+            },
+        )?;
+        if consumed != bytes.len() {
+            return Err(crate::matrix::CompactMatrixDecodeError::InvalidHeader(
+                "trailing RNS staging bytes",
+            ));
+        }
+        if version != 1 {
+            return Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version,
+                supported_versions: &[1],
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn zero_compact_bytes(
         params: &GpuDCRTPolyParams,
         nrow: usize,
@@ -4326,6 +4894,54 @@ mod tests {
             params.base_bits(),
             Some(params.dropped_moduli()),
         )
+    }
+
+    #[test]
+    fn malformed_gpu_artifacts_return_typed_errors_without_panicking() {
+        let compact = bincode::encode_to_vec(
+            (9u8, GPU_POLY_FORMAT_COEFF as u8, 0u32, 1usize, 1usize, 8u16, 1u16, vec![0u8; 16]),
+            bincode::config::standard(),
+        )
+        .expect("test compact encoding");
+        assert_eq!(
+            <GpuDCRTPolyMatrix as PolyMatrix>::validate_compact_bytes(&compact),
+            Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version: 9,
+                supported_versions: &[1],
+            })
+        );
+
+        let staging = bincode::encode_to_vec(
+            (7u8, 1usize, 1usize, 0usize, false, 0usize, Vec::<u8>::new()),
+            bincode::config::standard(),
+        )
+        .expect("test staging encoding");
+        assert_eq!(
+            GpuDCRTPolyMatrix::validate_cpu_staging_bytes(&staging),
+            Err(crate::matrix::CompactMatrixDecodeError::UnsupportedVersion {
+                version: 7,
+                supported_versions: &[1],
+            })
+        );
+
+        let zero = bincode::encode_to_vec(
+            (1u8, GPU_POLY_FORMAT_COEFF as u8, 0u32, 1usize, 1usize, 0u16, 0u16, Vec::<u8>::new()),
+            bincode::config::standard(),
+        )
+        .expect("test canonical zero encoding");
+        assert!(<GpuDCRTPolyMatrix as PolyMatrix>::validate_compact_bytes(&zero).is_ok());
+
+        let malformed_zero = bincode::encode_to_vec(
+            (1u8, GPU_POLY_FORMAT_COEFF as u8, 0u32, 1usize, 1usize, 0u16, 0u16, vec![0u8]),
+            bincode::config::standard(),
+        )
+        .expect("test malformed zero encoding");
+        assert_eq!(
+            <GpuDCRTPolyMatrix as PolyMatrix>::validate_compact_bytes(&malformed_zero),
+            Err(crate::matrix::CompactMatrixDecodeError::InvalidPayload(
+                "zero-width compact matrix must have an empty payload",
+            ))
+        );
     }
 
     fn random_cpu_matrix(
@@ -5184,6 +5800,99 @@ mod tests {
                 drop(output);
                 assert_eq!(transposed.to_cpu_matrix(), expected.transpose());
             }
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_tensor_sum_rows_allocation_topology_matches_native_selection() {
+        let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        let left_cpu = random_cpu_matrix(&params, 5, 2, &mut random);
+        let right_cpu = random_cpu_matrix(&params, 4, 2, &mut random);
+        let left = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu);
+        let right = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right_cpu);
+        let left_shape = crate::gpu_memory::GpuMemoryShape::new(
+            left.level(),
+            left.nrow,
+            left.ncol,
+            left.is_ntt,
+            crate::gpu_memory::GpuMemoryRange::new(0, left.ncol).unwrap(),
+        )
+        .unwrap();
+        let right_shape = crate::gpu_memory::GpuMemoryShape::new(
+            right.level(),
+            right.nrow,
+            right.ncol,
+            right.is_ntt,
+            crate::gpu_memory::GpuMemoryRange::new(0, right.ncol).unwrap(),
+        )
+        .unwrap();
+        // Deliberately repeat valid tensor rows so the two fallback boundaries
+        // are exercised independently of the available tensor-row count.
+        let groups16 = (0..16).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups17 = (0..17).map(|row| vec![row % 4]).collect::<Vec<_>>();
+        let groups32 = (0..16).map(|row| vec![row % 4, row % 4]).collect::<Vec<_>>();
+        let mut groups33 = groups32.clone();
+        groups33[0].push(0);
+        let small_grouped = vec![vec![0], vec![1, 2], vec![3]];
+        assert_eq!(small_grouped.len(), 3);
+        assert_eq!(small_grouped.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(groups17.len(), 17);
+        assert_eq!(groups17.iter().map(Vec::len).sum::<usize>(), 17);
+        assert_eq!(groups33.len(), 16);
+        assert_eq!(groups33.iter().map(Vec::len).sum::<usize>(), 33);
+        for (groups, expected_topology) in [
+            (small_grouped, TensorRowSumImplementation::FusedKernel),
+            (groups16, TensorRowSumImplementation::FusedKernel),
+            (groups17, TensorRowSumImplementation::MaterializedTensor),
+            (groups32, TensorRowSumImplementation::FusedKernel),
+            (groups33, TensorRowSumImplementation::MaterializedTensor),
+        ] {
+            let expected = left_cpu.tensor(&right_cpu).sum_rows(&groups);
+            let topology = GpuDCRTPolyMatrix::tensor_sum_rows_implementation(&groups);
+            assert_eq!(topology, expected_topology);
+            let evidence = crate::gpu_memory::tensor_sum_rows_allocation_evidence(
+                &gpu_params,
+                left_shape,
+                right_shape,
+                &groups,
+                crate::gpu_memory::GpuMemoryRange::new(0, 4).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(evidence.implementation, topology);
+            let device = *gpu_params.gpu_ids().first().unwrap();
+            crate::poly::dcrt::gpu::gpu_default_mempool_reset_high_water(device).unwrap();
+            let before =
+                crate::poly::dcrt::gpu::gpu_default_mempool_usage(device).unwrap().used_current;
+            let output = left.tensor_sum_rows(&right, &groups);
+            assert_eq!(output.to_cpu_matrix(), expected);
+            let measured_peak = crate::poly::dcrt::gpu::gpu_default_mempool_usage(device)
+                .unwrap()
+                .used_high
+                .saturating_sub(before);
+            let hard_envelope = evidence
+                .total_scratch_bytes()
+                .unwrap()
+                .saturating_add(evidence.row_sum_output.total_bytes);
+            assert!(measured_peak > 0);
+            assert!(hard_envelope > 0);
+            // CUDA pool high-water includes allocator-page rounding, while
+            // the native query reports logical owner bytes.  The measured
+            // peak must nevertheless include the complete result owner.
+            assert!(measured_peak >= evidence.row_sum_output.total_bytes);
+            if topology.is_materialized() {
+                assert!(evidence.tensor_allocation.is_some());
+                assert!(evidence.total_scratch_bytes().unwrap() > 0);
+                assert!(evidence.row_sum_workspace_owners > 0);
+            } else {
+                assert!(evidence.tensor_allocation.is_none());
+                let has_conversion = !left_shape.is_ntt || !right_shape.is_ntt;
+                assert_eq!(evidence.total_scratch_bytes().unwrap() > 0, has_conversion);
+            }
+            drop(output);
         }
     }
 
@@ -6341,6 +7050,16 @@ mod tests {
         )
         .unwrap();
         let view = rhs.column_view(1, 4);
+        let owner_allocation = rhs.allocation_bytes().unwrap();
+        let view_allocation = view.materialization_allocation_bytes().unwrap();
+        assert!(
+            view_allocation.total_bytes < owner_allocation.total_bytes,
+            "a narrow compact view must not charge the full parent payload"
+        );
+        let import = view.canonical_import_allocation_evidence().unwrap();
+        assert_eq!(import.device, view_allocation);
+        assert_eq!(import.pageable_host_bytes, view.as_ref().canonical_payload_bytes().unwrap());
+        assert_eq!(import.pinned_host_bytes, import.pageable_host_bytes);
         let report = view.as_ref().allocation_report(&lhs).unwrap();
         assert_eq!(report.compact_rhs_bytes, rhs.resident_payload_bytes);
         let actual = lhs.multiply_small_rhs(view.as_ref()).unwrap();
@@ -7408,7 +8127,7 @@ mod tests {
             }
         }
         let multi_limb = GpuDCRTPolyMatrix::zero(&target, 1, 1);
-        assert!(multi_limb.centered_rebase(&target).is_err());
+        assert!(multi_limb.centered_rebase(&target).is_ok());
         let source_cpu = DCRTPolyParams::new(dimension, 1, 17, base_bits, None, None);
         let unregistered = gpu_params_from_cpu(&source_cpu);
         assert!(GpuDCRTPolyMatrix::zero(&unregistered, 1, 1).centered_rebase(&target).is_err());
@@ -7417,6 +8136,173 @@ mod tests {
         assert!(
             GpuDCRTPolyMatrix::zero(&unregistered, 1, 1).centered_rebase(&incompatible).is_err()
         );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_centered_rebase_multi_limb_and_compact_owner_lifetime() {
+        gpu_device_sync();
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let all_cpu = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let primes = all_cpu.to_crt().0;
+        let source_cpu = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(vec![primes[2], primes[0]]),
+            None,
+        );
+        let target_cpu = DCRTPolyParams::new(
+            dimension,
+            3,
+            bits,
+            base_bits,
+            Some(vec![primes[1], primes[2], primes[0]]),
+            None,
+        );
+        let target_gpu = gpu_params_from_cpu(&target_cpu);
+        let source_gpu = GpuDCRTPolyParams::new_with_gpu(
+            dimension,
+            source_cpu.to_crt().0,
+            base_bits,
+            target_gpu.gpu_ids().to_vec(),
+            Some(1),
+            Some(&target_gpu),
+            None,
+        );
+        assert_eq!(source_gpu.execution_owner_id(), target_gpu.execution_owner_id());
+
+        let source_modulus = source_cpu.modulus().as_ref().clone();
+        let signed = [-7i64, -1, 0, 1, 7];
+        let source_coefficients = (0..dimension as usize)
+            .map(|index| {
+                let value = signed[index % signed.len()];
+                if value < 0 {
+                    &source_modulus - BigUint::from(value.unsigned_abs())
+                } else {
+                    BigUint::from(value as u64)
+                }
+            })
+            .collect::<Vec<_>>();
+        let source_cpu_matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &source_cpu,
+            vec![DCRTPoly::from_biguints(&source_cpu, &source_coefficients)],
+        );
+        let expected = source_cpu_matrix.centered_rebase(&target_cpu).unwrap();
+        let source = GpuDCRTPolyMatrix::from_cpu_matrix(&source_gpu, &source_cpu_matrix);
+        let rebased = source.centered_rebase(&target_gpu).unwrap();
+        // The kernel must retain the source consumer event; dropping the input
+        // immediately is part of the contract rather than an optional wait.
+        drop(source);
+        assert_eq!(rebased.to_cpu_matrix(), expected);
+
+        let bound = BigUint::from(7u8);
+        let compact_cpu = CpuSmallMatrix::new(source_cpu_matrix, bound.clone()).unwrap();
+        let payload = compact_cpu.to_canonical_coefficients().unwrap();
+        let compact =
+            GpuSmallMatrix::from_canonical_coefficients(&source_gpu, 1, 1, bound.clone(), &payload)
+                .unwrap();
+        let source_allocation = compact.allocation_bytes().unwrap();
+        assert!(source_allocation.total_bytes > 0);
+        assert_eq!(compact.canonical_payload_bytes().unwrap(), payload.len());
+        let queried_destination = compact.centered_rebase_allocation_bytes(&target_gpu).unwrap();
+        let compact_rebased = compact.centered_rebase(&target_gpu).unwrap();
+        let destination_allocation = compact_rebased.allocation_bytes().unwrap();
+        assert!(destination_allocation.total_bytes > 0);
+        assert_eq!(queried_destination, destination_allocation);
+        assert_eq!(compact_rebased.max_coefficient_bound(), &bound);
+        drop(compact);
+        assert_eq!(compact_rebased.to_canonical_coefficients().unwrap(), payload);
+
+        // Canonicality is checked before a compact device owner is allocated.
+        let mut noncanonical = payload.clone();
+        noncanonical[0] = 2;
+        noncanonical[1] = 0;
+        assert_eq!(
+            GpuSmallMatrix::from_canonical_coefficients(&source_gpu, 1, 1, bound, &noncanonical,),
+            Err(SmallMatrixError::NonCanonicalCoefficient)
+        );
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_block_mod_switch_matches_cpu_bigint_oracle_and_rejects_invalid_inputs() {
+        gpu_device_sync();
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let all_cpu = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let source_moduli = all_cpu.to_crt().0;
+        let source_cpu =
+            DCRTPolyParams::new(dimension, 3, bits, base_bits, Some(source_moduli.clone()), None);
+        let destination_cpu = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(vec![source_moduli[2], source_moduli[0]]),
+            None,
+        );
+        let source_gpu = gpu_params_from_cpu(&source_cpu);
+        let destination_gpu = GpuDCRTPolyParams::new_with_gpu(
+            dimension,
+            destination_cpu.to_crt().0,
+            base_bits,
+            source_gpu.gpu_ids().to_vec(),
+            Some(1),
+            Some(&source_gpu),
+            None,
+        );
+        let values = (0..dimension as usize)
+            .map(|index| BigUint::from((index * 17 + 1) as u64))
+            .collect::<Vec<_>>();
+        let source_cpu_matrix = DCRTPolyMatrix::from_poly_vec_row(
+            &source_cpu,
+            vec![DCRTPoly::from_biguints(&source_cpu, &values)],
+        );
+        let source = GpuDCRTPolyMatrix::from_cpu_matrix(&source_gpu, &source_cpu_matrix);
+        for plaintext_modulus in [
+            BigUint::from(1u8),
+            BigUint::from(3u8),
+            (BigUint::from(1u8) << 80usize) + BigUint::from(3u8),
+            // Regression: BlockModSwitch must accept t wider than the old
+            // fixed 64-word (4096-bit) CUDA metadata bound.
+            (BigUint::from(1u8) << 4096usize) + BigUint::from(3u8),
+        ] {
+            let expected =
+                source_cpu_matrix.block_mod_switch(&destination_cpu, &plaintext_modulus).unwrap();
+            let actual = source.block_mod_switch(&destination_gpu, &plaintext_modulus).unwrap();
+            assert_eq!(actual.to_cpu_matrix(), expected);
+        }
+
+        let zero = BigUint::ZERO;
+        assert!(source.block_mod_switch(&destination_gpu, &zero).is_err());
+        assert!(source.block_mod_switch(&source_gpu, &BigUint::from(3u8)).is_err());
+        let extended_cpu = DCRTPolyParams::new(dimension, 4, bits, base_bits, None, None);
+        let unrelated_moduli = vec![extended_cpu.to_crt().0[3], source_moduli[0]];
+        let unrelated_cpu =
+            DCRTPolyParams::new(dimension, 2, bits, base_bits, Some(unrelated_moduli), None);
+        let unrelated_gpu = GpuDCRTPolyParams::new_with_gpu(
+            dimension,
+            unrelated_cpu.to_crt().0,
+            base_bits,
+            source_gpu.gpu_ids().to_vec(),
+            Some(1),
+            Some(&source_gpu),
+            None,
+        );
+        assert!(source.block_mod_switch(&unrelated_gpu, &BigUint::from(3u8)).is_err());
+        let wrong_dimension_cpu =
+            DCRTPolyParams::new(dimension * 2, 3, bits, base_bits, None, None);
+        let wrong_dimension = GpuDCRTPolyParams::new_with_gpu(
+            dimension * 2,
+            wrong_dimension_cpu.to_crt().0,
+            base_bits,
+            source_gpu.gpu_ids().to_vec(),
+            Some(1),
+            None,
+            None,
+        );
+        assert!(source.block_mod_switch(&wrong_dimension, &BigUint::from(3u8)).is_err());
     }
 
     #[test]

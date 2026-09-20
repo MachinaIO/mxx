@@ -961,6 +961,29 @@ extern "C" int gpu_small_matrix_create(
     return 0;
 }
 
+extern "C" int gpu_small_matrix_query_allocation_bytes(
+    const GpuContext *ctx,
+    size_t rows,
+    size_t cols,
+    size_t magnitude_bytes,
+    GpuMatrixAllocationBytes *out)
+{
+    if (!ctx || !out || rows == 0 || cols == 0 || magnitude_bytes == 0)
+        return set_error("invalid compact matrix allocation query arguments");
+    if (ctx->N <= 0 || magnitude_bytes > 255)
+        return set_error("invalid compact matrix allocation query context or width");
+    size_t payload_bytes = 0;
+    if (small_payload_size(
+            rows, cols, static_cast<size_t>(ctx->N), magnitude_bytes, &payload_bytes) != 0)
+        return 1;
+    // The compact owner has one device payload.  Its stream event and bound
+    // words are host-side lifetime state, matching GpuSmallMatrix::allocation_bytes.
+    *out = GpuMatrixAllocationBytes{};
+    out->data_bytes = payload_bytes;
+    out->total_bytes = payload_bytes;
+    return 0;
+}
+
 extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
 {
     if (!mat) return;
@@ -999,6 +1022,26 @@ extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *
     if (!out || !src || out->ctx != src->ctx || out->rows != src->rows || out->cols != src->cols ||
         out->n != src->n || out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
         return set_error("incompatible compact matrix copy");
+    if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;
+    const size_t row_bytes = out->cols * out->n * (1 + out->magnitude_bytes);
+    const size_t out_pitch = out->storage_cols * out->n * (1 + out->magnitude_bytes);
+    const size_t src_pitch = src->storage_cols * src->n * (1 + src->magnitude_bytes);
+    auto *destination = out->payload + out->column_offset * out->n * (1 + out->magnitude_bytes);
+    const auto *source = src->payload + src->column_offset * src->n * (1 + src->magnitude_bytes);
+    const cudaError_t err = cudaMemcpy2DAsync(
+        destination, out_pitch, source, src_pitch, row_bytes, out->rows,
+        cudaMemcpyDeviceToDevice, out->stream);
+    if (err != cudaSuccess) return set_error(err);
+    if (small_record(out, out->stream) != 0) return 1;
+    return small_track_consumer(src, out->stream, out->write_done);
+}
+
+extern "C" int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const GpuSmallMatrix *src)
+{
+    if (!out || !src || out->device != src->device || out->rows != src->rows ||
+        out->cols != src->cols || out->n != src->n ||
+        out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
+        return set_error("incompatible cross-context compact matrix copy");
     if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;
     const size_t row_bytes = out->cols * out->n * (1 + out->magnitude_bytes);
     const size_t out_pitch = out->storage_cols * out->n * (1 + out->magnitude_bytes);

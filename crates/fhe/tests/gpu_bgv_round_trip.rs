@@ -1,16 +1,61 @@
+mod gpu_bgv_planned;
 pub mod gpu_utils;
 pub mod utils;
 
-use gpu_utils::{centered, compile, input, integers, run};
+use gpu_bgv_planned::{assert_fail_closed, prepare, run};
+use gpu_utils::{centered, input, integers};
 use mxx_dsl::{DslContext, Mat, Ring};
 use mxx_fhe::{BgvCiphertext, FheScheme};
-use mxx_ir_core::node::IndexRange;
+use mxx_ir_core::{ParamEnv, node::IndexRange};
 use mxx_primitives::poly::PolyParams;
+use mxx_runtime::{backend::poly_gpu::gpu_backend, executor::root_row_sum_plans};
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 use rand::Rng;
 use serde_json::json;
 use std::collections::BTreeMap;
+
+#[test]
+fn test_bgv_quadratic_graph_contains_tensor_row_sum_plan() {
+    let bgv = utils::bgv_params();
+    let n = bgv.common.ring.ring_dimension() as usize;
+    let ring = Ring::new(bgv.common.ring.modulus().as_ref().clone(), n);
+    let pk = ring.input("pk", (2, 1));
+    let template_context = DslContext::new("bgv-quadratic-fusion-regression");
+    let lhs_template = bgv.encrypt(&pk, &template_context.int_family_input("x", n)).unwrap();
+    let rhs_template = bgv.encrypt(&pk, &template_context.int_family_input("y", n)).unwrap();
+    let lhs = BgvCiphertext { components: ring.input("lhs", (2, 1)), ..lhs_template };
+    let rhs = BgvCiphertext { components: ring.input("rhs", (2, 1)), ..rhs_template };
+    let quadratic = bgv.mul_unrelinearized(&lhs, &rhs).unwrap();
+    let (_, key_width) = bgv.key_switch_parameters(bgv.common.ring.crt_depth() - 1).unwrap();
+    let rk_ring = Ring::new(
+        bgv.key_switch_parameters(bgv.common.ring.crt_depth() - 1)
+            .unwrap()
+            .0
+            .modulus()
+            .as_ref()
+            .clone(),
+        n,
+    );
+    let rk = rk_ring.input("rk", (2, key_width));
+    let relin = bgv.relinearize(&quadratic, &rk).unwrap();
+    let switched = bgv.mod_switch_to(&relin, bgv.common.ring.crt_depth() - 2).unwrap();
+    let stages = [("quadratic", quadratic), ("relinearized", relin), ("modswitched", switched)];
+    for (name, stage) in stages {
+        let graph = DslContext::new(format!("bgv-{name}-fusion-regression"))
+            .output("ct", stage.components)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let plans = root_row_sum_plans(&graph);
+        assert!(
+            plans.values().any(|plan| plan.tensor_operands.is_some()),
+            "BGV {name} graph must retain the tensor row-sum fusion plan: {plans:?}"
+        );
+    }
+}
 
 #[test]
 fn test_gpu_bgv_round_trip() {
@@ -30,9 +75,9 @@ fn test_gpu_bgv_round_trip() {
     let lhs = bgv.encrypt(&pk, &context.int_family_input("x", n)).unwrap();
     let rhs = bgv.encrypt(&pk, &context.int_family_input("y", n)).unwrap();
     let encryption = context
-        .public_output("lhs", lhs.components.clone())
+        .transferred_output("lhs", lhs.components.clone())
         .unwrap()
-        .public_output("rhs", rhs.components.clone())
+        .transferred_output("rhs", rhs.components.clone())
         .unwrap()
         .build()
         .unwrap();
@@ -65,24 +110,31 @@ fn test_gpu_bgv_round_trip() {
         );
     }
     let security = utils::security_report(common, Some(&p_primes));
-    let mut backend = gpu_utils::backend(common, Some(&bgv));
+    let gpu_parameters = gpu_utils::bgv_gpu_parameters(&bgv);
+    let mut backend = gpu_backend(gpu_parameters.iter().cloned());
+    let mut warmup_steps = Vec::new();
+    let mut protocol_predicted_seconds = 0.0;
     let (sk, pk) = bgv.keygen().unwrap();
     let generated_rk = bgv.relinearization_key(&sk, top).unwrap();
-    let keygen = compile(
+    let keygen = prepare(
         DslContext::new("integration-bgv-keygen")
-            .private_output("sk", sk)
+            .transferred_output("sk", sk)
             .unwrap()
-            .public_output("pk", pk)
+            .transferred_output("pk", pk)
             .unwrap()
-            .public_output("rk", generated_rk)
+            .transferred_output("rk", generated_rk)
             .unwrap()
             .build()
             .unwrap(),
         &mut backend,
+        &BTreeMap::new(),
+        &gpu_parameters,
     );
     let (keys, keygen_seconds) = run(&keygen, &mut backend, BTreeMap::new());
+    let keygen_report = keygen.warmup_report();
+    protocol_predicted_seconds += keygen_report.predicted_seconds;
+    warmup_steps.push(json!({"step":"keygen","predicted_seconds":keygen_report.predicted_seconds,"report":keygen_report}));
     println!("FHE_PROGRESS scheme=bgv stage=keygen seconds={keygen_seconds}");
-    let encryption = compile(encryption, &mut backend);
     let t = bgv.plaintext_modulus;
     let mut x = (0..n).map(|_| rand::rng().random_range(0..t) as i64).collect::<Vec<_>>();
     let mut y = (0..n).map(|_| rand::rng().random_range(0..t) as i64).collect::<Vec<_>>();
@@ -101,15 +153,16 @@ fn test_gpu_bgv_round_trip() {
         assert_eq!(y.len(), n);
         assert!(x.iter().chain(&y).all(|v| *v >= 0 && (*v as u64) < t));
     }
-    let (encrypted, encryption_seconds) = run(
-        &encryption,
-        &mut backend,
-        BTreeMap::from([
-            ("pk".into(), keys["pk"].clone()),
-            ("x".into(), input(&x)),
-            ("y".into(), input(&y)),
-        ]),
-    );
+    let encryption_inputs = BTreeMap::from([
+        ("pk".into(), keys["pk"].clone()),
+        ("x".into(), input(&x)),
+        ("y".into(), input(&y)),
+    ]);
+    let encryption = prepare(encryption, &mut backend, &encryption_inputs, &gpu_parameters);
+    let (encrypted, encryption_seconds) = run(&encryption, &mut backend, encryption_inputs);
+    let encryption_report = encryption.warmup_report();
+    protocol_predicted_seconds += encryption_report.predicted_seconds;
+    warmup_steps.push(json!({"step":"encryption","predicted_seconds":encryption_report.predicted_seconds,"report":encryption_report}));
     println!("FHE_PROGRESS scheme=bgv stage=encryption seconds={encryption_seconds}");
     let eval_inputs = BTreeMap::from([
         ("lhs".into(), encrypted["lhs"].clone()),
@@ -133,14 +186,6 @@ fn test_gpu_bgv_round_trip() {
             "correctness bound fails at {name}: E={}",
             ct.noise_bound
         );
-        let graph = compile(
-            DslContext::new(format!("integration-bgv-{name}"))
-                .output("ct", ct.components.clone())
-                .unwrap()
-                .build()
-                .unwrap(),
-            &mut backend,
-        );
         let needed = if *name == "lhs" {
             BTreeMap::from([("lhs".into(), encrypted["lhs"].clone())])
         } else if *name == "rhs" {
@@ -153,7 +198,25 @@ fn test_gpu_bgv_round_trip() {
         } else {
             eval_inputs.clone()
         };
-        let (evaluated, _) = run(&graph, &mut backend, needed);
+        let evaluated = if matches!(*name, "lhs" | "rhs") {
+            BTreeMap::from([("ct".into(), encrypted[*name].clone())])
+        } else {
+            let graph = prepare(
+                DslContext::new(format!("integration-bgv-{name}"))
+                    .output("ct", ct.components.clone())
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+                &mut backend,
+                &needed,
+                &gpu_parameters,
+            );
+            assert!(graph.measured_tensor_row_sum, "multiply must measure tensor-row-sum fusion");
+            let report = graph.warmup_report();
+            protocol_predicted_seconds += report.predicted_seconds;
+            warmup_steps.push(json!({"step":format!("evaluation-{name}"),"predicted_seconds":report.predicted_seconds,"report":report}));
+            run(&graph, &mut backend, needed).0
+        };
         stage_values.insert(*name, evaluated["ct"].clone());
         let p = common.parameters_at(*level).unwrap();
         let ring = Ring::new(p.modulus().as_ref().clone(), n);
@@ -171,24 +234,26 @@ fn test_gpu_bgv_round_trip() {
         for i in 1..*rows {
             phase = phase * &minus_s + row(&imported.components, i);
         }
-        let decrypt = compile(
+        let decrypt_inputs = BTreeMap::from([
+            ("ct".into(), evaluated["ct"].clone()),
+            ("sk".into(), keys["sk"].clone()),
+        ]);
+        let decrypt = prepare(
             DslContext::new(format!("integration-bgv-check-{name}"))
-                .private_output("slots", bgv.decrypt(&secret, &imported).unwrap())
+                .transferred_output("slots", bgv.decrypt(&secret, &imported).unwrap())
                 .unwrap()
-                .private_output("phase", phase.coefficients())
+                .transferred_output("phase", phase.coefficients())
                 .unwrap()
                 .build()
                 .unwrap(),
             &mut backend,
+            &decrypt_inputs,
+            &gpu_parameters,
         );
-        let (decoded, _) = run(
-            &decrypt,
-            &mut backend,
-            BTreeMap::from([
-                ("ct".into(), evaluated["ct"].clone()),
-                ("sk".into(), keys["sk"].clone()),
-            ]),
-        );
+        let decrypt_report = decrypt.warmup_report();
+        protocol_predicted_seconds += decrypt_report.predicted_seconds;
+        warmup_steps.push(json!({"step":format!("decryption-{name}"),"predicted_seconds":decrypt_report.predicted_seconds,"report":decrypt_report}));
+        let (decoded, _) = run(&decrypt, &mut backend, decrypt_inputs);
         let expected = x
             .iter()
             .zip(&y)
@@ -232,7 +297,8 @@ fn test_gpu_bgv_round_trip() {
             correction * scalar(dest.modulus().as_ref(), BigInt::from(t))) *
             scalar(dest.modulus().as_ref(), BigInt::from(inverse_p));
         let actual = bgv.mod_switch_to(&imported, level - 1).unwrap();
-        let graph = compile(
+        let inputs = BTreeMap::from([("ct".into(), stage_values["relinearized"].clone())]);
+        let graph = prepare(
             DslContext::new(format!("integration-bgv-modswitch-reference-{level}"))
                 .output("reference", reference.clone())
                 .unwrap()
@@ -241,12 +307,10 @@ fn test_gpu_bgv_round_trip() {
                 .build()
                 .unwrap(),
             &mut backend,
+            &inputs,
+            &gpu_parameters,
         );
-        let (output, _) = run(
-            &graph,
-            &mut backend,
-            BTreeMap::from([("ct".into(), stage_values["relinearized"].clone())]),
-        );
+        let (output, _) = run(&graph, &mut backend, inputs);
         assert_eq!(
             gpu_utils::matrix_bytes(&output["actual"], &backend),
             gpu_utils::matrix_bytes(&output["reference"], &backend),
@@ -258,23 +322,30 @@ fn test_gpu_bgv_round_trip() {
     for (label, index) in
         [("multiply", 2), ("multiply_relinearize", 3), ("multiply_relinearize_modswitch", 4)]
     {
-        let graph = compile(
+        let mut inputs = eval_inputs.clone();
+        if label == "multiply" {
+            inputs.remove("rk");
+        }
+        let graph = prepare(
             DslContext::new(format!("integration-bgv-timing-{label}"))
                 .output("ct", stages[index].1.components.clone())
                 .unwrap()
                 .build()
                 .unwrap(),
             &mut backend,
+            &inputs,
+            &gpu_parameters,
         );
+        assert!(graph.measured_tensor_row_sum, "multiply must measure tensor-row-sum fusion");
         let expected_bytes = gpu_utils::matrix_bytes(&stage_values[stages[index].0], &backend);
-        let (warmup, _) = run(&graph, &mut backend, eval_inputs.clone());
+        let (warmup, _) = run(&graph, &mut backend, inputs.clone());
         assert!(
             gpu_utils::matrix_bytes(&warmup["ct"], &backend) == expected_bytes,
             "warmup replay {label}"
         );
         let samples = (0..utils::repetitions())
             .map(|sample| {
-                let (output, seconds) = run(&graph, &mut backend, eval_inputs.clone());
+                let (output, seconds) = run(&graph, &mut backend, inputs.clone());
                 assert!(
                     gpu_utils::matrix_bytes(&output["ct"], &backend) == expected_bytes,
                     "replay {label} sample {sample}"
@@ -287,6 +358,9 @@ fn test_gpu_bgv_round_trip() {
             samples.len()
         );
         timings.push(json!({"operation":label,"seconds":samples}));
+        if label == "multiply" {
+            assert_fail_closed(&graph, &mut backend, &inputs);
+        }
     }
     for (label, index, rows) in [("relinearize", 2, 3), ("modswitch", 3, 2)] {
         let imported = BgvCiphertext {
@@ -299,18 +373,20 @@ fn test_gpu_bgv_round_trip() {
         } else {
             bgv.mod_switch_to(&imported, top - steps).unwrap()
         };
-        let graph = compile(
+        let mut inputs = BTreeMap::from([("ct".into(), stage_values[stages[index].0].clone())]);
+        if label == "relinearize" {
+            inputs.insert("rk".into(), keys["rk"].clone());
+        }
+        let graph = prepare(
             DslContext::new(format!("integration-bgv-timing-{label}"))
                 .output("ct", output.components)
                 .unwrap()
                 .build()
                 .unwrap(),
             &mut backend,
+            &inputs,
+            &gpu_parameters,
         );
-        let mut inputs = BTreeMap::from([("ct".into(), stage_values[stages[index].0].clone())]);
-        if label == "relinearize" {
-            inputs.insert("rk".into(), keys["rk"].clone());
-        }
         let expected_bytes = gpu_utils::matrix_bytes(&stage_values[stages[index + 1].0], &backend);
         let (warmup, _) = run(&graph, &mut backend, inputs.clone());
         assert!(
@@ -335,6 +411,6 @@ fn test_gpu_bgv_round_trip() {
     }
     utils::write_report(
         "bgv",
-        json!({"correct":true,"n":n,"q":q_primes,"p":p_primes,"t":t,"key_columns":key_width,"digit_size":utils::bgv_digit_size(),"gpu_event_seconds":null,"sigma":common.error_sigma,"cutoff":common.error_cutoff.to_string(),"base_bits":common.ring.base_bits(),"security":security,"keygen_seconds":keygen_seconds,"encryption_seconds":encryption_seconds,"stages":diagnostics,"timings":timings,"x":x,"y":y,"modswitch_steps":steps,"timing_contract":"host elapsed production execute + resident output retrieval + output result-event wait; inputs and outputs remain GPU-resident; excludes prior-iteration cleanup, output serialization and transfers, input generation, keygen, encrypt, graph validation, decrypt, diagnostics"}),
+        json!({"correct":true,"n":n,"q":q_primes,"p":p_primes,"t":t,"key_columns":key_width,"digit_size":utils::bgv_digit_size(),"gpu_event_seconds":null,"sigma":common.error_sigma,"cutoff":common.error_cutoff.to_string(),"base_bits":common.ring.base_bits(),"security":security,"keygen_seconds":keygen_seconds,"encryption_seconds":encryption_seconds,"stages":diagnostics,"timings":timings,"x":x,"y":y,"modswitch_steps":steps,"warmup_steps":warmup_steps,"protocol_predicted_seconds":protocol_predicted_seconds,"timing_contract":"host elapsed fixed-plan production execute + resident output retrieval + output result-event wait; inputs and outputs remain GPU-resident; excludes profile collection, warmup planning, prior-iteration cleanup, output serialization and transfers, input generation, keygen, encrypt, graph validation, decrypt, diagnostics"}),
     );
 }

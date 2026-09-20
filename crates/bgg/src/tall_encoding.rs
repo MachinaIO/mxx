@@ -795,8 +795,8 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::BigInt;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1586,9 +1586,15 @@ mod tests {
             BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(hash_key.to_vec()))]);
         let mut store = MemoryArtifactStore::default();
         let mut backend = cpu_backend([parameters.clone()]);
-        let produced =
-            execute(&producer, &mut backend, producer_inputs, &mut store, SamplingMode::Fresh)
-                .unwrap();
+        let produced = execute(
+            &producer,
+            &mut backend,
+            producer_inputs,
+            &mut store,
+            SamplingMode::Fresh,
+            ExecutionConfig::default(),
+        )
+        .unwrap();
         let production_id = produced.production_id.expect("artifact production");
         let manifest = store.manifest(&production_id).unwrap().clone();
         assert_eq!(manifest.artifacts.len(), 4);
@@ -1640,6 +1646,7 @@ mod tests {
                 .collect(),
             &mut store,
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
 

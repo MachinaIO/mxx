@@ -8,7 +8,7 @@ int set_error(const char *msg)
 
 int set_error(cudaError_t err)
 {
-    return gpu_set_last_error(cudaGetErrorString(err));
+    return gpu_set_last_error_cuda(static_cast<int>(err));
 }
 
 bool parse_format(int format, GpuPolyFormat &out)

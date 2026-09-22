@@ -60,6 +60,8 @@ fn main() {
     if env::var("CARGO_FEATURE_GPU").is_ok() {
         println!("cargo::rerun-if-env-changed=CUDA_ARCH");
         println!("cargo::rerun-if-changed=cuda/src/Runtime.cu");
+        println!("cargo::rerun-if-changed=cuda/src/Primitive.cu");
+        println!("cargo::rerun-if-changed=cuda/src/Control.cu");
         println!("cargo::rerun-if-changed=cuda/src/ChaCha.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/Matrix.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixUtils.cu");
@@ -71,11 +73,14 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixDecompose.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSampling.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixTrapdoor.cu");
+        println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerde.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSerdeBatch.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixCrt.cu");
         println!("cargo::rerun-if-changed=cuda/src/matrix/MatrixSmallRhs.cu");
         println!("cargo::rerun-if-changed=cuda/include/Runtime.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/Primitive.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/Control.cuh");
         println!("cargo::rerun-if-changed=cuda/include/ChaCha.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/Matrix.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixUtils.cuh");
@@ -86,6 +91,7 @@ fn main() {
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixNTT.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSampling.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixTrapdoor.cuh");
+        println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSerde.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixCrt.cuh");
         println!("cargo::rerun-if-changed=cuda/include/matrix/MatrixSmallRhs.cuh");
@@ -112,6 +118,8 @@ fn main() {
         build
             .cuda(true)
             .file("cuda/src/Runtime.cu")
+            .file("cuda/src/Primitive.cu")
+            .file("cuda/src/Control.cu")
             .file("cuda/src/matrix/Matrix.cu")
             .include("cuda/include")
             .flag("-std=c++17")

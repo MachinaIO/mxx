@@ -103,10 +103,6 @@ pub struct PlannedNodeBatchRequest {
     /// for that operation, never an ambiguous logical `(concat, rhs)` pair.
     pub effective_operands: Vec<PlannedOperandMetadata>,
     pub output_layout_metadata: Vec<PlannedLayoutMetadata>,
-    /// Physical output shape of a grouped TensorRowSums intermediate. Empty
-    /// for ordinary nodes; the executor splits this intermediate into the
-    /// original logical row-sum outputs.
-    pub grouped_output_layout_metadata: Vec<PlannedLayoutMetadata>,
     pub columns_per_job: Vec<usize>,
     pub instance_slots: Vec<usize>,
     pub instance_paths: Vec<Vec<InstantiationFrame>>,
@@ -169,13 +165,6 @@ impl PlannedNodeBatchRequest {
     ) -> Self {
         let output_layouts =
             outputs.iter().filter_map(|output| output.layout_id).collect::<Vec<_>>();
-        let grouped_output_layout_metadata = if inputs.row_sum_groups.is_empty() {
-            Vec::new()
-        } else {
-            let mut layout = outputs.first().cloned().expect("grouped output has a port");
-            layout.rows = inputs.row_sum_groups.iter().map(Vec::len).sum();
-            vec![layout]
-        };
         Self {
             site: key.site,
             shape_class: key.shape_class,
@@ -192,7 +181,6 @@ impl PlannedNodeBatchRequest {
             effective_operands: inputs.operands,
             output_ports: outputs.len(),
             output_layout_metadata: outputs,
-            grouped_output_layout_metadata,
             columns_per_job,
             instance_slots: vec![0],
             instance_paths: vec![Vec::new()],
@@ -343,10 +331,8 @@ pub enum FusedBatchRequest<M, S> {
         metadata: PlannedNodeBatchRequest,
         source: Arc<M>,
         right: Arc<M>,
-        /// Groups are concatenated in order into one matrix result. The
-        /// executor splits that result back into the original output nodes;
-        /// this keeps one fixed-plan output port while avoiding a second
-        /// tensor-product launch for a shared source.
+        /// One result owner per group, in group order. The shared tensor
+        /// reduction is computed once, then partitioned on the backend.
         rows: Vec<Vec<Vec<usize>>>,
     },
     Decompose {
@@ -442,7 +428,7 @@ pub enum FusedBatchOutput<M, S> {
 /// carried per original instance rather than per compressed batch position;
 /// a fleet backend can therefore rotate owners using the frozen slot/path
 /// without rediscovering a pilot or selecting a different implementation.
-pub enum FixedOperationBatchRequest<M, S> {
+pub enum FixedOperationBatchRequest<M, S, I> {
     /// A constant whose native constructor is indivisible and pinned to the
     /// owner selected by the frozen plan.  Keeping this distinct from
     /// generated-column constants prevents a SingleDeviceConstant from
@@ -462,7 +448,49 @@ pub enum FixedOperationBatchRequest<M, S> {
     LiftIntegerToConstantPolynomial {
         metadata: PlannedNodeBatchRequest,
         ty: ConcreteMatrixType,
-        coefficient: BigInt,
+        coefficient: Arc<I>,
+    },
+    /// Construct one scalar polynomial from an indexed integer family.  The
+    /// family is lowered as typed integer values at the GPU boundary; it is
+    /// never represented as an artifact payload or as a host matrix owner.
+    PolynomialFromValues {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        values: Arc<I>,
+        evaluation: bool,
+    },
+    /// Export one resident scalar polynomial into backend-owned integer values.
+    /// The owner remains resident until the executor needs host-visible family
+    /// members; fixed consumers can pass it directly to `PolynomialFromValues`.
+    PolynomialValues {
+        metadata: PlannedNodeBatchRequest,
+        value: Arc<M>,
+        evaluation: bool,
+    },
+    /// Extract one canonical coefficient into a backend-owned scalar integer
+    /// owner. GPU implementations keep this owner resident; CPU
+    /// implementations return a one-member integer vector.
+    ExtractCoefficient {
+        metadata: PlannedNodeBatchRequest,
+        value: Arc<M>,
+        position: usize,
+    },
+    /// Decode several coefficients in one backend operation. The output is
+    /// one integer owner per logical output port so fixed execution can retain
+    /// all ports resident without a protocol-value host round trip.
+    ThresholdDecode {
+        metadata: PlannedNodeBatchRequest,
+        value: Arc<M>,
+        plaintext_modulus: BigInt,
+        length: usize,
+        output_bool: bool,
+    },
+    /// Pack a resident bit family into one scalar polynomial.
+    PackPolynomialCoefficients {
+        metadata: PlannedNodeBatchRequest,
+        ty: ConcreteMatrixType,
+        bits: Arc<I>,
+        coefficient_bits: usize,
     },
     MatrixBinary {
         metadata: PlannedNodeBatchRequest,
@@ -505,7 +533,7 @@ pub enum FixedOperationBatchRequest<M, S> {
     },
     CrtRecompose {
         metadata: PlannedNodeBatchRequest,
-        levels: Vec<M>,
+        levels: Vec<Arc<M>>,
         plaintext_moduli: Vec<BigInt>,
         reconstruction_coefficients: Vec<BigInt>,
         destination: ConcreteMatrixType,
@@ -537,6 +565,11 @@ pub enum FixedUnaryOperation {
     },
     CenteredRebase {
         destination: ConcreteMatrixType,
+    },
+    /// Coefficientwise centered nearest division by a frozen positive divisor.
+    /// The divisor is metadata, never a runtime/device control value.
+    CenteredRoundDivide {
+        divisor: BigInt,
     },
     RnsModUp {
         destination: ConcreteMatrixType,
@@ -609,6 +642,15 @@ pub enum FixedGenerationRequest {
 pub enum FixedGenerationOutput<M, S> {
     Matrix(M),
     Small(S),
+}
+
+/// Output of a fixed ordinary operation.  Most operations produce a matrix;
+/// `PolynomialValues` produces backend-owned integer values so a following
+/// `PolynomialFromValues` can consume them without a host round trip.
+pub enum FixedOperationBatchOutput<M, I> {
+    Matrix(M),
+    IntegerValues(I),
+    IntegerValuesMany(Vec<I>),
 }
 
 pub struct FixedGadgetDecomposeRequest<M> {
@@ -2660,6 +2702,10 @@ impl FrozenGpuWarmupProfiles {
 pub trait Backend {
     type Matrix: Clone + Debug + PartialEq + Send + Sync + 'static;
     type SmallMatrix: Clone + Debug + PartialEq + Send + Sync;
+    /// Backend-owned values exported by `PolynomialValues`. CPU backends use
+    /// `Vec<BigInt>`; GPU backends may retain a native/device owner until a
+    /// host consumer explicitly asks for the final export.
+    type IntegerValues: Clone + Debug + Send + Sync + 'static;
     type Trapdoor: Clone + Debug + Send + Sync;
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -2677,11 +2723,9 @@ pub trait Backend {
                     }?;
                     Ok(FusedBatchOutput::Matrices(vec![output]))
                 }
-                DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => {
-                    let groups = rows.into_iter().flatten().collect::<Vec<_>>();
-                    self.tensor_sum_rows(&source, &right, &groups)
-                        .map(|value| FusedBatchOutput::Matrices(vec![value]))
-                }
+                DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => self
+                    .tensor_sum_row_groups(&source, &right, &rows)
+                    .map(FusedBatchOutput::Matrices),
                 DynamicFusedBatchRequest::Decompose { blocks, small, digits } => self
                     .gadget_decompose_row_blocks(
                         &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -2718,11 +2762,9 @@ pub trait Backend {
                     }?;
                     Ok(FusedBatchOutput::Matrices(vec![output]))
                 }
-                FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => {
-                    let groups = rows.into_iter().flatten().collect::<Vec<_>>();
-                    self.tensor_sum_rows(&source, &right, &groups)
-                        .map(|value| FusedBatchOutput::Matrices(vec![value]))
-                }
+                FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => self
+                    .tensor_sum_row_groups(&source, &right, &rows)
+                    .map(FusedBatchOutput::Matrices),
                 FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => self
                     .gadget_decompose_row_blocks(
                         &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -2750,51 +2792,115 @@ pub trait Backend {
     /// single-instance dispatch when a frozen plan is active.
     fn fixed_operation_batch(
         &mut self,
-        requests: Vec<FixedOperationBatchRequest<Self::Matrix, Self::SmallMatrix>>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests: Vec<
+            FixedOperationBatchRequest<Self::Matrix, Self::SmallMatrix, Self::IntegerValues>,
+        >,
+    ) -> Result<Vec<FixedOperationBatchOutput<Self::Matrix, Self::IntegerValues>>, Self::Error>
+    {
         requests
             .into_iter()
             .map(|request| match request {
-                FixedOperationBatchRequest::SingleDeviceConstant {
+                FixedOperationBatchRequest::PolynomialValues { value, evaluation, metadata: _ } => {
+                    self.polynomial_values_resident(&value, evaluation)
+                        .map(FixedOperationBatchOutput::IntegerValues)
+                }
+                FixedOperationBatchRequest::PolynomialFromValues {
                     ty,
+                    values,
+                    evaluation,
+                    metadata: _,
+                } => self
+                    .polynomial_from_integer_values(&ty, values.as_ref(), evaluation)
+                    .map(FixedOperationBatchOutput::Matrix),
+                FixedOperationBatchRequest::ExtractCoefficient { value, position, .. } => {
+                    let coefficient = self.extract_coefficient(&value, position)?;
+                    self.integer_values_from_host(std::slice::from_ref(&coefficient))
+                        .map(FixedOperationBatchOutput::IntegerValues)
+                }
+                FixedOperationBatchRequest::ThresholdDecode {
                     value,
-                    env,
-                    metadata: _,
-                } => self.constant_matrix(&ty, &value, &env),
-                FixedOperationBatchRequest::GeneratedConstant { ty, value, env, metadata: _ } => {
-                    self.constant_matrix(&ty, &value, &env)
-                }
-                FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                    plaintext_modulus,
+                    length,
+                    output_bool: _,
+                    ..
+                } => self
+                    .threshold_decode(&value, &plaintext_modulus, length)
+                    .and_then(|values| {
+                        values
+                            .into_iter()
+                            .map(|value| {
+                                self.integer_values_from_host(std::slice::from_ref(&value))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .map(FixedOperationBatchOutput::IntegerValuesMany),
+                FixedOperationBatchRequest::PackPolynomialCoefficients {
                     ty,
-                    coefficient,
-                    metadata: _,
+                    bits,
+                    coefficient_bits,
+                    ..
                 } => {
-                    let identity =
-                        self.constant_matrix(&ty, &ConstantMatrix::Identity, &ParamEnv::default())?;
-                    self.scale_integer(&identity, &coefficient)
+                    let values = self.integer_values_to_host(&bits)?;
+                    let bits = values
+                        .into_iter()
+                        .map(|value| value == BigInt::from(1u8))
+                        .collect::<Vec<_>>();
+                    self.pack_polynomial_coefficients(&ty, &bits, coefficient_bits)
+                        .map(FixedOperationBatchOutput::Matrix)
                 }
-                FixedOperationBatchRequest::MatrixBinary {
-                    operation,
-                    left,
-                    right,
-                    metadata: _,
-                } => match operation {
-                    MatrixBinaryOp::Add => self.add(&left, &right),
-                    MatrixBinaryOp::Subtract => self.sub(&left, &right),
-                    MatrixBinaryOp::Multiply => self.multiply(&left, &right),
-                },
-                FixedOperationBatchRequest::MatrixMulSmallRhs { left, right, metadata: _ } => {
-                    self.multiply_small_rhs(&left, &right)
-                }
-                FixedOperationBatchRequest::MatrixMulAccumulate { request, metadata: _ } => {
-                    self.matrix_mul_accumulate(request)
-                }
-                FixedOperationBatchRequest::Negate { value, metadata: _ } => self.negate(&value),
-                FixedOperationBatchRequest::Scale { value, scalar, metadata: _ } => {
-                    self.scale_integer(&value, &scalar)
-                }
-                FixedOperationBatchRequest::UnaryTransform { operation, value, metadata: _ } => {
-                    match operation {
+                request => match request {
+                    FixedOperationBatchRequest::SingleDeviceConstant {
+                        ty,
+                        value,
+                        env,
+                        metadata: _,
+                    } => self.constant_matrix(&ty, &value, &env),
+                    FixedOperationBatchRequest::GeneratedConstant {
+                        ty,
+                        value,
+                        env,
+                        metadata: _,
+                    } => self.constant_matrix(&ty, &value, &env),
+                    FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                        ty,
+                        coefficient,
+                        metadata: _,
+                    } => {
+                        let coefficient = self.integer_values_to_host(&coefficient)?;
+                        let identity = self.constant_matrix(
+                            &ty,
+                            &ConstantMatrix::Identity,
+                            &ParamEnv::default(),
+                        )?;
+                        self.scale_integer(&identity, &coefficient[0])
+                    }
+                    FixedOperationBatchRequest::MatrixBinary {
+                        operation,
+                        left,
+                        right,
+                        metadata: _,
+                    } => match operation {
+                        MatrixBinaryOp::Add => self.add(&left, &right),
+                        MatrixBinaryOp::Subtract => self.sub(&left, &right),
+                        MatrixBinaryOp::Multiply => self.multiply(&left, &right),
+                    },
+                    FixedOperationBatchRequest::MatrixMulSmallRhs { left, right, metadata: _ } => {
+                        self.multiply_small_rhs(&left, &right)
+                    }
+                    FixedOperationBatchRequest::MatrixMulAccumulate { request, metadata: _ } => {
+                        self.matrix_mul_accumulate(request)
+                    }
+                    FixedOperationBatchRequest::Negate { value, metadata: _ } => {
+                        self.negate(&value)
+                    }
+                    FixedOperationBatchRequest::Scale { value, scalar, metadata: _ } => {
+                        self.scale_integer(&value, &scalar)
+                    }
+                    FixedOperationBatchRequest::UnaryTransform {
+                        operation,
+                        value,
+                        metadata: _,
+                    } => match operation {
                         FixedUnaryOperation::RingAutomorphism { index } => {
                             self.ring_automorphism(&value, index)
                         }
@@ -2806,6 +2912,9 @@ pub trait Backend {
                         }
                         FixedUnaryOperation::CenteredRebase { destination } => {
                             self.centered_rebase(&value, &destination)
+                        }
+                        FixedUnaryOperation::CenteredRoundDivide { divisor } => {
+                            self.centered_round_divide(&value, &divisor)
                         }
                         FixedUnaryOperation::BlockModSwitch {
                             destination,
@@ -2843,27 +2952,33 @@ pub trait Backend {
                         FixedUnaryOperation::Slice { rows, columns } => {
                             self.slice(&value, rows.as_ref(), columns.as_ref())
                         }
+                    },
+                    FixedOperationBatchRequest::Tensor { left, right, metadata: _ } => {
+                        self.tensor(&left, &right)
                     }
+                    FixedOperationBatchRequest::Concat { inputs, axis, metadata: _ } => {
+                        let refs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
+                        self.concat(&refs, axis)
+                    }
+                    FixedOperationBatchRequest::CrtRecompose {
+                        levels,
+                        plaintext_moduli,
+                        reconstruction_coefficients,
+                        destination,
+                        metadata: _,
+                    } => self.crt_recompose(
+                        &levels.iter().map(|value| value.as_ref().clone()).collect::<Vec<_>>(),
+                        &plaintext_moduli,
+                        &reconstruction_coefficients,
+                        &destination,
+                    ),
+                    FixedOperationBatchRequest::PolynomialFromValues { .. } |
+                    FixedOperationBatchRequest::PolynomialValues { .. } |
+                    FixedOperationBatchRequest::ExtractCoefficient { .. } |
+                    FixedOperationBatchRequest::ThresholdDecode { .. } |
+                    FixedOperationBatchRequest::PackPolynomialCoefficients { .. } => unreachable!(),
                 }
-                FixedOperationBatchRequest::Tensor { left, right, metadata: _ } => {
-                    self.tensor(&left, &right)
-                }
-                FixedOperationBatchRequest::Concat { inputs, axis, metadata: _ } => {
-                    let refs = inputs.iter().map(Arc::as_ref).collect::<Vec<_>>();
-                    self.concat(&refs, axis)
-                }
-                FixedOperationBatchRequest::CrtRecompose {
-                    levels,
-                    plaintext_moduli,
-                    reconstruction_coefficients,
-                    destination,
-                    metadata: _,
-                } => self.crt_recompose(
-                    &levels,
-                    &plaintext_moduli,
-                    &reconstruction_coefficients,
-                    &destination,
-                ),
+                .map(FixedOperationBatchOutput::Matrix),
             })
             .collect()
     }
@@ -2958,6 +3073,36 @@ pub trait Backend {
         value: &Self::Matrix,
         evaluation: bool,
     ) -> Result<Vec<BigInt>, Self::Error>;
+
+    /// Imports host integer values into the backend-owned representation used
+    /// by fixed polynomial operations.
+    fn integer_values_from_host(
+        &mut self,
+        values: &[BigInt],
+    ) -> Result<Self::IntegerValues, Self::Error>;
+
+    /// Imports one polynomial from a backend-resident integer-value owner.
+    fn polynomial_from_integer_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &Self::IntegerValues,
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error>;
+
+    /// Produces backend-owned integer values without forcing a host export.
+    fn polynomial_values_resident(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Self::IntegerValues, Self::Error>;
+
+    /// Final host export for a resident integer-value owner.
+    fn integer_values_to_host(
+        &mut self,
+        values: &Self::IntegerValues,
+    ) -> Result<Vec<BigInt>, Self::Error>;
+
+    fn integer_values_len(&self, values: &Self::IntegerValues) -> usize;
 
     /// Selects the setup-time GPU calibration for the next primitive. CPU and
     /// non-fleet backends ignore this hook.
@@ -3267,6 +3412,15 @@ pub trait Backend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error>;
 
+    /// Divide centered coefficients by a frozen positive divisor, rounding to
+    /// the nearest integer. The divisor is carried as arbitrary-precision
+    /// metadata so fixed dispatch never truncates it to a device control word.
+    fn centered_round_divide(
+        &mut self,
+        value: &Self::Matrix,
+        divisor: &BigInt,
+    ) -> Result<Self::Matrix, Self::Error>;
+
     /// Rebase a bounded compact matrix without widening it to a full matrix.
     /// The canonical compact payload and coefficient bound are preserved;
     /// implementations may alias an owner or make a compact-to-compact copy.
@@ -3373,6 +3527,27 @@ pub trait Backend {
             .collect::<Result<Vec<_>, Self::Error>>()?;
         self.concat(&output.iter().collect::<Vec<_>>(), ConcatAxis::Rows)
     }
+    /// Sum selected tensor-product rows without requiring a materialized tensor.
+    fn tensor_sum_row_groups(
+        &mut self,
+        left: &Self::Matrix,
+        right: &Self::Matrix,
+        groups: &[Vec<Vec<usize>>],
+    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        let rows = groups.iter().flatten().cloned().collect::<Vec<_>>();
+        let combined = self.tensor_sum_rows(left, right, &rows)?;
+        let mut start = 0;
+        groups
+            .iter()
+            .map(|group| {
+                let end = start + group.len();
+                let output = self.slice(&combined, Some(&IndexRange { start, end }), None);
+                start = end;
+                output
+            })
+            .collect()
+    }
+
     /// Sum selected tensor-product rows without requiring a materialized tensor.
     fn tensor_sum_rows(
         &mut self,
@@ -3634,11 +3809,18 @@ pub trait Backend {
 /// execution's value-kind checks do not certify it or inspect resident matrix contents.
 pub enum RuntimeValue<B: Backend> {
     Int(BigInt),
+    /// A native signed integer used at a backend boundary. Host/control
+    /// arithmetic converts it to `BigInt`; it is never an owned matrix.
+    NativeInteger(i64),
     Real(f64),
     Bool(bool),
     Bytes(Vec<u8>),
     TypedBlob(Vec<u8>),
     Matrix(Arc<B::Matrix>),
+    /// Backend-owned polynomial values. This stays distinct from
+    /// `IndexedFamily`: a family may contain this owner as an intermediate,
+    /// while fixed polynomial operations can consume it without exporting.
+    IntegerValues(Arc<B::IntegerValues>),
     /// Host-staged matrix; expanded columns are loaded only when consumed.
     HostMatrix {
         matrix_type: ConcreteMatrixType,
@@ -3686,11 +3868,13 @@ impl<B: Backend> Clone for RuntimeValue<B> {
     fn clone(&self) -> Self {
         match self {
             Self::Int(value) => Self::Int(value.clone()),
+            Self::NativeInteger(value) => Self::NativeInteger(*value),
             Self::Real(value) => Self::Real(*value),
             Self::Bool(value) => Self::Bool(*value),
             Self::Bytes(value) => Self::Bytes(value.clone()),
             Self::TypedBlob(value) => Self::TypedBlob(value.clone()),
             Self::Matrix(value) => Self::Matrix(value.clone()),
+            Self::IntegerValues(value) => Self::IntegerValues(value.clone()),
             Self::HostMatrix { matrix_type, bytes } => {
                 Self::HostMatrix { matrix_type: matrix_type.clone(), bytes: bytes.clone() }
             }
@@ -3746,6 +3930,7 @@ impl<B: Backend> RuntimeValue<B> {
     pub(crate) fn releases_backend_resources_on_drop(&self) -> bool {
         match self {
             Self::Matrix(matrix) => Arc::strong_count(matrix) == 1,
+            Self::IntegerValues(values) => Arc::strong_count(values) == 1,
             Self::SmallMatrix(matrix) => Arc::strong_count(matrix) == 1,
             Self::Preimage(matrix) => Arc::strong_count(matrix) == 1,
             Self::Trapdoor { secret, public, .. } => {
@@ -3757,6 +3942,7 @@ impl<B: Backend> RuntimeValue<B> {
             }
             Self::HostMatrix { .. } |
             Self::Int(_) |
+            Self::NativeInteger(_) |
             Self::Real(_) |
             Self::Bool(_) |
             Self::Bytes(_) |
@@ -3772,6 +3958,10 @@ impl<B: Backend> RuntimeValue<B> {
 impl<B: Backend> RuntimeValue<B> {
     pub fn matrix(value: B::Matrix) -> Self {
         Self::Matrix(Arc::new(value))
+    }
+
+    pub fn integer_values(value: B::IntegerValues) -> Self {
+        Self::IntegerValues(Arc::new(value))
     }
 
     pub fn small_matrix(value: B::SmallMatrix) -> Self {
@@ -3790,7 +3980,13 @@ impl<B: Backend> RuntimeValue<B> {
     /// top-level Rust representation.
     pub fn matches_wire_type(&self, concrete: &ConcreteWireType) -> bool {
         match (self, concrete) {
-            (Self::Int(_), ConcreteWireType::ConstantInt | ConcreteWireType::Int) |
+            (Self::IntegerValues(_), ConcreteWireType::IndexedFamily { element, .. }) => {
+                matches!(element.as_ref(), ConcreteWireType::Int | ConcreteWireType::ConstantInt)
+            }
+            (
+                Self::Int(_) | Self::NativeInteger(_),
+                ConcreteWireType::ConstantInt | ConcreteWireType::Int,
+            ) |
             (Self::Real(_), ConcreteWireType::ConstantReal | ConcreteWireType::Real) |
             (Self::Bool(_), ConcreteWireType::ConstantBool | ConcreteWireType::Bool) |
             (Self::Bytes(_), ConcreteWireType::Bytes { .. }) |
@@ -4043,6 +4239,7 @@ mod warmup_profile_tests {
             NodeKind::ModulusSwitch { modulus: one() },
             NodeKind::ModulusReduce { modulus: one() },
             NodeKind::CenteredRebase { modulus: one() },
+            NodeKind::CenteredRoundDivide { divisor: one() },
             NodeKind::BlockModSwitch {
                 modulus: one(),
                 source_moduli: vec![17, 97],
@@ -4194,7 +4391,7 @@ mod warmup_profile_tests {
         assert_eq!(profile.workspace_bytes, 0);
         assert!(
             GpuWarmupProfile::measured_for_domain(
-                CanonicalWarmupProfileDomain::ConstantInt,
+                CanonicalWarmupProfileDomain::ConstantReal,
                 0.25,
                 1,
             )

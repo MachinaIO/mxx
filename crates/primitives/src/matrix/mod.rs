@@ -669,6 +669,10 @@ pub trait PolyMatrix:
     fn reduce_modulus(&self, destination: &<Self::P as Poly>::Params) -> Self;
     /// Transfers a single source limb's centered coefficients to a new CRT basis.
     fn centered_rebase(&self, destination: &<Self::P as Poly>::Params) -> Result<Self, String>;
+    /// Divides centered coefficients by a fixed positive integer, rounding
+    /// ties toward positive infinity, and returns a polynomial in the same
+    /// CRT ring.
+    fn centered_round_divide(&self, divisor: &BigUint) -> Result<Self, String>;
     /// Exact block modulus switch with a public positive integer scale.
     /// Destination is a strict CRT subset; the dropped block is centered as a
     /// whole before the retained residues are divided by its product.
@@ -926,9 +930,10 @@ pub trait SmallPolyMatrix: Clone + Debug + PartialEq + Eq + Send + Sync {
         let destination_basis = destination.to_crt().0;
         let destination_modulus: BigUint =
             destination_basis.iter().copied().map(BigUint::from).product();
-        if self.params().ring_dimension() != destination.ring_dimension() ||
-            (!source_basis.iter().all(|prime| destination_basis.contains(prime)) &&
-                self.max_coefficient_bound() > &(destination_modulus >> 1))
+        if source_basis.is_empty() ||
+            destination_basis.is_empty() ||
+            self.params().ring_dimension() != destination.ring_dimension() ||
+            self.max_coefficient_bound() > &(destination_modulus >> 1)
         {
             return Err(SmallMatrixError::ParameterMismatch);
         }

@@ -20,7 +20,8 @@ use crate::backend::{
 #[cfg(any(feature = "gpu", test))]
 use crate::gpu_column_policy::{
     CanonicalWarmupProfileDomain, GpuFragmentClass as TypedFragmentClass,
-    capability_for_effective_operation, fused_warmup_profile_domain,
+    capability_for_effective_operation, effective_gpu_operation_for_types,
+    fused_warmup_profile_domain, is_resident_control_operation_for_types,
     map_output_range_to_inputs_with_output,
 };
 #[cfg(any(feature = "gpu", test))]
@@ -1039,16 +1040,20 @@ fn validated_wire_bytes(
             validated_wire_bytes(element, descriptors, active_crt_towers, crt_limb_bytes)
                 .saturating_mul(*count as u64)
         }
+        // Resident control values use the native signed-value owner: one
+        // u64 slot per scalar, independent of matrix storage metadata.
+        ConcreteWireType::ConstantInt |
+        ConcreteWireType::Int |
+        ConcreteWireType::ConstantBool |
+        ConcreteWireType::Bool => 8,
         ConcreteWireType::Bytes { length } => *length as u64,
         _ => 0,
     }
 }
 
-/// Return whether warmup must retain storage metadata for a wire. Scalar
-/// values are host-only, but nonzero byte payloads remain tracked because
-/// `validated_wire_bytes` accounts for them in transfer/output contracts.
-/// Matrix-like values, byte payloads, and families containing either retain
-/// their ownership contract; zero-sized matrices remain tracked for routing.
+/// Return whether warmup must retain storage metadata for a wire. Integer and
+/// boolean values are resident control owners in the fixed GPU path; real
+/// values and host/session payloads remain host-only in this wave.
 #[cfg(any(feature = "gpu", test))]
 fn needs_storage_tracking(ty: &ConcreteWireType) -> bool {
     match ty {
@@ -1056,9 +1061,58 @@ fn needs_storage_tracking(ty: &ConcreteWireType) -> bool {
         ConcreteWireType::SmallMatrix { .. } |
         ConcreteWireType::Preimage { .. } |
         ConcreteWireType::Trapdoor { .. } => true,
+        ConcreteWireType::ConstantInt |
+        ConcreteWireType::Int |
+        ConcreteWireType::ConstantBool |
+        ConcreteWireType::Bool => true,
         ConcreteWireType::Bytes { length } => *length > 0,
         ConcreteWireType::IndexedFamily { element, .. } => needs_storage_tracking(element),
         _ => false,
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn resident_control_wire(ty: &ConcreteWireType) -> bool {
+    match ty {
+        ConcreteWireType::ConstantInt |
+        ConcreteWireType::Int |
+        ConcreteWireType::ConstantBool |
+        ConcreteWireType::Bool => true,
+        ConcreteWireType::IndexedFamily { element, .. } => resident_control_wire(element),
+        _ => false,
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn contains_matrix_wire(ty: &ConcreteWireType) -> bool {
+    match ty {
+        ConcreteWireType::IndexedFamily { element, .. } => contains_matrix_wire(element),
+        _ => ty.matrix_type().is_some(),
+    }
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn resident_scalar_control_operation(operation: &GpuWarmupOperationDescriptor) -> bool {
+    is_resident_control_operation_for_types(
+        &operation.kind,
+        &operation.concrete_argument_types,
+        &operation.concrete_output_types,
+    ) && (!operation.concrete_argument_types.is_empty() ||
+        !operation.concrete_output_types.is_empty()) &&
+        operation
+            .concrete_argument_types
+            .iter()
+            .chain(operation.concrete_output_types.iter())
+            .all(|ty| !contains_matrix_wire(ty) && resident_control_wire(ty))
+}
+
+#[cfg(any(feature = "gpu", test))]
+fn warmup_wire_columns(ty: &ConcreteWireType) -> usize {
+    match ty {
+        ConcreteWireType::IndexedFamily { element, .. } => warmup_wire_columns(element),
+        _ => ty
+            .matrix_type()
+            .map_or_else(|| usize::from(resident_control_wire(ty)), |matrix| matrix.columns),
     }
 }
 
@@ -1143,6 +1197,10 @@ fn validated_operation_identity(
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GpuStageReport {
     pub key: GpuExecutionSiteKey,
+    /// Effective identity selected by the lowering/fusion pass. This is
+    /// public plan evidence: callers do not need to reconstruct fusion from
+    /// the validated graph or from operation names.
+    pub fusion_identity: [u8; 32],
     pub operation_identity: [u8; 32],
     pub effective_operation: EffectiveGpuOperation,
     pub column_capability: ColumnCapability,
@@ -1668,14 +1726,38 @@ fn bounded_job_queries_for_layout(
                 _ => TypedFragmentClass::Full,
             };
             let output_range = ColumnRange { start: job.start, end: job.end };
-            let mapped = map_output_range_to_inputs_with_output(
+            let resident_scalar_control = resident_scalar_control_operation(operation);
+            let mapped = if resident_scalar_control {
+                map_output_range_to_inputs_with_output(
+                    &operation.kind,
+                    &operation.concrete_argument_types,
+                    layout.columns,
+                    output_range,
+                )
+                .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+            } else if matches!(
+                effective_gpu_operation_for_types(
+                    &operation.kind,
+                    &operation.concrete_argument_types,
+                    &operation.concrete_output_types,
+                ),
+                EffectiveGpuOperation::HostOrControl | EffectiveGpuOperation::TrapdoorPublic
+            ) || is_resident_control_operation_for_types(
                 &operation.kind,
                 &operation.concrete_argument_types,
-                layout.columns,
-                output_range,
-            )
-            .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?;
-            let source_range = mapped
+                &operation.concrete_output_types,
+            ) {
+                Vec::new()
+            } else {
+                map_output_range_to_inputs_with_output(
+                    &operation.kind,
+                    &operation.concrete_argument_types,
+                    layout.columns,
+                    output_range,
+                )
+                .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+            };
+            let mapped_source_range = mapped
                 .iter()
                 .map(|input| input.range)
                 .reduce(|left, right| ColumnRange {
@@ -1683,7 +1765,15 @@ fn bounded_job_queries_for_layout(
                     end: left.end.max(right.end),
                 })
                 .unwrap_or(output_range);
-            let routed_sources = if mapped.is_empty() {
+            // Resident integer/family owners are one logical control column
+            // even when a family contains multiple signed values. The range
+            // mapper exposes family cardinality for semantic indexing, but
+            // route descriptors describe physical owner columns. Reusing the
+            // semantic [0,count) range here makes a resident family look
+            // cross-device and incorrectly selects HostStaging.
+            let source_range =
+                resident_scalar_control.then_some(output_range).unwrap_or(mapped_source_range);
+            let routed_sources = if mapped.is_empty() || resident_scalar_control {
                 source_layouts
                     .iter()
                     .map(|source| rotated_storage_layout(source, devices, instance_slot))
@@ -1896,13 +1986,41 @@ fn bounded_fused_union_job_queries_for_layouts(
                         _ => TypedFragmentClass::Full,
                     };
                     let output_range = ColumnRange { start: job.range.start, end: job.range.end };
-                    let mapped = map_output_range_to_inputs_with_output(
+                    let mapped = if resident_scalar_control_operation(operation) {
+                        map_output_range_to_inputs_with_output(
+                            &operation.kind,
+                            &operation.concrete_argument_types,
+                            layouts[binding_port].columns,
+                            output_range,
+                        )
+                        .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+                    } else if matches!(
+                        effective_gpu_operation_for_types(
+                            &operation.kind,
+                            &operation.concrete_argument_types,
+                            &operation.concrete_output_types,
+                        ),
+                        EffectiveGpuOperation::HostOrControl |
+                            EffectiveGpuOperation::TrapdoorPublic
+                    ) || is_resident_control_operation_for_types(
                         &operation.kind,
                         &operation.concrete_argument_types,
-                        layouts[binding_port].columns,
-                        output_range,
-                    )
-                    .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?;
+                        &operation.concrete_output_types,
+                    ) {
+                        // Matrix-shaped subgraph/loop controls use their
+                        // physical output range. The resident mapper's
+                        // one-column semantic range is only valid for scalar
+                        // and family controls.
+                        Vec::new()
+                    } else {
+                        map_output_range_to_inputs_with_output(
+                            &operation.kind,
+                            &operation.concrete_argument_types,
+                            layouts[binding_port].columns,
+                            output_range,
+                        )
+                        .map_err(|error| GpuWarmupError::InvalidPlan(error.to_string()))?
+                    };
                     let source_range = mapped
                         .iter()
                         .map(|input| input.range)
@@ -3194,7 +3312,6 @@ fn choose_node_with_candidates(
         return Err(GpuWarmupError::NoNodeCandidate(node.key));
     }
     let mut best: Option<(f64, Vec<usize>, Vec<GpuResourceCost>)> = None;
-    let mut host_failure = None;
     let mut resource_failure = None;
     let mut profile_failure = false;
     let mut memory_failure = None;
@@ -3203,7 +3320,9 @@ fn choose_node_with_candidates(
         let single_device = node.column_capability == ColumnCapability::SingleDevice;
         let column_work = !matches!(
             node.column_capability,
-            ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+            ColumnCapability::HostOrControl |
+                ColumnCapability::NativeAlias |
+                ColumnCapability::SingleDevice
         ) && layouts.iter().any(|layout| layout.columns > 0);
         // Gadget/trapdoor single-device dispatch is contractually pinned to
         // logical GPU0. Owner candidates must never move this operation.
@@ -3263,8 +3382,6 @@ fn choose_node_with_candidates(
             }
         }
         let mut valid = true;
-        let mut device_failure = false;
-        let mut candidate_host_failure = None;
         for device in 0..devices {
             let scheduled_owned = schedules_owned
                 .iter()
@@ -3293,7 +3410,10 @@ fn choose_node_with_candidates(
             let point_evidence = stage_cost.measurement_evidence_by_width.get(&widths[device]);
             let empty_memory =
                 point_evidence.is_some_and(|evidence| !measurement_evidence_has_bytes(evidence));
-            let zero_memory_exception = node.column_capability == ColumnCapability::HostOrControl;
+            let zero_memory_exception = matches!(
+                node.column_capability,
+                ColumnCapability::HostOrControl | ColumnCapability::NativeAlias
+            );
             if !measured_jobs &&
                 ((!stage_cost.measurement_evidence_by_width.is_empty() &&
                     point_evidence.is_none()) ||
@@ -3405,24 +3525,14 @@ fn choose_node_with_candidates(
             }
             if peak.device_bytes() > budgets[device].device_bytes {
                 valid = false;
-                device_failure = true;
                 if resource_failure.is_none() {
                     resource_failure =
                         Some((device, peak.device_bytes(), budgets[device].device_bytes));
                 }
             }
-            if peak.pinned_host > budgets[device].pinned_host_bytes ||
-                peak.host > budgets[device].host_bytes
-            {
-                valid = false;
-                candidate_host_failure = Some((device, peak.pinned_host, peak.host));
-            }
             peaks.push(peak);
         }
         if !valid {
-            if !device_failure && host_failure.is_none() {
-                host_failure = candidate_host_failure;
-            }
             continue;
         }
         let times = node.cost.iter().map(|cost| cost.time.clone()).collect::<Vec<_>>();
@@ -3435,7 +3545,10 @@ fn choose_node_with_candidates(
             } else {
                 node.output_columns
             }
-        } else if node.column_capability == ColumnCapability::HostOrControl {
+        } else if matches!(
+            node.column_capability,
+            ColumnCapability::HostOrControl | ColumnCapability::NativeAlias
+        ) {
             1
         } else {
             0
@@ -3476,10 +3589,16 @@ fn choose_node_with_candidates(
                     .sum::<f64>();
                 seconds += cycle_sum * complete_cycles as f64;
             }
-            for phase in (complete_cycles * cycle_waves)..full_waves {
-                let first_slot =
-                    phase.checked_mul(wave_instances).ok_or(GpuWarmupError::ArithmeticOverflow)? %
-                        rotation_period.max(1);
+            // The complete cycles above are represented symbolically.  Only
+            // the residual prefix needs explicit schedules; deriving its
+            // phase from the absolute wave number would overflow for a
+            // validated loop whose count is near usize::MAX.  One complete
+            // phase cycle advances by a whole rotation period, so the
+            // residual phases have the same canonical starts as phase 0.
+            let residual_waves = full_waves % cycle_waves;
+            for phase in 0..residual_waves {
+                let first_slot = ((phase as u128 * wave_instances as u128) %
+                    rotation_period.max(1) as u128) as usize;
                 let schedules = schedules_for_wave(
                     layouts,
                     &widths,
@@ -3495,10 +3614,8 @@ fn choose_node_with_candidates(
                 };
             }
             if tail > 0 {
-                let first_slot = full_waves
-                    .checked_mul(wave_instances)
-                    .ok_or(GpuWarmupError::ArithmeticOverflow)? %
-                    rotation_period.max(1);
+                let first_slot = ((full_waves as u128 * wave_instances as u128) %
+                    rotation_period.max(1) as u128) as usize;
                 let schedules =
                     schedules_for_wave(layouts, &widths, first_slot, tail, rotation_period)?;
                 seconds += if node.cost.iter().any(|cost| !cost.profiles_by_job.is_empty()) {
@@ -3532,14 +3649,6 @@ fn choose_node_with_candidates(
         }
     }
     let Some((seconds, widths, peak)) = best else {
-        if let Some((device, pinned, host)) = host_failure {
-            return Err(GpuWarmupError::HostResourceExhausted {
-                site: node.key,
-                device,
-                pinned,
-                host,
-            });
-        }
         if profile_failure && resource_failure.is_none() {
             return Err(GpuWarmupError::MissingPreimageProfile { site: node.key });
         }
@@ -3561,6 +3670,7 @@ fn choose_node_with_candidates(
         seconds,
         report: GpuStageReport {
             key: node.key,
+            fusion_identity: node.operation_identity,
             operation_identity: node.operation_identity,
             effective_operation: node.effective_operation,
             column_capability: node.column_capability,
@@ -3656,18 +3766,6 @@ fn bound_loop_wave_candidates(
                         .unwrap_or(usize::MAX),
                 );
             }
-            if cost.per_instance.pinned_host > 0 {
-                device_bound = device_bound.min(
-                    usize::try_from(budget.pinned_host_bytes / cost.per_instance.pinned_host)
-                        .unwrap_or(usize::MAX),
-                );
-            }
-            if cost.per_instance.host > 0 {
-                device_bound = device_bound.min(
-                    usize::try_from(budget.host_bytes / cost.per_instance.host)
-                        .unwrap_or(usize::MAX),
-                );
-            }
             if device_bound != usize::MAX {
                 bound = bound.min(device_bound.max(1));
             }
@@ -3699,7 +3797,7 @@ fn profile_provider_error(error: GpuWarmupProfileError) -> GpuWarmupError {
     }
 }
 
-#[cfg(any(feature = "gpu", test))]
+#[cfg(feature = "gpu")]
 fn annotate_warmup_phase(phase: &str, error: GpuWarmupError) -> GpuWarmupError {
     match error {
         GpuWarmupError::ValidatedGraph(message) => {
@@ -5420,6 +5518,10 @@ fn warmup_input_for_owner_placement(
                 nested,
             });
         }
+        // A zero-count loop body is never entered. Its parent scope still
+        // owns the carried value, but the body must not introduce a second
+        // capture allocation or a route to an unavailable child placement.
+        let zero_loop_body_scope = loop_info.as_ref().is_some_and(|(_, count, _)| *count == 0);
         let scope = validated.source.scope(scope_id).ok_or_else(|| {
             GpuWarmupError::ValidatedGraph(format!("missing graph scope {scope_id:?}"))
         })?;
@@ -5441,7 +5543,7 @@ fn warmup_input_for_owner_placement(
                     id
                 } else {
                     let matrix = ty.matrix_type();
-                    let columns = matrix.map_or(0, |matrix| matrix.columns);
+                    let columns = warmup_wire_columns(ty);
                     let template = layout_columns
                         .get(&columns)
                         .and_then(|id| layout_indices.get(id))
@@ -5513,61 +5615,67 @@ fn warmup_input_for_owner_placement(
                 );
             }
         }
-        let scope_capture_allocations = inherited_wires
-            .into_iter()
-            .map(|(wire_shape, wire)| -> Result<Option<_>, GpuWarmupError> {
-                let source_scope = if wire_shape == shape_class {
-                    checked
-                } else {
-                    validated
-                        .scope(match scope_id {
-                            FrozenGraphScopeId::ParallelBody { parent, .. } |
-                            FrozenGraphScopeId::SequentialBody { parent, .. } => parent,
-                            _ => scope_id,
-                        })
+        let scope_capture_allocations = if zero_loop_body_scope {
+            Vec::new()
+        } else {
+            inherited_wires
+                .into_iter()
+                .map(|(wire_shape, wire)| -> Result<Option<_>, GpuWarmupError> {
+                    let source_scope = if wire_shape == shape_class {
+                        checked
+                    } else {
+                        validated
+                            .scope(match scope_id {
+                                FrozenGraphScopeId::ParallelBody { parent, .. } |
+                                FrozenGraphScopeId::SequentialBody { parent, .. } => parent,
+                                _ => scope_id,
+                            })
+                            .ok_or_else(|| {
+                                GpuWarmupError::ValidatedGraph(
+                                    "missing capture source scope".into(),
+                                )
+                            })?
+                    };
+                    let resolved = resolve_storage_wire(&wire_aliases, wire_shape, wire);
+                    let Some(ty) = source_scope
+                        .wire_types
+                        .get(&resolved)
+                        .or_else(|| source_scope.wire_types.get(&wire))
+                    else {
+                        return Ok(None);
+                    };
+                    if !needs_storage_tracking(ty) {
+                        return Ok(None);
+                    }
+                    let layout = wire_layouts
+                        .get(&(wire_shape, resolved))
+                        .or_else(|| wire_layouts.get(&(wire_shape, wire)))
+                        .copied()
                         .ok_or_else(|| {
-                            GpuWarmupError::ValidatedGraph("missing capture source scope".into())
-                        })?
-                };
-                let resolved = resolve_storage_wire(&wire_aliases, wire_shape, wire);
-                let Some(ty) = source_scope
-                    .wire_types
-                    .get(&resolved)
-                    .or_else(|| source_scope.wire_types.get(&wire))
-                else {
-                    return Ok(None);
-                };
-                if !needs_storage_tracking(ty) {
-                    return Ok(None);
-                }
-                let layout = wire_layouts
-                    .get(&(wire_shape, resolved))
-                    .or_else(|| wire_layouts.get(&(wire_shape, wire)))
-                    .copied()
-                    .ok_or_else(|| {
-                        GpuWarmupError::ValidatedGraph(format!(
-                            "missing layout for captured wire {wire_shape}:{wire:?}"
-                        ))
-                    })?;
-                Ok(Some((
-                    layout,
-                    validated_wire_bytes(
-                        ty,
-                        &config.storage_descriptors,
-                        config.active_crt_towers,
-                        config.crt_limb_bytes,
-                    ),
-                    GpuStorageIdentity { shape_class: wire_shape, wire: resolved },
-                )))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        // Scalar liveness is host-only and must not be reconsidered at every
-        // site.  Select storage-bearing candidates once for this scope; the
-        // site loop below still applies position-sensitive last-use checks,
-        // fused owner expansion, and alias deduplication to this reduced set.
+                            GpuWarmupError::ValidatedGraph(format!(
+                                "missing layout for captured wire {wire_shape}:{wire:?}"
+                            ))
+                        })?;
+                    Ok(Some((
+                        layout,
+                        validated_wire_bytes(
+                            ty,
+                            &config.storage_descriptors,
+                            config.active_crt_towers,
+                            config.crt_limb_bytes,
+                        ),
+                        GpuStorageIdentity { shape_class: wire_shape, wire: resolved },
+                    )))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        };
+        // Select storage-bearing candidates once for this scope; the site loop
+        // below still applies position-sensitive last-use checks, fused owner
+        // expansion, and alias deduplication to this reduced set. Resident
+        // integer/bool values are included alongside matrix owners.
         let storage_last_use = checked
             .liveness
             .last_use
@@ -5605,6 +5713,9 @@ fn warmup_input_for_owner_placement(
             .collect::<Vec<_>>();
         for (position, handle) in checked.execution_order.iter().enumerate() {
             let node_id = NodeId(position as u64);
+            if lowering.is_fused_follower(node_id) {
+                continue;
+            }
             let arguments = scope.arguments(handle).ok_or_else(|| {
                 GpuWarmupError::ValidatedGraph(format!(
                     "missing arguments for {scope_id:?}/{node_id:?}"
@@ -5630,7 +5741,9 @@ fn warmup_input_for_owner_placement(
                 .effective_operations
                 .get(&(shape_class, node_id.0))
                 .copied()
-                .unwrap_or_else(|| effective_gpu_operation(handle.kind()));
+                .unwrap_or_else(|| {
+                    effective_gpu_operation_for_types(handle.kind(), &argument_types, &output_types)
+                });
             let effective_operation = if matches!(handle.kind(), NodeKind::PreimageSample { .. }) &&
                 fused_warmup_operation_for_site(
                     validated,
@@ -5655,6 +5768,57 @@ fn warmup_input_for_owner_placement(
                     kind: handle.kind().clone(),
                 });
             }
+            // A zero-count sequential node publishes its initial carried
+            // owner without executing the body. The body scopes are visited
+            // for schema/liveness, but must not acquire a measured device
+            // job or output allocation of their own.
+            let zero_count_sequential = if let NodeKind::SequentialLoop(spec) = handle.kind() {
+                spec.count
+                    .evaluate(&validated.bindings)
+                    .map_err(|error| GpuWarmupError::ValidatedGraph(error.to_string()))?
+                    .to_usize()
+                    .ok_or_else(|| {
+                        GpuWarmupError::ValidatedGraph(
+                            "sequential loop count does not fit usize".into(),
+                        )
+                    })? ==
+                    0
+            } else {
+                false
+            };
+            // Structural loops are resident control instructions, but a loop
+            // whose values are matrices does not itself own a scalar control
+            // value or launch a matrix primitive.  Its child scope contains
+            // the native matrix/fixed operations and their measured owners;
+            // the structural instruction only wires those owners into the
+            // resident capture.  Do not register a synthetic resident-owner
+            // measurement for the structural node (that would incorrectly
+            // route it through the integer/bool allocator path).
+            let matrix_structural_loop = matches!(
+                handle.kind(),
+                NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)
+            ) && output_types
+                .iter()
+                .chain(argument_types.iter())
+                .any(contains_matrix_wire);
+            // Family packing and selection over matrix leaves are metadata
+            // aliases. They preserve the native matrix owner but do not
+            // launch an integer-control or matrix kernel of their own. The
+            // matrix leaf operation in the surrounding scope owns the actual
+            // measured work; manufacturing a profile here sends the family
+            // input through the resident scalar mapper and rejects it as a
+            // non-matrix owner.
+            let matrix_family_metadata_alias =
+                matches!(
+                    handle.kind(),
+                    NodeKind::FamilyPack { .. } |
+                        NodeKind::FamilyGetStatic { .. } |
+                        NodeKind::FamilyGetDynamic
+                ) && output_types.iter().chain(argument_types.iter()).any(contains_matrix_wire);
+            let no_gpu_work = zero_count_sequential ||
+                zero_loop_body_scope ||
+                matrix_structural_loop ||
+                matrix_family_metadata_alias;
             for port in 0..output_types.len() {
                 let output = WireRef { node: node_id, port: Port(port as u32) };
                 if let Some(source) = lowered_aliases.get(&output).copied() {
@@ -5753,6 +5917,7 @@ fn warmup_input_for_owner_placement(
             let output_allocations = output_types
                 .iter()
                 .enumerate()
+                .filter(|_| !no_gpu_work)
                 .filter(|(_, ty)| needs_storage_tracking(ty))
                 .map(|(port, ty)| {
                     (
@@ -5775,6 +5940,7 @@ fn warmup_input_for_owner_placement(
                 .collect::<Vec<_>>();
             let input_transfer_allocations = arguments
                 .iter()
+                .filter(|_| !zero_loop_body_scope)
                 .filter(|wire| checked.artifact_inputs.contains_key(wire))
                 .filter(|wire| checked.wire_types.get(wire).is_some_and(needs_storage_tracking))
                 .map(|wire| -> Result<_, GpuWarmupError> {
@@ -5827,6 +5993,12 @@ fn warmup_input_for_owner_placement(
                         .filter_map(|ty| ty.matrix_type().map(|matrix| matrix.columns))
                         .max()
                 })
+                .or_else(|| {
+                    output_types.iter().find_map(|ty| resident_control_wire(ty).then_some(1))
+                })
+                .or_else(|| {
+                    argument_types.iter().find_map(|ty| resident_control_wire(ty).then_some(1))
+                })
                 .unwrap_or_else(|| {
                     layout_indices.get(&layout_id).map_or(0, |index| layouts[*index].columns)
                 });
@@ -5841,7 +6013,7 @@ fn warmup_input_for_owner_placement(
             let mut output_layouts = Vec::new();
             for (port, ty) in output_types.iter().enumerate() {
                 let matrix = ty.matrix_type();
-                let port_columns = matrix.map_or(0, |matrix| matrix.columns);
+                let port_columns = warmup_wire_columns(ty);
                 let inherited_operand = match handle.kind() {
                     NodeKind::PreimageSample { .. } => 2,
                     NodeKind::MatrixMulSmallRhs => 1,
@@ -5865,18 +6037,43 @@ fn warmup_input_for_owner_placement(
                 // or artifact materialization) still needs an owner layout.
                 // The profile/template layout is the authoritative initial
                 // placement; subsequent column-preserving stages inherit it.
-                let owner_source_layout = source_layout.or_else(|| {
-                    layout_indices.get(&layout_id).and_then(|index| {
-                        (layouts[*index].columns == port_columns).then_some(&layouts[*index])
+                // A resident control producer without a value argument (for
+                // example ConstantInt) owns a real GPU value. Do not borrow
+                // the first matrix layout merely because it has the same
+                // width: that layout may belong to an unrelated anchor on a
+                // different GPU. The producer is pinned to the first logical
+                // GPU, matching the resident control measurement path.
+                let resident_control_producer = effective_operation ==
+                    EffectiveGpuOperation::HostOrControl &&
+                    source_layout.is_none() &&
+                    !matches!(handle.kind(), NodeKind::Input { .. });
+                let owner_source_layout = if resident_control_producer {
+                    source_layout
+                } else {
+                    source_layout.or_else(|| {
+                        layout_indices.get(&layout_id).and_then(|index| {
+                            (layouts[*index].columns == port_columns).then_some(&layouts[*index])
+                        })
                     })
-                });
-                let preserve_owners = owner_source_layout.is_some() &&
+                };
+                // A source owner map can be clipped for a narrower matrix
+                // output, but it cannot cover a wider output.  In that case
+                // inheriting the source intervals leaves the output schedule
+                // with a truncated global column range (notably for fused
+                // multi-output nodes), so let the output receive its own
+                // balanced physical ownership. Resident scalar/family
+                // values are one physical column and remain covered here.
+                let preserve_owners = owner_source_layout
+                    .is_some_and(|layout| layout.columns >= port_columns) &&
                     (!matches!(
                         capability,
                         ColumnCapability::MappedColumns | ColumnCapability::GeneratedColumns
                     ) || effective_operation == EffectiveGpuOperation::Slice);
-                let same_contract =
-                    source_layout.is_some_and(|source| layout_contract_matches(source, ty));
+                let same_contract = source_layout
+                    .is_some_and(|source| layout_contract_matches(source, ty)) ||
+                    (zero_count_sequential &&
+                        resident_control_wire(ty) &&
+                        source_layout.is_some());
                 let id = if preserve_owners && same_contract {
                     source_layout.map_or(layout_id, |layout| layout.id)
                 } else {
@@ -5927,6 +6124,8 @@ fn warmup_input_for_owner_placement(
                                 })
                                 .collect()
                         })
+                    } else if resident_control_producer {
+                        gpu0_owner_intervals(port_columns)
                     } else {
                         Vec::new()
                     },
@@ -5967,7 +6166,9 @@ fn warmup_input_for_owner_placement(
                 .unwrap_or_else(|| config.default_tile_widths.clone());
             if matches!(
                 capability,
-                ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+                ColumnCapability::HostOrControl |
+                    ColumnCapability::NativeAlias |
+                    ColumnCapability::SingleDevice
             ) {
                 // Host/control and indivisible single-device work use one
                 // fixed-call coordinate; they are not width curves.
@@ -6037,35 +6238,25 @@ fn warmup_input_for_owner_placement(
             // inventory even when the input is not retained and has no
             // transfer bytes.  Its owner phase still affects the route and
             // source-device workspace of later sibling waves.
-            let effective_source_layout_ids = effective_inputs
-                .origins
-                .iter()
-                .zip(effective_argument_types.iter())
-                .filter(|(_, ty)| needs_storage_tracking(ty))
-                .filter_map(|(wire, _)| {
-                    let resolved = resolve_storage_wire(&wire_aliases, shape_class, *wire);
-                    wire_layouts
-                        .get(&(shape_class, resolved))
-                        .or_else(|| wire_layouts.get(&(shape_class, *wire)))
-                        .copied()
-                })
-                .collect::<BTreeSet<_>>();
-            // A shared TensorRowSums dispatch returns the concatenation of all
-            // grouped row outputs before executor splitting. Keep that
-            // physical intermediate in the warmup storage contract instead of
-            // charging only the leader's output shape.
-            let grouped_output_rows = (!effective_inputs.row_sum_groups.is_empty()).then(|| {
-                effective_inputs.row_sum_groups.iter().map(|groups| groups.len()).sum::<usize>()
-            });
-            let output_layout = layout_indices
-                .get(&layout_id)
-                .map(|index| warmup_storage_layout(&layouts[*index]))
-                .map(|mut layout| {
-                    if let Some(rows) = grouped_output_rows {
-                        layout.rows = rows;
-                    }
-                    layout
-                });
+            let effective_source_layout_ids = if no_gpu_work {
+                BTreeSet::new()
+            } else {
+                effective_inputs
+                    .origins
+                    .iter()
+                    .zip(effective_argument_types.iter())
+                    .filter(|(_, ty)| needs_storage_tracking(ty))
+                    .filter_map(|(wire, _)| {
+                        let resolved = resolve_storage_wire(&wire_aliases, shape_class, *wire);
+                        wire_layouts
+                            .get(&(shape_class, resolved))
+                            .or_else(|| wire_layouts.get(&(shape_class, *wire)))
+                            .copied()
+                    })
+                    .collect::<BTreeSet<_>>()
+            };
+            let output_layout =
+                layout_indices.get(&layout_id).map(|index| warmup_storage_layout(&layouts[*index]));
             let operation_descriptor = GpuWarmupOperationDescriptor {
                 signature: operation_signature,
                 scope: scope_id.clone(),
@@ -6079,50 +6270,57 @@ fn warmup_input_for_owner_placement(
                 profile_domain,
                 fused_operation,
                 implementation_variant,
-                source_layouts: effective_source_layouts.clone(),
+                source_layouts: if no_gpu_work {
+                    Vec::new()
+                } else {
+                    effective_source_layouts.clone()
+                },
                 output_layout: output_layout.clone(),
-                route_resolver: layout_indices.get(&layout_id).and_then(|_| {
-                    let source_layouts = effective_source_layouts.clone();
-                    output_layout
-                        .as_ref()
-                        .and_then(|output_layout| {
+                route_resolver: (!no_gpu_work)
+                    .then(|| {
+                        layout_indices.get(&layout_id).and_then(|_| {
                             warmup_route_resolver_for_layouts(
-                                &source_layouts,
-                                output_layout,
+                                &effective_source_layouts,
+                                output_layout.as_ref()?,
                                 devices,
                             )
-                        })
-                        .map(|mut resolver| {
-                            let is_compact = |ty: &ConcreteWireType| {
-                                fn nested(ty: &ConcreteWireType) -> bool {
-                                    match ty {
-                                        ConcreteWireType::IndexedFamily { element, .. } => {
-                                            nested(element)
+                            .map(|mut resolver| {
+                                let is_compact = |ty: &ConcreteWireType| {
+                                    fn nested(ty: &ConcreteWireType) -> bool {
+                                        match ty {
+                                            ConcreteWireType::IndexedFamily { element, .. } => {
+                                                nested(element)
+                                            }
+                                            ConcreteWireType::SmallMatrix { .. } |
+                                            ConcreteWireType::Preimage { .. } => true,
+                                            _ => false,
                                         }
-                                        ConcreteWireType::SmallMatrix { .. } |
-                                        ConcreteWireType::Preimage { .. } => true,
-                                        _ => false,
                                     }
-                                }
-                                nested(ty)
-                            };
-                            resolver.source_compact = argument_types.iter().any(is_compact);
-                            resolver.destination_compact = output_types.iter().any(is_compact);
-                            resolver
+                                    nested(ty)
+                                };
+                                resolver.source_compact = argument_types.iter().any(is_compact);
+                                resolver.destination_compact = output_types.iter().any(is_compact);
+                                resolver
+                            })
                         })
-                }),
+                    })
+                    .flatten(),
                 host_control: host_control_descriptor(validated, &scope_id, node_id),
             };
             let true_zero_work = columns == 0 &&
                 !matches!(
                     capability,
-                    ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+                    ColumnCapability::HostOrControl |
+                        ColumnCapability::NativeAlias |
+                        ColumnCapability::SingleDevice
                 );
             let mut fragment_widths = Vec::new();
             if columns > 0 &&
                 !matches!(
                     capability,
-                    ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+                    ColumnCapability::HostOrControl |
+                        ColumnCapability::NativeAlias |
+                        ColumnCapability::SingleDevice
                 )
             {
                 if let Some(layout) = layout_indices.get(&layout_id).map(|index| &layouts[*index]) {
@@ -6150,7 +6348,9 @@ fn warmup_input_for_owner_placement(
             }
             let base_local_max_widths = if matches!(
                 capability,
-                ColumnCapability::SingleDevice | ColumnCapability::HostOrControl
+                ColumnCapability::SingleDevice |
+                    ColumnCapability::NativeAlias |
+                    ColumnCapability::HostOrControl
             ) {
                 // The native single-device path is pinned to its production
                 // owner (logical GPU0) and uses a fixed coordinate. Other
@@ -6180,11 +6380,16 @@ fn warmup_input_for_owner_placement(
                     })
                     .unwrap_or_else(|| vec![columns; devices])
             };
-            let job_queries_by_width = if operation_descriptor.measurement_kind() ==
-                WarmupMeasurementKind::HostMeasured
+            let job_queries_by_width = if no_gpu_work {
+                // Zero-count sequential/body stages publish no child/device
+                // route. The root's carried owner is retained by its scope
+                // capture allocation; body scopes have no allocation here.
+                None
+            } else if operation_descriptor.measurement_kind() == WarmupMeasurementKind::HostMeasured
             {
-                // Host/control operations have no physical GPU job inventory.
-                // They are measured through the host production path below.
+                // Host-measured operations have no physical GPU job inventory.
+                // Resident control operations are GPU-measured and continue
+                // through the ordinary bounded query path below.
                 None
             } else if capability == ColumnCapability::SingleDevice {
                 // Single-device operations have exactly one fixed-coordinate
@@ -6346,9 +6551,10 @@ fn warmup_input_for_owner_placement(
                     (width, bytes)
                 })
                 .collect::<BTreeMap<_, _>>();
-            let (cost, measured_profiles) = if true_zero_work {
-                // A genuinely empty range has exact zero GPU work and must
-                // not manufacture a provider request at width zero.
+            let (cost, measured_profiles) = if true_zero_work || no_gpu_work {
+                // A genuinely empty range, or a zero-count sequential/body
+                // stage, has exact zero GPU work and must not manufacture a
+                // provider request for an unavailable child/body route.
                 (vec![GpuStageCostModel::default(); devices], Vec::new())
             } else if let Some(provider) = profile_provider.as_deref_mut() {
                 measured_cost_from_profile_provider(
@@ -6399,7 +6605,7 @@ fn warmup_input_for_owner_placement(
             } else {
                 profile.map_or_else(
                     || {
-                        if true_zero_work {
+                        if true_zero_work || no_gpu_work {
                             GpuProfileProvenance::SizeQuery
                         } else {
                             GpuProfileProvenance::ConservativeEstimate
@@ -6507,7 +6713,9 @@ fn warmup_input_for_owner_placement(
             let lowered_range_bytes = if columns > 0 &&
                 !matches!(
                     capability,
-                    ColumnCapability::HostOrControl | ColumnCapability::SingleDevice
+                    ColumnCapability::HostOrControl |
+                        ColumnCapability::NativeAlias |
+                        ColumnCapability::SingleDevice
                 ) {
                 map_output_range_to_inputs_with_output(
                     handle.kind(),
@@ -6839,9 +7047,11 @@ pub(crate) fn warmup_gpu_for_inputs_with_execution_config<
 ) -> Result<GpuWarmupResult, GpuWarmupError> {
     let mut config = config.clone();
     config.max_parallel_instances = execution_config.max_parallel_instances;
-    backend.configure_gpu_plan_budgets(&config.contract.device_budgets).map_err(|error| {
-        GpuWarmupError::ValidatedGraph(format!("backend.configure_gpu_plan_budgets: {error}"))
-    })?;
+    if let Err(error) = backend.configure_gpu_plan_budgets(&config.contract.device_budgets) {
+        return Err(GpuWarmupError::ValidatedGraph(format!(
+            "backend.configure_gpu_plan_budgets: {error}"
+        )));
+    }
     config.contract = backend
         .gpu_runtime_contract(validated, inputs)
         .map_err(|error| {
@@ -7960,7 +8170,7 @@ mod tests {
     }
 
     #[test]
-    fn storage_tracking_distinguishes_scalar_payload_and_zero_sized_matrix() {
+    fn storage_tracking_accounts_resident_scalar_payload_and_zero_sized_matrix() {
         let scalar =
             ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count: 8 };
         let zero_sized_matrix = ConcreteWireType::Matrix(mxx_ir_core::types::ConcreteMatrixType {
@@ -7969,8 +8179,10 @@ mod tests {
             rows: 1,
             columns: 0,
         });
-        assert!(!needs_storage_tracking(&ConcreteWireType::Int));
-        assert!(!needs_storage_tracking(&scalar));
+        assert!(needs_storage_tracking(&ConcreteWireType::Int));
+        assert!(needs_storage_tracking(&scalar));
+        assert_eq!(validated_wire_bytes(&ConcreteWireType::Int, &BTreeMap::new(), 1, 8), 8);
+        assert_eq!(validated_wire_bytes(&scalar, &BTreeMap::new(), 1, 8), 64);
         let bytes = ConcreteWireType::Bytes { length: 7 };
         assert!(needs_storage_tracking(&bytes));
         assert!(needs_storage_tracking(&ConcreteWireType::IndexedFamily {
@@ -7987,11 +8199,11 @@ mod tests {
                 count: 4,
             })
             .collect::<Vec<_>>();
-        assert_eq!(scalar_fan_in.iter().filter(|ty| needs_storage_tracking(ty)).count(), 0);
+        assert_eq!(scalar_fan_in.iter().filter(|ty| needs_storage_tracking(ty)).count(), 1024);
     }
 
     #[test]
-    fn validated_scalar_family_pack_has_zero_storage_and_scales_linearly() {
+    fn validated_scalar_family_pack_accounts_resident_storage_linearly() {
         use mxx_dsl::{DslContext, Family, Int};
         use mxx_ir_core::ParamEnv;
 
@@ -8033,12 +8245,12 @@ mod tests {
 
         let (small_nodes, small_allocations, small_counters) = storage_counts(8);
         let (large_nodes, large_allocations, large_counters) = storage_counts(16);
-        assert_eq!(small_allocations, 0);
-        assert_eq!(large_allocations, 0);
-        assert_eq!(small_counters.storage_candidate_visits, 0);
-        assert_eq!(large_counters.storage_candidate_visits, 0);
-        assert_eq!(small_counters.temporary_entries, 0);
-        assert_eq!(large_counters.temporary_entries, 0);
+        assert!(small_allocations > 0);
+        assert!(large_allocations >= small_allocations);
+        assert!(small_counters.storage_candidate_visits > 0);
+        assert!(large_counters.storage_candidate_visits >= small_counters.storage_candidate_visits);
+        assert!(small_counters.temporary_entries > 0);
+        assert!(large_counters.temporary_entries >= small_counters.temporary_entries);
         assert!(small_counters.scope_preselections > 0);
         assert!(large_counters.scope_preselections > 0);
         assert!(large_nodes <= small_nodes.saturating_mul(2).saturating_add(8));
@@ -8046,6 +8258,79 @@ mod tests {
             large_counters.report_lookups <=
                 small_counters.report_lookups.saturating_mul(2).saturating_add(8)
         );
+    }
+
+    #[test]
+    fn zero_count_sequential_constant_keeps_a_device_local_initial_owner() {
+        use mxx_dsl::{DslContext, Int, Ring, iterate};
+
+        let context = DslContext::new("zero-count-sequential-constant-owner");
+        let ring = Ring::new(BigInt::from(97u64), 8);
+        let result = iterate(0, Int::constant(0), |index, state| Ok(state + index + 1))
+            .expect("construct zero-count sequential control graph");
+        let anchor = ring.input("anchor", (1, 1));
+        let graph = context
+            .output("result", result)
+            .expect("result output")
+            .output("anchor", anchor)
+            .expect("anchor output")
+            .build()
+            .expect("build zero-count sequential graph")
+            .validate(&mxx_ir_core::ParamEnv::default())
+            .expect("validate zero-count sequential graph");
+        let mut anchor_layout = layout(1, 2);
+        anchor_layout.owner_intervals = vec![GpuColumnInterval { device: 1, start: 0, end: 1 }];
+        let config = GpuValidatedWarmupConfig {
+            contract: contract(2, 1 << 20),
+            layouts: vec![anchor_layout],
+            default_tile_widths: vec![1],
+            default_cost: vec![GpuStageCostModel::default(); 2],
+            default_implementation_variant: "zero-count-owner-test".into(),
+            profiles: BTreeMap::new(),
+            effective_operation_identities: BTreeMap::new(),
+            effective_operations: BTreeMap::new(),
+            storage_descriptors: BTreeMap::new(),
+            active_crt_towers: 1,
+            crt_limb_bytes: 8,
+            max_parallel_instances: NonZeroUsize::new(1).unwrap(),
+        };
+
+        let input = warmup_input_from_validated(&graph, &config)
+            .expect("warmup zero-count sequential graph");
+        let constant = input
+            .nodes
+            .iter()
+            .find(|node| node.implementation_variant.contains("ConstantInt"))
+            .expect("constant producer node");
+        assert!(constant.storage_allocations.iter().any(|allocation| {
+            allocation.resource.outputs == 8 &&
+                allocation.resource.live == 0 &&
+                allocation.resource.transfers == 0
+        }));
+        let initial_layout = input
+            .layouts
+            .iter()
+            .find(|layout| layout.id == constant.output_layouts[0])
+            .expect("constant owner layout");
+        assert_eq!(
+            initial_layout.owner_intervals,
+            vec![GpuColumnInterval { device: 0, start: 0, end: 1 }]
+        );
+
+        let zero_loop = input
+            .nodes
+            .iter()
+            .find(|node| node.implementation_variant.contains("SequentialLoop"))
+            .expect("zero-count sequential node");
+        assert_eq!(
+            zero_loop.output_layouts[0], constant.output_layouts[0],
+            "zero-count output must alias the constant initial owner"
+        );
+        assert!(zero_loop.storage_allocations.iter().all(|allocation| {
+            allocation.resource.transfers == 0 && allocation.resource.outputs == 0
+        }));
+        let plan = plan_gpu_warmup(&input).expect("zero-count resident plan");
+        assert!(plan.plan.loops.iter().any(|choice| choice.loop_count == 0));
     }
 
     #[test]
@@ -8869,7 +9154,7 @@ mod tests {
     }
 
     #[test]
-    fn single_device_and_host_boundaries_have_costs() {
+    fn host_and_pinned_costs_are_diagnostic_only() {
         let costs = vec![GpuStageCostModel {
             fixed: GpuResourceCost {
                 transfers: 5,
@@ -8877,6 +9162,7 @@ mod tests {
                 host: 7,
                 ..Default::default()
             },
+            time: GpuTimeModel { per_column_seconds: 1.0, ..Default::default() },
             ..Default::default()
         }];
         let input = GpuWarmupInput {
@@ -8885,10 +9171,9 @@ mod tests {
             loops: vec![],
             nodes: vec![GpuWarmupNode { loop_site: None, ..node(1, costs, vec![1]) }],
         };
-        assert!(matches!(
-            plan_gpu_warmup(&input),
-            Err(GpuWarmupError::HostResourceExhausted { .. })
-        ));
+        let result = plan_gpu_warmup(&input).expect("host memory is outside GPU admission");
+        assert_eq!(result.report.stages[0].peak[0].pinned_host, 101);
+        assert_eq!(result.report.stages[0].peak[0].host, 7);
     }
 
     #[test]
@@ -10363,8 +10648,8 @@ mod tests {
             concrete_argument_types: Vec::new(),
             concrete_output_types: Vec::new(),
             bindings: mxx_ir_core::expr::ParamEnv::default(),
-            effective_operation: "polynomial_values".into(),
-            profile_domain: CanonicalWarmupProfileDomain::PolynomialValues,
+            effective_operation: "input".into(),
+            profile_domain: CanonicalWarmupProfileDomain::Input,
             fused_operation: None,
             implementation_variant: "host".into(),
             source_layouts: Vec::new(),
@@ -10392,16 +10677,8 @@ mod tests {
         transfer_probe.route_descriptor = route;
         let d2h = transfer_work_for_request(&descriptor, &transfer_probe)
             .expect("device-to-host transfer inventory");
-        assert_eq!(d2h.kind, crate::gpu_column_policy::WarmupTransferKind::DeviceToHost);
+        assert_eq!(d2h.kind, crate::gpu_column_policy::WarmupTransferKind::HostStaging);
         assert_eq!(d2h.request.coordinate(), 64);
-        let mut host_to_device = descriptor.clone();
-        host_to_device.profile_domain = CanonicalWarmupProfileDomain::PackPolynomialCoefficients;
-        assert_eq!(
-            transfer_work_for_request(&host_to_device, &transfer_probe)
-                .expect("host-to-device transfer inventory")
-                .kind,
-            crate::gpu_column_policy::WarmupTransferKind::HostToDevice
-        );
         let query = GpuWarmupJobQuery {
             device: 0,
             source_interval: 0,
@@ -10492,8 +10769,8 @@ mod tests {
             concrete_argument_types: Vec::new(),
             concrete_output_types: Vec::new(),
             bindings: mxx_ir_core::expr::ParamEnv::default(),
-            effective_operation: "polynomial_values".into(),
-            profile_domain: CanonicalWarmupProfileDomain::PolynomialValues,
+            effective_operation: "input".into(),
+            profile_domain: CanonicalWarmupProfileDomain::Input,
             fused_operation: None,
             implementation_variant: "host".into(),
             source_layouts: Vec::new(),
@@ -10634,8 +10911,8 @@ mod tests {
             concrete_argument_types: Vec::new(),
             concrete_output_types: Vec::new(),
             bindings: mxx_ir_core::expr::ParamEnv::default(),
-            effective_operation: "polynomial_values".into(),
-            profile_domain: CanonicalWarmupProfileDomain::PolynomialValues,
+            effective_operation: "input".into(),
+            profile_domain: CanonicalWarmupProfileDomain::Input,
             fused_operation: None,
             implementation_variant: "host".into(),
             source_layouts: Vec::new(),

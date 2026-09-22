@@ -7,16 +7,13 @@ use mxx_primitives::poly::{
     PolyParams,
     dcrt::gpu::{GpuDCRTPolyParams, detected_gpu_device_ids},
 };
-use mxx_runtime::{
-    artifact::MemoryArtifactStore, authority::GpuExecution,
-    gpu_measurement::GpuWarmupMeasurementConfig,
-};
+use mxx_runtime::{GpuRuntime, artifact::MemoryArtifactStore};
 use mxx_we::diamond::{DiamondParameterSearch, DiamondWeRuntime};
 use std::{env, time::Instant};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-type GpuDiamondWeRuntime = DiamondWeRuntime<GpuExecution, MemoryArtifactStore>;
+type GpuDiamondWeRuntime = DiamondWeRuntime<GpuRuntime, MemoryArtifactStore>;
 
 fn env_usize(name: &str, default: usize) -> usize {
     env::var(name).ok().and_then(|value| value.parse().ok()).unwrap_or(default)
@@ -99,12 +96,7 @@ fn test_gpu_diamond_we_parameter_search_and_round_trip() {
     );
     let mut runtime = GpuDiamondWeRuntime::new(
         selected.compiler,
-        GpuExecution::new(
-            backend,
-            [gpu_parameters.clone()],
-            GpuWarmupMeasurementConfig::default(),
-            "diamond-production-measured",
-        ),
+        GpuRuntime::new(backend).expect("GPU runtime construction"),
         MemoryArtifactStore::default(),
     )
     .expect("GPU Diamond WE runtime construction");
@@ -130,25 +122,6 @@ fn test_gpu_diamond_we_parameter_search_and_round_trip() {
         "completed GPU Diamond WE decryption"
     );
     assert_eq!(decoded, message, "GPU Diamond WE round trip must preserve the message");
-    let preparations = runtime.execution.preparations();
-    assert_eq!(preparations.len(), 2, "Diamond encrypt/decrypt each prepare once");
-    let predicted_seconds =
-        preparations.iter().map(|prepared| prepared.report().predicted_seconds).sum::<f64>();
-    let measurement_counts =
-        preparations.iter().map(|prepared| prepared.measurement_count()).collect::<Vec<_>>();
-    for prepared in preparations {
-        let report = prepared.report();
-        assert_eq!(report, prepared.report(), "GPU warmup report reads are pure");
-        let evidence = prepared.evidence();
-        assert_eq!(evidence, prepared.evidence(), "GPU warmup evidence reads are pure");
-        prepared.assert_measurements_unchanged();
-    }
-    assert_eq!(
-        measurement_counts,
-        preparations.iter().map(|prepared| prepared.measurement_count()).collect::<Vec<_>>(),
-        "GPU measurement counters remain unchanged after production runs"
-    );
-    info!(predicted_seconds, "Diamond GPU protocol predicted warmup time");
     info!(
         elapsed_seconds = total_started.elapsed().as_secs_f64(),
         "completed GPU Diamond WE integration test"

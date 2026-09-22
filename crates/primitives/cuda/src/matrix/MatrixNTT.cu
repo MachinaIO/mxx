@@ -1,3 +1,4 @@
+
 namespace
 {
     // Descriptors are owned by the matrix and initialized on its allocation
@@ -180,6 +181,50 @@ namespace
         return v != 0 && (v & (v - 1)) == 0;
     }
 
+    int register_ntt_descriptor_patch(
+        GpuContext *context,
+        cudaStream_t stream,
+        uint32_t binding_index,
+        const size_t *argument_sizes,
+        size_t argument_count)
+    {
+        if (binding_index == UINT32_MAX)
+            return mxx_graph_register_resident_descriptor_for_stream(
+                context, stream, argument_sizes, argument_count);
+        const MxxGraphPatch patch{
+            nullptr,
+            MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
+            0,
+            0,
+            sizeof(void *),
+            binding_index,
+            0,
+        };
+        return mxx_graph_register_kernel_update_for_stream(
+            context,
+            reinterpret_cast<void *>(stream),
+            argument_sizes,
+            argument_count,
+            &patch,
+            1);
+    }
+
+    constexpr size_t kNttTwistArgumentSizes[] = {
+        sizeof(MatrixNttDescriptorView), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(uint32_t), sizeof(size_t)};
+    constexpr size_t kNttScaleArgumentSizes[] = {
+        sizeof(MatrixNttDescriptorView), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(uint32_t), sizeof(size_t)};
+    constexpr size_t kNttStageArgumentSizes[] = {
+        sizeof(MatrixNttDescriptorView), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(size_t)};
+    constexpr size_t kNttFusedLocalArgumentSizes[] = {
+        sizeof(MatrixNttDescriptorView), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(void *), sizeof(void *), sizeof(uint32_t), sizeof(uint32_t), sizeof(size_t)};
+    constexpr size_t kNttFusedTopArgumentSizes[] = {
+        sizeof(MatrixNttDescriptorView), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(void *), sizeof(void *), sizeof(size_t)};
+
     int launch_twist_for_all_limbs(
         MatrixNttDescriptorView layout,
         const uint64_t *twiddles,
@@ -188,7 +233,9 @@ namespace
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *context,
+        uint32_t binding_index)
     {
         if (!layout.descriptors ||
             !twiddles || !twiddle_shoup || !moduli)
@@ -224,6 +271,10 @@ namespace
             {
                 return set_error(err);
             }
+            const int registered = register_ntt_descriptor_patch(
+                context, stream, binding_index, kNttTwistArgumentSizes,
+                std::size(kNttTwistArgumentSizes));
+            if (registered != 0) return registered;
         }
         return 0;
     }
@@ -236,7 +287,9 @@ namespace
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *context,
+        uint32_t binding_index)
     {
         if (!layout.descriptors ||
             !moduli || !n_inv || !n_inv_shoup)
@@ -272,6 +325,10 @@ namespace
             {
                 return set_error(err);
             }
+            const int registered = register_ntt_descriptor_patch(
+                context, stream, binding_index, kNttScaleArgumentSizes,
+                std::size(kNttScaleArgumentSizes));
+            if (registered != 0) return registered;
         }
         return 0;
     }
@@ -286,7 +343,9 @@ namespace
         uint32_t n,
         uint32_t len,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *context,
+        uint32_t binding_index)
     {
         if (!layout.descriptors ||
             !twiddles || !twiddle_shoup || !moduli)
@@ -324,6 +383,10 @@ namespace
             {
                 return set_error(err);
             }
+            const int registered = register_ntt_descriptor_patch(
+                context, stream, binding_index, kNttStageArgumentSizes,
+                std::size(kNttStageArgumentSizes));
+            if (registered != 0) return registered;
         }
         return 0;
     }
@@ -433,7 +496,9 @@ namespace
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *context,
+        uint32_t binding_index)
     {
         const uint32_t tile_size = std::min(n, kFusedNttCoefficients);
         for (size_t offset = 0; offset < poly_count; offset += kMaxGridY)
@@ -449,6 +514,10 @@ namespace
                 n, tile_size, offset);
             const cudaError_t error = cudaGetLastError();
             if (error != cudaSuccess) return set_error(error);
+            const int registered = register_ntt_descriptor_patch(
+                context, stream, binding_index, kNttFusedLocalArgumentSizes,
+                std::size(kNttFusedLocalArgumentSizes));
+            if (registered != 0) return registered;
         }
         return 0;
     }
@@ -528,7 +597,9 @@ namespace
         size_t limb_count,
         uint32_t n,
         size_t poly_count,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *context,
+        uint32_t binding_index)
     {
         const uint64_t *twiddles = Forward ? constants.twiddle_forward : constants.twiddle_inverse;
         const uint64_t *shoup = Forward ? constants.twiddle_shoup_forward : constants.twiddle_shoup_inverse;
@@ -551,12 +622,19 @@ namespace
             }
             const cudaError_t error = cudaGetLastError();
             if (error != cudaSuccess) return set_error(error);
+            const int registered = register_ntt_descriptor_patch(
+                context, stream, binding_index, kNttFusedTopArgumentSizes,
+                std::size(kNttFusedTopArgumentSizes));
+            if (registered != 0) return registered;
         }
         return 0;
     }
 
     template <bool Forward>
-    int run_matrix_transform_u64(GpuMatrix *mat)
+    int run_matrix_transform_u64(
+        GpuMatrix *mat,
+        cudaStream_t override_stream = nullptr,
+        uint32_t binding_index = UINT32_MAX)
     {
         if (!mat || !mat->ctx)
         {
@@ -627,10 +705,12 @@ namespace
             {
                 dispatch_device = limb_device;
                 dispatch_slot = static_cast<size_t>(limb_id.x);
-                status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
-                if (status != 0)
+                if (override_stream)
+                    dispatch_stream = override_stream;
+                else
                 {
-                    return status;
+                    status = matrix_limb_stream(mat, limb_id, &dispatch_stream);
+                    if (status != 0) return status;
                 }
                 if (!dispatch_stream)
                 {
@@ -707,8 +787,11 @@ namespace
             return set_error("null per-device NTT constants in run_matrix_transform_u64");
         }
 
-        status = matrix_wait_all_limb_streams(mat, dispatch_device, dispatch_stream);
-        if (status != 0) return status;
+        if (!override_stream)
+        {
+            status = matrix_wait_all_limb_streams(mat, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
+        }
 
         const uint64_t *twiddles =
             Forward ? device_constants.twiddle_forward : device_constants.twiddle_inverse;
@@ -720,37 +803,42 @@ namespace
             if (n > kFusedNttCoefficients && n <= 16 * kFusedNttCoefficients)
             {
                 status = launch_fused_top_stages<Forward>(
-                    layout, device_constants, limb_count, n, poly_count, dispatch_stream);
+                    layout, device_constants, limb_count, n, poly_count, dispatch_stream,
+                    mat->ctx, binding_index);
                 if (status != 0) return status;
             }
             else if (n > kFusedNttCoefficients)
             {
                 status = launch_twist_for_all_limbs(
                     layout, twiddles, twiddle_shoup, device_constants.moduli,
-                    limb_count, n, poly_count, dispatch_stream);
+                    limb_count, n, poly_count, dispatch_stream, mat->ctx, binding_index);
                 if (status != 0) return status;
                 // Global DIF stages precede independent shared-memory tiles.
                 for (uint32_t len = n; len > kFusedNttCoefficients; len >>= 1)
                 {
                     status = launch_stage_for_all_limbs<true>(
                         layout, twiddles, twiddle_shoup, device_constants.moduli,
-                        limb_count, n, len, poly_count, dispatch_stream);
+                        limb_count, n, len, poly_count, dispatch_stream,
+                        mat->ctx, binding_index);
                     if (status != 0) return status;
                 }
             }
             status = launch_fused_local_stages<true>(
-                layout, device_constants, limb_count, n, poly_count, dispatch_stream);
+                layout, device_constants, limb_count, n, poly_count, dispatch_stream,
+                mat->ctx, binding_index);
             if (status != 0) return status;
         }
         else
         {
             status = launch_fused_local_stages<false>(
-                layout, device_constants, limb_count, n, poly_count, dispatch_stream);
+                layout, device_constants, limb_count, n, poly_count, dispatch_stream,
+                mat->ctx, binding_index);
             if (status != 0) return status;
             if (n > kFusedNttCoefficients && n <= 16 * kFusedNttCoefficients)
             {
                 status = launch_fused_top_stages<Forward>(
-                    layout, device_constants, limb_count, n, poly_count, dispatch_stream);
+                    layout, device_constants, limb_count, n, poly_count, dispatch_stream,
+                    mat->ctx, binding_index);
                 if (status != 0) return status;
             }
             else if (n > kFusedNttCoefficients)
@@ -760,22 +848,27 @@ namespace
                 {
                     status = launch_stage_for_all_limbs<false>(
                         layout, twiddles, twiddle_shoup, device_constants.moduli,
-                        limb_count, n, len, poly_count, dispatch_stream);
+                        limb_count, n, len, poly_count, dispatch_stream,
+                        mat->ctx, binding_index);
                     if (status != 0) return status;
                 }
                 status = launch_scale_for_all_limbs(
                     layout, device_constants.moduli, device_constants.n_inv,
-                    device_constants.n_inv_shoup, limb_count, n, poly_count, dispatch_stream);
+                    device_constants.n_inv_shoup, limb_count, n, poly_count, dispatch_stream,
+                    mat->ctx, binding_index);
                 if (status != 0) return status;
                 status = launch_twist_for_all_limbs(
                     layout, twiddles, twiddle_shoup, device_constants.moduli,
-                    limb_count, n, poly_count, dispatch_stream);
+                    limb_count, n, poly_count, dispatch_stream, mat->ctx, binding_index);
                 if (status != 0) return status;
             }
         }
 
-        status = matrix_record_all_limb_writes(mat, dispatch_stream);
-        if (status != 0) return status;
+        if (!override_stream)
+        {
+            status = matrix_record_all_limb_writes(mat, dispatch_stream);
+            if (status != 0) return status;
+        }
 
         mat->format = Forward ? GPU_POLY_FORMAT_EVAL : GPU_POLY_FORMAT_COEFF;
         return 0;
@@ -806,4 +899,68 @@ int gpu_matrix_intt_all(GpuMatrix *mat)
         return 0;
     }
     return run_matrix_transform_u64<false>(mat);
+}
+
+int gpu_matrix_ntt_all_on_stream(GpuMatrix *mat, cudaStream_t stream)
+{
+    if (!mat || !mat->ctx || !stream)
+        return set_error("invalid gpu_matrix_ntt_all_on_stream arguments");
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+        return 0;
+    return run_matrix_transform_u64<true>(mat, stream);
+}
+
+int gpu_matrix_intt_all_on_stream(GpuMatrix *mat, cudaStream_t stream)
+{
+    if (!mat || !mat->ctx || !stream)
+        return set_error("invalid gpu_matrix_intt_all_on_stream arguments");
+    if (mat->format == GPU_POLY_FORMAT_COEFF)
+        return 0;
+    return run_matrix_transform_u64<false>(mat, stream);
+}
+
+int gpu_matrix_ntt_all_on_stream_bound(
+    GpuMatrix *mat,
+    cudaStream_t stream,
+    uint32_t binding_index)
+{
+    if (!mat || !mat->ctx || !stream)
+        return set_error("invalid gpu_matrix_ntt_all_on_stream_bound arguments");
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+        return 0;
+    return run_matrix_transform_u64<true>(mat, stream, binding_index);
+}
+
+int gpu_matrix_intt_all_on_stream_bound(
+    GpuMatrix *mat,
+    cudaStream_t stream,
+    uint32_t binding_index)
+{
+    if (!mat || !mat->ctx || !stream)
+        return set_error("invalid gpu_matrix_intt_all_on_stream_bound arguments");
+    if (mat->format == GPU_POLY_FORMAT_COEFF)
+        return 0;
+    return run_matrix_transform_u64<false>(mat, stream, binding_index);
+}
+
+int gpu_matrix_ntt_all_bound(GpuMatrix *mat, uint32_t binding_index)
+{
+    if (!mat || !mat->ctx)
+    {
+        return set_error("invalid gpu_matrix_ntt_all_bound arguments");
+    }
+    if (mat->format == GPU_POLY_FORMAT_EVAL)
+        return 0;
+    return run_matrix_transform_u64<true>(mat, nullptr, binding_index);
+}
+
+int gpu_matrix_intt_all_bound(GpuMatrix *mat, uint32_t binding_index)
+{
+    if (!mat || !mat->ctx)
+    {
+        return set_error("invalid gpu_matrix_intt_all_bound arguments");
+    }
+    if (mat->format == GPU_POLY_FORMAT_COEFF)
+        return 0;
+    return run_matrix_transform_u64<false>(mat, nullptr, binding_index);
 }

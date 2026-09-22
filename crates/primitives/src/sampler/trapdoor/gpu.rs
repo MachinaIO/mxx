@@ -2,12 +2,16 @@ use crate::{
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, SmallMatrixError,
         dcrt_poly::DCRTPolyMatrix,
-        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuSmallMatrix},
+        gpu_dcrt_poly::{GpuDCRTPolyMatrix, GpuMatrixOutputDescriptor, GpuSmallMatrix},
     },
     poly::{
         Poly, PolyParams,
         dcrt::{
-            gpu::{GpuDCRTPolyParams, GpuRngSeed},
+            gpu::{
+                GPU_MATRIX_DIST_GAUSS, GpuCaptureScope, GpuDCRTPolyParams, GpuDeviceBuffer,
+                GpuNativeEvent, GpuNativeGraphError, GpuNativeLaunchStream, GpuPreimageRetrySpec,
+                GpuRngSeed,
+            },
             params::DCRTPolyParams,
         },
     },
@@ -127,8 +131,8 @@ fn preimage_smoothing_parameter(base: u32, sigma: f64, d: usize, n: usize, k: us
         (((d * n * k) as f64).sqrt() + ((2 * n) as f64).sqrt() + 4.7)
 }
 
-fn coeff_cached_matrix(src: &GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
-    src.clone().into_coeff_domain()
+fn coeff_cached_matrix(src: GpuDCRTPolyMatrix) -> GpuDCRTPolyMatrix {
+    src.into_coeff_domain()
 }
 
 struct GpuPerturbationSamples {
@@ -154,6 +158,19 @@ pub struct GpuDCRTTrapdoor {
     p1_covariance_cache: Arc<Mutex<Option<GpuP1CovarianceCacheEntry>>>,
 }
 
+/// Immutable trapdoor destination layout.  Public and secret/cached
+/// components are described independently so capture preparation never needs
+/// to serialize a secret to host bytes and restore it later.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuTrapdoorOutputDescriptor {
+    pub public: GpuMatrixOutputDescriptor,
+    pub secret_r: GpuMatrixOutputDescriptor,
+    pub secret_e: GpuMatrixOutputDescriptor,
+    pub secret_a: GpuMatrixOutputDescriptor,
+    pub secret_b: GpuMatrixOutputDescriptor,
+    pub secret_d: GpuMatrixOutputDescriptor,
+}
+
 impl PartialEq for GpuDCRTTrapdoor {
     fn eq(&self, other: &Self) -> bool {
         self.r == other.r &&
@@ -167,6 +184,153 @@ impl PartialEq for GpuDCRTTrapdoor {
 impl Eq for GpuDCRTTrapdoor {}
 
 impl GpuDCRTTrapdoor {
+    /// All resident secret components, including the coefficient covariance
+    /// products consumed by preimage sampling, in their stable capture order.
+    pub fn capture_components(&self) -> [&GpuDCRTPolyMatrix; 5] {
+        [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+    }
+
+    pub fn capture_components_mut(&mut self) -> [&mut GpuDCRTPolyMatrix; 5] {
+        [
+            &mut self.r,
+            &mut self.e,
+            &mut self.a_mat_coeff,
+            &mut self.b_mat_coeff,
+            &mut self.d_mat_coeff,
+        ]
+    }
+
+    /// Return a handle retaining every native matrix allocation in this
+    /// trapdoor. This is intentionally separate from [`Clone`], whose
+    /// established semantics remain deep device copies. The covariance cache
+    /// is shared as well, so a retained handle keeps cached native resources
+    /// and the matrix CUDA contexts alive for the same lifetime.
+    pub fn clone_shallow(&self) -> Self {
+        Self {
+            r: self.r.clone_shallow(),
+            e: self.e.clone_shallow(),
+            a_mat_coeff: self.a_mat_coeff.clone_shallow(),
+            b_mat_coeff: self.b_mat_coeff.clone_shallow(),
+            d_mat_coeff: self.d_mat_coeff.clone_shallow(),
+            p1_covariance_cache: Arc::clone(&self.p1_covariance_cache),
+        }
+    }
+
+    pub fn output_descriptor_with_public(
+        &self,
+        public: &GpuDCRTPolyMatrix,
+    ) -> Result<GpuTrapdoorOutputDescriptor, String> {
+        Ok(GpuTrapdoorOutputDescriptor {
+            public: public.output_descriptor()?,
+            secret_r: self.r.output_descriptor()?,
+            secret_e: self.e.output_descriptor()?,
+            secret_a: self.a_mat_coeff.output_descriptor()?,
+            secret_b: self.b_mat_coeff.output_descriptor()?,
+            secret_d: self.d_mat_coeff.output_descriptor()?,
+        })
+    }
+
+    pub fn output_descriptor(&self) -> Result<GpuTrapdoorOutputDescriptor, String> {
+        self.output_descriptor_with_public(&self.r)
+    }
+
+    /// Build the complete fresh-owner contract for a regular sampled
+    /// trapdoor without sampling an exemplar.  The public matrix and `r/e`
+    /// are native evaluation-domain owners; the cached coefficient matrices
+    /// are coefficient-domain owners derived from them.
+    pub fn output_descriptor_for_shape(
+        params: &GpuDCRTPolyParams,
+        size: usize,
+        public_columns: usize,
+    ) -> Result<GpuTrapdoorOutputDescriptor, String> {
+        let level = params
+            .crt_depth()
+            .checked_sub(1)
+            .ok_or_else(|| "trapdoor output has empty CRT depth".to_owned())?;
+        let public =
+            GpuMatrixOutputDescriptor::for_shape(params, size, public_columns, level, true)?;
+        let secret_r = GpuMatrixOutputDescriptor::for_shape(
+            params,
+            size,
+            size.checked_mul(params.modulus_digits())
+                .ok_or_else(|| "trapdoor shape overflow".to_owned())?,
+            level,
+            true,
+        )?;
+        let secret_e = secret_r.clone();
+        let secret_a = GpuMatrixOutputDescriptor::for_shape(params, size, size, level, false)?;
+        let secret_b = secret_a.clone();
+        let secret_d = secret_a.clone();
+        Ok(GpuTrapdoorOutputDescriptor { public, secret_r, secret_e, secret_a, secret_b, secret_d })
+    }
+
+    /// Allocate a fresh public/secret trapdoor pair exactly from its frozen
+    /// output contract.  No sampled exemplar or host payload is retained.
+    #[doc(hidden)]
+    pub fn allocate_from_descriptor(
+        descriptor: &GpuTrapdoorOutputDescriptor,
+    ) -> (GpuDCRTPolyMatrix, Self) {
+        let secret = Self {
+            r: descriptor.secret_r.allocate(),
+            e: descriptor.secret_e.allocate(),
+            a_mat_coeff: descriptor.secret_a.allocate(),
+            b_mat_coeff: descriptor.secret_b.allocate(),
+            d_mat_coeff: descriptor.secret_d.allocate(),
+            p1_covariance_cache: Arc::new(Mutex::new(None)),
+        };
+        (descriptor.public.allocate(), secret)
+    }
+
+    /// Copy every public, secret, and cached component directly into a
+    /// preallocated destination owner. This is the capture-safe replacement
+    /// for host compact serialization/restore.
+    #[doc(hidden)]
+    pub fn copy_into(&self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        self.r.copy_into(&mut destination.r)?;
+        self.e.copy_into(&mut destination.e)?;
+        self.a_mat_coeff.copy_into(&mut destination.a_mat_coeff)?;
+        self.b_mat_coeff.copy_into(&mut destination.b_mat_coeff)?;
+        self.d_mat_coeff.copy_into(&mut destination.d_mat_coeff)?;
+        Ok(())
+    }
+
+    /// Copy the separately-owned public matrix and all secret components in
+    /// one destination-taking operation.
+    #[doc(hidden)]
+    pub fn copy_public_and_secret_into(
+        &self,
+        public: &GpuDCRTPolyMatrix,
+        destination_public: &mut GpuDCRTPolyMatrix,
+        destination_secret: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        public.copy_into(destination_public)?;
+        self.copy_into(destination_secret)
+    }
+
+    /// Allocate every trapdoor component in `params` and enqueue direct
+    /// device copies for the complete secret owner.  The covariance cache is
+    /// deliberately not copied: it is a destination-local derived cache and
+    /// is rebuilt only when a preimage job actually needs it.
+    #[doc(hidden)]
+    pub fn copy_to_params_direct(
+        &self,
+        params: &GpuDCRTPolyParams,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let r = self.r.copy_to_params_direct(params)?;
+        let e = self.e.copy_to_params_direct(params)?;
+        let a_mat_coeff = self.a_mat_coeff.copy_to_params_direct(params)?;
+        let b_mat_coeff = self.b_mat_coeff.copy_to_params_direct(params)?;
+        let d_mat_coeff = self.d_mat_coeff.copy_to_params_direct(params)?;
+        Ok(Self {
+            r,
+            e,
+            a_mat_coeff,
+            b_mat_coeff,
+            d_mat_coeff,
+            p1_covariance_cache: Arc::new(Mutex::new(None)),
+        })
+    }
+
     /// Waits for every matrix required to consume this trapdoor.
     pub fn wait_until_ready(&self) {
         self.r.wait_until_ready();
@@ -174,6 +338,58 @@ impl GpuDCRTTrapdoor {
         self.a_mat_coeff.wait_until_ready();
         self.b_mat_coeff.wait_until_ready();
         self.d_mat_coeff.wait_until_ready();
+    }
+
+    /// Resolve every component's external writer before a graph capture. This
+    /// keeps capture preparation value-free while covering the cached
+    /// coefficient owners as well as the sampled `r/e` pair.
+    #[doc(hidden)]
+    pub fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        self.r.prepare_external_for_capture()?;
+        self.e.prepare_external_for_capture()?;
+        self.a_mat_coeff.prepare_external_for_capture()?;
+        self.b_mat_coeff.prepare_external_for_capture()?;
+        self.d_mat_coeff.prepare_external_for_capture()?;
+        Ok(())
+    }
+
+    /// Queue readiness dependencies for every secret trapdoor component on a
+    /// compiled graph stream. This keeps the complete secret owner contract
+    /// together; callers cannot accidentally protect only `r`/`e` while the
+    /// cached coefficient components are still in flight.
+    #[doc(hidden)]
+    pub fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        for component in [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+        {
+            component.wait_compiled_inputs(consumer_device, launch_stream, true)?;
+        }
+        Ok(())
+    }
+
+    /// Attach the compiled submission completion to every secret component's
+    /// release stream as a read-only consumer. The writer events remain
+    /// independent so concurrent graph readers are not serialized.
+    #[doc(hidden)]
+    pub fn protect_compiled_submission(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        for component in [&self.r, &self.e, &self.a_mat_coeff, &self.b_mat_coeff, &self.d_mat_coeff]
+        {
+            component.protect_compiled_submission(
+                consumer_device,
+                launch_stream,
+                completion,
+                true,
+            )?;
+        }
+        Ok(())
     }
 
     /// Exact retained owner bytes after trapdoor construction.  This is
@@ -201,13 +417,16 @@ impl GpuDCRTTrapdoor {
         let dist = DistType::GaussDist { sigma, max_coefficient_bound: None };
         let r = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist.clone());
         let e = uniform_sampler.sample_uniform(params, size, size * log_base_q, dist);
-        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
-        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
-        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
+        let a_mat_coeff = coeff_cached_matrix(&r * &r.transpose());
+        let b_mat_coeff = coeff_cached_matrix(&r * &e.transpose());
+        let d_mat_coeff = coeff_cached_matrix(&e * &e.transpose());
         let p1_covariance_cache = Arc::new(Mutex::new(None));
         Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache }
     }
 
+    /// Compatibility artifact export for host persistence. Capture and
+    /// compiled execution must use `copy_into`/`output_descriptor` so secret
+    /// components never take a host serialize/restore round trip.
     pub fn to_compact_bytes(&self) -> Vec<u8> {
         let mats = [&self.r, &self.e];
         let mut parts = Vec::with_capacity(mats.len());
@@ -225,6 +444,8 @@ impl GpuDCRTTrapdoor {
         out
     }
 
+    /// Compatibility artifact import. This is intentionally not part of the
+    /// capture path; use preallocated component destinations there.
     pub fn from_compact_bytes(params: &GpuDCRTPolyParams, bytes: &[u8]) -> Option<Self> {
         let mut offset = 0usize;
         let next = |buf: &[u8], offset: &mut usize| -> Option<Vec<u8>> {
@@ -250,9 +471,9 @@ impl GpuDCRTTrapdoor {
 
         let r = GpuDCRTPolyMatrix::from_compact_bytes(params, &r_bytes);
         let e = GpuDCRTPolyMatrix::from_compact_bytes(params, &e_bytes);
-        let a_mat_coeff = coeff_cached_matrix(&(&r * &r.transpose()));
-        let b_mat_coeff = coeff_cached_matrix(&(&r * &e.transpose()));
-        let d_mat_coeff = coeff_cached_matrix(&(&e * &e.transpose()));
+        let a_mat_coeff = coeff_cached_matrix(&r * &r.transpose());
+        let b_mat_coeff = coeff_cached_matrix(&r * &e.transpose());
+        let d_mat_coeff = coeff_cached_matrix(&e * &e.transpose());
         let p1_covariance_cache = Arc::new(Mutex::new(None));
         Some(Self { r, e, a_mat_coeff, b_mat_coeff, d_mat_coeff, p1_covariance_cache })
     }
@@ -293,6 +514,7 @@ fn get_or_create_p1_covariance_cache(
         c,
         s,
         dgg_stddev,
+        None,
     ));
     *guard = Some(GpuP1CovarianceCacheEntry { c, s, dgg_stddev, cache: cache.clone() });
     cache
@@ -331,6 +553,23 @@ pub struct GpuDCRTPolyTrapdoorSampler {
 }
 
 fn preimage_seed(base: [u8; 32], stage: &[u8], column_start: usize, attempt: usize) -> GpuRngSeed {
+    GpuRngSeed::from_bytes(preimage_seed_bytes(base, stage, column_start, attempt))
+}
+
+/// Return the canonical seed bytes for one logical preimage attempt.
+///
+/// This is deliberately kept as the single Rust-side definition of the seed
+/// ABI.  The CUDA retry adapter must consume these bytes without adding a
+/// device/frame/physical-GPU coordinate: those coordinates are scheduling
+/// details and would change transcript identity.  In particular, callers may
+/// use this helper to build the fixed device control block before launching a
+/// retry graph.
+pub fn preimage_seed_bytes(
+    base: [u8; 32],
+    stage: &[u8],
+    column_start: usize,
+    attempt: usize,
+) -> [u8; 32] {
     let mut hasher = keccak_asm::Keccak256::new();
     hasher.update(b"mxx-preimage-sampler/v1");
     hasher.update(base);
@@ -338,7 +577,86 @@ fn preimage_seed(base: [u8; 32], stage: &[u8], column_start: usize, attempt: usi
     hasher.update(stage);
     hasher.update((column_start as u64).to_le_bytes());
     hasher.update((attempt as u64).to_le_bytes());
-    GpuRngSeed::from_bytes(hasher.finalize().into())
+    hasher.finalize().into()
+}
+
+/// Canonical retry seed ABI for a captured conditional body.  The fixed
+/// control block is part of the logical transcript: physical device/shard
+/// coordinates are deliberately excluded, while nonce, logical instance,
+/// global column and attempt are all consumed so a body replay can never
+/// regenerate the same candidate for a different retry.
+pub fn preimage_seed_bytes_with_control(
+    control: &PreimageLaunchControl,
+    stage: &[u8],
+    attempt: u32,
+) -> [u8; 32] {
+    let mut hasher = keccak_asm::Keccak256::new();
+    hasher.update(b"mxx-preimage-sampler/v2");
+    hasher.update(control.execution_nonce);
+    hasher.update(control.logical_instance.to_le_bytes());
+    hasher.update(control.global_column_start.to_le_bytes());
+    hasher.update((stage.len() as u64).to_le_bytes());
+    hasher.update(stage);
+    hasher.update(attempt.to_le_bytes());
+    hasher.finalize().into()
+}
+
+impl PreimageLaunchControl {
+    /// Derive a unique logical attempt seed without introducing physical
+    /// placement into the transcript.
+    pub fn attempt_seed(&self, stage: &[u8], attempt: u32) -> GpuRngSeed {
+        GpuRngSeed::from_bytes(preimage_seed_bytes_with_control(self, stage, attempt))
+    }
+}
+
+/// Device-visible result of one fixed retry region.
+///
+/// The record is intentionally small and has a stable C layout.  It is reset
+/// for every tile invocation and copied to the host exactly once after the
+/// retry region, where `error_code != 0` prevents dependent work from being
+/// submitted.  `accepted` is a count (rather than a bool) so a malformed
+/// multi-accept body can fail closed in the host gate.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreimageStatus {
+    pub attempts: u32,
+    pub accepted: u32,
+    pub error_code: u32,
+    pub reserved: u32,
+}
+
+impl PreimageStatus {
+    pub const SUCCESS: u32 = 0;
+    pub const EXHAUSTED: u32 = 1;
+
+    pub const fn reset() -> Self {
+        Self { attempts: 0, accepted: 0, error_code: Self::SUCCESS, reserved: 0 }
+    }
+
+    pub const fn succeeded(self) -> bool {
+        self.error_code == Self::SUCCESS && self.accepted == 1
+    }
+
+    pub const fn exhausted(self) -> bool {
+        self.error_code == Self::EXHAUSTED
+    }
+}
+
+/// Stable device control block for a retry invocation.
+///
+/// Pointer roots used by the attempt adapter live in the fixed-layout device
+/// binding table referenced by `binding_table`; they are not captured as
+/// direct per-run kernel arguments.  The launch stream updates this block and
+/// the status record before entering the conditional body.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreimageLaunchControl {
+    pub execution_nonce: [u8; 32],
+    pub logical_instance: u64,
+    pub global_column_start: u64,
+    pub max_attempts: u32,
+    pub attempt: u32,
+    pub binding_table: u64,
 }
 
 fn dcrt_matrix_bytes(
@@ -352,9 +670,10 @@ fn dcrt_matrix_bytes(
         .map_err(|_| SmallMatrixError::DimensionOverflow)
 }
 
+#[cfg(test)]
 enum RetryFailure {
-    Error(SmallMatrixError),
-    Exhausted(usize),
+    Error,
+    Exhausted,
 }
 
 /// Whether the first use of a trapdoor covariance cache is part of the
@@ -530,25 +849,609 @@ pub struct PreimageFootprint {
     pub max_attempts: usize,
 }
 
+struct TileWorkspaceBytes {
+    candidate: usize,
+    perturbation: usize,
+    residual: usize,
+    z_hat: usize,
+    target_tile: usize,
+    packed_staging: usize,
+}
+
+/// Fixed device storage and graph-binding indices for one conditional
+/// preimage body. Every pointer is prepared before capture and remains valid
+/// for the complete bounded retry region.
+#[derive(Clone, Debug)]
+pub struct GpuPreimageBodyScratch {
+    covariance_cache: Arc<crate::matrix::gpu_dcrt_poly::GpuP1CovarianceCache>,
+    total_columns: usize,
+    pub fixed_scratch: *mut std::ffi::c_void,
+    pub p2_seed: *mut std::ffi::c_void,
+    pub p1_seed: *mut std::ffi::c_void,
+    pub z_seed: *mut std::ffi::c_void,
+    pub p1_sampled: *mut std::ffi::c_void,
+    pub p1_workspace: *mut std::ffi::c_void,
+    pub p1_workspace_bytes: usize,
+    pub gaussian_digits: *mut std::ffi::c_void,
+    pub gaussian_digits_bytes: usize,
+    pub gaussian_bases: *mut std::ffi::c_void,
+    pub gaussian_strides: *mut std::ffi::c_void,
+    pub gaussian_coeff_bytes: *mut std::ffi::c_void,
+    pub gaussian_moduli: *mut std::ffi::c_void,
+    pub p2_seed_binding_index: u32,
+    pub p1_seed_binding_index: u32,
+    pub z_seed_binding_index: u32,
+    pub p2_binding_index: u32,
+    pub p1_sampled_binding_index: u32,
+    pub p1_workspace_binding_index: u32,
+    pub gaussian_digits_binding_index: u32,
+    pub gaussian_bases_binding_index: u32,
+    pub gaussian_strides_binding_index: u32,
+    pub gaussian_coeff_bytes_binding_index: u32,
+    pub gaussian_moduli_binding_index: u32,
+}
+
+/// Fully typed input contract for one captured retry body.  It is deliberately
+/// primitive-owned so allocation cannot depend on a runtime exemplar or on a
+/// backend-specific request enum.
+pub struct GpuPreimageBodyTypedRequest<'a> {
+    pub params: &'a GpuDCRTPolyParams,
+    pub sigma: f64,
+    pub public_matrix: &'a GpuDCRTPolyMatrix,
+    pub target: &'a GpuDCRTPolyMatrix,
+    pub trapdoor: &'a GpuDCRTTrapdoor,
+    pub tile_columns: usize,
+    pub total_columns: usize,
+}
+
+/// Plan-owned native resources used by one conditional retry graph.  The
+/// matrix owners and opaque buffers remain alive for the graph executable's
+/// entire lifetime; replay only patches run-local destination bindings.
+pub struct GpuPreimageBodyAllocation {
+    pub p2: GpuDCRTPolyMatrix,
+    pub tp2: GpuDCRTPolyMatrix,
+    pub p1: GpuDCRTPolyMatrix,
+    pub residual: GpuDCRTPolyMatrix,
+    pub z_hat: GpuDCRTPolyMatrix,
+    pub candidate: GpuDCRTPolyMatrix,
+    pub(crate) fixed_scratch: GpuDeviceBuffer,
+    pub(crate) control: GpuDeviceBuffer,
+    pub(crate) p2_seed: GpuDeviceBuffer,
+    pub(crate) p1_seed: GpuDeviceBuffer,
+    pub(crate) z_seed: GpuDeviceBuffer,
+    pub(crate) p1_sampled: GpuDeviceBuffer,
+    pub(crate) p1_workspace: GpuDeviceBuffer,
+    pub(crate) gaussian_digits: GpuDeviceBuffer,
+    pub(crate) gaussian_bases: GpuDeviceBuffer,
+    pub(crate) gaussian_strides: GpuDeviceBuffer,
+    pub(crate) gaussian_coeff_bytes: GpuDeviceBuffer,
+    pub(crate) gaussian_moduli: GpuDeviceBuffer,
+    scratch: GpuPreimageBodyScratch,
+}
+
+impl GpuPreimageBodyAllocation {
+    /// Allocate every matrix, pointer slab, seed, and fixed workspace needed
+    /// by the captured body before graph capture begins.
+    pub fn allocate_from_typed_request(
+        request: GpuPreimageBodyTypedRequest<'_>,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let params = request.params;
+        let d = request.public_matrix.row_size();
+        let (c, s, dgg_stddev) = p1_covariance_parameters(params, d, request.sigma);
+        // Capture owns storage, not an exemplar's computed covariance. Each
+        // replay refreshes it from that replay's trapdoor before sampling.
+        let covariance_cache = Arc::new(GpuDCRTPolyMatrix::create_p1_covariance_cache(
+            &request.trapdoor.a_mat_coeff,
+            &request.trapdoor.b_mat_coeff,
+            &request.trapdoor.d_mat_coeff,
+            c,
+            s,
+            dgg_stddev,
+            Some(stream),
+        ));
+        let p2_rows = request.trapdoor.r.col_size();
+        let p1_rows = d
+            .checked_mul(2)
+            .ok_or_else(|| GpuNativeGraphError::Native("preimage p1 row count overflows".into()))?;
+        let z_rows = request
+            .target
+            .row_size()
+            .checked_mul(params.modulus_digits())
+            .ok_or_else(|| GpuNativeGraphError::Native("preimage z shape overflows".into()))?;
+        let candidate_rows = p1_rows.checked_add(p2_rows).ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage candidate row count overflows".into())
+        })?;
+        let columns = request.tile_columns;
+        let level = params.crt_depth().checked_sub(1).ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage allocation has empty CRT depth".into())
+        })?;
+        let p2 =
+            GpuDCRTPolyMatrix::new_empty_with_state(params, p2_rows, columns, level, false, None);
+        let tp2 =
+            GpuDCRTPolyMatrix::new_empty_with_state(params, p1_rows, columns, level, true, None);
+        let p1 =
+            GpuDCRTPolyMatrix::new_empty_with_state(params, p1_rows, columns, level, false, None);
+        let residual = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            request.target.row_size(),
+            columns,
+            level,
+            true,
+            None,
+        );
+        let z_hat =
+            GpuDCRTPolyMatrix::new_empty_with_state(params, z_rows, columns, level, false, None);
+        let candidate = GpuDCRTPolyMatrix::new_empty_with_state(
+            params,
+            candidate_rows,
+            columns,
+            level,
+            true,
+            None,
+        );
+        let fixed_scratch = GpuDeviceBuffer::allocate(stream, 1)?;
+        let control =
+            GpuDeviceBuffer::allocate(stream, std::mem::size_of::<PreimageLaunchControl>())?;
+        let seed_bytes = std::mem::size_of::<GpuRngSeed>();
+        let p2_seed = GpuDeviceBuffer::allocate(stream, seed_bytes)?;
+        let p1_seed = GpuDeviceBuffer::allocate(stream, seed_bytes)?;
+        let z_seed = GpuDeviceBuffer::allocate(stream, seed_bytes)?;
+        let n = params.ring_dimension() as usize;
+        let depth = level + 1;
+        let p1_sampled_bytes = p1_rows
+            .checked_mul(columns)
+            .and_then(|value| value.checked_mul(n))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<i64>()))
+            .ok_or_else(|| GpuNativeGraphError::Native("p1 scratch size overflows".into()))?;
+        let p1_workspace_bytes = columns
+            .checked_mul(p1_rows)
+            .and_then(|value| value.checked_mul(n))
+            .and_then(|value| {
+                value.checked_mul(std::mem::size_of::<f64>() + std::mem::size_of::<i64>())
+            })
+            .ok_or_else(|| GpuNativeGraphError::Native("p1 workspace size overflows".into()))?;
+        let p1_sampled = GpuDeviceBuffer::allocate(stream, p1_sampled_bytes.max(1))?;
+        let p1_workspace = GpuDeviceBuffer::allocate(stream, p1_workspace_bytes.max(1))?;
+        let gaussian_digits_bytes = request
+            .target
+            .row_size()
+            .checked_mul(columns)
+            .and_then(|value| value.checked_mul(n))
+            .and_then(|value| value.checked_mul(params.modulus_digits()))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<i64>()))
+            .ok_or_else(|| GpuNativeGraphError::Native("Gaussian scratch size overflows".into()))?;
+        let gaussian_digits = GpuDeviceBuffer::allocate(stream, gaussian_digits_bytes.max(1))?;
+        let gaussian_bases = GpuDeviceBuffer::allocate(stream, depth * std::mem::size_of::<u64>())?;
+        let gaussian_strides =
+            GpuDeviceBuffer::allocate(stream, depth * std::mem::size_of::<usize>())?;
+        let gaussian_coeff_bytes = GpuDeviceBuffer::allocate(stream, depth)?;
+        let gaussian_moduli =
+            GpuDeviceBuffer::allocate(stream, depth * std::mem::size_of::<u64>())?;
+        let components = z_hat.binding_components()?;
+        let component = components.first().ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage z output has no native component".into())
+        })?;
+        let mut bases = Vec::with_capacity(depth);
+        let mut strides = Vec::with_capacity(depth);
+        let mut coeff_bytes = Vec::with_capacity(depth);
+        let mut offset = 0usize;
+        for modulus in params.moduli().iter().take(depth).copied() {
+            let width = (64 - modulus.leading_zeros() as usize).div_ceil(8);
+            bases.push(component.data_address as usize + offset);
+            strides.push(component.bytes_per_poly);
+            coeff_bytes.push(width as u8);
+            offset = offset
+                .checked_add(n.checked_mul(width).ok_or_else(|| {
+                    GpuNativeGraphError::Native("Gaussian limb stride overflows".into())
+                })?)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native("Gaussian limb offset overflows".into())
+                })?;
+        }
+        let bases_bytes = as_bytes(&bases);
+        let strides_bytes = as_bytes(&strides);
+        let coeff_bytes_bytes = as_bytes(&coeff_bytes);
+        let moduli_bytes = as_bytes(params.moduli().get(..depth).ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage CRT basis is incomplete".into())
+        })?);
+        gaussian_bases.upload(0, &bases_bytes)?;
+        gaussian_strides.upload(0, &strides_bytes)?;
+        gaussian_coeff_bytes.upload(0, &coeff_bytes_bytes)?;
+        gaussian_moduli.upload(0, &moduli_bytes)?;
+        let scratch = GpuPreimageBodyScratch {
+            covariance_cache,
+            total_columns: request.total_columns,
+            fixed_scratch: fixed_scratch.as_ptr(),
+            p2_seed: p2_seed.as_ptr(),
+            p1_seed: p1_seed.as_ptr(),
+            z_seed: z_seed.as_ptr(),
+            p1_sampled: p1_sampled.as_ptr(),
+            p1_workspace: p1_workspace.as_ptr(),
+            p1_workspace_bytes,
+            gaussian_digits: gaussian_digits.as_ptr(),
+            gaussian_digits_bytes,
+            gaussian_bases: gaussian_bases.as_ptr(),
+            gaussian_strides: gaussian_strides.as_ptr(),
+            gaussian_coeff_bytes: gaussian_coeff_bytes.as_ptr(),
+            gaussian_moduli: gaussian_moduli.as_ptr(),
+            p2_seed_binding_index: 3,
+            p1_seed_binding_index: 4,
+            z_seed_binding_index: 5,
+            p2_binding_index: 6,
+            p1_sampled_binding_index: 7,
+            p1_workspace_binding_index: 8,
+            gaussian_digits_binding_index: 9,
+            gaussian_bases_binding_index: 10,
+            gaussian_strides_binding_index: 11,
+            gaussian_coeff_bytes_binding_index: 12,
+            gaussian_moduli_binding_index: 13,
+        };
+        Ok(Self {
+            p2,
+            tp2,
+            p1,
+            residual,
+            z_hat,
+            candidate,
+            fixed_scratch,
+            control,
+            p2_seed,
+            p1_seed,
+            z_seed,
+            p1_sampled,
+            p1_workspace,
+            gaussian_digits,
+            gaussian_bases,
+            gaussian_strides,
+            gaussian_coeff_bytes,
+            gaussian_moduli,
+            scratch,
+        })
+    }
+
+    pub fn scratch(&self) -> GpuPreimageBodyScratch {
+        let mut scratch = self.scratch.clone();
+        scratch.fixed_scratch = self.fixed_scratch.as_ptr();
+        scratch.p2_seed = self.p2_seed.as_ptr();
+        scratch.p1_seed = self.p1_seed.as_ptr();
+        scratch.z_seed = self.z_seed.as_ptr();
+        scratch.p1_sampled = self.p1_sampled.as_ptr();
+        scratch.p1_workspace = self.p1_workspace.as_ptr();
+        scratch.gaussian_digits = self.gaussian_digits.as_ptr();
+        scratch.gaussian_bases = self.gaussian_bases.as_ptr();
+        scratch.gaussian_strides = self.gaussian_strides.as_ptr();
+        scratch.gaussian_coeff_bytes = self.gaussian_coeff_bytes.as_ptr();
+        scratch.gaussian_moduli = self.gaussian_moduli.as_ptr();
+        scratch
+    }
+
+    pub fn control_ptr(&self) -> *mut std::ffi::c_void {
+        self.control.as_ptr()
+    }
+
+    pub fn initialize_retry(
+        &self,
+        control: &PreimageLaunchControl,
+        device_status: *mut std::ffi::c_void,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        self.scratch.covariance_cache.initialize_retry(
+            self.control_ptr(),
+            device_status,
+            control,
+            stream,
+        );
+    }
+
+    /// Refresh the per-execution nonce in the graph-owned control block.
+    /// The control allocation is reused by every replay, so leaving the
+    /// capture-time nonce in place would make repeated executions regenerate
+    /// the same sampler transcript. The upload is queued on the allocation
+    /// stream and therefore precedes the next graph launch on that stream.
+    pub fn update_execution_nonce(
+        &self,
+        execution_nonce: [u8; 32],
+    ) -> Result<(), GpuNativeGraphError> {
+        self.control.upload(0, &execution_nonce)?;
+        self.control.upload(52, &0u32.to_ne_bytes())
+    }
+}
+
+fn as_bytes<T>(values: &[T]) -> Vec<u8> {
+    unsafe {
+        std::slice::from_raw_parts(
+            values.as_ptr().cast::<u8>(),
+            values.len() * std::mem::size_of::<T>(),
+        )
+        .to_vec()
+    }
+}
+
 impl PreimageFootprint {
     pub fn fits_budget(&self, budget_bytes: usize) -> bool {
         self.cold_sampler_peak_bytes <= budget_bytes
     }
 }
 
+#[cfg(test)]
 fn bounded_retry<T, F>(attempts: usize, mut attempt: F) -> Result<T, RetryFailure>
 where
     F: FnMut() -> Result<Option<T>, SmallMatrixError>,
 {
     for _ in 0..attempts {
-        if let Some(value) = attempt().map_err(RetryFailure::Error)? {
+        if let Some(value) = attempt().map_err(|_| RetryFailure::Error)? {
             return Ok(value);
         }
     }
-    Err(RetryFailure::Exhausted(attempts))
+    Err(RetryFailure::Exhausted)
 }
 
 impl GpuDCRTPolyTrapdoorSampler {
+    /// Enqueue the cached p1 candidate kernel on a conditional-body stream.
+    /// All destination and scratch owners must have been allocated before
+    /// capture; the device seed is re-read on each body iteration.
+    pub fn sample_p1_cached_into_body(
+        &self,
+        params: &GpuDCRTPolyParams,
+        trapdoor: &GpuDCRTTrapdoor,
+        tp2: &GpuDCRTPolyMatrix,
+        sampled_out: *mut std::ffi::c_void,
+        workspace: *mut std::ffi::c_void,
+        workspace_bytes: usize,
+        device_seed: *const std::ffi::c_void,
+        out: &mut GpuDCRTPolyMatrix,
+        stream: &GpuNativeLaunchStream,
+        tp2_binding_index: u32,
+        seed_binding_index: u32,
+        sampled_binding_index: u32,
+        workspace_binding_index: u32,
+    ) {
+        let d = trapdoor.r.row_size();
+        let s = preimage_smoothing_parameter(
+            self.base,
+            self.sigma,
+            d,
+            params.ring_dimension() as usize,
+            params.modulus_digits(),
+        );
+        let dgg_stddev = (s * s - self.c * self.c).sqrt();
+        let cache = get_or_create_p1_covariance_cache(trapdoor, self.c, s, dgg_stddev);
+        GpuDCRTPolyMatrix::sample_p1_full_cached_into(
+            cache.as_ref(),
+            tp2,
+            sampled_out,
+            workspace,
+            workspace_bytes,
+            device_seed,
+            out,
+            stream,
+            tp2_binding_index,
+            seed_binding_index,
+            sampled_binding_index,
+            workspace_binding_index,
+        );
+    }
+
+    /// Enqueue the complete Gaussian digit generation, scatter, and NTT
+    /// sequence on the retry-body stream using fixed caller-owned scratch.
+    pub fn sample_gauss_into_body(
+        &self,
+        source: &GpuDCRTPolyMatrix,
+        output: &mut GpuDCRTPolyMatrix,
+        sampled_digits: *mut std::ffi::c_void,
+        sampled_capacity_bytes: usize,
+        device_seed: *const std::ffi::c_void,
+        dst_bases_device: *mut std::ffi::c_void,
+        dst_strides_device: *const std::ffi::c_void,
+        dst_coeff_bytes_device: *const std::ffi::c_void,
+        dst_moduli_device: *const std::ffi::c_void,
+        stream: &GpuNativeLaunchStream,
+        source_binding_index: u32,
+        out_bases_binding_index: u32,
+        out_strides_binding_index: u32,
+        out_coeff_bytes_binding_index: u32,
+        out_moduli_binding_index: u32,
+        seed_binding_index: u32,
+        sampled_binding_index: u32,
+    ) {
+        GpuDCRTPolyMatrix::gauss_samp_gq_arb_base_into(
+            source,
+            output,
+            sampled_digits,
+            sampled_capacity_bytes,
+            device_seed,
+            dst_bases_device,
+            dst_strides_device,
+            dst_coeff_bytes_device,
+            dst_moduli_device,
+            self.c,
+            stream,
+            source_binding_index,
+            out_bases_binding_index,
+            out_strides_binding_index,
+            out_coeff_bytes_binding_index,
+            out_moduli_binding_index,
+            seed_binding_index,
+            sampled_binding_index,
+        );
+    }
+
+    /// Capture one complete allocation-free conditional retry body. The same
+    /// body is replayed by CUDA's device-side WHILE node: it derives a fresh
+    /// seed from control, regenerates every candidate component, applies the
+    /// hard cutoff, and publishes only accepted output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_preimage_retry_with_candidate_body(
+        &self,
+        capture: &mut GpuCaptureScope,
+        spec: GpuPreimageRetrySpec,
+        scratch: GpuPreimageBodyScratch,
+        device_control: *mut std::ffi::c_void,
+        device_status: *mut std::ffi::c_void,
+        destination: &mut GpuSmallMatrix,
+        target: &GpuDCRTPolyMatrix,
+        public_matrix: &GpuDCRTPolyMatrix,
+        trapdoor: &GpuDCRTTrapdoor,
+        p2: &mut GpuDCRTPolyMatrix,
+        tp2: &mut GpuDCRTPolyMatrix,
+        p1: &mut GpuDCRTPolyMatrix,
+        residual: &mut GpuDCRTPolyMatrix,
+        z_hat: &mut GpuDCRTPolyMatrix,
+        candidate: &mut GpuDCRTPolyMatrix,
+        stream_target_column: usize,
+    ) -> Result<(), GpuNativeGraphError> {
+        let tile_columns = target.col_size();
+        let d = public_matrix.row_size();
+        let n = public_matrix.params.ring_dimension() as usize;
+        let k = public_matrix.params.modulus_digits();
+        let s = preimage_smoothing_parameter(self.base, self.sigma, d, n, k);
+        let dgg_large_std = (s * s - self.c * self.c).sqrt();
+        let cache = scratch.covariance_cache.clone();
+        GpuDCRTPolyMatrix::refresh_p1_covariance_cache(
+            cache.as_ref(),
+            &trapdoor.a_mat_coeff,
+            &trapdoor.b_mat_coeff,
+            &trapdoor.d_mat_coeff,
+            self.sigma,
+            capture.launch_stream(),
+        );
+        capture.add_preimage_retry_with_body(
+            spec,
+            scratch.fixed_scratch,
+            device_control,
+            device_status,
+            |stream| {
+                destination.derive_preimage_stage_seed_from_control(
+                    device_control,
+                    scratch.p2_seed,
+                    0,
+                    spec.control_binding_index,
+                    scratch.p2_seed_binding_index,
+                    stream,
+                );
+                destination.derive_preimage_stage_seed_from_control(
+                    device_control,
+                    scratch.p1_seed,
+                    1,
+                    spec.control_binding_index,
+                    scratch.p1_seed_binding_index,
+                    stream,
+                );
+                destination.derive_preimage_stage_seed_from_control(
+                    device_control,
+                    scratch.z_seed,
+                    2,
+                    spec.control_binding_index,
+                    scratch.z_seed_binding_index,
+                    stream,
+                );
+                p2.sample_distribution_columns_coeff_from_device_seed(
+                    scratch.total_columns,
+                    stream_target_column,
+                    GPU_MATRIX_DIST_GAUSS,
+                    dgg_large_std,
+                    0,
+                    scratch.p2_seed.cast_const(),
+                    scratch.p2_seed_binding_index,
+                    stream,
+                );
+                p2.ntt_all_on_stream(stream);
+                GpuDCRTPolyMatrix::mul_vertical_pair_into_on_stream(
+                    &trapdoor.r,
+                    &trapdoor.e,
+                    p2,
+                    tp2,
+                    stream,
+                );
+                tp2.intt_all_on_stream(stream);
+                GpuDCRTPolyMatrix::sample_p1_full_cached_into(
+                    cache.as_ref(),
+                    tp2,
+                    scratch.p1_sampled,
+                    scratch.p1_workspace,
+                    scratch.p1_workspace_bytes,
+                    scratch.p1_seed.cast_const(),
+                    p1,
+                    stream,
+                    scratch.p2_binding_index,
+                    scratch.p1_seed_binding_index,
+                    scratch.p1_sampled_binding_index,
+                    scratch.p1_workspace_binding_index,
+                );
+                GpuDCRTPolyMatrix::preimage_residual_into_on_stream(
+                    target,
+                    public_matrix,
+                    p1,
+                    p2,
+                    residual,
+                    stream,
+                );
+                residual.intt_all_on_stream(stream);
+                self.sample_gauss_into_body(
+                    residual,
+                    z_hat,
+                    scratch.gaussian_digits,
+                    scratch.gaussian_digits_bytes,
+                    scratch.z_seed.cast_const(),
+                    scratch.gaussian_bases,
+                    scratch.gaussian_strides.cast_const(),
+                    scratch.gaussian_coeff_bytes.cast_const(),
+                    scratch.gaussian_moduli.cast_const(),
+                    stream,
+                    scratch.p2_binding_index,
+                    scratch.gaussian_bases_binding_index,
+                    scratch.gaussian_strides_binding_index,
+                    scratch.gaussian_coeff_bytes_binding_index,
+                    scratch.gaussian_moduli_binding_index,
+                    scratch.z_seed_binding_index,
+                    scratch.gaussian_digits_binding_index,
+                );
+                p1.copy_block_into_on_capture_stream(
+                    candidate,
+                    0,
+                    0,
+                    0,
+                    0,
+                    p1.row_size(),
+                    tile_columns,
+                    stream,
+                    0,
+                    target.params.crt_depth() as u32,
+                )?;
+                p2.copy_block_into_on_capture_stream(
+                    candidate,
+                    0,
+                    0,
+                    p1.row_size(),
+                    0,
+                    p2.row_size(),
+                    tile_columns,
+                    stream,
+                    0,
+                    target.params.crt_depth() as u32,
+                )?;
+                candidate.preimage_add_correction_on_stream(
+                    &trapdoor.r,
+                    &trapdoor.e,
+                    z_hat,
+                    stream,
+                );
+                candidate.intt_all_on_stream(stream);
+                destination.submit_preimage_hard_cutoff_tile_control(
+                    candidate,
+                    0,
+                    stream_target_column,
+                    candidate.row_size(),
+                    tile_columns,
+                    device_control,
+                    stream,
+                );
+                Ok(())
+            },
+        )
+    }
+
     /// Construct the production covariance cache without running the sampler.
     /// Warmup uses this as the timed cold/setup operation, then retains the
     /// trapdoor owner for the corresponding local-job measurement.
@@ -660,7 +1563,7 @@ impl GpuDCRTPolyTrapdoorSampler {
         k: usize,
         tile_columns: usize,
         magnitude_bytes: usize,
-    ) -> Result<(usize, usize, usize, usize, usize, usize), SmallMatrixError> {
+    ) -> Result<TileWorkspaceBytes, SmallMatrixError> {
         let candidate = dcrt_matrix_bytes(params, k, tile_columns)?;
         let perturbation = dcrt_matrix_bytes(params, 2 * d, tile_columns)?
             .checked_add(dcrt_matrix_bytes(params, trapdoor.r.col_size(), tile_columns)?)
@@ -673,7 +1576,14 @@ impl GpuDCRTPolyTrapdoorSampler {
             .and_then(|value| value.checked_mul(params.ring_dimension() as usize))
             .and_then(|value| value.checked_mul(1 + magnitude_bytes))
             .ok_or(SmallMatrixError::DimensionOverflow)?;
-        Ok((candidate, perturbation, residual, z_hat, target_tile, packed_staging))
+        Ok(TileWorkspaceBytes {
+            candidate,
+            perturbation,
+            residual,
+            z_hat,
+            target_tile,
+            packed_staging,
+        })
     }
 
     fn allocation_evidence(
@@ -735,17 +1645,10 @@ impl GpuDCRTPolyTrapdoorSampler {
                     .and_then(|subset| bytes.checked_add(subset))
             })
             .ok_or(SmallMatrixError::DimensionOverflow)?;
-        let device_control_bytes = std::mem::size_of::<i32>();
-        let pinned_host_control_bytes = std::mem::size_of::<i32>();
+        let device_control_bytes = std::mem::size_of::<PreimageStatus>();
+        let pinned_host_control_bytes = std::mem::size_of::<PreimageStatus>();
         let sampler_event_bytes = 2 * std::mem::size_of::<usize>();
-        let (
-            candidate_workspace_bytes,
-            perturbation_workspace_bytes,
-            residual,
-            z_hat,
-            target_tile,
-            host_staging_bytes,
-        ) = Self::tile_workspace_bytes(
+        let workspace = Self::tile_workspace_bytes(
             params,
             trapdoor,
             d,
@@ -753,13 +1656,15 @@ impl GpuDCRTPolyTrapdoorSampler {
             config.tile_columns.get(),
             magnitude_bytes,
         )?;
-        let scratch_bytes =
-            residual.checked_add(z_hat).ok_or(SmallMatrixError::DimensionOverflow)?;
+        let scratch_bytes = workspace
+            .residual
+            .checked_add(workspace.z_hat)
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
         // The fixed native call stages the target tile on the source side and
         // packs the accepted compact result through host staging.  The output
         // itself is already represented by compact_output_bytes; don't charge
         // it a second time as destination staging.
-        let source_device_staging_bytes = target_tile;
+        let source_device_staging_bytes = workspace.target_tile;
         let destination_device_staging_bytes = 0;
         let warm_peak = PreimageAllocationEnvelope::checked_sum([
             public_matrix_bytes,
@@ -767,12 +1672,12 @@ impl GpuDCRTPolyTrapdoorSampler {
             resident_target_bytes,
             retained_covariance_cache_bytes,
             compact_output_bytes,
-            candidate_workspace_bytes,
-            perturbation_workspace_bytes,
+            workspace.candidate,
+            workspace.perturbation,
             scratch_bytes,
             source_device_staging_bytes,
             destination_device_staging_bytes,
-            host_staging_bytes,
+            workspace.packed_staging,
             device_control_bytes,
             pinned_host_control_bytes,
             sampler_event_bytes,
@@ -791,12 +1696,12 @@ impl GpuDCRTPolyTrapdoorSampler {
             resident_target_bytes,
             retained_covariance_cache_bytes,
             compact_output_bytes,
-            candidate_workspace_bytes,
-            perturbation_workspace_bytes,
+            candidate_workspace_bytes: workspace.candidate,
+            perturbation_workspace_bytes: workspace.perturbation,
             scratch_bytes,
             source_device_staging_bytes,
             destination_device_staging_bytes,
-            host_staging_bytes,
+            host_staging_bytes: workspace.packed_staging,
             device_control_bytes,
             pinned_host_control_bytes,
             sampler_event_bytes,
@@ -955,7 +1860,7 @@ impl GpuDCRTPolyTrapdoorSampler {
             });
         }
         let tile_columns = config.tile_columns.get();
-        let (candidate, perturbation, _residual, _z_hat, target_tile, _packed_staging) =
+        let workspace =
             Self::tile_workspace_bytes(params, trapdoor, d, k, tile_columns, magnitude_bytes)?;
         let mut destination = GpuSmallMatrix::new_empty_checked(
             params,
@@ -965,14 +1870,17 @@ impl GpuDCRTPolyTrapdoorSampler {
             magnitude_bytes,
             budget,
         )?;
-        destination.prepare_preimage_hard_cutoff();
+        // The retry body reuses one fixed device staging tile. Acceptance is
+        // latched on the device; the host does not observe it between
+        // attempts. A single status D2H is queued after the bounded body.
+        destination.prepare_preimage_hard_cutoff_for_tile(k, tile_columns);
         let report = destination.sampler_allocation_report(
             footprint
                 .persistent_bytes
-                .checked_add(target_tile)
+                .checked_add(workspace.target_tile)
                 .ok_or(SmallMatrixError::DimensionOverflow)?,
-            candidate,
-            perturbation,
+            workspace.candidate,
+            workspace.perturbation,
             footprint.scratch_bytes,
             footprint.hard_cutoff_plan_bytes,
             footprint.packed_staging_bytes,
@@ -1008,8 +1916,7 @@ impl GpuDCRTPolyTrapdoorSampler {
                 .global_column_start()
                 .checked_add(column_start)
                 .ok_or(SmallMatrixError::DimensionOverflow)?;
-            let mut attempt = 0usize;
-            let outcome = bounded_retry(config.max_attempts.get(), || {
+            for attempt in 0..config.max_attempts.get() {
                 let candidate = expanded_preimage_candidate(
                     self,
                     params,
@@ -1019,27 +1926,25 @@ impl GpuDCRTPolyTrapdoorSampler {
                     preimage_seed(randomness_seed, b"candidate", global_column, attempt),
                 )
                 .into_coeff_domain();
-                attempt += 1;
-                let accepted = destination.try_pack_preimage_hard_cutoff_tile(
+                destination.submit_preimage_hard_cutoff_tile(
                     &candidate,
                     0,
                     column_start,
                     k,
                     column_count,
-                )?;
+                    attempt as u32,
+                );
                 drop(candidate);
-                Ok(accepted.then_some(()))
-            });
-            match outcome {
-                Ok(()) => {}
-                Err(RetryFailure::Error(error)) => return Err(error),
-                Err(RetryFailure::Exhausted(attempt_count)) => {
-                    return Err(SmallMatrixError::AttemptExhausted {
-                        column_start,
-                        column_count,
-                        attempts: attempt_count,
-                    });
-                }
+            }
+            destination.mark_preimage_exhausted();
+            destination.copy_preimage_status_async();
+            let status = destination.wait_preimage_status();
+            if status.error_code != PreimageStatus::SUCCESS {
+                return Err(SmallMatrixError::AttemptExhausted {
+                    column_start,
+                    column_count,
+                    attempts: status.attempts as usize,
+                });
             }
         }
         Ok(destination)
@@ -1185,7 +2090,8 @@ impl PolyTrapdoorSampler for GpuDCRTPolyTrapdoorSampler {
         let trapdoor = GpuDCRTTrapdoor::new(params, size, self.sigma);
         let a_bar = uniform_sampler.sample_uniform(params, size, size, DistType::FinRingDist);
         let g = GpuDCRTPolyMatrix::gadget_matrix(params, size, None);
-        let a0 = a_bar.concat_columns(&[&GpuDCRTPolyMatrix::identity(params, size, None)]);
+        let identity = GpuDCRTPolyMatrix::identity_columns(params, size, 0, size);
+        let a0 = a_bar.concat_columns(&[&identity]);
         let a1 = &g - &(&a_bar * &trapdoor.r + &trapdoor.e);
         let a = a0.concat_columns(&[&a1]);
         (trapdoor, a)
@@ -1430,12 +2336,198 @@ mod tests {
     const SIGMA: f64 = 4.578;
 
     #[test]
+    #[sequential]
+    fn test_gpu_trapdoor_shallow_clone_preserves_component_identity() {
+        if detected_gpu_device_ids().is_empty() {
+            return;
+        }
+        let params = GpuDCRTPolyParams::new(16, vec![65_537, 67_073], 8, None);
+        let descriptor = GpuDCRTTrapdoor::output_descriptor_for_shape(&params, 1, 2)
+            .expect("trapdoor output descriptor");
+        let (_, trapdoor) = GpuDCRTTrapdoor::allocate_from_descriptor(&descriptor);
+        trapdoor.wait_until_ready();
+        let expected = [
+            trapdoor.r.binding_components().expect("r bindings"),
+            trapdoor.e.binding_components().expect("e bindings"),
+            trapdoor.a_mat_coeff.binding_components().expect("a bindings"),
+            trapdoor.b_mat_coeff.binding_components().expect("b bindings"),
+            trapdoor.d_mat_coeff.binding_components().expect("d bindings"),
+        ];
+        let retained = trapdoor.clone_shallow();
+        drop(trapdoor);
+        let actual = [
+            retained.r.binding_components().expect("retained r bindings"),
+            retained.e.binding_components().expect("retained e bindings"),
+            retained.a_mat_coeff.binding_components().expect("retained a bindings"),
+            retained.b_mat_coeff.binding_components().expect("retained b bindings"),
+            retained.d_mat_coeff.binding_components().expect("retained d bindings"),
+        ];
+        assert_eq!(expected, actual, "shallow trapdoor handles must retain native identities");
+    }
+
+    #[test]
     fn fixed_preimage_config_requires_nonzero_choices() {
         assert_eq!(FixedPreimageConfig::new(0, 1), None);
         assert_eq!(FixedPreimageConfig::new(1, 0), None);
         let config = FixedPreimageConfig::new(3, 7).expect("positive fixed choices");
         assert_eq!(config.tile_columns.get(), 3);
         assert_eq!(config.max_attempts.get(), 7);
+    }
+
+    #[test]
+    fn preimage_seed_uses_logical_attempt_coordinates_and_keccak_abi() {
+        let base = [0xabu8; 32];
+        let t0 = preimage_seed_bytes(base, b"candidate", 11, 0);
+        let t1 = preimage_seed_bytes(base, b"candidate", 11, 1);
+        let other_column = preimage_seed_bytes(base, b"candidate", 12, 0);
+        assert_ne!(t0, t1, "t=0 and t=1 must be distinct logical draws");
+        assert_ne!(t0, other_column, "column identity must be part of the seed");
+        assert_eq!(t0, preimage_seed(base, b"candidate", 11, 0).to_bytes());
+
+        // Keep this byte-order check close to the ABI definition: all integer
+        // fields are LE64 and the stage is length-prefixed, rather than being
+        // concatenated with a delimiter or hashed with SHA3.
+        let mut reference = keccak_asm::Keccak256::new();
+        reference.update(b"mxx-preimage-sampler/v1");
+        reference.update(base);
+        reference.update((9u64).to_le_bytes());
+        reference.update(b"candidate");
+        reference.update((11u64).to_le_bytes());
+        reference.update((0u64).to_le_bytes());
+        assert_eq!(t0, <[u8; 32]>::from(reference.finalize()));
+    }
+
+    #[test]
+    fn preimage_status_is_a_single_run_resettable_gate() {
+        assert_eq!(std::mem::size_of::<PreimageStatus>(), 16);
+        let status = PreimageStatus::reset();
+        assert_eq!(status, PreimageStatus::default());
+        assert!(!status.succeeded());
+
+        let accepted = PreimageStatus { attempts: 1, accepted: 1, ..status };
+        assert!(accepted.succeeded());
+        assert!(!accepted.exhausted());
+
+        let exhausted = PreimageStatus {
+            attempts: 4,
+            accepted: 0,
+            error_code: PreimageStatus::EXHAUSTED,
+            reserved: 0,
+        };
+        assert!(exhausted.exhausted());
+        assert!(!exhausted.succeeded());
+        assert_eq!(PreimageStatus::reset(), status, "the next tile/run starts clean");
+    }
+
+    #[test]
+    fn preimage_launch_control_has_stable_fixed_layout() {
+        assert_eq!(std::mem::size_of::<PreimageLaunchControl>(), 64);
+        let control = PreimageLaunchControl {
+            execution_nonce: [0x11; 32],
+            logical_instance: 3,
+            global_column_start: 9,
+            max_attempts: 7,
+            attempt: 0,
+            binding_table: 0x1000,
+        };
+        assert_eq!(control.max_attempts, 7);
+        assert_eq!(control.binding_table, 0x1000);
+    }
+
+    #[test]
+    fn captured_retry_seed_consumes_nonce_instance_column_and_attempt() {
+        let control = PreimageLaunchControl {
+            execution_nonce: [0x11; 32],
+            logical_instance: 3,
+            global_column_start: 9,
+            max_attempts: 7,
+            attempt: 0,
+            binding_table: 0x1000,
+        };
+        let baseline = control.attempt_seed(b"candidate", 0).to_bytes();
+        assert_ne!(baseline, control.attempt_seed(b"candidate", 1).to_bytes());
+        let mut changed = control;
+        changed.execution_nonce[0] ^= 1;
+        assert_ne!(baseline, changed.attempt_seed(b"candidate", 0).to_bytes());
+        changed = control;
+        changed.logical_instance += 1;
+        assert_ne!(baseline, changed.attempt_seed(b"candidate", 0).to_bytes());
+        changed = control;
+        changed.global_column_start += 1;
+        assert_ne!(baseline, changed.attempt_seed(b"candidate", 0).to_bytes());
+
+        let mut reference = keccak_asm::Keccak256::new();
+        reference.update(b"mxx-preimage-sampler/v2");
+        reference.update(control.execution_nonce);
+        reference.update(control.logical_instance.to_le_bytes());
+        reference.update(control.global_column_start.to_le_bytes());
+        reference.update((9u64).to_le_bytes());
+        reference.update(b"candidate");
+        reference.update(0u32.to_le_bytes());
+        assert_eq!(baseline, <[u8; 32]>::from(reference.finalize()));
+    }
+
+    #[test]
+    fn retry_stage_seeds_are_byte_exact_and_distinct_per_attempt() {
+        let control = PreimageLaunchControl {
+            execution_nonce: [0x42; 32],
+            logical_instance: 19,
+            global_column_start: 73,
+            max_attempts: 4,
+            attempt: 0,
+            binding_table: 0,
+        };
+        for stage in [b"p2".as_slice(), b"p1".as_slice(), b"z".as_slice()] {
+            let mut previous = None;
+            for attempt in 0..control.max_attempts {
+                let actual = preimage_seed_bytes(
+                    control.execution_nonce,
+                    stage,
+                    control.global_column_start as usize,
+                    attempt as usize,
+                );
+                let mut reference = keccak_asm::Keccak256::new();
+                reference.update(b"mxx-preimage-sampler/v1");
+                reference.update(control.execution_nonce);
+                reference.update((stage.len() as u64).to_le_bytes());
+                reference.update(stage);
+                reference.update((control.global_column_start as u64).to_le_bytes());
+                reference.update((attempt as u64).to_le_bytes());
+                assert_eq!(actual, <[u8; 32]>::from(reference.finalize()));
+                if let Some(previous) = previous {
+                    assert_ne!(previous, actual, "stage seed repeated across attempts");
+                }
+                previous = Some(actual);
+            }
+        }
+        assert_ne!(
+            preimage_seed_bytes(
+                control.execution_nonce,
+                b"p2",
+                control.global_column_start as usize,
+                0
+            ),
+            preimage_seed_bytes(
+                control.execution_nonce,
+                b"p1",
+                control.global_column_start as usize,
+                0
+            ),
+        );
+        assert_ne!(
+            preimage_seed_bytes(
+                control.execution_nonce,
+                b"p1",
+                control.global_column_start as usize,
+                0
+            ),
+            preimage_seed_bytes(
+                control.execution_nonce,
+                b"z",
+                control.global_column_start as usize,
+                0
+            ),
+        );
     }
 
     #[test]

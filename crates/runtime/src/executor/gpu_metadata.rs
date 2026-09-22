@@ -103,6 +103,17 @@ impl<'a> GpuScopeLowering<'a> {
                         .ok_or_else(|| "missing fused output type".to_owned())
                 })
                 .collect::<Result<Vec<_>, _>>()?
+        } else if let Some(outputs) = aliases.tensor_row_sum_groups.get(&node) {
+            outputs
+                .iter()
+                .map(|output| {
+                    checked
+                        .wire_types
+                        .get(&WireRef { node: *output, port: Port(0) })
+                        .cloned()
+                        .ok_or_else(|| "missing tensor row-sum output type".to_owned())
+                })
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             checked
                 .wire_types
@@ -125,7 +136,43 @@ impl<'a> GpuScopeLowering<'a> {
         Ok((metadata.output_types, metadata.effective_identity))
     }
 
-    #[cfg(any(feature = "gpu", test))]
+    /// Prove the public/secret association from the validated producer graph,
+    /// without observing not-yet-executed capture output allocations.
+    pub(crate) fn is_trapdoor_public_projection(&self, public: WireRef, trapdoor: WireRef) -> bool {
+        let aliases = self.alias_facts();
+        let origin = |mut wire: WireRef| {
+            for _ in 0..=aliases.len() {
+                match aliases.get(&wire) {
+                    Some(source) if *source != wire => wire = *source,
+                    _ => return Some(wire),
+                }
+            }
+            None
+        };
+        let (Some(public), Some(trapdoor)) = (origin(public), origin(trapdoor)) else {
+            return false;
+        };
+        let Some(producer) = self.scope.node(public.node) else {
+            return false;
+        };
+        if public.port != Port(0) {
+            return false;
+        }
+        match producer.kind() {
+            NodeKind::TrapdoorSample { .. } => {
+                public.node == trapdoor.node && trapdoor.port == Port(1)
+            }
+            NodeKind::TrapdoorPublic => {
+                self.scope
+                    .arguments(producer)
+                    .and_then(|arguments| arguments.first().copied())
+                    .and_then(origin) ==
+                    Some(trapdoor)
+            }
+            _ => false,
+        }
+    }
+
     pub(crate) fn alias_facts(&self) -> BTreeMap<WireRef, WireRef> {
         let aliases = &self.aliases;
         let mut facts = BTreeMap::new();
@@ -159,7 +206,18 @@ impl<'a> GpuScopeLowering<'a> {
                     groups.iter().filter_map(|group| group.first().copied()).collect(),
                 )
             })
+            .chain(self.aliases.tensor_row_sum_groups.iter().map(|(leader, outputs)| {
+                (
+                    WireRef { node: *leader, port: Port(0) },
+                    outputs.iter().map(|node| WireRef { node: *node, port: Port(0) }).collect(),
+                )
+            }))
             .collect()
+    }
+
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn is_fused_follower(&self, node: NodeId) -> bool {
+        self.aliases.tensor_row_sum_leaders.get(&node).is_some_and(|leader| *leader != node)
     }
 
     #[cfg(any(feature = "gpu", test))]
@@ -349,6 +407,48 @@ mod tests {
     };
     use mxx_dsl::{DslContext, Int, Mat, Ring, parallel};
     use mxx_ir_core::node::{ConcatAxis, IndexRange};
+
+    #[test]
+    fn test_gpu_preimage_public_provenance_rejects_another_trapdoor() {
+        let ring = Ring::new(97u64, 8usize);
+        let first = ring.sample_trapdoor(1, 1, 2, 7, 1000);
+        let second = ring.sample_trapdoor(1, 1, 2, 7, 1000);
+        let graph = DslContext::new("preimage-public-provenance")
+            .output("first-public", first.public_matrix())
+            .unwrap()
+            .transferred_trapdoor_output("first-secret", first)
+            .unwrap()
+            .output("second-public", second.public_matrix())
+            .unwrap()
+            .transferred_trapdoor_output("second-secret", second)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default())
+            .unwrap();
+        let lowering = GpuScopeLowering::new(&graph, &FrozenGraphScopeId::Root).unwrap();
+        let nodes = lowering
+            .scope
+            .nodes()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, node)| {
+                matches!(node.kind(), NodeKind::TrapdoorSample { .. })
+                    .then_some(NodeId(index as u64))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(nodes.len(), 2);
+        let public = WireRef { node: nodes[0], port: Port(0) };
+        assert!(
+            lowering
+                .is_trapdoor_public_projection(public, WireRef { node: nodes[0], port: Port(1) })
+        );
+        assert!(
+            !lowering
+                .is_trapdoor_public_projection(public, WireRef { node: nodes[1], port: Port(1) })
+        );
+        assert!(!lowering.is_trapdoor_public_projection(public, public));
+    }
 
     #[test]
     fn test_gpu_scope_lowering_cache_builds_once_per_scope() {

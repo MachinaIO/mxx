@@ -131,6 +131,19 @@ impl DCRTPoly {
         .map_err(|error| error.to_string())
     }
 
+    /// Divide centered coefficients by a fixed positive arbitrary-precision
+    /// divisor, rounding ties toward positive infinity, while preserving the
+    /// polynomial's evaluation/coefficient format.
+    pub(crate) fn centered_round_divide(&self, divisor: &BigUint) -> Result<Self, String> {
+        let words = divisor.to_u64_digits();
+        if words.is_empty() {
+            return Err("CenteredRoundDivide divisor must be positive".into());
+        }
+        super::native::ffi::exact_basis_centered_round_divide(&self.ptr_poly, words.as_slice())
+            .map(Self::new)
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn rns_convert(
         &self,
         params: &DCRTPolyParams,

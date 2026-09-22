@@ -5,13 +5,45 @@ use mxx_gadgets::circuit::{
     BooleanCircuitShape,
 };
 use mxx_ir_core::{artifact::ProductionId, encoding::spec_hash};
-use mxx_runtime::{Backend, RuntimeValue, SessionStore, authority::ExecutionAuthority};
+use mxx_runtime::{
+    Backend, RuntimeValue, SessionStore, authority::ExecutionAuthority, executor::ExecutionResult,
+};
+#[cfg(feature = "gpu")]
+use mxx_runtime::{GpuExecutionResult, backend::poly_gpu::GpuDcrtBackend};
 use rand::random;
 use std::{collections::BTreeMap, time::Instant};
 use thiserror::Error;
 use tracing::{debug, info};
 
 use super::graph::{DECODED_OUTPUT, HASH_KEY_INPUT, MESSAGE_INPUT};
+
+/// The execution authority deliberately chooses its concrete result type (CPU
+/// execution and compiled GPU execution have different ownership metadata).
+/// Diamond only needs the boolean value produced by its decryption graph, so
+/// keep that result contract local to the protocol caller instead of exposing
+/// executor-specific fields through `ExecutionAuthority`.
+pub trait DiamondBooleanOutput<B: Backend> {
+    fn boolean_output(&self, name: &str) -> Option<bool>;
+}
+
+impl<B: Backend> DiamondBooleanOutput<B> for ExecutionResult<B> {
+    fn boolean_output(&self, name: &str) -> Option<bool> {
+        match self.outputs.get(name) {
+            Some(RuntimeValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl DiamondBooleanOutput<GpuDcrtBackend> for GpuExecutionResult {
+    fn boolean_output(&self, name: &str) -> Option<bool> {
+        match self.outputs.get(name) {
+            Some(RuntimeValue::Bool(value)) => Some(*value),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DiamondWeCiphertext {
@@ -21,7 +53,8 @@ pub struct DiamondWeCiphertext {
 
 pub struct DiamondWeRuntime<E, S>
 where
-    E: ExecutionAuthority,
+    S: SessionStore,
+    E: ExecutionAuthority<S>,
 {
     pub compiler: DiamondWeCompiler,
     pub execution: E,
@@ -56,9 +89,10 @@ pub enum DiamondRuntimeError {
 
 impl<E, S> DiamondWeRuntime<E, S>
 where
-    E: ExecutionAuthority,
     S: SessionStore,
+    E: ExecutionAuthority<S>,
     E::Backend: Backend,
+    E::Result: DiamondBooleanOutput<E::Backend>,
 {
     pub fn new(
         compiler: DiamondWeCompiler,
@@ -123,10 +157,10 @@ where
         );
         let execution_started = Instant::now();
         info!("starting Diamond encryption graph execution");
-        let prepared =
+        let mut prepared =
             self.execution.prepare(validated, &inputs).map_err(DiamondRuntimeError::Execution)?;
         self.execution
-            .run(prepared, inputs, &mut self.store, hash_key)
+            .run(&mut prepared, inputs, &mut self.store, hash_key)
             .map_err(DiamondRuntimeError::Execution)?;
         info!(
             execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
@@ -212,21 +246,20 @@ where
         );
         let execution_started = Instant::now();
         info!("starting Diamond decryption graph execution");
-        let prepared =
+        let mut prepared =
             self.execution.prepare(validated, &inputs).map_err(DiamondRuntimeError::Execution)?;
         let result = self
             .execution
-            .run(prepared, inputs, &mut self.store, [0; 32])
+            .run(&mut prepared, inputs, &mut self.store, [0; 32])
             .map_err(DiamondRuntimeError::Execution)?;
-        let Some(RuntimeValue::Bool(decoded)) = result.outputs.get(DECODED_OUTPUT) else {
-            return Err(DiamondRuntimeError::DecodeOutput);
-        };
+        let decoded =
+            result.boolean_output(DECODED_OUTPUT).ok_or(DiamondRuntimeError::DecodeOutput)?;
         info!(
             execution_elapsed_seconds = execution_started.elapsed().as_secs_f64(),
             total_elapsed_seconds = total_started.elapsed().as_secs_f64(),
             "finished Diamond decryption graph execution"
         );
-        Ok(*decoded)
+        Ok(decoded)
     }
 
     fn validate_public_inputs(
@@ -289,9 +322,10 @@ fn insert_boolean_family_input<B: Backend>(
 
 impl<E, S> WitnessEncryptionRuntime for DiamondWeRuntime<E, S>
 where
-    E: ExecutionAuthority,
     S: SessionStore,
+    E: ExecutionAuthority<S>,
     E::Backend: Backend,
+    E::Result: DiamondBooleanOutput<E::Backend>,
 {
     type Ciphertext = DiamondWeCiphertext;
     type Message = bool;

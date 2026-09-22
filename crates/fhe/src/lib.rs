@@ -12,7 +12,7 @@ mod params;
 mod ring_gsw;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
-mod utils;
+pub mod utils;
 
 pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};
 use mxx_dsl::{DslError, GraphValue, Mat};

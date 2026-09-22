@@ -746,6 +746,14 @@ fn validate_node(
                 }
             }
         }
+        NodeKind::CenteredRoundDivide { divisor } => {
+            require_arity(scope, node, 1)?;
+            let divisor = divisor.evaluate(env)?;
+            if divisor <= BigInt::zero() {
+                return node_error(scope, node.id, "centered round divisor must be positive");
+            }
+            vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
+        }
         NodeKind::BlockModSwitch { modulus, source_moduli, plaintext_modulus } => {
             require_arity(scope, node, 1)?;
             let input = matrix_argument(scope, values, node, 0)?;
@@ -2827,6 +2835,22 @@ mod tests {
                 vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
             );
             assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn centered_round_divide_requires_positive_divisor_and_preserves_shape() {
+        for (divisor, valid) in [(3, true), (1, true), (0, false), (-2, false)] {
+            let source = input("source", matrix_type(257, 2, 3));
+            let divided = value(
+                NodeKind::CenteredRoundDivide { divisor: IntExpr::constant(divisor) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(257, 2, 3))],
+            );
+            assert_eq!(
+                validate(&graph("centered-round-divide", divided), &ParamEnv::default()).is_ok(),
+                valid
+            );
         }
     }
 

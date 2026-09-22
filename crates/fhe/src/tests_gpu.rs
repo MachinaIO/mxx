@@ -1,23 +1,54 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
 use crate::{
     BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme, RingGswParams,
-    utils::common,
+    utils::{common, gpu::configure_widths},
 };
 use mxx_dsl::{DslContext, Ring};
 use mxx_ir_core::{ParamEnv, artifact::ArtifactAvailability};
 use mxx_primitives::poly::{PolyParams, dcrt::gpu::GpuDCRTPolyParams};
 use mxx_runtime::{
-    ExecutionConfig, ExecutionResult, MemoryArtifactStore, RuntimeValue,
+    Backend, GpuExecutionResult, GpuRuntime, MemoryArtifactStore, RuntimeValue,
     backend::poly_gpu::{GpuDcrtBackend, gpu_backend},
-    gpu_measurement::{GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare},
 };
 use num_bigint::{BigInt, BigUint};
 use num_integer::Integer;
 use std::collections::BTreeMap;
 
-#[path = "gpu_test_utils.rs"]
-mod gpu_test_utils;
-use gpu_test_utils::configure_widths;
+#[test]
+fn test_gpu_integer_family_permutation_across_waves() {
+    let width = std::env::var("MXX_GPU_MAX_PARALLEL_INSTANCES")
+        .ok()
+        .map(|value| value.parse::<usize>().unwrap())
+        .unwrap_or(64);
+    let count = width * 2;
+    let context = DslContext::new("integer-permutation-waves");
+    let input_family = context.int_family_input("values", count);
+    let indices =
+        mxx_dsl::Family::pack((0..count).rev().map(mxx_dsl::Int::constant).collect()).unwrap();
+    let result = mxx_dsl::parallel(count, |i| Ok(input_family.at(indices.at(i)))).unwrap();
+    let common = common();
+    let ring =
+        Ring::new(common.ring.modulus().as_ref().clone(), common.ring.ring_dimension() as usize);
+    let graph = context
+        .output("result", result)
+        .unwrap()
+        .output("anchor", ring.zero((1, 1)))
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    let mut runtime = GpuRuntime::new(backend(&common, None)).unwrap();
+    let input_values = (0..count).map(|i| i as i64).collect::<Vec<_>>();
+    let inputs = BTreeMap::from([("values".into(), input(&input_values))]);
+    let mut plan = runtime.plan(graph, &inputs).unwrap();
+    let mut store = MemoryArtifactStore::default();
+    let result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+    assert_eq!(
+        crate::utils::gpu::integers(runtime.backend_mut(), &result.outputs, "result"),
+        input_values.iter().rev().map(|value| BigInt::from(*value)).collect::<Vec<_>>()
+    );
+}
 
 fn gpu_parameters(common: &FheCommonParams, bgv: Option<&BgvParams>) -> Vec<GpuDCRTPolyParams> {
     let rings = if let Some(bgv) = bgv {
@@ -42,23 +73,18 @@ fn backend(common: &FheCommonParams, bgv: Option<&BgvParams>) -> GpuDcrtBackend 
 
 fn prepare_and_run(
     graph: mxx_ir_core::ValidatedGraph,
-    backend: &mut GpuDcrtBackend,
+    runtime: &mut GpuRuntime,
     inputs: BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
     store: &mut MemoryArtifactStore,
-    parameters: &[GpuDCRTPolyParams],
-) -> ExecutionResult<GpuDcrtBackend> {
-    let prepared = prepare(GpuPreparationRequest {
-        validated: graph,
-        backend,
-        inputs: &inputs,
-        parameters,
-        default_tile_widths: vec![1, 2, 4, 8],
-        implementation_variant: "fhe-gpu-test".to_owned(),
-        measurement_config: GpuWarmupMeasurementConfig::default(),
-        execution_config: ExecutionConfig::default(),
-    })
-    .expect("prepare FHE GPU graph");
-    prepared.run(backend, inputs, store, [0; 32]).expect("execute FHE GPU graph")
+) -> GpuExecutionResult {
+    let mut plan = runtime.plan(graph, &inputs).expect("prepare FHE GPU graph");
+    let launches_before = plan.compiled_launch_count();
+    let result = runtime.execute(&mut plan, inputs, store, [0; 32]).expect("execute FHE GPU graph");
+    assert!(
+        plan.compiled_launch_count() > launches_before,
+        "FHE GPU execution must submit the compiled production path"
+    );
+    result
 }
 
 fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
@@ -68,23 +94,70 @@ fn input(values: &[i64]) -> RuntimeValue<GpuDcrtBackend> {
 }
 
 fn values(
-    result: &mut ExecutionResult<GpuDcrtBackend>,
+    result: &mut GpuExecutionResult,
     name: &str,
-    backend: &GpuDcrtBackend,
+    backend: &mut GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
 ) -> Vec<BigInt> {
-    let RuntimeValue::IndexedFamily(values) =
-        result.materialize_output(name, backend, store).unwrap()
-    else {
-        panic!("integer family")
-    };
-    values
-        .iter()
-        .map(|v| {
-            let RuntimeValue::Int(v) = v else { panic!("integer") };
-            v.clone()
-        })
-        .collect()
+    let output = result.materialize_output(name, backend, store).unwrap();
+    let RuntimeValue::IntegerValues(values) = output else { panic!("integer family") };
+    backend.integer_values_to_host(values).expect("download resident integer result")
+}
+
+#[test]
+fn test_gpu_compiled_matrix_product_rebinds_sources() {
+    let common = common();
+    let n = common.ring.ring_dimension() as usize;
+    let mut runtime = GpuRuntime::new(backend(&common, None)).unwrap();
+    let context = DslContext::new("compiled-product-rebinding");
+    let input_values = context.int_family_input("values", n);
+    let matrix = common.ring().from_coefficients(&input_values);
+    let wide = mxx_dsl::Mat::concat(
+        mxx_ir_core::node::ConcatAxis::Columns,
+        vec![matrix.clone(), matrix.clone(), matrix.clone()],
+    );
+    let partial =
+        wide.slice(None, Some(mxx_ir_core::node::IndexRange { start: 1.into(), end: 2.into() }));
+    let rounded = partial.clone().centered_round_divide(1);
+    let product = matrix.clone() * rounded.clone();
+    let graph = context
+        .output("source", matrix.coefficients())
+        .unwrap()
+        .output("partial", partial.coefficients())
+        .unwrap()
+        .output("rounded", rounded.coefficients())
+        .unwrap()
+        .output("product", product.coefficients())
+        .unwrap()
+        .build()
+        .unwrap()
+        .validate(&ParamEnv::default())
+        .unwrap();
+    configure_widths(runtime.backend_mut(), &graph);
+    let mut coefficients = vec![0; n];
+    coefficients[0] = 1;
+    let initial = BTreeMap::from([("values".into(), input(&coefficients))]);
+    let mut store = MemoryArtifactStore::default();
+    let mut plan = runtime.plan(graph, &initial).unwrap();
+    for coefficient in [1i64, 3, -2] {
+        coefficients[0] = coefficient;
+        let inputs = BTreeMap::from([("values".into(), input(&coefficients))]);
+        let launches = plan.compiled_launch_count();
+        let mut result = runtime.execute(&mut plan, inputs, &mut store, [0; 32]).unwrap();
+        assert!(plan.compiled_launch_count() > launches);
+        let modulus = BigInt::from(common.ring.modulus().as_ref().clone());
+        let mut expected = vec![BigInt::from(0); n];
+        expected[0] = BigInt::from(coefficient).mod_floor(&modulus);
+        for name in ["source", "partial", "rounded"] {
+            assert_eq!(
+                values(&mut result, name, runtime.backend_mut(), &mut store),
+                expected,
+                "{name}"
+            );
+        }
+        expected[0] = BigInt::from(coefficient * coefficient);
+        assert_eq!(values(&mut result, "product", runtime.backend_mut(), &mut store), expected);
+    }
 }
 
 #[test]
@@ -118,18 +191,18 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     let mut backend = backend(&common, None);
     let mut store = MemoryArtifactStore::default();
     configure_widths(&mut backend, &graph);
+    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
     let mut result = prepare_and_run(
         graph,
-        &mut backend,
+        &mut runtime,
         BTreeMap::from([
             ("message".into(), input(&message)),
             ("multiplier".into(), input(&multiplier)),
         ]),
         &mut store,
-        &gpu_parameters(&common, None),
     );
     assert_eq!(
-        values(&mut result, "roundtrip", &backend, &mut store),
+        values(&mut result, "roundtrip", runtime.backend_mut(), &mut store),
         message
             .iter()
             .map(|v| BigInt::from(*v)
@@ -137,7 +210,7 @@ fn test_gpu_fhe_ring_gsw_runtime() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        values(&mut result, "sum", &backend, &mut store),
+        values(&mut result, "sum", runtime.backend_mut(), &mut store),
         message
             .iter()
             .map(|v| BigInt::from(2 * v)
@@ -150,14 +223,13 @@ fn test_gpu_fhe_ring_gsw_runtime() {
     expected.rotate_right(1);
     expected[0] = -expected[0];
     assert_eq!(
-        values(&mut result, "product", &backend, &mut store),
+        values(&mut result, "product", runtime.backend_mut(), &mut store),
         expected
             .into_iter()
             .map(|v| BigInt::from(v)
                 .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
             .collect::<Vec<_>>()
     );
-    result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
@@ -201,12 +273,12 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
     let mut store = MemoryArtifactStore::default();
     let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
     configure_widths(&mut backend, &encryption);
+    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
     let encrypted = prepare_and_run(
         encryption,
-        &mut backend,
+        &mut runtime,
         BTreeMap::from([("slots".into(), input(&message))]),
         &mut store,
-        &gpu_parameters(&common, Some(&bgv)),
     );
     let encryption_id = encrypted.production_id.unwrap();
     let mut manifests =
@@ -271,14 +343,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
-    configure_widths(&mut backend, &evaluator);
-    let evaluated = prepare_and_run(
-        evaluator,
-        &mut backend,
-        BTreeMap::new(),
-        &mut store,
-        &gpu_parameters(&common, Some(&bgv)),
-    );
+    configure_widths(runtime.backend_mut(), &evaluator);
+    let evaluated = prepare_and_run(evaluator, &mut runtime, BTreeMap::new(), &mut store);
     let evaluation_id = evaluated.production_id.unwrap();
     manifests.insert(evaluation_id.clone(), store.manifest(&evaluation_id).unwrap().clone());
     let secret = common.ring().artifact_input(
@@ -311,14 +377,8 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
         .unwrap()
         .validate_with_manifests(&ParamEnv::default(), &manifests)
         .unwrap();
-    configure_widths(&mut backend, &decryption);
-    let mut result = prepare_and_run(
-        decryption,
-        &mut backend,
-        BTreeMap::new(),
-        &mut store,
-        &gpu_parameters(&common, Some(&bgv)),
-    );
+    configure_widths(runtime.backend_mut(), &decryption);
+    let mut result = prepare_and_run(decryption, &mut runtime, BTreeMap::new(), &mut store);
     for (name, _) in outputs {
         let expected = (0..n)
             .map(|i| {
@@ -334,9 +394,12 @@ fn test_gpu_fhe_bgv_simd_staged_runtime() {
                 BigInt::from(if name == "sum" { (2 * m) % t } else { (m * m) % t })
             })
             .collect::<Vec<_>>();
-        assert_eq!(values(&mut result, name, &backend, &mut store), expected, "{name}");
+        assert_eq!(
+            values(&mut result, name, runtime.backend_mut(), &mut store),
+            expected,
+            "{name}"
+        );
     }
-    result.cleanup_staged(&mut store).unwrap();
 }
 
 #[test]
@@ -370,31 +433,30 @@ fn test_gpu_fhe_bgv_short_slot_inputs() {
     let mut backend = backend(&common, Some(&bgv));
     configure_widths(&mut backend, &graph);
     let mut store = MemoryArtifactStore::default();
+    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
     let partial_values = (0..n - 1).map(|i| i as i64 - t as i64 - 1).collect::<Vec<_>>();
     let mut result = prepare_and_run(
         graph,
-        &mut backend,
+        &mut runtime,
         BTreeMap::from([
             ("single".into(), input(&[-1])),
             ("partial".into(), input(&partial_values)),
         ]),
         &mut store,
-        &gpu_parameters(&common, Some(&bgv)),
     );
     let mut expected = vec![BigInt::from(0); n];
     expected[0] = BigInt::from(t - 1);
-    assert_eq!(values(&mut result, "single", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "single", runtime.backend_mut(), &mut store), expected);
     // Positive rotation moves slot zero to the last position of its row,
     // which was outside the single-value input. Decryption must still return it.
     expected[..n / 2].rotate_left(1);
-    assert_eq!(values(&mut result, "rotated", &backend, &mut store), expected);
+    assert_eq!(values(&mut result, "rotated", runtime.backend_mut(), &mut store), expected);
     let mut expected = partial_values
         .into_iter()
         .map(|v| BigInt::from(v).mod_floor(&BigInt::from(t)))
         .collect::<Vec<_>>();
     expected.push(BigInt::from(0));
-    assert_eq!(values(&mut result, "partial", &backend, &mut store), expected);
-    result.cleanup_staged(&mut store).unwrap();
+    assert_eq!(values(&mut result, "partial", runtime.backend_mut(), &mut store), expected);
 }
 
 #[test]
@@ -454,13 +516,13 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     let mut backend = backend(&common, Some(&bgv));
     configure_widths(&mut backend, &graph);
     let mut store = MemoryArtifactStore::default();
+    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
     let message = (0..n).map(|i| (i as u64 % t) as i64).collect::<Vec<_>>();
     let mut result = prepare_and_run(
         graph,
-        &mut backend,
+        &mut runtime,
         BTreeMap::from([("slots".into(), input(&message))]),
         &mut store,
-        &gpu_parameters(&common, Some(&bgv)),
     );
     let expected = message
         .iter()
@@ -472,8 +534,13 @@ fn test_gpu_fhe_bgv_hybrid_multilimb_all_levels() {
     rotated[..n / 2].rotate_left(1);
     rotated[n / 2..].rotate_left(1);
     for level in 0..depth {
-        assert_eq!(values(&mut result, &format!("product{level}"), &backend, &mut store), expected);
-        assert_eq!(values(&mut result, &format!("rotated{level}"), &backend, &mut store), rotated);
+        assert_eq!(
+            values(&mut result, &format!("product{level}"), runtime.backend_mut(), &mut store),
+            expected
+        );
+        assert_eq!(
+            values(&mut result, &format!("rotated{level}"), runtime.backend_mut(), &mut store),
+            rotated
+        );
     }
-    result.cleanup_staged(&mut store).unwrap();
 }

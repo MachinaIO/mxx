@@ -2004,16 +2004,15 @@ mod tests {
         let execute_once = |parameters: &DCRTPolyParams| {
             let mut backend = cpu_backend([parameters.clone()]);
             let mut store = MemoryArtifactStore::default();
+            let mut execution_config = ExecutionConfig::default();
+            execution_config.max_parallel_instances = NonZeroUsize::new(2).unwrap();
             let mut result = execute(
                 &validated,
                 &mut backend,
                 BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x6d; 32]))]),
                 &mut store,
                 SamplingMode::Fresh,
-                ExecutionConfig {
-                    max_parallel_instances: NonZeroUsize::new(2).unwrap(),
-                    ..ExecutionConfig::default()
-                },
+                execution_config,
             )
             .unwrap();
             let low = {

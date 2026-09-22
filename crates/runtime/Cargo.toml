@@ -28,6 +28,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 mxx-dsl.workspace = true
-mxx-primitives = { workspace = true, features = ["test-gpu-sync"] }
 serial_test.workspace = true
 tempfile.workspace = true

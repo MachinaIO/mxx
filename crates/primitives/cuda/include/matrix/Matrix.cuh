@@ -44,6 +44,9 @@ struct GpuMatrix
         cudaStream_t stream;
         // This event is physically owned here and destroyed exactly once.
         cudaEvent_t write_done;
+        // Capture-only event node. Replay and host observation must use the
+        // ordinary write_done event allocated outside graph capture.
+        MxxGpuCaptureEvent *capture_write_done;
         // Local state index whose owned event currently dominates this limb.
         uint32_t completion_owner;
         // Producer ownership and last event-recording stream can differ.

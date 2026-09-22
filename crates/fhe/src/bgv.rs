@@ -423,7 +423,7 @@ impl BgvParams {
             ),
         })
     }
-    /// Drops trailing primes with centered single-limb RNS corrections.
+    /// Drops trailing primes with centered CRT corrections.
     pub fn mod_switch_to(
         &self,
         ct: &BgvCiphertext,
@@ -449,9 +449,7 @@ impl BgvParams {
                 (self.phase_from_noise(&output.noise_bound) + correction_bound + &prime - 1u8) /
                     &prime;
             let noise_bound = self.noise_from_phase(&phase_bound);
-            // For one dropped prime, RNS ModDown has P=p and cofactor 1:
-            // U=center_p(-C/t), C'=(C+t*U)/p. This is exactly the previous
-            // centered single-limb correction, batched over both components.
+            // RNS ModDown applies the centered correction to both components.
             // Keep level drops sequential: centering modulo a product instead
             // would choose a different correction and need a different bound.
             let components = output.components.rns_mod_down(
@@ -493,16 +491,12 @@ impl FheScheme for BgvParams {
     fn encrypt(&self, key: &Mat, slots: &Family<Int>) -> Result<BgvCiphertext, FheError> {
         utils::check_matrix(&self.common.ring, key, 2, 1)?;
         let coefficients = self.encode_slots(slots)?;
-        let centered = parallel(self.common.ring.ring_dimension(), |i| {
-            utils::centered(
-                coefficients.at(i).rem(Int::constant(self.plaintext_modulus)),
-                &BigUint::from(self.plaintext_modulus),
-            )
-        })?;
-        // Slot values are evaluations in R_t. Lift the encoded coefficients,
-        // not their evaluations, to R_Q: the two rings have different NTT roots.
-        // The primitive then stores the lifted polynomial in evaluation format.
-        let message = utils::pack(&self.common.ring, &centered)?;
+        // Slot values are coefficients in R_t. Reconstruct that polynomial first,
+        // then lift its centered coefficients to R_Q; the two rings have
+        // different NTT roots, so lifting the evaluations would be incorrect.
+        let message = Ring::new(self.plaintext_modulus, self.common.ring.ring_dimension())
+            .from_coefficients(&coefficients)
+            .centered_rebase(self.common.ring.modulus().as_ref().clone());
         let u = self.common.sample_secret();
         let t = utils::scalar(&self.common.ring, self.plaintext_modulus);
         // The phase noise is e_pk*u + e_b - s*e_a. Both secret polynomials
@@ -528,17 +522,14 @@ impl FheScheme for BgvParams {
         for index in 1..rows {
             phase = phase * &minus_s + row(&ct.components, index);
         }
-        let coefficients = utils::extract(&params, &phase)?;
         // The centered phase reduces to f*m modulo t. Undo the public factor
         // to recover m even after modulus switching has made f different from 1.
         let inverse = mod_inverse(ct.correction_factor, self.plaintext_modulus)
             .ok_or(FheError::InvalidCorrectionFactor)?;
-        let plaintext = parallel(params.ring_dimension(), |i| {
-            Ok(utils::centered(coefficients.at(i), params.modulus().as_ref())?
-                .mul(Int::constant(inverse))
-                .rem(Int::constant(self.plaintext_modulus)))
-        })?;
-        self.decode_slots(&plaintext)
+        let plaintext = phase.centered_rebase(self.plaintext_modulus) *
+            Ring::new(self.plaintext_modulus, params.ring_dimension())
+                .polynomial([IntExpr::constant(inverse)]);
+        self.decode_slots(&plaintext.coefficients())
     }
     fn add(&self, lhs: &BgvCiphertext, rhs: &BgvCiphertext) -> Result<BgvCiphertext, FheError> {
         let rows = self.ciphertext_rows(lhs)?;

@@ -223,17 +223,9 @@ impl PolyMatrix for DCRTPolyMatrix {
         if destination.ring_dimension() != self.params.ring_dimension() {
             return Err("centered rebase requires matching ring dimensions".into());
         }
-        let source_basis = self.params.to_crt().0;
         let destination_basis = destination.to_crt().0;
         if destination_basis.is_empty() {
             return Err("centered rebase requires a nonempty destination basis".into());
-        }
-        if source_basis.len() > 1 &&
-            source_basis.iter().any(|prime| !destination_basis.contains(prime))
-        {
-            return Err(
-                "multi-limb centered rebase destination must contain the source basis".into()
-            );
         }
         let polys = (0..self.nrow)
             .into_par_iter()
@@ -245,6 +237,22 @@ impl PolyMatrix for DCRTPolyMatrix {
             })
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Self::from_poly_vec(destination, polys))
+    }
+
+    fn centered_round_divide(&self, divisor: &BigUint) -> Result<Self, String> {
+        if divisor.is_zero() {
+            return Err("CenteredRoundDivide divisor must be positive".into());
+        }
+        let polys = (0..self.nrow)
+            .into_par_iter()
+            .map(|row| {
+                (0..self.ncol)
+                    .into_par_iter()
+                    .map(|column| self.entry(row, column).centered_round_divide(divisor))
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self::from_poly_vec(&self.params, polys))
     }
 
     fn block_mod_switch(
@@ -856,6 +864,7 @@ mod tests {
 
     use super::*;
     use num_bigint::BigUint;
+    use num_traits::Signed;
     use rand::{Rng, rng};
 
     #[test]
@@ -1030,6 +1039,76 @@ mod tests {
         for (index, value) in expected.iter().enumerate() {
             assert_eq!(output.entry(0, 0).coeffs()[index].value, *value);
         }
+    }
+
+    #[test]
+    fn test_centered_round_divide_multiword_signs_and_ties() {
+        let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let all = DCRTPolyParams::new(dimension, 6, bits, base_bits, None, None);
+        let primes = all.to_crt().0;
+        let source = DCRTPolyParams::new(
+            dimension,
+            4,
+            bits,
+            base_bits,
+            Some(vec![primes[0], primes[1], primes[2], primes[3]]),
+            None,
+        );
+        let destination =
+            DCRTPolyParams::new(dimension, 1, bits, base_bits, Some(vec![primes[2]]), None);
+        let destination_multi = DCRTPolyParams::new(
+            dimension,
+            2,
+            bits,
+            base_bits,
+            Some(vec![primes[4], primes[5]]),
+            None,
+        );
+        let q = source.modulus().as_ref().clone();
+        let divisor = (BigUint::from(1u8) << 60usize) + BigUint::from(3u8);
+        let values = vec![
+            BigUint::from(0u8),
+            BigUint::from(1u8),
+            (&q / 2u8) - 1u8,
+            (&q / 2u8) + 1u8,
+            &q - 1u8,
+        ];
+        let input = DCRTPolyMatrix::from_poly_vec(
+            &source,
+            vec![vec![DCRTPoly::from_biguints(&source, &values)]],
+        );
+        let expected = values
+            .iter()
+            .map(|value| {
+                let centered = if value * 2u8 > q {
+                    BigInt::from(value.clone()) - BigInt::from(q.clone())
+                } else {
+                    BigInt::from(value.clone())
+                };
+                let numerator = &centered * 2u8 + BigInt::from(divisor.clone());
+                let denominator = BigInt::from(divisor.clone()) * 2u8;
+                let quotient = numerator.clone() / denominator.clone();
+                let remainder = numerator % denominator;
+                let rounded = if remainder.is_negative() { quotient - 1u8 } else { quotient };
+                (((rounded % BigInt::from(q.clone())) + BigInt::from(q.clone())) %
+                    BigInt::from(q.clone()))
+                .to_biguint()
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let output = input.centered_round_divide(&divisor).unwrap();
+        let actual = output.entry(0, 0).coeffs();
+        assert_eq!(
+            actual[..expected.len()]
+                .iter()
+                .map(|coefficient| coefficient.value.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        let unrelated = input.centered_rebase(&destination).unwrap();
+        assert_eq!(unrelated.params(), &destination);
+        let unrelated_multi = input.centered_rebase(&destination_multi).unwrap();
+        assert_eq!(unrelated_multi.params(), &destination_multi);
     }
 
     #[test]

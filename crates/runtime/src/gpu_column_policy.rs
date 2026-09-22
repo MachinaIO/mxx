@@ -6,7 +6,7 @@
 
 use mxx_ir_core::{
     expr::IntExpr,
-    node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
+    node::{ConcatAxis, ConstantMatrix, LoopInputMode, MatrixBinaryOp, NodeKind},
     types::{ConcreteMatrixType, ConcreteWireType},
 };
 use num_traits::ToPrimitive;
@@ -20,6 +20,10 @@ pub enum ColumnCapability {
     GeneratedColumns,
     MappedColumns,
     SingleDevice,
+    /// A zero-copy projection of an existing native owner.  Alias operations
+    /// participate in the same frozen placement as their source but do not
+    /// launch a kernel or allocate a destination.
+    NativeAlias,
     HostOrControl,
     /// A future or otherwise unlisted operation. It must be rejected during
     /// planning instead of silently taking a host/GPU-0 fallback.
@@ -55,6 +59,7 @@ pub enum EffectiveGpuOperation {
     ModulusSwitch,
     ModulusReduce,
     CenteredRebase,
+    CenteredRoundDivide,
     BlockModSwitch,
     RnsModUp,
     RnsModDown,
@@ -104,6 +109,7 @@ impl EffectiveGpuOperation {
         Self::ModulusSwitch,
         Self::ModulusReduce,
         Self::CenteredRebase,
+        Self::CenteredRoundDivide,
         Self::BlockModSwitch,
         Self::RnsModUp,
         Self::RnsModDown,
@@ -132,12 +138,6 @@ impl EffectiveGpuOperation {
     /// requires updating both dispatch inventories.
     pub const fn transfer_kind(self) -> WarmupTransferKind {
         match self {
-            Self::ExtractCoefficient | Self::ThresholdDecode | Self::PolynomialValues => {
-                WarmupTransferKind::DeviceToHost
-            }
-            Self::PackPolynomialCoefficients | Self::PolynomialFromValues => {
-                WarmupTransferKind::HostToDevice
-            }
             Self::GeneratedConstant |
             Self::SingleDeviceConstant |
             Self::UniformResidueSample |
@@ -148,6 +148,11 @@ impl EffectiveGpuOperation {
             Self::GadgetTrapdoor |
             Self::LiftIntegerToConstantPolynomial |
             Self::TrapdoorPublic |
+            Self::ExtractCoefficient |
+            Self::ThresholdDecode |
+            Self::PackPolynomialCoefficients |
+            Self::PolynomialFromValues |
+            Self::PolynomialValues |
             Self::PreimageSample |
             Self::GadgetDecompose |
             Self::MatrixScale |
@@ -156,6 +161,7 @@ impl EffectiveGpuOperation {
             Self::ModulusSwitch |
             Self::ModulusReduce |
             Self::CenteredRebase |
+            Self::CenteredRoundDivide |
             Self::BlockModSwitch |
             Self::RnsModUp |
             Self::RnsModDown |
@@ -218,6 +224,7 @@ pub enum CanonicalWarmupProfileDomain {
     ModulusSwitch,
     ModulusReduce,
     CenteredRebase,
+    CenteredRoundDivide,
     BlockModSwitch,
     RnsModUp,
     RnsModDown,
@@ -354,6 +361,7 @@ impl CanonicalWarmupProfileDomain {
         Self::ModulusSwitch,
         Self::ModulusReduce,
         Self::CenteredRebase,
+        Self::CenteredRoundDivide,
         Self::BlockModSwitch,
         Self::RnsModUp,
         Self::RnsModDown,
@@ -444,6 +452,7 @@ impl CanonicalWarmupProfileDomain {
             Self::ModulusSwitch => "modulus_switch",
             Self::ModulusReduce => "modulus_reduce",
             Self::CenteredRebase => "centered_rebase",
+            Self::CenteredRoundDivide => "centered_round_divide",
             Self::BlockModSwitch => "block_mod_switch",
             Self::RnsModUp => "rns_mod_up",
             Self::RnsModDown => "rns_mod_down",
@@ -481,34 +490,41 @@ impl CanonicalWarmupProfileDomain {
     pub const fn measurement_kind(self) -> WarmupMeasurementKind {
         match self {
             Self::Input |
+            Self::TrapdoorPublic |
+            Self::ConstantReal |
+            Self::IntToReal |
+            Self::RealBinary |
+            Self::RealSqrt => WarmupMeasurementKind::HostMeasured,
             Self::ConstantInt |
             Self::EvaluateInt |
-            Self::ConstantReal |
             Self::ConstantBool |
             Self::IntBinary |
             Self::IntCompare |
             Self::BitExtract |
-            Self::IntToReal |
             Self::BoolToInt |
-            Self::RealBinary |
-            Self::RealSqrt |
-            Self::TrapdoorPublic |
-            // These backend boundaries produce host values (or consume host
-            // scalar/family values) and have no production GPU kernel.  Their
-            // elapsed time is measured through the real host dispatch; any
-            // device/host copy is identified separately by `transfer_kind`.
-            Self::ExtractCoefficient |
-            Self::ThresholdDecode |
-            Self::PackPolynomialCoefficients |
-            Self::PolynomialFromValues |
-            Self::PolynomialValues |
             Self::SubgraphCall |
             Self::ParallelLoop |
             Self::SequentialLoop |
             Self::FamilyPack |
             Self::FamilyGetStatic |
             Self::FamilyGetDynamic |
-            Self::Select => WarmupMeasurementKind::HostMeasured,
+            Self::Select |
+            Self::MatrixNegate |
+            Self::MatrixScale |
+            Self::RingAutomorphism |
+            Self::ModulusSwitch |
+            Self::ModulusReduce |
+            Self::CenteredRebase |
+            Self::CenteredRoundDivide |
+            Self::BlockModSwitch |
+            Self::RnsModUp |
+            Self::RnsModDown |
+            Self::Transpose |
+            Self::Slice |
+            Self::Tensor |
+            Self::ConcatRows |
+            Self::ConcatColumns |
+            Self::ConcatDiagonal |
             Self::ConstantMatrixZero |
             Self::ConstantMatrixIdentity |
             Self::ConstantMatrixUnitRow |
@@ -523,21 +539,6 @@ impl CanonicalWarmupProfileDomain {
             Self::MatrixMultiply |
             Self::MatrixMulAccumulate |
             Self::MatrixMulSmallRhs |
-            Self::MatrixNegate |
-            Self::MatrixScale |
-            Self::RingAutomorphism |
-            Self::ModulusSwitch |
-            Self::ModulusReduce |
-            Self::CenteredRebase |
-            Self::BlockModSwitch |
-            Self::RnsModUp |
-            Self::RnsModDown |
-            Self::Transpose |
-            Self::Slice |
-            Self::Tensor |
-            Self::ConcatRows |
-            Self::ConcatColumns |
-            Self::ConcatDiagonal |
             Self::UniformResidueSample |
             Self::UniformIntervalSample |
             Self::GaussianSample |
@@ -546,6 +547,11 @@ impl CanonicalWarmupProfileDomain {
             Self::PreimageSample |
             Self::GadgetDecompose |
             Self::LiftIntegerToConstantPolynomial |
+            Self::ExtractCoefficient |
+            Self::ThresholdDecode |
+            Self::PackPolynomialCoefficients |
+            Self::PolynomialFromValues |
+            Self::PolynomialValues |
             Self::CrtRecompose |
             Self::FusedRowSum |
             Self::FusedTensorRowSum |
@@ -563,12 +569,6 @@ impl CanonicalWarmupProfileDomain {
     /// may account for the physical copy as a distinct transport stage.
     pub const fn transfer_kind(self) -> WarmupTransferKind {
         match self {
-            Self::ExtractCoefficient | Self::ThresholdDecode | Self::PolynomialValues => {
-                WarmupTransferKind::DeviceToHost
-            }
-            Self::PackPolynomialCoefficients | Self::PolynomialFromValues => {
-                WarmupTransferKind::HostToDevice
-            }
             Self::Input |
             Self::ConstantInt |
             Self::EvaluateInt |
@@ -602,6 +602,7 @@ impl CanonicalWarmupProfileDomain {
             Self::ModulusSwitch |
             Self::ModulusReduce |
             Self::CenteredRebase |
+            Self::CenteredRoundDivide |
             Self::BlockModSwitch |
             Self::RnsModUp |
             Self::RnsModDown |
@@ -619,6 +620,11 @@ impl CanonicalWarmupProfileDomain {
             Self::PreimageSample |
             Self::GadgetDecompose |
             Self::LiftIntegerToConstantPolynomial |
+            Self::ExtractCoefficient |
+            Self::ThresholdDecode |
+            Self::PackPolynomialCoefficients |
+            Self::PolynomialFromValues |
+            Self::PolynomialValues |
             Self::CrtRecompose |
             Self::SubgraphCall |
             Self::ParallelLoop |
@@ -703,6 +709,7 @@ pub fn canonical_warmup_profile_domain(kind: &NodeKind) -> CanonicalWarmupProfil
         NodeKind::ModulusSwitch { .. } => CanonicalWarmupProfileDomain::ModulusSwitch,
         NodeKind::ModulusReduce { .. } => CanonicalWarmupProfileDomain::ModulusReduce,
         NodeKind::CenteredRebase { .. } => CanonicalWarmupProfileDomain::CenteredRebase,
+        NodeKind::CenteredRoundDivide { .. } => CanonicalWarmupProfileDomain::CenteredRoundDivide,
         NodeKind::BlockModSwitch { .. } => CanonicalWarmupProfileDomain::BlockModSwitch,
         NodeKind::RnsModUp { .. } => CanonicalWarmupProfileDomain::RnsModUp,
         NodeKind::RnsModDown { .. } => CanonicalWarmupProfileDomain::RnsModDown,
@@ -1335,6 +1342,7 @@ pub fn gpu_execution_range(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::CenteredRoundDivide { .. } |
         NodeKind::BlockModSwitch { .. } |
         NodeKind::RnsModUp { .. } |
         NodeKind::RnsModDown { .. } |
@@ -1535,89 +1543,221 @@ fn inferred_output_columns(kind: &NodeKind, arguments: &[ConcreteWireType]) -> u
     }
 }
 
-/// Classify a node against the explicit GPU-operation allowlist. Unknown node
-/// kinds intentionally remain `Unsupported` even if they are harmless on CPU.
-pub fn effective_gpu_operation(kind: &NodeKind) -> EffectiveGpuOperation {
+/// Closed execution disposition shared by policy and capture lowering.
+/// Every DSL node must choose one concrete execution family here.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuNodeDisposition {
+    Input,
+    Resident,
+    TypedReal,
+    NativeAlias,
+    Native(EffectiveGpuOperation),
+}
+
+pub fn gpu_node_disposition(kind: &NodeKind) -> GpuNodeDisposition {
     match kind {
         NodeKind::ConstantMatrix { value, .. } => match value {
             ConstantMatrix::Zero |
             ConstantMatrix::Identity |
             ConstantMatrix::UnitRow { .. } |
             ConstantMatrix::UnitColumn { .. } |
-            ConstantMatrix::Gadget { .. } => EffectiveGpuOperation::GeneratedConstant,
+            ConstantMatrix::Gadget { .. } => {
+                GpuNodeDisposition::Native(EffectiveGpuOperation::GeneratedConstant)
+            }
             ConstantMatrix::PowerOfBase { .. } |
             ConstantMatrix::Rotation { .. } |
-            ConstantMatrix::Polynomial { .. } => EffectiveGpuOperation::SingleDeviceConstant,
+            ConstantMatrix::Polynomial { .. } => {
+                GpuNodeDisposition::Native(EffectiveGpuOperation::SingleDeviceConstant)
+            }
         },
-        NodeKind::UniformResidueSample { .. } => EffectiveGpuOperation::UniformResidueSample,
-        NodeKind::UniformIntervalSample { .. } => EffectiveGpuOperation::UniformIntervalSample,
-        NodeKind::GaussianSample { .. } => EffectiveGpuOperation::GaussianSample,
-        NodeKind::HashSample { .. } => EffectiveGpuOperation::HashSample,
-        NodeKind::TrapdoorSample { .. } => EffectiveGpuOperation::TrapdoorSample,
-        NodeKind::GadgetTrapdoor { .. } => EffectiveGpuOperation::GadgetTrapdoor,
-        NodeKind::LiftIntegerToConstantPolynomial { .. } => {
-            EffectiveGpuOperation::LiftIntegerToConstantPolynomial
+        NodeKind::UniformResidueSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::UniformResidueSample)
         }
-        NodeKind::TrapdoorPublic => EffectiveGpuOperation::TrapdoorPublic,
-        NodeKind::PreimageSample { .. } => EffectiveGpuOperation::PreimageSample,
-        NodeKind::GadgetDecompose { .. } => EffectiveGpuOperation::GadgetDecompose,
-        NodeKind::MatrixScale { .. } => EffectiveGpuOperation::MatrixScale,
-        NodeKind::MatrixNegate => EffectiveGpuOperation::MatrixNegate,
-        NodeKind::RingAutomorphism { .. } => EffectiveGpuOperation::RingAutomorphism,
-        NodeKind::ModulusSwitch { .. } => EffectiveGpuOperation::ModulusSwitch,
-        NodeKind::ModulusReduce { .. } => EffectiveGpuOperation::ModulusReduce,
-        NodeKind::CenteredRebase { .. } => EffectiveGpuOperation::CenteredRebase,
-        NodeKind::BlockModSwitch { .. } => EffectiveGpuOperation::BlockModSwitch,
-        NodeKind::RnsModUp { .. } => EffectiveGpuOperation::RnsModUp,
-        NodeKind::RnsModDown { .. } => EffectiveGpuOperation::RnsModDown,
-        NodeKind::CrtRecompose { .. } => EffectiveGpuOperation::CrtRecompose,
-        NodeKind::MatrixBinary(MatrixBinaryOp::Add) => EffectiveGpuOperation::MatrixAdd,
-        NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => EffectiveGpuOperation::MatrixSubtract,
-        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => EffectiveGpuOperation::MatrixMultiply,
-        NodeKind::MatrixMulAccumulate { .. } => EffectiveGpuOperation::MatrixMulAccumulate,
-        NodeKind::MatrixMulSmallRhs => EffectiveGpuOperation::MatrixMulSmallRhs,
-        NodeKind::Transpose => EffectiveGpuOperation::Transpose,
-        NodeKind::Slice { .. } => EffectiveGpuOperation::Slice,
-        NodeKind::Tensor => EffectiveGpuOperation::Tensor,
-        NodeKind::Concat { axis: ConcatAxis::Rows } => EffectiveGpuOperation::ConcatRows,
-        NodeKind::Concat { axis: ConcatAxis::Columns } => EffectiveGpuOperation::ConcatColumns,
-        NodeKind::Concat { axis: ConcatAxis::Diagonal } => EffectiveGpuOperation::ConcatDiagonal,
-        NodeKind::Input { .. } |
+        NodeKind::UniformIntervalSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::UniformIntervalSample)
+        }
+        NodeKind::GaussianSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::GaussianSample)
+        }
+        NodeKind::HashSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::HashSample)
+        }
+        NodeKind::TrapdoorSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::TrapdoorSample)
+        }
+        NodeKind::GadgetTrapdoor { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::GadgetTrapdoor)
+        }
+        NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::LiftIntegerToConstantPolynomial)
+        }
+        NodeKind::TrapdoorPublic => GpuNodeDisposition::NativeAlias,
+        NodeKind::PreimageSample { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::PreimageSample)
+        }
+        NodeKind::GadgetDecompose { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::GadgetDecompose)
+        }
+        NodeKind::MatrixScale { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixScale)
+        }
+        NodeKind::MatrixNegate => GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixNegate),
+        NodeKind::RingAutomorphism { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::RingAutomorphism)
+        }
+        NodeKind::ModulusSwitch { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ModulusSwitch)
+        }
+        NodeKind::ModulusReduce { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ModulusReduce)
+        }
+        NodeKind::CenteredRebase { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::CenteredRebase)
+        }
+        NodeKind::CenteredRoundDivide { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::CenteredRoundDivide)
+        }
+        NodeKind::BlockModSwitch { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::BlockModSwitch)
+        }
+        NodeKind::RnsModUp { .. } => GpuNodeDisposition::Native(EffectiveGpuOperation::RnsModUp),
+        NodeKind::RnsModDown { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::RnsModDown)
+        }
+        NodeKind::CrtRecompose { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::CrtRecompose)
+        }
+        NodeKind::MatrixBinary(MatrixBinaryOp::Add) => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixAdd)
+        }
+        NodeKind::MatrixBinary(MatrixBinaryOp::Subtract) => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixSubtract)
+        }
+        NodeKind::MatrixBinary(MatrixBinaryOp::Multiply) => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixMultiply)
+        }
+        NodeKind::MatrixMulAccumulate { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixMulAccumulate)
+        }
+        NodeKind::MatrixMulSmallRhs => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::MatrixMulSmallRhs)
+        }
+        NodeKind::Transpose => GpuNodeDisposition::Native(EffectiveGpuOperation::Transpose),
+        NodeKind::Slice { .. } => GpuNodeDisposition::Native(EffectiveGpuOperation::Slice),
+        NodeKind::Tensor => GpuNodeDisposition::Native(EffectiveGpuOperation::Tensor),
+        NodeKind::Concat { axis: ConcatAxis::Rows } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ConcatRows)
+        }
+        NodeKind::Concat { axis: ConcatAxis::Columns } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ConcatColumns)
+        }
+        NodeKind::Concat { axis: ConcatAxis::Diagonal } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ConcatDiagonal)
+        }
+        NodeKind::Input { .. } => GpuNodeDisposition::Input,
+        NodeKind::ConstantReal(_) |
+        NodeKind::IntToReal |
+        NodeKind::RealBinary(_) |
+        NodeKind::RealSqrt => GpuNodeDisposition::TypedReal,
         NodeKind::ConstantInt(_) |
         NodeKind::EvaluateInt(_) |
-        NodeKind::ConstantReal(_) |
         NodeKind::ConstantBool(_) |
         NodeKind::IntBinary(_) |
         NodeKind::IntCompare(_) |
         NodeKind::BitExtract { .. } |
-        NodeKind::IntToReal |
         NodeKind::BoolToInt |
-        NodeKind::RealBinary(_) |
-        NodeKind::RealSqrt |
         NodeKind::SubgraphCall(_) |
         NodeKind::ParallelLoop(_) |
         NodeKind::SequentialLoop(_) |
         NodeKind::FamilyPack { .. } |
         NodeKind::FamilyGetStatic { .. } |
         NodeKind::FamilyGetDynamic |
-        NodeKind::Select { .. } => EffectiveGpuOperation::HostOrControl,
-        NodeKind::ExtractCoefficient { .. } => EffectiveGpuOperation::ExtractCoefficient,
-        NodeKind::ThresholdDecode { .. } => EffectiveGpuOperation::ThresholdDecode,
-        NodeKind::PackPolynomialCoefficients { .. } => {
-            EffectiveGpuOperation::PackPolynomialCoefficients
+        NodeKind::Select { .. } => GpuNodeDisposition::Resident,
+        NodeKind::ExtractCoefficient { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ExtractCoefficient)
         }
-        NodeKind::PolynomialFromValues { .. } => EffectiveGpuOperation::PolynomialFromValues,
-        NodeKind::PolynomialValues { .. } => EffectiveGpuOperation::PolynomialValues,
+        NodeKind::ThresholdDecode { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::ThresholdDecode)
+        }
+        NodeKind::PackPolynomialCoefficients { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::PackPolynomialCoefficients)
+        }
+        NodeKind::PolynomialFromValues { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::PolynomialFromValues)
+        }
+        NodeKind::PolynomialValues { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::PolynomialValues)
+        }
     }
+}
+
+/// Refine the kind-only disposition with the validated wire shapes.  Matrix
+/// families stay in the resident control path: their owners are retained by
+/// the frame and dynamic selection is performed by the device gather.  Static
+/// matrix selection remains a native alias because its index is frozen.
+pub fn gpu_node_disposition_for_types(
+    kind: &NodeKind,
+    arguments: &[ConcreteWireType],
+    outputs: &[ConcreteWireType],
+) -> GpuNodeDisposition {
+    let matrix_family_static_alias = matches!(kind, NodeKind::FamilyGetStatic { .. }) &&
+        arguments.first().is_some_and(matrix_family_type) &&
+        outputs.first().is_some_and(|ty| ty.matrix_type().is_some());
+    if matrix_family_static_alias {
+        GpuNodeDisposition::NativeAlias
+    } else {
+        gpu_node_disposition(kind)
+    }
+}
+
+fn matrix_family_type(ty: &ConcreteWireType) -> bool {
+    matches!(
+        ty,
+        ConcreteWireType::IndexedFamily { element, .. }
+            if element.matrix_type().is_some()
+    )
+}
+
+pub fn effective_gpu_operation(kind: &NodeKind) -> EffectiveGpuOperation {
+    match gpu_node_disposition(kind) {
+        GpuNodeDisposition::Input |
+        GpuNodeDisposition::Resident |
+        GpuNodeDisposition::TypedReal => EffectiveGpuOperation::HostOrControl,
+        GpuNodeDisposition::NativeAlias => EffectiveGpuOperation::TrapdoorPublic,
+        GpuNodeDisposition::Native(operation) => operation,
+    }
+}
+
+pub fn effective_gpu_operation_for_types(
+    kind: &NodeKind,
+    arguments: &[ConcreteWireType],
+    outputs: &[ConcreteWireType],
+) -> EffectiveGpuOperation {
+    match gpu_node_disposition_for_types(kind, arguments, outputs) {
+        GpuNodeDisposition::Input |
+        GpuNodeDisposition::Resident |
+        GpuNodeDisposition::TypedReal => EffectiveGpuOperation::HostOrControl,
+        GpuNodeDisposition::NativeAlias => EffectiveGpuOperation::TrapdoorPublic,
+        GpuNodeDisposition::Native(operation) => operation,
+    }
+}
+
+pub fn is_resident_control_operation(kind: &NodeKind) -> bool {
+    matches!(gpu_node_disposition(kind), GpuNodeDisposition::Resident)
+}
+
+pub fn is_resident_control_operation_for_types(
+    kind: &NodeKind,
+    arguments: &[ConcreteWireType],
+    outputs: &[ConcreteWireType],
+) -> bool {
+    matches!(gpu_node_disposition_for_types(kind, arguments, outputs), GpuNodeDisposition::Resident)
 }
 
 /// Whether an operation is explicitly known to remain on the host/control
 /// path. This is deliberately narrower than "not column-separable".
 pub fn known_host_or_control(kind: &NodeKind) -> bool {
-    matches!(
-        effective_gpu_operation(kind),
-        EffectiveGpuOperation::HostOrControl | EffectiveGpuOperation::TrapdoorPublic
-    )
+    matches!(effective_gpu_operation(kind), EffectiveGpuOperation::HostOrControl)
 }
 
 /// Classify an effective operation using only validated operation and concrete
@@ -1657,6 +1797,7 @@ pub fn capability_for_effective_operation(
         EffectiveGpuOperation::ModulusSwitch |
         EffectiveGpuOperation::ModulusReduce |
         EffectiveGpuOperation::CenteredRebase |
+        EffectiveGpuOperation::CenteredRoundDivide |
         EffectiveGpuOperation::BlockModSwitch |
         EffectiveGpuOperation::RnsModUp |
         EffectiveGpuOperation::RnsModDown |
@@ -1672,9 +1813,8 @@ pub fn capability_for_effective_operation(
         EffectiveGpuOperation::ConcatRows |
         EffectiveGpuOperation::ConcatColumns |
         EffectiveGpuOperation::ConcatDiagonal => ColumnCapability::MappedColumns,
-        EffectiveGpuOperation::TrapdoorPublic | EffectiveGpuOperation::HostOrControl => {
-            ColumnCapability::HostOrControl
-        }
+        EffectiveGpuOperation::TrapdoorPublic => ColumnCapability::NativeAlias,
+        EffectiveGpuOperation::HostOrControl => ColumnCapability::HostOrControl,
         EffectiveGpuOperation::Unsupported => {
             let _ = arguments;
             ColumnCapability::Unsupported
@@ -1709,7 +1849,9 @@ pub fn map_output_range_to_inputs(
     // width. Their concrete output contract is validated by the caller, so
     // this convenience entry point only needs to lower the requested range.
     let capability = checked_column_capability(kind, arguments)?;
-    let columns = if capability == ColumnCapability::GeneratedColumns {
+    let columns = if is_resident_control_operation(kind) {
+        resident_output_columns(kind, arguments)?
+    } else if capability == ColumnCapability::GeneratedColumns {
         output.end
     } else {
         inferred_output_columns(kind, arguments)
@@ -1726,15 +1868,37 @@ pub fn map_output_range_to_inputs_with_output(
     output_columns: usize,
     output: ColumnRange,
 ) -> Result<Vec<InputColumnRange>, ColumnPolicyError> {
+    if is_resident_control_operation(kind) {
+        return map_resident_control_range(kind, arguments, output_columns, output);
+    }
     match effective_gpu_operation(kind) {
         EffectiveGpuOperation::Unsupported => {
             return Err(ColumnPolicyError::UnsupportedOperation {
                 operation: "unknown GPU operation",
             });
         }
-        EffectiveGpuOperation::TrapdoorPublic | EffectiveGpuOperation::HostOrControl => {
+        EffectiveGpuOperation::HostOrControl => {
             return Err(ColumnPolicyError::UnsupportedOperation {
                 operation: "host/control operation",
+            });
+        }
+        EffectiveGpuOperation::TrapdoorPublic => {
+            if arguments.len() != 1 {
+                return Err(ColumnPolicyError::MissingOperand { operand: 0 });
+            }
+            if let Some(matrix) = matrix_type(&arguments[0]) {
+                if output.end > matrix.columns {
+                    return Err(ColumnPolicyError::InvalidOutputRange {
+                        start: output.start,
+                        end: output.end,
+                        columns: matrix.columns,
+                    });
+                }
+            }
+            return Ok(if output.is_empty() {
+                Vec::new()
+            } else {
+                vec![InputColumnRange { operand: 0, range: output }]
             });
         }
         EffectiveGpuOperation::GeneratedConstant |
@@ -1759,6 +1923,7 @@ pub fn map_output_range_to_inputs_with_output(
         EffectiveGpuOperation::ModulusSwitch |
         EffectiveGpuOperation::ModulusReduce |
         EffectiveGpuOperation::CenteredRebase |
+        EffectiveGpuOperation::CenteredRoundDivide |
         EffectiveGpuOperation::BlockModSwitch |
         EffectiveGpuOperation::RnsModUp |
         EffectiveGpuOperation::RnsModDown |
@@ -1816,14 +1981,22 @@ pub fn map_output_range_to_inputs_with_output(
         NodeKind::UniformIntervalSample { .. } |
         NodeKind::GaussianSample { .. } |
         NodeKind::HashSample { .. } |
-        NodeKind::LiftIntegerToConstantPolynomial { .. } => {}
+        NodeKind::LiftIntegerToConstantPolynomial { .. } |
+        NodeKind::PackPolynomialCoefficients { .. } |
+        NodeKind::PolynomialFromValues { .. } => {}
         NodeKind::TrapdoorSample { .. } => {
             return Err(ColumnPolicyError::UnsupportedOperation { operation: "trapdoor sampling" });
         }
-        NodeKind::GadgetTrapdoor { .. } | NodeKind::TrapdoorPublic => {
+        NodeKind::GadgetTrapdoor { .. } => {
             return Err(ColumnPolicyError::UnsupportedOperation {
                 operation: "single-device operation",
             });
+        }
+        NodeKind::TrapdoorPublic => {
+            if arguments.len() != 1 {
+                return Err(ColumnPolicyError::MissingOperand { operand: 0 });
+            }
+            push(0, output);
         }
         NodeKind::MatrixScale { .. } |
         NodeKind::MatrixNegate |
@@ -1831,6 +2004,7 @@ pub fn map_output_range_to_inputs_with_output(
         NodeKind::ModulusSwitch { .. } |
         NodeKind::ModulusReduce { .. } |
         NodeKind::CenteredRebase { .. } |
+        NodeKind::CenteredRoundDivide { .. } |
         NodeKind::BlockModSwitch { .. } |
         NodeKind::RnsModUp { .. } |
         NodeKind::RnsModDown { .. } |
@@ -2117,8 +2291,6 @@ pub fn map_output_range_to_inputs_with_output(
         NodeKind::Select { .. } |
         NodeKind::ExtractCoefficient { .. } |
         NodeKind::ThresholdDecode { .. } |
-        NodeKind::PackPolynomialCoefficients { .. } |
-        NodeKind::PolynomialFromValues { .. } |
         NodeKind::PolynomialValues { .. } => {
             return Err(ColumnPolicyError::UnsupportedOperation {
                 operation: "host/control operation",
@@ -2129,10 +2301,238 @@ pub fn map_output_range_to_inputs_with_output(
     Ok(ranges)
 }
 
+fn resident_integer(ty: &ConcreteWireType) -> bool {
+    matches!(ty, ConcreteWireType::Int | ConcreteWireType::ConstantInt)
+}
+
+fn resident_bool(ty: &ConcreteWireType) -> bool {
+    matches!(ty, ConcreteWireType::Bool | ConcreteWireType::ConstantBool)
+}
+
+fn resident_family(ty: &ConcreteWireType) -> Option<usize> {
+    match ty {
+        ConcreteWireType::IndexedFamily { element, count }
+            if resident_integer(element) || resident_bool(element) =>
+        {
+            Some(*count)
+        }
+        _ => None,
+    }
+}
+
+fn resident_output_columns(
+    kind: &NodeKind,
+    arguments: &[ConcreteWireType],
+) -> Result<usize, ColumnPolicyError> {
+    match kind {
+        NodeKind::ConstantInt(_) | NodeKind::EvaluateInt(_) | NodeKind::ConstantBool(_) => Ok(1),
+        NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
+            if arguments.iter().all(resident_integer) {
+                Ok(1)
+            } else {
+                Err(ColumnPolicyError::NonMatrixOperand { operand: 0 })
+            }
+        }
+        NodeKind::BitExtract { .. } => {
+            if arguments.first().is_some_and(resident_integer) {
+                Ok(1)
+            } else {
+                Err(ColumnPolicyError::NonMatrixOperand { operand: 0 })
+            }
+        }
+        NodeKind::BoolToInt => {
+            if arguments.first().is_some_and(resident_bool) {
+                Ok(1)
+            } else {
+                Err(ColumnPolicyError::NonMatrixOperand { operand: 0 })
+            }
+        }
+        NodeKind::FamilyPack { .. } => {
+            if arguments.iter().all(|ty| resident_integer(ty) || resident_bool(ty)) {
+                Ok(arguments.len())
+            } else {
+                Err(ColumnPolicyError::NonMatrixOperand {
+                    operand: arguments
+                        .iter()
+                        .position(|ty| !resident_integer(ty) && !resident_bool(ty))
+                        .unwrap_or(0),
+                })
+            }
+        }
+        NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => Ok(1),
+        NodeKind::Select { .. } => Ok(1),
+        NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) | NodeKind::SubgraphCall(_) => {
+            Ok(arguments
+                .iter()
+                .filter_map(matrix_type)
+                .map(|matrix| matrix.columns)
+                .max()
+                .unwrap_or(1))
+        }
+        _ => {
+            Err(ColumnPolicyError::UnsupportedOperation { operation: "resident control operation" })
+        }
+    }
+}
+
+fn map_resident_control_range(
+    kind: &NodeKind,
+    arguments: &[ConcreteWireType],
+    output_columns: usize,
+    output: ColumnRange,
+) -> Result<Vec<InputColumnRange>, ColumnPolicyError> {
+    if output.start > output.end || output.end > output_columns {
+        return Err(ColumnPolicyError::InvalidOutputRange {
+            start: output.start,
+            end: output.end,
+            columns: output_columns,
+        });
+    }
+    if output.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut ranges = Vec::new();
+    let mut push = |operand: usize, range: ColumnRange| {
+        if !range.is_empty() {
+            ranges.push(InputColumnRange { operand, range });
+        }
+    };
+    let scalar = ColumnRange { start: 0, end: 1 };
+    match kind {
+        NodeKind::ConstantInt(_) | NodeKind::EvaluateInt(_) | NodeKind::ConstantBool(_) => {}
+        NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
+            for (operand, ty) in arguments.iter().enumerate() {
+                if !resident_integer(ty) {
+                    return Err(ColumnPolicyError::NonMatrixOperand { operand });
+                }
+                push(operand, scalar);
+            }
+        }
+        NodeKind::BitExtract { .. } => {
+            if !arguments.first().is_some_and(resident_integer) {
+                return Err(ColumnPolicyError::NonMatrixOperand { operand: 0 });
+            }
+            push(0, scalar);
+        }
+        NodeKind::BoolToInt => {
+            if !arguments.first().is_some_and(resident_bool) {
+                return Err(ColumnPolicyError::NonMatrixOperand { operand: 0 });
+            }
+            push(0, scalar);
+        }
+        NodeKind::FamilyPack { .. } => {
+            for (operand, ty) in arguments.iter().enumerate() {
+                if !resident_integer(ty) && !resident_bool(ty) {
+                    return Err(ColumnPolicyError::NonMatrixOperand { operand });
+                }
+                push(operand, scalar);
+            }
+        }
+        NodeKind::FamilyGetStatic { index } => {
+            let count = resident_family(
+                arguments.first().ok_or(ColumnPolicyError::MissingOperand { operand: 0 })?,
+            )
+            .ok_or(ColumnPolicyError::NonMatrixOperand { operand: 0 })?;
+            let range = constant_usize(index)
+                .and_then(|index| index.checked_add(1).map(|end| ColumnRange { start: index, end }))
+                .filter(|range| range.end <= count)
+                .unwrap_or(ColumnRange { start: 0, end: count });
+            push(0, range);
+        }
+        NodeKind::FamilyGetDynamic => {
+            let count = resident_family(
+                arguments.first().ok_or(ColumnPolicyError::MissingOperand { operand: 0 })?,
+            )
+            .ok_or(ColumnPolicyError::NonMatrixOperand { operand: 0 })?;
+            push(0, ColumnRange { start: 0, end: count });
+            if !arguments.get(1).is_some_and(resident_integer) {
+                return Err(ColumnPolicyError::NonMatrixOperand { operand: 1 });
+            }
+            push(1, scalar);
+        }
+        NodeKind::Select { .. } => {
+            if !arguments.first().is_some_and(resident_integer) {
+                return Err(ColumnPolicyError::NonMatrixOperand { operand: 0 });
+            }
+            push(0, scalar);
+            for (operand, ty) in arguments.iter().enumerate().skip(1) {
+                if !resident_integer(ty) && !resident_bool(ty) {
+                    return Err(ColumnPolicyError::NonMatrixOperand { operand });
+                }
+                push(operand, scalar);
+            }
+        }
+        NodeKind::ParallelLoop(spec) => {
+            for (operand, ty) in arguments.iter().enumerate() {
+                let range = match spec
+                    .input_modes
+                    .get(operand)
+                    .copied()
+                    .unwrap_or(LoopInputMode::Broadcast)
+                {
+                    LoopInputMode::Broadcast => scalar,
+                    LoopInputMode::Zip => {
+                        let width = matrix_type(ty).map_or(1, |matrix| matrix.columns);
+                        if output.end > width {
+                            return Err(ColumnPolicyError::InvalidOutputRange {
+                                start: output.start,
+                                end: output.end,
+                                columns: width,
+                            });
+                        }
+                        output
+                    }
+                    LoopInputMode::ZipOffset { offset } => {
+                        let mapped = output
+                            .checked_translate(offset)
+                            .ok_or(ColumnPolicyError::ArithmeticOverflow)?;
+                        let width = matrix_type(ty).map_or(1, |matrix| matrix.columns);
+                        if mapped.end > width {
+                            return Err(ColumnPolicyError::InvalidOutputRange {
+                                start: mapped.start,
+                                end: mapped.end,
+                                columns: width,
+                            });
+                        }
+                        mapped
+                    }
+                };
+                push(operand, range);
+            }
+        }
+        NodeKind::SequentialLoop(_) | NodeKind::SubgraphCall(_) => {
+            for (operand, ty) in arguments.iter().enumerate() {
+                let width = matrix_type(ty).map_or(1, |matrix| matrix.columns);
+                if output.end > width {
+                    return Err(ColumnPolicyError::InvalidOutputRange {
+                        start: output.start,
+                        end: output.end,
+                        columns: width,
+                    });
+                }
+                push(operand, if matrix_type(ty).is_some() { output } else { scalar });
+            }
+        }
+        _ => {
+            return Err(ColumnPolicyError::UnsupportedOperation {
+                operation: "resident control operation",
+            })
+        }
+    }
+    Ok(ranges)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mxx_ir_core::{expr::IntExpr, node::IndexRange};
+    use mxx_ir_core::{
+        expr::{IntExpr, RealExpr},
+        node::{
+            ConcatAxis, ConstantMatrix, HashVariant, IndexRange, IntBinaryOp, IntCompareOp,
+            MatrixBinaryOp, ParallelLoop, RealBinaryOp, SampleRange, SequentialLoop, SubgraphCall,
+        },
+        types::{MatrixType, WireType},
+    };
     use num_bigint::BigInt;
 
     fn matrix(rows: usize, columns: usize) -> ConcreteWireType {
@@ -2142,6 +2542,300 @@ mod tests {
             rows,
             columns,
         })
+    }
+
+    #[test]
+    fn every_dsl_primitive_has_an_explicit_gpu_or_resident_lowering() {
+        let scalar_matrix = MatrixType {
+            modulus: IntExpr::constant(17),
+            ring_dimension: IntExpr::constant(8),
+            rows: IntExpr::constant(1),
+            columns: IntExpr::constant(1),
+        };
+        let real = RealExpr::FromInt(IntExpr::constant(1));
+        let integer = IntExpr::constant(1);
+        let primitives = vec![
+            (
+                "input",
+                NodeKind::Input { name: "x".into(), wire_type: WireType::Int, artifact: None },
+            ),
+            ("constant_int", NodeKind::ConstantInt(BigInt::from(1))),
+            ("evaluate_int", NodeKind::EvaluateInt(integer.clone())),
+            ("constant_real", NodeKind::ConstantReal(real.clone())),
+            ("constant_bool", NodeKind::ConstantBool(true)),
+            (
+                "constant_matrix",
+                NodeKind::ConstantMatrix {
+                    matrix_type: scalar_matrix.clone(),
+                    value: ConstantMatrix::Zero,
+                },
+            ),
+            (
+                "gadget_trapdoor",
+                NodeKind::GadgetTrapdoor {
+                    matrix_type: scalar_matrix.clone(),
+                    base: integer.clone(),
+                },
+            ),
+            ("trapdoor_public", NodeKind::TrapdoorPublic),
+            ("int_binary", NodeKind::IntBinary(IntBinaryOp::Add)),
+            ("int_compare", NodeKind::IntCompare(IntCompareOp::Equal)),
+            ("bit_extract", NodeKind::BitExtract { bit: integer.clone() }),
+            ("int_to_real", NodeKind::IntToReal),
+            ("bool_to_int", NodeKind::BoolToInt),
+            ("real_binary", NodeKind::RealBinary(RealBinaryOp::Add)),
+            ("real_sqrt", NodeKind::RealSqrt),
+            ("matrix_binary", NodeKind::MatrixBinary(MatrixBinaryOp::Add)),
+            (
+                "matrix_mul_accumulate",
+                NodeKind::MatrixMulAccumulate {
+                    coefficients: vec![integer.clone()],
+                    has_bias: true,
+                },
+            ),
+            ("matrix_mul_small_rhs", NodeKind::MatrixMulSmallRhs),
+            ("matrix_negate", NodeKind::MatrixNegate),
+            ("matrix_scale", NodeKind::MatrixScale { scalar: integer.clone() }),
+            ("ring_automorphism", NodeKind::RingAutomorphism { index: integer.clone() }),
+            ("modulus_switch", NodeKind::ModulusSwitch { modulus: integer.clone() }),
+            ("modulus_reduce", NodeKind::ModulusReduce { modulus: integer.clone() }),
+            ("centered_rebase", NodeKind::CenteredRebase { modulus: integer.clone() }),
+            ("centered_round_divide", NodeKind::CenteredRoundDivide { divisor: integer.clone() }),
+            (
+                "rns_mod_up",
+                NodeKind::RnsModUp {
+                    modulus: integer.clone(),
+                    source_moduli: vec![17],
+                    digit_size: 1,
+                    normalize: false,
+                },
+            ),
+            (
+                "rns_mod_down",
+                NodeKind::RnsModDown {
+                    modulus: integer.clone(),
+                    source_moduli: vec![17],
+                    plaintext_modulus: integer.clone(),
+                },
+            ),
+            (
+                "block_mod_switch",
+                NodeKind::BlockModSwitch {
+                    modulus: integer.clone(),
+                    source_moduli: vec![17],
+                    plaintext_modulus: integer.clone(),
+                },
+            ),
+            ("transpose", NodeKind::Transpose),
+            (
+                "slice",
+                NodeKind::Slice {
+                    rows: None,
+                    columns: Some(IndexRange { start: integer.clone(), end: IntExpr::constant(2) }),
+                },
+            ),
+            ("tensor", NodeKind::Tensor),
+            ("concat", NodeKind::Concat { axis: ConcatAxis::Rows }),
+            (
+                "uniform_residue_sample",
+                NodeKind::UniformResidueSample { matrix_type: scalar_matrix.clone() },
+            ),
+            (
+                "uniform_interval_sample",
+                NodeKind::UniformIntervalSample {
+                    matrix_type: scalar_matrix.clone(),
+                    range: SampleRange {
+                        minimum: IntExpr::constant(-1),
+                        maximum: IntExpr::constant(1),
+                    },
+                },
+            ),
+            (
+                "gaussian_sample",
+                NodeKind::GaussianSample {
+                    matrix_type: scalar_matrix.clone(),
+                    sigma: real.clone(),
+                    max_coefficient_bound: integer.clone(),
+                },
+            ),
+            (
+                "hash_sample",
+                NodeKind::HashSample {
+                    matrix_type: scalar_matrix.clone(),
+                    variant: HashVariant::Plain,
+                    tag_prefix: Vec::new(),
+                    tag_components: Vec::new(),
+                    base: None,
+                    digit_count: None,
+                },
+            ),
+            (
+                "trapdoor_sample",
+                NodeKind::TrapdoorSample {
+                    matrix_type: scalar_matrix.clone(),
+                    sigma: real.clone(),
+                    gadget_base: integer.clone(),
+                    digit_count: integer.clone(),
+                    preimage_max_coefficient_bound: integer.clone(),
+                },
+            ),
+            (
+                "preimage_sample",
+                NodeKind::PreimageSample {
+                    matrix_type: scalar_matrix.clone(),
+                    max_coefficient_bound: integer.clone(),
+                },
+            ),
+            (
+                "gadget_decompose",
+                NodeKind::GadgetDecompose {
+                    base: integer.clone(),
+                    small: false,
+                    digit_count: integer.clone(),
+                },
+            ),
+            (
+                "extract_coefficient",
+                NodeKind::ExtractCoefficient {
+                    position: integer.clone(),
+                    canonical_input_exclusive_upper: None,
+                },
+            ),
+            (
+                "lift_integer",
+                NodeKind::LiftIntegerToConstantPolynomial { matrix_type: scalar_matrix.clone() },
+            ),
+            (
+                "threshold_decode",
+                NodeKind::ThresholdDecode {
+                    plaintext_modulus: integer.clone(),
+                    length: integer.clone(),
+                    output_bool: true,
+                },
+            ),
+            (
+                "crt_recompose",
+                NodeKind::CrtRecompose {
+                    modulus: integer.clone(),
+                    plaintext_moduli: vec![integer.clone()],
+                    reconstruction_coefficients: vec![integer.clone()],
+                },
+            ),
+            (
+                "pack_polynomial_coefficients",
+                NodeKind::PackPolynomialCoefficients {
+                    matrix_type: scalar_matrix.clone(),
+                    coefficient_bits: integer.clone(),
+                },
+            ),
+            (
+                "polynomial_from_values",
+                NodeKind::PolynomialFromValues {
+                    matrix_type: scalar_matrix.clone(),
+                    evaluation: true,
+                },
+            ),
+            ("polynomial_values", NodeKind::PolynomialValues { evaluation: true }),
+            (
+                "subgraph_call",
+                NodeKind::SubgraphCall(SubgraphCall {
+                    definition: "coverage".into(),
+                    bindings: Vec::new(),
+                    canonical_input_exclusive_uppers: Vec::new(),
+                }),
+            ),
+            (
+                "parallel_loop",
+                NodeKind::ParallelLoop(ParallelLoop {
+                    count: integer.clone(),
+                    minimum_count: 0,
+                    index_slot: 0,
+                    bindings: Vec::new(),
+                    input_modes: Vec::new(),
+                }),
+            ),
+            (
+                "sequential_loop",
+                NodeKind::SequentialLoop(SequentialLoop {
+                    count: integer.clone(),
+                    index_slot: 0,
+                    bindings: Vec::new(),
+                    carried_count: 0,
+                }),
+            ),
+            ("family_pack", NodeKind::FamilyPack { count: integer.clone() }),
+            ("family_get_static", NodeKind::FamilyGetStatic { index: integer.clone() }),
+            ("family_get_dynamic", NodeKind::FamilyGetDynamic),
+            ("select", NodeKind::Select { count: integer }),
+        ];
+        assert!(
+            EffectiveGpuOperation::all()
+                .iter()
+                .all(|operation| { *operation != EffectiveGpuOperation::Unsupported })
+        );
+        for (name, kind) in primitives {
+            let operation = effective_gpu_operation(&kind);
+            assert_ne!(operation, EffectiveGpuOperation::Unsupported, "{name} is unclassified");
+            assert!(
+                EffectiveGpuOperation::all().contains(&operation),
+                "{name} lacks operation inventory"
+            );
+            assert!(
+                canonical_warmup_profile_domain(&kind).is_profileable(),
+                "{name} lacks profile domain"
+            );
+            assert_ne!(
+                column_capability(&kind, &[]),
+                ColumnCapability::Unsupported,
+                "{name} lacks capability"
+            );
+        }
+    }
+
+    #[test]
+    fn static_family_get_lowers_to_a_bounded_resident_range() {
+        let family = ConcreteWireType::IndexedFamily {
+            element: Box::new(ConcreteWireType::Int),
+            count: 8192,
+        };
+        let kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(80) };
+        assert_eq!(effective_gpu_operation(&kind), EffectiveGpuOperation::HostOrControl);
+        assert!(is_resident_control_operation(&kind));
+        assert_eq!(
+            map_output_range_to_inputs_with_output(
+                &kind,
+                &[family],
+                1,
+                ColumnRange { start: 0, end: 1 },
+            )
+            .unwrap(),
+            vec![InputColumnRange { operand: 0, range: ColumnRange { start: 80, end: 81 } }]
+        );
+    }
+
+    #[test]
+    fn dynamic_matrix_family_get_stays_in_resident_control() {
+        let family = ConcreteWireType::IndexedFamily { element: Box::new(matrix(2, 4)), count: 4 };
+        let kind = NodeKind::FamilyGetDynamic;
+        assert_eq!(
+            gpu_node_disposition_for_types(
+                &kind,
+                &[family, ConcreteWireType::Int],
+                &[matrix(2, 4)],
+            ),
+            GpuNodeDisposition::Resident
+        );
+        assert_eq!(
+            effective_gpu_operation_for_types(
+                &kind,
+                &[
+                    ConcreteWireType::IndexedFamily { element: Box::new(matrix(2, 4)), count: 4 },
+                    ConcreteWireType::Int,
+                ],
+                &[matrix(2, 4)],
+            ),
+            EffectiveGpuOperation::HostOrControl
+        );
     }
 
     #[test]
@@ -2346,14 +3040,14 @@ mod tests {
     }
 
     #[test]
-    fn operation_allowlist_keeps_known_host_nodes_explicit() {
+    fn operation_allowlist_keeps_real_host_nodes_explicit() {
         let kind = NodeKind::ConstantInt(num_bigint::BigInt::from(3));
         assert_eq!(effective_gpu_operation(&kind), EffectiveGpuOperation::HostOrControl);
         assert_eq!(column_capability(&kind, &[]), ColumnCapability::HostOrControl);
-        assert!(matches!(
+        assert_eq!(
             map_output_range_to_inputs(&kind, &[], ColumnRange { start: 0, end: 1 }),
-            Err(ColumnPolicyError::UnsupportedOperation { .. })
-        ));
+            Ok(vec![])
+        );
     }
 
     #[test]
@@ -2464,7 +3158,9 @@ mod tests {
     #[test]
     fn every_canonical_domain_has_explicit_measurement_owner() {
         let gpu = canonical_warmup_profile_domain(&NodeKind::MatrixNegate);
-        let host = canonical_warmup_profile_domain(&NodeKind::ConstantInt(BigInt::from(1)));
+        let host = canonical_warmup_profile_domain(&NodeKind::ConstantReal(
+            mxx_ir_core::expr::RealExpr::from_integer(1),
+        ));
         assert_eq!(gpu.measurement_kind(), WarmupMeasurementKind::GpuMeasured);
         assert_eq!(host.measurement_kind(), WarmupMeasurementKind::HostMeasured);
         assert!(!host.is_gpu_measured());
@@ -2478,7 +3174,7 @@ mod tests {
             EffectiveGpuOperation::TrapdoorPublic
         );
         assert!(EffectiveGpuOperation::all().contains(&EffectiveGpuOperation::TrapdoorPublic));
-        assert!(known_host_or_control(&NodeKind::TrapdoorPublic));
+        assert!(!known_host_or_control(&NodeKind::TrapdoorPublic));
         assert_eq!(
             canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic).measurement_kind(),
             WarmupMeasurementKind::HostMeasured
@@ -2490,7 +3186,7 @@ mod tests {
         assert!(canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic).is_profileable());
         assert_eq!(
             column_capability(&NodeKind::TrapdoorPublic, &[]),
-            ColumnCapability::HostOrControl
+            ColumnCapability::NativeAlias
         );
         assert!(matches!(
             map_output_range_to_inputs(
@@ -2498,10 +3194,19 @@ mod tests {
                 &[],
                 ColumnRange { start: 0, end: 1 }
             ),
-            Err(ColumnPolicyError::UnsupportedOperation { .. })
+            Err(ColumnPolicyError::MissingOperand { operand: 0 })
         ));
 
         let matrix = matrix(1, 1);
+        assert_eq!(
+            map_output_range_to_inputs(
+                &NodeKind::TrapdoorPublic,
+                std::slice::from_ref(&matrix),
+                ColumnRange { start: 0, end: 1 }
+            )
+            .expect("trapdoor public is a native alias"),
+            vec![InputColumnRange { operand: 0, range: ColumnRange { start: 0, end: 1 } }]
+        );
         let extract = NodeKind::ExtractCoefficient {
             position: IntExpr::constant(0),
             canonical_input_exclusive_upper: None,
@@ -2514,7 +3219,7 @@ mod tests {
         for kind in [&extract, &threshold] {
             assert_eq!(
                 canonical_warmup_profile_domain(kind).measurement_kind(),
-                WarmupMeasurementKind::HostMeasured
+                WarmupMeasurementKind::GpuMeasured
             );
             assert_eq!(
                 column_capability(kind, std::slice::from_ref(&matrix)),
@@ -2523,11 +3228,11 @@ mod tests {
         }
         assert_eq!(
             canonical_warmup_profile_domain(&extract).transfer_kind(),
-            WarmupTransferKind::DeviceToHost
+            WarmupTransferKind::None
         );
         assert_eq!(
             canonical_warmup_profile_domain(&threshold).transfer_kind(),
-            WarmupTransferKind::DeviceToHost
+            WarmupTransferKind::None
         );
     }
 
@@ -2719,7 +3424,7 @@ mod tests {
     }
 
     #[test]
-    fn host_codec_boundaries_are_host_measured_with_explicit_transfer_routes() {
+    fn resident_codec_boundaries_are_gpu_measured_without_transfer_routes() {
         let matrix_type = mxx_ir_core::types::MatrixType {
             modulus: IntExpr::constant(17),
             ring_dimension: IntExpr::constant(8),
@@ -2732,22 +3437,22 @@ mod tests {
                     matrix_type: matrix_type.clone(),
                     coefficient_bits: IntExpr::constant(1),
                 },
-                WarmupTransferKind::HostToDevice,
+                WarmupTransferKind::None,
             ),
             (
                 NodeKind::PolynomialFromValues {
                     matrix_type: matrix_type.clone(),
                     evaluation: false,
                 },
-                WarmupTransferKind::HostToDevice,
+                WarmupTransferKind::None,
             ),
-            (NodeKind::PolynomialValues { evaluation: false }, WarmupTransferKind::DeviceToHost),
+            (NodeKind::PolynomialValues { evaluation: false }, WarmupTransferKind::None),
         ];
         for (kind, transfer) in cases {
             let domain = canonical_warmup_profile_domain(&kind);
-            assert_eq!(domain.measurement_kind(), WarmupMeasurementKind::HostMeasured);
+            assert_eq!(domain.measurement_kind(), WarmupMeasurementKind::GpuMeasured);
             assert_eq!(domain.transfer_kind(), transfer);
-            assert!(domain.has_transport_stage());
+            assert!(!domain.has_transport_stage());
         }
         assert_eq!(
             canonical_warmup_profile_domain(&NodeKind::TrapdoorPublic).transfer_kind(),

@@ -19,6 +19,10 @@ pub(crate) mod ffi {
             moduli: &[u64],
             plaintext_modulus_words: &[u64],
         ) -> Result<UniquePtr<DCRTPoly>>;
+        fn exact_basis_centered_round_divide(
+            input: &DCRTPoly,
+            divisor_words: &[u64],
+        ) -> Result<UniquePtr<DCRTPoly>>;
         fn exact_basis_coefficients(input: &DCRTPoly) -> Result<Vec<u8>>;
         #[namespace = "openfhe"]
         type Matrix = openfhe::ffi::Matrix;

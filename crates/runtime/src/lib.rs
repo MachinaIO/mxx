@@ -3,13 +3,26 @@
 pub mod artifact;
 pub mod authority;
 pub mod backend;
+pub mod env;
 pub mod executor;
 #[cfg(feature = "gpu")]
 pub mod gpu_calibration;
 pub mod gpu_column_policy;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_compiled;
 pub mod gpu_execution_plan;
 #[cfg(feature = "gpu")]
+pub(crate) mod gpu_io_worker;
+#[cfg(feature = "gpu")]
 pub mod gpu_measurement;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_preimage_scheduler;
+#[cfg(feature = "gpu")]
+pub mod gpu_runtime;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_runtime_control;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_runtime_io;
 pub mod gpu_schedule;
 pub mod gpu_warmup;
 pub mod host_control;
@@ -24,9 +37,8 @@ pub use artifact::{
 };
 pub use backend::{Backend, RuntimeValue};
 pub use executor::{
-    ExecutionConfig, ExecutionError, ExecutionPlan, ExecutionResult, ExecutionTrace,
-    PreimageProgressConfig, StagedFamilyLease, execute, execute_in_session, execute_prepared,
-    execute_with_trace,
+    ExecutionConfig, ExecutionError, ExecutionResult, ExecutionTrace, PreimageProgressConfig,
+    execute, execute_in_session, execute_prepared, execute_with_trace,
 };
 pub use host_control::{
     HostControlBodyAction, HostControlBodyInvocation, HostControlBodyNode, HostControlChild,
@@ -42,4 +54,10 @@ pub use host_control::{
 };
 pub use session::{
     ArtifactHandle, SessionAliasDescriptor, SessionDescriptor, SessionStatus, SessionStore,
+};
+
+#[cfg(feature = "gpu")]
+pub use gpu_runtime::{
+    GpuExecutionPlan, GpuExecutionResult, GpuPlanError, GpuPreparedBackendContract, GpuRuntime,
+    GpuRuntimeConfigError, GpuRuntimeError, GpuRuntimeOptions,
 };

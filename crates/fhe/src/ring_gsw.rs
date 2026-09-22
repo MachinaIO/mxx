@@ -1,8 +1,8 @@
 use crate::{
     FheCommonParams, FheError, FheScheme,
-    utils::{self, check_matrix, scalar},
+    utils::{check_matrix, scalar},
 };
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Int, Mat, MatType, parallel};
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
@@ -205,16 +205,8 @@ impl FheScheme for RingGswParams {
         for part in [secret, &ciphertext.a, &ciphertext.b] {
             check_matrix(p, part, 1, 1)?;
         }
-        // Center before rounding: a residue near q represents a small negative
-        // phase. Packing the decoded integers returns canonical R_q residues.
         let phase = &ciphertext.b - secret * &ciphertext.a;
-        let coefficients = utils::extract(p, &phase)?;
-        let delta = BigInt::from(self.scale.clone());
-        let decoded = parallel(p.ring_dimension(), |index| {
-            let value = utils::centered(coefficients.at(index), p.modulus().as_ref())?;
-            Ok(value.mul(2).add(Int::constant(delta.clone())).div(Int::constant(&delta * 2)))
-        })?;
-        utils::pack(p, &decoded)
+        Ok(phase.centered_round_divide(self.scale.clone()))
     }
     fn add(
         &self,

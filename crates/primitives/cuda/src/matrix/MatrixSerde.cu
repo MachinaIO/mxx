@@ -69,6 +69,16 @@ namespace
         event_set->entries.reserve(streams.size());
         for (const auto &entry : streams)
         {
+            // A host-visible event must never be recorded on a capture
+            // stream. Such an event becomes a graph node and CUDA rejects a
+            // later host wait with cudaErrorStreamCaptureUnsupported. The
+            // capture path has its own graph-local event ownership; serde is
+            // a post-replay host boundary and therefore requires an ordinary
+            // stream.
+            if (matrix_stream_is_capturing(entry.stream))
+            {
+                return set_error(cudaErrorStreamCaptureUnsupported);
+            }
             cudaError_t err = cudaSetDevice(entry.device);
             if (err != cudaSuccess)
             {
@@ -132,6 +142,91 @@ namespace
             dst_stride_bytes,
             dst_coeff_bytes,
             value);
+    }
+
+    __device__ __forceinline__ uint64_t serde_signed_value_mod(
+        int64_t value,
+        uint64_t modulus)
+    {
+        const uint64_t bits = static_cast<uint64_t>(value);
+        if (value >= 0)
+        {
+            return bits % modulus;
+        }
+        // Unsigned subtraction is defined modulo 2^64, including INT64_MIN.
+        const uint64_t magnitude = uint64_t(0) - bits;
+        const uint64_t residue = magnitude % modulus;
+        return residue == 0 ? 0 : modulus - residue;
+    }
+
+
+    struct SerdeValuesMetadata
+    {
+        int limb_count;
+        int word_count;
+        uint64_t moduli[kMaxRnsLimbs];
+    };
+
+    __global__ void serde_reconstruct_rns_to_words_owner_kernel(
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+        SerdeValuesMetadata metadata,
+        size_t n,
+        uint64_t *values_out)
+    {
+        const size_t coeff = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if (coeff >= n)
+        {
+            return;
+        }
+        uint64_t mixed_digits[kMaxRnsLimbs];
+        for (int i = 0; i < metadata.limb_count; ++i)
+        {
+            const auto descriptor = descriptors[i];
+            mixed_digits[i] = matrix_load_limb_u64(
+                                  descriptor.base,
+                                  0,
+                                  coeff,
+                                  descriptor.stride,
+                                  descriptor.width) % metadata.moduli[i];
+        }
+        for (int i = 1; i < metadata.limb_count; ++i)
+        {
+            const uint64_t qi = metadata.moduli[i];
+            uint64_t t = mixed_digits[i];
+            for (int j = 0; j < i; ++j)
+            {
+                const uint64_t xj_mod_qi = mixed_digits[j] % qi;
+                const uint64_t diff = t >= xj_mod_qi
+                    ? t - xj_mod_qi
+                    : static_cast<uint64_t>(
+                          static_cast<unsigned __int128>(t) + qi - xj_mod_qi);
+                // CRT moduli are prime, so Fermat inversion avoids carrying
+                // a second device-resident metadata allocation into capture.
+                uint64_t inverse = 1;
+                uint64_t base = metadata.moduli[j] % qi;
+                uint64_t exponent = qi - 2;
+                while (exponent != 0)
+                {
+                    if (exponent & 1u)
+                        inverse = serde_mul_mod_u64_device(inverse, base, qi);
+                    base = serde_mul_mod_u64_device(base, base, qi);
+                    exponent >>= 1u;
+                }
+                t = serde_mul_mod_u64_device(diff, inverse, qi);
+            }
+            mixed_digits[i] = t;
+        }
+        uint64_t *value = values_out + coeff * (metadata.word_count + 1);
+        for (int word = 0; word <= metadata.word_count; ++word) value[word] = 0;
+        for (int i = metadata.limb_count - 1; i >= 0; --i)
+        {
+            uint64_t carry = mixed_digits[i];
+            for (int word = 1; word <= metadata.word_count; ++word) {
+                const unsigned __int128 term = static_cast<unsigned __int128>(value[word]) * metadata.moduli[i] + carry;
+                value[word] = static_cast<uint64_t>(term);
+                carry = static_cast<uint64_t>(term >> 64);
+            }
+        }
     }
 
     __global__ void serde_unpack_packed_limb_to_u64_kernel(
@@ -880,6 +975,302 @@ extern "C" int gpu_matrix_load_rns_batch(
 
     mat->format = target_format;
     return serde_build_event_set_from_streams(streams, out_events);
+}
+
+__global__ void serde_write_values_kernel(
+    const uint64_t *values,
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *descriptors,
+    SerdeValuesMetadata metadata,
+    size_t count,
+    int encoding,
+    size_t dimension,
+    size_t columns,
+    size_t constant_column_start)
+{
+    const size_t coefficient = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int limb = blockIdx.y;
+    if (coefficient >= count || limb >= metadata.limb_count) return;
+    const auto descriptor = descriptors[limb];
+    const uint64_t modulus = metadata.moduli[limb];
+    const bool constant = constant_column_start != SIZE_MAX;
+    const size_t source_index = constant ? 0 : coefficient;
+    const size_t polynomial = coefficient / dimension;
+    if (constant && (coefficient % dimension != 0 || polynomial / columns != polynomial % columns + constant_column_start)) {
+        matrix_store_limb_u64(descriptor.base, polynomial, coefficient % dimension, descriptor.stride, descriptor.width, 0);
+        return;
+    }
+    uint64_t residue = encoding == GPU_VALUES_SIGNED_I64
+        ? serde_signed_value_mod(static_cast<int64_t>(values[source_index]), modulus)
+        : values[source_index] % modulus;
+    if (encoding > 2) {
+        const int words = encoding - 2;
+        const uint64_t *value = values + source_index * (words + 1);
+        residue = 0;
+        for (int word = words; word > 0; --word)
+            residue = static_cast<uint64_t>(((static_cast<unsigned __int128>(residue) << 64) + value[word]) % modulus);
+        if (value[0] && residue) residue = modulus - residue;
+    }
+    matrix_store_limb_u64(descriptor.base, polynomial, coefficient % dimension,
+        descriptor.stride, descriptor.width, residue);
+}
+
+extern "C" int gpu_matrix_write_values(
+    GpuMatrix *mat,
+    const void *values_device,
+    size_t values_count,
+    int format,
+    int encoding,
+    int output_format,
+    size_t constant_column_start,
+    void *stream_raw,
+    uint32_t source_binding_index,
+    uint32_t destination_binding_index)
+{
+    if (!mat || !mat->ctx || !values_device || !stream_raw ||
+        mat->level < 0 ||
+        (constant_column_start == SIZE_MAX ? (mat->rows != 1 || mat->cols != 1 || values_count != static_cast<size_t>(mat->ctx->N)) : values_count != 1) ||
+        mat->shared_limb_buffers.size() != 1 ||
+        encoding < 0 || encoding == 2)
+        return set_error("invalid resident values writer arguments");
+    GpuPolyFormat source_format, target_format;
+    if (!parse_format(format, source_format) || !parse_format(output_format, target_format))
+        return set_error("invalid resident values writer format");
+    const auto &buffer = mat->shared_limb_buffers[0];
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    int status = matrix_wait_all_limb_streams(mat, buffer.device, stream, false, false);
+    if (status != 0) return status;
+    SerdeValuesMetadata metadata{};
+    metadata.limb_count = mat->level + 1;
+    if (metadata.limb_count > kMaxRnsLimbs) return set_error("invalid CRT limb count");
+    for (int limb = 0; limb < metadata.limb_count; ++limb)
+        metadata.moduli[limb] = mat->ctx->moduli[mat->ctx->limb_prime_ids[limb]];
+    cudaError_t error = cudaSetDevice(buffer.device);
+    if (error != cudaSuccess) return set_error(error);
+    const size_t count = mat->rows * mat->cols * mat->ctx->N;
+    serde_write_values_kernel<<<dim3((count + 255) / 256, metadata.limb_count), 256, 0, stream>>>(
+        static_cast<const uint64_t *>(values_device), buffer.device_descriptors,
+        metadata, count, encoding, mat->ctx->N, mat->cols, constant_column_start);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    const size_t sizes[] = {sizeof(void *), sizeof(void *), sizeof(metadata), sizeof(size_t), sizeof(int), sizeof(size_t), sizeof(size_t), sizeof(size_t)};
+    const MxxGraphPatch patches[] = {
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0, sizeof(void *), source_binding_index, 0},
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 1, 0, sizeof(void *), destination_binding_index, 0},
+        {nullptr, MXX_GRAPH_PATCH_INTEGER_ENCODING, 4, 0, sizeof(int), source_binding_index, reinterpret_cast<uint64_t>(values_device)},
+    };
+    MxxGraphPatch selected[3];
+    size_t selected_count = 0;
+    for (const auto &patch : patches)
+        if (patch.binding_index != UINT32_MAX) selected[selected_count++] = patch;
+    if (selected_count) {
+        status = mxx_graph_register_kernel_update_for_stream(mat->ctx, stream, sizes, 8, selected, selected_count);
+        if (status != 0) return status;
+    }
+    for (int limb = 0; limb < metadata.limb_count; ++limb) {
+        status = matrix_record_limb_write(mat, mat->ctx->limb_gpu_ids[limb], stream);
+        if (status != 0) return status;
+    }
+    mat->format = constant_column_start == SIZE_MAX ? source_format : GPU_POLY_FORMAT_COEFF;
+    if (mat->format == target_format) return 0;
+    return target_format == GPU_POLY_FORMAT_EVAL
+        ? gpu_matrix_ntt_all_on_stream_bound(mat, stream, destination_binding_index)
+        : gpu_matrix_intt_all_on_stream_bound(mat, stream, destination_binding_index);
+}
+
+static int serde_store_values_into(
+    GpuMatrix *mat,
+    void *values_device,
+    size_t values_count,
+    size_t words,
+    int format,
+    int output_device,
+    void *output_stream_raw,
+    uint32_t descriptor_binding_index,
+    uint32_t output_binding_index,
+    bool preserve_source)
+{
+    if (!mat || !mat->ctx || !values_device || !output_stream_raw)
+    {
+        return set_error("invalid gpu_matrix_store_values_into arguments");
+    }
+    GpuPolyFormat source_format;
+    if (!parse_format(format, source_format))
+    {
+        return set_error("invalid format in gpu_matrix_store_values_into");
+    }
+    bool restore_source = false;
+    if (mat->format != source_format)
+    {
+        // Captured PolynomialValues commonly requests coefficient values from
+        // an evaluation-form source. Transform the resident source in place,
+        // extract, and restore evaluation form before the graph completes.
+        if (!preserve_source)
+        {
+            return set_error("matrix format mismatch in gpu_matrix_store_values_into");
+        }
+        const int wait_status = matrix_wait_all_limb_streams(
+            mat,
+            output_device,
+            reinterpret_cast<cudaStream_t>(output_stream_raw),
+            false,
+            true);
+        if (wait_status != 0)
+        {
+            return wait_status;
+        }
+        const int status = source_format == GPU_POLY_FORMAT_COEFF
+            ? gpu_matrix_intt_all_on_stream_bound(mat, reinterpret_cast<cudaStream_t>(output_stream_raw), descriptor_binding_index)
+            : gpu_matrix_ntt_all_on_stream_bound(mat, reinterpret_cast<cudaStream_t>(output_stream_raw), descriptor_binding_index);
+        if (status != 0)
+        {
+            return status;
+        }
+        restore_source = true;
+    }
+    if (mat->rows != 1 || mat->cols != 1 || mat->level < 0 ||
+        values_count != static_cast<size_t>(mat->ctx->N))
+    {
+        return set_error("invalid polynomial values shape in gpu_matrix_store_values_into");
+    }
+    const size_t limb_count = static_cast<size_t>(mat->level) + 1;
+    if (limb_count == 0 || limb_count > static_cast<size_t>(kMaxRnsLimbs) ||
+        mat->ctx->moduli.size() < limb_count || mat->shared_limb_buffers.size() != 1)
+    {
+        return set_error("unsupported polynomial values basis in gpu_matrix_store_values_into");
+    }
+    if (words == 0 || words > kMaxCoeffWords) return set_error("invalid coefficient word count");
+    const auto &buffer = mat->shared_limb_buffers[0];
+    if (buffer.device != output_device || !buffer.device_descriptors ||
+        buffer.limb_count < limb_count)
+    {
+        return set_error("polynomial values require one colocated output device");
+    }
+    cudaStream_t output_stream = reinterpret_cast<cudaStream_t>(output_stream_raw);
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 limb_id = mat->ctx->limb_gpu_ids[limb];
+        if (limb_id.x != 0)
+        {
+            return set_error("polynomial values require one CRT device partition");
+        }
+        const int status = matrix_wait_limb_stream(
+            mat, limb_id, output_device, output_stream, false, true);
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+    cudaError_t error = cudaSetDevice(output_device);
+    if (error != cudaSuccess)
+    {
+        return set_error(error);
+    }
+    SerdeValuesMetadata metadata{};
+    metadata.limb_count = static_cast<int>(limb_count);
+    metadata.word_count = static_cast<int>(words);
+    std::copy_n(mat->ctx->moduli.begin(), limb_count, metadata.moduli);
+    const int threads = 256;
+    const int blocks = static_cast<int>(
+        (values_count + static_cast<size_t>(threads) - 1) / static_cast<size_t>(threads));
+    serde_reconstruct_rns_to_words_owner_kernel<<<blocks, threads, 0, output_stream>>>(
+        buffer.device_descriptors,
+        metadata,
+        values_count,
+        static_cast<uint64_t *>(values_device));
+    error = cudaGetLastError();
+    if (error != cudaSuccess)
+    {
+        return set_error(error);
+    }
+    if (descriptor_binding_index != UINT32_MAX || output_binding_index != UINT32_MAX)
+    {
+        constexpr size_t argument_sizes[] = {
+            sizeof(void *), sizeof(SerdeValuesMetadata), sizeof(size_t), sizeof(void *)};
+        const MxxGraphPatch patches[] = {
+            {
+                nullptr,
+                MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
+                0,
+                0,
+                sizeof(void *),
+                descriptor_binding_index,
+                0,
+            },
+            {
+                nullptr,
+                MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD,
+                3,
+                0,
+                sizeof(void *),
+                output_binding_index,
+                0,
+            },
+        };
+        const int status = mxx_graph_register_kernel_update_for_stream(
+            mat->ctx,
+            output_stream,
+            argument_sizes,
+            sizeof(argument_sizes) / sizeof(argument_sizes[0]),
+            patches,
+            sizeof(patches) / sizeof(patches[0]));
+        if (status != 0)
+        {
+            return status;
+        }
+    }
+    if (restore_source)
+    {
+        return source_format == GPU_POLY_FORMAT_COEFF
+            ? gpu_matrix_ntt_all_on_stream_bound(mat, reinterpret_cast<cudaStream_t>(output_stream_raw), descriptor_binding_index)
+            : gpu_matrix_intt_all_on_stream_bound(mat, reinterpret_cast<cudaStream_t>(output_stream_raw), descriptor_binding_index);
+    }
+    return 0;
+}
+
+extern "C" int gpu_matrix_store_values_into(
+    const GpuMatrix *mat,
+    void *values_device,
+    size_t values_count,
+    size_t words,
+    int format,
+    int output_device,
+    void *output_stream_raw)
+{
+    return serde_store_values_into(
+        const_cast<GpuMatrix *>(mat),
+        values_device,
+        values_count,
+        words,
+        format,
+        output_device,
+        output_stream_raw,
+        UINT32_MAX,
+        UINT32_MAX,
+        true);
+}
+
+extern "C" int gpu_matrix_store_values_into_bound(
+    GpuMatrix *mat,
+    void *values_device,
+    size_t values_count,
+    size_t words,
+    int format,
+    int output_device,
+    void *output_stream_raw,
+    uint32_t descriptor_binding_index,
+    uint32_t output_binding_index)
+{
+    return serde_store_values_into(
+        mat,
+        values_device,
+        values_count,
+        words,
+        format,
+        output_device,
+        output_stream_raw,
+        descriptor_binding_index,
+        output_binding_index,
+        true);
 }
 
 extern "C" int gpu_matrix_store_rns_batch(

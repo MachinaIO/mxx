@@ -47,13 +47,9 @@ use mxx_primitives::{
     utils::{gen_biguint_for_modulus, mod_inverse},
 };
 use mxx_runtime::{
-    ExecutionConfig, ExecutionResult, PreimageProgressConfig, RuntimeValue,
+    GpuExecutionPlan, GpuExecutionResult, GpuRuntime, RuntimeValue,
     artifact::{ArtifactKey, ArtifactPayload, MemoryArtifactStore, MemoryFinalizedSessionSnapshot},
     backend::poly::gpu::{GpuDcrtBackend, gpu_backend_on},
-    gpu_measurement::{
-        GpuPreparationRequest, GpuWarmupMeasurementConfig, PreparedGpuExecution,
-        prepare as prepare_gpu,
-    },
     gpu_warmup::GpuWarmupReport,
 };
 use num_bigint::{BigInt, BigUint};
@@ -64,7 +60,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashMap},
     env, fs,
-    num::NonZeroUsize,
     path::PathBuf,
     process::Command,
     sync::Arc,
@@ -344,7 +339,6 @@ struct PreparedCandidate {
     layout: BggSamplerLayout,
     preprocessing: BuiltGraph,
     preprocessing_graph_construction: Duration,
-    preprocessing_preimage_count: usize,
     production: ProductionId,
     runtime_manifest: RuntimeManifest,
     lookup_compilers: Vec<mxx_bgg::LweLookupCompiler>,
@@ -890,7 +884,6 @@ fn prepare_candidate(
         layout,
         preprocessing,
         preprocessing_graph_construction,
-        preprocessing_preimage_count,
         production,
         runtime_manifest,
         lookup_compilers,
@@ -1274,50 +1267,14 @@ fn prepare_selected_benchmark_candidate(config: &TestConfig) -> Result<PreparedC
 
 fn prepare_gpu_graph(
     validated: mxx_ir_core::ValidatedGraph,
-    backend: &mut GpuDcrtBackend,
+    runtime: &mut GpuRuntime,
     inputs: &BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
-    parameters: &[GpuDCRTPolyParams],
-    execution_config: ExecutionConfig,
-) -> Result<PreparedGpuExecution, String> {
-    let prepared = prepare_gpu(GpuPreparationRequest {
-        validated,
-        backend,
-        inputs,
-        parameters,
-        default_tile_widths: vec![1, 2, 4, 8],
-        implementation_variant: "tall-production-measured".into(),
-        measurement_config: GpuWarmupMeasurementConfig::default(),
-        execution_config,
-    })
-    .map_err(|error| error.to_string())?;
-    prepared.validate_evidence().map_err(|error| error.to_string())?;
-    Ok(prepared)
-}
-
-fn execution_config(
-    config: &TestConfig,
-    max_parallel_instances: usize,
-    preprocessing_preimage_count: Option<usize>,
-) -> Result<ExecutionConfig, String> {
-    Ok(ExecutionConfig {
-        max_parallel_instances: NonZeroUsize::new(max_parallel_instances)
-            .ok_or_else(|| "maximum parallel instances must be positive".to_owned())?,
-        preimage_progress: preprocessing_preimage_count.map(|total| PreimageProgressConfig {
-            total,
-            report_interval: NonZeroUsize::new(config.preimage_progress_interval)
-                .expect("validated nonzero progress interval"),
-        }),
-        // Release-stream epochs bound queued frees without synchronizing live values.
-        release_fence_interval: Some(
-            NonZeroUsize::new(config.release_fence_interval)
-                .expect("validated nonzero fence interval"),
-        ),
-        ..ExecutionConfig::default()
-    })
+) -> Result<GpuExecutionPlan, String> {
+    runtime.plan(validated, inputs).map_err(|error| error.to_string())
 }
 
 fn matrix_family_output(
-    result: &mut ExecutionResult<GpuDcrtBackend>,
+    result: &mut GpuExecutionResult,
     name: &str,
     backend: &mut GpuDcrtBackend,
     store: &mut MemoryArtifactStore,
@@ -1712,12 +1669,6 @@ fn end_to_end_processing(
         "selected parameter evidence retained for end-to-end processing"
     );
     let bindings = ParamEnv::default();
-    let producer_execution_config = execution_config(
-        config,
-        config.preprocessing_parallel_instances,
-        Some(selected.preprocessing_preimage_count),
-    )?;
-    let runtime_execution_config = execution_config(config, config.max_parallel_instances, None)?;
     info!(
         elapsed = ?selected.preprocessing_graph_construction,
         "timed preprocessing graph construction during selected-candidate preparation"
@@ -1751,35 +1702,33 @@ fn end_to_end_processing(
         // the consumer starts without the preprocessing allocator pool and transient preimage
         // buffers still resident on the GPU.
         let (production, preprocessing_report) = {
-            let mut preprocessing_backend =
+            let preprocessing_backend =
                 gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+            let mut preprocessing_runtime =
+                GpuRuntime::new(preprocessing_backend).map_err(|error| error.to_string())?;
             let preprocessing_inputs = BTreeMap::from([(
                 HASH_KEY_INPUT.to_owned(),
                 RuntimeValue::Bytes(hash_key.to_vec()),
             )]);
-            let prepared = prepare_gpu_graph(
+            let mut prepared = prepare_gpu_graph(
                 preprocessing,
-                &mut preprocessing_backend,
+                &mut preprocessing_runtime,
                 &preprocessing_inputs,
-                std::slice::from_ref(gpu_parameters),
-                producer_execution_config,
             )?;
             info!(
                 predicted_seconds = prepared.report().predicted_seconds,
                 stages = prepared.report().stages.len(),
                 "prepared Tall preprocessing GPU plan"
             );
-            let preprocessing_report = prepared.report();
+            let preprocessing_report = prepared.report().clone();
             let started = Instant::now();
-            let preprocessing_result = prepared
-                .run(
-                    &mut preprocessing_backend,
-                    preprocessing_inputs,
-                    &mut preprocessing_store,
-                    [0x71; 32],
-                )
+            let launches_before = prepared.compiled_launch_count();
+            let preprocessing_result = preprocessing_runtime
+                .execute(&mut prepared, preprocessing_inputs, &mut preprocessing_store, [0x71; 32])
                 .map_err(|error| error.to_string())?;
-            prepared.assert_measurements_unchanged();
+            if prepared.compiled_launch_count() <= launches_before {
+                return Err("Tall preprocessing did not submit the compiled production path".into());
+            }
             info!(elapsed = ?started.elapsed(), "timed preprocessing execution");
             let production = preprocessing_result
                 .production_id
@@ -1805,7 +1754,8 @@ fn end_to_end_processing(
     };
     let preprocessing_predicted_seconds = Some(preprocessing_report.predicted_seconds);
     let manifests = BTreeMap::from([(selected.production.clone(), manifest)]);
-    let mut backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+    let backend = gpu_backend_on([gpu_parameters.clone()], device_ids.iter().copied());
+    let mut runtime = GpuRuntime::new(backend).map_err(|error| error.to_string())?;
 
     let started = Instant::now();
     let operands = random_operands(selected, config);
@@ -1843,13 +1793,7 @@ fn end_to_end_processing(
         .map_err(|error| error.to_string())?;
     info!(elapsed = ?started.elapsed(), "timed Tall encoding graph validation");
     let started = Instant::now();
-    let prepared_encoding = prepare_gpu_graph(
-        encoding_graph,
-        &mut backend,
-        &inputs,
-        std::slice::from_ref(gpu_parameters),
-        runtime_execution_config,
-    )?;
+    let mut prepared_encoding = prepare_gpu_graph(encoding_graph, &mut runtime, &inputs)?;
     info!(
         predicted_seconds = prepared_encoding.report().predicted_seconds,
         stages = prepared_encoding.report().stages.len(),
@@ -1864,20 +1808,31 @@ fn end_to_end_processing(
         protocol_predicted_seconds,
         "Tall GPU protocol predicted warmup time"
     );
-    let mut encoding_result = prepared_encoding
-        .run(&mut backend, inputs, &mut store, [0; 32])
+    let launches_before = prepared_encoding.compiled_launch_count();
+    let mut encoding_result = runtime
+        .execute(&mut prepared_encoding, inputs, &mut store, [0; 32])
         .map_err(|error| error.to_string())?;
-    let encoding_rows =
-        matrix_family_output(&mut encoding_result, "encoding_rows", &mut backend, &mut store)?;
-    let output_plaintexts =
-        matrix_family_output(&mut encoding_result, "output_plaintexts", &mut backend, &mut store)?;
+    if prepared_encoding.compiled_launch_count() <= launches_before {
+        return Err("Tall encoding did not submit the compiled production path".into());
+    }
+    let encoding_rows = matrix_family_output(
+        &mut encoding_result,
+        "encoding_rows",
+        runtime.backend_mut(),
+        &mut store,
+    )?;
+    let output_plaintexts = matrix_family_output(
+        &mut encoding_result,
+        "output_plaintexts",
+        runtime.backend_mut(),
+        &mut store,
+    )?;
     let residuals = matrix_family_output(
         &mut encoding_result,
         TALL_OPERATIONAL_RESIDUAL,
-        &mut backend,
+        runtime.backend_mut(),
         &mut store,
     )?;
-    encoding_result.cleanup_staged(&mut store).map_err(|error| error.to_string())?;
     encoding_rows.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     output_plaintexts.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
     residuals.par_iter().for_each(GpuDCRTPolyMatrix::wait_until_ready);
@@ -1891,7 +1846,6 @@ fn end_to_end_processing(
         residuals.par_iter().map(GpuDCRTPolyMatrix::to_cpu_matrix).collect::<Vec<_>>();
     info!(elapsed = ?started.elapsed(), "timed output transfer");
     info!(elapsed = ?encoding_pass_started.elapsed(), "timed encoding-pass total");
-    prepared_encoding.assert_measurements_unchanged();
     Ok(EndToEndOutputs { encoding_rows, output_plaintexts, residuals, expected_output_slots })
 }
 

@@ -79,9 +79,14 @@ pub enum NodeKind {
     ModulusReduce {
         modulus: IntExpr,
     },
-    /// Re-encodes centered residues from a single native CRT limb.
+    /// Re-encodes the centered coefficients of a source CRT basis in another ring.
     CenteredRebase {
         modulus: IntExpr,
+    },
+    /// Divides centered coefficients by a positive compile-time divisor and rounds
+    /// to the nearest integer, preserving the matrix ring and shape.
+    CenteredRoundDivide {
+        divisor: IntExpr,
     },
     /// Fused centered CRT digit extension into a multiple modulus.
     RnsModUp {

@@ -9,42 +9,79 @@ use crate::{
             gpu::{
                 GPU_MATRIX_DIST_BIT, GPU_MATRIX_DIST_GAUSS, GPU_MATRIX_DIST_TERNARY,
                 GPU_MATRIX_DIST_UNIFORM, GPU_POLY_FORMAT_COEFF, GPU_POLY_FORMAT_EVAL, GpuDCRTPoly,
-                GpuDCRTPolyParams, GpuEventSetOpaque, GpuMatrixAllocationBytes, GpuMatrixOpaque,
-                GpuP1CovarianceCacheOpaque, GpuRngSeed, GpuSmallMatrixAllocationReportRaw,
-                GpuSmallMatrixOpaque, PinnedHostBuffer, check_status, gpu_event_set_destroy,
-                gpu_event_set_wait, gpu_matrix_add, gpu_matrix_add_block,
-                gpu_matrix_add_row_blocks, gpu_matrix_binary_batch, gpu_matrix_block_mod_switch,
-                gpu_matrix_centered_rebase, gpu_matrix_convert_modulus, gpu_matrix_copy,
-                gpu_matrix_copy_block, gpu_matrix_copy_peer, gpu_matrix_copy_peer_query,
-                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
+                GpuDCRTPolyParams, GpuDecomposeFragmentRangeRaw, GpuDeviceBuffer,
+                GpuEventSetOpaque, GpuMatrixAllocationBytes, GpuMatrixBindingComponentRaw,
+                GpuMatrixLaneLimbLayoutRaw, GpuMatrixLanePhysicalLayoutRaw, GpuMatrixOpaque,
+                GpuModulusConversionPlan, GpuModulusConversionPlanOpaque, GpuNativeEvent,
+                GpuNativeGraphError, GpuNativeLaunchStream, GpuP1CovarianceCacheOpaque, GpuRngSeed,
+                GpuRowBlockAddFragmentRaw, GpuSignedValues, GpuSignedValuesEncoding,
+                GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixBindingDescriptorRaw,
+                GpuSmallMatrixOpaque, PinnedHostBuffer, bind_family_descriptor_table_live_sources,
+                check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
+                gpu_matrix_add_scalar,
+                gpu_matrix_add_block, gpu_matrix_add_row_blocks, gpu_matrix_binary_batch,
+                gpu_matrix_binary_lane_batch_layout, gpu_matrix_binding_component,
+                gpu_matrix_binding_component_count, gpu_matrix_block_mod_switch,
+                gpu_matrix_centered_rebase, gpu_matrix_centered_rebase_prepare,
+                gpu_matrix_centered_rebase_submit, gpu_matrix_centered_round_divide_prepare,
+                gpu_matrix_centered_round_divide_submit, gpu_matrix_copy, gpu_matrix_copy_block,
+                gpu_matrix_copy_block_on_capture_stream, gpu_matrix_copy_block_on_stream,
+                gpu_matrix_copy_peer, gpu_matrix_copy_peer_query, gpu_matrix_create,
+                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
                 gpu_matrix_fill_small_decomposed_identity_chunk, gpu_matrix_fill_unit_row_columns,
-                gpu_matrix_gauss_samp_gq_arb_base, gpu_matrix_intt_all, gpu_matrix_intt_batch,
-                gpu_matrix_load_compact_bytes, gpu_matrix_load_rns_batch, gpu_matrix_mul,
-                gpu_matrix_mul_accumulate_batch, gpu_matrix_mul_batch, gpu_matrix_mul_scalar,
+                gpu_matrix_gather_family, gpu_matrix_gauss_samp_gq_arb_base,
+                gpu_matrix_gauss_samp_gq_arb_base_into, gpu_matrix_initialize_preimage_retry,
+                gpu_matrix_intt_all, gpu_matrix_intt_all_on_stream, gpu_matrix_intt_batch,
+                gpu_matrix_lane_physical_layout, gpu_matrix_load_compact_bytes,
+                gpu_matrix_load_rns_batch, gpu_matrix_modulus_conversion_prepare,
+                gpu_matrix_modulus_conversion_submit, gpu_matrix_mul,
+                gpu_matrix_mul_accumulate_batch, gpu_matrix_mul_batch,
+                gpu_matrix_mul_lane_batch_layout, gpu_matrix_mul_scalar,
                 gpu_matrix_mul_scalar_batch, gpu_matrix_mul_small_rhs,
-                gpu_matrix_mul_vertical_pair, gpu_matrix_negate_batch, gpu_matrix_ntt_all,
-                gpu_matrix_ntt_in_place_batch, gpu_matrix_preimage_add_correction,
-                gpu_matrix_preimage_residual, gpu_matrix_ring_automorphism_batch,
-                gpu_matrix_rns_conversion, gpu_matrix_sample_distribution,
-                gpu_matrix_sample_distribution_columns, gpu_matrix_sample_p1_full_cached,
-                gpu_matrix_store_compact_bytes, gpu_matrix_store_compact_bytes_batch,
-                gpu_matrix_store_const_coeff_batch, gpu_matrix_store_rns_batch, gpu_matrix_sub,
+                gpu_matrix_mul_vertical_pair, gpu_matrix_mul_vertical_pair_on_stream,
+                gpu_matrix_negate_batch, gpu_matrix_negate_lane_batch_layout, gpu_matrix_ntt_all,
+                gpu_matrix_ntt_all_on_stream, gpu_matrix_ntt_in_place_batch,
+                gpu_matrix_preimage_add_correction, gpu_matrix_preimage_add_correction_on_stream,
+                gpu_matrix_preimage_residual, gpu_matrix_preimage_residual_on_stream,
+                gpu_matrix_record_compiled_write, gpu_matrix_refresh_p1_covariance_cache,
+                gpu_matrix_ring_automorphism_batch, gpu_matrix_rns_conversion,
+                gpu_matrix_sample_distribution, gpu_matrix_sample_distribution_columns,
+                gpu_matrix_sample_distribution_columns_device_seed,
+                gpu_matrix_sample_p1_full_cached, gpu_matrix_sample_p1_full_cached_into,
+                gpu_matrix_scalar_mul_lane_batch_layout, gpu_matrix_store_compact_bytes,
+                gpu_matrix_store_compact_bytes_batch, gpu_matrix_store_const_coeff_batch,
+                gpu_matrix_store_rns_batch, gpu_matrix_store_values_into_bound, gpu_matrix_sub,
                 gpu_matrix_sum_rows, gpu_matrix_tensor, gpu_matrix_tensor_sum_rows,
-                gpu_matrix_transpose, gpu_matrix_wait, gpu_small_matrix_copy,
+                gpu_matrix_track_compiled_consumer, gpu_matrix_transpose,
+                gpu_matrix_transpose_lane_batch_layout, gpu_matrix_wait,
+                gpu_matrix_wait_compiled_inputs, gpu_preimage_seed_from_control_stage_async,
+                gpu_small_matrix_binding_descriptor, gpu_small_matrix_copy,
                 gpu_small_matrix_copy_columns, gpu_small_matrix_copy_cross_context,
-                gpu_small_matrix_create, gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
-                gpu_small_matrix_load_coefficients, gpu_small_matrix_prepare_preimage_hard_cutoff,
-                gpu_small_matrix_query_allocation_bytes, gpu_small_matrix_store_coefficients,
+                gpu_small_matrix_copy_preimage_status_async,
+                gpu_small_matrix_copy_preimage_status_async_with_bindings, gpu_small_matrix_create,
+                gpu_small_matrix_decompose_base, gpu_small_matrix_destroy,
+                gpu_small_matrix_load_coefficients, gpu_small_matrix_mark_preimage_exhausted,
+                gpu_small_matrix_prepare_preimage_hard_cutoff,
+                gpu_small_matrix_prepare_preimage_hard_cutoff_for_tile,
+                gpu_small_matrix_query_allocation_bytes, gpu_small_matrix_record_compiled_write,
+                gpu_small_matrix_store_coefficients,
+                gpu_small_matrix_submit_preimage_hard_cutoff_tile,
+                gpu_small_matrix_submit_preimage_hard_cutoff_tile_control,
+                gpu_small_matrix_submit_preimage_hard_cutoff_tile_on_stream,
+                gpu_small_matrix_track_compiled_consumer,
                 gpu_small_matrix_try_pack_preimage_hard_cutoff_tile, gpu_small_matrix_view_columns,
-                gpu_small_matrix_wait,
+                gpu_small_matrix_wait, gpu_small_matrix_wait_compiled_inputs,
+                gpu_small_matrix_wait_preimage_status, prepare_matrix_external_for_capture,
+                prepare_small_matrix_external_for_capture,
             },
             params::DCRTPolyParams,
             poly::DCRTPoly,
         },
     },
+    sampler::trapdoor::gpu::PreimageStatus,
     utils::block_size,
 };
 use num_bigint::BigUint;
@@ -56,22 +93,541 @@ use std::{
     collections::BTreeMap,
     fmt::Debug,
     ops::{Add, Mul, Neg, Range, Sub},
+    os::raw::c_void,
     path::Path,
     ptr,
     sync::Arc,
 };
 use tracing::debug;
 
+unsafe extern "C" {
+    fn gpu_matrix_mul_small_rhs_into_bound(
+        outputs: *const *mut GpuMatrixOpaque,
+        inputs: *const *const GpuMatrixOpaque,
+        block_count: usize,
+        rhs_small: *const GpuSmallMatrixOpaque,
+        residency_budget_bytes: usize,
+        allocation_report: *mut GpuSmallMatrixAllocationReportRaw,
+        stream: *mut c_void,
+        source_binding_indices: *const u32,
+        destination_binding_indices: *const u32,
+        rhs_payload_binding_index: u32,
+        block_fragment_ends: *const usize,
+    ) -> i32;
+
+    fn gpu_matrix_gather_family_lanes(
+        family_descriptors: *const c_void,
+        family_count: usize,
+        destinations: *const *const GpuMatrixOpaque,
+        destination_count: usize,
+        indices: *const i64,
+        index_count: usize,
+        active_count: usize,
+        active_lane_mask: u64,
+        semantic_offset: i64,
+        width: usize,
+        physical_device: i32,
+        stream: *mut c_void,
+        status: *mut u32,
+        indices_binding_index: u32,
+        status_binding_index: u32,
+        destination_binding_indices: *const u32,
+    ) -> i32;
+
+    fn gpu_matrix_tensor_sum_rows_batch(
+        outputs: *const *mut GpuMatrixOpaque,
+        output_count: usize,
+        lhs: *const GpuMatrixOpaque,
+        rhs: *const GpuMatrixOpaque,
+        rows: *const usize,
+        offsets: *const usize,
+        output_offsets: *const usize,
+        group_count: usize,
+        term_count: usize,
+    ) -> i32;
+}
+
 #[path = "gpu_rns.rs"]
 mod gpu_rns;
 
+/// Shared lifetime token for a native matrix allocation.
+///
+/// The public matrix `Clone` implementation remains a deep device copy, but
+/// graph-owned descriptor tables need a way to retain an existing allocation
+/// without copying it.  Shallow handles share this token and therefore keep
+/// the native object alive until the last handle is dropped.
+struct GpuMatrixOwner {
+    raw: *mut GpuMatrixOpaque,
+    // Keep the CUDA context alive until the native matrix is destroyed.  The
+    // owner field is declared before the public matrix metadata so Rust drops
+    // this token before the matrix's parameter handle.
+    _params: GpuDCRTPolyParams,
+}
+
+unsafe impl Send for GpuMatrixOwner {}
+unsafe impl Sync for GpuMatrixOwner {}
+
+impl Drop for GpuMatrixOwner {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { gpu_matrix_destroy(self.raw) };
+            self.raw = ptr::null_mut();
+        }
+    }
+}
+
 pub struct GpuDCRTPolyMatrix {
+    owner: Arc<GpuMatrixOwner>,
     pub params: GpuDCRTPolyParams,
     pub nrow: usize,
     pub ncol: usize,
     level: usize,
     is_ntt: bool,
     raw: *mut GpuMatrixOpaque,
+}
+
+/// One resident rectangle in a fused row-block addition.
+pub struct GpuRowBlockAddFragment<'a> {
+    pub left: &'a GpuDCRTPolyMatrix,
+    pub right: &'a GpuDCRTPolyMatrix,
+    pub left_column: usize,
+    pub right_row: usize,
+    pub right_column: usize,
+    pub destination_row: usize,
+    pub destination_column: usize,
+    pub rows: usize,
+    pub columns: usize,
+}
+
+/// Binary operation selected by the bounded lane primitive.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuMatrixLaneBinaryOperation {
+    Add,
+    Sub,
+}
+
+/// Number of local graph bindings required for one `(lane, limb)` metadata
+/// record.  The order is lhs data, rhs data, output data, lhs descriptors, rhs
+/// descriptors, output descriptors.
+pub const GPU_MATRIX_LANE_BINARY_POINTERS_PER_LIMB: usize = 6;
+/// Number of replay bindings for one multiply metadata record.
+pub const GPU_MATRIX_LANE_MUL_POINTERS_PER_LIMB: usize = 3;
+/// Number of replay bindings for one unary or scalar metadata record.
+pub const GPU_MATRIX_LANE_UNARY_POINTERS_PER_LIMB: usize = 3;
+/// Number of replay bindings for one transpose metadata record.
+pub const GPU_MATRIX_LANE_TRANSPOSE_POINTERS_PER_LIMB: usize = 2;
+
+/// A matrix's typed physical CRT layout.  The owner borrow keeps descriptor
+/// and data allocations alive through capture and replay; the limb records are
+/// immutable snapshots used by the native lane ABI.
+pub struct GpuMatrixLanePhysicalLayout<'a> {
+    owner: &'a GpuDCRTPolyMatrix,
+    limbs: Box<[GpuMatrixLaneLimbLayoutRaw]>,
+    rows: usize,
+    columns: usize,
+}
+
+impl<'a> GpuMatrixLanePhysicalLayout<'a> {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn limb_count(&self) -> usize {
+        self.limbs.len()
+    }
+
+    fn raw(&self) -> GpuMatrixLanePhysicalLayoutRaw {
+        GpuMatrixLanePhysicalLayoutRaw {
+            owner: self.owner.raw.cast_const(),
+            limbs: self.limbs.as_ptr(),
+            limb_count: self.limbs.len(),
+            rows: self.rows,
+            columns: self.columns,
+        }
+    }
+}
+
+/// Borrowed physical allocation projection used to resolve graph bindings.
+/// Addresses are valid only while the originating matrix owner remains alive;
+/// this descriptor contains no owner or release responsibility.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuMatrixBindingComponent {
+    pub physical_device: i32,
+    pub limb_count: usize,
+    pub bytes_per_poly: usize,
+    pub data_bytes: usize,
+    pub ring_dimension: usize,
+    pub device_descriptor_stride: usize,
+    pub data_address: u64,
+    pub device_descriptors_address: u64,
+    pub auxiliary_address: u64,
+    pub auxiliary_slots_per_poly: usize,
+    pub auxiliary_slots_total: usize,
+}
+
+/// Persistent device-side descriptor table for one physical matrix
+/// partition. Each entry points at an independent owner's native local-limb
+/// descriptor array; the owners are retained here so graph replay cannot
+/// observe a released allocation.  Capture may additionally register a
+/// device-side live-source refresh, whose table-entry pointer patches are
+/// applied by graph replay without a host pointer-array rebuild.
+#[doc(hidden)]
+pub struct GpuMatrixFamilyDescriptorTable {
+    owners: Box<[Arc<GpuDCRTPolyMatrix>]>,
+    table: GpuDeviceBuffer,
+    physical_device: i32,
+    limb_count: usize,
+}
+
+unsafe impl Send for GpuMatrixFamilyDescriptorTable {}
+unsafe impl Sync for GpuMatrixFamilyDescriptorTable {}
+
+impl GpuMatrixFamilyDescriptorTable {
+    /// Build a descriptor table while retaining existing matrix allocations.
+    ///
+    /// This path creates only shallow Rust handles.  It never invokes the
+    /// matrix's deep-copy [`Clone`] implementation, so family construction
+    /// does not allocate or copy a second device matrix.  The table retains
+    /// the handles until it is dropped, which keeps every descriptor target
+    /// valid through graph capture and replay.
+    pub fn for_partition_borrowed(
+        owners: &[&GpuDCRTPolyMatrix],
+        physical_device: i32,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let shallow =
+            owners.iter().map(|owner| Arc::new(owner.clone_shallow())).collect::<Vec<_>>();
+        Self::for_partition(&shallow, physical_device)
+    }
+
+    /// Build a descriptor table for one physical partition. All owners must
+    /// share the destination-compatible context, shape, level, and domain.
+    pub fn for_partition(
+        owners: &[Arc<GpuDCRTPolyMatrix>],
+        physical_device: i32,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let first = owners.first().ok_or_else(|| {
+            GpuNativeGraphError::Native("matrix family descriptor table is empty".into())
+        })?;
+        if owners.iter().any(|owner| {
+            owner.params != first.params ||
+                owner.nrow != first.nrow ||
+                owner.ncol != first.ncol ||
+                owner.level != first.level ||
+                owner.is_ntt != first.is_ntt
+        }) {
+            return Err(GpuNativeGraphError::Native(
+                "matrix family descriptor owners are not shape-compatible".into(),
+            ));
+        }
+        let stream = first.params.native_launch_stream(physical_device)?;
+        let mut addresses = Vec::with_capacity(owners.len());
+        let mut limb_count = None;
+        for owner in owners {
+            let component = owner
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "matrix family owner has no requested physical partition".into(),
+                    )
+                })?;
+            if component.device_descriptors_address == 0 || component.limb_count == 0 {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix family owner has no native limb descriptors".into(),
+                ));
+            }
+            if limb_count.is_some_and(|count| count != component.limb_count) {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix family owners have different local limb counts".into(),
+                ));
+            }
+            limb_count = Some(component.limb_count);
+            addresses.push(component.device_descriptors_address);
+        }
+        let limb_count = limb_count.unwrap_or(0);
+        let bytes = addresses.len().checked_mul(std::mem::size_of::<u64>()).ok_or_else(|| {
+            GpuNativeGraphError::Native("matrix family table size overflow".into())
+        })?;
+        let table = GpuDeviceBuffer::allocate(&stream, bytes.max(1))?;
+        let mut encoded = Vec::with_capacity(bytes);
+        for address in addresses {
+            encoded.extend_from_slice(&address.to_ne_bytes());
+        }
+        table.upload(0, &encoded)?;
+        Ok(Self { owners: owners.to_vec().into_boxed_slice(), table, physical_device, limb_count })
+    }
+
+    pub fn family_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    pub fn physical_device(&self) -> i32 {
+        self.physical_device
+    }
+
+    pub fn limb_count(&self) -> usize {
+        self.limb_count
+    }
+
+    /// Device address of the capture-owned descriptor-pointer table.  The
+    /// table itself is a graph resource and must be rebound as one pointer;
+    /// use [`Self::bind_live_source_descriptors`] when replay source owners
+    /// can change.
+    #[doc(hidden)]
+    pub fn binding_address(&self) -> u64 {
+        self.table.as_ptr() as usize as u64
+    }
+
+    #[doc(hidden)]
+    pub fn binding_bytes(&self) -> usize {
+        self.family_count() * std::mem::size_of::<u64>()
+    }
+
+    /// Register the live descriptor owner for every family entry.  During
+    /// capture this emits a device-side pointer-table upload whose entries are
+    /// patched from `source_binding_indices` on replay.  Consequently a
+    /// replay can replace every source owner without rebuilding a host pointer
+    /// array or changing the gather kernel's table binding.
+    #[doc(hidden)]
+    pub fn bind_live_source_descriptors(
+        &self,
+        source_owners: &[&GpuDCRTPolyMatrix],
+        source_binding_indices: &[u32],
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        if source_owners.len() != self.family_count() ||
+            source_binding_indices.len() != self.family_count() ||
+            source_owners.is_empty()
+        {
+            return Err(GpuNativeGraphError::Native(
+                "family live-source binding count mismatch".into(),
+            ));
+        }
+        let reference = &self.owners[0];
+        let launch_stream = stream.control_launch_stream();
+        let mut descriptors = Vec::with_capacity(source_owners.len());
+        for owner in source_owners {
+            if owner.params != reference.params ||
+                owner.nrow != reference.nrow ||
+                owner.ncol != reference.ncol ||
+                owner.level != reference.level ||
+                owner.is_ntt != reference.is_ntt
+            {
+                return Err(GpuNativeGraphError::Native(
+                    "family live-source owner shape/domain mismatch".into(),
+                ));
+            }
+            let component = owner
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == self.physical_device)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "family live-source owner has no requested physical partition".into(),
+                    )
+                })?;
+            if component.device_descriptors_address == 0 || component.limb_count != self.limb_count
+            {
+                return Err(GpuNativeGraphError::Native(
+                    "family live-source owner descriptor identity mismatch".into(),
+                ));
+            }
+            owner.wait_compiled_inputs(self.physical_device, &launch_stream, true)?;
+            descriptors.push(component.device_descriptors_address);
+        }
+        self.table.wait_compiled_inputs(self.physical_device, &launch_stream, false)?;
+        bind_family_descriptor_table_live_sources(
+            self.table.as_ptr(),
+            &descriptors,
+            source_binding_indices,
+            stream,
+        )?;
+        self.table.record_compiled_write(&launch_stream)?;
+        Ok(())
+    }
+
+    pub fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        self.table.prepare_external_for_capture()
+    }
+}
+
+/// Persistent per-lane destination owners for a captured family gather.
+///
+/// Unlike [`GpuMatrixFamilyDescriptorTable`], this table does not pack the
+/// lanes into one widened matrix and does not allocate a scratch payload.  It
+/// retains one shallow owner per lane, so every lane keeps its own semantic
+/// `(rows, columns)` shape and native descriptor allocation alive through
+/// graph capture and replay.
+#[doc(hidden)]
+pub struct GpuMatrixLaneDestinationTable {
+    owners: Box<[Arc<GpuDCRTPolyMatrix>]>,
+    raw_owners: Box<[*const GpuMatrixOpaque]>,
+    physical_device: i32,
+    rows: usize,
+    columns: usize,
+    limb_count: usize,
+}
+
+unsafe impl Send for GpuMatrixLaneDestinationTable {}
+unsafe impl Sync for GpuMatrixLaneDestinationTable {}
+
+impl GpuMatrixLaneDestinationTable {
+    /// Build a lane destination table while retaining existing allocations.
+    /// The matrix clone is shallow and therefore does not copy device data.
+    pub fn for_partition_borrowed(
+        owners: &[&GpuDCRTPolyMatrix],
+        physical_device: i32,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let shallow =
+            owners.iter().map(|owner| Arc::new(owner.clone_shallow())).collect::<Vec<_>>();
+        Self::for_partition(&shallow, physical_device)
+    }
+
+    /// Build a destination table for one physical partition. Every lane must
+    /// have the same context, level, domain, shape and local CRT placement;
+    /// the allocations themselves remain independent.
+    pub fn for_partition(
+        owners: &[Arc<GpuDCRTPolyMatrix>],
+        physical_device: i32,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let first = owners.first().ok_or_else(|| {
+            GpuNativeGraphError::Native("matrix lane destination table is empty".into())
+        })?;
+        if owners.iter().any(|owner| {
+            owner.params != first.params ||
+                owner.nrow != first.nrow ||
+                owner.ncol != first.ncol ||
+                owner.level != first.level ||
+                owner.is_ntt != first.is_ntt
+        }) {
+            return Err(GpuNativeGraphError::Native(
+                "matrix lane destinations are not shape-compatible".into(),
+            ));
+        }
+        let mut limb_count = None;
+        for owner in owners {
+            let component = owner
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "matrix lane destination has no requested physical partition".into(),
+                    )
+                })?;
+            if component.device_descriptors_address == 0 || component.limb_count == 0 {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix lane destination has no native limb descriptors".into(),
+                ));
+            }
+            if limb_count.is_some_and(|count| count != component.limb_count) {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix lane destinations have different local limb counts".into(),
+                ));
+            }
+            limb_count = Some(component.limb_count);
+        }
+        let owners = owners.to_vec().into_boxed_slice();
+        let raw_owners = owners
+            .iter()
+            .map(|owner| owner.raw.cast_const())
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            rows: first.nrow,
+            columns: first.ncol,
+            limb_count: limb_count.unwrap_or(0),
+            owners,
+            raw_owners,
+            physical_device,
+        })
+    }
+
+    pub fn lane_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self) -> usize {
+        self.columns
+    }
+
+    pub fn physical_device(&self) -> i32 {
+        self.physical_device
+    }
+
+    pub fn limb_count(&self) -> usize {
+        self.limb_count
+    }
+
+    /// Resolve completed producer work before entering CUDA graph capture.
+    pub fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        for owner in &self.owners {
+            owner.prepare_external_for_capture()?;
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed compact payload/control projection used to resolve graph
+/// bindings. It intentionally does not expose or own host staging storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpuSmallMatrixBindingDescriptor {
+    pub physical_device: i32,
+    pub rows: usize,
+    pub columns: usize,
+    pub ring_dimension: usize,
+    pub magnitude_bytes: usize,
+    pub payload_bytes: usize,
+    pub payload_address: u64,
+    pub device_status_address: u64,
+    pub host_status_address: u64,
+    pub hard_cutoff_staging_address: u64,
+    pub hard_cutoff_staging_bytes: usize,
+}
+
+/// Immutable matrix output contract used by capture preparation.  It records
+/// the complete representation (level, domain and ordered CRT basis) together
+/// with the native allocation envelope and deterministic physical shard
+/// ranges.  No device owner or graph handle is retained by this descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuMatrixOutputDescriptor {
+    pub params: GpuDCRTPolyParams,
+    pub rows: usize,
+    pub columns: usize,
+    pub level: usize,
+    pub is_ntt: bool,
+    pub basis: Box<[u64]>,
+    pub shards: Box<[GpuMatrixShardDescriptor]>,
+    pub allocation: GpuMatrixAllocationBytes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuMatrixShardDescriptor {
+    pub physical_device: i32,
+    pub column_range: Range<usize>,
+}
+
+/// Immutable compact output contract.  The bound and encoded magnitude width
+/// are frozen before capture so a retry body can pack into one preallocated
+/// destination without changing graph topology.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GpuSmallMatrixOutputDescriptor {
+    pub params: GpuDCRTPolyParams,
+    pub rows: usize,
+    pub columns: usize,
+    pub max_coefficient_bound: BigUint,
+    pub magnitude_bytes: usize,
+    pub payload_bytes: usize,
+    pub allocation: GpuMatrixAllocationBytes,
 }
 
 /// Fully validated metadata and payload for the GPU compact matrix codec.
@@ -444,6 +1000,14 @@ impl AsRef<GpuSmallMatrix> for GpuSmallMatrixColumnView<'_> {
 }
 
 impl GpuSmallMatrixColumnView<'_> {
+    /// Consume this borrowed range descriptor and return its non-owning
+    /// native view. The caller must retain the source matrix for as long as
+    /// the returned view is used; this is the allocation-free counterpart to
+    /// [`GpuSmallMatrix::slice_columns`].
+    pub fn into_matrix(self) -> GpuSmallMatrix {
+        self.value
+    }
+
     /// Query the compact owner allocation that would be created if this
     /// borrowed range were materialized.  The view itself keeps the parent
     /// owner's resident payload so multiplication accounting continues to
@@ -474,10 +1038,125 @@ impl GpuSmallMatrixColumnView<'_> {
 }
 
 impl GpuSmallMatrix {
+    /// Build the immutable compact destination contract before capture.
+    pub fn output_descriptor(&self) -> Result<GpuSmallMatrixOutputDescriptor, SmallMatrixError> {
+        GpuSmallMatrixOutputDescriptor::for_shape(
+            &self.params,
+            self.rows,
+            self.columns,
+            self.max_coefficient_bound.clone(),
+        )
+    }
+
+    /// Resolve the borrowed device payload/control projection for graph
+    /// binding. The native owner remains responsible for all allocations.
+    #[doc(hidden)]
+    pub fn binding_descriptor(
+        &self,
+    ) -> Result<GpuSmallMatrixBindingDescriptor, GpuNativeGraphError> {
+        let mut raw = GpuSmallMatrixBindingDescriptorRaw::default();
+        let status = unsafe { gpu_small_matrix_binding_descriptor(self.raw, &mut raw as *mut _) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_small_matrix_binding_descriptor failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(GpuSmallMatrixBindingDescriptor {
+            physical_device: raw.physical_device,
+            rows: raw.rows,
+            columns: raw.columns,
+            ring_dimension: raw.n,
+            magnitude_bytes: raw.magnitude_bytes,
+            payload_bytes: raw.payload_bytes,
+            payload_address: raw.payload as usize as u64,
+            device_status_address: raw.device_status as usize as u64,
+            host_status_address: raw.host_status as usize as u64,
+            hard_cutoff_staging_address: raw.hard_cutoff_staging as usize as u64,
+            hard_cutoff_staging_bytes: raw.hard_cutoff_staging_bytes,
+        })
+    }
+
     /// Wait only for this compact owner's last write event.
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_small_matrix_wait(self.raw) };
         check_status(status, "gpu_small_matrix_wait");
+    }
+
+    /// Queue the compact owner's producer dependency on a compiled graph
+    /// stream. This is device-side only and never observes completion on the
+    /// host.
+    #[doc(hidden)]
+    pub fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_small_matrix_wait_compiled_inputs(
+                self.raw,
+                consumer_device,
+                launch_stream.raw_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_small_matrix_wait_compiled_inputs failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register this compact owner as a read consumer of one compiled graph
+    /// submission. The native release stream waits for the supplied event.
+    #[doc(hidden)]
+    pub fn protect_compiled_submission(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_small_matrix_track_compiled_consumer(
+                self.raw,
+                launch_stream.raw_ptr(),
+                completion_event,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_small_matrix_track_compiled_consumer failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register the graph's write completion as this compact owner's current
+    /// producer event. The host-ready state is invalidated by the native
+    /// writer registration before any subsequent consumer can bypass it.
+    #[doc(hidden)]
+    pub fn record_compiled_write(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status =
+            unsafe { gpu_small_matrix_record_compiled_write(self.raw, launch_stream.raw_ptr()) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_small_matrix_record_compiled_write failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve this private compact exemplar before graph capture and clear
+    /// only its completed pre-capture writer dependency.
+    #[doc(hidden)]
+    pub fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        prepare_small_matrix_external_for_capture(self.raw)
     }
 
     /// Return the exact device allocation owned by this compact matrix.
@@ -571,6 +1250,21 @@ impl GpuSmallMatrix {
             self.params.ring_dimension(),
             self.magnitude_bytes,
         )
+    }
+
+    /// Copy this compact owner into a caller-provided graph-boundary
+    /// destination. The destination remains an ordinary run-local owner and
+    /// receives the native writer event from the asynchronous copy.
+    #[doc(hidden)]
+    pub fn copy_into(&self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe { gpu_small_matrix_copy(destination.raw, self.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_small_matrix_copy failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
     }
 
     /// Number of payload bytes used for one signed coefficient magnitude.
@@ -910,6 +1604,188 @@ impl GpuSmallMatrix {
         Ok(accepted[0] != 0)
     }
 
+    /// Prepare one fixed device staging tile for allocation-free retry
+    /// submissions. The workspace is retained by this owner and reused by
+    /// every attempt; callers must choose the maximum admitted tile width
+    /// before entering a captured/conditional region.
+    pub fn prepare_preimage_hard_cutoff_for_tile(&mut self, rows: usize, columns: usize) {
+        let status = unsafe {
+            gpu_small_matrix_prepare_preimage_hard_cutoff_for_tile(self.raw, rows, columns)
+        };
+        check_status(status, "gpu_small_matrix_prepare_preimage_hard_cutoff_for_tile");
+    }
+
+    /// Enqueue one cutoff attempt using the retained staging/status buffers.
+    /// This is the graph-body primitive: it performs no host transfer,
+    /// allocation, callback, or synchronization.
+    pub fn submit_preimage_hard_cutoff_tile(
+        &mut self,
+        source: &GpuDCRTPolyMatrix,
+        dst_row: usize,
+        dst_col: usize,
+        rows: usize,
+        columns: usize,
+        attempt: u32,
+    ) {
+        if source.params.gpu_ids() != self.params.gpu_ids() {
+            panic!("preimage hard-cutoff submit requires matching devices");
+        }
+        if source.params != self.params {
+            panic!("preimage hard-cutoff submit requires matching parameters");
+        }
+        if source.params.ctx_raw() != self.params.ctx_raw() {
+            panic!("preimage hard-cutoff submit requires matching context");
+        }
+        assert!(!source.is_ntt, "preimage hard-cutoff submit requires coefficient source");
+        let words = Self::bound_words(&self.max_coefficient_bound);
+        let status = unsafe {
+            gpu_small_matrix_submit_preimage_hard_cutoff_tile(
+                self.raw,
+                source.raw,
+                dst_row,
+                dst_col,
+                rows,
+                columns,
+                words.as_ptr(),
+                words.len(),
+                attempt,
+            )
+        };
+        check_status(status, "gpu_small_matrix_submit_preimage_hard_cutoff_tile");
+    }
+
+    /// Enqueue the fixed cutoff/pack sequence onto a sampler body-capture
+    /// stream. No allocation, host transfer, or synchronization is performed.
+    #[doc(hidden)]
+    pub fn submit_preimage_hard_cutoff_tile_on_stream(
+        &mut self,
+        source: &GpuDCRTPolyMatrix,
+        dst_row: usize,
+        dst_col: usize,
+        rows: usize,
+        columns: usize,
+        attempt: u32,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        if source.params.ctx_raw() != self.params.ctx_raw() || source.is_ntt {
+            panic!("preimage body submit requires a matching coefficient-domain context");
+        }
+        let words = Self::bound_words(&self.max_coefficient_bound);
+        let status = unsafe {
+            gpu_small_matrix_submit_preimage_hard_cutoff_tile_on_stream(
+                self.raw,
+                source.raw,
+                dst_row,
+                dst_col,
+                rows,
+                columns,
+                words.as_ptr(),
+                words.len(),
+                attempt,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_small_matrix_submit_preimage_hard_cutoff_tile_on_stream");
+    }
+
+    /// Device-control variant used by a conditional WHILE body. The native
+    /// init kernel reads the device attempt counter instead of a captured host
+    /// scalar, preserving per-replay attempt identity.
+    #[doc(hidden)]
+    pub fn submit_preimage_hard_cutoff_tile_control(
+        &mut self,
+        source: &GpuDCRTPolyMatrix,
+        dst_row: usize,
+        dst_col: usize,
+        rows: usize,
+        columns: usize,
+        device_control: *mut c_void,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        if source.params.ctx_raw() != self.params.ctx_raw() || source.is_ntt {
+            panic!("preimage body submit requires a matching coefficient-domain context");
+        }
+        let words = Self::bound_words(&self.max_coefficient_bound);
+        let status = unsafe {
+            gpu_small_matrix_submit_preimage_hard_cutoff_tile_control(
+                self.raw,
+                source.raw,
+                dst_row,
+                dst_col,
+                rows,
+                columns,
+                words.as_ptr(),
+                words.len(),
+                device_control,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_small_matrix_submit_preimage_hard_cutoff_tile_control");
+    }
+
+    #[doc(hidden)]
+    pub fn derive_preimage_stage_seed_from_control(
+        &self,
+        device_control: *const c_void,
+        device_seed: *mut c_void,
+        stage_id: u32,
+        control_binding_index: u32,
+        seed_binding_index: u32,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        let status = unsafe {
+            gpu_preimage_seed_from_control_stage_async(
+                self.params.ctx_raw(),
+                device_control,
+                device_seed,
+                stage_id,
+                stream.raw_ptr(),
+                control_binding_index,
+                seed_binding_index,
+            )
+        };
+        check_status(status, "gpu_preimage_seed_from_control_stage_async");
+    }
+
+    /// Enqueue the single final status D2H transfer after all retry work has
+    /// completed. The host observes it through `wait_preimage_status` once.
+    pub fn copy_preimage_status_async(&mut self) {
+        let status = unsafe { gpu_small_matrix_copy_preimage_status_async(self.raw) };
+        check_status(status, "gpu_small_matrix_copy_preimage_status_async");
+    }
+
+    /// Queue the final status transfer using the retry region's frozen
+    /// device/host binding indices.  This keeps the memcpy schema aligned with
+    /// the gate and attempt body rather than relying on a primitive-local
+    /// index pair.
+    #[doc(hidden)]
+    pub fn copy_preimage_status_async_with_bindings(
+        &mut self,
+        status_binding_index: u32,
+        host_status_binding_index: u32,
+    ) {
+        let status = unsafe {
+            gpu_small_matrix_copy_preimage_status_async_with_bindings(
+                self.raw,
+                status_binding_index,
+                host_status_binding_index,
+            )
+        };
+        check_status(status, "gpu_small_matrix_copy_preimage_status_async_with_bindings");
+    }
+
+    pub fn mark_preimage_exhausted(&mut self) {
+        let status = unsafe { gpu_small_matrix_mark_preimage_exhausted(self.raw) };
+        check_status(status, "gpu_small_matrix_mark_preimage_exhausted");
+    }
+
+    pub fn wait_preimage_status(&mut self) -> PreimageStatus {
+        let mut out = PreimageStatus::default();
+        let status = unsafe { gpu_small_matrix_wait_preimage_status(self.raw, &mut out) };
+        check_status(status, "gpu_small_matrix_wait_preimage_status");
+        out
+    }
+
     /// Allocates and uploads the immutable CRT hard-cutoff plan once, before
     /// preimage retry sampling begins. Other compact matrices do not carry it.
     pub fn prepare_preimage_hard_cutoff(&mut self) {
@@ -986,6 +1862,43 @@ impl GpuSmallMatrix {
             u32_workspace_limb_count: workspace_layout.u32_limb_count,
             u64_workspace_limb_count: workspace_layout.u64_limb_count,
         })
+    }
+}
+
+impl GpuSmallMatrixOutputDescriptor {
+    pub fn for_shape(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        max_coefficient_bound: BigUint,
+    ) -> Result<Self, SmallMatrixError> {
+        let magnitude_bytes = GpuSmallMatrix::magnitude_bytes(&max_coefficient_bound)?;
+        let payload_bytes =
+            GpuSmallMatrix::payload_len(rows, columns, params.ring_dimension(), magnitude_bytes)?;
+        let allocation =
+            GpuSmallMatrix::allocation_bytes_for_shape(params, rows, columns, magnitude_bytes)
+                .map_err(|_| SmallMatrixError::InvalidConfig)?;
+        Ok(Self {
+            params: params.clone(),
+            rows,
+            columns,
+            max_coefficient_bound,
+            magnitude_bytes,
+            payload_bytes,
+            allocation,
+        })
+    }
+
+    /// Allocate exactly the compact owner described by this frozen contract.
+    pub fn allocate(&self) -> Result<GpuSmallMatrix, SmallMatrixError> {
+        GpuSmallMatrix::new_empty_checked(
+            &self.params,
+            self.rows,
+            self.columns,
+            self.max_coefficient_bound.clone(),
+            self.magnitude_bytes,
+            usize::MAX,
+        )
     }
 }
 
@@ -1145,6 +2058,7 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
                 words.len(),
                 out.raw,
                 dropped,
+                ptr::null(),
             )
         };
         check_status(status, "gpu_small_matrix_decompose_base");
@@ -1237,13 +2151,47 @@ impl PolyMatrixSmallRhs for GpuDCRTPolyMatrix {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct GpuP1CovarianceCache {
     raw: *mut GpuP1CovarianceCacheOpaque,
+    capture_stream: Option<GpuNativeLaunchStream>,
+}
+
+impl std::fmt::Debug for GpuP1CovarianceCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GpuP1CovarianceCache")
+            .field("raw", &self.raw)
+            .field(
+                "capture_device",
+                &self.capture_stream.as_ref().map(GpuNativeLaunchStream::physical_device),
+            )
+            .finish()
+    }
 }
 
 unsafe impl Send for GpuP1CovarianceCache {}
 unsafe impl Sync for GpuP1CovarianceCache {}
+
+impl GpuP1CovarianceCache {
+    pub(crate) fn initialize_retry(
+        &self,
+        device_control: *mut std::ffi::c_void,
+        device_status: *mut std::ffi::c_void,
+        control: &crate::sampler::trapdoor::gpu::PreimageLaunchControl,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        let status = unsafe {
+            gpu_matrix_initialize_preimage_retry(
+                self.raw,
+                device_control,
+                device_status,
+                std::ptr::from_ref(control).cast(),
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_initialize_preimage_retry");
+    }
+}
 
 impl Drop for GpuP1CovarianceCache {
     fn drop(&mut self) {
@@ -1328,12 +2276,7 @@ unsafe impl Send for GpuDCRTPolyMatrix {}
 unsafe impl Sync for GpuDCRTPolyMatrix {}
 
 impl Drop for GpuDCRTPolyMatrix {
-    fn drop(&mut self) {
-        if !self.raw.is_null() {
-            unsafe { gpu_matrix_destroy(self.raw) };
-            self.raw = ptr::null_mut();
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 impl Clone for GpuDCRTPolyMatrix {
@@ -1411,6 +2354,1051 @@ impl PartialEq for GpuDCRTPolyMatrix {
 impl Eq for GpuDCRTPolyMatrix {}
 
 impl GpuDCRTPolyMatrix {
+    /// Enqueue one compact-RHS product into preallocated evaluation-domain
+    /// destinations on an explicitly supplied stream. Binding indices are
+    /// operation-local identities for each source descriptor, destination
+    /// descriptor, and the compact RHS payload; the capture owner maps them
+    /// to its outer schema before this call.
+    #[doc(hidden)]
+    pub fn multiply_small_rhs_row_blocks_into_bound(
+        blocks: &[&Self],
+        rhs: &GpuSmallMatrix,
+        outputs: &mut [&mut Self],
+        stream: &GpuNativeLaunchStream,
+        source_binding_indices: &[u32],
+        destination_binding_indices: &[u32],
+        rhs_payload_binding_index: u32,
+        block_fragment_ends: &[usize],
+    ) -> Result<(), SmallMatrixError> {
+        let first = *blocks.first().ok_or(SmallMatrixError::ShapeMismatch)?;
+        if blocks.len() > 128 ||
+            outputs.len() > 32 ||
+            block_fragment_ends.len() != outputs.len() ||
+            block_fragment_ends.last() != Some(&blocks.len()) ||
+            source_binding_indices.len() != blocks.len() ||
+            destination_binding_indices.len() != outputs.len() ||
+            blocks.iter().any(|block| {
+                block.params != first.params ||
+                    block.params.ctx_raw() != first.params.ctx_raw() ||
+                    block.level != first.level ||
+                    !block.is_ntt
+            })
+        {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if first.params.gpu_ids() != rhs.params.gpu_ids() {
+            return Err(SmallMatrixError::DeviceMismatch);
+        }
+        if first.params != rhs.params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if first.params.ctx_raw() != rhs.params.ctx_raw() {
+            return Err(SmallMatrixError::ContextMismatch);
+        }
+        if outputs.iter().any(|output| {
+            output.params != first.params ||
+                output.params.ctx_raw() != first.params.ctx_raw() ||
+                output.nrow == 0 ||
+                output.ncol != rhs.columns ||
+                output.level != first.level ||
+                !output.is_ntt
+        }) {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        let mut start = 0;
+        for (end, output) in block_fragment_ends.iter().zip(outputs.iter()) {
+            if *end <= start ||
+                *end > blocks.len() ||
+                blocks[start..*end].iter().any(|block| output.nrow != block.nrow) ||
+                blocks[start..*end]
+                    .iter()
+                    .try_fold(0usize, |sum, block| sum.checked_add(block.ncol)) !=
+                    Some(rhs.rows)
+            {
+                return Err(SmallMatrixError::ShapeMismatch);
+            }
+            start = *end;
+        }
+        let budget = first.params.vram_budget_bytes();
+        let allocation_bytes = |matrix: &Self| {
+            first
+                .params
+                .matrix_allocation_bytes(matrix.level, matrix.nrow, matrix.ncol, matrix.is_ntt)
+                .map(|allocation| allocation.total_bytes)
+                .map_err(|_| SmallMatrixError::DimensionOverflow)
+        };
+        let lhs_bytes = blocks.iter().try_fold(0usize, |total, block| {
+            total.checked_add(allocation_bytes(block)?).ok_or(SmallMatrixError::DimensionOverflow)
+        })?;
+        let output_bytes = outputs.iter().try_fold(0usize, |total, output| {
+            total.checked_add(allocation_bytes(output)?).ok_or(SmallMatrixError::DimensionOverflow)
+        })?;
+        let planned = rhs.allocation_report_from_planner_totals(lhs_bytes, output_bytes)?;
+        validate_small_rhs_budget(&planned, budget)?;
+        let raw_outputs = outputs.iter().map(|output| output.raw).collect::<Vec<_>>();
+        let raw_inputs = blocks.iter().map(|block| block.raw.cast_const()).collect::<Vec<_>>();
+        let mut raw_report = GpuSmallMatrixAllocationReportRaw::default();
+        let status = unsafe {
+            gpu_matrix_mul_small_rhs_into_bound(
+                raw_outputs.as_ptr(),
+                raw_inputs.as_ptr(),
+                outputs.len(),
+                rhs.raw,
+                budget,
+                &mut raw_report,
+                stream.raw_ptr(),
+                source_binding_indices.as_ptr(),
+                destination_binding_indices.as_ptr(),
+                rhs_payload_binding_index,
+                block_fragment_ends.as_ptr(),
+            )
+        };
+        if status == 2 {
+            return Err(SmallMatrixError::ResourceExhausted {
+                requested_bytes: raw_report.high_water_bytes,
+                budget_bytes: budget,
+            });
+        }
+        check_status(status, "gpu_matrix_mul_small_rhs_into_bound");
+        validate_small_rhs_runtime_report(&planned, &raw_report, budget)
+    }
+
+    /// Snapshot the owner-checked physical data/descriptor layout for one
+    /// matrix.  The snapshot contains no host coefficient data and is safe to
+    /// retain while a captured lane wave is replayed.
+    pub fn physical_lane_layout(&self) -> GpuMatrixLanePhysicalLayout<'_> {
+        let mut limbs = vec![
+            GpuMatrixLaneLimbLayoutRaw {
+                data: std::ptr::null(),
+                descriptors: std::ptr::null(),
+                stride_bytes: 0,
+                coefficient_bytes: 0,
+            };
+            self.level + 1
+        ];
+        let mut limb_count = 0usize;
+        let mut rows = 0usize;
+        let mut columns = 0usize;
+        let status = unsafe {
+            gpu_matrix_lane_physical_layout(
+                self.raw.cast_const(),
+                limbs.as_mut_ptr(),
+                limbs.len(),
+                &mut limb_count,
+                &mut rows,
+                &mut columns,
+            )
+        };
+        check_status(status, "gpu_matrix_lane_physical_layout");
+        limbs.truncate(limb_count);
+        GpuMatrixLanePhysicalLayout { owner: self, limbs: limbs.into_boxed_slice(), rows, columns }
+    }
+
+    /// Submit one capture-safe add/sub launch for a preallocated wave.  Each
+    /// lane retains its own rows/columns shape; `active_lane_mask` may be a
+    /// full mask or a tail mask and inactive output lanes are untouched.
+    /// `right_broadcast` repeats `right_layouts[0]` for every active lane.
+    pub fn binary_lane_batch<'a>(
+        outputs: &[&'a Self],
+        left_layouts: &[&'a Self],
+        right_layouts: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        operation: GpuMatrixLaneBinaryOperation,
+        right_broadcast: bool,
+    ) {
+        assert_eq!(outputs.len(), left_layouts.len(), "lane output/left count mismatch");
+        assert!(
+            right_broadcast || right_layouts.len() == outputs.len(),
+            "varying RHS lane count mismatch"
+        );
+        assert!(!right_broadcast || !right_layouts.is_empty(), "broadcast RHS is empty");
+        let output_layouts =
+            outputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let left_layouts =
+            left_layouts.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let right_layouts =
+            right_layouts.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        Self::binary_lane_batch_layout(
+            &output_layouts,
+            &left_layouts,
+            &right_layouts,
+            active_count,
+            active_lane_mask,
+            operation,
+            right_broadcast,
+        );
+    }
+
+    /// Submit a lane wave from typed physical layouts prepared before the
+    /// launch.  This is the fleet-facing form: the owner borrow in each
+    /// layout pins its exact descriptor/data binding through capture/replay.
+    pub fn binary_lane_batch_layout(
+        outputs: &[GpuMatrixLanePhysicalLayout<'_>],
+        left_layouts: &[GpuMatrixLanePhysicalLayout<'_>],
+        right_layouts: &[GpuMatrixLanePhysicalLayout<'_>],
+        active_count: usize,
+        active_lane_mask: u64,
+        operation: GpuMatrixLaneBinaryOperation,
+        right_broadcast: bool,
+    ) {
+        Self::binary_lane_batch_layout_with_bindings(
+            outputs,
+            left_layouts,
+            right_layouts,
+            active_count,
+            active_lane_mask,
+            operation,
+            right_broadcast,
+            &[],
+        );
+    }
+
+    /// Submit a lane wave with an explicit six-pointer binding tuple for every
+    /// `(lane, limb)`: lhs data, rhs data, output data, lhs descriptors, rhs
+    /// descriptors, and output descriptors.  The tuple is flattened in lane,
+    /// then limb, then pointer-role order.
+    #[doc(hidden)]
+    pub fn binary_lane_batch_layout_with_bindings(
+        outputs: &[GpuMatrixLanePhysicalLayout<'_>],
+        left_layouts: &[GpuMatrixLanePhysicalLayout<'_>],
+        right_layouts: &[GpuMatrixLanePhysicalLayout<'_>],
+        active_count: usize,
+        active_lane_mask: u64,
+        operation: GpuMatrixLaneBinaryOperation,
+        right_broadcast: bool,
+        metadata_binding_indices: &[u32],
+    ) {
+        assert_eq!(outputs.len(), left_layouts.len(), "lane output/left count mismatch");
+        assert!(
+            right_broadcast || right_layouts.len() == outputs.len(),
+            "varying RHS lane count mismatch"
+        );
+        assert!(!right_broadcast || !right_layouts.is_empty(), "broadcast RHS is empty");
+        let output_raw = outputs.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let left_raw =
+            left_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let right_raw =
+            right_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_binary_lane_batch_layout(
+                output_raw.as_ptr(),
+                left_raw.as_ptr(),
+                right_raw.as_ptr(),
+                output_raw.len(),
+                active_count,
+                active_lane_mask,
+                match operation {
+                    GpuMatrixLaneBinaryOperation::Add => 0,
+                    GpuMatrixLaneBinaryOperation::Sub => 1,
+                },
+                right_broadcast as i32,
+                metadata_binding_indices.as_ptr(),
+                metadata_binding_indices.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_binary_lane_batch_layout");
+    }
+
+    /// Submit one evaluation-domain matrix multiply per active lane in one
+    /// launch.  The output matrices must be preallocated with each lane's
+    /// `(rows, columns)` product shape.
+    pub fn mul_lane_batch<'a>(
+        outputs: &[&'a Self],
+        left_layouts: &[&'a Self],
+        right_layouts: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+    ) {
+        Self::mul_lane_batch_with_bindings(
+            outputs,
+            left_layouts,
+            right_layouts,
+            active_count,
+            active_lane_mask,
+            &[],
+        );
+    }
+
+    /// Submit a matrix multiply lane wave with three replay bindings per
+    /// `(lane, limb)`: lhs data, rhs data, and output data.
+    #[doc(hidden)]
+    pub fn mul_lane_batch_with_bindings<'a>(
+        outputs: &[&'a Self],
+        left_layouts: &[&'a Self],
+        right_layouts: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        metadata_binding_indices: &[u32],
+    ) {
+        assert_eq!(outputs.len(), left_layouts.len(), "lane output/left count mismatch");
+        assert_eq!(outputs.len(), right_layouts.len(), "lane output/right count mismatch");
+        let output_layouts =
+            outputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let left_layouts =
+            left_layouts.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let right_layouts =
+            right_layouts.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        assert!(
+            output_layouts.iter().zip(left_layouts.iter()).zip(right_layouts.iter()).all(
+                |((output, left), right)| {
+                    output.owner.is_ntt && left.owner.is_ntt && right.owner.is_ntt
+                }
+            ),
+            "lane matrix multiply requires evaluation-domain owners"
+        );
+        let output_raw =
+            output_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let left_raw =
+            left_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let right_raw =
+            right_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_mul_lane_batch_layout(
+                output_raw.as_ptr(),
+                left_raw.as_ptr(),
+                right_raw.as_ptr(),
+                output_raw.len(),
+                active_count,
+                active_lane_mask,
+                metadata_binding_indices.as_ptr(),
+                metadata_binding_indices.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_mul_lane_batch_layout");
+    }
+
+    /// Submit one negate launch for all active lanes.
+    pub fn negate_lane_batch<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+    ) {
+        Self::negate_lane_batch_with_bindings(outputs, inputs, active_count, active_lane_mask, &[]);
+    }
+
+    /// Submit a negate lane wave with three replay bindings per `(lane, limb)`:
+    /// input data, the input alias used by the scalar slot, and output data.
+    #[doc(hidden)]
+    pub fn negate_lane_batch_with_bindings<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        metadata_binding_indices: &[u32],
+    ) {
+        assert_eq!(outputs.len(), inputs.len(), "lane output/input count mismatch");
+        let output_layouts =
+            outputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let input_layouts =
+            inputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let output_raw =
+            output_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let input_raw =
+            input_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_negate_lane_batch_layout(
+                output_raw.as_ptr(),
+                input_raw.as_ptr(),
+                output_raw.len(),
+                active_count,
+                active_lane_mask,
+                metadata_binding_indices.as_ptr(),
+                metadata_binding_indices.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_negate_lane_batch_layout");
+    }
+
+    /// Submit one scalar multiplication launch for all active lanes.  A
+    /// broadcast scalar layout is reused across lanes when requested.
+    pub fn scalar_mul_lane_batch<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        scalars: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        scalar_broadcast: bool,
+    ) {
+        Self::scalar_mul_lane_batch_with_bindings(
+            outputs,
+            inputs,
+            scalars,
+            active_count,
+            active_lane_mask,
+            scalar_broadcast,
+            &[],
+        );
+    }
+
+    /// Submit a scalar multiplication lane wave with three replay bindings per
+    /// `(lane, limb)`: input data, scalar data, and output data.
+    #[doc(hidden)]
+    pub fn scalar_mul_lane_batch_with_bindings<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        scalars: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        scalar_broadcast: bool,
+        metadata_binding_indices: &[u32],
+    ) {
+        assert_eq!(outputs.len(), inputs.len(), "lane output/input count mismatch");
+        assert!(
+            scalar_broadcast || scalars.len() == outputs.len(),
+            "varying scalar lane count mismatch"
+        );
+        assert!(!scalar_broadcast || !scalars.is_empty(), "broadcast scalar is empty");
+        let output_layouts =
+            outputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let input_layouts =
+            inputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let scalar_layouts =
+            scalars.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let output_raw =
+            output_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let input_raw =
+            input_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let scalar_raw =
+            scalar_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_scalar_mul_lane_batch_layout(
+                output_raw.as_ptr(),
+                input_raw.as_ptr(),
+                scalar_raw.as_ptr(),
+                output_raw.len(),
+                active_count,
+                active_lane_mask,
+                scalar_broadcast as i32,
+                metadata_binding_indices.as_ptr(),
+                metadata_binding_indices.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_scalar_mul_lane_batch_layout");
+    }
+
+    /// Submit one transpose launch for all active lanes, preserving each
+    /// lane's independent rectangular shape.
+    pub fn transpose_lane_batch<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+    ) {
+        Self::transpose_lane_batch_with_bindings(
+            outputs,
+            inputs,
+            active_count,
+            active_lane_mask,
+            &[],
+        );
+    }
+
+    /// Submit a transpose lane wave with two replay bindings per `(lane, limb)`:
+    /// input data and output data.
+    #[doc(hidden)]
+    pub fn transpose_lane_batch_with_bindings<'a>(
+        outputs: &[&'a Self],
+        inputs: &[&'a Self],
+        active_count: usize,
+        active_lane_mask: u64,
+        metadata_binding_indices: &[u32],
+    ) {
+        assert_eq!(outputs.len(), inputs.len(), "lane output/input count mismatch");
+        let output_layouts =
+            outputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let input_layouts =
+            inputs.iter().map(|matrix| matrix.physical_lane_layout()).collect::<Vec<_>>();
+        let output_raw =
+            output_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let input_raw =
+            input_layouts.iter().map(GpuMatrixLanePhysicalLayout::raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_transpose_lane_batch_layout(
+                output_raw.as_ptr(),
+                input_raw.as_ptr(),
+                output_raw.len(),
+                active_count,
+                active_lane_mask,
+                metadata_binding_indices.as_ptr(),
+                metadata_binding_indices.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_transpose_lane_batch_layout");
+    }
+
+    /// Return a handle sharing this matrix's native allocation.
+    ///
+    /// This is intentionally separate from [`Clone`], whose established
+    /// semantics are a deep device copy.  The shallow handle is used only by
+    /// graph resource owners that also retain the source allocation for the
+    /// complete capture/replay lifetime. The returned handle retains the
+    /// allocation, CUDA context, and producer/lifetime state through the
+    /// shared native owner token.
+    pub fn clone_shallow(&self) -> Self {
+        Self {
+            params: self.params.clone(),
+            nrow: self.nrow,
+            ncol: self.ncol,
+            level: self.level,
+            is_ntt: self.is_ntt,
+            raw: self.raw,
+            owner: Arc::clone(&self.owner),
+        }
+    }
+
+    /// Submit fused row-block decomposition from resident sources into a
+    /// compact owner prepared before capture.
+    pub fn gadget_decompose_row_blocks_ref_into(
+        blocks: &[&Self],
+        small: bool,
+        digit_count: Option<usize>,
+        output: &mut GpuSmallMatrix,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), SmallMatrixError> {
+        let source_binding_indices = vec![u32::MAX; blocks.len()];
+        Self::gadget_decompose_row_blocks_ref_into_bound(
+            blocks,
+            small,
+            digit_count,
+            output,
+            stream,
+            &source_binding_indices,
+            None,
+        )
+    }
+
+    /// Submit fused row-block decomposition with explicit descriptor bindings
+    /// for each source block. The binding IDs are operation-local IDs used by
+    /// the captured decomposition kernel; `u32::MAX` disables patching for an
+    /// ordinary non-captured launch. Input domain metadata and ownership stay
+    /// unchanged: evaluation-domain sources are transformed in place before
+    /// decomposition and restored before this method returns.
+    pub fn gadget_decompose_row_blocks_ref_into_bound(
+        blocks: &[&Self],
+        small: bool,
+        digit_count: Option<usize>,
+        output: &mut GpuSmallMatrix,
+        stream: &GpuNativeLaunchStream,
+        source_binding_indices: &[u32],
+        ranges: Option<&[(std::ops::Range<usize>, usize, usize)]>,
+    ) -> Result<(), SmallMatrixError> {
+        let first = *blocks.first().ok_or(SmallMatrixError::ShapeMismatch)?;
+        if source_binding_indices.len() != blocks.len() ||
+            ranges.is_some_and(|ranges| ranges.len() != blocks.len())
+        {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        if blocks.len() > 32 ||
+            blocks.iter().any(|block| {
+                block.params != first.params ||
+                    block.params.ctx_raw() != first.params.ctx_raw() ||
+                    (ranges.is_none() && block.ncol != first.ncol) ||
+                    block.level != first.level
+            })
+        {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        let base = BigUint::from(1u8) << first.params.base_bits();
+        let bound =
+            if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
+        let default_digits = if small {
+            first.params.crt_bits().div_ceil(first.params.base_bits() as usize)
+        } else {
+            first.params.modulus_digits()
+        };
+        let digits = digit_count.unwrap_or(default_digits);
+        let dropped = if small {
+            if digits != default_digits {
+                return Err(SmallMatrixError::InvalidConfig);
+            }
+            first.params.dropped_moduli()
+        } else {
+            first
+                .params
+                .gadget_dropped_moduli(Some(digits))
+                .ok_or(SmallMatrixError::InvalidConfig)?
+        };
+        if dropped > 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let rows = blocks
+            .iter()
+            .try_fold(0usize, |rows, block| rows.checked_add(block.nrow))
+            .and_then(|rows| rows.checked_mul(digits))
+            .ok_or(SmallMatrixError::DimensionOverflow)?;
+        if output.params != first.params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if ranges.is_none() && (output.rows_count() != rows || output.columns_count() != first.ncol)
+        {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if output.bound() != &bound {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        if blocks.iter().any(|block| block.is_ntt) {
+            for (block_index, block) in blocks.iter().copied().enumerate() {
+                if block.is_ntt {
+                    block
+                        .transform_coefficients_on_stream(
+                            stream,
+                            source_binding_indices[block_index],
+                            false,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("gpu_matrix_intt_all_on_stream decomposition failed: {error}")
+                        });
+                }
+            }
+        }
+        let words = GpuSmallMatrix::bound_words(&bound);
+        let raw_sources = blocks.iter().map(|block| block.raw.cast_const()).collect::<Vec<_>>();
+        let raw_ranges = ranges.map(|ranges| {
+            ranges
+                .iter()
+                .map(|(range, row, column)| GpuDecomposeFragmentRangeRaw {
+                    source_column: range.start,
+                    destination_row: *row,
+                    destination_column: *column,
+                    columns: range.len(),
+                })
+                .collect::<Vec<_>>()
+        });
+        let status = unsafe {
+            gpu_small_matrix_decompose_base(
+                raw_sources.as_ptr(),
+                raw_sources.len(),
+                first.params.base_bits(),
+                i32::from(small),
+                words.as_ptr(),
+                words.len(),
+                output.raw,
+                dropped,
+                raw_ranges.as_ref().map_or(ptr::null(), |ranges| ranges.as_ptr()),
+            )
+        };
+        check_status(status, "gpu_small_matrix_decompose_base");
+        for (block_index, block) in blocks.iter().copied().enumerate() {
+            if block.is_ntt {
+                block
+                    .transform_coefficients_on_stream(
+                        stream,
+                        source_binding_indices[block_index],
+                        true,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "gpu_matrix_ntt_all_on_stream restore decomposition input failed: {error}"
+                        )
+                    });
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit decomposition from a resident source into a compact owner
+    /// prepared before capture. No owner is created here.
+    pub fn gadget_decompose_ref_into(
+        &self,
+        small: bool,
+        digit_count: Option<usize>,
+        output: &mut GpuSmallMatrix,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), SmallMatrixError> {
+        self.gadget_decompose_ref_into_bound(small, digit_count, output, stream, u32::MAX)
+    }
+
+    /// Submit decomposition with an explicit operation-local source
+    /// descriptor binding. `u32::MAX` disables descriptor patching for an
+    /// ordinary non-captured launch. The source's Rust domain/owner metadata
+    /// is preserved while its resident data is temporarily transformed.
+    pub fn gadget_decompose_ref_into_bound(
+        &self,
+        small: bool,
+        digit_count: Option<usize>,
+        output: &mut GpuSmallMatrix,
+        stream: &GpuNativeLaunchStream,
+        source_binding_index: u32,
+    ) -> Result<(), SmallMatrixError> {
+        let base = BigUint::from(1u8) << self.params.base_bits();
+        let bound =
+            if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
+        let default_digits = if small {
+            self.params.crt_bits().div_ceil(self.params.base_bits() as usize)
+        } else {
+            self.params.modulus_digits()
+        };
+        let digits = digit_count.unwrap_or(default_digits);
+        let dropped = if small {
+            if digits != default_digits {
+                return Err(SmallMatrixError::InvalidConfig);
+            }
+            self.params.dropped_moduli()
+        } else {
+            self.params
+                .gadget_dropped_moduli(Some(digits))
+                .ok_or(SmallMatrixError::InvalidConfig)?
+        };
+        if dropped > 0 {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let rows = self.nrow.checked_mul(digits).ok_or(SmallMatrixError::DimensionOverflow)?;
+        if output.params != self.params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if output.rows_count() != rows || output.columns_count() != self.ncol {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if output.bound() != &bound {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        if self.is_ntt {
+            self.transform_coefficients_on_stream(stream, source_binding_index, false)
+                .unwrap_or_else(|error| {
+                    panic!("gpu_matrix_intt_all_on_stream decomposition failed: {error}")
+                });
+        }
+        let words = GpuSmallMatrix::bound_words(&bound);
+        let status = unsafe {
+            gpu_small_matrix_decompose_base(
+                [self.raw.cast_const()].as_ptr(),
+                1,
+                self.params.base_bits(),
+                i32::from(small),
+                words.as_ptr(),
+                words.len(),
+                output.raw,
+                dropped,
+                ptr::null(),
+            )
+        };
+        check_status(status, "gpu_small_matrix_decompose_base");
+        if self.is_ntt {
+            self.transform_coefficients_on_stream(stream, source_binding_index, true)
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "gpu_matrix_ntt_all_on_stream restore decomposition input failed: {error}"
+                    )
+                });
+        }
+        Ok(())
+    }
+
+    /// Decompose into a compact owner prepared by the caller. The destination
+    /// is allocated before graph capture; this method only converts the source
+    /// and launches the decomposition kernel.
+    pub fn gadget_decompose_into(
+        self,
+        small: bool,
+        digit_count: Option<usize>,
+        output: &mut GpuSmallMatrix,
+    ) -> Result<(), SmallMatrixError> {
+        let base = BigUint::from(1u8) << self.params.base_bits();
+        let bound =
+            if small { &base - BigUint::from(1u8) } else { (&base + BigUint::from(1u8)) >> 1 };
+        let default_digits = if small {
+            self.params.crt_bits().div_ceil(self.params.base_bits() as usize)
+        } else {
+            self.params.modulus_digits()
+        };
+        let digits = digit_count.unwrap_or(default_digits);
+        let dropped = if small {
+            if digits != default_digits {
+                return Err(SmallMatrixError::InvalidConfig);
+            }
+            self.params.dropped_moduli()
+        } else {
+            self.params
+                .gadget_dropped_moduli(Some(digits))
+                .ok_or(SmallMatrixError::InvalidConfig)?
+        };
+        if !small && dropped > 0 && !self.params.supports_shared_crt_correction() {
+            return Err(SmallMatrixError::InvalidConfig);
+        }
+        let rows = self.nrow.checked_mul(digits).ok_or(SmallMatrixError::DimensionOverflow)?;
+        if output.params != self.params {
+            return Err(SmallMatrixError::ParameterMismatch);
+        }
+        if output.rows_count() != rows || output.columns_count() != self.ncol {
+            return Err(SmallMatrixError::ShapeMismatch);
+        }
+        if output.bound() != &bound {
+            return Err(SmallMatrixError::BoundMismatch);
+        }
+        let mut source = self;
+        if source.is_ntt && source.nrow > 0 && source.ncol > 0 {
+            let status = unsafe { gpu_matrix_intt_batch([source.raw].as_ptr(), ptr::null(), 1) };
+            check_status(status, "gpu_matrix_intt_batch decomposition");
+            source.is_ntt = false;
+        }
+        if !small && dropped > 0 {
+            let status = unsafe {
+                crate::poly::dcrt::gpu::gpu_matrix_correct_gadget_residues(source.raw, dropped)
+            };
+            check_status(status, "gpu_matrix_correct_gadget_residues");
+        }
+        let words = GpuSmallMatrix::bound_words(&bound);
+        let status = unsafe {
+            gpu_small_matrix_decompose_base(
+                [source.raw.cast_const()].as_ptr(),
+                1,
+                source.params.base_bits(),
+                i32::from(small),
+                words.as_ptr(),
+                words.len(),
+                output.raw,
+                dropped,
+                ptr::null(),
+            )
+        };
+        check_status(status, "gpu_small_matrix_decompose_base");
+        Ok(())
+    }
+
+    /// Build the immutable matrix destination contract before capture.
+    pub fn output_descriptor(&self) -> Result<GpuMatrixOutputDescriptor, String> {
+        GpuMatrixOutputDescriptor::for_shape(
+            &self.params,
+            self.nrow,
+            self.ncol,
+            self.level,
+            self.is_ntt,
+        )
+    }
+
+    /// Copy into a caller-provided graph-boundary destination while retaining
+    /// the native asynchronous writer event on that destination.
+    #[doc(hidden)]
+    pub fn copy_into(&self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe { gpu_matrix_copy(destination.raw, self.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_copy failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        destination.is_ntt = self.is_ntt;
+        Ok(())
+    }
+
+    /// Copy the complete matrix into a caller-provided destination on an
+    /// explicit capture stream. Capture callers provide contiguous source and
+    /// destination binding bases; the body records only an asynchronous
+    /// device-to-device copy and never allocates or uploads host RNS bytes
+    /// while CUDA capture is active.
+    #[doc(hidden)]
+    pub fn copy_into_on_stream(
+        &self,
+        destination: &mut Self,
+        stream: &GpuNativeLaunchStream,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.copy_block_into_on_capture_stream(
+            destination,
+            0,
+            0,
+            0,
+            0,
+            self.nrow,
+            self.ncol,
+            stream,
+            source_binding_base,
+            destination_binding_base,
+        )
+    }
+
+    /// Copy a rectangular source block into a destination on an explicit
+    /// CUDA capture stream.
+    ///
+    /// `self` is the source. The source and destination offsets are semantic
+    /// matrix row/column offsets, while the binding bases identify the local
+    /// graph bindings for the source and destination allocations. The native
+    /// operation expands each base over every active CRT limb, launches one
+    /// asynchronous device-to-device copy, and leaves stream ordering to
+    /// CUDA graph capture. No host RNS bytes are materialized or copied.
+    pub fn copy_block_into_on_capture_stream(
+        &self,
+        destination: &mut Self,
+        source_row: usize,
+        source_col: usize,
+        destination_row: usize,
+        destination_col: usize,
+        rows: usize,
+        columns: usize,
+        stream: &GpuNativeLaunchStream,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let source_row_end = source_row.checked_add(rows).ok_or_else(|| {
+            GpuNativeGraphError::Native("source row range overflows usize".into())
+        })?;
+        let source_col_end = source_col.checked_add(columns).ok_or_else(|| {
+            GpuNativeGraphError::Native("source column range overflows usize".into())
+        })?;
+        let destination_row_end = destination_row.checked_add(rows).ok_or_else(|| {
+            GpuNativeGraphError::Native("destination row range overflows usize".into())
+        })?;
+        let destination_col_end = destination_col.checked_add(columns).ok_or_else(|| {
+            GpuNativeGraphError::Native("destination column range overflows usize".into())
+        })?;
+        if self.params.ctx_raw() != destination.params.ctx_raw() {
+            return Err(GpuNativeGraphError::Native(
+                "capture copy source and destination use different GPU contexts".into(),
+            ));
+        }
+        if self.level != destination.level {
+            return Err(GpuNativeGraphError::Native(format!(
+                "capture copy level mismatch: source {} != destination {}",
+                self.level, destination.level
+            )));
+        }
+        if source_row_end > self.nrow || source_col_end > self.ncol {
+            return Err(GpuNativeGraphError::Native(format!(
+                "capture copy source block out of bounds: ({source_row}, {source_col}) + ({rows}, {columns}) exceeds ({}, {})",
+                self.nrow, self.ncol
+            )));
+        }
+        if destination_row_end > destination.nrow || destination_col_end > destination.ncol {
+            return Err(GpuNativeGraphError::Native(format!(
+                "capture copy destination block out of bounds: ({destination_row}, {destination_col}) + ({rows}, {columns}) exceeds ({}, {})",
+                destination.nrow, destination.ncol
+            )));
+        }
+
+        let status = unsafe {
+            gpu_matrix_copy_block_on_capture_stream(
+                destination.raw,
+                self.raw,
+                destination_row,
+                destination_col,
+                source_row,
+                source_col,
+                rows,
+                columns,
+                stream.raw_ptr(),
+                source_binding_base,
+                destination_binding_base,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_copy_block_on_capture_stream failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        // The native copy writes all active limbs and propagates the source
+        // polynomial format. Keep the Rust metadata in lockstep with it.
+        destination.is_ntt = self.is_ntt;
+        Ok(())
+    }
+
+    /// Copy a semantic column range into an independently allocated replay
+    /// owner. Both pointer sets are registered for deferred capture rebinding.
+    pub fn copy_columns_into_on_stream(
+        &self,
+        destination: &mut Self,
+        source_start: usize,
+        destination_start: usize,
+        columns: usize,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_matrix_copy_block_on_stream(
+                destination.raw,
+                self.raw,
+                0,
+                destination_start,
+                0,
+                source_start,
+                self.nrow,
+                columns,
+                stream.raw_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        destination.is_ntt = self.is_ntt;
+        Ok(())
+    }
+
+    /// Copy a semantic column range into a graph-bound destination while
+    /// registering explicit source and destination pointer patches. Each base
+    /// is expanded by limb index in the native launch-site ABI.
+    pub fn copy_columns_into_on_capture_stream(
+        &self,
+        destination: &mut Self,
+        source_start: usize,
+        destination_start: usize,
+        columns: usize,
+        stream: &GpuNativeLaunchStream,
+        source_binding_base: u32,
+        destination_binding_base: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.copy_block_into_on_capture_stream(
+            destination,
+            0,
+            source_start,
+            0,
+            destination_start,
+            self.nrow,
+            columns,
+            stream,
+            source_binding_base,
+            destination_binding_base,
+        )
+    }
+
+    /// Allocate a destination in `params` and enqueue an asynchronous direct
+    /// device copy into it.  The native peer-copy path records the destination
+    /// writer event and protects the source release stream; no host payload is
+    /// materialized.  A missing peer route is reported explicitly so callers
+    /// can select their planned host-staged route before dispatch.
+    pub fn copy_to_params_direct(
+        &self,
+        params: &GpuDCRTPolyParams,
+    ) -> Result<Self, GpuNativeGraphError> {
+        if self.params.ctx_raw() == params.ctx_raw() {
+            let mut destination = GpuMatrixOutputDescriptor::for_shape(
+                params,
+                self.nrow,
+                self.ncol,
+                self.level,
+                self.is_ntt,
+            )
+            .map_err(GpuNativeGraphError::Native)?
+            .allocate();
+            self.copy_into(&mut destination)?;
+            return Ok(destination);
+        }
+        let destination = GpuMatrixOutputDescriptor::for_shape(
+            params,
+            self.nrow,
+            self.ncol,
+            self.level,
+            self.is_ntt,
+        )
+        .map_err(GpuNativeGraphError::Native)?
+        .allocate();
+        let mut copied = 0i32;
+        let status = unsafe { gpu_matrix_copy_peer(destination.raw, self.raw, &mut copied) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_copy_peer failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        if copied == 0 {
+            return Err(GpuNativeGraphError::Native(
+                "gpu_matrix_copy_peer is unavailable for the requested placement".into(),
+            ));
+        }
+        Ok(destination)
+    }
+
     /// Return the exact native topology selected by `tensor_sum_rows` for
     /// the supplied row groups.  Warmup allocation queries call this same
     /// decision so a fallback can never be advertised as output-only.
@@ -1440,17 +3428,8 @@ impl GpuDCRTPolyMatrix {
         if self.params.ring_dimension() != destination.ring_dimension() {
             return Err("centered rebase requires matching ring dimensions".into());
         }
-        let source_basis = self.params.moduli();
-        let destination_basis = destination.moduli();
-        if source_basis.len() > 1 &&
-            source_basis
-                .iter()
-                .take(self.level + 1)
-                .any(|prime| !destination_basis.contains(prime))
-        {
-            return Err(
-                "multi-limb centered rebase destination must contain the source basis".into()
-            );
+        if self.params.moduli().is_empty() || destination.moduli().is_empty() {
+            return Err("centered rebase requires nonempty CRT bases".into());
         }
         Ok(())
     }
@@ -1468,19 +3447,6 @@ impl GpuDCRTPolyMatrix {
             BigUint::from(0u8),
             "destination modulus must divide source modulus"
         );
-        let divisor = &source_modulus / destination_modulus.as_ref();
-        let division_inverses = destination
-            .moduli()
-            .iter()
-            .map(|modulus| {
-                if round_scale {
-                    crate::utils::mod_inverse((&divisor % modulus).to_u64().unwrap(), *modulus)
-                        .expect("switch divisor must be invertible in every retained tower")
-                } else {
-                    1
-                }
-            })
-            .collect::<Vec<_>>();
         let coefficients = round_scale.then(|| self.clone().into_coeff_domain());
         let source = coefficients.as_ref().unwrap_or(self);
         let mut output = Self::new_empty_with_state(
@@ -1491,26 +3457,590 @@ impl GpuDCRTPolyMatrix {
             source.is_ntt,
             None,
         );
-        let status = unsafe {
-            gpu_matrix_convert_modulus(
-                output.raw,
-                source.raw,
-                i32::from(round_scale),
-                division_inverses.as_ptr(),
-                division_inverses.len(),
-            )
-        };
-        check_status(status, "gpu_matrix_convert_modulus");
+        let plan = source
+            .prepare_modulus_conversion(&output, round_scale)
+            .unwrap_or_else(|error| panic!("modulus conversion preparation failed: {error}"));
+        source
+            .submit_modulus_conversion_into(&mut output, &plan, 0, 1)
+            .unwrap_or_else(|error| panic!("modulus conversion submission failed: {error}"));
         if round_scale {
             output.ntt_all_in_place();
         }
         output
     }
 
+    /// Prepare immutable CRT conversion metadata before entering CUDA graph
+    /// capture. The plan retains the pinned upload and device metadata until
+    /// dropped; source/output descriptor pointers remain dynamic at submit.
+    #[doc(hidden)]
+    pub fn prepare_modulus_conversion(
+        &self,
+        destination: &Self,
+        round_scale: bool,
+    ) -> Result<GpuModulusConversionPlan, GpuNativeGraphError> {
+        if self.params.context_execution_identity() !=
+            destination.params.context_execution_identity()
+        {
+            return Err(GpuNativeGraphError::Native(
+                "modulus conversion requires a shared GPU context".into(),
+            ));
+        }
+        if self.params.ring_dimension() != destination.params.ring_dimension() {
+            return Err(GpuNativeGraphError::Native(
+                "modulus conversion ring dimension mismatch".into(),
+            ));
+        }
+        let source_modulus = self.params.modulus_for_level(self.level);
+        let destination_modulus = destination.params.modulus();
+        if &source_modulus % destination_modulus.as_ref() != BigUint::from(0u8) {
+            return Err(GpuNativeGraphError::Native(
+                "destination modulus must divide source modulus".into(),
+            ));
+        }
+        let divisor = &source_modulus / destination_modulus.as_ref();
+        let division_inverses = destination
+            .params
+            .moduli()
+            .iter()
+            .map(|modulus| {
+                if round_scale {
+                    let residue = (&divisor % modulus).to_u64().ok_or_else(|| {
+                        GpuNativeGraphError::Native(
+                            "switch divisor residue does not fit u64".into(),
+                        )
+                    })?;
+                    crate::utils::mod_inverse(residue, *modulus).ok_or_else(|| {
+                        GpuNativeGraphError::Native(
+                            "switch divisor must be invertible in every retained tower".into(),
+                        )
+                    })
+                } else {
+                    Ok(1)
+                }
+            })
+            .collect::<Result<Vec<_>, GpuNativeGraphError>>()?;
+        let mut raw = std::ptr::null_mut::<GpuModulusConversionPlanOpaque>();
+        let status = unsafe {
+            gpu_matrix_modulus_conversion_prepare(
+                destination.raw,
+                self.raw,
+                i32::from(round_scale),
+                division_inverses.as_ptr(),
+                division_inverses.len(),
+                &mut raw,
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_modulus_conversion_prepare failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(GpuModulusConversionPlan { raw, context: destination.params.context_arc() })
+    }
+
+    /// Prepare centered-rebase metadata before graph capture. The native plan
+    /// keeps the CRT metadata stable while source/output descriptors remain
+    /// patchable at replay.
+    #[doc(hidden)]
+    pub fn prepare_centered_rebase(
+        &self,
+        destination: &Self,
+    ) -> Result<GpuModulusConversionPlan, GpuNativeGraphError> {
+        self.validate_centered_rebase_destination(destination.params())
+            .map_err(GpuNativeGraphError::Native)?;
+        let mut raw = std::ptr::null_mut::<GpuModulusConversionPlanOpaque>();
+        let status =
+            unsafe { gpu_matrix_centered_rebase_prepare(destination.raw, self.raw, &mut raw) };
+        if status != 0 || raw.is_null() {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_centered_rebase_prepare failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(GpuModulusConversionPlan { raw, context: destination.params.context_arc() })
+    }
+
+    /// Submit a prepared centered rebase with dynamic descriptor bindings.
+    #[doc(hidden)]
+    pub fn submit_centered_rebase_into(
+        &self,
+        destination: &mut Self,
+        plan: &GpuModulusConversionPlan,
+        source_binding_index: u32,
+        output_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_matrix_centered_rebase_submit(
+                plan.raw,
+                destination.raw,
+                self.raw,
+                source_binding_index,
+                output_binding_index,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_centered_rebase_submit failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        destination.is_ntt = true;
+        Ok(())
+    }
+
+    /// Prepare exact centered division metadata before CUDA graph capture.
+    #[doc(hidden)]
+    pub fn prepare_centered_round_divide(
+        &self,
+        destination: &Self,
+        divisor: &BigUint,
+    ) -> Result<GpuModulusConversionPlan, GpuNativeGraphError> {
+        if divisor.is_zero() {
+            return Err(GpuNativeGraphError::Native(
+                "CenteredRoundDivide divisor must be positive".into(),
+            ));
+        }
+        if self.params.context_execution_identity() !=
+            destination.params.context_execution_identity() ||
+            self.params.ring_dimension() != destination.params.ring_dimension() ||
+            self.level != destination.level ||
+            self.nrow != destination.nrow ||
+            self.ncol != destination.ncol ||
+            destination.is_ntt
+        {
+            return Err(GpuNativeGraphError::Native(
+                "CenteredRoundDivide requires matching matrices and coefficient-domain output"
+                    .into(),
+            ));
+        }
+        let words = divisor.to_u64_digits();
+        let mut raw = std::ptr::null_mut::<GpuModulusConversionPlanOpaque>();
+        let status = unsafe {
+            gpu_matrix_centered_round_divide_prepare(
+                destination.raw,
+                self.raw,
+                words.as_ptr(),
+                words.len(),
+                &mut raw,
+            )
+        };
+        if status != 0 || raw.is_null() {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_centered_round_divide_prepare failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(GpuModulusConversionPlan { raw, context: destination.params.context_arc() })
+    }
+
+    /// Submit exact centered division with only descriptor pointers dynamic.
+    #[doc(hidden)]
+    pub fn submit_centered_round_divide_into(
+        &self,
+        destination: &mut Self,
+        plan: &GpuModulusConversionPlan,
+        source_binding_index: u32,
+        output_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_matrix_centered_round_divide_submit(
+                plan.raw,
+                destination.raw,
+                self.raw,
+                source_binding_index,
+                output_binding_index,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_centered_round_divide_submit failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        destination.is_ntt = true;
+        Ok(())
+    }
+
+    /// Submit a prepared conversion using the same launch body as the
+    /// allocating API. During graph capture only the source/output descriptor
+    /// pointers are registered as dynamic bindings; no host/device allocation
+    /// or metadata upload occurs here.
+    #[doc(hidden)]
+    pub fn submit_modulus_conversion_into(
+        &self,
+        destination: &mut Self,
+        plan: &GpuModulusConversionPlan,
+        source_binding_index: u32,
+        output_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_matrix_modulus_conversion_submit(
+                plan.raw,
+                destination.raw,
+                self.raw,
+                source_binding_index,
+                output_binding_index,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_modulus_conversion_submit failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
     /// Waits for writes to this matrix without synchronizing unrelated device work.
     pub fn wait_until_ready(&self) {
         let status = unsafe { gpu_matrix_wait(self.raw) };
         check_status(status, "gpu_matrix_wait");
+    }
+
+    /// Resolve borrowed physical allocation descriptors for all partitions.
+    /// The returned addresses are snapshots for binding only and do not retain
+    /// the matrix owner or alter its release policy.
+    #[doc(hidden)]
+    pub fn binding_components(
+        &self,
+    ) -> Result<Box<[GpuMatrixBindingComponent]>, GpuNativeGraphError> {
+        let mut count = 0usize;
+        let status = unsafe { gpu_matrix_binding_component_count(self.raw, &mut count as *mut _) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_binding_component_count failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        let mut components = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut raw = GpuMatrixBindingComponentRaw::default();
+            let status =
+                unsafe { gpu_matrix_binding_component(self.raw, index, &mut raw as *mut _) };
+            if status != 0 {
+                return Err(GpuNativeGraphError::Native(format!(
+                    "gpu_matrix_binding_component failed: {}",
+                    crate::poly::dcrt::gpu::last_error_string()
+                )));
+            }
+            components.push(GpuMatrixBindingComponent {
+                physical_device: raw.physical_device,
+                limb_count: raw.limb_count,
+                bytes_per_poly: raw.bytes_per_poly,
+                data_bytes: raw.data_bytes,
+                ring_dimension: raw.n,
+                device_descriptor_stride: raw.device_descriptor_stride,
+                data_address: raw.data as usize as u64,
+                device_descriptors_address: raw.device_descriptors as usize as u64,
+                auxiliary_address: raw.auxiliary as usize as u64,
+                auxiliary_slots_per_poly: raw.aux_slots_per_poly,
+                auxiliary_slots_total: raw.aux_slots_total,
+            });
+        }
+        Ok(components.into_boxed_slice())
+    }
+
+    /// Submit one allocation-free, lane-batched matrix-family gather. The
+    /// descriptor table and signed indices remain device-resident; callers
+    /// may provide graph binding indices for the destination descriptor,
+    /// index pointer, and status pointer. Ownership/lifetime of every family
+    /// member is retained by `family`.
+    #[doc(hidden)]
+    pub fn gather_family_into(
+        &mut self,
+        family: &GpuMatrixFamilyDescriptorTable,
+        indices: &GpuSignedValues,
+        lane_count: usize,
+        wave_base: i64,
+        lane_offset: i64,
+        width: usize,
+        status: Option<&GpuSignedValues>,
+        stream: &GpuNativeLaunchStream,
+        destination_binding_index: u32,
+        indices_binding_index: u32,
+        status_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        if family.physical_device != stream.physical_device() ||
+            indices.physical_device() != stream.physical_device() ||
+            self.params.gpu_ids().iter().all(|device| *device != stream.physical_device())
+        {
+            return Err(GpuNativeGraphError::Native("matrix family gather device mismatch".into()));
+        }
+        if family.owners.iter().any(|owner| {
+            owner.params != self.params ||
+                owner.nrow != self.nrow ||
+                owner.ncol == 0 ||
+                owner.level != self.level ||
+                owner.is_ntt != self.is_ntt
+        }) {
+            return Err(GpuNativeGraphError::Native(
+                "matrix family gather shape/domain mismatch".into(),
+            ));
+        }
+        if lane_count == 0 ||
+            width == 0 ||
+            lane_count.checked_mul(family.owners[0].ncol) != Some(self.ncol)
+        {
+            return Err(GpuNativeGraphError::Native(
+                "matrix family gather destination shape mismatch".into(),
+            ));
+        }
+        if indices.encoding() != GpuSignedValuesEncoding::SignedI64 {
+            return Err(GpuNativeGraphError::Native(
+                "matrix family gather requires signed i64 indices".into(),
+            ));
+        }
+        if let Some(status) = status {
+            if status.physical_device() != stream.physical_device() ||
+                status.encoding() != GpuSignedValuesEncoding::SignedI64 ||
+                status.count() == 0
+            {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix family gather status must be a resident i64 word".into(),
+                ));
+            }
+        }
+        let destination_partition = self
+            .binding_components()?
+            .iter()
+            .position(|component| component.physical_device == stream.physical_device())
+            .ok_or_else(|| {
+                GpuNativeGraphError::Native("matrix gather destination partition missing".into())
+            })?;
+        let launch_stream = stream.control_launch_stream();
+        self.wait_compiled_inputs(stream.physical_device(), &launch_stream, false)?;
+        indices.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        family.table.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        for owner in family.owners.iter() {
+            owner.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        }
+        let native_status = unsafe {
+            gpu_matrix_gather_family(
+                self.raw,
+                family.table.as_ptr().cast_const(),
+                family.family_count(),
+                indices.device_address().cast(),
+                indices.count(),
+                wave_base,
+                lane_offset,
+                lane_count,
+                family.owners[0].ncol,
+                width,
+                launch_stream.raw_ptr(),
+                status.map_or(ptr::null_mut(), |value| value.device_address() as *mut u32),
+                destination_partition,
+                destination_binding_index,
+                indices_binding_index,
+                status_binding_index,
+            )
+        };
+        if native_status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_gather_family failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Submit one capture-safe family gather into independent per-lane
+    /// destinations.  `indices` is local to this wave: lane `l` always reads
+    /// `indices[l]`, and `semantic_offset` is applied to that value only.
+    /// Thus a later wave can carry values such as `wave_base + l` without
+    /// shifting the device index pointer.  Each active destination descriptor
+    /// has its own graph binding identity; no packed `rows x (W * columns)`
+    /// scratch matrix is created or required.
+    #[doc(hidden)]
+    pub fn gather_family_lanes_into(
+        family: &GpuMatrixFamilyDescriptorTable,
+        destinations: &GpuMatrixLaneDestinationTable,
+        indices: &GpuSignedValues,
+        active_count: usize,
+        active_lane_mask: u64,
+        semantic_offset: i64,
+        width: usize,
+        status: Option<&GpuSignedValues>,
+        stream: &GpuNativeLaunchStream,
+        destination_binding_indices: &[u32],
+        indices_binding_index: u32,
+        status_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let lane_count = destinations.lane_count();
+        let lane_bits = if lane_count >= 64 {
+            u64::MAX
+        } else if lane_count == 0 {
+            0
+        } else {
+            (1u64 << lane_count) - 1
+        };
+        if family.physical_device != stream.physical_device() ||
+            destinations.physical_device != stream.physical_device() ||
+            indices.physical_device() != stream.physical_device()
+        {
+            return Err(GpuNativeGraphError::Native("matrix lane gather device mismatch".into()));
+        }
+        if lane_count == 0 ||
+            lane_count > 64 ||
+            active_count > lane_count ||
+            width == 0 ||
+            destination_binding_indices.len() != lane_count ||
+            (active_lane_mask & !lane_bits) != 0 ||
+            active_lane_mask.count_ones() as usize != active_count
+        {
+            return Err(GpuNativeGraphError::Native(
+                "matrix lane gather mask or destination count mismatch".into(),
+            ));
+        }
+        if indices.encoding() != GpuSignedValuesEncoding::SignedI64 {
+            return Err(GpuNativeGraphError::Native(
+                "matrix lane gather requires signed i64 indices".into(),
+            ));
+        }
+        if status_binding_index != u32::MAX && status.is_none() {
+            return Err(GpuNativeGraphError::Native(
+                "matrix lane gather status binding has no status owner".into(),
+            ));
+        }
+        if let Some(status) = status {
+            if status.physical_device() != stream.physical_device() ||
+                status.encoding() != GpuSignedValuesEncoding::SignedI64 ||
+                status.count() == 0
+            {
+                return Err(GpuNativeGraphError::Native(
+                    "matrix lane gather status must be a resident i64 word".into(),
+                ));
+            }
+        }
+        if family.owners.iter().any(|owner| {
+            owner.params != destinations.owners[0].params ||
+                owner.nrow != destinations.rows ||
+                owner.ncol != destinations.columns ||
+                owner.level != destinations.owners[0].level ||
+                owner.is_ntt != destinations.owners[0].is_ntt
+        }) {
+            return Err(GpuNativeGraphError::Native(
+                "matrix lane gather source/destination shape mismatch".into(),
+            ));
+        }
+        let launch_stream = stream.control_launch_stream();
+        indices.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        family.table.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        for owner in family.owners.iter() {
+            owner.wait_compiled_inputs(stream.physical_device(), &launch_stream, true)?;
+        }
+        for owner in destinations.owners.iter() {
+            owner.wait_compiled_inputs(stream.physical_device(), &launch_stream, false)?;
+        }
+        let native_status = unsafe {
+            gpu_matrix_gather_family_lanes(
+                family.table.as_ptr().cast_const(),
+                family.family_count(),
+                destinations.raw_owners.as_ptr(),
+                lane_count,
+                indices.device_address().cast(),
+                indices.count(),
+                active_count,
+                active_lane_mask,
+                semantic_offset,
+                width,
+                stream.physical_device(),
+                launch_stream.raw_ptr(),
+                status.map_or(ptr::null_mut(), |value| value.device_address() as *mut u32),
+                indices_binding_index,
+                status_binding_index,
+                destination_binding_indices.as_ptr(),
+            )
+        };
+        if native_status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_gather_family_lanes failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Queue every active CRT limb's producer dependency on a compiled graph
+    /// stream. The helper preserves the physical limb placement and performs
+    /// no host synchronization.
+    #[doc(hidden)]
+    pub fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe {
+            gpu_matrix_wait_compiled_inputs(
+                self.raw,
+                consumer_device,
+                launch_stream.raw_ptr(),
+                read_only,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_wait_compiled_inputs failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Attach a graph completion event to every physical limb's release
+    /// dependency. Read-only consumers preserve the source writer event,
+    /// while read/write consumers use the native join contract.
+    #[doc(hidden)]
+    pub fn protect_compiled_submission(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let completion_event = completion.raw_event()?;
+        let status = unsafe {
+            gpu_matrix_track_compiled_consumer(
+                self.raw,
+                consumer_device,
+                launch_stream.raw_ptr(),
+                completion_event,
+                read_only,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_track_compiled_consumer failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Register all active limbs as written by this compiled submission. The
+    /// native operation invalidates host-observed readiness before recording
+    /// physical-device write events, so a later reader cannot bypass the join.
+    #[doc(hidden)]
+    pub fn record_compiled_write(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        let status = unsafe { gpu_matrix_record_compiled_write(self.raw, launch_stream.raw_ptr()) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_record_compiled_write failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Resolve this private matrix exemplar before graph capture and clear
+    /// only its completed pre-capture writer dependencies.
+    #[doc(hidden)]
+    pub fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        prepare_matrix_external_for_capture(self.raw)
     }
 
     // Disabling descriptor initialization is reserved for a private output
@@ -1562,7 +4092,8 @@ impl GpuDCRTPolyMatrix {
             );
             check_status(status, &context);
         }
-        Self { params: params.clone(), nrow, ncol, level, is_ntt, raw }
+        let owner = Arc::new(GpuMatrixOwner { raw, _params: params.clone() });
+        Self { owner, params: params.clone(), nrow, ncol, level, is_ntt, raw }
     }
 
     pub(crate) fn new_empty(params: &GpuDCRTPolyParams, nrow: usize, ncol: usize) -> Self {
@@ -1764,11 +4295,14 @@ impl GpuDCRTPolyMatrix {
     }
 
     pub(crate) fn ensure_eval_domain(&self) -> Self {
-        if self.is_ntt {
-            return self.clone();
-        }
         let mut output = self.clone();
-        output.ntt_all_in_place();
+        // Normalize the native format as well as the Rust-side state.  Capture
+        // rebinding can replace the device descriptors without changing the
+        // owner metadata, so the native format is authoritative here.  The
+        // CUDA entry point is a no-op for an already evaluated matrix.
+        let status = unsafe { gpu_matrix_ntt_all(output.raw) };
+        check_status(status, "gpu_matrix_ntt_all");
+        output.is_ntt = true;
         output
     }
 
@@ -1791,7 +4325,7 @@ impl GpuDCRTPolyMatrix {
         self.is_ntt = false;
     }
 
-    pub(crate) fn into_coeff_domain(mut self) -> Self {
+    pub fn into_coeff_domain(mut self) -> Self {
         self.intt_all_in_place();
         self
     }
@@ -2039,7 +4573,7 @@ impl GpuDCRTPolyMatrix {
 
     fn binary_out_of_place_same_domain(&self, rhs: &Self, operation: i32) -> Self {
         debug_assert_eq!(self.is_ntt, rhs.is_ntt, "binary operation requires one domain");
-        let out = Self::new_empty_with_state(
+        let mut out = Self::new_empty_with_state(
             &self.params,
             self.nrow,
             self.ncol,
@@ -2048,14 +4582,12 @@ impl GpuDCRTPolyMatrix {
             None,
         );
         if self.nrow != 0 && self.ncol != 0 {
-            let status = unsafe {
-                if operation == 0 {
-                    gpu_matrix_add(out.raw, self.raw, rhs.raw)
-                } else {
-                    gpu_matrix_sub(out.raw, self.raw, rhs.raw)
-                }
+            let result = if operation == 0 {
+                self.add_into(rhs, &mut out)
+            } else {
+                self.sub_into(rhs, &mut out)
             };
-            check_status(status, "gpu_matrix_binary_out_of_place");
+            result.unwrap_or_else(|error| panic!("gpu_matrix_binary_out_of_place failed: {error}"));
         }
         out
     }
@@ -2081,9 +4613,9 @@ impl GpuDCRTPolyMatrix {
     ///
     /// Plaintext moduli and active RNS moduli must fit in `u64`, and the
     /// current exact-integer kernel supports at most 64 RNS limbs. Each input
-    /// level is converted to coefficient form independently before the single
-    /// recomposition launch. This keeps the initial implementation simple and
-    /// asynchronous, but does not batch those inverse-NTT launches.
+    /// level is converted to coefficient form independently. Recomposition
+    /// launches one exact accumulation per level with bounded by-value metadata
+    /// so that graph capture never uploads pointer-bearing host metadata.
     pub fn crt_recompose_levels(
         levels: &[Self],
         plaintext_moduli: &[u64],
@@ -2110,6 +4642,28 @@ impl GpuDCRTPolyMatrix {
             levels.iter().cloned().map(Self::into_coeff_domain).collect::<Vec<_>>();
         let mut output =
             Self::new_empty_with_state(destination, 1, first.ncol, limb_count - 1, false, None);
+        Self::crt_recompose_coefficients_into(
+            &coefficient_levels,
+            plaintext_moduli,
+            reconstruction_residues,
+            &mut output,
+        );
+        output
+    }
+
+    /// Recompose coefficient-domain levels into the caller's resident output.
+    /// Capture callers normalize their source copies under their exact binding
+    /// maps before invoking this operation; the output is fully overwritten.
+    pub fn crt_recompose_coefficients_into(
+        coefficient_levels: &[Self],
+        plaintext_moduli: &[u64],
+        reconstruction_residues: &[u64],
+        output: &mut Self,
+    ) {
+        let limb_count = output.params.crt_depth();
+        assert_eq!(coefficient_levels.len(), plaintext_moduli.len());
+        assert_eq!(reconstruction_residues.len(), coefficient_levels.len() * limb_count);
+        assert!(coefficient_levels.iter().all(|level| !level.is_ntt));
         let raw_levels = coefficient_levels
             .iter()
             .map(|level| level.raw as *const GpuMatrixOpaque)
@@ -2125,10 +4679,12 @@ impl GpuDCRTPolyMatrix {
             )
         };
         check_status(status, "gpu_matrix_crt_recompose");
-        let status = unsafe { gpu_matrix_ntt_all(output.raw) };
+        let output_binding = u32::try_from(coefficient_levels.len())
+            .expect("CRT level count exceeds descriptor binding capacity");
+        let status =
+            unsafe { crate::poly::dcrt::gpu::gpu_matrix_ntt_all_bound(output.raw, output_binding) };
         check_status(status, "gpu_matrix_ntt_all after CRT recomposition");
         output.is_ntt = true;
-        output
     }
 
     fn decompose_from_raw(
@@ -2448,6 +5004,39 @@ impl GpuDCRTPolyMatrix {
         out
     }
 
+    /// Enqueue coefficient-domain sampling from a seed stored in device
+    /// memory. This is the capture-body form: no seed value is copied from
+    /// the host and the output allocation must be prepared before capture.
+    #[doc(hidden)]
+    pub fn sample_distribution_columns_coeff_from_device_seed(
+        &mut self,
+        total_ncol: usize,
+        col_start: usize,
+        dist_type: i32,
+        sigma: f64,
+        max_coefficient_bound: u64,
+        device_seed: *const c_void,
+        seed_binding_index: u32,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        assert!(!self.is_ntt, "device-seed sampling requires coefficient output");
+        let status = unsafe {
+            gpu_matrix_sample_distribution_columns_device_seed(
+                self.raw,
+                dist_type,
+                sigma,
+                max_coefficient_bound,
+                self.params.modulus().to_u64().unwrap_or(0),
+                device_seed.cast(),
+                total_ncol,
+                col_start,
+                seed_binding_index,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_sample_distribution_columns_device_seed");
+    }
+
     pub fn gauss_samp_gq_arb_base(mut self, c: f64, dgg_stddev: f64, seed: GpuRngSeed) -> Self {
         let log_base_q = self.params.modulus_digits();
         let out_nrow = self.nrow.saturating_mul(log_base_q);
@@ -2476,6 +5065,7 @@ impl GpuDCRTPolyMatrix {
         sigma: f64,
         s: f64,
         dgg_stddev: f64,
+        capture_stream: Option<&GpuNativeLaunchStream>,
     ) -> GpuP1CovarianceCache {
         debug_assert_eq!(a_mat.params, b_mat.params, "A/B params mismatch");
         debug_assert_eq!(a_mat.params, d_mat.params, "A/D params mismatch");
@@ -2493,11 +5083,38 @@ impl GpuDCRTPolyMatrix {
                 sigma,
                 s,
                 dgg_stddev,
+                capture_stream.map_or(ptr::null_mut(), GpuNativeLaunchStream::raw_ptr),
                 &mut raw as *mut *mut GpuP1CovarianceCacheOpaque,
             )
         };
         check_status(status, "gpu_matrix_create_p1_covariance_cache");
-        GpuP1CovarianceCache { raw }
+        GpuP1CovarianceCache { raw, capture_stream: capture_stream.cloned() }
+    }
+
+    pub(crate) fn refresh_p1_covariance_cache(
+        cache: &GpuP1CovarianceCache,
+        a_mat: &Self,
+        b_mat: &Self,
+        d_mat: &Self,
+        dgg_stddev: f64,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        assert_eq!(
+            cache.capture_stream.as_ref().map(GpuNativeLaunchStream::raw_ptr),
+            Some(stream.raw_ptr()),
+            "covariance refresh must use its allocation/capture stream"
+        );
+        let status = unsafe {
+            gpu_matrix_refresh_p1_covariance_cache(
+                cache.raw,
+                a_mat.raw,
+                b_mat.raw,
+                d_mat.raw,
+                dgg_stddev,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_refresh_p1_covariance_cache");
     }
 
     pub(crate) fn sample_p1_full_cached(
@@ -2513,6 +5130,114 @@ impl GpuDCRTPolyMatrix {
         let status = unsafe { gpu_matrix_sample_p1_full_cached(cache.raw, tp2.raw, seed, out.raw) };
         check_status(status, "gpu_matrix_sample_p1_full_cached");
         out
+    }
+
+    /// Allocation-free cached p1 sampler for a conditional retry body.
+    /// `sampled_out` and `workspace` are fixed device scratch prepared before
+    /// capture; the seed is read from device memory on every body iteration.
+    #[doc(hidden)]
+    pub(crate) fn sample_p1_full_cached_into(
+        cache: &GpuP1CovarianceCache,
+        tp2: &Self,
+        sampled_out: *mut c_void,
+        workspace: *mut c_void,
+        workspace_bytes: usize,
+        device_seed: *const c_void,
+        out: &mut Self,
+        stream: &GpuNativeLaunchStream,
+        tp2_binding_index: u32,
+        seed_binding_index: u32,
+        sampled_binding_index: u32,
+        workspace_binding_index: u32,
+    ) {
+        assert_eq!(tp2.params, out.params, "cached p1 body parameter mismatch");
+        assert_eq!(tp2.nrow, out.nrow, "cached p1 body row mismatch");
+        assert_eq!(tp2.ncol, out.ncol, "cached p1 body column mismatch");
+        assert!(!tp2.is_ntt && !out.is_ntt, "cached p1 body requires coefficient matrices");
+        let status = unsafe {
+            gpu_matrix_sample_p1_full_cached_into(
+                cache.raw,
+                tp2.raw,
+                device_seed.cast(),
+                sampled_out,
+                workspace,
+                workspace_bytes,
+                out.raw,
+                stream.raw_ptr(),
+                tp2_binding_index,
+                seed_binding_index,
+                sampled_binding_index,
+                workspace_binding_index,
+            )
+        };
+        check_status(status, "gpu_matrix_sample_p1_full_cached_into");
+        out.is_ntt = true;
+    }
+
+    /// Complete allocation-free Gaussian sampling and coefficient scatter.
+    /// All metadata arrays and the digit slab are caller-owned fixed device
+    /// storage prepared before capture.
+    #[doc(hidden)]
+    pub(crate) fn gauss_samp_gq_arb_base_into(
+        source: &Self,
+        output: &mut Self,
+        sampled_digits: *mut c_void,
+        sampled_capacity_bytes: usize,
+        device_seed: *const c_void,
+        dst_bases_device: *mut c_void,
+        dst_strides_device: *const c_void,
+        dst_coeff_bytes_device: *const c_void,
+        dst_moduli_device: *const c_void,
+        c: f64,
+        stream: &GpuNativeLaunchStream,
+        src_binding_index: u32,
+        out_bases_binding_index: u32,
+        out_strides_binding_index: u32,
+        out_coeff_bytes_binding_index: u32,
+        out_moduli_binding_index: u32,
+        seed_binding_index: u32,
+        sampled_binding_index: u32,
+    ) {
+        assert!(!source.is_ntt && !output.is_ntt, "Gaussian body requires coefficient matrices");
+        let status = unsafe {
+            gpu_matrix_gauss_samp_gq_arb_base_into(
+                source.raw,
+                output.raw,
+                device_seed.cast(),
+                sampled_digits,
+                sampled_capacity_bytes,
+                source.params.base_bits(),
+                c,
+                dst_bases_device,
+                dst_strides_device,
+                dst_coeff_bytes_device,
+                dst_moduli_device,
+                stream.raw_ptr(),
+                src_binding_index,
+                out_bases_binding_index,
+                out_strides_binding_index,
+                out_coeff_bytes_binding_index,
+                out_moduli_binding_index,
+                seed_binding_index,
+                sampled_binding_index,
+            )
+        };
+        check_status(status, "gpu_matrix_gauss_samp_gq_arb_base_into");
+        output.is_ntt = true;
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn ntt_all_on_stream(&mut self, stream: &GpuNativeLaunchStream) {
+        let status = unsafe { gpu_matrix_ntt_all_on_stream(self.raw, stream.raw_ptr()) };
+        check_status(status, "gpu_matrix_ntt_all_on_stream");
+        self.is_ntt = true;
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn intt_all_on_stream(&mut self, stream: &GpuNativeLaunchStream) {
+        let status = unsafe { gpu_matrix_intt_all_on_stream(self.raw, stream.raw_ptr()) };
+        check_status(status, "gpu_matrix_intt_all_on_stream");
+        self.is_ntt = false;
     }
 
     pub(crate) fn mul_vertical_pair(top: &Self, bottom: &Self, rhs: &Self) -> Self {
@@ -2537,6 +5262,27 @@ impl GpuDCRTPolyMatrix {
         let status = unsafe { gpu_matrix_mul_vertical_pair(out.raw, top.raw, bottom.raw, rhs.raw) };
         check_status(status, "gpu_matrix_mul_vertical_pair");
         out
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn mul_vertical_pair_into_on_stream(
+        top: &Self,
+        bottom: &Self,
+        rhs: &Self,
+        out: &mut Self,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        assert!(top.is_ntt && bottom.is_ntt && rhs.is_ntt && out.is_ntt);
+        let status = unsafe {
+            gpu_matrix_mul_vertical_pair_on_stream(
+                out.raw,
+                top.raw,
+                bottom.raw,
+                rhs.raw,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_mul_vertical_pair_on_stream");
     }
 
     pub(crate) fn preimage_residual(
@@ -2579,6 +5325,29 @@ impl GpuDCRTPolyMatrix {
         };
         check_status(status, "gpu_matrix_preimage_residual");
         out
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn preimage_residual_into_on_stream(
+        target: &Self,
+        public_matrix: &Self,
+        p1: &Self,
+        p2: &Self,
+        out: &mut Self,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        assert!(target.is_ntt && public_matrix.is_ntt && p1.is_ntt && p2.is_ntt && out.is_ntt);
+        let status = unsafe {
+            gpu_matrix_preimage_residual_on_stream(
+                out.raw,
+                target.raw,
+                public_matrix.raw,
+                p1.raw,
+                p2.raw,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_preimage_residual_on_stream");
     }
 
     pub(crate) fn preimage_output_from_perturbation(
@@ -2633,6 +5402,27 @@ impl GpuDCRTPolyMatrix {
         }
         let status = unsafe { gpu_matrix_preimage_add_correction(self.raw, r.raw, e.raw, z.raw) };
         check_status(status, "gpu_matrix_preimage_add_correction");
+    }
+
+    #[doc(hidden)]
+    pub(crate) fn preimage_add_correction_on_stream(
+        &mut self,
+        r: &Self,
+        e: &Self,
+        z: &Self,
+        stream: &GpuNativeLaunchStream,
+    ) {
+        assert!(self.is_ntt && r.is_ntt && e.is_ntt && z.is_ntt);
+        let status = unsafe {
+            gpu_matrix_preimage_add_correction_on_stream(
+                self.raw,
+                r.raw,
+                e.raw,
+                z.raw,
+                stream.raw_ptr(),
+            )
+        };
+        check_status(status, "gpu_matrix_preimage_add_correction_on_stream");
     }
 
     pub(crate) fn store_rns_bytes(&self, bytes_out: &mut [u8], bytes_per_poly: usize, format: i32) {
@@ -2722,6 +5512,206 @@ impl GpuDCRTPolyMatrix {
             check_status(wait_status, "gpu_event_set_wait");
         }
         self.is_ntt = format == GPU_POLY_FORMAT_EVAL;
+    }
+
+    /// Fill a preallocated scalar polynomial from a device-resident signed
+    /// integer vector. The source allocation is owned by the caller and must
+    /// remain live until this matrix's producer event completes. This is the
+    /// capture-safe values-to-polynomial primitive: it performs no host
+    /// serialization and allocates no temporary matrix or staging buffer.
+    #[doc(hidden)]
+    pub fn write_values_into(
+        &mut self,
+        values: &GpuSignedValues,
+        evaluation: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.write_values_into_bound(values, evaluation, values.launch_stream(), u32::MAX, u32::MAX)
+    }
+
+    /// Temporarily expose coefficient descriptors on the operation stream.
+    /// The matching restore is enqueued before returning the graph body.
+    pub fn transform_coefficients_on_stream(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        descriptor_binding: u32,
+        restore: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        if !self.is_ntt {
+            return Ok(());
+        }
+        let result = unsafe {
+            if restore {
+                crate::poly::dcrt::gpu::gpu_matrix_ntt_all_on_stream_bound(
+                    self.raw,
+                    stream.raw_ptr(),
+                    descriptor_binding,
+                )
+            } else {
+                crate::poly::dcrt::gpu::gpu_matrix_intt_all_on_stream_bound(
+                    self.raw,
+                    stream.raw_ptr(),
+                    descriptor_binding,
+                )
+            }
+        };
+        if result != 0 {
+            return Err(GpuNativeGraphError::Native(crate::poly::dcrt::gpu::last_error_string()));
+        }
+        Ok(())
+    }
+
+    pub fn write_values_into_bound(
+        &mut self,
+        values: &GpuSignedValues,
+        evaluation: bool,
+        stream: &GpuNativeLaunchStream,
+        source_binding_index: u32,
+        destination_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.write_values_mode_into_bound(
+            values,
+            evaluation,
+            usize::MAX,
+            stream,
+            source_binding_index,
+            destination_binding_index,
+        )
+    }
+
+    pub fn write_integer_constant_into_bound(
+        &mut self,
+        values: &GpuSignedValues,
+        column_start: usize,
+        stream: &GpuNativeLaunchStream,
+        source_binding_index: u32,
+        destination_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.write_values_mode_into_bound(
+            values,
+            true,
+            column_start,
+            stream,
+            source_binding_index,
+            destination_binding_index,
+        )
+    }
+
+    fn write_values_mode_into_bound(
+        &mut self,
+        values: &GpuSignedValues,
+        evaluation: bool,
+        constant_column_start: usize,
+        stream: &GpuNativeLaunchStream,
+        source_binding_index: u32,
+        destination_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        values.wait_compiled_inputs(values.physical_device(), stream, true)?;
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_write_values(
+                self.raw,
+                values.device_address().cast(),
+                values.count(),
+                if evaluation { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF },
+                match values.encoding() {
+                    GpuSignedValuesEncoding::SignedI64 => 0,
+                    GpuSignedValuesEncoding::CanonicalU64 => 1,
+                    GpuSignedValuesEncoding::SignedWords(words) => 2 + words as i32,
+                },
+                if self.is_ntt { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF },
+                constant_column_start,
+                stream.raw_ptr(),
+                source_binding_index,
+                destination_binding_index,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_write_values failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        values.record_compiled_write(stream)?;
+        Ok(())
+    }
+
+    pub fn store_values_into(
+        &self,
+        values: &GpuSignedValues,
+        evaluation: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let GpuSignedValuesEncoding::SignedWords(words) = values.encoding() else {
+            return Err(GpuNativeGraphError::Native(
+                "polynomial values require multiword storage".into(),
+            ));
+        };
+        if words < (self.params.modulus_for_level(self.level).bits() as usize).div_ceil(64) {
+            return Err(GpuNativeGraphError::Native(
+                "polynomial values storage is too narrow".into(),
+            ));
+        }
+        let status = unsafe {
+            crate::poly::dcrt::gpu::gpu_matrix_store_values_into(
+                self.raw,
+                values.device_address() as *mut std::ffi::c_void,
+                values.count(),
+                words,
+                if evaluation { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF },
+                values.physical_device(),
+                values.launch_stream().raw_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_store_values_into failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        values.record_compiled_write(values.launch_stream())
+    }
+
+    /// Capture-safe polynomial extraction into a preallocated values owner.
+    /// The native helper registers the descriptor and destination pointer
+    /// fields against the supplied schema indices and preserves an evaluation
+    /// source by enclosing extraction in a captured INTT/NTT pair.
+    #[doc(hidden)]
+    pub fn store_values_into_bound(
+        &self,
+        values: &GpuSignedValues,
+        evaluation: bool,
+        stream: &GpuNativeLaunchStream,
+        descriptor_binding_index: u32,
+        output_binding_index: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let GpuSignedValuesEncoding::SignedWords(words) = values.encoding() else {
+            return Err(GpuNativeGraphError::Native(
+                "polynomial values require multiword storage".into(),
+            ));
+        };
+        if words < (self.params.modulus_for_level(self.level).bits() as usize).div_ceil(64) {
+            return Err(GpuNativeGraphError::Native(
+                "polynomial values storage is too narrow".into(),
+            ));
+        }
+        let status = unsafe {
+            gpu_matrix_store_values_into_bound(
+                self.raw,
+                values.device_address() as *mut std::ffi::c_void,
+                values.count(),
+                words,
+                if evaluation { GPU_POLY_FORMAT_EVAL } else { GPU_POLY_FORMAT_COEFF },
+                values.physical_device(),
+                stream.raw_ptr(),
+                descriptor_binding_index,
+                output_binding_index,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_store_values_into_bound failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        values.record_compiled_write(stream)
     }
 
     pub fn to_rns_snapshot(&self) -> GpuDCRTMatrixRnsSnapshot {
@@ -3010,6 +6000,602 @@ impl GpuDCRTPolyMatrix {
     }
 }
 
+impl GpuMatrixOutputDescriptor {
+    pub fn for_shape(
+        params: &GpuDCRTPolyParams,
+        rows: usize,
+        columns: usize,
+        level: usize,
+        is_ntt: bool,
+    ) -> Result<Self, String> {
+        if level >= params.crt_depth() {
+            return Err("matrix output level exceeds CRT depth".into());
+        }
+        let allocation = params.matrix_allocation_bytes(level, rows, columns, is_ntt)?;
+        let basis = params.moduli()[..=level].to_vec().into_boxed_slice();
+        let device_ids = params.gpu_ids();
+        let shard_count = device_ids.len().max(1);
+        let shards = (0..shard_count)
+            .map(|index| {
+                let start = columns * index / shard_count;
+                let end = columns * (index + 1) / shard_count;
+                GpuMatrixShardDescriptor {
+                    physical_device: device_ids.get(index).copied().unwrap_or(-1),
+                    column_range: start..end,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self { params: params.clone(), rows, columns, level, is_ntt, basis, shards, allocation })
+    }
+
+    /// Allocate exactly the destination described by this frozen contract.
+    pub fn allocate(&self) -> GpuDCRTPolyMatrix {
+        GpuDCRTPolyMatrix::new_empty_with_state(
+            &self.params,
+            self.rows,
+            self.columns,
+            self.level,
+            self.is_ntt,
+            None,
+        )
+    }
+}
+
+impl GpuDCRTPolyMatrix {
+    fn validate_destination(
+        &self,
+        destination: &Self,
+        rows: usize,
+        columns: usize,
+        level: usize,
+        is_ntt: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        if destination.params != self.params ||
+            destination.nrow != rows ||
+            destination.ncol != columns ||
+            destination.level != level ||
+            destination.is_ntt != is_ntt
+        {
+            return Err(GpuNativeGraphError::Native(
+                "destination does not match immutable matrix output descriptor".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Destination-taking elementwise add launch body. The allocating API
+    /// may use this same body after obtaining `output_descriptor()`.
+    pub fn add_into(&self, rhs: &Self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        self.validate_destination(destination, self.nrow, self.ncol, self.level, self.is_ntt)?;
+        if rhs.params != self.params ||
+            rhs.nrow != self.nrow ||
+            rhs.ncol != self.ncol ||
+            rhs.level != self.level
+        {
+            return Err(GpuNativeGraphError::Native("add_into shape/domain mismatch".into()));
+        }
+        let lhs_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let rhs_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let lhs = lhs_eval.as_ref().unwrap_or(self);
+        let rhs = rhs_eval.as_ref().unwrap_or(rhs);
+        let status = unsafe { gpu_matrix_add(destination.raw, lhs.raw, rhs.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_add failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Add a resident singleton polynomial to every matrix entry without
+    /// materializing a full-size broadcast matrix.  The CUDA body keeps the
+    /// singleton pointer in the graph binding map and reuses it for every
+    /// output polynomial.
+    pub fn add_scalar_into(
+        &self,
+        scalar: &Self,
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.params != scalar.params ||
+            self.level != scalar.level ||
+            scalar.size() != (1, 1)
+        {
+            return Err(GpuNativeGraphError::Native("add_scalar_into shape mismatch".into()));
+        }
+        self.validate_destination(destination, self.nrow, self.ncol, self.level, self.is_ntt)?;
+        let matrix_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let scalar_eval = (!scalar.is_ntt).then(|| scalar.ensure_eval_domain());
+        let matrix = matrix_eval.as_ref().unwrap_or(self);
+        let scalar = scalar_eval.as_ref().unwrap_or(scalar);
+        let status = unsafe { gpu_matrix_add_scalar(destination.raw, matrix.raw, scalar.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_add_scalar failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn add_scalar_in_place(&mut self, scalar: &Self) -> Result<(), GpuNativeGraphError> {
+        if self.params != scalar.params || self.level != scalar.level || scalar.size() != (1, 1) {
+            return Err(GpuNativeGraphError::Native("add_scalar_in_place shape mismatch".into()));
+        }
+        let matrix_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let scalar_eval = (!scalar.is_ntt).then(|| scalar.ensure_eval_domain());
+        let matrix = matrix_eval.as_ref().unwrap_or(self);
+        let scalar = scalar_eval.as_ref().unwrap_or(scalar);
+        let status = unsafe { gpu_matrix_add_scalar(self.raw, matrix.raw, scalar.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_add_scalar failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        self.is_ntt = true;
+        Ok(())
+    }
+
+    pub fn sub_into(&self, rhs: &Self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        self.validate_destination(destination, self.nrow, self.ncol, self.level, self.is_ntt)?;
+        if rhs.params != self.params ||
+            rhs.nrow != self.nrow ||
+            rhs.ncol != self.ncol ||
+            rhs.level != self.level
+        {
+            return Err(GpuNativeGraphError::Native("sub_into shape/domain mismatch".into()));
+        }
+        let lhs_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let rhs_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let lhs = lhs_eval.as_ref().unwrap_or(self);
+        let rhs = rhs_eval.as_ref().unwrap_or(rhs);
+        let status = unsafe { gpu_matrix_sub(destination.raw, lhs.raw, rhs.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_sub failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn transpose_into(&self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        self.validate_destination(destination, self.ncol, self.nrow, self.level, self.is_ntt)?;
+        let status = unsafe { gpu_matrix_transpose(destination.raw, self.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_transpose failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn mul_into(&self, rhs: &Self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        if self.params != rhs.params || self.level != rhs.level || self.ncol != rhs.nrow {
+            return Err(GpuNativeGraphError::Native("mul_into shape mismatch".into()));
+        }
+        self.validate_destination(destination, self.nrow, rhs.ncol, self.level, true)?;
+        let lhs_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let rhs_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let lhs = lhs_eval.as_ref().unwrap_or(self);
+        let rhs = rhs_eval.as_ref().unwrap_or(rhs);
+        let status = unsafe { gpu_matrix_mul(destination.raw, lhs.raw, rhs.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_mul failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Multiply by a resident singleton polynomial without extracting or
+    /// copying it. Capture and allocating scalar multiplication share this body.
+    pub fn mul_scalar_into(
+        &self,
+        scalar: &Self,
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.params != scalar.params || self.level != scalar.level || scalar.size() != (1, 1) {
+            return Err(GpuNativeGraphError::Native("mul_scalar_into shape mismatch".into()));
+        }
+        self.validate_destination(destination, self.nrow, self.ncol, self.level, true)?;
+        let matrix_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let scalar_eval = (!scalar.is_ntt).then(|| scalar.ensure_eval_domain());
+        let matrix = matrix_eval.as_ref().unwrap_or(self);
+        let scalar = scalar_eval.as_ref().unwrap_or(scalar);
+        let status = unsafe { gpu_matrix_mul_scalar(destination.raw, matrix.raw, scalar.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_mul_scalar failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Multiply by a resident scalar polynomial without exposing the
+    /// polynomial's private matrix wrapper to GPU runtime callers.
+    pub fn mul_scalar_poly_into(
+        &self,
+        scalar: &crate::poly::dcrt::gpu::GpuDCRTPoly,
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.mul_scalar_into(scalar.inner(), destination)
+    }
+
+    pub fn tensor_into(
+        &self,
+        rhs: &Self,
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.params != rhs.params || self.level != rhs.level {
+            return Err(GpuNativeGraphError::Native("tensor_into parameter mismatch".into()));
+        }
+        let rows = self
+            .nrow
+            .checked_mul(rhs.nrow)
+            .ok_or_else(|| GpuNativeGraphError::Native("tensor row overflow".into()))?;
+        let columns = self
+            .ncol
+            .checked_mul(rhs.ncol)
+            .ok_or_else(|| GpuNativeGraphError::Native("tensor column overflow".into()))?;
+        self.validate_destination(destination, rows, columns, self.level, true)?;
+        let left_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let right_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let left = left_eval.as_ref().unwrap_or(self);
+        let right = right_eval.as_ref().unwrap_or(rhs);
+        let status = unsafe { gpu_matrix_tensor(destination.raw, left.raw, right.raw) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_tensor failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sum rows from up to sixteen disjoint column fragments in one launch.
+    /// Each tuple is (resident source, local source range, destination column).
+    /// Capture bindings are source descriptors in order, then the destination.
+    pub fn sum_rows_into(
+        sources: &[(&Self, std::ops::Range<usize>, usize)],
+        rows: &[Vec<usize>],
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        let Some((first, ..)) = sources.first() else {
+            return Err(GpuNativeGraphError::Native("row sum requires resident sources".into()));
+        };
+        first.validate_destination(
+            destination,
+            rows.len(),
+            destination.ncol,
+            first.level,
+            first.is_ntt,
+        )?;
+        if sources.len() > 16 {
+            return Err(GpuNativeGraphError::Native(
+                "row sum exceeds sixteen source fragments".into(),
+            ));
+        }
+        for (source, range, destination_start) in sources {
+            first.validate_destination(
+                source,
+                first.nrow,
+                source.ncol,
+                first.level,
+                first.is_ntt,
+            )?;
+            // A zero-column matrix has one empty logical range, not an
+            // omitted fragment of a nonempty destination. Preserve that
+            // valid no-work shape while rejecting all other empty ranges.
+            if range.start > range.end ||
+                (range.is_empty() && (source.ncol != 0 || destination.ncol != 0)) ||
+                range.end > source.ncol ||
+                *destination_start > destination.ncol ||
+                range.len() > destination.ncol - destination_start
+            {
+                return Err(GpuNativeGraphError::Native("invalid row sum fragment range".into()));
+            }
+        }
+        let terms = rows.iter().map(Vec::len).sum::<usize>();
+        if rows.is_empty() ||
+            rows.len() > 16 ||
+            terms > 32 ||
+            rows.iter()
+                .any(|group| group.is_empty() || group.iter().any(|row| *row >= first.nrow))
+        {
+            return Err(GpuNativeGraphError::Native(
+                "sum_rows_into requires bounded nonempty groups of valid rows".into(),
+            ));
+        }
+        let mut flat = [0usize; 32];
+        let mut offsets = [0usize; 17];
+        let mut end = 0;
+        for (index, group) in rows.iter().enumerate() {
+            flat[end..end + group.len()].copy_from_slice(group);
+            end += group.len();
+            offsets[index + 1] = end;
+        }
+        let raw = sources.iter().map(|(source, ..)| source.raw.cast_const()).collect::<Vec<_>>();
+        let starts = sources.iter().map(|(_, range, _)| range.start).collect::<Vec<_>>();
+        let widths = sources.iter().map(|(_, range, _)| range.len()).collect::<Vec<_>>();
+        let destination_starts = sources.iter().map(|(_, _, start)| *start).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_sum_rows(
+                destination.raw,
+                raw.as_ptr(),
+                starts.as_ptr(),
+                widths.as_ptr(),
+                destination_starts.as_ptr(),
+                sources.len(),
+                flat.as_ptr(),
+                offsets.as_ptr(),
+                rows.len(),
+                terms,
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_sum_rows failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Add row blocks directly into the retained output descriptor owner.
+    pub fn add_row_blocks_into(
+        fragments: &[GpuRowBlockAddFragment<'_>],
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        if fragments.is_empty() || fragments.len() > 16 {
+            return Err(GpuNativeGraphError::Native(
+                "row-block add requires one to sixteen fragments".into(),
+            ));
+        }
+        let mut raw = Vec::with_capacity(fragments.len());
+        for fragment in fragments {
+            destination.validate_destination(
+                fragment.left,
+                fragment.left.nrow,
+                fragment.left.ncol,
+                destination.level,
+                true,
+            )?;
+            destination.validate_destination(
+                fragment.right,
+                fragment.right.nrow,
+                fragment.right.ncol,
+                destination.level,
+                true,
+            )?;
+            raw.push(GpuRowBlockAddFragmentRaw {
+                lhs: fragment.left.raw,
+                rhs: fragment.right.raw,
+                lhs_column: fragment.left_column,
+                rhs_row: fragment.right_row,
+                rhs_column: fragment.right_column,
+                destination_row: fragment.destination_row,
+                destination_column: fragment.destination_column,
+                rows: fragment.rows,
+                columns: fragment.columns,
+            });
+        }
+        let status = unsafe { gpu_matrix_add_row_blocks(destination.raw, raw.as_ptr(), raw.len()) };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_add_row_blocks failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Submit a bounded tensor row-sum directly into an already allocated
+    /// destination owner.  Keeping allocation outside this method is
+    /// required for graph capture: native replay patches the exact lhs/rhs/
+    /// destination descriptor bindings and never relies on an uninitialized
+    /// output descriptor exemplar.
+    pub fn tensor_sum_rows_into(
+        &self,
+        rhs: &Self,
+        rows: &[Vec<usize>],
+        destination: &mut Self,
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.params != rhs.params || self.level != rhs.level || self.is_ntt != rhs.is_ntt {
+            return Err(GpuNativeGraphError::Native(
+                "tensor_sum_rows_into parameter/domain mismatch".into(),
+            ));
+        }
+        let columns = self
+            .ncol
+            .checked_mul(rhs.ncol)
+            .ok_or_else(|| GpuNativeGraphError::Native("tensor columns overflow".into()))?;
+        self.validate_destination(destination, rows.len(), columns, self.level, true)?;
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let terms = rows.iter().map(Vec::len).sum::<usize>();
+        if rows.len() > TensorRowSumImplementation::MAX_GROUPS ||
+            terms > TensorRowSumImplementation::MAX_TERMS ||
+            rows.iter().any(|group| {
+                group.is_empty() ||
+                    group
+                        .iter()
+                        .any(|&row| row >= self.nrow.checked_mul(rhs.nrow).unwrap_or(usize::MAX))
+            })
+        {
+            return Err(GpuNativeGraphError::Native(
+                "tensor_sum_rows_into exceeds the bounded native row topology".into(),
+            ));
+        }
+        let left_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let right_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let left = left_eval.as_ref().unwrap_or(self);
+        let right = right_eval.as_ref().unwrap_or(rhs);
+        let mut flat = Vec::with_capacity(terms);
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        offsets.push(0);
+        for group in rows {
+            flat.extend_from_slice(group);
+            offsets.push(flat.len());
+        }
+        let status = unsafe {
+            gpu_matrix_tensor_sum_rows(
+                destination.raw,
+                left.raw,
+                right.raw,
+                flat.as_ptr(),
+                offsets.as_ptr(),
+                rows.len(),
+                terms,
+            )
+        };
+        check_status(status, "gpu_matrix_tensor_sum_rows");
+        Ok(())
+    }
+
+    /// Submit several logical tensor-row-sum outputs in one fused launch.
+    /// `groups` is indexed by output owner, then by output row.  The complete
+    /// flattened topology is bounded exactly like the native single-output
+    /// primitive, so no materialized tensor, slicing, or copy owner is needed.
+    pub fn tensor_sum_row_groups_into(
+        &self,
+        rhs: &Self,
+        groups: &[Vec<Vec<usize>>],
+        destinations: &mut [Self],
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.params != rhs.params || self.level != rhs.level || self.is_ntt != rhs.is_ntt {
+            return Err(GpuNativeGraphError::Native(
+                "tensor_sum_row_groups_into parameter/domain mismatch".into(),
+            ));
+        }
+        if groups.len() != destinations.len() {
+            return Err(GpuNativeGraphError::Native("tensor row-sum output count mismatch".into()));
+        }
+        if groups.is_empty() {
+            return Ok(());
+        }
+        if groups.len() > TensorRowSumImplementation::MAX_GROUPS {
+            return Err(GpuNativeGraphError::Native(
+                "tensor row-sum output count exceeds the bounded native topology".into(),
+            ));
+        }
+        let columns = self
+            .ncol
+            .checked_mul(rhs.ncol)
+            .ok_or_else(|| GpuNativeGraphError::Native("tensor columns overflow".into()))?;
+        let tensor_rows = self
+            .nrow
+            .checked_mul(rhs.nrow)
+            .ok_or_else(|| GpuNativeGraphError::Native("tensor rows overflow".into()))?;
+        let mut flat_rows = Vec::new();
+        let mut offsets = vec![0usize];
+        let mut output_offsets = vec![0usize];
+        for (destination, output_groups) in destinations.iter().zip(groups) {
+            self.validate_destination(destination, output_groups.len(), columns, self.level, true)?;
+            if output_groups.is_empty() {
+                return Err(GpuNativeGraphError::Native(
+                    "tensor row-sum output groups must be nonempty".into(),
+                ));
+            }
+            for group in output_groups {
+                if group.is_empty() || group.iter().any(|&row| row >= tensor_rows) {
+                    return Err(GpuNativeGraphError::Native("invalid tensor row-sum group".into()));
+                }
+                flat_rows.extend_from_slice(group);
+                if flat_rows.len() > TensorRowSumImplementation::MAX_TERMS {
+                    return Err(GpuNativeGraphError::Native(
+                        "tensor row-sum terms exceed the bounded native topology".into(),
+                    ));
+                }
+                offsets.push(flat_rows.len());
+            }
+            output_offsets.push(offsets.len() - 1);
+        }
+        let left_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let right_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let left = left_eval.as_ref().unwrap_or(self);
+        let right = right_eval.as_ref().unwrap_or(rhs);
+        let output_raw = destinations.iter_mut().map(|value| value.raw).collect::<Vec<_>>();
+        let status = unsafe {
+            gpu_matrix_tensor_sum_rows_batch(
+                output_raw.as_ptr(),
+                output_raw.len(),
+                left.raw,
+                right.raw,
+                flat_rows.as_ptr(),
+                offsets.as_ptr(),
+                output_offsets.as_ptr(),
+                offsets.len() - 1,
+                flat_rows.len(),
+            )
+        };
+        check_status(status, "gpu_matrix_tensor_sum_rows_batch");
+        Ok(())
+    }
+
+    pub fn decompose_into(
+        &self,
+        destination: &mut Self,
+        small: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        let digits = if small {
+            self.params.crt_bits().div_ceil(self.params.base_bits() as usize)
+        } else {
+            self.params.modulus_digits()
+        };
+        let rows = self
+            .nrow
+            .checked_mul(digits)
+            .ok_or_else(|| GpuNativeGraphError::Native("decompose row overflow".into()))?;
+        self.validate_destination(destination, rows, self.ncol, self.level, true)?;
+        let source = (!self.is_ntt).then(|| self.clone().into_coeff_domain());
+        let source = source.as_ref().unwrap_or(self);
+        let status = unsafe {
+            if small {
+                gpu_matrix_decompose_base_small(
+                    source.raw,
+                    self.params.base_bits(),
+                    destination.raw,
+                )
+            } else {
+                gpu_matrix_decompose_base(
+                    source.raw,
+                    self.params.base_bits(),
+                    destination.raw,
+                    self.params.dropped_moduli(),
+                )
+            }
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_decompose failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn negate_into(&self, destination: &mut Self) -> Result<(), GpuNativeGraphError> {
+        self.validate_destination(destination, self.nrow, self.ncol, self.level, self.is_ntt)?;
+        let status = unsafe {
+            gpu_matrix_negate_batch([destination.raw].as_ptr(), [self.raw.cast_const()].as_ptr(), 1)
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(format!(
+                "gpu_matrix_negate_batch failed: {}",
+                crate::poly::dcrt::gpu::last_error_string()
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl PolyMatrix for GpuDCRTPolyMatrix {
     type P = GpuDCRTPoly;
 
@@ -3088,7 +6674,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             let sum = outputs.next().unwrap().concat_rows_owned(outputs.collect());
             return if self.is_ntt { sum } else { sum.into_coeff_domain() };
         }
-        let out = Self::new_empty_with_state(
+        let mut out = Self::new_empty_with_state(
             &self.params,
             rows.len(),
             self.ncol,
@@ -3096,25 +6682,8 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             self.is_ntt,
             None,
         );
-        let mut flat = [0usize; 32];
-        let mut offsets = [0usize; 17];
-        let mut end = 0;
-        for (index, group) in rows.iter().enumerate() {
-            flat[end..end + group.len()].copy_from_slice(group);
-            end += group.len();
-            offsets[index + 1] = end;
-        }
-        let status = unsafe {
-            gpu_matrix_sum_rows(
-                out.raw,
-                self.raw,
-                flat.as_ptr(),
-                offsets.as_ptr(),
-                rows.len(),
-                terms,
-            )
-        };
-        check_status(status, "gpu_matrix_sum_rows");
+        Self::sum_rows_into(&[(self, 0..self.ncol, 0)], rows, &mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_sum_rows failed: {error}"));
         out
     }
 
@@ -3123,7 +6692,7 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             let (first, rest) = blocks.split_first().expect("nonempty row blocks");
             return first.concat_rows(rest).add_out_of_place(self);
         }
-        let out = Self::new_empty_with_state(
+        let mut out = Self::new_empty_with_state(
             &self.params,
             self.nrow,
             self.ncol,
@@ -3134,10 +6703,29 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if self.nrow == 0 || self.ncol == 0 {
             return out;
         }
-        let raw = blocks.iter().map(|block| block.raw.cast_const()).collect::<Vec<_>>();
-        let status =
-            unsafe { gpu_matrix_add_row_blocks(out.raw, raw.as_ptr(), raw.len(), self.raw) };
-        check_status(status, "gpu_matrix_add_row_blocks");
+        let mut row = 0;
+        let fragments = blocks
+            .iter()
+            .filter(|block| block.nrow > 0)
+            .map(|block| {
+                let fragment = GpuRowBlockAddFragment {
+                    left: block,
+                    right: self,
+                    left_column: 0,
+                    right_row: row,
+                    right_column: 0,
+                    destination_row: row,
+                    destination_column: 0,
+                    rows: block.nrow,
+                    columns: self.ncol,
+                };
+                row += block.nrow;
+                fragment
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(row, self.nrow, "row block sum differs from output rows");
+        Self::add_row_blocks_into(&fragments, &mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_add_row_blocks failed: {error}"));
         out
     }
 
@@ -3162,6 +6750,8 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     fn multiply_batch_out_of_place(inputs: Vec<(Arc<Self>, Arc<Self>)>) -> Vec<Self> {
         let mut groups = BTreeMap::new();
         for (index, (left, right)) in inputs.into_iter().enumerate() {
+            let left = if left.is_ntt { left } else { Arc::new(left.ensure_eval_domain()) };
+            let right = if right.is_ntt { right } else { Arc::new(right.ensure_eval_domain()) };
             let key = (
                 left.params.ctx_raw() as usize,
                 right.params.ctx_raw() as usize,
@@ -3171,8 +6761,6 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
                 right.ncol,
                 left.level,
                 right.level,
-                left.is_ntt,
-                right.is_ntt,
             );
             groups.entry(key).or_insert_with(Vec::new).push((index, left, right));
         }
@@ -4110,16 +7698,17 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
     }
 
     fn transpose(&self) -> Self {
-        let out = Self::new_empty_with_state(
+        let descriptor = GpuMatrixOutputDescriptor::for_shape(
             &self.params,
             self.ncol,
             self.nrow,
             self.level,
             self.is_ntt,
-            None,
-        );
-        let status = unsafe { gpu_matrix_transpose(out.raw, self.raw) };
-        check_status(status, "gpu_matrix_transpose");
+        )
+        .expect("transpose output descriptor");
+        let mut out = descriptor.allocate();
+        self.transpose_into(&mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_transpose failed: {error}"));
         out
     }
 
@@ -4155,15 +7744,8 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if Self::tensor_sum_rows_implementation(rows).is_materialized() {
             return self.tensor(rhs).sum_rows(rows);
         }
-        let terms = rows.iter().map(Vec::len).sum::<usize>();
-        let out = Self::new_empty_with_state(
-            &self.params,
-            rows.len(),
-            columns,
-            self.level,
-            true,
-            Some(rows.is_empty() || columns == 0),
-        );
+        let out =
+            Self::new_empty_with_state(&self.params, rows.len(), columns, self.level, true, None);
         if rows.is_empty() {
             return out;
         }
@@ -4176,30 +7758,9 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
             );
             return out;
         }
-        let left_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
-        let right_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
-        let left = left_eval.as_ref().unwrap_or(self);
-        let right = right_eval.as_ref().unwrap_or(rhs);
-        let mut flat = [0usize; 32];
-        let mut offsets = [0usize; 17];
-        let mut end = 0;
-        for (index, group) in rows.iter().enumerate() {
-            flat[end..end + group.len()].copy_from_slice(group);
-            end += group.len();
-            offsets[index + 1] = end;
-        }
-        let status = unsafe {
-            gpu_matrix_tensor_sum_rows(
-                out.raw,
-                left.raw,
-                right.raw,
-                flat.as_ptr(),
-                offsets.as_ptr(),
-                rows.len(),
-                terms,
-            )
-        };
-        check_status(status, "gpu_matrix_tensor_sum_rows");
+        let mut out = out;
+        self.tensor_sum_rows_into(rhs, rows, &mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_tensor_sum_rows failed: {error}"));
         out
     }
 
@@ -4209,17 +7770,19 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         debug_assert_eq!(self.is_ntt, other.is_ntt, "Tensor requires same domain");
         let out_nrow = self.nrow * other.nrow;
         let out_ncol = self.ncol * other.ncol;
-        let out =
-            Self::new_empty_with_state(&self.params, out_nrow, out_ncol, self.level, true, None);
-        if self.nrow == 0 || self.ncol == 0 || other.nrow == 0 || other.ncol == 0 {
-            return out;
+        let descriptor = GpuMatrixOutputDescriptor::for_shape(
+            &self.params,
+            out_nrow,
+            out_ncol,
+            self.level,
+            true,
+        )
+        .expect("tensor output descriptor");
+        let mut out = descriptor.allocate();
+        if self.nrow != 0 && self.ncol != 0 && other.nrow != 0 && other.ncol != 0 {
+            self.tensor_into(other, &mut out)
+                .unwrap_or_else(|error| panic!("gpu_matrix_tensor failed: {error}"));
         }
-        let left_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
-        let right_eval = (!other.is_ntt).then(|| other.ensure_eval_domain());
-        let left = left_eval.as_ref().unwrap_or(self);
-        let right = right_eval.as_ref().unwrap_or(other);
-        let status = unsafe { gpu_matrix_tensor(out.raw, left.raw, right.raw) };
-        check_status(status, "gpu_matrix_tensor");
         out
     }
 
@@ -4369,6 +7932,24 @@ impl PolyMatrix for GpuDCRTPolyMatrix {
         if status != 0 {
             return Err(crate::poly::dcrt::gpu::last_error_string());
         }
+        output.ntt_all_in_place();
+        Ok(output)
+    }
+
+    fn centered_round_divide(&self, divisor: &BigUint) -> Result<Self, String> {
+        if divisor.is_zero() {
+            return Err("CenteredRoundDivide divisor must be positive".into());
+        }
+        let coefficients = self.is_ntt.then(|| self.clone().into_coeff_domain());
+        let source = coefficients.as_ref().unwrap_or(self);
+        let mut output =
+            Self::new_empty_with_state(&self.params, self.nrow, self.ncol, self.level, false, None);
+        let plan = source
+            .prepare_centered_round_divide(&output, divisor)
+            .map_err(|error| error.to_string())?;
+        source
+            .submit_centered_round_divide_into(&mut output, &plan, 0, 1)
+            .map_err(|error| error.to_string())?;
         output.ntt_all_in_place();
         Ok(output)
     }
@@ -4683,7 +8264,7 @@ impl Sub<&GpuDCRTPolyMatrix> for &GpuDCRTPolyMatrix {
 
 impl GpuDCRTPolyMatrix {
     pub(crate) fn negate_direct(&self) -> GpuDCRTPolyMatrix {
-        let out = GpuDCRTPolyMatrix::new_empty_with_state(
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
             &self.params,
             self.nrow,
             self.ncol,
@@ -4694,36 +8275,25 @@ impl GpuDCRTPolyMatrix {
         if self.nrow == 0 || self.ncol == 0 {
             return out;
         }
-        let output = [out.raw];
-        let input = [self.raw.cast_const()];
-        let status = unsafe { gpu_matrix_negate_batch(output.as_ptr(), input.as_ptr(), 1) };
-        check_status(status, "gpu_matrix_negate_batch");
+        self.negate_into(&mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_negate_batch failed: {error}"));
         out
     }
 
     fn mul_scalar(&self, scalar: &GpuDCRTPoly) -> GpuDCRTPolyMatrix {
-        let matrix_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
-        let matrix = matrix_eval.as_ref().unwrap_or(self);
-        let out = GpuDCRTPolyMatrix::new_empty_with_state(
-            &matrix.params,
-            matrix.nrow,
-            matrix.ncol,
-            matrix.level,
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
+            &self.params,
+            self.nrow,
+            self.ncol,
+            self.level,
             true,
             None,
         );
-        if matrix.nrow == 0 || matrix.ncol == 0 {
+        if self.nrow == 0 || self.ncol == 0 {
             return out;
         }
-        let scalar_eval = (!scalar.is_ntt()).then(|| {
-            let mut value = scalar.clone();
-            value.ntt_in_place();
-            value
-        });
-        let scalar_mat = scalar_eval.as_ref().unwrap_or(scalar).inner();
-        scalar_mat.assert_singleton();
-        let status = unsafe { gpu_matrix_mul_scalar(out.raw, matrix.raw, scalar_mat.raw) };
-        check_status(status, "gpu_matrix_mul_scalar");
+        self.mul_scalar_into(scalar.inner(), &mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_mul_scalar failed: {error}"));
         out
     }
 
@@ -4736,20 +8306,23 @@ impl GpuDCRTPolyMatrix {
         );
         debug_assert_eq!(self.params, rhs.params, "Multiplication requires same params");
         debug_assert_eq!(self.level, rhs.level, "Multiplication requires same level");
-        debug_assert_eq!(self.is_ntt, rhs.is_ntt, "Multiplication requires same domain");
-        let out = GpuDCRTPolyMatrix::new_empty_with_state(
+        let lhs_eval = (!self.is_ntt).then(|| self.ensure_eval_domain());
+        let rhs_eval = (!rhs.is_ntt).then(|| rhs.ensure_eval_domain());
+        let lhs = lhs_eval.as_ref().unwrap_or(self);
+        let rhs = rhs_eval.as_ref().unwrap_or(rhs);
+        let mut out = GpuDCRTPolyMatrix::new_empty_with_state(
             &self.params,
             self.nrow,
             rhs.ncol,
             self.level,
-            self.is_ntt,
+            true,
             None,
         );
         if self.nrow == 0 || rhs.ncol == 0 || self.ncol == 0 {
             return out;
         }
-        let status = unsafe { gpu_matrix_mul(out.raw, self.raw, rhs.raw) };
-        check_status(status, "gpu_matrix_mul");
+        lhs.mul_into(&rhs, &mut out)
+            .unwrap_or_else(|error| panic!("gpu_matrix_mul failed: {error}"));
         out
     }
 }
@@ -4894,6 +8467,26 @@ mod tests {
             params.base_bits(),
             Some(params.dropped_moduli()),
         )
+    }
+
+    #[test]
+    fn capture_block_copy_api_has_explicit_offsets_and_bindings() {
+        // Keep this as a compile-time API check: executing it would require a
+        // CUDA device and a stream, while the primitive no-run gate still
+        // verifies the complete source/destination offset and binding ABI.
+        let _copy: for<'source, 'destination> fn(
+            &'source GpuDCRTPolyMatrix,
+            &'destination mut GpuDCRTPolyMatrix,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            usize,
+            &GpuNativeLaunchStream,
+            u32,
+            u32,
+        ) -> Result<(), GpuNativeGraphError> = GpuDCRTPolyMatrix::copy_block_into_on_capture_stream;
     }
 
     #[test]
@@ -5724,6 +9317,80 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_matrix_sum_rows_fragmented_ranges_match_cpu() {
+        let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        let cpu = random_cpu_matrix(&params, 5, 7, &mut random);
+        let groups = vec![vec![4, 1, 4], vec![0], vec![3, 2]];
+        let expected = cpu.slice(0, 5, 1, 6).sum_rows(&groups);
+        for coefficient_domain in [false, true] {
+            let mut input = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &cpu);
+            if coefficient_domain {
+                input = input.into_coeff_domain();
+            }
+            let left = input.slice(0, 5, 0, 4);
+            let right = input.slice(0, 5, 3, 7);
+            let mut output = GpuDCRTPolyMatrix::new_empty_with_state(
+                &gpu_params,
+                groups.len(),
+                5,
+                input.level,
+                input.is_ntt,
+                None,
+            );
+            GpuDCRTPolyMatrix::sum_rows_into(
+                &[(&left, 1..4, 0), (&right, 1..3, 3)],
+                &groups,
+                &mut output,
+            )
+            .expect("fragmented row sum");
+            drop((input, left, right));
+            assert_eq!(output.to_cpu_matrix(), expected);
+        }
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_add_row_blocks_fragmented_ranges_match_cpu() {
+        let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, 4, 54, 8, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let mut random = rng();
+        let left_cpu = random_cpu_matrix(&params, 3, 5, &mut random);
+        let right_cpu = random_cpu_matrix(&params, 3, 5, &mut random);
+        let expected = left_cpu.slice(0, 3, 1, 5) + right_cpu.slice(0, 3, 1, 5);
+        let left = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu);
+        let right = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &right_cpu);
+        let top = left.slice(0, 1, 0, 5);
+        let bottom = left.slice(1, 3, 0, 5);
+        let mut output =
+            GpuDCRTPolyMatrix::new_empty_with_state(&gpu_params, 3, 4, left.level, true, None);
+        let mut fragments = Vec::new();
+        for (block, row) in [(&top, 0), (&bottom, 1)] {
+            for (column, columns) in [(0, 3), (3, 1)] {
+                fragments.push(GpuRowBlockAddFragment {
+                    left: block,
+                    right: &right,
+                    left_column: column + 1,
+                    right_row: row,
+                    right_column: column + 1,
+                    destination_row: row,
+                    destination_column: column,
+                    rows: block.nrow,
+                    columns,
+                });
+            }
+        }
+        GpuDCRTPolyMatrix::add_row_blocks_into(&fragments, &mut output)
+            .expect("fragmented row-block add");
+        drop((left, right, top, bottom));
+        assert_eq!(output.to_cpu_matrix(), expected);
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_matrix_tensor_sum_rows_matches_cpu() {
         let (n, _, _, _) = crate::env::modulus_conversion_test_parameters();
         let mut random = rng();
@@ -6068,7 +9735,7 @@ mod tests {
             ],
         ];
         let source = GpuDCRTPolyMatrix::from_poly_vec(&source_params, values);
-        let Some(copied) = source.copy_to_params_direct(&destination_params) else {
+        let Ok(copied) = source.copy_to_params_direct(&destination_params) else {
             return;
         };
         drop(source);
@@ -7115,6 +10782,92 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_compact_fragmented_decomposition_and_product_match_cpu() {
+        let (n, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let params = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
+        let gpu_params = gpu_params_from_cpu(&params);
+        let stream = gpu_params.native_launch_stream(gpu_params.device_ids()[0]).expect("stream");
+        let mut random = rng();
+        let cpu = random_cpu_matrix(&params, 2, 3, &mut random);
+        let source = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &cpu);
+        for small in [false, true] {
+            let expected = source.clone().gadget_decompose(small, None).unwrap();
+            let fragments = [
+                source.slice(0, 1, 0, 2),
+                source.slice(0, 1, 1, 3),
+                source.slice(1, 2, 0, 2),
+                source.slice(1, 2, 1, 3),
+            ];
+            let mut output = GpuSmallMatrix::new_empty(
+                &gpu_params,
+                expected.rows(),
+                3,
+                expected.bound().clone(),
+            )
+            .unwrap();
+            let references = fragments.iter().collect::<Vec<_>>();
+            GpuDCRTPolyMatrix::gadget_decompose_row_blocks_ref_into_bound(
+                &references,
+                small,
+                None,
+                &mut output,
+                &stream,
+                &[0, 1, 2, 3],
+                Some(&[(0..1, 0, 0), (0..2, 0, 1), (0..1, 1, 0), (0..2, 1, 1)]),
+            )
+            .expect("fragmented decomposition");
+            assert_eq!(
+                output.to_canonical_coefficients().unwrap(),
+                expected.to_canonical_coefficients().unwrap()
+            );
+            assert_eq!(source.to_cpu_matrix(), cpu);
+            if !small {
+                let inner = expected.rows();
+                let left_cpu = random_cpu_matrix(&params, 3, inner, &mut random);
+                let expected_product = &left_cpu * &cpu.decompose();
+                let left = GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, &left_cpu);
+                let pieces = [
+                    left.slice(0, 1, 0, 1),
+                    left.slice(0, 1, 1, inner),
+                    left.slice(1, 3, 0, inner - 1),
+                    left.slice(1, 3, inner - 1, inner),
+                ];
+                let inputs = pieces.iter().collect::<Vec<_>>();
+                let mut top = GpuDCRTPolyMatrix::new_empty_with_state(
+                    &gpu_params,
+                    1,
+                    3,
+                    left.level,
+                    true,
+                    None,
+                );
+                let mut bottom = GpuDCRTPolyMatrix::new_empty_with_state(
+                    &gpu_params,
+                    2,
+                    3,
+                    left.level,
+                    true,
+                    None,
+                );
+                GpuDCRTPolyMatrix::multiply_small_rhs_row_blocks_into_bound(
+                    &inputs,
+                    &output,
+                    &mut [&mut top, &mut bottom],
+                    &stream,
+                    &[0, 1, 2, 3],
+                    &[4, 5],
+                    6,
+                    &[2, 4],
+                )
+                .expect("fragmented compact product");
+                assert_eq!(top.to_cpu_matrix(), expected_product.slice(0, 1, 0, 3));
+                assert_eq!(bottom.to_cpu_matrix(), expected_product.slice(1, 3, 0, 3));
+            }
+        }
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_compact_row_blocks_match_materialized_operations() {
         let (n, depth, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
         let params = DCRTPolyParams::new(n, depth, bits, base_bits, None, None);
@@ -7895,6 +11648,191 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_matrix_binary_lane_batch_full_tail_broadcast() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let constant = |value| {
+            GpuDCRTPolyMatrix::from_poly_vec(
+                &gpu_params,
+                vec![vec![GpuDCRTPoly::from_usize_to_constant(&gpu_params, value)]],
+            )
+        };
+
+        let left = [constant(1), constant(2), constant(3)];
+        let rhs = constant(10);
+        let outputs = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+        ];
+        GpuDCRTPolyMatrix::binary_lane_batch(
+            &[&outputs[0], &outputs[1], &outputs[2]],
+            &[&left[0], &left[1], &left[2]],
+            &[&rhs],
+            3,
+            0b111,
+            GpuMatrixLaneBinaryOperation::Add,
+            true,
+        );
+        for (output, expected) in outputs.iter().zip([11u64, 12, 13]) {
+            assert_eq!(output.entry(0, 0).coeffs()[0].value(), &BigUint::from(expected));
+        }
+
+        let varying_rhs = [constant(10), constant(20), constant(30)];
+        let varying_outputs = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+        ];
+        GpuDCRTPolyMatrix::binary_lane_batch(
+            &[&varying_outputs[0], &varying_outputs[1], &varying_outputs[2]],
+            &[&left[0], &left[1], &left[2]],
+            &[&varying_rhs[0], &varying_rhs[1], &varying_rhs[2]],
+            3,
+            0b111,
+            GpuMatrixLaneBinaryOperation::Add,
+            false,
+        );
+        for (output, expected) in varying_outputs.iter().zip([11u64, 22, 33]) {
+            assert_eq!(output.entry(0, 0).coeffs()[0].value(), &BigUint::from(expected));
+        }
+
+        let mixed_left = [
+            constant(4),
+            GpuDCRTPolyMatrix::from_poly_vec(
+                &gpu_params,
+                vec![vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 5),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 6),
+                ]],
+            ),
+        ];
+        let mixed_rhs = [
+            constant(10),
+            GpuDCRTPolyMatrix::from_poly_vec(
+                &gpu_params,
+                vec![vec![
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 20),
+                    GpuDCRTPoly::from_usize_to_constant(&gpu_params, 30),
+                ]],
+            ),
+        ];
+        let mixed_outputs = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 2),
+        ];
+        GpuDCRTPolyMatrix::binary_lane_batch(
+            &[&mixed_outputs[0], &mixed_outputs[1]],
+            &[&mixed_left[0], &mixed_left[1]],
+            &[&mixed_rhs[0], &mixed_rhs[1]],
+            2,
+            0b11,
+            GpuMatrixLaneBinaryOperation::Add,
+            false,
+        );
+        assert_eq!(mixed_outputs[0].entry(0, 0).coeffs()[0].value(), &BigUint::from(14u8));
+        assert_eq!(mixed_outputs[1].entry(0, 0).coeffs()[0].value(), &BigUint::from(25u8));
+        assert_eq!(mixed_outputs[1].entry(0, 1).coeffs()[0].value(), &BigUint::from(36u8));
+
+        let tail_sentinel = constant(77);
+        let tail_outputs = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            tail_sentinel,
+        ];
+        GpuDCRTPolyMatrix::binary_lane_batch(
+            &[&tail_outputs[0], &tail_outputs[1], &tail_outputs[2]],
+            &[&left[0], &left[1], &left[2]],
+            &[&rhs],
+            2,
+            0b011,
+            GpuMatrixLaneBinaryOperation::Sub,
+            true,
+        );
+        let modulus = gpu_params.modulus();
+        assert_eq!(tail_outputs[0].entry(0, 0).coeffs()[0].value(), &(&*modulus - 9u8));
+        assert_eq!(tail_outputs[1].entry(0, 0).coeffs()[0].value(), &(&*modulus - 8u8));
+        assert_eq!(tail_outputs[2].entry(0, 0).coeffs()[0].value(), &BigUint::from(77u8));
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_matrix_lane_batch_matmul_unary_transpose() {
+        gpu_device_sync();
+        let params = gpu_test_params();
+        let gpu_params = gpu_params_from_cpu(&params);
+        let constant = |value| GpuDCRTPoly::from_usize_to_constant(&gpu_params, value);
+        let matrix = |rows: Vec<Vec<usize>>| {
+            GpuDCRTPolyMatrix::from_poly_vec(
+                &gpu_params,
+                rows.into_iter().map(|row| row.into_iter().map(constant).collect()).collect(),
+            )
+        };
+
+        let left =
+            [matrix(vec![vec![1, 2]]), matrix(vec![vec![1, 2], vec![3, 4]]), matrix(vec![vec![7]])];
+        let right =
+            [matrix(vec![vec![3], vec![4]]), matrix(vec![vec![5], vec![6]]), matrix(vec![vec![8]])];
+        let products = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 2, 1),
+            matrix(vec![vec![91]]),
+        ];
+        GpuDCRTPolyMatrix::mul_lane_batch(
+            &[&products[0], &products[1], &products[2]],
+            &[&left[0], &left[1], &left[2]],
+            &[&right[0], &right[1], &right[2]],
+            2,
+            0b011,
+        );
+        assert_eq!(products[0].entry(0, 0).coeffs()[0].value(), &BigUint::from(11u8));
+        assert_eq!(products[1].entry(0, 0).coeffs()[0].value(), &BigUint::from(17u8));
+        assert_eq!(products[1].entry(1, 0).coeffs()[0].value(), &BigUint::from(39u8));
+        assert_eq!(products[2].entry(0, 0).coeffs()[0].value(), &BigUint::from(91u8));
+
+        let unary_input = [matrix(vec![vec![7, 8]]), matrix(vec![vec![9]])];
+        let unary_outputs = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 2),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+        ];
+        GpuDCRTPolyMatrix::negate_lane_batch(
+            &[&unary_outputs[0], &unary_outputs[1]],
+            &[&unary_input[0], &unary_input[1]],
+            2,
+            0b11,
+        );
+        let modulus = gpu_params.modulus();
+        assert_eq!(unary_outputs[0].entry(0, 0).coeffs()[0].value(), &(&*modulus - 7u8));
+        assert_eq!(unary_outputs[0].entry(0, 1).coeffs()[0].value(), &(&*modulus - 8u8));
+        assert_eq!(unary_outputs[1].entry(0, 0).coeffs()[0].value(), &(&*modulus - 9u8));
+
+        let scalar = [matrix(vec![vec![3]])];
+        let scaled = [
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 2),
+            GpuDCRTPolyMatrix::zero(&gpu_params, 1, 1),
+        ];
+        GpuDCRTPolyMatrix::scalar_mul_lane_batch(
+            &[&scaled[0], &scaled[1]],
+            &[&unary_input[0], &unary_input[1]],
+            &[&scalar[0]],
+            2,
+            0b11,
+            true,
+        );
+        assert_eq!(scaled[0].entry(0, 0).coeffs()[0].value(), &BigUint::from(21u8));
+        assert_eq!(scaled[0].entry(0, 1).coeffs()[0].value(), &BigUint::from(24u8));
+        assert_eq!(scaled[1].entry(0, 0).coeffs()[0].value(), &BigUint::from(27u8));
+
+        let transpose_input = [matrix(vec![vec![8, 9]])];
+        let transposed = [GpuDCRTPolyMatrix::zero(&gpu_params, 2, 1)];
+        GpuDCRTPolyMatrix::transpose_lane_batch(&[&transposed[0]], &[&transpose_input[0]], 1, 0b1);
+        assert_eq!(transposed[0].entry(0, 0).coeffs()[0].value(), &BigUint::from(8u8));
+        assert_eq!(transposed[0].entry(1, 0).coeffs()[0].value(), &BigUint::from(9u8));
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_matrix_concatenation() {
         gpu_device_sync();
         let params = gpu_test_params();
@@ -8061,6 +11999,87 @@ mod tests {
 
     #[test]
     #[sequential]
+    fn test_gpu_centered_rebase_graph_rebinds_evaluation_owners() {
+        use crate::poly::dcrt::gpu::GpuGraphBindingValue;
+
+        let (dimension, _, _, base_bits) = crate::env::modulus_conversion_test_parameters();
+        let source_cpu = DCRTPolyParams::new(dimension, 1, 17, base_bits, None, None);
+        let wide = DCRTPolyParams::new(dimension, 1, 59, base_bits, None, None);
+        let target_cpu = DCRTPolyParams::new(
+            dimension,
+            2,
+            59,
+            base_bits,
+            Some(vec![source_cpu.to_crt().0[0], wide.to_crt().0[0]]),
+            None,
+        );
+        let target = gpu_params_from_cpu(&target_cpu);
+        let source = GpuDCRTPolyParams::new_with_gpu(
+            dimension,
+            source_cpu.to_crt().0,
+            base_bits,
+            target.gpu_ids().to_vec(),
+            Some(1),
+            Some(&target),
+            None,
+        );
+        let device = target.gpu_ids()[0];
+        let (mut graph, conversion) = {
+            let input = GpuDCRTPolyMatrix::zero(&source, 1, 1);
+            let mut output = GpuDCRTPolyMatrix::zero(&target, 1, 1);
+            input.prepare_external_for_capture().unwrap();
+            output.prepare_external_for_capture().unwrap();
+            let conversion = input.prepare_centered_rebase(&output).unwrap();
+            let capture = source.begin_capture(device).unwrap();
+            // Reversed indices prove the conversion uses the supplied schema,
+            // rather than assuming input=0 and destination=1.
+            input.submit_centered_rebase_into(&mut output, &conversion, 1, 0).unwrap();
+            (capture.finish().unwrap(), conversion)
+        };
+        let stream = graph.launch_stream().clone();
+        graph.upload(&stream).unwrap();
+        let mut random = rng();
+        let mut previous: Option<(GpuDCRTPolyMatrix, DCRTPolyMatrix)> = None;
+        for _ in 0..2 {
+            let coefficients = (0..dimension)
+                .map(|_| BigUint::from(random.random_range(0..source.moduli()[0])))
+                .collect::<Vec<_>>();
+            let cpu = DCRTPolyMatrix::from_poly_vec(
+                &source_cpu,
+                vec![vec![DCRTPoly::from_biguints(&source_cpu, &coefficients)]],
+            );
+            let expected = cpu.centered_rebase(&target_cpu).unwrap();
+            let input = GpuDCRTPolyMatrix::from_cpu_matrix(&source, &cpu);
+            let output = GpuDCRTPolyMatrix::zero(&target, 1, 1);
+            graph
+                .bind(&[
+                    GpuGraphBindingValue::DeviceAddress(
+                        output.binding_components().unwrap()[0].device_descriptors_address,
+                    ),
+                    GpuGraphBindingValue::DeviceAddress(
+                        input.binding_components().unwrap()[0].device_descriptors_address,
+                    ),
+                ])
+                .unwrap();
+            input.wait_compiled_inputs(device, &stream, true).unwrap();
+            output.wait_compiled_inputs(device, &stream, false).unwrap();
+            let completion = graph.launch(&stream).unwrap();
+            input.protect_compiled_submission(device, &stream, &completion, true).unwrap();
+            output.record_compiled_write(&stream).unwrap();
+            completion.wait().unwrap();
+            assert_eq!(input.to_cpu_matrix(), cpu);
+            assert_eq!(output.to_cpu_matrix(), expected);
+            if let Some((old, expected)) = previous.take() {
+                assert_eq!(old.to_cpu_matrix(), expected);
+            }
+            previous = Some((output, expected));
+        }
+        drop(graph);
+        drop(conversion);
+    }
+
+    #[test]
+    #[sequential]
     fn test_gpu_matrix_centered_rebase_matches_cpu() {
         let (dimension, _, _, base_bits) = crate::env::modulus_conversion_test_parameters();
         // Exercise both device storage widths and target moduli smaller than the lift magnitude.
@@ -8143,7 +12162,7 @@ mod tests {
     fn test_gpu_centered_rebase_multi_limb_and_compact_owner_lifetime() {
         gpu_device_sync();
         let (dimension, _, bits, base_bits) = crate::env::modulus_conversion_test_parameters();
-        let all_cpu = DCRTPolyParams::new(dimension, 3, bits, base_bits, None, None);
+        let all_cpu = DCRTPolyParams::new(dimension, 5, bits, base_bits, None, None);
         let primes = all_cpu.to_crt().0;
         let source_cpu = DCRTPolyParams::new(
             dimension,
@@ -8153,15 +12172,26 @@ mod tests {
             Some(vec![primes[2], primes[0]]),
             None,
         );
-        let target_cpu = DCRTPolyParams::new(
+        let target_cpu =
+            DCRTPolyParams::new(dimension, 1, bits, base_bits, Some(vec![primes[3]]), None);
+        let target_gpu = gpu_params_from_cpu(&target_cpu);
+        let target_multi_cpu = DCRTPolyParams::new(
             dimension,
-            3,
+            2,
             bits,
             base_bits,
-            Some(vec![primes[1], primes[2], primes[0]]),
+            Some(vec![primes[3], primes[4]]),
             None,
         );
-        let target_gpu = gpu_params_from_cpu(&target_cpu);
+        let target_multi_gpu = GpuDCRTPolyParams::new_with_gpu(
+            dimension,
+            target_multi_cpu.to_crt().0,
+            base_bits,
+            target_gpu.gpu_ids().to_vec(),
+            Some(1),
+            Some(&target_gpu),
+            None,
+        );
         let source_gpu = GpuDCRTPolyParams::new_with_gpu(
             dimension,
             source_cpu.to_crt().0,
@@ -8196,6 +12226,11 @@ mod tests {
         // immediately is part of the contract rather than an optional wait.
         drop(source);
         assert_eq!(rebased.to_cpu_matrix(), expected);
+        let expected_multi = source_cpu_matrix.centered_rebase(&target_multi_cpu).unwrap();
+        let source_multi = GpuDCRTPolyMatrix::from_cpu_matrix(&source_gpu, &source_cpu_matrix);
+        let rebased_multi = source_multi.centered_rebase(&target_multi_gpu).unwrap();
+        drop(source_multi);
+        assert_eq!(rebased_multi.to_cpu_matrix(), expected_multi);
 
         let bound = BigUint::from(7u8);
         let compact_cpu = CpuSmallMatrix::new(source_cpu_matrix, bound.clone()).unwrap();

@@ -21,8 +21,21 @@ impl Default for GpuWarmupMeasurementConfig {
     fn default() -> Self {
         Self {
             warm_up_iterations: 1,
-            measured_iterations: 3,
+            measured_iterations: 2,
             memory_poll_interval: Duration::from_millis(1),
+        }
+    }
+}
+
+impl GpuWarmupMeasurementConfig {
+    /// Build the setup harness from the runtime's already-frozen options.
+    /// This keeps environment parsing at construction/preparation time and
+    /// avoids a second parser or a late environment lookup in measurement.
+    pub fn from_runtime_options(options: &crate::env::GpuRuntimeOptions) -> Self {
+        Self {
+            warm_up_iterations: options.measurement_warmups,
+            measured_iterations: options.measurement_iterations.get(),
+            ..Self::default()
         }
     }
 }
@@ -93,7 +106,7 @@ where
     let peak = AtomicU64::new(baseline);
     let stop = AtomicBool::new(false);
     let probe_error = Mutex::new(None);
-    let elapsed = thread::scope(|scope| {
+    let (elapsed, retained_delta, spread) = thread::scope(|scope| {
         scope.spawn(|| {
             while !stop.load(Ordering::Acquire) {
                 match probe.current_bytes() {
@@ -114,13 +127,50 @@ where
                 }
             }
         });
-        let started = Instant::now();
+        let mut retained_output = None;
+        let mut retained_after = baseline;
+        let mut sample_seconds = Vec::with_capacity(config.measured_iterations);
         for _ in 0..config.measured_iterations {
-            black_box(operation());
+            // Keep the final returned value alive while sampling U1. This is
+            // what distinguishes retained output/cache residency from the
+            // transient high-water observation.
+            let started = Instant::now();
+            let output = operation();
+            retained_output = Some(black_box(output));
+            let after = probe.current_bytes().map_err(MeasurementHarnessError::MemoryProbe);
+            match after {
+                Ok(bytes) => {
+                    retained_after = bytes;
+                    peak.fetch_max(bytes, Ordering::AcqRel);
+                }
+                Err(error) => {
+                    stop.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            }
+            sample_seconds.push(started.elapsed().as_secs_f64());
         }
         stop.store(true, Ordering::Release);
-        started.elapsed().as_secs_f64()
-    });
+        let elapsed = sample_seconds.iter().sum::<f64>();
+        let mean = elapsed / sample_seconds.len() as f64;
+        let spread = if sample_seconds.len() > 1 {
+            let variance = sample_seconds
+                .iter()
+                .map(|sample| (sample - mean) * (sample - mean))
+                .sum::<f64>() /
+                sample_seconds.len() as f64;
+            variance.sqrt()
+        } else {
+            0.0
+        };
+        let retained_delta = retained_after.saturating_sub(baseline);
+        // Keep the last output alive until U1 has been sampled, then release
+        // it before returning so the next candidate starts from a clean
+        // allocator state. The timing summary is per invocation, not a
+        // batch-wide wall-clock interval.
+        drop(retained_output);
+        Ok((elapsed, retained_delta, spread))
+    })?;
     if let Some(error) = probe_error.lock().expect("memory probe error lock poisoned").take() {
         return Err(MeasurementHarnessError::MemoryProbe(error));
     }
@@ -132,6 +182,9 @@ where
         independent_wave_count: 1,
         measured_wave_workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
         workspace_bytes: peak.load(Ordering::Acquire).saturating_sub(baseline),
+        retained_delta_bytes: retained_delta,
+        spread_seconds: spread,
+        graph_pool_workspace_bytes: 0,
     })
 }
 
@@ -150,10 +203,10 @@ mod tests {
     }
 
     #[test]
-    fn default_measurement_count_is_one_warmup_and_three_samples() {
+    fn default_measurement_count_is_one_warmup_and_two_samples() {
         let config = GpuWarmupMeasurementConfig::default();
         assert_eq!(config.warm_up_iterations, 1);
-        assert_eq!(config.measured_iterations, 3);
+        assert_eq!(config.measured_iterations, 2);
     }
 
     impl MemoryProbe for Probe {
@@ -190,6 +243,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::Acquire), 5);
         assert!(measurement.work_seconds >= 0.0);
         assert_eq!(measurement.work_seconds, measurement.latency_seconds);
+        assert!(measurement.spread_seconds >= 0.0);
     }
 
     #[test]
@@ -219,6 +273,34 @@ mod tests {
         )
         .expect("measurement");
         assert_eq!(measurement.workspace_bytes, 64);
+        assert_eq!(measurement.retained_delta_bytes, 0);
+    }
+
+    #[test]
+    fn harness_reports_output_retained_at_u1_separately_from_peak() {
+        let probe = Probe {
+            bytes: AtomicU64::new(16),
+            samples: AtomicUsize::new(0),
+            observed_high: AtomicBool::new(false),
+        };
+        let measurement = measure_operation(
+            &GpuWarmupMeasurementConfig {
+                warm_up_iterations: 0,
+                measured_iterations: 1,
+                memory_poll_interval: Duration::ZERO,
+            },
+            &probe,
+            || {
+                // The returned value represents a retained output owner. It
+                // remains live through the explicit U1 probe below.
+                probe.bytes.store(48, Ordering::Release);
+                7u64
+            },
+        )
+        .expect("measurement");
+        assert_eq!(measurement.workspace_bytes, 32);
+        assert_eq!(measurement.retained_delta_bytes, 32);
+        assert!(measurement.spread_seconds >= 0.0);
     }
 
     #[test]

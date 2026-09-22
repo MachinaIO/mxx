@@ -15,15 +15,15 @@ use crate::{
         GpuWarmupProfileRequest, GpuWarmupProvenance, GpuWarmupResidencyDelta, GpuWarmupRoute,
         GpuWarmupTimingScope, IndexRange, MatrixMulAccumulateRequest, MemoryEvidenceKind,
         PreimageCacheIdentity, PreimageRequest, RuntimeValue, SampleRange,
-        poly::{PolyBackendError, gpu::gpu_backend_on},
+        poly::PolyBackendError,
         poly_gpu::{
             GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEvidenceKind,
-            GpuDcrtBackend, GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor,
-            GpuLocalProductionInput, GpuLocalProductionJobRequest, GpuLocalProductionSource,
-            GpuProductionCompletion,
+            GpuDcrtBackend, GpuFleetMatrix, GpuFleetSignedValues, GpuFleetSmallMatrix,
+            GpuFleetTrapdoor, GpuLocalProductionInput, GpuLocalProductionJobRequest,
+            GpuLocalProductionSource, GpuProductionCompletion,
         },
     },
-    executor::{ExecutionConfig, ExecutionError, ExecutionPlan, ExecutionResult, execute_prepared},
+    executor::ExecutionConfig,
     gpu_calibration::{
         GpuCalibrationProfile, GpuColumnWidths, GpuDeviceMemory, gpu_matrix_multiply_scales_left,
     },
@@ -33,7 +33,8 @@ use crate::{
         GpuFragmentClass as TypedFragmentClass, GpuTransferRoute, InputColumnRange,
         WarmupMeasurementKind, WarmupTransferKind, canonical_warmup_profile_domain,
         column_capability, effective_gpu_operation, fused_warmup_profile_domain,
-        gpu_execution_range, map_output_range_to_inputs_with_output,
+        gpu_execution_range, is_resident_control_operation_for_types,
+        map_output_range_to_inputs_with_output,
     },
     gpu_execution_plan::{
         FrozenGpuPlan, FrozenGpuPlanIndex, GpuDeviceBudget, GpuExecutionSiteKey, GpuLayout,
@@ -45,13 +46,9 @@ use crate::{
         gpu_non_column_batch_wave_time,
     },
     host_control::{
-        HostControlBodyAction, HostControlChild, HostPrimitiveValue, dispatch_extract_coefficient,
-        dispatch_pack_polynomial_coefficients, dispatch_polynomial_from_values,
-        dispatch_polynomial_values, dispatch_threshold_decode, measure_host_container_primitive,
-        measure_host_control_with, measure_host_primitive, measure_runtime_container_primitive,
-        measure_runtime_family_get_primitive, measure_trapdoor_public, measure_typed_runtime_input,
+        HostControlChild, HostPrimitiveValue, measure_host_primitive, measure_trapdoor_public,
+        measure_typed_runtime_input,
     },
-    session::SessionStore,
 };
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph, encoding,
@@ -66,7 +63,7 @@ use mxx_primitives::{
         dcrt::gpu::{
             GpuDCRTPolyParams, GpuOutOfMemory, gpu_default_mempool_reset_high_water,
             gpu_default_mempool_usage, gpu_device_memory_usage, gpu_device_runtime_identity,
-            gpu_memory_info,
+            gpu_graph_memory_snapshot, gpu_memory_info,
         },
     },
     sampler::trapdoor::gpu::{
@@ -82,7 +79,7 @@ use std::{
     fmt,
     panic::{self, AssertUnwindSafe},
     sync::{
-        Arc, Barrier,
+        Arc, Barrier, Mutex, MutexGuard, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -99,6 +96,162 @@ mod multigpu_lifecycle_tests;
 #[cfg(test)]
 mod primitive_lifecycle_tests;
 
+/// One measured operation point shared by all homogeneous fleet members.
+/// `incremental_peak_bytes` is the inclusive `P - U0` observation; it is not
+/// a scratch-only estimate. `retained_delta_bytes` is retained as a separate
+/// diagnostic because its lifetime need not coincide with the peak.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuMeasuredCostPoint {
+    pub mean_seconds: f64,
+    pub spread_seconds: f64,
+    pub repetitions: usize,
+    pub incremental_peak_bytes: u64,
+    pub retained_delta_bytes: u64,
+    /// Peak reserved bytes observed through the native graph-pool snapshot.
+    /// This is kept separate from ordinary async-pool high-water bytes.
+    pub graph_pool_peak_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum GpuMeasurementTransportClass {
+    Resident,
+    Peer { source_device: i32, destination_device: i32 },
+    HostStaged { source_device: i32, destination_device: i32 },
+}
+
+/// Identity of a measured resident operation.  Physical GPU identity is
+/// deliberately absent for resident work: a homogeneous fleet shares this
+/// point. Transfer endpoints remain part of the transport class.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct GpuMeasuredCostKey {
+    pub implementation_variant: GpuWarmupEffectiveVariant,
+    pub operation_identity: [u8; 32],
+    pub transport_class: GpuMeasurementTransportClass,
+}
+
+/// Canonical setup-time measured-cost table. Width is the sole interpolation
+/// coordinate and is intentionally kept outside the operation identity.
+#[derive(Clone, Debug, Default)]
+pub struct GpuMeasuredCostCache {
+    points: HashMap<(GpuMeasuredCostKey, usize), GpuMeasuredCostPoint>,
+}
+
+impl GpuMeasuredCostCache {
+    pub fn exact(&self, key: &GpuMeasuredCostKey, width: usize) -> Option<GpuMeasuredCostPoint> {
+        self.points.get(&(key.clone(), width)).copied()
+    }
+
+    pub fn insert(&mut self, key: GpuMeasuredCostKey, width: usize, point: GpuMeasuredCostPoint) {
+        self.points.insert((key, width), point);
+    }
+
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+
+    /// Record only the timing/measurement scalars that are safe to share
+    /// across equivalent resident jobs.  Resource evidence is intentionally
+    /// rebuilt by the planner from the current request; a cache hit must never
+    /// authorize another device or route by copying its memory envelope.
+    pub fn insert_profile(
+        &mut self,
+        key: GpuMeasuredCostKey,
+        width: usize,
+        profile: &GpuWarmupProfile,
+    ) -> Result<(), GpuMeasurementError> {
+        if width == 0 || !profile.time_seconds.is_finite() || profile.time_seconds <= 0.0 {
+            return Err(GpuMeasurementError(
+                "measured-cost cache requires a positive width and finite positive time".into(),
+            ));
+        }
+        if profile.repetitions == 0 ||
+            !profile.spread_seconds.is_finite() ||
+            profile.spread_seconds < 0.0
+        {
+            return Err(GpuMeasurementError(
+                "measured-cost cache requires positive repetitions and finite spread".into(),
+            ));
+        }
+        self.insert(
+            key,
+            width,
+            GpuMeasuredCostPoint {
+                mean_seconds: profile.time_seconds,
+                spread_seconds: profile.spread_seconds,
+                repetitions: profile.repetitions,
+                // `workspace_bytes` is the inclusive P-U0 high-water point;
+                // it is deliberately not reduced to a scratch-only residual.
+                incremental_peak_bytes: profile.workspace_bytes,
+                // Provider-side profiles created from a cache hit do not
+                // carry this diagnostic; measured providers populate it via
+                // `insert_measurement_point` below.
+                retained_delta_bytes: 0,
+                graph_pool_peak_bytes: 0,
+            },
+        );
+        Ok(())
+    }
+
+    fn insert_measurement_point(
+        &mut self,
+        key: GpuMeasuredCostKey,
+        width: usize,
+        profile: &GpuWarmupProfile,
+        measurement: &NodeMeasurement,
+    ) -> Result<(), GpuMeasurementError> {
+        if width == 0 || !profile.time_seconds.is_finite() || profile.time_seconds <= 0.0 {
+            return Err(GpuMeasurementError(
+                "measured-cost cache requires a positive width and finite positive time".into(),
+            ));
+        }
+        self.insert(
+            key,
+            width,
+            GpuMeasuredCostPoint {
+                mean_seconds: profile.time_seconds,
+                spread_seconds: profile.spread_seconds,
+                repetitions: profile.repetitions,
+                incremental_peak_bytes: measurement.workspace_bytes,
+                retained_delta_bytes: measurement.retained_delta_bytes,
+                graph_pool_peak_bytes: measurement.graph_pool_workspace_bytes,
+            },
+        );
+        Ok(())
+    }
+}
+
+fn measured_transport_class(
+    descriptor: GpuExecutionRouteDescriptor,
+) -> GpuMeasurementTransportClass {
+    let endpoint =
+        |device: Option<usize>| device.and_then(|device| i32::try_from(device).ok()).unwrap_or(-1);
+    match descriptor.route {
+        GpuTransferRoute::Resident => GpuMeasurementTransportClass::Resident,
+        GpuTransferRoute::Peer => GpuMeasurementTransportClass::Peer {
+            source_device: endpoint(descriptor.source_device),
+            destination_device: endpoint(descriptor.destination_device),
+        },
+        GpuTransferRoute::HostStaging => GpuMeasurementTransportClass::HostStaged {
+            source_device: endpoint(descriptor.source_device),
+            destination_device: endpoint(descriptor.destination_device),
+        },
+    }
+}
+
+fn measured_cost_key(key: &GpuWarmupProfileKey, profile: &GpuWarmupProfile) -> GpuMeasuredCostKey {
+    GpuMeasuredCostKey {
+        implementation_variant: key.implementation_variant.clone(),
+        operation_identity: key.operation_identity,
+        transport_class: measured_transport_class(
+            profile.resolved_route_descriptor.unwrap_or(key.route_descriptor),
+        ),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 struct NodeMeasurement {
     work_seconds: f64,
@@ -107,6 +260,9 @@ struct NodeMeasurement {
     independent_wave_count: usize,
     measured_wave_workspace_bytes: u64,
     workspace_bytes: u64,
+    retained_delta_bytes: u64,
+    spread_seconds: f64,
+    graph_pool_workspace_bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -155,49 +311,68 @@ struct GpuMemoryProbe {
     device_id: i32,
 }
 
-#[derive(Clone, Copy)]
 struct GpuMemoryMeasurementBaseline {
-    pool_used_current: usize,
-    context_generation: u64,
-    owned_contexts: usize,
+    pool_used_high: usize,
+    graph_reserved_current: u64,
+    /// The CUDA default mempool counters are process-wide per physical
+    /// device.  Keep this permit until the matching peak is collected so two
+    /// setup providers cannot reset/read the same high-water mark at once.
+    /// This is deliberately narrower than serializing GPU tests or runtime
+    /// execution: only the interval that observes the shared counters is
+    /// single-flight.
+    permit: MutexGuard<'static, ()>,
 }
 
-fn require_exclusive_measurement_context(
+const GPU_MEASUREMENT_DEVICE_LOCK_COUNT: usize = 256;
+
+static GPU_MEASUREMENT_DEVICE_LOCKS: OnceLock<[Mutex<()>; GPU_MEASUREMENT_DEVICE_LOCK_COUNT]> =
+    OnceLock::new();
+
+fn gpu_measurement_device_permit(
     device_id: i32,
-    live_contexts: usize,
-    owned_contexts: usize,
-) -> Result<(), GpuMeasurementError> {
-    if owned_contexts > 0 && live_contexts == owned_contexts {
-        Ok(())
-    } else {
-        Err(GpuMeasurementError(format!(
-            "GPU {device_id} has {live_contexts} live mxx contexts but the measurement backend owns {owned_contexts}; exclusive CUDA mempool measurement is required"
-        )))
-    }
+) -> Result<MutexGuard<'static, ()>, GpuMeasurementError> {
+    let index = usize::try_from(device_id).map_err(|_| {
+        GpuMeasurementError(format!("GPU device id {device_id} cannot be measured"))
+    })?;
+    let locks =
+        GPU_MEASUREMENT_DEVICE_LOCKS.get_or_init(|| std::array::from_fn(|_| Mutex::new(())));
+    locks
+        .get(index)
+        .ok_or_else(|| GpuMeasurementError(format!("GPU device id {device_id} is out of range")))?
+        .lock()
+        .map_err(|_| GpuMeasurementError("GPU measurement device lock poisoned".into()))
 }
 
-/// Select the worker for a physical device.  In replicated multi-GPU setup
-/// every worker backend may contain the entire fleet, so backend containment
-/// alone is ambiguous.  The worker's explicit device owner is authoritative;
-/// containment is retained only for legacy/shared-backend fallback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct GpuMemoryMeasurementPeaks {
+    ordinary_pool_bytes: u64,
+    graph_pool_bytes: u64,
+}
+
+/// Select the worker that owns a physical device.
 fn select_worker_index_for_physical(
     worker_count: usize,
     physical: i32,
     worker_device_id: impl Fn(usize) -> i32,
-    backend_contains: impl Fn(usize) -> bool,
 ) -> Option<usize> {
-    (0..worker_count)
-        .find(|&index| worker_device_id(index) == physical)
-        .or_else(|| (0..worker_count).find(|&index| backend_contains(index)))
+    (0..worker_count).find(|&index| worker_device_id(index) == physical)
 }
 
 fn begin_gpu_memory_measurement(
     worker: &mut GpuMeasurementWorker,
 ) -> Result<GpuMemoryMeasurementBaseline, GpuMeasurementError> {
     let device_id = worker.device_id;
+    // The ordinary CUDA pool and its high-water counter are shared by all
+    // backend-owned contexts on a physical device.  Measure one owner at a
+    // time so another setup provider cannot change the baseline or peak while
+    // this operation is being sampled.
+    let permit = gpu_measurement_device_permit(device_id)?;
     let memory = gpu_device_memory_usage(device_id).map_err(GpuMeasurementError)?;
-    let owned_contexts = worker.backend.owned_context_count(device_id);
-    require_exclusive_measurement_context(device_id, memory.live_contexts, owned_contexts)?;
+    if memory.live_contexts == 0 {
+        return Err(GpuMeasurementError(format!(
+            "GPU {device_id} has no live mxx context for measurement"
+        )));
+    }
     // Matrix readiness precedes owner destruction, which queues frees on separate release
     // streams. Match the runtime calibration boundary before sampling the allocator baseline.
     // This fences release events only, outside the measured operation.
@@ -205,36 +380,53 @@ fn begin_gpu_memory_measurement(
         .backend
         .fence_released_memory()
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
-    gpu_default_mempool_reset_high_water(device_id).map_err(GpuMeasurementError)?;
-    let pool_used_current =
-        gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?.used_current;
-    Ok(GpuMemoryMeasurementBaseline {
-        pool_used_current,
-        context_generation: memory.context_generation,
-        owned_contexts,
-    })
+    let pool = gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?;
+    // CUDA exposes one default mempool per physical device and only permits
+    // resetting its high-water mark while exactly one mxx context is live.
+    // Independent runtimes may legitimately remain live while this provider
+    // owns the measurement permit, so retain the current high-water baseline
+    // whenever the native API cannot reset it.
+    let pool_used_high = if memory.live_contexts == 1 {
+        gpu_default_mempool_reset_high_water(device_id).map_err(GpuMeasurementError)?;
+        let reset = gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?;
+        reset.used_high
+    } else {
+        pool.used_high
+    };
+    let graph_reserved_current = gpu_graph_memory_snapshot(device_id)
+        .map_err(|error| GpuMeasurementError(error.to_string()))?
+        .reserved_current;
+    Ok(GpuMemoryMeasurementBaseline { pool_used_high, graph_reserved_current, permit })
 }
 
 fn finish_gpu_memory_measurement(
     device_id: i32,
     baseline: GpuMemoryMeasurementBaseline,
-) -> Result<u64, GpuMeasurementError> {
-    let memory = gpu_device_memory_usage(device_id).map_err(GpuMeasurementError)?;
-    require_exclusive_measurement_context(
-        device_id,
-        memory.live_contexts,
-        baseline.owned_contexts,
-    )?;
-    if memory.context_generation != baseline.context_generation {
-        return Err(GpuMeasurementError(format!(
-            "GPU {device_id} context generation changed during CUDA mempool measurement"
-        )));
-    }
-    let high_water = gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?.used_high;
-    u64::try_from(high_water.checked_sub(baseline.pool_used_current).ok_or_else(|| {
-        GpuMeasurementError("GPU mempool high-water is below its measurement baseline".into())
-    })?)
-    .map_err(|_| GpuMeasurementError("GPU workspace exceeds u64".to_owned()))
+) -> Result<GpuMemoryMeasurementPeaks, GpuMeasurementError> {
+    let GpuMemoryMeasurementBaseline { pool_used_high, graph_reserved_current, permit } = baseline;
+    let result = (|| {
+        let memory = gpu_device_memory_usage(device_id).map_err(GpuMeasurementError)?;
+        if memory.live_contexts == 0 {
+            return Err(GpuMeasurementError(format!(
+                "GPU {device_id} has no live mxx context after measurement"
+            )));
+        }
+        let high_water =
+            gpu_default_mempool_usage(device_id).map_err(GpuMeasurementError)?.used_high;
+        let ordinary_pool_bytes =
+            u64::try_from(high_water.checked_sub(pool_used_high).ok_or_else(|| {
+                GpuMeasurementError(
+                    "GPU mempool high-water is below its measurement baseline".into(),
+                )
+            })?)
+            .map_err(|_| GpuMeasurementError("GPU workspace exceeds u64".to_owned()))?;
+        let graph_pool = gpu_graph_memory_snapshot(device_id)
+            .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        let graph_pool_bytes = graph_pool.reserved_high.saturating_sub(graph_reserved_current);
+        Ok(GpuMemoryMeasurementPeaks { ordinary_pool_bytes, graph_pool_bytes })
+    })();
+    drop(permit);
+    result
 }
 
 impl MemoryProbe for GpuMemoryProbe {
@@ -256,19 +448,13 @@ struct PreparedMeasurement {
 }
 
 /// Host-only representatives are prepared once, outside the timed loop.
-/// Runtime values retain their real ownership shape so family/select timing
-/// exercises the same clone/materialization boundary as production.
+/// Only input ownership, the native trapdoor alias, and the four typed real
+/// operations use this path; integer and family operations remain resident.
 struct PreparedHostPrimitive {
     typed_inputs:
         Option<(BTreeMap<String, RuntimeValue<GpuDcrtBackend>>, String, ConcreteWireType)>,
     trapdoor: Option<RuntimeValue<GpuDcrtBackend>>,
     scalar_inputs: Vec<HostPrimitiveValue>,
-    family_inputs: Vec<RuntimeValue<GpuDcrtBackend>>,
-    /// Shared scalar-family storage used by FamilyGet sites. Keeping the
-    /// family behind Arc avoids cloning its O(count) vector per measured site.
-    family_fixture: Option<Arc<Vec<RuntimeValue<GpuDcrtBackend>>>>,
-    dynamic_index: Option<RuntimeValue<GpuDcrtBackend>>,
-    choices: Vec<RuntimeValue<GpuDcrtBackend>>,
 }
 
 impl PreparedMeasurement {
@@ -283,6 +469,7 @@ impl PreparedMeasurement {
 }
 
 enum GpuMeasurementOutput {
+    IntegerValues(GpuFleetSignedValues),
     Matrix(GpuFleetMatrix),
     SmallMatrix(GpuFleetSmallMatrix),
     Trapdoor(GpuFleetTrapdoor),
@@ -295,6 +482,9 @@ impl GpuMeasurementOutput {
 
     fn finish(&self) {
         match self {
+            Self::IntegerValues(value) => {
+                value.wait_until_ready().expect("resident integer measurement completion")
+            }
             Self::Matrix(value) => {
                 value.shards().iter().for_each(|shard| shard.value.wait_until_ready());
             }
@@ -324,29 +514,6 @@ struct GpuMeasurementWorker {
     /// the job to a bare duration; warmup admission needs every physical
     /// owner (including host/pinned staging), not just the callback device.
     last_production_job: Option<ProductionJobObservation>,
-    /// One reusable host-family fixture for this worker. The cache is
-    /// deliberately scalar-only: matrix/compact/trapdoor payloads retain
-    /// their ordinary setup ownership and are never cached here. Replacing
-    /// the entry on any key change keeps worker/context ownership explicit and
-    /// makes dropping the provider drop the fixture and its evidence too.
-    scalar_family_cache: Option<ScalarFamilyFixture>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ScalarFamilyCacheKey {
-    element_type: ConcreteWireType,
-    count: usize,
-    bindings: ParamEnv,
-    logical_device: usize,
-    worker_device_id: i32,
-    worker_devices: Vec<i32>,
-}
-
-#[derive(Clone)]
-struct ScalarFamilyFixture {
-    key: ScalarFamilyCacheKey,
-    values: Arc<Vec<RuntimeValue<GpuDcrtBackend>>>,
-    setup_memory: Arc<GpuWarmupMemoryObservations>,
 }
 
 #[derive(Clone, Debug)]
@@ -479,6 +646,10 @@ fn tensor_row_sum_allocation_groups(
 pub struct ProductionGpuWarmupProvider {
     workers: Vec<GpuMeasurementWorker>,
     harness: GpuWarmupMeasurementConfig,
+    /// Setup-time timing cache. It stores only timing and measurement
+    /// scalars; the planner must rebuild route-specific resource evidence for
+    /// each current job before admission.
+    measured_costs: GpuMeasuredCostCache,
     /// Preimage retry metadata is not part of the generic profile point.  It
     /// is retained only as validated sampler metadata, keyed by the same
     /// canonical execution class as the point table.
@@ -569,12 +740,9 @@ impl ProductionGpuWarmupProvider {
     }
 
     fn worker_index_for_physical_device(&self, physical: i32) -> Option<usize> {
-        select_worker_index_for_physical(
-            self.workers.len(),
-            physical,
-            |index| self.workers[index].device_id,
-            |index| self.workers[index].backend.physical_device_ids().contains(&physical),
-        )
+        select_worker_index_for_physical(self.workers.len(), physical, |index| {
+            self.workers[index].device_id
+        })
     }
 
     fn worker_index_for_logical_device(&self, logical: usize) -> Option<usize> {
@@ -601,7 +769,7 @@ impl ProductionGpuWarmupProvider {
         .digest()
     }
 
-    fn is_host_backend_boundary(kind: &NodeKind) -> bool {
+    fn is_native_polynomial_primitive(kind: &NodeKind) -> bool {
         matches!(
             kind,
             NodeKind::ExtractCoefficient { .. } |
@@ -610,46 +778,6 @@ impl ProductionGpuWarmupProvider {
                 NodeKind::PolynomialFromValues { .. } |
                 NodeKind::PolynomialValues { .. }
         )
-    }
-
-    fn boundary_route(
-        worker: &GpuMeasurementWorker,
-        representative: &RepresentativeMeasurement,
-    ) -> Result<GpuExecutionRouteDescriptor, GpuMeasurementError> {
-        let ty = representative
-            .concrete_output_types
-            .iter()
-            .chain(&representative.concrete_argument_types)
-            .find_map(|ty| ty.matrix_type())
-            .ok_or_else(|| GpuMeasurementError("boundary has no matrix type".into()))?;
-        // Native polynomial upload/download moves one u64 residue for each
-        // coefficient of each active CRT limb. This is a transfer payload,
-        // not an estimate of the complete native allocation.
-        let limbs = worker
-            .backend
-            .ring_crt_depth(ty)
-            .map_err(|error| GpuMeasurementError(error.to_string()))?;
-        let bytes = ty
-            .ring_dimension
-            .checked_mul(limbs)
-            .and_then(|count| count.checked_mul(size_of::<u64>()))
-            .ok_or_else(|| GpuMeasurementError("boundary transfer size overflows".into()))?;
-        Ok(crate::gpu_column_policy::resolve_gpu_route(
-            crate::gpu_column_policy::GpuRouteResolutionInput {
-                source_device: Some(0),
-                destination_device: Some(0),
-                source_range: ColumnRange { start: 0, end: 1 },
-                destination_range: ColumnRange { start: 0, end: 1 },
-                source_is_resident: false,
-                peer_available: false,
-                source_compact: false,
-                destination_compact: false,
-                fragment: TypedFragmentClass::Full,
-                source_staging_bytes: bytes,
-                host_staging_bytes: bytes,
-                pinned_host_staging_bytes: 0,
-            },
-        ))
     }
 
     /// Creates a representative GPU measurement backend for validated IR nodes.
@@ -672,12 +800,7 @@ impl ProductionGpuWarmupProvider {
                 backend
                     .set_measurement_owners(owners.clone())
                     .expect("validated measurement owners");
-                GpuMeasurementWorker {
-                    backend,
-                    device_id,
-                    last_production_job: None,
-                    scalar_family_cache: None,
-                }
+                GpuMeasurementWorker { backend, device_id, last_production_job: None }
             })
             .collect();
         Self::from_workers(workers, harness)
@@ -690,6 +813,7 @@ impl ProductionGpuWarmupProvider {
         Self {
             workers,
             harness,
+            measured_costs: GpuMeasuredCostCache::default(),
             preimage_profile_metadata: HashMap::new(),
             preimage_footprints: HashMap::new(),
             preimage_memory: HashMap::new(),
@@ -726,6 +850,12 @@ impl ProductionGpuWarmupProvider {
     /// production-equivalent point.
     pub fn warmup_measurement_provenances(&self) -> &[GpuWarmupProvenance] {
         &self.warmup_measurement_provenances
+    }
+
+    /// Return the setup cache accumulated by this provider. The cache is
+    /// copied into prepared execution state before the provider is dropped.
+    pub fn measured_costs(&self) -> &GpuMeasuredCostCache {
+        &self.measured_costs
     }
 
     /// Successful public production dispatches observed during setup.
@@ -1745,6 +1875,7 @@ impl ProductionGpuWarmupProvider {
                     representative
                         .concrete_output_types
                         .iter()
+                        .chain(representative.concrete_argument_types.iter())
                         .find_map(|ty| ty.matrix_type())
                         .ok_or_else(|| {
                             GpuMeasurementError(
@@ -2030,16 +2161,6 @@ impl ProductionGpuWarmupProvider {
             ));
         }
 
-        // The failed allocation may have left the async pool's high-water
-        // marker and temporary blocks live. Reset it only after the release
-        // stream has been fenced, and treat a reset failure as fatal: silently
-        // admitting the next candidate would make its memory evidence stale.
-        if let Err(error) = gpu_default_mempool_reset_high_water(physical) {
-            return GpuWarmupProfileError::Measurement(format!(
-                "OOM allocator cleanup failed on GPU {physical}: {error}"
-            ));
-        }
-
         let memory = match gpu_device_memory_usage(physical) {
             Ok(memory) => memory,
             Err(error) => {
@@ -2048,16 +2169,24 @@ impl ProductionGpuWarmupProvider {
                 ));
             }
         };
-        let owned_contexts = self
-            .workers
-            .iter()
-            .map(|worker| worker.backend.owned_context_count(physical))
-            .sum::<usize>();
-        if memory.live_contexts != owned_contexts || owned_contexts == 0 {
+        if memory.live_contexts == 0 {
             return GpuWarmupProfileError::Measurement(format!(
-                "OOM context usability validation found {} live contexts on GPU {physical}",
-                memory.live_contexts
+                "OOM context usability validation found no live context on GPU {physical}"
             ));
+        }
+
+        // The failed allocation may have left the async pool's high-water
+        // marker and temporary blocks live. CUDA only allows resetting that
+        // marker with one live context; with independent runtimes, preserve
+        // the shared marker and let the next measurement use a fresh
+        // high-water baseline instead of serializing or rejecting the other
+        // owner.
+        if memory.live_contexts == 1 {
+            if let Err(error) = gpu_default_mempool_reset_high_water(physical) {
+                return GpuWarmupProfileError::Measurement(format!(
+                    "OOM allocator cleanup failed on GPU {physical}: {error}"
+                ));
+            }
         }
         // Re-read after allocator cleanup.  Besides checking that the context
         // remains usable, this catches a reset/recreate race before the OOM is
@@ -2070,8 +2199,7 @@ impl ProductionGpuWarmupProvider {
                 ));
             }
         };
-        if validated.live_contexts != owned_contexts ||
-            validated.context_generation != memory.context_generation
+        if validated.live_contexts == 0 || validated.context_generation != memory.context_generation
         {
             return GpuWarmupProfileError::Measurement(format!(
                 "GPU {physical} context changed during OOM cleanup (generation {} -> {}, live contexts {} -> {})",
@@ -2294,101 +2422,50 @@ impl ProductionGpuWarmupProvider {
             }
         }
         let capability = column_capability(&descriptor.kind, &descriptor.concrete_argument_types);
-        if capability == ColumnCapability::HostOrControl &&
-            matches!(
-                descriptor.kind,
-                NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_)
-            )
+        // Integer/bool control operations that are lowered into the resident
+        // GPU region do not have a matrix-native request. Measure their real
+        // integer owner allocation directly. Real-valued host operations and
+        // explicit host/device boundaries use the paths below.
+        if Self::resident_control_kind_for_types(
+            &descriptor.kind,
+            &descriptor.concrete_argument_types,
+            &descriptor.concrete_output_types,
+        ) && request.timing_scope != GpuWarmupTimingScope::Transfer
         {
-            let child =
-                self.host_control_operations.get(&(descriptor.scope.clone(), descriptor.id));
-            let (elapsed, spread, repetitions) = Self::measure_host_control_repeated(
-                &self.harness,
-                descriptor.id,
-                &descriptor.kind,
-                &descriptor.bindings,
-                child,
-            )
-            .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
-            if !elapsed.is_finite() || elapsed <= 0.0 {
-                return Err(GpuWarmupProfileError::InvalidMeasurement(
-                    "host warmup timing must be finite and positive".into(),
-                ));
-            }
-            let profile = GpuWarmupProfile::measured_with_observation(
-                elapsed,
-                0,
-                WarmupMeasurementKind::HostMeasured,
-                GpuWarmupMemoryObservations::explicit_exact_zero(),
-                GpuWarmupResidencyDelta::default(),
-                repetitions,
-                spread,
-                GpuWarmupProvenance::ProductionEquivalent,
-                profile_key.cache_state,
-                profile_key.timing_scope,
-            )?;
-            self.record_warmup_dispatch(request, profile_domain, fused_operation);
-            self.warmup_measurement_provenances.push(profile.provenance);
-            return Ok(profile);
-        }
-        // Host-visible codec primitives have two deliberately disjoint
-        // measurements.  The main point times only the host dispatch after
-        // its representative has been prepared; it does not enter the
-        // inclusive local-production materializer (which owns D2H/H2D and
-        // staging).  The latter is measured separately by the Transfer
-        // request below.  This keeps a containing-stage composition from
-        // charging one physical copy twice while still recording a positive
-        // host time and exact zero GPU workspace.
-        if profile_domain.measurement_kind() == WarmupMeasurementKind::HostMeasured &&
-            Self::is_host_backend_boundary(&descriptor.kind) &&
-            request.timing_scope != GpuWarmupTimingScope::Transfer
-        {
-            if selected_device >= self.workers.len() {
-                return Err(GpuWarmupProfileError::Measurement(
-                    "warmup production selected device is unavailable".into(),
-                ));
-            }
-            let representative = RepresentativeMeasurement {
-                source_layouts: Vec::new(),
-                fixed_metadata: None,
-                retry_cap: None,
-                inputs: Default::default(),
-                kind: descriptor.kind.clone(),
+            let node = MeasurementNode {
+                id: descriptor.id,
+                kind: &descriptor.kind,
                 concrete_argument_types: descriptor.concrete_argument_types.clone(),
                 concrete_output_types: descriptor.concrete_output_types.clone(),
-                fixed_arguments: Self::fixed_arguments(
-                    &descriptor.kind,
-                    &descriptor.concrete_argument_types,
-                ),
-                output_range: None,
             };
-            let (elapsed, spread, repetitions, setup_memory) =
-                Self::measure_host_boundary_repeated(
-                    &mut self.workers[selected_device],
-                    selected_device,
-                    &self.harness,
-                    descriptor.id,
-                    &descriptor.bindings,
-                    &representative,
-                )
-                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
-            self.last_host_setup_memory = Some(setup_memory);
+            let (measurement, memory) = Self::measure_resident_control_repeated(
+                &mut self.workers[selected_device],
+                selected_device,
+                &node,
+                &self.harness,
+            )
+            .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
             let mut profile = GpuWarmupProfile::measured_with_observation(
-                elapsed,
-                0,
-                WarmupMeasurementKind::HostMeasured,
-                GpuWarmupMemoryObservations::explicit_exact_zero(),
+                measurement.cumulative_wave_seconds,
+                measurement.workspace_bytes,
+                profile_domain.measurement_kind(),
+                memory,
                 GpuWarmupResidencyDelta::default(),
-                repetitions,
-                spread,
+                self.harness.measured_iterations,
+                measurement.spread_seconds,
                 GpuWarmupProvenance::ProductionEquivalent,
                 profile_key.cache_state,
                 profile_key.timing_scope,
             )?;
-            profile.resolved_route_descriptor = Some(
-                Self::boundary_route(&self.workers[selected_device], &representative)
-                    .map_err(Self::classify_measurement_error)?,
-            );
+            profile.resolved_route_descriptor = Some(request.route_descriptor);
+            self.measured_costs
+                .insert_measurement_point(
+                    measured_cost_key(&profile_key, &profile),
+                    request.coordinate(),
+                    &profile,
+                    &measurement,
+                )
+                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
             self.record_warmup_dispatch(request, profile_domain, fused_operation);
             self.warmup_measurement_provenances.push(profile.provenance);
             return Ok(profile);
@@ -2450,6 +2527,13 @@ impl ProductionGpuWarmupProvider {
                 profile_key.cache_state,
                 profile_key.timing_scope,
             )?;
+            self.measured_costs
+                .insert_profile(
+                    measured_cost_key(&profile_key, &profile),
+                    request.coordinate(),
+                    &profile,
+                )
+                .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
             self.record_warmup_dispatch(request, profile_domain, fused_operation);
             self.warmup_measurement_provenances.push(profile.provenance);
             return Ok(profile);
@@ -2765,10 +2849,9 @@ impl ProductionGpuWarmupProvider {
                 &descriptor.bindings,
             )
             .map_err(Self::classify_measurement_error)?
-        } else if Self::is_host_backend_boundary(&descriptor.kind) {
-            // The independently measured transfer owns a real native matrix
-            // and host payload. Never relabel the sampled allocator peak as
-            // an exact allocation query.
+        } else if Self::is_native_polynomial_primitive(&descriptor.kind) {
+            // Native polynomial primitives retain the matrix representation
+            // even when their exposed output is an integer family.
             let matrix = representative
                 .concrete_argument_types
                 .iter()
@@ -2861,7 +2944,7 @@ impl ProductionGpuWarmupProvider {
             memory.clone(),
             resident_delta.clone(),
             self.harness.measured_iterations,
-            0.0,
+            measurement.spread_seconds,
             GpuWarmupProvenance::ProductionEquivalent,
             profile_key.cache_state,
             profile_key.timing_scope,
@@ -2874,11 +2957,19 @@ impl ProductionGpuWarmupProvider {
             profile.preimage_certified_tile_width = Some(width);
         }
         if let Some(footprint) =
-            self.preimage_footprints.get(&(profile_key, request.tile_width)).cloned()
+            self.preimage_footprints.get(&(profile_key.clone(), request.tile_width)).cloned()
         {
             profile.preimage_footprint = Some(footprint);
         }
         profile.resolved_cache_identity = resolved_cache_identity;
+        self.measured_costs
+            .insert_measurement_point(
+                measured_cost_key(&profile_key, &profile),
+                request.coordinate(),
+                &profile,
+                &measurement,
+            )
+            .map_err(|error| GpuWarmupProfileError::Measurement(error.to_string()))?;
         self.record_warmup_dispatch(request, profile_domain, fused_operation);
         self.warmup_measurement_provenances.push(profile.provenance);
         Ok(profile)
@@ -3450,7 +3541,11 @@ impl ProductionGpuWarmupProvider {
         backend: &GpuDcrtBackend,
         wire_types: &[&ConcreteWireType],
     ) -> Result<(), GpuMeasurementError> {
-        let mut totals = BTreeMap::<i32, (u128, u128, u128)>::new();
+        // Host and pinned-host staging are executable transient allocations,
+        // not planner dimensions. Keep this preflight limited to the device
+        // owner budget; the production constructor performs the host
+        // allocation and returns an ordinary allocation error if it fails.
+        let mut totals = BTreeMap::<i32, u128>::new();
         for wire_type in wire_types {
             let compact = match family_leaf_type(wire_type) {
                 ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
@@ -3478,25 +3573,16 @@ impl ProductionGpuWarmupProvider {
             )
             .map_err(|error| GpuMeasurementError(error.to_string()))?;
             let entry = totals.entry(owner).or_default();
-            entry.0 = entry
-                .0
+            *entry = entry
                 .checked_add(evidence.device.total_bytes as u128)
                 .ok_or_else(|| GpuMeasurementError("compact setup device bytes overflow".into()))?;
-            entry.1 = entry
-                .1
-                .checked_add(evidence.pageable_host_bytes as u128)
-                .ok_or_else(|| GpuMeasurementError("compact setup host bytes overflow".into()))?;
-            entry.2 = entry
-                .2
-                .checked_add(evidence.pinned_host_bytes as u128)
-                .ok_or_else(|| GpuMeasurementError("compact setup pinned bytes overflow".into()))?;
         }
         if totals.is_empty() {
             return Ok(());
         }
         let physical = backend.physical_device_ids();
         let configured = backend.configured_plan_budgets();
-        for (owner, (device_bytes, host_bytes, pinned_bytes)) in totals {
+        for (owner, device_bytes) in totals {
             let index = physical.iter().position(|device| *device == owner).ok_or_else(|| {
                 GpuMeasurementError(format!("compact setup owner {owner} is not in this fleet"))
             })?;
@@ -3511,23 +3597,6 @@ impl ProductionGpuWarmupProvider {
                 return Err(GpuMeasurementError(format!(
                     "compact setup device allocation exceeds selected owner budget: device={owner}, required={device_bytes}, budget={device_budget}"
                 )));
-            }
-            if let Some(budgets) = configured {
-                let budget = budgets.get(index).ok_or_else(|| {
-                    GpuMeasurementError("compact setup budget count does not match fleet".into())
-                })?;
-                if host_bytes > budget.host_bytes as u128 {
-                    return Err(GpuMeasurementError(format!(
-                        "compact setup pageable staging exceeds selected owner budget: device={owner}, required={host_bytes}, budget={}",
-                        budget.host_bytes
-                    )));
-                }
-                if pinned_bytes > budget.pinned_host_bytes as u128 {
-                    return Err(GpuMeasurementError(format!(
-                        "compact setup pinned staging exceeds selected owner budget: device={owner}, required={pinned_bytes}, budget={}",
-                        budget.pinned_host_bytes
-                    )));
-                }
             }
         }
         Ok(())
@@ -3585,7 +3654,7 @@ impl ProductionGpuWarmupProvider {
         };
         for (layout, index) in representative.source_layouts.iter().zip(source_indices) {
             let Some(ty) = representative.concrete_argument_types.get(index) else { continue };
-            if ty.matrix_type().is_none() {
+            if matrix_leaf_type(ty).is_none() {
                 continue;
             }
             if let Some(value) = prepared.arguments.get(index).and_then(Option::as_ref) {
@@ -3648,9 +3717,9 @@ impl ProductionGpuWarmupProvider {
         let mut operation_error = None;
         let measured = measure_batch_operation(harness, &probe, 1, |representative_batch| {
             if operation_error.is_some() {
-                return;
+                return GpuMeasurementOutputs(Vec::new());
             }
-            if let Err(error) = Self::execute_local_production_measurement(
+            match Self::execute_local_production_measurement(
                 worker,
                 &node,
                 bindings,
@@ -3661,7 +3730,11 @@ impl ProductionGpuWarmupProvider {
                 None,
                 false,
             ) {
-                operation_error = Some(error);
+                Ok(output) => output,
+                Err(error) => {
+                    operation_error = Some(error);
+                    GpuMeasurementOutputs(Vec::new())
+                }
             }
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
@@ -3669,8 +3742,10 @@ impl ProductionGpuWarmupProvider {
             return Err(error);
         }
         let mut measurement = measured.measurement;
-        measurement.workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        let peaks = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        measurement.workspace_bytes = peaks.ordinary_pool_bytes;
         measurement.measured_wave_workspace_bytes = measurement.workspace_bytes;
+        measurement.graph_pool_workspace_bytes = peaks.graph_pool_bytes;
         Ok(measurement)
     }
 
@@ -3695,14 +3770,17 @@ impl ProductionGpuWarmupProvider {
             ));
         }
         let seconds = started.elapsed().as_secs_f64();
-        let workspace = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        let peaks = finish_gpu_memory_measurement(worker.device_id, baseline)?;
         Ok(NodeMeasurement {
             work_seconds: seconds,
             latency_seconds: seconds,
             cumulative_wave_seconds: seconds,
             independent_wave_count: 1,
-            measured_wave_workspace_bytes: workspace,
-            workspace_bytes: workspace,
+            measured_wave_workspace_bytes: peaks.ordinary_pool_bytes,
+            workspace_bytes: peaks.ordinary_pool_bytes,
+            retained_delta_bytes: 0,
+            spread_seconds: 0.0,
+            graph_pool_workspace_bytes: peaks.graph_pool_bytes,
         })
     }
 
@@ -3952,7 +4030,7 @@ impl ProductionGpuWarmupProvider {
         fused: Option<FusedWarmupOperation>,
         binding_port: Option<usize>,
         transfer_only: bool,
-    ) -> Result<(), GpuMeasurementError> {
+    ) -> Result<GpuMeasurementOutputs, GpuMeasurementError> {
         let output_columns = representative
             .concrete_output_types
             .iter()
@@ -4009,16 +4087,13 @@ impl ProductionGpuWarmupProvider {
                 inputs,
                 fragment: TypedFragmentClass::PlannedJob,
             }
-        } else if Self::is_host_backend_boundary(node.kind) ||
+        } else if Self::is_native_polynomial_primitive(node.kind) ||
             column_capability(node.kind, &representative.concrete_argument_types) ==
                 ColumnCapability::SingleDevice
         {
-            // Boundary primitives still consume their real production matrix
-            // inputs, but they have no column-lowering rule: extraction and
-            // codec dispatch operate on the complete host-visible value.
-            // Build the typed full-range request explicitly so their host
-            // elapsed time is measured through the same materializer and any
-            // route/staging cost is retained in the transfer profile.
+            // Scalar polynomial primitives consume a complete native value;
+            // their matrix input is indivisible even when the result is an
+            // integer family rather than a matrix column range.
             let inputs = representative
                 .concrete_argument_types
                 .iter()
@@ -4280,7 +4355,7 @@ impl ProductionGpuWarmupProvider {
             })?;
         worker.last_production_job =
             Some(ProductionJobObservation { routes: result.routes, resources: result.resources });
-        Ok(())
+        Ok(result.value)
     }
 
     fn measure_fused_representative(
@@ -4324,9 +4399,9 @@ impl ProductionGpuWarmupProvider {
         let mut operation_error = None;
         let measured = measure_batch_operation(harness, &probe, 1, |batch_size| {
             if operation_error.is_some() {
-                return;
+                return GpuMeasurementOutputs(Vec::new());
             }
-            if let Err(error) = Self::execute_local_production_measurement(
+            match Self::execute_local_production_measurement(
                 worker,
                 &node,
                 bindings,
@@ -4337,7 +4412,11 @@ impl ProductionGpuWarmupProvider {
                 Some(binding_port),
                 false,
             ) {
-                operation_error = Some(error);
+                Ok(output) => output,
+                Err(error) => {
+                    operation_error = Some(error);
+                    GpuMeasurementOutputs(Vec::new())
+                }
             }
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
@@ -4345,8 +4424,10 @@ impl ProductionGpuWarmupProvider {
             return Err(error);
         }
         let mut measurement = measured.measurement;
-        measurement.workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        let peaks = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        measurement.workspace_bytes = peaks.ordinary_pool_bytes;
         measurement.measured_wave_workspace_bytes = measurement.workspace_bytes;
+        measurement.graph_pool_workspace_bytes = peaks.graph_pool_bytes;
         Ok(measurement)
     }
 
@@ -4369,16 +4450,6 @@ impl ProductionGpuWarmupProvider {
         };
         let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)
             .map_err(|error| warmup_node_phase_error("transfer preparation", &node, error))?;
-        let boundary = Self::is_host_backend_boundary(node.kind);
-        let boundary_type = representative
-            .concrete_output_types
-            .iter()
-            .chain(&representative.concrete_argument_types)
-            .find_map(|ty| ty.matrix_type());
-        let canonical =
-            vec![num_bigint::BigUint::from(0u8); boundary_type.map_or(0, |ty| ty.ring_dimension)];
-        let boundary_route =
-            if boundary { Some(Self::boundary_route(worker, representative)?) } else { None };
         let prepared = Self::place_prepared_sources(worker, representative, prepared)
             .map_err(|error| warmup_node_phase_error("transfer source placement", &node, error))?;
         let baseline = begin_gpu_memory_measurement(worker)?;
@@ -4386,72 +4457,9 @@ impl ProductionGpuWarmupProvider {
         let mut operation_error = None;
         let measured = measure_batch_operation(harness, &probe, 1, |batch_size| {
             if operation_error.is_some() {
-                return;
+                return GpuMeasurementOutputs(Vec::new());
             }
-            if let Some(route) = boundary_route {
-                let result = (|| -> Result<(), GpuMeasurementError> {
-                    for _ in 0..batch_size {
-                        match node.kind {
-                            NodeKind::PolynomialFromValues { .. } |
-                            NodeKind::PackPolynomialCoefficients { .. } => {
-                                let evaluation = matches!(
-                                    node.kind,
-                                    NodeKind::PolynomialFromValues { evaluation: true, .. }
-                                );
-                                let value = worker
-                                    .backend
-                                    .upload_polynomial_values(
-                                        boundary_type.ok_or_else(|| {
-                                            GpuMeasurementError("missing boundary type".into())
-                                        })?,
-                                        &canonical,
-                                        evaluation,
-                                    )
-                                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                                value.complete();
-                            }
-                            _ => {
-                                let source = prepared
-                                    .arguments
-                                    .first()
-                                    .and_then(Option::as_ref)
-                                    .ok_or_else(|| {
-                                        GpuMeasurementError("missing download source".into())
-                                    })?;
-                                std::hint::black_box(
-                                    worker
-                                        .backend
-                                        .download_polynomial_values(
-                                            source,
-                                            matches!(
-                                                node.kind,
-                                                NodeKind::PolynomialValues { evaluation: true }
-                                            ),
-                                        )
-                                        .map_err(|error| GpuMeasurementError(error.to_string()))?,
-                                );
-                            }
-                        }
-                    }
-                    Ok(())
-                })();
-                if let Err(error) = result {
-                    operation_error = Some(error);
-                    return;
-                }
-                worker.last_production_job = Some(ProductionJobObservation {
-                    routes: vec![route],
-                    resources: vec![GpuAffectedResourceEnvelope {
-                        device_index: 0,
-                        physical_device: worker.device_id,
-                        device_bytes: route.source_staging_bytes,
-                        host_bytes: route.host_staging_bytes,
-                        pinned_host_bytes: route.pinned_host_staging_bytes,
-                    }],
-                });
-                return;
-            }
-            if let Err(error) = Self::execute_local_production_measurement(
+            match Self::execute_local_production_measurement(
                 worker,
                 &node,
                 bindings,
@@ -4462,7 +4470,11 @@ impl ProductionGpuWarmupProvider {
                 None,
                 true,
             ) {
-                operation_error = Some(error);
+                Ok(output) => output,
+                Err(error) => {
+                    operation_error = Some(error);
+                    GpuMeasurementOutputs(Vec::new())
+                }
             }
         })
         .map_err(|error| GpuMeasurementError(error.to_string()))?;
@@ -4470,8 +4482,10 @@ impl ProductionGpuWarmupProvider {
             return Err(error);
         }
         let mut measurement = measured.measurement;
-        measurement.workspace_bytes = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        let peaks = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        measurement.workspace_bytes = peaks.ordinary_pool_bytes;
         measurement.measured_wave_workspace_bytes = measurement.workspace_bytes;
+        measurement.graph_pool_workspace_bytes = peaks.graph_pool_bytes;
         Ok(measurement)
     }
 
@@ -4561,161 +4575,6 @@ impl ProductionGpuWarmupProvider {
         }
     }
 
-    /// Build one payload that can stand for a family member during host-side
-    /// container timing.  Host family access does not consume every member's
-    /// backend value, so materializing a fresh matrix for each member would
-    /// make setup VRAM scale with the family cardinality.  Nested families
-    /// retain their *exact* container shape and cardinality; cloning the
-    /// representative only clones the O(count) host vectors while the
-    /// heavyweight matrix/compact owners remain Arc-backed and shared.
-    fn representative_family_member(
-        backend: &mut GpuDcrtBackend,
-        wire_type: &ConcreteWireType,
-        bindings: &ParamEnv,
-    ) -> Result<RuntimeValue<GpuDcrtBackend>, GpuMeasurementError> {
-        match wire_type {
-            ConcreteWireType::IndexedFamily { element, count } => {
-                if *count == 0 {
-                    return Err(GpuMeasurementError(
-                        "host family representative cannot use an empty nested family".into(),
-                    ));
-                }
-                let exemplar = Self::representative_family_member(backend, element, bindings)?;
-                Ok(RuntimeValue::IndexedFamily((0..*count).map(|_| exemplar.clone()).collect()))
-            }
-            _ => Self::representative_runtime_value(backend, wire_type, bindings),
-        }
-    }
-
-    fn evaluated_family_count(wire_type: &ConcreteWireType) -> Result<usize, GpuMeasurementError> {
-        let ConcreteWireType::IndexedFamily { count, .. } = wire_type else {
-            return Err(GpuMeasurementError("host family input is not indexed".into()));
-        };
-        if *count == 0 {
-            return Err(GpuMeasurementError(
-                "host family representative cannot use an empty family".into(),
-            ));
-        }
-        Ok(*count)
-    }
-
-    fn scalar_family_element(wire_type: &ConcreteWireType) -> bool {
-        matches!(
-            wire_type,
-            ConcreteWireType::ConstantInt |
-                ConcreteWireType::ConstantReal |
-                ConcreteWireType::ConstantBool |
-                ConcreteWireType::Int |
-                ConcreteWireType::Real |
-                ConcreteWireType::Bool |
-                ConcreteWireType::Bytes { .. } |
-                ConcreteWireType::TypedBlob { .. }
-        )
-    }
-
-    /// Resolve the complete family shape and validate the selected index
-    /// before consulting the cache. This keeps static nonzero/last accesses
-    /// equivalent to the ordinary production helper and prevents an invalid
-    /// request from populating a fixture.
-    fn scalar_family_request(
-        node: &MeasurementNode<'_>,
-        bindings: &ParamEnv,
-    ) -> Result<Option<(ConcreteWireType, usize)>, GpuMeasurementError> {
-        if !matches!(node.kind, NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic) {
-            return Ok(None);
-        }
-        let family = node
-            .concrete_argument_types
-            .first()
-            .cloned()
-            .or_else(|| {
-                let output = node.concrete_output_types.first()?.clone();
-                let count = match node.kind {
-                    NodeKind::FamilyGetStatic { index } => index
-                        .evaluate(bindings)
-                        .ok()
-                        .and_then(|value| value.to_usize())
-                        .and_then(|value| value.checked_add(1))
-                        .unwrap_or(1),
-                    NodeKind::FamilyGetDynamic => 1,
-                    _ => 1,
-                };
-                Some(ConcreteWireType::IndexedFamily { element: Box::new(output), count })
-            })
-            .ok_or_else(|| GpuMeasurementError("family selection has no family input".into()))?;
-        let ConcreteWireType::IndexedFamily { element, count } = &family else {
-            return Ok(None);
-        };
-        if *count == 0 {
-            return Err(GpuMeasurementError(
-                "host family representative cannot use an empty family".into(),
-            ));
-        }
-        if !Self::scalar_family_element(element) {
-            return Ok(None);
-        }
-        let selected_index = match node.kind {
-            NodeKind::FamilyGetStatic { index } => index
-                .evaluate(bindings)
-                .map_err(|error| GpuMeasurementError(error.to_string()))?
-                .to_usize()
-                .ok_or_else(|| GpuMeasurementError("family index does not fit usize".into()))?,
-            NodeKind::FamilyGetDynamic => 0,
-            _ => unreachable!(),
-        };
-        if selected_index >= *count {
-            return Err(GpuMeasurementError(format!(
-                "family representative index {selected_index} is out of range for {count} members"
-            )));
-        }
-        Ok(Some((element.as_ref().clone(), *count)))
-    }
-
-    fn ensure_scalar_family_cache(
-        worker: &mut GpuMeasurementWorker,
-        node: &MeasurementNode<'_>,
-        bindings: &ParamEnv,
-        logical_device: usize,
-    ) -> Result<Option<ScalarFamilyFixture>, GpuMeasurementError> {
-        let Some((element_type, count)) = Self::scalar_family_request(node, bindings)? else {
-            return Ok(None);
-        };
-        let key = ScalarFamilyCacheKey {
-            element_type: element_type.clone(),
-            count,
-            bindings: bindings.clone(),
-            logical_device,
-            worker_device_id: worker.device_id,
-            worker_devices: worker.backend.physical_device_ids(),
-        };
-        if let Some(cached) = worker.scalar_family_cache.as_ref() {
-            if cached.key == key {
-                return Ok(Some(cached.clone()));
-            }
-        }
-
-        // Scalar values have no GPU payload. The only O(count) allocation is
-        // the complete container fixture that the production family helper
-        // indexes/clones; no matrix, compact matrix, or trapdoor is retained.
-        let exemplar =
-            Self::representative_runtime_value(&mut worker.backend, &element_type, bindings)?;
-        let values = Arc::new((0..count).map(|_| exemplar.clone()).collect::<Vec<_>>());
-        let prepared = PreparedHostPrimitive {
-            typed_inputs: None,
-            trapdoor: None,
-            scalar_inputs: Vec::new(),
-            family_inputs: vec![RuntimeValue::IndexedFamily((*values).clone())],
-            family_fixture: None,
-            dynamic_index: None,
-            choices: Vec::new(),
-        };
-        let setup_memory =
-            Arc::new(Self::host_setup_memory(&worker.backend, &prepared, logical_device)?);
-        let fixture = ScalarFamilyFixture { key, values, setup_memory };
-        worker.scalar_family_cache = Some(fixture.clone());
-        Ok(Some(fixture))
-    }
-
     fn run_host_primitive(
         backend: &mut GpuDcrtBackend,
         node: &MeasurementNode<'_>,
@@ -4743,31 +4602,21 @@ impl ProductionGpuWarmupProvider {
                 .map_err(|error| GpuMeasurementError(error.to_string()));
         }
         let inputs = match node.kind {
-            NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
-                vec![
-                    HostPrimitiveValue::Int(BigInt::from(7)),
-                    HostPrimitiveValue::Int(BigInt::from(3)),
-                ]
-            }
-            NodeKind::BitExtract { .. } | NodeKind::IntToReal => {
+            NodeKind::IntToReal => {
                 vec![HostPrimitiveValue::Int(BigInt::from(7))]
             }
-            NodeKind::BoolToInt => vec![HostPrimitiveValue::Bool(true)],
             NodeKind::RealBinary(_) => {
                 vec![HostPrimitiveValue::Real(1.25), HostPrimitiveValue::Real(0.75)]
             }
             NodeKind::RealSqrt => vec![HostPrimitiveValue::Real(1.25)],
-            _ => Vec::new(),
-        };
-        let elapsed = match node.kind {
-            NodeKind::FamilyPack { .. } |
-            NodeKind::FamilyGetStatic { .. } |
-            NodeKind::FamilyGetDynamic |
-            NodeKind::Select { .. } => {
-                measure_host_container_primitive(node.id, node.kind, bindings, batch_size)
+            NodeKind::ConstantReal(_) => Vec::new(),
+            _ => {
+                return Err(GpuMeasurementError(
+                    "non-real operation reached typed host measurement".into(),
+                ))
             }
-            _ => measure_host_primitive(node.id, node.kind, bindings, &inputs, batch_size),
         };
+        let elapsed = measure_host_primitive(node.id, node.kind, bindings, &inputs, batch_size);
         elapsed.map(|_| ()).map_err(|error| GpuMeasurementError(error.to_string()))
     }
 
@@ -4775,7 +4624,6 @@ impl ProductionGpuWarmupProvider {
         backend: &mut GpuDcrtBackend,
         node: &MeasurementNode<'_>,
         bindings: &ParamEnv,
-        scalar_family_fixture: Option<&ScalarFamilyFixture>,
     ) -> Result<PreparedHostPrimitive, GpuMeasurementError> {
         let mut compact_types = Vec::new();
         match node.kind {
@@ -4789,52 +4637,11 @@ impl ProductionGpuWarmupProvider {
                     compact_types.push(input);
                 }
             }
-            NodeKind::FamilyPack { .. } => {
-                if let Some(input) = node.concrete_argument_types.first() {
-                    compact_types.push(input);
-                } else if let Some(ConcreteWireType::IndexedFamily { element, .. }) =
-                    node.concrete_output_types.first()
-                {
-                    compact_types.push(element);
-                }
-            }
-            NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => {
-                if let Some(input) = node.concrete_argument_types.first() {
-                    compact_types.push(input);
-                } else if let Some(output) = node.concrete_output_types.first() {
-                    compact_types.push(output);
-                }
-            }
-            NodeKind::Select { count } => {
-                let count = count
-                    .evaluate(bindings)
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?
-                    .to_usize()
-                    .ok_or_else(|| GpuMeasurementError("select count does not fit usize".into()))?;
-                let choices = if node.concrete_argument_types.len() > 1 {
-                    node.concrete_argument_types.iter().skip(1).take(count).collect::<Vec<_>>()
-                } else {
-                    node.concrete_output_types.first().into_iter().cycle().take(count).collect()
-                };
-                let mut seen = HashSet::new();
-                for choice in choices {
-                    if seen.insert(choice) {
-                        compact_types.push(choice);
-                    }
-                }
-            }
             _ => {}
         }
         Self::preflight_compact_setup(backend, &compact_types)?;
-        let mut prepared = PreparedHostPrimitive {
-            typed_inputs: None,
-            trapdoor: None,
-            scalar_inputs: Vec::new(),
-            family_inputs: Vec::new(),
-            family_fixture: None,
-            dynamic_index: None,
-            choices: Vec::new(),
-        };
+        let mut prepared =
+            PreparedHostPrimitive { typed_inputs: None, trapdoor: None, scalar_inputs: Vec::new() };
         if let NodeKind::Input { name, .. } = node.kind {
             let output = node.concrete_output_types.first().ok_or_else(|| {
                 GpuMeasurementError(format!("input node {:?} has no output type", node.id))
@@ -4853,156 +4660,8 @@ impl ProductionGpuWarmupProvider {
             return Ok(prepared);
         }
         match node.kind {
-            NodeKind::FamilyPack { .. } => {
-                let member_types = if node.concrete_argument_types.is_empty() {
-                    match node.concrete_output_types.first() {
-                        Some(ConcreteWireType::IndexedFamily { element, count }) => {
-                            vec![element.as_ref().clone(); *count]
-                        }
-                        _ => Vec::new(),
-                    }
-                } else {
-                    node.concrete_argument_types.clone()
-                };
-                // FamilyPack's host work is intentionally still O(count): the
-                // timed runtime helper clones this vector into the resulting
-                // family.  Each member shares one bounded representative
-                // payload rather than allocating an independent GPU object.
-                if let Some(first) = member_types.first() {
-                    let exemplar = Self::representative_family_member(backend, first, bindings)?;
-                    prepared.family_inputs =
-                        member_types.iter().map(|_| exemplar.clone()).collect();
-                }
-            }
-            NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => {
-                let family = node
-                    .concrete_argument_types
-                    .first()
-                    .cloned()
-                    .or_else(|| {
-                        let output = node.concrete_output_types.first()?.clone();
-                        let count = match node.kind {
-                            NodeKind::FamilyGetStatic { index } => index
-                                .evaluate(bindings)
-                                .ok()
-                                .and_then(|value| value.to_usize())
-                                .and_then(|value| value.checked_add(1))
-                                .unwrap_or(1),
-                            NodeKind::FamilyGetDynamic => 1,
-                            _ => 1,
-                        };
-                        Some(ConcreteWireType::IndexedFamily { element: Box::new(output), count })
-                    })
-                    .ok_or_else(|| {
-                        GpuMeasurementError("family selection has no family input".into())
-                    })?;
-                let count = Self::evaluated_family_count(&family)?;
-                let ConcreteWireType::IndexedFamily { element, .. } = &family else {
-                    unreachable!("evaluated_family_count validated indexed family");
-                };
-                let selected_index = match node.kind {
-                    NodeKind::FamilyGetStatic { index } => index
-                        .evaluate(bindings)
-                        .map_err(|error| GpuMeasurementError(error.to_string()))?
-                        .to_usize()
-                        .ok_or_else(|| {
-                            GpuMeasurementError("family index does not fit usize".into())
-                        })?,
-                    NodeKind::FamilyGetDynamic => 0,
-                    _ => unreachable!(),
-                };
-                if selected_index >= count {
-                    return Err(GpuMeasurementError(format!(
-                        "family representative index {selected_index} is out of range for {count} members"
-                    )));
-                }
-                // Static access may select a nonzero member.  Preserve the
-                // complete family shape: production clones/accesses a real
-                // indexed container, and replacing unselected nested values
-                // with scalar sentinels would measure a different operation.
-                if let Some(fixture) = scalar_family_fixture {
-                    prepared.family_fixture = Some(Arc::clone(&fixture.values));
-                } else {
-                    let exemplar = Self::representative_family_member(backend, element, bindings)?;
-                    let family_values = (0..count).map(|_| exemplar.clone()).collect::<Vec<_>>();
-                    prepared.family_inputs.push(RuntimeValue::IndexedFamily(family_values));
-                }
-                if matches!(node.kind, NodeKind::FamilyGetDynamic) {
-                    // Index zero is valid for every nonempty family and is
-                    // deliberately independent of the generic Int exemplar.
-                    prepared.dynamic_index = Some(RuntimeValue::Int(BigInt::from(0u8)));
-                }
-            }
-            NodeKind::Select { .. } => {
-                let count = match node.kind {
-                    NodeKind::Select { count } => count
-                        .evaluate(bindings)
-                        .map_err(|error| GpuMeasurementError(error.to_string()))?
-                        .to_usize()
-                        .ok_or_else(|| {
-                            GpuMeasurementError("select count does not fit usize".into())
-                        })?,
-                    _ => unreachable!(),
-                };
-                if count == 0 {
-                    return Err(GpuMeasurementError(
-                        "select representative cannot use zero choices".into(),
-                    ));
-                }
-                // Zero is in range for every nonempty Select.  Do not use the
-                // generic Int representative (7), which is invalid for the
-                // common two-choice case.
-                prepared.dynamic_index = Some(RuntimeValue::Int(BigInt::from(0u8)));
-                let choice_types = if node.concrete_argument_types.len() > 1 {
-                    node.concrete_argument_types.iter().skip(1).cloned().collect()
-                } else {
-                    let output = node
-                        .concrete_output_types
-                        .first()
-                        .cloned()
-                        .unwrap_or(ConcreteWireType::Int);
-                    vec![output; count]
-                };
-                if choice_types.is_empty() {
-                    return Err(GpuMeasurementError("select representative has no choices".into()));
-                }
-                // Preserve each choice's complete nested shape.  Reusing the
-                // first representative for homogeneous choices keeps one GPU
-                // owner; heterogeneous choices are materialized once per
-                // distinct type and then cloned as O(count) host entries.
-                let mut representatives =
-                    HashMap::<ConcreteWireType, RuntimeValue<GpuDcrtBackend>>::new();
-                prepared.choices = choice_types
-                    .iter()
-                    .take(count)
-                    .map(|choice_type| {
-                        if let Some(value) = representatives.get(choice_type) {
-                            return Ok(value.clone());
-                        }
-                        let value =
-                            Self::representative_family_member(backend, choice_type, bindings)?;
-                        representatives.insert(choice_type.clone(), value.clone());
-                        Ok(value)
-                    })
-                    .collect::<Result<Vec<_>, GpuMeasurementError>>()?;
-                if prepared.choices.len() != count {
-                    return Err(GpuMeasurementError(format!(
-                        "select representative has {} choices for count {count}",
-                        prepared.choices.len()
-                    )));
-                }
-            }
-            NodeKind::IntBinary(_) | NodeKind::IntCompare(_) => {
-                prepared.scalar_inputs = vec![
-                    HostPrimitiveValue::Int(BigInt::from(7)),
-                    HostPrimitiveValue::Int(BigInt::from(3)),
-                ];
-            }
-            NodeKind::BitExtract { .. } | NodeKind::IntToReal => {
+            NodeKind::IntToReal => {
                 prepared.scalar_inputs = vec![HostPrimitiveValue::Int(BigInt::from(7))];
-            }
-            NodeKind::BoolToInt => {
-                prepared.scalar_inputs = vec![HostPrimitiveValue::Bool(true)];
             }
             NodeKind::RealBinary(_) => {
                 prepared.scalar_inputs =
@@ -5031,37 +4690,6 @@ impl ProductionGpuWarmupProvider {
                 .map(|_| ())
                 .map_err(|error| GpuMeasurementError(error.to_string()));
         }
-        if matches!(
-            node.kind,
-            NodeKind::FamilyPack { .. } |
-                NodeKind::FamilyGetStatic { .. } |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::Select { .. }
-        ) {
-            if let Some(values) = prepared.family_fixture.as_ref() {
-                return measure_runtime_family_get_primitive(
-                    node.id,
-                    node.kind,
-                    bindings,
-                    values,
-                    prepared.dynamic_index.as_ref(),
-                    1,
-                )
-                .map(|_| ())
-                .map_err(|error| GpuMeasurementError(error.to_string()));
-            }
-            return measure_runtime_container_primitive(
-                node.id,
-                node.kind,
-                bindings,
-                &prepared.family_inputs,
-                prepared.dynamic_index.as_ref(),
-                &prepared.choices,
-                1,
-            )
-            .map(|_| ())
-            .map_err(|error| GpuMeasurementError(error.to_string()));
-        }
         measure_host_primitive(node.id, node.kind, bindings, &prepared.scalar_inputs, 1)
             .map(|_| ())
             .map_err(|error| GpuMeasurementError(error.to_string()))
@@ -5071,23 +4699,136 @@ impl ProductionGpuWarmupProvider {
         matches!(
             kind,
             NodeKind::Input { .. } |
-                NodeKind::ConstantInt(_) |
-                NodeKind::EvaluateInt(_) |
+                NodeKind::TrapdoorPublic |
                 NodeKind::ConstantReal(_) |
-                NodeKind::ConstantBool(_) |
-                NodeKind::IntBinary(_) |
-                NodeKind::IntCompare(_) |
-                NodeKind::BitExtract { .. } |
                 NodeKind::IntToReal |
-                NodeKind::BoolToInt |
                 NodeKind::RealBinary(_) |
-                NodeKind::RealSqrt |
-                NodeKind::FamilyPack { .. } |
-                NodeKind::FamilyGetStatic { .. } |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::Select { .. } |
-                NodeKind::TrapdoorPublic
+                NodeKind::RealSqrt
         )
+    }
+
+    fn resident_control_kind_for_types(
+        kind: &NodeKind,
+        arguments: &[ConcreteWireType],
+        outputs: &[ConcreteWireType],
+    ) -> bool {
+        is_resident_control_operation_for_types(kind, arguments, outputs) &&
+            arguments.iter().chain(outputs).all(|ty| {
+                matrix_leaf_type(ty).is_none() && Self::resident_control_owner_count(ty).is_some()
+            })
+    }
+
+    fn resident_control_owner_count(wire_type: &ConcreteWireType) -> Option<usize> {
+        match wire_type {
+            ConcreteWireType::ConstantInt |
+            ConcreteWireType::Int |
+            ConcreteWireType::ConstantBool |
+            ConcreteWireType::Bool => Some(1),
+            ConcreteWireType::IndexedFamily { element, count } => {
+                Self::resident_control_owner_count(element)?.checked_mul(*count)
+            }
+            _ => None,
+        }
+    }
+
+    /// Measure the actual resident integer owner allocation used by migrated
+    /// control operations. This keeps the allocator/mempool interval under
+    /// the same per-device single-flight guard as matrix GPU measurements.
+    fn measure_resident_control_repeated(
+        worker: &mut GpuMeasurementWorker,
+        logical_device: usize,
+        node: &MeasurementNode<'_>,
+        harness: &GpuWarmupMeasurementConfig,
+    ) -> Result<(NodeMeasurement, GpuWarmupMemoryObservations), GpuMeasurementError> {
+        let output_owner_count = node
+            .concrete_output_types
+            .iter()
+            .filter_map(Self::resident_control_owner_count)
+            .try_fold(0usize, |total, count| total.checked_add(count))
+            .ok_or_else(|| GpuMeasurementError("resident control owner bytes overflow".into()))?;
+        let owner_count = if output_owner_count > 0 {
+            output_owner_count
+        } else {
+            node.concrete_argument_types
+                .iter()
+                .filter_map(Self::resident_control_owner_count)
+                .try_fold(0usize, |total, count| total.checked_add(count))
+                .ok_or_else(|| {
+                    GpuMeasurementError("resident control owner bytes overflow".into())
+                })?
+        };
+        if owner_count == 0 {
+            return Err(GpuMeasurementError(
+                "resident control measurement has no integer/bool owner".into(),
+            ));
+        }
+        let host_values = vec![BigInt::from(7); owner_count];
+        let baseline = begin_gpu_memory_measurement(worker)?;
+        let probe = GpuMemoryProbe { device_id: worker.device_id };
+        let mut operation_error = None;
+        let measured = measure_batch_operation(harness, &probe, 1, |batch_size| {
+            if operation_error.is_some() {
+                return Vec::new();
+            }
+            let mut owners = Vec::with_capacity(batch_size);
+            for _ in 0..batch_size {
+                let owner = match worker
+                    .backend
+                    .integer_values_from_host_on_device(worker.device_id, &host_values)
+                {
+                    Ok(owner) => owner,
+                    Err(error) => {
+                        operation_error = Some(GpuMeasurementError(error.to_string()));
+                        return Vec::new();
+                    }
+                };
+                if let Err(error) = owner.wait_until_ready() {
+                    operation_error = Some(GpuMeasurementError(error.to_string()));
+                    return Vec::new();
+                }
+                owners.push(owner);
+            }
+            owners
+        })
+        .map_err(|error| GpuMeasurementError(error.to_string()))?;
+        if let Some(error) = operation_error {
+            let _ = finish_gpu_memory_measurement(worker.device_id, baseline);
+            return Err(error);
+        }
+        let peaks = finish_gpu_memory_measurement(worker.device_id, baseline)?;
+        let mut measurement = measured.measurement;
+        measurement.workspace_bytes = peaks.ordinary_pool_bytes;
+        measurement.measured_wave_workspace_bytes = measurement.workspace_bytes;
+        measurement.graph_pool_workspace_bytes = peaks.graph_pool_bytes;
+        let identity =
+            gpu_device_runtime_identity(worker.device_id).map_err(GpuMeasurementError)?;
+        let owner = GpuWarmupDeviceIdentity::new(
+            logical_device,
+            format!(
+                "uuid={}-{}-sm{}.{}-mem{}",
+                identity.uuid,
+                identity.name,
+                identity.compute_major,
+                identity.compute_minor,
+                identity.total_global_memory
+            ),
+            format!(
+                "{}:driver{}:runtime{}",
+                identity.native_kernel_revision, identity.driver_version, identity.runtime_version
+            ),
+        )
+        .with_context_generation(identity.context_generation);
+        let bytes = u64::try_from(owner_count)
+            .ok()
+            .and_then(|count| count.checked_mul(std::mem::size_of::<u64>() as u64))
+            .ok_or_else(|| GpuMeasurementError("resident integer owner bytes overflow".into()))?;
+        let memory = GpuWarmupMemoryObservations {
+            affected_devices: BTreeMap::from([(owner, bytes)]),
+            host_bytes: 0,
+            pinned_host_bytes: 0,
+            evidence: MemoryEvidenceKind::ExactQuery,
+        };
+        Ok((measurement, memory))
     }
 
     fn measure_scalar_host_repeated(
@@ -5102,19 +4843,8 @@ impl ProductionGpuWarmupProvider {
                 "host warmup measurement requires at least one measured repetition".into(),
             ));
         }
-        let scalar_family_fixture =
-            Self::ensure_scalar_family_cache(worker, node, bindings, logical_device)?;
-        let prepared = Self::prepare_host_primitive_inner(
-            &mut worker.backend,
-            node,
-            bindings,
-            scalar_family_fixture.as_ref(),
-        )?;
-        let setup_memory = if let Some(fixture) = scalar_family_fixture.as_ref() {
-            (*fixture.setup_memory).clone()
-        } else {
-            Self::host_setup_memory(&worker.backend, &prepared, logical_device)?
-        };
+        let prepared = Self::prepare_host_primitive_inner(&mut worker.backend, node, bindings)?;
+        let setup_memory = Self::host_setup_memory(&worker.backend, &prepared, logical_device)?;
         for _ in 0..harness.warm_up_iterations {
             Self::run_prepared_host_primitive(node, bindings, &prepared)?;
         }
@@ -5299,9 +5029,6 @@ impl ProductionGpuWarmupProvider {
             .into_iter()
             .flat_map(|(inputs, _, _)| inputs.values())
             .chain(prepared.trapdoor.iter())
-            .chain(prepared.family_inputs.iter())
-            .chain(prepared.family_fixture.iter().flat_map(|values| values.iter()))
-            .chain(prepared.choices.iter())
         {
             visit(
                 backend,
@@ -5314,291 +5041,6 @@ impl ProductionGpuWarmupProvider {
             )?;
         }
         Ok(observations)
-    }
-
-    /// Inventory the owners that are already live for a host-visible boundary.
-    /// The boundary's input is the prepared measurement value; manufacturing a
-    /// representative from the output type here would allocate an unrelated
-    /// GPU owner and charge it to host setup.
-    fn host_boundary_setup_memory(
-        backend: &GpuDcrtBackend,
-        prepared: &PreparedMeasurement,
-        logical_device: usize,
-    ) -> Result<GpuWarmupMemoryObservations, GpuMeasurementError> {
-        let mut observations = GpuWarmupMemoryObservations {
-            evidence: MemoryEvidenceKind::ExactQuery,
-            ..Default::default()
-        };
-        for value in prepared.arguments.iter().flatten() {
-            for (device, bytes) in backend
-                .resident_allocation_bytes_by_device(value)
-                .map_err(|error| GpuMeasurementError(error.to_string()))?
-            {
-                let identity = gpu_device_runtime_identity(device).map_err(GpuMeasurementError)?;
-                let owner = GpuWarmupDeviceIdentity::new(
-                    logical_device,
-                    format!(
-                        "uuid={}-{}-sm{}.{}-mem{}",
-                        identity.uuid,
-                        identity.name,
-                        identity.compute_major,
-                        identity.compute_minor,
-                        identity.total_global_memory
-                    ),
-                    format!(
-                        "{}:driver{}:runtime{}",
-                        identity.native_kernel_revision,
-                        identity.driver_version,
-                        identity.runtime_version
-                    ),
-                )
-                .with_context_generation(identity.context_generation);
-                let entry = observations.affected_devices.entry(owner).or_default();
-                *entry = entry.checked_add(bytes as u64).ok_or_else(|| {
-                    GpuMeasurementError("host boundary input bytes overflow".into())
-                })?;
-            }
-        }
-        for value in prepared.small_arguments.iter().flatten() {
-            for shard in value.shards() {
-                let allocation = shard.value.allocation_bytes().map_err(GpuMeasurementError)?;
-                let identity =
-                    gpu_device_runtime_identity(shard.device_id).map_err(GpuMeasurementError)?;
-                let owner = GpuWarmupDeviceIdentity::new(
-                    logical_device,
-                    format!(
-                        "uuid={}-{}-sm{}.{}-mem{}",
-                        identity.uuid,
-                        identity.name,
-                        identity.compute_major,
-                        identity.compute_minor,
-                        identity.total_global_memory
-                    ),
-                    format!(
-                        "{}:driver{}:runtime{}",
-                        identity.native_kernel_revision,
-                        identity.driver_version,
-                        identity.runtime_version
-                    ),
-                )
-                .with_context_generation(identity.context_generation);
-                let entry = observations.affected_devices.entry(owner).or_default();
-                *entry = entry.checked_add(allocation.total_bytes as u64).ok_or_else(|| {
-                    GpuMeasurementError("host boundary compact bytes overflow".into())
-                })?;
-                // Compact canonical-import staging is temporary setup memory;
-                // only the retained compact owner belongs in the residency
-                // observation.
-            }
-        }
-        Ok(observations)
-    }
-
-    fn measure_host_boundary_repeated(
-        worker: &mut GpuMeasurementWorker,
-        logical_device: usize,
-        config: &GpuWarmupMeasurementConfig,
-        id: mxx_ir_core::types::NodeId,
-        bindings: &ParamEnv,
-        representative: &RepresentativeMeasurement,
-    ) -> Result<(f64, f64, usize, GpuWarmupMemoryObservations), GpuMeasurementError> {
-        if config.measured_iterations == 0 {
-            return Err(GpuMeasurementError(
-                "host warmup measurement requires at least one measured repetition".into(),
-            ));
-        }
-        let node = MeasurementNode {
-            id,
-            kind: &representative.kind,
-            concrete_argument_types: representative.concrete_argument_types.clone(),
-            concrete_output_types: representative.concrete_output_types.clone(),
-        };
-        // Preparation is setup work.  In particular, a matrix upload made to
-        // build the representative must never be charged to the host core.
-        let prepared = Self::prepare(&mut worker.backend, &node, bindings, None)?;
-        // Account only for owners retained by the actual prepared input.  In
-        // particular, PolynomialFromValues and PackPolynomialCoefficients
-        // have no GPU output owner during their host-only phase.
-        let mut setup_memory =
-            Self::host_boundary_setup_memory(&worker.backend, &prepared, logical_device)?;
-        let matrix_type = representative
-            .concrete_output_types
-            .iter()
-            .chain(&representative.concrete_argument_types)
-            .find_map(|ty| ty.matrix_type())
-            .ok_or_else(|| GpuMeasurementError("boundary has no matrix contract".into()))?;
-        let downloaded = match node.kind {
-            NodeKind::ExtractCoefficient { .. } |
-            NodeKind::ThresholdDecode { .. } |
-            NodeKind::PolynomialValues { .. } => {
-                let value = prepared
-                    .arguments
-                    .first()
-                    .and_then(Option::as_ref)
-                    .ok_or_else(|| GpuMeasurementError("boundary input is missing".into()))?;
-                worker
-                    .backend
-                    .download_polynomial_values(
-                        value,
-                        matches!(node.kind, NodeKind::PolynomialValues { evaluation: true }),
-                    )
-                    .map_err(|error| GpuMeasurementError(error.to_string()))?
-            }
-            _ => Vec::new(),
-        };
-        // The downloaded polynomial remains live for every host repetition and
-        // is therefore part of setup residency.  Count its vector storage and
-        // the native limbs represented by each BigUint without constructing a
-        // second GPU value merely to measure the boundary.
-        let downloaded_bytes = downloaded.iter().try_fold(
-            downloaded.capacity().saturating_mul(std::mem::size_of::<num_bigint::BigUint>()),
-            |total, value| {
-                total
-                    .checked_add(value.to_bytes_le().len())
-                    .ok_or_else(|| GpuMeasurementError("boundary host buffer overflow".into()))
-            },
-        )?;
-        let downloaded_bytes = u64::try_from(downloaded_bytes)
-            .map_err(|_| GpuMeasurementError("boundary host buffer exceeds u64".into()))?;
-        setup_memory.host_bytes = setup_memory
-            .host_bytes
-            .checked_add(downloaded_bytes)
-            .ok_or_else(|| GpuMeasurementError("boundary host buffer overflow".into()))?;
-        let evaluate = |value: &mxx_ir_core::IntExpr| {
-            value.evaluate(bindings).map_err(|error| GpuMeasurementError(error.to_string()))
-        };
-        let as_usize = |value: &mxx_ir_core::IntExpr| {
-            evaluate(value)?
-                .to_usize()
-                .ok_or_else(|| GpuMeasurementError("boundary dimension overflows".into()))
-        };
-        let run_host = || -> Result<(), GpuMeasurementError> {
-            use crate::backend::poly::{
-                canonical_polynomial_values, extract_host_coefficient, pack_polynomial_bits,
-                polynomial_host_values, threshold_decode_coefficients,
-            };
-            let error = |error: PolyBackendError| GpuMeasurementError(error.to_string());
-            match node.kind {
-                NodeKind::ExtractCoefficient { position, .. } => {
-                    std::hint::black_box(
-                        extract_host_coefficient(&downloaded, as_usize(position)?)
-                            .map_err(error)?,
-                    );
-                }
-                NodeKind::ThresholdDecode { plaintext_modulus, length, .. } => {
-                    std::hint::black_box(threshold_decode_coefficients(
-                        downloaded.clone(),
-                        &matrix_type.modulus,
-                        &evaluate(plaintext_modulus)?,
-                        as_usize(length)?,
-                    ));
-                }
-                NodeKind::PolynomialValues { .. } => {
-                    std::hint::black_box(polynomial_host_values(downloaded.clone()));
-                }
-                NodeKind::PolynomialFromValues { .. } => {
-                    std::hint::black_box(
-                        canonical_polynomial_values(
-                            matrix_type,
-                            &vec![BigInt::from(0); matrix_type.ring_dimension],
-                        )
-                        .map_err(error)?,
-                    );
-                }
-                NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
-                    let bits = as_usize(coefficient_bits)?;
-                    std::hint::black_box(
-                        pack_polynomial_bits(
-                            matrix_type,
-                            &vec![false; matrix_type.ring_dimension * bits],
-                            bits,
-                        )
-                        .map_err(error)?,
-                    );
-                }
-                _ => return Err(GpuMeasurementError("not a host codec".into())),
-            }
-            Ok(())
-        };
-        for _ in 0..config.warm_up_iterations {
-            run_host()?;
-        }
-        let mut samples = Vec::with_capacity(config.measured_iterations);
-        for _ in 0..config.measured_iterations {
-            let started = std::time::Instant::now();
-            run_host()?;
-            samples.push(started.elapsed().as_secs_f64().max(f64::MIN_POSITIVE));
-        }
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        let spread = if samples.len() > 1 {
-            let variance =
-                samples.iter().map(|sample| (sample - mean) * (sample - mean)).sum::<f64>() /
-                    samples.len() as f64;
-            variance.sqrt()
-        } else {
-            0.0
-        };
-        if !mean.is_finite() || mean <= 0.0 || !spread.is_finite() {
-            return Err(GpuMeasurementError(
-                "host warmup timing must be finite and positive".into(),
-            ));
-        }
-        Ok((mean, spread, samples.len(), setup_memory))
-    }
-
-    /// Measure one validated structural dispatch through the shared
-    /// production/warmup walker.  The walker owns loop binding and child
-    /// traversal; this callback only executes the leaf host primitive.
-    fn measure_host_control_once(
-        id: mxx_ir_core::types::NodeId,
-        kind: &NodeKind,
-        bindings: &ParamEnv,
-        child: Option<&HostControlChild>,
-    ) -> Result<f64, GpuMeasurementError> {
-        measure_host_control_with(id, kind, bindings, child, |invocation| {
-            // Structural control walkers do not own the GPU backend; their
-            // concrete leaf timing is charged by the enclosing production
-            // node path. Keep traversal here side-effect free.
-            debug_assert!(invocation.coverage.is_complete());
-            Ok::<_, GpuMeasurementError>(HostControlBodyAction::VisitChildren)
-        })
-        .map_err(|error| GpuMeasurementError(error.to_string()))
-    }
-
-    fn measure_host_control_repeated(
-        config: &GpuWarmupMeasurementConfig,
-        id: mxx_ir_core::types::NodeId,
-        kind: &NodeKind,
-        bindings: &ParamEnv,
-        child: Option<&HostControlChild>,
-    ) -> Result<(f64, f64, usize), GpuMeasurementError> {
-        if config.measured_iterations == 0 {
-            return Err(GpuMeasurementError(
-                "host warmup measurement requires at least one measured repetition".into(),
-            ));
-        }
-        for _ in 0..config.warm_up_iterations {
-            std::hint::black_box(Self::measure_host_control_once(id, kind, bindings, child)?);
-        }
-        let mut samples = Vec::with_capacity(config.measured_iterations);
-        for _ in 0..config.measured_iterations {
-            samples.push(Self::measure_host_control_once(id, kind, bindings, child)?);
-        }
-        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-        let spread = if samples.len() > 1 {
-            let variance =
-                samples.iter().map(|sample| (sample - mean) * (sample - mean)).sum::<f64>() /
-                    samples.len() as f64;
-            variance.sqrt()
-        } else {
-            0.0
-        };
-        if !mean.is_finite() || mean <= 0.0 || !spread.is_finite() {
-            return Err(GpuMeasurementError(
-                "host warmup timing must be finite and positive".into(),
-            ));
-        }
-        Ok((mean, spread, samples.len()))
     }
 
     fn run_node(
@@ -5676,21 +5118,11 @@ impl ProductionGpuWarmupProvider {
         if matches!(
             node.kind,
             NodeKind::Input { .. } |
-                NodeKind::ConstantInt(_) |
-                NodeKind::EvaluateInt(_) |
                 NodeKind::ConstantReal(_) |
-                NodeKind::ConstantBool(_) |
-                NodeKind::IntBinary(_) |
-                NodeKind::IntCompare(_) |
-                NodeKind::BitExtract { .. } |
                 NodeKind::IntToReal |
-                NodeKind::BoolToInt |
                 NodeKind::RealBinary(_) |
                 NodeKind::RealSqrt |
-                NodeKind::FamilyPack { .. } |
-                NodeKind::FamilyGetStatic { .. } |
-                NodeKind::FamilyGetDynamic |
-                NodeKind::Select { .. }
+                NodeKind::TrapdoorPublic
         ) {
             Self::run_host_primitive(backend, node, bindings, batch_size)?;
             return Ok(Vec::new());
@@ -5883,6 +5315,20 @@ impl ProductionGpuWarmupProvider {
                         .map(|_| {
                             backend
                                 .block_mod_switch(matrix(0)?, &destination, source_moduli, &t)
+                                .map_err(backend_error)
+                        })
+                        .collect(),
+                )
+            }
+            NodeKind::CenteredRoundDivide { divisor } => {
+                let divisor = divisor
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                matrix_outputs(
+                    (0..batch_size)
+                        .map(|_| {
+                            backend
+                                .centered_round_divide(matrix(0)?, &divisor)
                                 .map_err(backend_error)
                         })
                         .collect(),
@@ -6283,11 +5729,15 @@ impl ProductionGpuWarmupProvider {
                 .collect(),
             NodeKind::ExtractCoefficient { position, .. } => {
                 let position = evaluate_usize(position)?;
-                for _ in 0..batch_size {
-                    dispatch_extract_coefficient(backend, matrix(0)?, position)
-                        .map_err(backend_error)?;
-                }
-                Ok(Vec::new())
+                backend
+                    .fixed_batch_extract_coefficient(
+                        vec![(matrix_arc(0)?, position); batch_size],
+                        &(0..batch_size).collect::<Vec<_>>(),
+                    )
+                    .map(|values| {
+                        values.into_iter().map(GpuMeasurementOutput::IntegerValues).collect()
+                    })
+                    .map_err(backend_error)
             }
             NodeKind::LiftIntegerToConstantPolynomial { matrix_type } => {
                 let modulus = matrix_type
@@ -6353,11 +5803,22 @@ impl ProductionGpuWarmupProvider {
                     .evaluate(bindings)
                     .map_err(|error| GpuMeasurementError(error.to_string()))?;
                 let length = evaluate_usize(length)?;
-                for _ in 0..batch_size {
-                    dispatch_threshold_decode(backend, matrix(0)?, &modulus, length)
-                        .map_err(backend_error)?;
-                }
-                Ok(Vec::new())
+                let output_bool = node.concrete_output_types.first().is_some_and(|ty| {
+                    matches!(ty, ConcreteWireType::Bool | ConcreteWireType::ConstantBool)
+                });
+                backend
+                    .fixed_batch_threshold_decode(
+                        vec![(matrix_arc(0)?, modulus, length, output_bool); batch_size],
+                        &(0..batch_size).collect::<Vec<_>>(),
+                    )
+                    .map(|values| {
+                        values
+                            .into_iter()
+                            .flatten()
+                            .map(GpuMeasurementOutput::IntegerValues)
+                            .collect()
+                    })
+                    .map_err(backend_error)
             }
             NodeKind::CrtRecompose { plaintext_moduli, reconstruction_coefficients, .. } => {
                 let destination = output_matrix_type()?;
@@ -6420,14 +5881,21 @@ impl ProductionGpuWarmupProvider {
                             // taken from validated metadata; only its bit
                             // payload is chosen to exercise the production
                             // packing loop.
-                            let bits = (0..count).map(|index| index % 2 == 0).collect::<Vec<_>>();
-                            dispatch_pack_polynomial_coefficients(
-                                backend,
-                                &ty,
-                                &bits,
-                                coefficient_bits,
-                            )
-                            .map_err(backend_error)
+                            let bits = (0..count)
+                                .map(|index| BigInt::from(u8::from(index % coefficient_bits == 0)))
+                                .collect::<Vec<_>>();
+                            let bits =
+                                backend.integer_values_from_host(&bits).map_err(backend_error)?;
+                            backend
+                                .fixed_batch_pack_polynomial_coefficients(
+                                    vec![(ty.clone(), Arc::new(bits), coefficient_bits)],
+                                    &[0],
+                                )
+                                .map_err(backend_error)?
+                                .pop()
+                                .ok_or_else(|| {
+                                    GpuMeasurementError("native pack produced no matrix".into())
+                                })
                         })
                         .collect(),
                 )
@@ -6446,7 +5914,10 @@ impl ProductionGpuWarmupProvider {
                 matrix_outputs(
                     (0..batch_size)
                         .map(|_| {
-                            dispatch_polynomial_from_values(backend, &ty, &values, *evaluation)
+                            let values =
+                                backend.integer_values_from_host(&values).map_err(backend_error)?;
+                            backend
+                                .polynomial_from_integer_values(&ty, &values, *evaluation)
                                 .map_err(backend_error)
                         })
                         .collect(),
@@ -6454,41 +5925,40 @@ impl ProductionGpuWarmupProvider {
             }
             NodeKind::PolynomialValues { evaluation } => {
                 let value = matrix(0)?;
-                for _ in 0..batch_size {
-                    let values = dispatch_polynomial_values(backend, value, *evaluation)
-                        .map_err(backend_error)?;
-                    std::hint::black_box(values);
-                }
-                Ok(Vec::new())
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .polynomial_values_resident(value, *evaluation)
+                            .map(GpuMeasurementOutput::IntegerValues)
+                            .map_err(backend_error)
+                    })
+                    .collect()
             }
             NodeKind::TrapdoorPublic => {
                 Self::run_host_primitive(backend, node, bindings, batch_size)?;
                 Ok(Vec::new())
             }
             NodeKind::Input { .. } |
+            NodeKind::ConstantReal(_) |
+            NodeKind::IntToReal |
+            NodeKind::RealBinary(_) |
+            NodeKind::RealSqrt => Ok(Vec::new()),
             NodeKind::ConstantInt(_) |
             NodeKind::EvaluateInt(_) |
-            NodeKind::ConstantReal(_) |
             NodeKind::ConstantBool(_) |
             NodeKind::IntBinary(_) |
             NodeKind::IntCompare(_) |
             NodeKind::BitExtract { .. } |
-            NodeKind::IntToReal |
             NodeKind::BoolToInt |
-            NodeKind::RealBinary(_) |
-            NodeKind::RealSqrt |
             NodeKind::FamilyPack { .. } |
             NodeKind::FamilyGetStatic { .. } |
             NodeKind::FamilyGetDynamic |
-            NodeKind::Select { .. } => Ok(Vec::new()),
-            NodeKind::SubgraphCall(_) | NodeKind::ParallelLoop(_) | NodeKind::SequentialLoop(_) => {
-                measure_host_control_with(node.id, node.kind, bindings, None, |invocation| {
-                    debug_assert!(invocation.coverage.is_complete());
-                    Ok::<_, GpuMeasurementError>(HostControlBodyAction::VisitChildren)
-                })
-                .map_err(|error| GpuMeasurementError(error.to_string()))?;
-                Ok(Vec::new())
-            }
+            NodeKind::Select { .. } |
+            NodeKind::SubgraphCall(_) |
+            NodeKind::ParallelLoop(_) |
+            NodeKind::SequentialLoop(_) => Err(GpuMeasurementError(
+                "resident control node reached matrix measurement without an integer owner".into(),
+            )),
         }
     }
 }
@@ -6621,7 +6091,7 @@ impl GpuWarmupProfileProvider for ProductionGpuWarmupProvider {
 /// backend contract, layouts, storage descriptors, and finite resource
 /// budgets from the graph/backend pair. Callers supply only graph-independent
 /// policy and measurement inputs.
-pub struct GpuPreparationRequest<'a> {
+pub(crate) struct GpuPreparationRequest<'a> {
     pub validated: ValidatedGraph,
     pub backend: &'a mut GpuDcrtBackend,
     pub inputs: &'a BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
@@ -6632,238 +6102,68 @@ pub struct GpuPreparationRequest<'a> {
     pub execution_config: ExecutionConfig,
 }
 
-#[derive(Clone, Debug)]
-pub struct GpuPreparationEvidence {
-    pub measurement_calls: usize,
-    pub provenances: Vec<GpuWarmupProvenance>,
-    pub dispatches: Vec<GpuWarmupDispatchRecord>,
-    /// The provider's live observation token.  Keeping this Arc in the
-    /// prepared value lets callers prove that no setup measurement happened
-    /// after preparation, even though the provider itself has been dropped.
-    measurement_counter: Arc<AtomicUsize>,
-    measurement_baseline: usize,
-}
-
-impl PartialEq for GpuPreparationEvidence {
-    fn eq(&self, other: &Self) -> bool {
-        self.measurement_calls == other.measurement_calls &&
-            self.provenances == other.provenances &&
-            self.dispatches == other.dispatches &&
-            self.measurement_baseline == other.measurement_baseline &&
-            Arc::ptr_eq(&self.measurement_counter, &other.measurement_counter)
-    }
-}
-
-impl GpuPreparationEvidence {
-    pub fn measurement_count(&self) -> usize {
-        self.measurement_counter.load(Ordering::SeqCst)
-    }
-
-    pub fn assert_measurements_unchanged(&self) {
-        assert_eq!(
-            self.measurement_count(),
-            self.measurement_baseline,
-            "GPU measurement provider was invoked after preparation"
-        );
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
-pub enum GpuPreparationError {
+pub(crate) enum GpuPreparationError {
     #[error("GPU warmup preparation failed: {0}")]
     Warmup(#[from] GpuWarmupError),
     #[error("GPU warmup preparation input is invalid: {0}")]
     InvalidInput(String),
-    #[error("GPU warmup preparation evidence is invalid: {0}")]
-    InvalidEvidence(String),
-    #[error("prepared GPU execution failed: {0}")]
-    Execution(#[from] ExecutionError),
 }
 
-/// The immutable result of canonical setup.  Reports and evidence are copied
-/// values: calling accessors cannot invoke a provider, backend, or allocator.
+/// Immutable setup output consumed by the compiled runtime. This is an
+/// internal lowering result, not an execution facade: execution owns the
+/// compiled plan and is entered only through `GpuRuntime::execute`.
 #[derive(Clone, Debug)]
-pub struct PreparedGpuExecution {
+pub(crate) struct GpuPreparedSetup {
     validated: Arc<ValidatedGraph>,
     plan: Arc<FrozenGpuPlan>,
     plan_index: FrozenGpuPlanIndex,
+    measured_costs: GpuMeasuredCostCache,
     report: GpuWarmupReport,
-    report_stages_by_key: BTreeMap<GpuExecutionSiteKey, usize>,
-    execution_config: ExecutionConfig,
-    evidence: GpuPreparationEvidence,
 }
 
-impl PreparedGpuExecution {
-    pub fn validated(&self) -> &ValidatedGraph {
+impl GpuPreparedSetup {
+    pub(crate) fn validated(&self) -> &ValidatedGraph {
         &self.validated
     }
 
-    pub fn plan(&self) -> &FrozenGpuPlan {
+    pub(crate) fn plan(&self) -> &FrozenGpuPlan {
         &self.plan
     }
 
-    pub fn report(&self) -> GpuWarmupReport {
-        self.report.clone()
+    /// Setup-time measured points used to rank the frozen candidate. Only
+    /// timing and measurement scalars are reusable; route/resource evidence
+    /// remains on the per-job warmup profile and is validated independently.
+    pub(crate) fn measured_costs(&self) -> &GpuMeasuredCostCache {
+        &self.measured_costs
     }
 
-    pub fn evidence(&self) -> GpuPreparationEvidence {
-        self.evidence.clone()
+    /// Return the immutable lookup index paired with the frozen plan.  Runtime
+    /// graph-capture preparation uses the same validated index as warmup so it
+    /// cannot reconstruct layouts or node choices from operation identities.
+    pub(crate) fn plan_index(&self) -> &FrozenGpuPlanIndex {
+        &self.plan_index
     }
 
-    pub fn measurement_count(&self) -> usize {
-        self.evidence.measurement_count()
-    }
-
-    pub fn assert_measurements_unchanged(&self) {
-        self.evidence.assert_measurements_unchanged();
-    }
-
-    pub fn execution_config(&self) -> ExecutionConfig {
-        self.execution_config.clone()
-    }
-
-    /// Validate the immutable evidence captured during setup.  This is kept as
-    /// a separate check so callers can reject a tampered or incomplete value
-    /// before handing it to the production executor.
-    pub fn validate_evidence(&self) -> Result<(), GpuPreparationError> {
-        self.plan
-            .validate_with_index(&self.plan_index)
-            .map_err(|error| GpuPreparationError::InvalidEvidence(error.to_string()))?;
-
-        let executable = !self.plan.nodes.is_empty();
-        if executable && self.evidence.measurement_calls == 0 {
-            return Err(GpuPreparationError::InvalidEvidence(
-                "executable GPU plan has no setup measurements".into(),
-            ));
-        }
-        let live_measurements = self.evidence.measurement_count();
-        if live_measurements != self.evidence.measurement_baseline ||
-            live_measurements != self.evidence.measurement_calls
-        {
-            return Err(GpuPreparationError::InvalidEvidence(format!(
-                "measurement counter changed: live {}, baseline {}, captured {}",
-                live_measurements,
-                self.evidence.measurement_baseline,
-                self.evidence.measurement_calls
-            )));
-        }
-        if self.evidence.provenances.len() != self.evidence.measurement_calls {
-            return Err(GpuPreparationError::InvalidEvidence(format!(
-                "measurement provenance count {} does not match measurement count {}",
-                self.evidence.provenances.len(),
-                self.evidence.measurement_calls
-            )));
-        }
-        if self
-            .evidence
-            .provenances
-            .iter()
-            .any(|provenance| *provenance != GpuWarmupProvenance::ProductionEquivalent)
-        {
-            return Err(GpuPreparationError::InvalidEvidence(
-                "setup measurement is not production-equivalent".into(),
-            ));
-        }
-        if self
-            .report
-            .stages
-            .iter()
-            .any(|stage| stage.provenance == GpuProfileProvenance::ConservativeEstimate)
-        {
-            return Err(GpuPreparationError::InvalidEvidence(
-                "warmup report contains a conservative estimate".into(),
-            ));
-        }
-        match &self.execution_config.plan {
-            ExecutionPlan::FrozenGpu(plan) if plan.as_ref() == self.plan.as_ref() => {}
-            ExecutionPlan::FrozenGpu(_) => {
-                return Err(GpuPreparationError::InvalidEvidence(
-                    "execution configuration plan differs from prepared plan".into(),
-                ));
-            }
-            ExecutionPlan::Cpu => {
-                return Err(GpuPreparationError::InvalidEvidence(
-                    "prepared GPU execution has no frozen GPU plan".into(),
-                ));
-            }
-        }
-
-        if self.report.stages.len() != self.plan.nodes.len() {
-            return Err(GpuPreparationError::InvalidEvidence(format!(
-                "warmup report has {} stages but frozen plan has {} nodes",
-                self.report.stages.len(),
-                self.plan.nodes.len()
-            )));
-        }
-        if self.report_stages_by_key.len() != self.report.stages.len() {
-            return Err(GpuPreparationError::InvalidEvidence(
-                "warmup report contains duplicate plan sites".into(),
-            ));
-        }
-        for node in &self.plan.nodes {
-            let Some(stage) = self
-                .report_stages_by_key
-                .get(&node.key)
-                .and_then(|index| self.report.stages.get(*index))
-            else {
-                return Err(GpuPreparationError::InvalidEvidence(format!(
-                    "warmup report is missing plan node {:?}",
-                    node.key
-                )));
-            };
-            if stage.operation_identity != node.operation_identity ||
-                stage.effective_operation != node.effective_operation ||
-                stage.column_capability != node.column_capability ||
-                stage.output_layouts != node.output_layouts ||
-                stage.loop_site != node.loop_site ||
-                stage.columns_per_job != node.columns_per_job ||
-                stage.implementation_variant != node.implementation_variant
-            {
-                return Err(GpuPreparationError::InvalidEvidence(format!(
-                    "warmup report identity differs from frozen plan at {:?}",
-                    node.key
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// Execute the already prepared graph using the frozen production plan.
-    /// Artifact-producing graphs are recognized from their validated output
-    /// declarations and use the session path; transient and artifact-consumer
-    /// graphs stay transient. Sampling and the execution configuration are
-    /// intentionally fixed by this value.
-    pub fn run<S>(
-        &self,
-        backend: &mut GpuDcrtBackend,
-        inputs: BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
-        artifact_store: &mut S,
-        execution_nonce: [u8; 32],
-    ) -> Result<ExecutionResult<GpuDcrtBackend>, GpuPreparationError>
-    where
-        S: SessionStore,
-    {
-        self.validate_evidence()?;
-        self.evidence.assert_measurements_unchanged();
-        let result = execute_prepared(
-            &self.validated,
-            backend,
-            inputs,
-            artifact_store,
-            execution_nonce,
-            self.execution_config.clone(),
-        )?;
-        self.evidence.assert_measurements_unchanged();
-        Ok(result)
+    pub(crate) fn report(&self) -> &GpuWarmupReport {
+        &self.report
     }
 }
 
 /// Prepare one exact production GPU execution.  Measurement is performed at
 /// most once here; all returned state is detached from the provider and is
 /// safe to reuse for fixed execution and pure reporting.
-pub fn prepare(
+pub(crate) fn prepare_gpu_setup(
     request: GpuPreparationRequest<'_>,
-) -> Result<PreparedGpuExecution, GpuPreparationError> {
+) -> Result<GpuPreparedSetup, GpuPreparationError> {
+    // Setup baselines must not observe release work queued by a previous
+    // preparation or execution. This is a backend-owned release-stream
+    // boundary; callers should not have to reach through the runtime to fence
+    // it before asking for a plan.
+    request
+        .backend
+        .fence_released_memory()
+        .map_err(|error| GpuPreparationError::InvalidInput(error.to_string()))?;
     let device_ids = request.backend.physical_device_ids();
     if device_ids.is_empty() {
         return Err(GpuPreparationError::InvalidInput("GPU fleet is empty".into()));
@@ -6878,26 +6178,18 @@ pub fn prepare(
             "native parameter device ownership disagrees with the production fleet".into(),
         ));
     }
+    // A runtime may prepare a replacement graph after executing an earlier
+    // plan.  The backend's frozen plan is the mutable execution binding, not
+    // part of the caller-owned `GpuExecutionPlan`; release it before deriving
+    // the replacement contract so budget admission does not mistake a valid
+    // re-plan for an unsupported placement.
+    request.backend.clear_frozen_plan();
     let mut contract = request
         .backend
         .gpu_runtime_contract(&request.validated, request.inputs)
         .map_err(|error| GpuPreparationError::InvalidInput(error.to_string()))?
         .ok_or_else(|| {
             GpuPreparationError::InvalidInput("backend has no fixed GPU contract".into())
-        })?;
-    let available_host = std::fs::read_to_string("/proc/meminfo")
-        .map_err(|error| {
-            GpuPreparationError::InvalidInput(format!("host memory information: {error}"))
-        })?
-        .lines()
-        .find_map(|line| {
-            line.strip_prefix("MemAvailable:")
-                .and_then(|value| value.split_whitespace().next())
-                .and_then(|value| value.parse::<u64>().ok())
-                .and_then(|value| value.checked_mul(1024))
-        })
-        .ok_or_else(|| {
-            GpuPreparationError::InvalidInput("available host memory is unavailable".into())
         })?;
     contract.device_budgets = contract
         .logical_to_physical_devices
@@ -6909,8 +6201,12 @@ pub fn prepare(
                 device_bytes: gpu_memory_info(*physical as i32)
                     .map_err(GpuPreparationError::InvalidInput)?
                     .free as u64,
-                pinned_host_bytes: available_host.min(1 << 30),
-                host_bytes: available_host.min(8 << 30),
+                // Host/pageable and pinned RAM are executable-resource
+                // requirements, not planner dimensions. Allocation failure
+                // is reported by execution/store and never triggers a GPU
+                // candidate fallback.
+                pinned_host_bytes: 0,
+                host_bytes: 0,
             })
         })
         .collect::<Result<Vec<_>, GpuPreparationError>>()?;
@@ -6953,15 +6249,15 @@ pub fn prepare(
     let measurement_backends = device_ids
         .iter()
         .map(|device| {
-            (
-                gpu_backend_on(request.parameters.iter().cloned(), device_ids.iter().copied()),
-                *device,
-            )
+            request
+                .backend
+                .measurement_backend()
+                .map(|backend| (backend, *device))
+                .map_err(|error| GpuPreparationError::InvalidInput(error.to_string()))
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     let mut provider =
         ProductionGpuWarmupProvider::new(measurement_backends, request.measurement_config);
-    let measurement_counter = provider.warmup_measurement_counter();
     let warmup = crate::gpu_warmup::warmup_gpu_for_inputs_with_execution_config(
         &request.validated,
         request.backend,
@@ -6970,40 +6266,18 @@ pub fn prepare(
         &mut provider,
         &request.execution_config,
     )?;
-    let evidence = GpuPreparationEvidence {
-        measurement_calls: provider.warmup_measurement_call_count(),
-        provenances: provider.warmup_measurement_provenances().to_vec(),
-        dispatches: provider.warmup_dispatch_records().to_vec(),
-        measurement_baseline: provider.warmup_measurement_call_count(),
-        measurement_counter,
-    };
+    let measured_costs = provider.measured_costs().clone();
     drop(provider);
     let plan = Arc::new(warmup.plan);
     let plan_index = FrozenGpuPlanIndex::build(&plan)
-        .map_err(|error| GpuPreparationError::InvalidEvidence(error.to_string()))?;
-    let mut report_stages_by_key = BTreeMap::new();
-    for (index, stage) in warmup.report.stages.iter().enumerate() {
-        if report_stages_by_key.insert(stage.key, index).is_some() {
-            return Err(GpuPreparationError::InvalidEvidence(
-                "warmup report contains duplicate plan sites".into(),
-            ));
-        }
-    }
-    let execution_config = ExecutionConfig {
-        plan: ExecutionPlan::FrozenGpu(Arc::clone(&plan)),
-        ..request.execution_config
-    };
-    let prepared = PreparedGpuExecution {
+        .map_err(|error| GpuPreparationError::InvalidInput(error.to_string()))?;
+    Ok(GpuPreparedSetup {
         validated: Arc::new(request.validated),
         plan,
         plan_index,
+        measured_costs,
         report: warmup.report,
-        report_stages_by_key,
-        execution_config,
-        evidence,
-    };
-    prepared.validate_evidence()?;
-    Ok(prepared)
+    })
 }
 
 #[cfg(test)]
@@ -7036,11 +6310,11 @@ fn compact_matrix_bytes_u128(matrix: &ConcreteMatrixType, max_coefficient_bound:
 #[cfg(test)]
 mod tests {
     use super::{
-        GpuMeasurementError, GpuMeasurementOutput, GpuMeasurementWorker, MeasurementNode,
-        PendingMeasurement, PreparedMeasurement, ProductionGpuWarmupProvider, ScalarFamilyCacheKey,
-        ScalarFamilyFixture, authoritative_production_route, compact_matrix_bytes,
-        harness::GpuWarmupMeasurementConfig, matrix_bytes, require_exclusive_measurement_context,
-        select_worker_index_for_physical, tensor_row_sum_allocation_groups,
+        GpuMeasuredCostCache, GpuMeasuredCostKey, GpuMeasuredCostPoint, GpuMeasurementOutput,
+        GpuMeasurementTransportClass, MeasurementNode, PendingMeasurement, PreparedMeasurement,
+        ProductionGpuWarmupProvider, authoritative_production_route, compact_matrix_bytes,
+        harness::GpuWarmupMeasurementConfig, matrix_bytes, select_worker_index_for_physical,
+        tensor_row_sum_allocation_groups,
     };
     use crate::{
         backend::{
@@ -7079,7 +6353,52 @@ mod tests {
         },
     };
     use num_bigint::{BigInt, BigUint};
-    use std::{collections::BTreeSet, sync::Arc};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn measured_cost_cache_keeps_resident_points_shared_and_routes_distinct() {
+        let operation = GpuMeasuredCostKey {
+            implementation_variant: crate::backend::GpuWarmupEffectiveVariant::Ordinary,
+            operation_identity: [0x11; 32],
+            transport_class: GpuMeasurementTransportClass::Resident,
+        };
+        let peer = GpuMeasuredCostKey {
+            transport_class: GpuMeasurementTransportClass::Peer {
+                source_device: 0,
+                destination_device: 1,
+            },
+            ..operation.clone()
+        };
+        let mut cache = GpuMeasuredCostCache::default();
+        cache.insert(
+            operation.clone(),
+            8,
+            GpuMeasuredCostPoint {
+                mean_seconds: 1.25,
+                spread_seconds: 0.05,
+                repetitions: 2,
+                incremental_peak_bytes: 100,
+                retained_delta_bytes: 40,
+                graph_pool_peak_bytes: 0,
+            },
+        );
+        cache.insert(
+            peer.clone(),
+            8,
+            GpuMeasuredCostPoint {
+                mean_seconds: 2.5,
+                spread_seconds: 0.1,
+                repetitions: 2,
+                incremental_peak_bytes: 180,
+                retained_delta_bytes: 80,
+                graph_pool_peak_bytes: 12,
+            },
+        );
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.exact(&operation, 8).unwrap().retained_delta_bytes, 40);
+        assert_eq!(cache.exact(&peer, 8).unwrap().incremental_peak_bytes, 180);
+        assert!(cache.exact(&operation, 4).is_none());
+    }
 
     #[test]
     fn grouped_tensor_row_sum_allocation_uses_every_output_group() {
@@ -7156,292 +6475,16 @@ mod tests {
     }
 
     #[test]
-    fn scalar_family_request_preserves_nonzero_tail_and_rejects_out_of_range() {
-        let family =
-            ConcreteWireType::IndexedFamily { element: Box::new(ConcreteWireType::Int), count: 4 };
-        let nonzero_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(2) };
-        let nonzero = MeasurementNode {
-            id: NodeId(1),
-            kind: &nonzero_kind,
-            concrete_argument_types: vec![family.clone()],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert_eq!(
-            ProductionGpuWarmupProvider::scalar_family_request(&nonzero, &ParamEnv::default())
-                .expect("valid static family index"),
-            Some((ConcreteWireType::Int, 4))
-        );
-        let tail_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(3) };
-        let tail = MeasurementNode {
-            id: NodeId(1),
-            kind: &tail_kind,
-            concrete_argument_types: vec![family.clone()],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert_eq!(
-            ProductionGpuWarmupProvider::scalar_family_request(&tail, &ParamEnv::default())
-                .expect("valid tail family index"),
-            Some((ConcreteWireType::Int, 4))
-        );
-        let out_of_range_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(4) };
-        let out_of_range = MeasurementNode {
-            id: NodeId(1),
-            kind: &out_of_range_kind,
-            concrete_argument_types: vec![family.clone()],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert!(
-            ProductionGpuWarmupProvider::scalar_family_request(&out_of_range, &ParamEnv::default())
-                .is_err()
-        );
-        let dynamic_kind = NodeKind::FamilyGetDynamic;
-        let dynamic = MeasurementNode {
-            id: NodeId(2),
-            kind: &dynamic_kind,
-            concrete_argument_types: vec![family.clone()],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert_eq!(
-            ProductionGpuWarmupProvider::scalar_family_request(&dynamic, &ParamEnv::default())
-                .expect("valid dynamic family index"),
-            Some((ConcreteWireType::Int, 4))
-        );
-        let nested_kind = NodeKind::FamilyGetDynamic;
-        let nested = MeasurementNode {
-            id: NodeId(3),
-            kind: &nested_kind,
-            concrete_argument_types: vec![ConcreteWireType::IndexedFamily {
-                element: Box::new(family),
-                count: 2,
-            }],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert_eq!(
-            ProductionGpuWarmupProvider::scalar_family_request(&nested, &ParamEnv::default())
-                .expect("nested family is valid but not scalar-only"),
-            None
-        );
-    }
-
-    #[test]
-    fn scalar_family_cache_key_replacement_keeps_setup_evidence_immutable() {
-        let key = ScalarFamilyCacheKey {
-            element_type: ConcreteWireType::Int,
-            count: 4,
-            bindings: ParamEnv::default(),
-            logical_device: 0,
-            worker_device_id: 0,
-            worker_devices: vec![0, 1],
-        };
-        let setup_memory = Arc::new(crate::backend::GpuWarmupMemoryObservations::default());
-        let fixture = ScalarFamilyFixture {
-            key: key.clone(),
-            values: Arc::new(Vec::new()),
-            setup_memory: Arc::clone(&setup_memory),
-        };
-        let reused = fixture.clone();
-        assert_eq!(reused.key, key);
-        assert!(Arc::ptr_eq(&reused.setup_memory, &setup_memory));
-
-        let mut replaced_key = key;
-        replaced_key.count = 5;
-        assert_ne!(replaced_key, reused.key);
-        replaced_key.element_type = ConcreteWireType::Real;
-        assert_ne!(replaced_key, reused.key);
-        replaced_key.worker_device_id = 1;
-        assert_ne!(replaced_key, reused.key);
-        let mut bindings = ParamEnv::default();
-        bindings.integers.insert("n".into(), 7.into());
-        replaced_key.bindings = bindings;
-        assert_ne!(replaced_key, reused.key);
-    }
-
-    #[cfg(feature = "gpu")]
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn scalar_family_fixture_cache_reuses_evidence_and_replaces_on_shape_or_worker_change() {
-        use crate::backend::poly_gpu::gpu_backend_on;
-        use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
-
-        let device = detected_gpu_device_ids()
-            .into_iter()
-            .next()
-            .expect("GPU feature tests require one detected device");
-        let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
-        let mut worker = GpuMeasurementWorker {
-            backend: gpu_backend_on([parameters], [device]),
-            device_id: device,
-            last_production_job: None,
-            scalar_family_cache: None,
-        };
-        let family =
-            |element, count| ConcreteWireType::IndexedFamily { element: Box::new(element), count };
-        let bindings = ParamEnv::default();
-        let static_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(1) };
-        let node = MeasurementNode {
-            id: NodeId(10),
-            kind: &static_kind,
-            concrete_argument_types: vec![family(ConcreteWireType::Int, 4)],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        let first = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &node,
-            &bindings,
-            0,
-        )
-        .expect("scalar family cache setup")
-        .expect("scalar family must be cached");
-        assert_eq!(first.values.len(), 4);
-        assert_eq!(first.setup_memory.evidence, MemoryEvidenceKind::ExactQuery);
-        let tail_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(3) };
-        let tail = MeasurementNode {
-            id: NodeId(11),
-            kind: &tail_kind,
-            concrete_argument_types: node.concrete_argument_types.clone(),
-            concrete_output_types: node.concrete_output_types.clone(),
-        };
-        let reused = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &tail,
-            &bindings,
-            0,
-        )
-        .expect("scalar family cache reuse")
-        .expect("scalar family must remain cached");
-        assert!(Arc::ptr_eq(&first.values, &reused.values));
-        assert!(Arc::ptr_eq(&first.setup_memory, &reused.setup_memory));
-        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-            &mut worker.backend,
-            &tail,
-            &bindings,
-            Some(&first),
-        )
-        .expect("cached family preparation");
-        assert!(prepared.family_inputs.is_empty());
-        assert!(Arc::ptr_eq(
-            prepared.family_fixture.as_ref().expect("shared family fixture"),
-            &first.values
-        ));
-        let (elapsed, spread, repetitions, evidence) =
-            ProductionGpuWarmupProvider::measure_scalar_host_repeated(
-                &mut worker,
-                0,
-                &tail,
-                &bindings,
-                &GpuWarmupMeasurementConfig::default(),
-            )
-            .expect("cached family must use the production host helper");
-        assert!(elapsed.is_finite() && elapsed > 0.0);
-        assert!(spread.is_finite());
-        assert_eq!(repetitions, 3, "default warmup keeps the 1+3 measurement contract");
-        assert_eq!(evidence.evidence, MemoryEvidenceKind::ExactQuery);
-
-        let changed_count_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(4) };
-        let changed_count = MeasurementNode {
-            id: NodeId(12),
-            kind: &changed_count_kind,
-            concrete_argument_types: vec![family(ConcreteWireType::Int, 5)],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        let replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &changed_count,
-            &bindings,
-            0,
-        )
-        .expect("changed count cache replacement")
-        .expect("changed count must remain scalar");
-        assert_eq!(replacement.values.len(), 5);
-        assert!(!Arc::ptr_eq(&first.values, &replacement.values));
-
-        let changed_type_kind = NodeKind::FamilyGetDynamic;
-        let changed_type = MeasurementNode {
-            id: NodeId(13),
-            kind: &changed_type_kind,
-            concrete_argument_types: vec![family(ConcreteWireType::Real, 5)],
-            concrete_output_types: vec![ConcreteWireType::Real],
-        };
-        let type_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &changed_type,
-            &bindings,
-            0,
-        )
-        .expect("changed type cache replacement")
-        .expect("changed type must remain scalar");
-        assert!(!Arc::ptr_eq(&replacement.values, &type_replacement.values));
-
-        let mut changed_bindings = ParamEnv::default();
-        changed_bindings.integers.insert("family_count".into(), 5.into());
-        let binding_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &changed_type,
-            &changed_bindings,
-            0,
-        )
-        .expect("changed bindings cache replacement")
-        .expect("changed bindings must remain scalar");
-        assert!(!Arc::ptr_eq(&type_replacement.values, &binding_replacement.values));
-
-        worker.device_id = device.saturating_add(1);
-        let worker_replacement = ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-            &mut worker,
-            &changed_type,
-            &changed_bindings,
-            0,
-        )
-        .expect("changed worker cache replacement")
-        .expect("changed worker must remain scalar");
-        assert!(!Arc::ptr_eq(&binding_replacement.values, &worker_replacement.values));
-
-        let invalid_kind = NodeKind::FamilyGetStatic { index: IntExpr::constant(5) };
-        let invalid = MeasurementNode {
-            id: NodeId(14),
-            kind: &invalid_kind,
-            concrete_argument_types: vec![family(ConcreteWireType::Int, 5)],
-            concrete_output_types: vec![ConcreteWireType::Int],
-        };
-        assert!(
-            ProductionGpuWarmupProvider::ensure_scalar_family_cache(
-                &mut worker,
-                &invalid,
-                &changed_bindings,
-                0,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn worker_selection_prefers_explicit_owner_in_replicated_full_fleet() {
         let worker_devices = [0, 1];
-        let replicated_fleet = [vec![0, 1], vec![0, 1]];
         let select = |physical| {
-            select_worker_index_for_physical(
-                worker_devices.len(),
-                physical,
-                |index| worker_devices[index],
-                |index| replicated_fleet[index].contains(&physical),
-            )
+            select_worker_index_for_physical(worker_devices.len(), physical, |index| {
+                worker_devices[index]
+            })
         };
 
         assert_eq!(select(0), Some(0));
         assert_eq!(select(1), Some(1));
-
-        // Shared-backend configurations have no exact worker owner and still
-        // use containment as the compatibility fallback.
-        let shared_devices = [7, 8];
-        let shared_fleet = [vec![0, 1], vec![0, 1]];
-        assert_eq!(
-            select_worker_index_for_physical(
-                shared_devices.len(),
-                1,
-                |index| shared_devices[index],
-                |index| shared_fleet[index].contains(&1),
-            ),
-            Some(0)
-        );
     }
 
     #[test]
@@ -7578,17 +6621,19 @@ mod tests {
         assert!(resolved.validate());
     }
 
-    /// Exercise every host/control profile through the real setup provider.
+    /// Exercise every control profile through the real setup provider.
     /// The table deliberately carries the concrete node variant and wire
     /// contract for each case; a profile-only fake would not execute these
-    /// production host dispatches and would therefore miss invalid
-    /// representatives.
+    /// production dispatches and would therefore miss invalid representatives.
     #[cfg(feature = "gpu")]
     #[test]
     #[serial_test::serial(gpu_context)]
-    fn real_provider_dispatches_all_host_control_inventory_variants() {
+    fn real_provider_dispatches_all_control_inventory_variants() {
         use crate::{
-            backend::{GpuWarmupProfileProvider, GpuWarmupRoute, poly_gpu::gpu_backend_on},
+            backend::{
+                GpuWarmupProfileProvider, GpuWarmupRoute, GpuWarmupRouteResolverData,
+                poly_gpu::gpu_backend_on,
+            },
             gpu_column_policy::GpuFragmentClass,
         };
         use mxx_ir_core::{
@@ -7730,7 +6775,7 @@ mod tests {
                     canonical_input_exclusive_uppers: vec![],
                 }),
                 vec![],
-                vec![],
+                vec![int.clone()],
             ),
             (
                 CanonicalWarmupProfileDomain::ParallelLoop,
@@ -7742,7 +6787,7 @@ mod tests {
                     input_modes: vec![LoopInputMode::Broadcast],
                 }),
                 vec![],
-                vec![],
+                vec![int.clone()],
             ),
             (
                 CanonicalWarmupProfileDomain::SequentialLoop,
@@ -7753,11 +6798,26 @@ mod tests {
                     carried_count: 0,
                 }),
                 vec![],
-                vec![],
+                vec![int.clone()],
             ),
         ];
         for (index, (domain, kind, arguments, outputs)) in cases.into_iter().enumerate() {
-            assert_eq!(domain.measurement_kind(), WarmupMeasurementKind::HostMeasured);
+            let measurement_kind = domain.measurement_kind();
+            let gpu_measured = measurement_kind == WarmupMeasurementKind::GpuMeasured;
+            let resolver = gpu_measured.then_some(GpuWarmupRouteResolverData {
+                source_layouts: Vec::new(),
+                output_layout: None,
+                source_owners: vec![0],
+                destination_owner: 0,
+                source_range: ColumnRange { start: 0, end: 1 },
+                destination_range: ColumnRange { start: 0, end: 1 },
+                source_compact: false,
+                destination_compact: false,
+                peer_available: false,
+                source_staging_bytes: 0,
+                host_staging_bytes: 0,
+                pinned_host_staging_bytes: 0,
+            });
             let signature = GpuWarmupOperationSignature {
                 operation: [index as u8 + 1; 32],
                 shape_class: index as u64 + 1,
@@ -7779,10 +6839,10 @@ mod tests {
                     implementation_variant: domain.identity().into(),
                     source_layouts: Vec::new(),
                     output_layout: None,
-                    route_resolver: None,
+                    route_resolver: resolver.clone(),
                     host_control: None,
                 })
-                .expect("host inventory descriptor must register");
+                .expect("control inventory descriptor must register");
             let request = GpuWarmupProfileRequest {
                 signature,
                 device: 0,
@@ -7791,13 +6851,17 @@ mod tests {
                 range: RuntimeIndexRange { start: 0, end: 1 },
                 executed_range_start: 0,
                 executed_range_class: GpuWarmupFragmentClass::Whole,
-                route: GpuWarmupRoute::HostOnly,
+                route: if gpu_measured {
+                    GpuWarmupRoute::DeviceLocal
+                } else {
+                    GpuWarmupRoute::HostOnly
+                },
                 route_descriptor: GpuExecutionRouteDescriptor::device_local(
                     0,
                     ColumnRange { start: 0, end: 1 },
                     GpuFragmentClass::Full,
                 ),
-                route_resolver: None,
+                route_resolver: resolver,
                 binding_port: None,
                 fragment: GpuWarmupFragmentClass::Whole,
                 retry_cap: None,
@@ -7805,16 +6869,21 @@ mod tests {
                 cache_state: GpuWarmupCacheState::Warm,
                 timing_scope: GpuWarmupTimingScope::LocalJob,
             };
-            let profile =
-                provider.measure(&request).expect("host production dispatch must measure");
-            assert_eq!(profile.measurement, WarmupMeasurementKind::HostMeasured);
+            let profile = provider.measure(&request).unwrap_or_else(|error| {
+                panic!("control production case {domain:?} must measure: {error}")
+            });
+            assert_eq!(profile.measurement, measurement_kind);
             assert_eq!(
                 profile.resident_delta,
                 GpuWarmupResidencyDelta::default(),
-                "temporary host fixture owners and aliased inputs are not production cache growth"
+                "temporary measurement owners and aliased inputs are not production cache growth"
             );
             assert!(profile.time_seconds.is_finite() && profile.time_seconds > 0.0);
-            assert_eq!(profile.workspace_bytes, 0);
+            if gpu_measured {
+                assert!(profile.memory.affected_devices.values().any(|bytes| *bytes > 0));
+            } else {
+                assert_eq!(profile.workspace_bytes, 0);
+            }
             assert_eq!(profile.provenance, GpuWarmupProvenance::ProductionEquivalent);
             assert_eq!(profile.timing_scope, GpuWarmupTimingScope::LocalJob);
             assert_eq!(profile.memory.evidence, MemoryEvidenceKind::ExactQuery);
@@ -7822,218 +6891,6 @@ mod tests {
                 record.profile_domain == domain && record.fused_operation.is_none()
             }));
         }
-        gpu_device_sync();
-    }
-
-    #[cfg(feature = "gpu")]
-    #[test]
-    #[serial_test::serial(gpu_context)]
-    fn host_family_representatives_use_valid_indices_and_bounded_payloads() {
-        use crate::backend::{RuntimeValue, poly_gpu::gpu_backend_on};
-        use mxx_primitives::poly::dcrt::gpu::{
-            GpuDCRTPolyParams, detected_gpu_device_ids, gpu_device_sync,
-        };
-        use num_bigint::Sign;
-
-        let device = detected_gpu_device_ids()
-            .into_iter()
-            .next()
-            .expect("GPU feature tests require one detected device");
-        let parameters = GpuDCRTPolyParams::new(8, vec![131_009, 130_817], 8, None);
-        let modulus = BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone());
-        let matrix = |columns| {
-            ConcreteWireType::Matrix(ConcreteMatrixType {
-                modulus: modulus.clone(),
-                ring_dimension: parameters.ring_dimension() as usize,
-                rows: 1,
-                columns,
-            })
-        };
-        let mut backend = gpu_backend_on([parameters.clone()], [device]);
-        backend.select_operation([0xD1; 32]).expect("select setup operation");
-        for (id, count) in [1usize, 2, 7, 8].into_iter().enumerate() {
-            let family_type =
-                ConcreteWireType::IndexedFamily { element: Box::new(matrix(1)), count };
-            let arguments = [family_type, ConcreteWireType::Int];
-            let outputs = [matrix(1)];
-            let kind = NodeKind::FamilyGetDynamic;
-            let node = MeasurementNode {
-                id: NodeId(10 + id as u64),
-                kind: &kind,
-                concrete_argument_types: arguments.to_vec(),
-                concrete_output_types: outputs.to_vec(),
-            };
-            let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-                &mut backend,
-                &node,
-                &ParamEnv::default(),
-                None,
-            )
-            .expect("nonempty dynamic family must prepare");
-            assert!(matches!(
-                prepared.dynamic_index,
-                Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
-            ));
-            let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
-                panic!("dynamic family representative must remain indexed");
-            };
-            assert_eq!(values.len(), count);
-        }
-
-        let family_type =
-            ConcreteWireType::IndexedFamily { element: Box::new(matrix(64)), count: 64 };
-        let dynamic_arguments = [family_type, ConcreteWireType::Int];
-        let dynamic_outputs = [matrix(64)];
-        let dynamic_kind = NodeKind::FamilyGetDynamic;
-        let dynamic_node = MeasurementNode {
-            id: NodeId(1),
-            kind: &dynamic_kind,
-            concrete_argument_types: dynamic_arguments.to_vec(),
-            concrete_output_types: dynamic_outputs.to_vec(),
-        };
-        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-            &mut backend,
-            &dynamic_node,
-            &ParamEnv::default(),
-            None,
-        )
-        .expect("nonempty dynamic family must prepare");
-        assert!(matches!(
-            prepared.dynamic_index,
-            Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
-        ));
-        let Some(RuntimeValue::IndexedFamily(values)) = prepared.family_inputs.first() else {
-            panic!("dynamic family representative must remain indexed");
-        };
-        assert_eq!(values.len(), 64, "family access must preserve its container cardinality");
-        assert!(matches!(values.first(), Some(RuntimeValue::Matrix(_))));
-
-        // Nested family representatives must retain every container layer's
-        // cardinality.  The leaf matrix owner is shared, so this exercises
-        // real O(count) vector construction/cloning without count×GPU payload.
-        for nested_count in [1usize, 2, 1024] {
-            let nested = ConcreteWireType::IndexedFamily {
-                element: Box::new(matrix(1)),
-                count: nested_count,
-            };
-            let outer =
-                ConcreteWireType::IndexedFamily { element: Box::new(nested), count: nested_count };
-            let nested_arguments = [outer, ConcreteWireType::Int];
-            let nested_outputs = [ConcreteWireType::IndexedFamily {
-                element: Box::new(matrix(1)),
-                count: nested_count,
-            }];
-            let nested_kind = NodeKind::FamilyGetDynamic;
-            let nested_node = MeasurementNode {
-                id: NodeId(100 + nested_count as u64),
-                kind: &nested_kind,
-                concrete_argument_types: nested_arguments.to_vec(),
-                concrete_output_types: nested_outputs.to_vec(),
-            };
-            let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-                &mut backend,
-                &nested_node,
-                &ParamEnv::default(),
-                None,
-            )
-            .expect("nested family representative must prepare");
-            let Some(RuntimeValue::IndexedFamily(outer_values)) = prepared.family_inputs.first()
-            else {
-                panic!("nested family representative must remain indexed");
-            };
-            assert_eq!(outer_values.len(), nested_count);
-            let Some(RuntimeValue::IndexedFamily(first_inner)) = outer_values.first() else {
-                panic!("nested family member must remain indexed");
-            };
-            assert_eq!(first_inner.len(), nested_count);
-            let Some(RuntimeValue::Matrix(first_leaf)) = first_inner.first() else {
-                panic!("nested family leaf must remain a matrix");
-            };
-            for outer_value in outer_values {
-                let RuntimeValue::IndexedFamily(inner_values) = outer_value else {
-                    panic!("every nested family member must retain its shape");
-                };
-                assert_eq!(inner_values.len(), nested_count);
-                for inner_value in inner_values {
-                    let RuntimeValue::Matrix(leaf) = inner_value else {
-                        panic!("every nested family leaf must remain a matrix");
-                    };
-                    assert!(std::sync::Arc::ptr_eq(first_leaf, &leaf));
-                }
-            }
-        }
-
-        let select_kind = NodeKind::Select { count: IntExpr::constant(2) };
-        let select_outputs = [matrix(64)];
-        let select_node = MeasurementNode {
-            id: NodeId(2),
-            kind: &select_kind,
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: select_outputs.to_vec(),
-        };
-        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-            &mut backend,
-            &select_node,
-            &ParamEnv::default(),
-            None,
-        )
-        .expect("nonempty select must prepare");
-        assert!(matches!(
-            prepared.dynamic_index,
-            Some(RuntimeValue::Int(ref value)) if value == &BigInt::from(0u8)
-        ));
-        assert_eq!(prepared.choices.len(), 2);
-        let (Some(RuntimeValue::Matrix(first)), Some(RuntimeValue::Matrix(second))) =
-            (prepared.choices.first(), prepared.choices.get(1))
-        else {
-            panic!("select choices must contain matrix exemplars");
-        };
-        assert!(std::sync::Arc::ptr_eq(first, second));
-
-        let pack_kind = NodeKind::FamilyPack { count: IntExpr::constant(64) };
-        let pack_outputs =
-            [ConcreteWireType::IndexedFamily { element: Box::new(matrix(64)), count: 64 }];
-        let pack_node = MeasurementNode {
-            id: NodeId(3),
-            kind: &pack_kind,
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: pack_outputs.to_vec(),
-        };
-        let prepared = ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-            &mut backend,
-            &pack_node,
-            &ParamEnv::default(),
-            None,
-        )
-        .expect("family pack must prepare");
-        assert_eq!(prepared.family_inputs.len(), 64);
-        let matrices = prepared
-            .family_inputs
-            .iter()
-            .map(|value| match value {
-                RuntimeValue::Matrix(matrix) => matrix,
-                _ => panic!("family pack representative must preserve payload kind"),
-            })
-            .collect::<Vec<_>>();
-        assert!(matrices.windows(2).all(|pair| std::sync::Arc::ptr_eq(pair[0], pair[1])));
-
-        let empty_kind = NodeKind::Select { count: IntExpr::constant(0) };
-        let empty_outputs = [ConcreteWireType::Int];
-        let empty_node = MeasurementNode {
-            id: NodeId(4),
-            kind: &empty_kind,
-            concrete_argument_types: Vec::new(),
-            concrete_output_types: empty_outputs.to_vec(),
-        };
-        assert!(
-            ProductionGpuWarmupProvider::prepare_host_primitive_inner(
-                &mut backend,
-                &empty_node,
-                &ParamEnv::default(),
-                None,
-            )
-            .is_err()
-        );
         gpu_device_sync();
     }
 
@@ -8429,43 +7286,6 @@ mod tests {
     }
 
     #[test]
-    fn host_control_repetition_policy_accepts_one_and_rejects_zero() {
-        let kind = NodeKind::SubgraphCall(mxx_ir_core::node::SubgraphCall {
-            definition: "empty".into(),
-            bindings: Vec::new(),
-            canonical_input_exclusive_uppers: Vec::new(),
-        });
-        let bindings = ParamEnv::default();
-        let one = ProductionGpuWarmupProvider::measure_host_control_repeated(
-            &GpuWarmupMeasurementConfig {
-                warm_up_iterations: 0,
-                measured_iterations: 1,
-                memory_poll_interval: std::time::Duration::ZERO,
-            },
-            NodeId(0),
-            &kind,
-            &bindings,
-            None,
-        )
-        .expect("one host repetition is valid");
-        assert_eq!(one.2, 1);
-        assert!(one.0.is_finite() && one.0 > 0.0);
-        assert_eq!(one.1, 0.0);
-        let zero = ProductionGpuWarmupProvider::measure_host_control_repeated(
-            &GpuWarmupMeasurementConfig {
-                warm_up_iterations: 0,
-                measured_iterations: 0,
-                memory_poll_interval: std::time::Duration::ZERO,
-            },
-            NodeId(0),
-            &kind,
-            &bindings,
-            None,
-        );
-        assert!(matches!(zero, Err(GpuMeasurementError(_))));
-    }
-
-    #[test]
     #[serial_test::serial(gpu_context)]
     fn test_gpu_provider_projects_budgets_for_disjoint_and_replicated_workers() {
         use crate::backend::poly_gpu::gpu_backend_on;
@@ -8661,17 +7481,6 @@ mod tests {
         assert_eq!(
             ProductionGpuWarmupProvider::fixed_plan_wave_seconds(&plan, site, &model).unwrap(),
             8.0
-        );
-    }
-
-    #[test]
-    fn shared_cuda_pool_is_an_explicit_measurement_error() {
-        assert!(require_exclusive_measurement_context(0, 1, 1).is_ok());
-        assert!(require_exclusive_measurement_context(0, 2, 2).is_ok());
-        let error = require_exclusive_measurement_context(3, 2, 1).unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "GPU 3 has 2 live mxx contexts but the measurement backend owns 1; exclusive CUDA mempool measurement is required"
         );
     }
 

@@ -666,8 +666,10 @@ pub fn measure_runtime_container_primitive<B: Backend>(
                     .map_err(|error| expression_error(error.to_string()))?
                     .to_usize()
                     .ok_or_else(|| expression_error("select count does not fit usize".into()))?;
-                let Some(RuntimeValue::Int(index)) = dynamic_index else {
-                    return Err(expression_error("select index is not an integer".into()));
+                let index = match dynamic_index {
+                    Some(RuntimeValue::Int(index)) => index.clone(),
+                    Some(RuntimeValue::NativeInteger(index)) => (*index).into(),
+                    _ => return Err(expression_error("select index is not an integer".into())),
                 };
                 let Some(index) = index.to_usize().filter(|index| *index < count) else {
                     return Err(expression_error("select index is out of range".into()));
@@ -700,8 +702,10 @@ fn runtime_family_get_value<'a, B: Backend>(
             .to_usize()
             .ok_or_else(|| expression_error("family index does not fit usize".into()))?,
         NodeKind::FamilyGetDynamic => {
-            let Some(RuntimeValue::Int(index)) = dynamic_index else {
-                return Err(expression_error("dynamic family index is not an integer".into()));
+            let index = match dynamic_index {
+                Some(RuntimeValue::Int(index)) => index.clone(),
+                Some(RuntimeValue::NativeInteger(index)) => (*index).into(),
+                _ => return Err(expression_error("dynamic family index is not an integer".into())),
             };
             index
                 .to_usize()

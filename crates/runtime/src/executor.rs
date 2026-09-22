@@ -1,12 +1,14 @@
+#[cfg(not(feature = "gpu"))]
+use crate::backend::{
+    FixedCompactOperationBatchRequest, FixedCompactUnaryOperation, FixedGadgetDecomposeRequest,
+    FixedGenerationRequest, FixedOperationBatchRequest, FixedTrapdoorRequest, FixedUnaryOperation,
+};
 use crate::{
     artifact::{ArtifactKey, ArtifactPayload, ArtifactStore},
     backend::{
-        Backend, DynamicFusedBatchRequest, FixedCompactOperationBatchRequest,
-        FixedCompactUnaryOperation, FixedGadgetDecomposeRequest, FixedGenerationOutput,
-        FixedGenerationRequest, FixedOperationBatchRequest, FixedTrapdoorRequest,
-        FixedUnaryOperation, FusedBatchOutput, FusedBatchRequest, IndexRange as RuntimeIndexRange,
-        MatrixMulAccumulateRequest, PlannedNodeBatchRequest, PreimageRequest, RuntimeValue,
-        SampleRange as RuntimeSampleRange,
+        Backend, DynamicFusedBatchRequest, FixedGenerationOutput, FixedOperationBatchOutput,
+        FusedBatchOutput, IndexRange as RuntimeIndexRange, MatrixMulAccumulateRequest,
+        PlannedNodeBatchRequest, PreimageRequest, RuntimeValue, SampleRange as RuntimeSampleRange,
     },
     gpu_column_policy::{
         ColumnCapability, EffectiveGpuOperation, column_capability, effective_gpu_operation,
@@ -22,6 +24,8 @@ use crate::{
     session::{ArtifactHandle, SessionDescriptor, SessionStatus, SessionStore},
     transcript::{DrawSite, RecordedValue, SamplingMode, TranscriptError},
 };
+#[cfg(not(feature = "gpu"))]
+use mxx_ir_core::node::ConstantMatrix;
 use mxx_ir_core::{
     ParamEnv, ValidatedGraph,
     artifact::{
@@ -29,7 +33,7 @@ use mxx_ir_core::{
         ProductionId, SmallMatrixSemanticKind, SpecHash,
     },
     graph::{FrozenGraphScopeId, GraphScope},
-    node::{ConstantMatrix, HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind},
+    node::{HashVariant, LoopInputMode, MatrixBinaryOp, NodeKind},
     types::{
         ConcreteMatrixType, ConcreteWireType, InstantiationFrame, NodeId, Port, WireId, WireRef,
     },
@@ -46,6 +50,10 @@ use std::{
 use thiserror::Error;
 use tracing::info;
 
+pub(crate) mod gpu_capture;
+use gpu_capture::{
+    GpuCaptureRequest, GpuRequestLoweringInput, GpuRequestOperands, lower_gpu_request,
+};
 mod gpu_metadata;
 #[cfg(feature = "gpu")]
 mod gpu_plan;
@@ -53,8 +61,9 @@ pub(crate) use gpu_metadata::{GpuScopeLowering, GpuScopeLoweringCache};
 mod plan_cache;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ExecutionPlan {
+pub(crate) enum ExecutionPlan {
     Cpu,
+    #[cfg(test)]
     FrozenGpu(Arc<FrozenGpuPlan>),
 }
 
@@ -73,7 +82,9 @@ pub struct ExecutionConfig {
     /// When set, also drain pending releases before returning. With `None`,
     /// releases remain asynchronous and are protected by backend lifetime events.
     pub release_fence_interval: Option<NonZeroUsize>,
-    pub plan: ExecutionPlan,
+    /// Legacy fixed-plan selection is private to the runtime crate while the
+    /// compiled GPU runtime owns the public prepare/run path.
+    pub(crate) plan: ExecutionPlan,
 }
 
 impl Default for ExecutionConfig {
@@ -101,7 +112,7 @@ pub struct ExecutionResult<B: Backend> {
     pub outputs: BTreeMap<String, RuntimeValue<B>>,
     pub production_id: Option<ProductionId>,
     pub artifact_handles: BTreeMap<String, Vec<ArtifactHandle>>,
-    pub staged_family_leases: Vec<StagedFamilyLease>,
+    staged_family_leases: Vec<StagedFamilyLease>,
 }
 
 /// A dispatch-only optimization: the original graph, validation and producer
@@ -710,7 +721,10 @@ impl<B: Backend> ExecutionResult<B> {
         // keep their owners in place instead of cloning and reinserting them.
         if !matches!(
             value,
-            RuntimeValue::Matrix(_) | RuntimeValue::SmallMatrix(_) | RuntimeValue::Preimage(_)
+            RuntimeValue::Matrix(_) |
+                RuntimeValue::IntegerValues(_) |
+                RuntimeValue::SmallMatrix(_) |
+                RuntimeValue::Preimage(_)
         ) {
             *value = materialize_runtime_value(value.clone(), backend, store)?;
         }
@@ -821,34 +835,6 @@ pub enum ExecutionError {
     Manifest(String),
     #[error("scratch cleanup failed: {message}")]
     StagedCleanup { message: String, leases: Vec<StagedFamilyLease> },
-}
-
-impl ExecutionError {
-    /// Retries cleanup owned by a failed execution.
-    pub fn cleanup_staged<S: ArtifactStore>(
-        &mut self,
-        store: &mut S,
-    ) -> Result<(), ExecutionError> {
-        let Self::StagedCleanup { leases, .. } = self else {
-            return Ok(());
-        };
-        for lease in leases.iter() {
-            let count = lease.descriptor.family_count.ok_or_else(|| {
-                ExecutionError::Manifest("staged family lease has no cardinality".to_owned())
-            })?;
-            for index in 0..count {
-                store
-                    .remove_staged(&ArtifactKey {
-                        production: lease.production.clone(),
-                        name: lease.name.clone(),
-                        index: Some(index),
-                    })
-                    .map_err(|error| ExecutionError::Artifact(error.to_string()))?;
-            }
-        }
-        leases.clear();
-        Ok(())
-    }
 }
 
 /// Executes trusted inputs prepared for the exact validated graph and parameter bindings.
@@ -1025,8 +1011,9 @@ fn execution_preflight<B: Backend>(
     config: &ExecutionConfig,
     capture_trace: bool,
 ) -> Result<ExecutionPreflight, ExecutionError> {
-    let gpu_plan = match &config.plan {
+    let gpu_plan: Option<Arc<FrozenGpuPlan>> = match &config.plan {
         ExecutionPlan::Cpu => None,
+        #[cfg(test)]
         ExecutionPlan::FrozenGpu(plan) => Some(plan.clone()),
     };
     let runtime_contract = backend
@@ -1366,6 +1353,68 @@ fn fixed_global_instance_slot(
         .unwrap_or(Ok(local_index))
 }
 
+/// Construct the owner-free fixed request shared by sequential execution and
+/// capture preparation.  This helper intentionally accepts only planner
+/// metadata and wire-level instance bindings; native owners are attached by
+/// the backend submit path later.
+pub(crate) fn build_fixed_node_batch_request(
+    key: GpuExecutionSiteKey,
+    operation_identity: [u8; 32],
+    implementation_variant: String,
+    inputs: crate::backend::GpuEffectiveInputs,
+    output_layout_metadata: Vec<crate::backend::PlannedLayoutMetadata>,
+    columns_per_job: Vec<usize>,
+    instance_indices: &[usize],
+    instance_paths: &[Vec<InstantiationFrame>],
+    output_ports: usize,
+    execution_nonce: [u8; 32],
+) -> Result<PlannedNodeBatchRequest, ExecutionError> {
+    if instance_indices.len() != instance_paths.len() {
+        return Err(ExecutionError::InvalidGpuPlan(
+            "fixed request instance metadata is inconsistent".into(),
+        ));
+    }
+    let mut request = PlannedNodeBatchRequest::for_lowered_operation(
+        key,
+        operation_identity,
+        implementation_variant,
+        inputs,
+        output_layout_metadata,
+        columns_per_job,
+    );
+    // `instance_indices` address local wave arrays, while the instantiation
+    // path carries the global sibling slot used by frozen owner rotation.
+    request.instance_slots = instance_indices
+        .iter()
+        .zip(instance_paths)
+        .map(|(&index, path)| fixed_global_instance_slot(path, index))
+        .collect::<Result<Vec<_>, _>>()?;
+    request.instance_paths = instance_paths.to_vec();
+    request.draw_sites = instance_paths
+        .iter()
+        .map(|path| {
+            Some(DrawSite {
+                instantiation_path: path.clone(),
+                node: NodeId(key.site),
+                port: Port(0),
+            })
+        })
+        .collect();
+    request.randomness_seeds = instance_paths
+        .iter()
+        .map(|path| {
+            Some(preimage_request_seed(
+                execution_nonce,
+                path,
+                WireRef { node: NodeId(key.site), port: Port(0) },
+            ))
+        })
+        .collect();
+    request.output_ports =
+        if request.output_ports == 0 { output_ports } else { request.output_ports };
+    Ok(request)
+}
+
 impl<B, S> Executor<'_, B, S>
 where
     B: Backend,
@@ -1610,42 +1659,19 @@ where
             .effective_inputs(node, &instance_envs[*instance_indices.first().unwrap_or(&0)])
             .map_err(ExecutionError::InvalidGpuPlan)?;
         let output_ports = if effective_ports == 0 { output_ports } else { effective_ports };
-        let mut request = PlannedNodeBatchRequest::for_lowered_operation(
+        build_fixed_node_batch_request(
             key,
             choice.operation_identity,
             choice.implementation_variant.clone(),
             inputs,
             output_layout_metadata,
             choice.columns_per_job.clone(),
-        );
-        // `instance_indices` address the current wave's local arrays, while
-        // the backend slot is the global sibling position that determines
-        // owner rotation.  Warmup schedules use those global positions.  The
-        // path is authoritative for production, including tail waves and
-        // nested/subgraph calls; root/single-instance paths retain slot 0 (or
-        // their caller-provided local position when no loop frame exists).
-        request.instance_slots = instance_indices
-            .iter()
-            .zip(instance_paths)
-            .map(|(&index, path)| fixed_global_instance_slot(path, index))
-            .collect::<Result<Vec<_>, _>>()?;
-        request.instance_paths = instance_paths.to_vec();
-        request.draw_sites = instance_paths
-            .iter()
-            .map(|path| Some(DrawSite { instantiation_path: path.clone(), node, port: Port(0) }))
-            .collect();
-        request.randomness_seeds = instance_paths
-            .iter()
-            .map(|path| {
-                Some(preimage_request_seed(
-                    self.production.execution_nonce,
-                    path,
-                    WireRef { node, port: Port(0) },
-                ))
-            })
-            .collect();
-        request.output_ports = output_ports;
-        Ok(Some(request))
+            instance_indices,
+            instance_paths,
+            output_ports,
+            self.production.execution_nonce,
+        )
+        .map(Some)
     }
 
     fn fixed_execution_site_key(
@@ -1740,14 +1766,58 @@ where
                                     "missing fused input metadata".into(),
                                 )
                             })?;
+                        let source_wires = row_sum
+                            .tensor_operands
+                            .as_ref()
+                            .map(|wires| wires.as_slice())
+                            .unwrap_or(std::slice::from_ref(&row_sum.source));
+                        let exemplar_values: BTreeMap<WireRef, RuntimeValue<B>> = source_wires
+                            .iter()
+                            .zip(matrices.iter())
+                            .map(|(wire, matrix)| (*wire, RuntimeValue::matrix((*matrix).clone())))
+                            .collect::<BTreeMap<_, _>>();
+                        let lowering = self
+                            .gpu_lowerings
+                            .get(scope_id)
+                            .map_err(ExecutionError::InvalidGpuPlan)?;
+                        let handle = scope.node(*node).ok_or_else(|| {
+                            ExecutionError::InvalidGpuPlan("missing input row-sum node".into())
+                        })?;
+                        let arguments = scope.arguments(handle).ok_or_else(|| {
+                            ExecutionError::InvalidGpuPlan("missing input row-sum arguments".into())
+                        })?;
+                        let output_type = validated_scope
+                            .wire_types
+                            .get(&WireRef { node: *node, port: Port(0) })
+                            .and_then(|ty| ty.matrix_type().cloned());
+                        let source_owner = Arc::new(matrices[0].clone());
+                        let right_owner = matrices.get(1).map(|value| Arc::new((*value).clone()));
+                        let request = lower_gpu_request(GpuRequestLoweringInput {
+                            lowering,
+                            node: *node,
+                            kind: handle.kind(),
+                            arguments: &arguments,
+                            metadata,
+                            env: &envs[0],
+                            operands: GpuRequestOperands {
+                                values: &exemplar_values,
+                                row_blocks: None,
+                                row_sum_sources: Some((&source_owner, right_owner.as_ref())),
+                                preimage_target: None,
+                            },
+                            output_type,
+                            row_sum: Some(row_sum.rows.clone()),
+                            row_sum_groups: Vec::new(),
+                        })
+                        .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
+                        let GpuCaptureRequest::Fused(requests) = request else {
+                            return Err(ExecutionError::InvalidGpuPlan(
+                                "input row-sum lowered to an incompatible request".into(),
+                            ));
+                        };
                         let mut result = self
                             .backend
-                            .fixed_fused_batch(vec![FusedBatchRequest::RowSum {
-                                metadata,
-                                source: Arc::new(matrices[0].clone()),
-                                right: matrices.get(1).map(|value| Arc::new((*value).clone())),
-                                rows: row_sum.rows.clone(),
-                            }])
+                            .fixed_fused_batch(requests)
                             .map_err(Self::backend_error)?;
                         match result.pop() {
                             Some(FusedBatchOutput::Matrices(mut values)) if values.len() == 1 => {
@@ -1853,24 +1923,24 @@ where
             // single-device operations retain their dedicated fixed paths.
             // Only ordinary matrix operations use the sibling batch hook.
             let fixed_ordinary_operation = self.gpu_plan.is_some() &&
-                (!matches!(fixed_capability, Some(ColumnCapability::SingleDevice)) ||
-                    matches!(
-                        effective_gpu_operation(node.kind),
-                        EffectiveGpuOperation::GadgetTrapdoor |
-                            EffectiveGpuOperation::SingleDeviceConstant
-                    )) &&
                 matches!(
                     effective_gpu_operation(node.kind),
                     EffectiveGpuOperation::GeneratedConstant |
                         EffectiveGpuOperation::SingleDeviceConstant |
                         EffectiveGpuOperation::GadgetTrapdoor |
                         EffectiveGpuOperation::LiftIntegerToConstantPolynomial |
+                        EffectiveGpuOperation::PolynomialFromValues |
+                        EffectiveGpuOperation::PolynomialValues |
+                        EffectiveGpuOperation::ExtractCoefficient |
+                        EffectiveGpuOperation::ThresholdDecode |
+                        EffectiveGpuOperation::PackPolynomialCoefficients |
                         EffectiveGpuOperation::MatrixScale |
                         EffectiveGpuOperation::MatrixNegate |
                         EffectiveGpuOperation::RingAutomorphism |
                         EffectiveGpuOperation::ModulusSwitch |
                         EffectiveGpuOperation::ModulusReduce |
                         EffectiveGpuOperation::CenteredRebase |
+                        EffectiveGpuOperation::CenteredRoundDivide |
                         EffectiveGpuOperation::BlockModSwitch |
                         EffectiveGpuOperation::RnsModUp |
                         EffectiveGpuOperation::RnsModDown |
@@ -2114,35 +2184,32 @@ where
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
-                            let metadata = self
-                                .fixed_node_batch_request(
-                                    scope_id,
-                                    node.id,
-                                    &[index],
-                                    &[paths[index].clone()],
-                                    envs,
-                                    handle.output_types().len(),
-                                )?
-                                .ok_or_else(|| {
-                                    ExecutionError::InvalidGpuPlan(
-                                        "fixed fused request has no plan metadata".into(),
-                                    )
-                                })?;
                             let (source, right) = row_sum_sources[index]
                                 .remove(&node.id)
                                 .expect("shared row sum source survives until leader");
                             let Some(right) = right else {
                                 return Err(ExecutionError::InvalidBatch(node.id));
                             };
-                            requests.push(FusedBatchRequest::TensorRowSums {
-                                metadata,
-                                source,
-                                right,
-                                rows: group
-                                    .iter()
-                                    .map(|output| block_aliases.row_sums[output].rows.clone())
-                                    .collect(),
-                            });
+                            let request = self.lower_fixed_typed_request(
+                                scope_id,
+                                envs,
+                                paths,
+                                &node,
+                                &mut values,
+                                index,
+                                handle.output_types().len(),
+                                false,
+                                None,
+                                Some((&source, Some(&right))),
+                                None,
+                            )?;
+                            let GpuCaptureRequest::Fused(mut requests_for_instance) = request
+                            else {
+                                return Err(ExecutionError::InvalidGpuPlan(
+                                    "tensor row-sum lowered to an incompatible request".into(),
+                                ));
+                            };
+                            requests.append(&mut requests_for_instance);
                         }
                         self.backend.fixed_fused_batch(requests)
                     } else {
@@ -2181,25 +2248,16 @@ where
                         let FusedBatchOutput::Matrices(output) = output else {
                             return Err(ExecutionError::InvalidBatch(node.id));
                         };
-                        if output.len() != 1 {
+                        if output.len() != group.len() {
                             return Err(ExecutionError::InvalidBatch(node.id));
                         }
-                        let fused = output.into_iter().next().expect("one flattened output");
-                        let mut start = 0usize;
-                        for output_node in group.iter().copied() {
-                            let rows = block_aliases.row_sums[&output_node].rows.len();
-                            let end = start.saturating_add(rows);
-                            let matrix = self
-                                .backend
-                                .slice(&fused, Some(&RuntimeIndexRange { start, end }), None)
-                                .map_err(Self::backend_error)?;
+                        for (output_node, matrix) in group.iter().copied().zip(output) {
                             self.put(
                                 &mut values[index],
                                 output_node,
                                 0,
                                 RuntimeValue::matrix(matrix),
                             );
-                            start = end;
                         }
                         self.has_pending_releases = true;
                     }
@@ -2207,29 +2265,29 @@ where
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
-                            let metadata = self
-                                .fixed_node_batch_request(
-                                    scope_id,
-                                    node.id,
-                                    &[index],
-                                    &[paths[index].clone()],
-                                    envs,
-                                    handle.output_types().len(),
-                                )?
-                                .ok_or_else(|| {
-                                    ExecutionError::InvalidGpuPlan(
-                                        "fixed fused request has no plan metadata".into(),
-                                    )
-                                })?;
                             let (source, right) = row_sum_sources[index]
                                 .remove(&node.id)
                                 .expect("row sum source survives until concat");
-                            requests.push(FusedBatchRequest::RowSum {
-                                metadata,
-                                source,
-                                right,
-                                rows: row_sum.rows.clone(),
-                            });
+                            let request = self.lower_fixed_typed_request(
+                                scope_id,
+                                envs,
+                                paths,
+                                &node,
+                                &mut values,
+                                index,
+                                handle.output_types().len(),
+                                false,
+                                None,
+                                Some((&source, right.as_ref())),
+                                None,
+                            )?;
+                            let GpuCaptureRequest::Fused(mut requests_for_instance) = request
+                            else {
+                                return Err(ExecutionError::InvalidGpuPlan(
+                                    "row sum lowered to an incompatible request".into(),
+                                ));
+                            };
+                            requests.append(&mut requests_for_instance);
                         }
                         self.backend.fixed_fused_batch(requests)
                     } else {
@@ -2268,20 +2326,6 @@ where
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
-                            let metadata = self
-                                .fixed_node_batch_request(
-                                    scope_id,
-                                    node.id,
-                                    &[index],
-                                    &[paths[index].clone()],
-                                    envs,
-                                    handle.output_types().len(),
-                                )?
-                                .ok_or_else(|| {
-                                    ExecutionError::InvalidGpuPlan(
-                                        "fixed fused request has no plan metadata".into(),
-                                    )
-                                })?;
                             self.set_placement(placements[index])?;
                             let input_type =
                                 self.matrix_type(scope_id, &paths[index], node.args[0])?;
@@ -2295,12 +2339,26 @@ where
                             let blocks = row_blocks[index]
                                 .remove(concat)
                                 .expect("decomposition block owners");
-                            requests.push(FusedBatchRequest::Decompose {
-                                metadata,
-                                blocks,
-                                small: *small,
-                                digits,
-                            });
+                            let request = self.lower_fixed_typed_request(
+                                scope_id,
+                                envs,
+                                paths,
+                                &node,
+                                &mut values,
+                                index,
+                                handle.output_types().len(),
+                                false,
+                                Some(&blocks),
+                                None,
+                                None,
+                            )?;
+                            let GpuCaptureRequest::Fused(mut requests_for_instance) = request
+                            else {
+                                return Err(ExecutionError::InvalidGpuPlan(
+                                    "fused decomposition lowered to an incompatible request".into(),
+                                ));
+                            };
+                            requests.append(&mut requests_for_instance);
                         }
                         self.backend.fixed_fused_batch(requests)
                     } else {
@@ -2356,30 +2414,30 @@ where
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
-                            let metadata = self
-                                .fixed_node_batch_request(
-                                    scope_id,
-                                    node.id,
-                                    &[index],
-                                    &[paths[index].clone()],
-                                    envs,
-                                    handle.output_types().len(),
-                                )?
-                                .ok_or_else(|| {
-                                    ExecutionError::InvalidGpuPlan(
-                                        "fixed fused request has no plan metadata".into(),
-                                    )
-                                })?;
                             self.set_placement(placements[index])?;
-                            let rhs = self.small_matrix(&mut values[index], *rhs)?;
                             let blocks = row_blocks[index]
                                 .remove(concat)
                                 .expect("compact product block owners");
-                            requests.push(FusedBatchRequest::SmallProduct {
-                                metadata,
-                                blocks,
-                                rhs,
-                            });
+                            let request = self.lower_fixed_typed_request(
+                                scope_id,
+                                envs,
+                                paths,
+                                &node,
+                                &mut values,
+                                index,
+                                handle.output_types().len(),
+                                false,
+                                Some(&blocks),
+                                None,
+                                None,
+                            )?;
+                            let GpuCaptureRequest::Fused(mut requests_for_instance) = request
+                            else {
+                                return Err(ExecutionError::InvalidGpuPlan(
+                                    "compact product lowered to an incompatible request".into(),
+                                ));
+                            };
+                            requests.append(&mut requests_for_instance);
                         }
                         self.backend.fixed_fused_batch(requests)
                     } else {
@@ -2422,26 +2480,30 @@ where
                     let outputs = if self.gpu_plan.is_some() {
                         let mut requests = Vec::with_capacity(indices.len());
                         for &index in indices {
-                            let metadata = self
-                                .fixed_node_batch_request(
-                                    scope_id,
-                                    node.id,
-                                    &[index],
-                                    &[paths[index].clone()],
-                                    envs,
-                                    handle.output_types().len(),
-                                )?
-                                .ok_or_else(|| {
-                                    ExecutionError::InvalidGpuPlan(
-                                        "fixed fused request has no plan metadata".into(),
-                                    )
-                                })?;
                             self.set_placement(placements[index])?;
-                            let right = self.matrix(&mut values[index], *right)?;
                             let blocks = row_blocks[index]
                                 .remove(concat)
                                 .expect("fused concat blocks survive until Add");
-                            requests.push(FusedBatchRequest::Add { metadata, blocks, right });
+                            let request = self.lower_fixed_typed_request(
+                                scope_id,
+                                envs,
+                                paths,
+                                &node,
+                                &mut values,
+                                index,
+                                handle.output_types().len(),
+                                false,
+                                Some(&blocks),
+                                None,
+                                None,
+                            )?;
+                            let GpuCaptureRequest::Fused(mut requests_for_instance) = request
+                            else {
+                                return Err(ExecutionError::InvalidGpuPlan(
+                                    "row-block add lowered to an incompatible request".into(),
+                                ));
+                            };
+                            requests.append(&mut requests_for_instance);
                         }
                         self.backend.fixed_fused_batch(requests)
                     } else {
@@ -2584,15 +2646,8 @@ where
                         );
                     }
                 }
-                for argument in node.args {
-                    if schedule.last_use.get(argument) == Some(&position) &&
-                        !schedule.retained.contains(argument)
-                    {
-                        if let Some(value) = values[index].remove(argument) {
-                            self.has_pending_releases |= value.releases_backend_resources_on_drop();
-                        }
-                    }
-                }
+                self.has_pending_releases |=
+                    release_last_uses(schedule, position, &node.args, &mut values[index]);
             }
             self.executed_node_count = self.executed_node_count.saturating_add(envs.len());
             if self.has_pending_releases &&
@@ -2656,11 +2711,120 @@ where
         Ok(true)
     }
 
+    fn lower_fixed_typed_request(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        index: usize,
+        output_ports: usize,
+        materialize_arguments: bool,
+        row_blocks: Option<&[Arc<B::Matrix>]>,
+        row_sum_sources: Option<(&Arc<B::Matrix>, Option<&Arc<B::Matrix>>)>,
+        preimage_target: Option<Arc<dyn mxx_primitives::matrix::PolyMatrixColumnSource<B::Matrix>>>,
+    ) -> Result<GpuCaptureRequest<B>, ExecutionError> {
+        let metadata = self
+            .fixed_node_batch_request(
+                scope_id,
+                node.id,
+                &[index],
+                &[paths[index].clone()],
+                envs,
+                output_ports,
+            )?
+            .ok_or_else(|| ExecutionError::InvalidGpuPlan("fixed request without plan".into()))?;
+        // Fixed execution historically materialized lazily loaded inputs at
+        // each typed request construction site. Materialize all declared
+        // arguments once here, before the shared owner resolver sees them.
+        if materialize_arguments {
+            for wire in node.args {
+                let value = self.materialize(&mut values[index], *wire)?;
+                values[index].insert(*wire, value);
+            }
+        }
+        let output_type = (output_ports > 0)
+            .then(|| {
+                self.matrix_type(scope_id, &paths[index], WireRef { node: node.id, port: Port(0) })
+            })
+            .transpose()?;
+        let lowering = self.gpu_lowerings.get(scope_id).map_err(ExecutionError::InvalidGpuPlan)?;
+        let effective_inputs = lowering
+            .effective_inputs(node.id, &envs[index])
+            .map_err(ExecutionError::InvalidGpuPlan)?;
+        let request = lower_gpu_request(GpuRequestLoweringInput {
+            lowering,
+            node: node.id,
+            kind: node.kind,
+            arguments: node.args,
+            metadata,
+            env: &envs[index],
+            operands: GpuRequestOperands {
+                values: &values[index],
+                row_blocks,
+                row_sum_sources,
+                preimage_target,
+            },
+            output_type,
+            row_sum: Some(effective_inputs.row_groups),
+            row_sum_groups: effective_inputs.row_sum_groups,
+        })
+        .map_err(|error| ExecutionError::InvalidGpuPlan(error.to_string()))?;
+        match &request {
+            GpuCaptureRequest::Ordinary(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "ordinary GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Fused(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "fused GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Compact(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "compact GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Generation(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "generation GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Decomposition(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "decomposition GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Preimage(requests) if requests.is_empty() => {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "preimage GPU request lowering produced no requests".into(),
+                ));
+            }
+            GpuCaptureRequest::Trapdoor(request) => {
+                if request.metadata.output_ports == 0 {
+                    return Err(ExecutionError::InvalidGpuPlan(
+                        "trapdoor GPU request lowering produced no outputs".into(),
+                    ));
+                }
+            }
+            GpuCaptureRequest::Ordinary(_) |
+            GpuCaptureRequest::Fused(_) |
+            GpuCaptureRequest::Compact(_) |
+            GpuCaptureRequest::Generation(_) |
+            GpuCaptureRequest::Decomposition(_) |
+            GpuCaptureRequest::Preimage(_) => {}
+        }
+        Ok(request)
+    }
+
     /// Submit a whole fixed-plan sibling wave as one backend batch.  The
     /// ordinary placement path intentionally stays separate: it groups by
     /// current residency, whereas fixed GPU plans group by original instance
     /// slot and let the backend apply the frozen owner rotation.
-    fn execute_fixed_operation_batch(
+    #[cfg(feature = "gpu")]
+    fn execute_fixed_operation_batch_lowered(
         &mut self,
         scope_id: &FrozenGraphScopeId,
         envs: &[ParamEnv],
@@ -2670,376 +2834,92 @@ where
         placements: &[usize],
         indices: &[usize],
     ) -> Result<(), ExecutionError> {
-        // CenteredRebase preserves bounded compact storage.  Compact
-        // instances use their own fixed batch request so the payload stays
-        // compact and the backend consumes the frozen owner/slot metadata.
-        if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
-            let mut compact_requests = Vec::with_capacity(indices.len());
-            for &index in indices {
-                self.set_placement(placements[index])?;
-                let metadata = self
-                    .fixed_node_batch_request(
-                        scope_id,
-                        node.id,
-                        &[index],
-                        &[paths[index].clone()],
-                        envs,
-                        1,
-                    )?
-                    .ok_or_else(|| {
-                        ExecutionError::InvalidGpuPlan("fixed operation without plan".into())
-                    })?;
-                let value = self.materialize(&mut values[index], node.args[0])?;
-                let value = match value {
-                    RuntimeValue::SmallMatrix(value) | RuntimeValue::Preimage(value) => value,
-                    _ => break,
-                };
-                let destination = self.matrix_type(
-                    scope_id,
-                    &paths[index],
-                    WireRef { node: node.id, port: Port(0) },
-                )?;
-                compact_requests.push(FixedCompactOperationBatchRequest {
-                    metadata,
-                    operation: FixedCompactUnaryOperation::CenteredRebase { destination },
-                    value,
-                });
-            }
-            if compact_requests.len() == indices.len() {
-                let outputs = self
-                    .backend
-                    .fixed_compact_operation_batch(compact_requests)
-                    .map_err(Self::backend_error)?;
-                if outputs.len() != indices.len() {
-                    return Err(ExecutionError::InvalidBatch(node.id));
-                }
-                for (&index, output) in indices.iter().zip(outputs) {
-                    let kind = self
-                        .bounded_matrix_schema(
-                            scope_id,
-                            &paths[index],
-                            WireRef { node: node.id, port: Port(0) },
-                        )?
-                        .1;
-                    self.put(&mut values[index], node.id, 0, compact_runtime_value(output, kind));
-                }
-                return Ok(());
-            }
-        }
-        let mut requests = Vec::with_capacity(indices.len());
+        let mut ordinary = Vec::with_capacity(indices.len());
+        let mut compact = Vec::with_capacity(indices.len());
         for &index in indices {
             self.set_placement(placements[index])?;
-            let metadata = self
-                .fixed_node_batch_request(
-                    scope_id,
-                    node.id,
-                    &[index],
-                    &[paths[index].clone()],
-                    envs,
-                    1,
-                )?
-                .ok_or_else(|| {
-                    ExecutionError::InvalidGpuPlan("fixed operation without plan".into())
-                })?;
-            let request = match node.kind {
-                NodeKind::ConstantMatrix { value, .. }
-                    if effective_gpu_operation(node.kind) ==
-                        EffectiveGpuOperation::SingleDeviceConstant =>
-                {
-                    let ty = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::SingleDeviceConstant {
-                        metadata,
-                        ty,
-                        value: value.clone(),
-                        env: envs[index].clone(),
-                    }
-                }
-                NodeKind::ConstantMatrix { value, .. } => {
-                    let ty = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::GeneratedConstant {
-                        metadata,
-                        ty,
-                        value: value.clone(),
-                        env: envs[index].clone(),
-                    }
-                }
-                NodeKind::GadgetTrapdoor { base, .. } => {
-                    let ty = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::GeneratedConstant {
-                        metadata,
-                        ty,
-                        value: ConstantMatrix::Gadget { base: base.clone(), small: false },
-                        env: envs[index].clone(),
-                    }
-                }
-                NodeKind::LiftIntegerToConstantPolynomial { .. } => {
-                    let coefficient = self.int(&mut values[index], node.args[0])?;
-                    let ty = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
-                        metadata,
-                        ty,
-                        coefficient,
-                    }
-                }
-                NodeKind::MatrixBinary(operation) => {
-                    let left = self.matrix(&mut values[index], node.args[0])?;
-                    let right = self.matrix(&mut values[index], node.args[1])?;
-                    FixedOperationBatchRequest::MatrixBinary {
-                        metadata,
-                        operation: *operation,
-                        left,
-                        right,
-                    }
-                }
-                NodeKind::MatrixMulSmallRhs => {
-                    let left = self.matrix(&mut values[index], node.args[0])?;
-                    let right = self.small_matrix(&mut values[index], node.args[1])?;
-                    FixedOperationBatchRequest::MatrixMulSmallRhs { metadata, left, right }
-                }
-                NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
-                    let mut products = Vec::with_capacity(coefficients.len());
-                    for (product, coefficient) in coefficients.iter().enumerate() {
-                        products.push((
-                            coefficient
-                                .evaluate(&envs[index])
-                                .map_err(|error| self.expression_error(node.id, error))?,
-                            self.matrix(&mut values[index], node.args[2 * product])?,
-                            self.matrix(&mut values[index], node.args[2 * product + 1])?,
-                        ));
-                    }
-                    let bias = if *has_bias {
-                        Some(self.matrix(&mut values[index], node.args[2 * coefficients.len()])?)
-                    } else {
-                        None
-                    };
-                    FixedOperationBatchRequest::MatrixMulAccumulate {
-                        metadata,
-                        request: MatrixMulAccumulateRequest { products, bias },
-                    }
-                }
-                NodeKind::MatrixNegate => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    FixedOperationBatchRequest::Negate { metadata, value }
-                }
-                NodeKind::MatrixScale { scalar } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let scalar = scalar
-                        .evaluate(&envs[index])
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    FixedOperationBatchRequest::Scale { metadata, value, scalar }
-                }
-                NodeKind::RingAutomorphism { index: automorphism } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let index = self.eval_usize(node.id, automorphism, &envs[index])?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::RingAutomorphism { index },
-                        value,
-                    }
-                }
-                NodeKind::ModulusSwitch { .. } |
-                NodeKind::ModulusReduce { .. } |
-                NodeKind::CenteredRebase { .. } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let destination = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    let operation = if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
-                        FixedUnaryOperation::ModulusSwitch { destination }
-                    } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
-                        FixedUnaryOperation::CenteredRebase { destination }
-                    } else {
-                        FixedUnaryOperation::ReduceModulus { destination }
-                    };
-                    FixedOperationBatchRequest::UnaryTransform { metadata, operation, value }
-                }
-                NodeKind::BlockModSwitch { source_moduli, plaintext_modulus, .. } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let destination = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    let plaintext_modulus = plaintext_modulus
-                        .evaluate(&envs[index])
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::BlockModSwitch {
-                            destination,
-                            source_moduli: source_moduli.clone(),
-                            plaintext_modulus,
-                        },
-                        value,
-                    }
-                }
-                NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let destination = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::RnsModUp {
-                            destination,
-                            source_moduli: source_moduli.clone(),
-                            digit_size: *digit_size,
-                            normalize: *normalize,
-                        },
-                        value,
-                    }
-                }
-                NodeKind::RnsModDown { source_moduli, plaintext_modulus, .. } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let destination = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    let plaintext_modulus = plaintext_modulus
-                        .evaluate(&envs[index])
-                        .map_err(|error| self.expression_error(node.id, error))?
-                        .to_u64()
-                        .ok_or_else(|| {
-                            self.expression_error(node.id, "plaintext modulus does not fit u64")
-                        })?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::RnsModDown {
-                            destination,
-                            source_moduli: source_moduli.clone(),
-                            plaintext_modulus,
-                        },
-                        value,
-                    }
-                }
-                NodeKind::Transpose => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::Transpose,
-                        value,
-                    }
-                }
-                NodeKind::Slice { rows, columns } => {
-                    let value = self.matrix(&mut values[index], node.args[0])?;
-                    let rows = rows
-                        .as_ref()
-                        .map(|range| {
-                            Ok::<_, ExecutionError>(RuntimeIndexRange {
-                                start: self.eval_usize(node.id, &range.start, &envs[index])?,
-                                end: self.eval_usize(node.id, &range.end, &envs[index])?,
-                            })
-                        })
-                        .transpose()?;
-                    let columns = columns
-                        .as_ref()
-                        .map(|range| {
-                            Ok::<_, ExecutionError>(RuntimeIndexRange {
-                                start: self.eval_usize(node.id, &range.start, &envs[index])?,
-                                end: self.eval_usize(node.id, &range.end, &envs[index])?,
-                            })
-                        })
-                        .transpose()?;
-                    FixedOperationBatchRequest::UnaryTransform {
-                        metadata,
-                        operation: FixedUnaryOperation::Slice { rows, columns },
-                        value,
-                    }
-                }
-                NodeKind::Tensor => {
-                    let left = self.matrix(&mut values[index], node.args[0])?;
-                    let right = self.matrix(&mut values[index], node.args[1])?;
-                    FixedOperationBatchRequest::Tensor { metadata, left, right }
-                }
-                NodeKind::Concat { axis } => {
-                    let inputs = node
-                        .args
-                        .iter()
-                        .map(|argument| self.matrix(&mut values[index], *argument))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    FixedOperationBatchRequest::Concat { metadata, inputs, axis: *axis }
-                }
-                NodeKind::CrtRecompose {
-                    plaintext_moduli, reconstruction_coefficients, ..
-                } => {
-                    let levels = node
-                        .args
-                        .iter()
-                        .map(|wire| {
-                            self.matrix(&mut values[index], *wire)
-                                .map(|value| value.as_ref().clone())
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let plaintext_moduli = plaintext_moduli
-                        .iter()
-                        .map(|value| {
-                            value
-                                .evaluate(&envs[index])
-                                .map_err(|error| self.expression_error(node.id, error))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let reconstruction_coefficients = reconstruction_coefficients
-                        .iter()
-                        .map(|value| {
-                            value
-                                .evaluate(&envs[index])
-                                .map_err(|error| self.expression_error(node.id, error))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let destination = self.matrix_type(
-                        scope_id,
-                        &paths[index],
-                        WireRef { node: node.id, port: Port(0) },
-                    )?;
-                    FixedOperationBatchRequest::CrtRecompose {
-                        metadata,
-                        levels,
-                        plaintext_moduli,
-                        reconstruction_coefficients,
-                        destination,
-                    }
-                }
+            let request = self.lower_fixed_typed_request(
+                scope_id, envs, paths, node, values, index, 1, true, None, None, None,
+            )?;
+            match request {
+                GpuCaptureRequest::Ordinary(mut requests) => ordinary.append(&mut requests),
+                GpuCaptureRequest::Compact(mut requests) => compact.append(&mut requests),
                 _ => {
-                    return Err(ExecutionError::InvalidGpuPlan(format!(
-                        "fixed ordinary operation has no batch lowering: {:?}",
-                        node.kind
-                    )))
+                    return Err(ExecutionError::InvalidGpuPlan(
+                        "ordinary fixed operation lowered to an incompatible request".into(),
+                    ))
                 }
-            };
-            requests.push(request);
+            }
         }
-        let outputs = self.backend.fixed_operation_batch(requests).map_err(Self::backend_error)?;
+        if !compact.is_empty() {
+            if compact.len() != indices.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            let outputs =
+                self.backend.fixed_compact_operation_batch(compact).map_err(Self::backend_error)?;
+            if outputs.len() != indices.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            for (&index, output) in indices.iter().zip(outputs) {
+                let kind = self
+                    .bounded_matrix_schema(
+                        scope_id,
+                        &paths[index],
+                        WireRef { node: node.id, port: Port(0) },
+                    )?
+                    .1;
+                self.put(&mut values[index], node.id, 0, compact_runtime_value(output, kind));
+            }
+            return Ok(());
+        }
+        if ordinary.len() != indices.len() {
+            return Err(ExecutionError::InvalidBatch(node.id));
+        }
+        let outputs = self.backend.fixed_operation_batch(ordinary).map_err(Self::backend_error)?;
         if outputs.len() != indices.len() {
             return Err(ExecutionError::InvalidBatch(node.id));
         }
         for (&index, output) in indices.iter().zip(outputs) {
+            let output = match output {
+                FixedOperationBatchOutput::IntegerValues(output)
+                    if matches!(node.kind, NodeKind::PolynomialValues { .. }) =>
+                {
+                    self.put(&mut values[index], node.id, 0, RuntimeValue::integer_values(output));
+                    continue;
+                }
+                FixedOperationBatchOutput::IntegerValues(output)
+                    if matches!(node.kind, NodeKind::ExtractCoefficient { .. }) =>
+                {
+                    self.put(&mut values[index], node.id, 0, RuntimeValue::integer_values(output));
+                    continue;
+                }
+                FixedOperationBatchOutput::IntegerValuesMany(outputs)
+                    if matches!(node.kind, NodeKind::ThresholdDecode { .. }) =>
+                {
+                    for (port, output) in outputs.into_iter().enumerate() {
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            port as u32,
+                            RuntimeValue::integer_values(output),
+                        );
+                    }
+                    continue;
+                }
+                FixedOperationBatchOutput::Matrix(output) => output,
+                FixedOperationBatchOutput::IntegerValues(_) |
+                FixedOperationBatchOutput::IntegerValuesMany(_) => {
+                    return Err(ExecutionError::InvalidGpuPlan(
+                        "fixed matrix operation returned integer values".into(),
+                    ));
+                }
+            };
             if matches!(node.kind, NodeKind::GadgetTrapdoor { .. }) {
-                let trapdoor_wire = WireRef { node: node.id, port: Port(0) };
-                let ty = self.trapdoor_type(scope_id, &paths[index], trapdoor_wire)?;
-                let sigma = self.trapdoor_sigma(scope_id, &paths[index], trapdoor_wire)?;
+                let wire = WireRef { node: node.id, port: Port(0) };
+                let ty = self.trapdoor_type(scope_id, &paths[index], wire)?;
+                let sigma = self.trapdoor_sigma(scope_id, &paths[index], wire)?;
                 let (gadget_base, digit_count) =
-                    self.trapdoor_layout(scope_id, &paths[index], trapdoor_wire)?;
+                    self.trapdoor_layout(scope_id, &paths[index], wire)?;
                 self.put(
                     &mut values[index],
                     node.id,
@@ -3061,7 +2941,7 @@ where
         Ok(())
     }
 
-    fn execute_fixed_trapdoor_batch(
+    fn execute_fixed_operation_batch(
         &mut self,
         scope_id: &FrozenGraphScopeId,
         envs: &[ParamEnv],
@@ -3071,46 +2951,607 @@ where
         placements: &[usize],
         indices: &[usize],
     ) -> Result<(), ExecutionError> {
-        let NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } = node.kind else {
-            return Err(ExecutionError::InvalidGpuPlan(
-                "fixed trapdoor batch received a non-trapdoor node".into(),
-            ));
-        };
+        #[cfg(feature = "gpu")]
+        {
+            return self.execute_fixed_operation_batch_lowered(
+                scope_id, envs, paths, node, values, placements, indices,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            // CenteredRebase preserves bounded compact storage.  Compact
+            // instances use their own fixed batch request so the payload stays
+            // compact and the backend consumes the frozen owner/slot metadata.
+            if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                let mut compact_requests = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    self.set_placement(placements[index])?;
+                    let metadata = self
+                        .fixed_node_batch_request(
+                            scope_id,
+                            node.id,
+                            &[index],
+                            &[paths[index].clone()],
+                            envs,
+                            1,
+                        )?
+                        .ok_or_else(|| {
+                            ExecutionError::InvalidGpuPlan("fixed operation without plan".into())
+                        })?;
+                    let value = self.materialize(&mut values[index], node.args[0])?;
+                    let value = match value {
+                        RuntimeValue::SmallMatrix(value) | RuntimeValue::Preimage(value) => value,
+                        _ => break,
+                    };
+                    let destination = self.matrix_type(
+                        scope_id,
+                        &paths[index],
+                        WireRef { node: node.id, port: Port(0) },
+                    )?;
+                    compact_requests.push(FixedCompactOperationBatchRequest {
+                        metadata,
+                        operation: FixedCompactUnaryOperation::CenteredRebase { destination },
+                        value,
+                    });
+                }
+                if compact_requests.len() == indices.len() {
+                    let outputs = self
+                        .backend
+                        .fixed_compact_operation_batch(compact_requests)
+                        .map_err(Self::backend_error)?;
+                    if outputs.len() != indices.len() {
+                        return Err(ExecutionError::InvalidBatch(node.id));
+                    }
+                    for (&index, output) in indices.iter().zip(outputs) {
+                        let kind = self
+                            .bounded_matrix_schema(
+                                scope_id,
+                                &paths[index],
+                                WireRef { node: node.id, port: Port(0) },
+                            )?
+                            .1;
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            0,
+                            compact_runtime_value(output, kind),
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            let mut requests = Vec::with_capacity(indices.len());
+            for &index in indices {
+                self.set_placement(placements[index])?;
+                let metadata = self
+                    .fixed_node_batch_request(
+                        scope_id,
+                        node.id,
+                        &[index],
+                        &[paths[index].clone()],
+                        envs,
+                        1,
+                    )?
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidGpuPlan("fixed operation without plan".into())
+                    })?;
+                let request = match node.kind {
+                    NodeKind::ConstantMatrix { value, .. }
+                        if effective_gpu_operation(node.kind) ==
+                            EffectiveGpuOperation::SingleDeviceConstant =>
+                    {
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::SingleDeviceConstant {
+                            metadata,
+                            ty,
+                            value: value.clone(),
+                            env: envs[index].clone(),
+                        }
+                    }
+                    NodeKind::ConstantMatrix { value, .. } => {
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::GeneratedConstant {
+                            metadata,
+                            ty,
+                            value: value.clone(),
+                            env: envs[index].clone(),
+                        }
+                    }
+                    NodeKind::GadgetTrapdoor { base, .. } => {
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::GeneratedConstant {
+                            metadata,
+                            ty,
+                            value: ConstantMatrix::Gadget { base: base.clone(), small: false },
+                            env: envs[index].clone(),
+                        }
+                    }
+                    NodeKind::LiftIntegerToConstantPolynomial { .. } => {
+                        let coefficient = self.int(&mut values[index], node.args[0])?;
+                        let coefficient = Arc::new(
+                            self.backend
+                                .integer_values_from_host(&[coefficient])
+                                .map_err(Self::backend_error)?,
+                        );
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                            metadata,
+                            ty,
+                            coefficient,
+                        }
+                    }
+                    NodeKind::PolynomialFromValues { evaluation, .. } => {
+                        let family_wire = node.args[0];
+                        let family = self.materialize(&mut values[index], family_wire)?;
+                        let values = match family {
+                            RuntimeValue::IntegerValues(values) => values,
+                            RuntimeValue::IndexedFamily(members) => {
+                                let values = members
+                                    .into_iter()
+                                    .map(|member| match member {
+                                        RuntimeValue::Int(value) => Ok(value),
+                                        RuntimeValue::NativeInteger(value) => {
+                                            Ok(BigInt::from(value))
+                                        }
+                                        _ => Err(ExecutionError::ValueKind(family_wire)),
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                Arc::new(
+                                    self.backend
+                                        .integer_values_from_host(&values)
+                                        .map_err(Self::backend_error)?,
+                                )
+                            }
+                            _ => return Err(ExecutionError::ValueKind(family_wire)),
+                        };
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::PolynomialFromValues {
+                            metadata,
+                            ty,
+                            values,
+                            evaluation: *evaluation,
+                        }
+                    }
+                    NodeKind::PolynomialValues { evaluation } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        FixedOperationBatchRequest::PolynomialValues {
+                            metadata,
+                            value,
+                            evaluation: *evaluation,
+                        }
+                    }
+                    NodeKind::ExtractCoefficient { position, .. } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let position = self.eval_usize(node.id, position, &envs[index])?;
+                        FixedOperationBatchRequest::ExtractCoefficient { metadata, value, position }
+                    }
+                    NodeKind::ThresholdDecode { plaintext_modulus, length, output_bool } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let plaintext_modulus = plaintext_modulus
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        let length = self.eval_usize(node.id, length, &envs[index])?;
+                        FixedOperationBatchRequest::ThresholdDecode {
+                            metadata,
+                            value,
+                            plaintext_modulus,
+                            length,
+                            output_bool: *output_bool,
+                        }
+                    }
+                    NodeKind::PackPolynomialCoefficients { coefficient_bits, .. } => {
+                        let family_wire = node.args[0];
+                        let family = self.materialize(&mut values[index], family_wire)?;
+                        let bits = match family {
+                            RuntimeValue::IntegerValues(values) => values,
+                            RuntimeValue::IndexedFamily(members) => {
+                                let values = members
+                                    .into_iter()
+                                    .map(|member| match member {
+                                        RuntimeValue::Bool(value) => {
+                                            Ok(BigInt::from(u8::from(value)))
+                                        }
+                                        _ => Err(ExecutionError::ValueKind(family_wire)),
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?;
+                                Arc::new(
+                                    self.backend
+                                        .integer_values_from_host(&values)
+                                        .map_err(Self::backend_error)?,
+                                )
+                            }
+                            _ => return Err(ExecutionError::ValueKind(family_wire)),
+                        };
+                        let ty = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        let coefficient_bits =
+                            self.eval_usize(node.id, coefficient_bits, &envs[index])?;
+                        FixedOperationBatchRequest::PackPolynomialCoefficients {
+                            metadata,
+                            ty,
+                            bits,
+                            coefficient_bits,
+                        }
+                    }
+                    NodeKind::MatrixBinary(operation) => {
+                        let left = self.matrix(&mut values[index], node.args[0])?;
+                        let right = self.matrix(&mut values[index], node.args[1])?;
+                        FixedOperationBatchRequest::MatrixBinary {
+                            metadata,
+                            operation: *operation,
+                            left,
+                            right,
+                        }
+                    }
+                    NodeKind::MatrixMulSmallRhs => {
+                        let left = self.matrix(&mut values[index], node.args[0])?;
+                        let right = self.small_matrix(&mut values[index], node.args[1])?;
+                        FixedOperationBatchRequest::MatrixMulSmallRhs { metadata, left, right }
+                    }
+                    NodeKind::MatrixMulAccumulate { coefficients, has_bias } => {
+                        let mut products = Vec::with_capacity(coefficients.len());
+                        for (product, coefficient) in coefficients.iter().enumerate() {
+                            products.push((
+                                coefficient
+                                    .evaluate(&envs[index])
+                                    .map_err(|error| self.expression_error(node.id, error))?,
+                                self.matrix(&mut values[index], node.args[2 * product])?,
+                                self.matrix(&mut values[index], node.args[2 * product + 1])?,
+                            ));
+                        }
+                        let bias = if *has_bias {
+                            Some(
+                                self.matrix(&mut values[index], node.args[2 * coefficients.len()])?,
+                            )
+                        } else {
+                            None
+                        };
+                        FixedOperationBatchRequest::MatrixMulAccumulate {
+                            metadata,
+                            request: MatrixMulAccumulateRequest { products, bias },
+                        }
+                    }
+                    NodeKind::MatrixNegate => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        FixedOperationBatchRequest::Negate { metadata, value }
+                    }
+                    NodeKind::MatrixScale { scalar } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let scalar = scalar
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        FixedOperationBatchRequest::Scale { metadata, value, scalar }
+                    }
+                    NodeKind::RingAutomorphism { index: automorphism } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let index = self.eval_usize(node.id, automorphism, &envs[index])?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::RingAutomorphism { index },
+                            value,
+                        }
+                    }
+                    NodeKind::ModulusSwitch { .. } |
+                    NodeKind::ModulusReduce { .. } |
+                    NodeKind::CenteredRebase { .. } |
+                    NodeKind::CenteredRoundDivide { .. } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let operation = if let NodeKind::CenteredRoundDivide { divisor } = node.kind
+                        {
+                            let divisor = divisor
+                                .evaluate(&envs[index])
+                                .map_err(|error| self.expression_error(node.id, error))?;
+                            FixedUnaryOperation::CenteredRoundDivide { divisor }
+                        } else if matches!(node.kind, NodeKind::CenteredRebase { .. }) {
+                            let destination = self.matrix_type(
+                                scope_id,
+                                &paths[index],
+                                WireRef { node: node.id, port: Port(0) },
+                            )?;
+                            FixedUnaryOperation::CenteredRebase { destination }
+                        } else {
+                            let destination = self.matrix_type(
+                                scope_id,
+                                &paths[index],
+                                WireRef { node: node.id, port: Port(0) },
+                            )?;
+                            if matches!(node.kind, NodeKind::ModulusSwitch { .. }) {
+                                FixedUnaryOperation::ModulusSwitch { destination }
+                            } else {
+                                FixedUnaryOperation::ReduceModulus { destination }
+                            }
+                        };
+                        FixedOperationBatchRequest::UnaryTransform { metadata, operation, value }
+                    }
+                    NodeKind::BlockModSwitch { source_moduli, plaintext_modulus, .. } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let destination = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        let plaintext_modulus = plaintext_modulus
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::BlockModSwitch {
+                                destination,
+                                source_moduli: source_moduli.clone(),
+                                plaintext_modulus,
+                            },
+                            value,
+                        }
+                    }
+                    NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let destination = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::RnsModUp {
+                                destination,
+                                source_moduli: source_moduli.clone(),
+                                digit_size: *digit_size,
+                                normalize: *normalize,
+                            },
+                            value,
+                        }
+                    }
+                    NodeKind::RnsModDown { source_moduli, plaintext_modulus, .. } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let destination = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        let plaintext_modulus = plaintext_modulus
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?
+                            .to_u64()
+                            .ok_or_else(|| {
+                                self.expression_error(node.id, "plaintext modulus does not fit u64")
+                            })?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::RnsModDown {
+                                destination,
+                                source_moduli: source_moduli.clone(),
+                                plaintext_modulus,
+                            },
+                            value,
+                        }
+                    }
+                    NodeKind::Transpose => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::Transpose,
+                            value,
+                        }
+                    }
+                    NodeKind::Slice { rows, columns } => {
+                        let value = self.matrix(&mut values[index], node.args[0])?;
+                        let rows = rows
+                            .as_ref()
+                            .map(|range| {
+                                Ok::<_, ExecutionError>(RuntimeIndexRange {
+                                    start: self.eval_usize(node.id, &range.start, &envs[index])?,
+                                    end: self.eval_usize(node.id, &range.end, &envs[index])?,
+                                })
+                            })
+                            .transpose()?;
+                        let columns = columns
+                            .as_ref()
+                            .map(|range| {
+                                Ok::<_, ExecutionError>(RuntimeIndexRange {
+                                    start: self.eval_usize(node.id, &range.start, &envs[index])?,
+                                    end: self.eval_usize(node.id, &range.end, &envs[index])?,
+                                })
+                            })
+                            .transpose()?;
+                        FixedOperationBatchRequest::UnaryTransform {
+                            metadata,
+                            operation: FixedUnaryOperation::Slice { rows, columns },
+                            value,
+                        }
+                    }
+                    NodeKind::Tensor => {
+                        let left = self.matrix(&mut values[index], node.args[0])?;
+                        let right = self.matrix(&mut values[index], node.args[1])?;
+                        FixedOperationBatchRequest::Tensor { metadata, left, right }
+                    }
+                    NodeKind::Concat { axis } => {
+                        let inputs = node
+                            .args
+                            .iter()
+                            .map(|argument| self.matrix(&mut values[index], *argument))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        FixedOperationBatchRequest::Concat { metadata, inputs, axis: *axis }
+                    }
+                    NodeKind::CrtRecompose {
+                        plaintext_moduli,
+                        reconstruction_coefficients,
+                        ..
+                    } => {
+                        let levels = node
+                            .args
+                            .iter()
+                            .map(|wire| self.matrix(&mut values[index], *wire))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let plaintext_moduli = plaintext_moduli
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .evaluate(&envs[index])
+                                    .map_err(|error| self.expression_error(node.id, error))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let reconstruction_coefficients = reconstruction_coefficients
+                            .iter()
+                            .map(|value| {
+                                value
+                                    .evaluate(&envs[index])
+                                    .map_err(|error| self.expression_error(node.id, error))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let destination = self.matrix_type(
+                            scope_id,
+                            &paths[index],
+                            WireRef { node: node.id, port: Port(0) },
+                        )?;
+                        FixedOperationBatchRequest::CrtRecompose {
+                            metadata,
+                            levels,
+                            plaintext_moduli,
+                            reconstruction_coefficients,
+                            destination,
+                        }
+                    }
+                    _ => {
+                        return Err(ExecutionError::InvalidGpuPlan(format!(
+                            "fixed ordinary operation has no batch lowering: {:?}",
+                            node.kind
+                        )))
+                    }
+                };
+                requests.push(request);
+            }
+            let outputs =
+                self.backend.fixed_operation_batch(requests).map_err(Self::backend_error)?;
+            if outputs.len() != indices.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            for (&index, output) in indices.iter().zip(outputs) {
+                let output = match output {
+                    FixedOperationBatchOutput::IntegerValues(output)
+                        if matches!(node.kind, NodeKind::PolynomialValues { .. }) =>
+                    {
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            0,
+                            RuntimeValue::integer_values(output),
+                        );
+                        continue;
+                    }
+                    FixedOperationBatchOutput::IntegerValues(output)
+                        if matches!(node.kind, NodeKind::ExtractCoefficient { .. }) =>
+                    {
+                        self.put(
+                            &mut values[index],
+                            node.id,
+                            0,
+                            RuntimeValue::integer_values(output),
+                        );
+                        continue;
+                    }
+                    FixedOperationBatchOutput::IntegerValuesMany(outputs)
+                        if matches!(node.kind, NodeKind::ThresholdDecode { .. }) =>
+                    {
+                        for (port, output) in outputs.into_iter().enumerate() {
+                            self.put(
+                                &mut values[index],
+                                node.id,
+                                port as u32,
+                                RuntimeValue::integer_values(output),
+                            );
+                        }
+                        continue;
+                    }
+                    FixedOperationBatchOutput::Matrix(output) => output,
+                    FixedOperationBatchOutput::IntegerValues(_) |
+                    FixedOperationBatchOutput::IntegerValuesMany(_) => {
+                        return Err(ExecutionError::InvalidGpuPlan(
+                            "fixed matrix operation returned integer values".into(),
+                        ));
+                    }
+                };
+                if matches!(node.kind, NodeKind::GadgetTrapdoor { .. }) {
+                    let trapdoor_wire = WireRef { node: node.id, port: Port(0) };
+                    let ty = self.trapdoor_type(scope_id, &paths[index], trapdoor_wire)?;
+                    let sigma = self.trapdoor_sigma(scope_id, &paths[index], trapdoor_wire)?;
+                    let (gadget_base, digit_count) =
+                        self.trapdoor_layout(scope_id, &paths[index], trapdoor_wire)?;
+                    self.put(
+                        &mut values[index],
+                        node.id,
+                        0,
+                        RuntimeValue::Trapdoor {
+                            secret: None,
+                            public: Arc::new(output),
+                            matrix_type: ty,
+                            sigma,
+                            gadget_base,
+                            digit_count,
+                            gadget_small: Some(false),
+                        },
+                    );
+                } else {
+                    self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(output));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn execute_fixed_trapdoor_batch_lowered(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        placements: &[usize],
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
+        let mut requests = Vec::with_capacity(indices.len());
         for &index in indices {
             self.set_placement(placements[index])?;
-            let metadata = self
-                .fixed_node_batch_request(
-                    scope_id,
-                    node.id,
-                    &[index],
-                    &[paths[index].clone()],
-                    envs,
-                    2,
-                )?
-                .ok_or_else(|| {
-                    ExecutionError::InvalidGpuPlan("fixed trapdoor without plan".into())
-                })?;
-            let matrix_wire = WireRef { node: node.id, port: Port(0) };
-            let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
-            let ty = self.matrix_type(scope_id, &paths[index], matrix_wire)?;
-            let sigma = sigma
-                .evaluate_f64(&envs[index])
-                .map_err(|error| self.expression_error(node.id, error))?;
-            let gadget_base = gadget_base
-                .evaluate(&envs[index])
-                .map_err(|error| self.expression_error(node.id, error))?
-                .abs();
-            let digit_count = self.eval_usize(node.id, digit_count, &envs[index])?;
-            let (public, secret) = self
-                .backend
-                .fixed_sample_trapdoor(FixedTrapdoorRequest {
-                    metadata,
-                    ty: ty.clone(),
-                    sigma,
-                    gadget_base,
-                    digit_count,
-                })
-                .map_err(Self::backend_error)?;
+            let request = self.lower_fixed_typed_request(
+                scope_id, envs, paths, node, values, index, 2, true, None, None, None,
+            )?;
+            let GpuCaptureRequest::Trapdoor(request) = request else {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "trapdoor lowered to an incompatible request".into(),
+                ));
+            };
+            requests.push(request);
+        }
+        // The fixed trapdoor backend accepts one request at a time because it
+        // returns a public/secret pair. Keep the existing owner publication
+        // and transcript order while sharing only request construction.
+        for (index, request) in indices.iter().copied().zip(requests) {
+            let ty = request.ty.clone();
+            let (public, secret) =
+                self.backend.fixed_sample_trapdoor(request).map_err(Self::backend_error)?;
             if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
                 recorder.record(
                     DrawSite {
@@ -3136,6 +3577,7 @@ where
                     },
                 )?;
             }
+            let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
             let sigma = self.trapdoor_sigma(scope_id, &paths[index], trapdoor_wire)?;
             let (gadget_base, digit_count) =
                 self.trapdoor_layout(scope_id, &paths[index], trapdoor_wire)?;
@@ -3159,7 +3601,115 @@ where
         Ok(())
     }
 
-    fn execute_fixed_generation_batch(
+    fn execute_fixed_trapdoor_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        placements: &[usize],
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.execute_fixed_trapdoor_batch_lowered(
+                scope_id, envs, paths, node, values, placements, indices,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } = node.kind else {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "fixed trapdoor batch received a non-trapdoor node".into(),
+                ));
+            };
+            for &index in indices {
+                self.set_placement(placements[index])?;
+                let metadata = self
+                    .fixed_node_batch_request(
+                        scope_id,
+                        node.id,
+                        &[index],
+                        &[paths[index].clone()],
+                        envs,
+                        2,
+                    )?
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidGpuPlan("fixed trapdoor without plan".into())
+                    })?;
+                let matrix_wire = WireRef { node: node.id, port: Port(0) };
+                let trapdoor_wire = WireRef { node: node.id, port: Port(1) };
+                let ty = self.matrix_type(scope_id, &paths[index], matrix_wire)?;
+                let sigma = sigma
+                    .evaluate_f64(&envs[index])
+                    .map_err(|error| self.expression_error(node.id, error))?;
+                let gadget_base = gadget_base
+                    .evaluate(&envs[index])
+                    .map_err(|error| self.expression_error(node.id, error))?
+                    .abs();
+                let digit_count = self.eval_usize(node.id, digit_count, &envs[index])?;
+                let (public, secret) = self
+                    .backend
+                    .fixed_sample_trapdoor(FixedTrapdoorRequest {
+                        metadata,
+                        ty: ty.clone(),
+                        sigma,
+                        gadget_base,
+                        digit_count,
+                    })
+                    .map_err(Self::backend_error)?;
+                if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
+                    recorder.record(
+                        DrawSite {
+                            instantiation_path: paths[index].clone(),
+                            node: node.id,
+                            port: Port(0),
+                        },
+                        RecordedValue::Matrix {
+                            matrix_type: ty.clone(),
+                            bytes: self.backend.matrix_to_bytes(&public),
+                        },
+                    )?;
+                    recorder.record(
+                        DrawSite {
+                            instantiation_path: paths[index].clone(),
+                            node: node.id,
+                            port: Port(1),
+                        },
+                        RecordedValue::Trapdoor {
+                            matrix_type: ty.clone(),
+                            public_bytes: self.backend.matrix_to_bytes(&public),
+                            trapdoor_bytes: self.backend.trapdoor_to_bytes(&secret),
+                        },
+                    )?;
+                }
+                let sigma = self.trapdoor_sigma(scope_id, &paths[index], trapdoor_wire)?;
+                let (gadget_base, digit_count) =
+                    self.trapdoor_layout(scope_id, &paths[index], trapdoor_wire)?;
+                let public = Arc::new(public);
+                self.put(&mut values[index], node.id, 0, RuntimeValue::matrix((*public).clone()));
+                self.put(
+                    &mut values[index],
+                    node.id,
+                    1,
+                    RuntimeValue::Trapdoor {
+                        secret: Some(Arc::new(secret)),
+                        public,
+                        matrix_type: ty,
+                        sigma,
+                        gadget_base,
+                        digit_count,
+                        gadget_small: None,
+                    },
+                );
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn execute_fixed_generation_batch_lowered(
         &mut self,
         scope_id: &FrozenGraphScopeId,
         envs: &[ParamEnv],
@@ -3173,175 +3723,32 @@ where
         let mut kinds = Vec::with_capacity(indices.len());
         for &index in indices {
             self.set_placement(placements[index])?;
-            let metadata = self
-                .fixed_node_batch_request(
-                    scope_id,
-                    node.id,
-                    &[index],
-                    &[paths[index].clone()],
-                    envs,
-                    1,
-                )?
-                .ok_or_else(|| {
-                    ExecutionError::InvalidGpuPlan("fixed generation without plan".into())
-                })?;
             let wire = WireRef { node: node.id, port: Port(0) };
             let ty = self.matrix_type(scope_id, &paths[index], wire)?;
-            let request = match node.kind {
-                NodeKind::UniformResidueSample { .. } => {
-                    let range = RuntimeSampleRange {
-                        minimum: BigInt::from(0),
-                        maximum: &ty.modulus - BigInt::from(1),
-                    };
-                    kinds.push((index, ty.clone(), None));
-                    FixedGenerationRequest::Uniform { metadata, ty, range }
+            let small = match node.kind {
+                NodeKind::HashSample { variant, .. }
+                    if matches!(
+                        variant,
+                        HashVariant::Decomposed | HashVariant::SmallDecomposed
+                    ) =>
+                {
+                    Some(self.bounded_matrix_schema(scope_id, &paths[index], wire)?)
                 }
-                NodeKind::UniformIntervalSample { range, .. } => {
-                    let range = RuntimeSampleRange {
-                        minimum: range
-                            .minimum
-                            .evaluate(&envs[index])
-                            .map_err(|error| self.expression_error(node.id, error))?,
-                        maximum: range
-                            .maximum
-                            .evaluate(&envs[index])
-                            .map_err(|error| self.expression_error(node.id, error))?,
-                    };
-                    kinds.push((index, ty.clone(), None));
-                    FixedGenerationRequest::Uniform { metadata, ty, range }
-                }
-                NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
-                    let sigma = sigma
-                        .evaluate_f64(&envs[index])
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    let max_coefficient_bound = max_coefficient_bound
-                        .evaluate(&envs[index])
-                        .map_err(|error| self.expression_error(node.id, error))?;
-                    kinds.push((index, ty.clone(), None));
-                    FixedGenerationRequest::Gaussian { metadata, ty, sigma, max_coefficient_bound }
-                }
-                NodeKind::HashSample {
-                    variant,
-                    tag_prefix,
-                    tag_components,
-                    base,
-                    digit_count,
-                    ..
-                } => {
-                    let key = self.bytes(&mut values[index], node.args[0])?;
-                    let key: [u8; 32] =
-                        key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
-                    let mut tag = tag_prefix.clone();
-                    for component in tag_components {
-                        use mxx_ir_core::node::HashTagComponent;
-                        match component {
-                            HashTagComponent::Bytes(bytes) => {
-                                tag.push(0);
-                                tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-                                tag.extend_from_slice(bytes);
-                            }
-                            HashTagComponent::Integer(expression) => {
-                                let value = expression
-                                    .evaluate(&envs[index])
-                                    .map_err(|error| self.expression_error(node.id, error))?;
-                                tag.push(1);
-                                append_tag_integer(&mut tag, &value);
-                            }
-                            HashTagComponent::Decimal(expression) => {
-                                let value = expression
-                                    .evaluate(&envs[index])
-                                    .map_err(|error| self.expression_error(node.id, error))?;
-                                let decimal = value.to_string();
-                                tag.push(2);
-                                tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
-                                tag.extend_from_slice(decimal.as_bytes());
-                            }
-                            HashTagComponent::U64Le(expression) => {
-                                let value = expression
-                                    .evaluate(&envs[index])
-                                    .map_err(|error| self.expression_error(node.id, error))?
-                                    .to_u64()
-                                    .ok_or_else(|| {
-                                        self.expression_error(
-                                            node.id,
-                                            "little-endian hash tag component must fit u64",
-                                        )
-                                    })?;
-                                tag.push(3);
-                                tag.extend_from_slice(&value.to_le_bytes());
-                            }
-                            HashTagComponent::Operand(operand) => {
-                                tag.push(1);
-                                append_tag_integer(
-                                    &mut tag,
-                                    &self.int(&mut values[index], node.args[*operand])?,
-                                );
-                            }
-                        }
-                    }
-                    let gadget_base = base
-                        .as_ref()
-                        .map(|base| {
-                            base.evaluate(&envs[index])
-                                .map_err(|error| self.expression_error(node.id, error))
-                        })
-                        .transpose()?;
-                    let digit_count = digit_count
-                        .as_ref()
-                        .map(|count| self.eval_usize(node.id, count, &envs[index]))
-                        .transpose()?;
-                    match (variant, gadget_base, digit_count) {
-                        (HashVariant::Plain, None, None) => {
-                            kinds.push((index, ty.clone(), None));
-                            FixedGenerationRequest::Hash { metadata, ty, key, tag }
-                        }
-                        (
-                            HashVariant::Decomposed | HashVariant::SmallDecomposed,
-                            Some(gadget_base),
-                            Some(digit_count),
-                        ) => {
-                            if digit_count == 0 || ty.rows % digit_count != 0 {
-                                return Err(ExecutionError::Expression {
-                                    node: node.id,
-                                    message:
-                                        "decomposed hash rows must be divisible by digit count"
-                                            .to_owned(),
-                                });
-                            }
-                            let (schema, semantic_kind) =
-                                self.bounded_matrix_schema(scope_id, &paths[index], wire)?;
-                            if semantic_kind != SmallMatrixSemanticKind::Generic {
-                                return Err(ExecutionError::Manifest(
-                                    "decomposed hash output is not a generic small matrix"
-                                        .to_owned(),
-                                ));
-                            }
-                            kinds.push((index, ty.clone(), Some((schema, semantic_kind))));
-                            FixedGenerationRequest::HashDecomposed {
-                                metadata,
-                                ty,
-                                key,
-                                tag,
-                                gadget_base,
-                                digit_count,
-                                small: *variant == HashVariant::SmallDecomposed,
-                            }
-                        }
-                        _ => {
-                            return Err(ExecutionError::Expression {
-                                node: node.id,
-                                message: "hash variant and gadget layout do not match".to_owned(),
-                            })
-                        }
-                    }
-                }
-                _ => {
-                    return Err(ExecutionError::InvalidGpuPlan(
-                        "fixed generation batch received a non-generation node".into(),
-                    ))
-                }
+                _ => None,
             };
-            requests.push(request);
+            let request = self.lower_fixed_typed_request(
+                scope_id, envs, paths, node, values, index, 1, true, None, None, None,
+            )?;
+            let GpuCaptureRequest::Generation(requests_for_instance) = request else {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "generation lowered to an incompatible request".into(),
+                ));
+            };
+            if requests_for_instance.len() != 1 {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            requests.extend(requests_for_instance);
+            kinds.push((index, ty, small));
         }
         let outputs = self.backend.fixed_generation_batch(requests).map_err(Self::backend_error)?;
         if outputs.len() != indices.len() || outputs.len() != kinds.len() {
@@ -3366,6 +3773,11 @@ where
                     self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(value));
                 }
                 (Some((schema, semantic_kind)), FixedGenerationOutput::Small(value)) => {
+                    if semantic_kind != SmallMatrixSemanticKind::Generic {
+                        return Err(ExecutionError::Manifest(
+                            "decomposed hash output is not a generic small matrix".to_owned(),
+                        ));
+                    }
                     if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
                         recorder.record(
                             DrawSite {
@@ -3391,7 +3803,256 @@ where
         Ok(())
     }
 
-    fn execute_fixed_gadget_decompose_batch(
+    fn execute_fixed_generation_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        placements: &[usize],
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.execute_fixed_generation_batch_lowered(
+                scope_id, envs, paths, node, values, placements, indices,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let mut requests = Vec::with_capacity(indices.len());
+            let mut kinds = Vec::with_capacity(indices.len());
+            for &index in indices {
+                self.set_placement(placements[index])?;
+                let metadata = self
+                    .fixed_node_batch_request(
+                        scope_id,
+                        node.id,
+                        &[index],
+                        &[paths[index].clone()],
+                        envs,
+                        1,
+                    )?
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidGpuPlan("fixed generation without plan".into())
+                    })?;
+                let wire = WireRef { node: node.id, port: Port(0) };
+                let ty = self.matrix_type(scope_id, &paths[index], wire)?;
+                let request = match node.kind {
+                    NodeKind::UniformResidueSample { .. } => {
+                        let range = RuntimeSampleRange {
+                            minimum: BigInt::from(0),
+                            maximum: &ty.modulus - BigInt::from(1),
+                        };
+                        kinds.push((index, ty.clone(), None));
+                        FixedGenerationRequest::Uniform { metadata, ty, range }
+                    }
+                    NodeKind::UniformIntervalSample { range, .. } => {
+                        let range = RuntimeSampleRange {
+                            minimum: range
+                                .minimum
+                                .evaluate(&envs[index])
+                                .map_err(|error| self.expression_error(node.id, error))?,
+                            maximum: range
+                                .maximum
+                                .evaluate(&envs[index])
+                                .map_err(|error| self.expression_error(node.id, error))?,
+                        };
+                        kinds.push((index, ty.clone(), None));
+                        FixedGenerationRequest::Uniform { metadata, ty, range }
+                    }
+                    NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
+                        let sigma = sigma
+                            .evaluate_f64(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        let max_coefficient_bound = max_coefficient_bound
+                            .evaluate(&envs[index])
+                            .map_err(|error| self.expression_error(node.id, error))?;
+                        kinds.push((index, ty.clone(), None));
+                        FixedGenerationRequest::Gaussian {
+                            metadata,
+                            ty,
+                            sigma,
+                            max_coefficient_bound,
+                        }
+                    }
+                    NodeKind::HashSample {
+                        variant,
+                        tag_prefix,
+                        tag_components,
+                        base,
+                        digit_count,
+                        ..
+                    } => {
+                        let key = self.bytes(&mut values[index], node.args[0])?;
+                        let key: [u8; 32] =
+                            key.try_into().map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
+                        let mut tag = tag_prefix.clone();
+                        for component in tag_components {
+                            use mxx_ir_core::node::HashTagComponent;
+                            match component {
+                                HashTagComponent::Bytes(bytes) => {
+                                    tag.push(0);
+                                    tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                                    tag.extend_from_slice(bytes);
+                                }
+                                HashTagComponent::Integer(expression) => {
+                                    let value = expression
+                                        .evaluate(&envs[index])
+                                        .map_err(|error| self.expression_error(node.id, error))?;
+                                    tag.push(1);
+                                    append_tag_integer(&mut tag, &value);
+                                }
+                                HashTagComponent::Decimal(expression) => {
+                                    let value = expression
+                                        .evaluate(&envs[index])
+                                        .map_err(|error| self.expression_error(node.id, error))?;
+                                    let decimal = value.to_string();
+                                    tag.push(2);
+                                    tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                                    tag.extend_from_slice(decimal.as_bytes());
+                                }
+                                HashTagComponent::U64Le(expression) => {
+                                    let value = expression
+                                        .evaluate(&envs[index])
+                                        .map_err(|error| self.expression_error(node.id, error))?
+                                        .to_u64()
+                                        .ok_or_else(|| {
+                                            self.expression_error(
+                                                node.id,
+                                                "little-endian hash tag component must fit u64",
+                                            )
+                                        })?;
+                                    tag.push(3);
+                                    tag.extend_from_slice(&value.to_le_bytes());
+                                }
+                                HashTagComponent::Operand(operand) => {
+                                    tag.push(1);
+                                    append_tag_integer(
+                                        &mut tag,
+                                        &self.int(&mut values[index], node.args[*operand])?,
+                                    );
+                                }
+                            }
+                        }
+                        let gadget_base = base
+                            .as_ref()
+                            .map(|base| {
+                                base.evaluate(&envs[index])
+                                    .map_err(|error| self.expression_error(node.id, error))
+                            })
+                            .transpose()?;
+                        let digit_count = digit_count
+                            .as_ref()
+                            .map(|count| self.eval_usize(node.id, count, &envs[index]))
+                            .transpose()?;
+                        match (variant, gadget_base, digit_count) {
+                            (HashVariant::Plain, None, None) => {
+                                kinds.push((index, ty.clone(), None));
+                                FixedGenerationRequest::Hash { metadata, ty, key, tag }
+                            }
+                            (
+                                HashVariant::Decomposed | HashVariant::SmallDecomposed,
+                                Some(gadget_base),
+                                Some(digit_count),
+                            ) => {
+                                if digit_count == 0 || ty.rows % digit_count != 0 {
+                                    return Err(ExecutionError::Expression {
+                                        node: node.id,
+                                        message:
+                                            "decomposed hash rows must be divisible by digit count"
+                                                .to_owned(),
+                                    });
+                                }
+                                let (schema, semantic_kind) =
+                                    self.bounded_matrix_schema(scope_id, &paths[index], wire)?;
+                                if semantic_kind != SmallMatrixSemanticKind::Generic {
+                                    return Err(ExecutionError::Manifest(
+                                        "decomposed hash output is not a generic small matrix"
+                                            .to_owned(),
+                                    ));
+                                }
+                                kinds.push((index, ty.clone(), Some((schema, semantic_kind))));
+                                FixedGenerationRequest::HashDecomposed {
+                                    metadata,
+                                    ty,
+                                    key,
+                                    tag,
+                                    gadget_base,
+                                    digit_count,
+                                    small: *variant == HashVariant::SmallDecomposed,
+                                }
+                            }
+                            _ => {
+                                return Err(ExecutionError::Expression {
+                                    node: node.id,
+                                    message: "hash variant and gadget layout do not match"
+                                        .to_owned(),
+                                })
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(ExecutionError::InvalidGpuPlan(
+                            "fixed generation batch received a non-generation node".into(),
+                        ))
+                    }
+                };
+                requests.push(request);
+            }
+            let outputs =
+                self.backend.fixed_generation_batch(requests).map_err(Self::backend_error)?;
+            if outputs.len() != indices.len() || outputs.len() != kinds.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            for ((index, ty, small), output) in kinds.into_iter().zip(outputs) {
+                match (small, output) {
+                    (None, FixedGenerationOutput::Matrix(value)) => {
+                        if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
+                            recorder.record(
+                                DrawSite {
+                                    instantiation_path: paths[index].clone(),
+                                    node: node.id,
+                                    port: Port(0),
+                                },
+                                RecordedValue::Matrix {
+                                    matrix_type: ty,
+                                    bytes: self.backend.matrix_to_bytes(&value),
+                                },
+                            )?;
+                        }
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::matrix(value));
+                    }
+                    (Some((schema, semantic_kind)), FixedGenerationOutput::Small(value)) => {
+                        if let SamplingMode::Record(recorder) = &mut self.sampling_mode {
+                            recorder.record(
+                                DrawSite {
+                                    instantiation_path: paths[index].clone(),
+                                    node: node.id,
+                                    port: Port(0),
+                                },
+                                RecordedValue::SmallMatrix {
+                                    bytes: self
+                                        .backend
+                                        .small_matrix_to_bytes(&value, &schema, semantic_kind)
+                                        .map_err(Self::backend_error)?,
+                                    schema: schema.clone(),
+                                    semantic_kind,
+                                },
+                            )?;
+                        }
+                        self.put(&mut values[index], node.id, 0, RuntimeValue::small_matrix(value));
+                    }
+                    _ => return Err(ExecutionError::InvalidBatch(node.id)),
+                }
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    fn execute_fixed_gadget_decompose_batch_lowered(
         &mut self,
         scope_id: &FrozenGraphScopeId,
         envs: &[ParamEnv],
@@ -3409,28 +4070,23 @@ where
         let mut requests = Vec::with_capacity(indices.len());
         for &index in indices {
             self.set_placement(placements[index])?;
-            let metadata = self
-                .fixed_node_batch_request(
-                    scope_id,
-                    node.id,
-                    &[index],
-                    &[paths[index].clone()],
-                    envs,
-                    1,
-                )?
-                .ok_or_else(|| {
-                    ExecutionError::InvalidGpuPlan("fixed gadget without plan".into())
-                })?;
-            let input = self.matrix(&mut values[index], node.args[0])?;
             let input_type = self.matrix_type(scope_id, &paths[index], node.args[0])?;
-            let base = base
+            let base_value = base
                 .evaluate(&envs[index])
                 .map_err(|error| self.expression_error(node.id, error))?;
             let digits = self.eval_usize(node.id, digit_count, &envs[index])?;
             self.backend
-                .validate_gadget_layout(&input_type, &base, digits, *small)
+                .validate_gadget_layout(&input_type, &base_value, digits, *small)
                 .map_err(Self::backend_error)?;
-            requests.push(FixedGadgetDecomposeRequest { metadata, input, small: *small, digits });
+            let request = self.lower_fixed_typed_request(
+                scope_id, envs, paths, node, values, index, 1, true, None, None, None,
+            )?;
+            let GpuCaptureRequest::Decomposition(requests_for_instance) = request else {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "gadget decomposition lowered to an incompatible request".into(),
+                ));
+            };
+            requests.extend(requests_for_instance);
         }
         let outputs =
             self.backend.fixed_gadget_decompose_batch(requests).map_err(Self::backend_error)?;
@@ -3448,6 +4104,84 @@ where
             self.put(&mut values[index], node.id, 0, compact_runtime_value(output, semantic_kind));
         }
         Ok(())
+    }
+
+    fn execute_fixed_gadget_decompose_batch(
+        &mut self,
+        scope_id: &FrozenGraphScopeId,
+        envs: &[ParamEnv],
+        paths: &[Vec<InstantiationFrame>],
+        node: &ExecutableNode<'_>,
+        values: &mut [BTreeMap<WireRef, RuntimeValue<B>>],
+        placements: &[usize],
+        indices: &[usize],
+    ) -> Result<(), ExecutionError> {
+        #[cfg(feature = "gpu")]
+        {
+            return self.execute_fixed_gadget_decompose_batch_lowered(
+                scope_id, envs, paths, node, values, placements, indices,
+            );
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            let NodeKind::GadgetDecompose { base, small, digit_count } = node.kind else {
+                return Err(ExecutionError::InvalidGpuPlan(
+                    "fixed gadget batch received a non-gadget node".into(),
+                ));
+            };
+            let mut requests = Vec::with_capacity(indices.len());
+            for &index in indices {
+                self.set_placement(placements[index])?;
+                let metadata = self
+                    .fixed_node_batch_request(
+                        scope_id,
+                        node.id,
+                        &[index],
+                        &[paths[index].clone()],
+                        envs,
+                        1,
+                    )?
+                    .ok_or_else(|| {
+                        ExecutionError::InvalidGpuPlan("fixed gadget without plan".into())
+                    })?;
+                let input = self.matrix(&mut values[index], node.args[0])?;
+                let input_type = self.matrix_type(scope_id, &paths[index], node.args[0])?;
+                let base = base
+                    .evaluate(&envs[index])
+                    .map_err(|error| self.expression_error(node.id, error))?;
+                let digits = self.eval_usize(node.id, digit_count, &envs[index])?;
+                self.backend
+                    .validate_gadget_layout(&input_type, &base, digits, *small)
+                    .map_err(Self::backend_error)?;
+                requests.push(FixedGadgetDecomposeRequest {
+                    metadata,
+                    input,
+                    small: *small,
+                    digits,
+                });
+            }
+            let outputs =
+                self.backend.fixed_gadget_decompose_batch(requests).map_err(Self::backend_error)?;
+            if outputs.len() != indices.len() {
+                return Err(ExecutionError::InvalidBatch(node.id));
+            }
+            for (&index, output) in indices.iter().zip(outputs) {
+                let semantic_kind = self
+                    .bounded_matrix_schema(
+                        scope_id,
+                        &paths[index],
+                        WireRef { node: node.id, port: Port(0) },
+                    )?
+                    .1;
+                self.put(
+                    &mut values[index],
+                    node.id,
+                    0,
+                    compact_runtime_value(output, semantic_kind),
+                );
+            }
+            Ok(())
+        }
     }
 
     fn execute_parallel_matrix_node(
@@ -3957,6 +4691,9 @@ where
                 let bytes = value.to_signed_bytes_le();
                 Ok(ArtifactPayload::Bytes(bytes))
             }
+            (RuntimeValue::NativeInteger(value), ArtifactType::Int) => {
+                Ok(ArtifactPayload::Bytes(BigInt::from(*value).to_signed_bytes_le()))
+            }
             (RuntimeValue::Matrix(matrix), ArtifactType::Matrix(_)) => {
                 Ok(ArtifactPayload::Matrix(self.backend.matrix_to_bytes(matrix)))
             }
@@ -4223,6 +4960,7 @@ where
                 let members = (0..count)
                     .map(|index| match self.family_member(values, wire, index, node.id)? {
                         RuntimeValue::Int(value) => Ok(value),
+                        RuntimeValue::NativeInteger(value) => Ok(BigInt::from(value)),
                         _ => Err(ExecutionError::ValueKind(wire)),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -4783,6 +5521,16 @@ where
                     .map_err(Self::backend_error)?;
                     self.put(values, node.id, 0, RuntimeValue::matrix(output));
                 }
+            }
+            NodeKind::CenteredRoundDivide { divisor } => {
+                let input = self.matrix(values, node.args[0])?;
+                let divisor =
+                    divisor.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
+                let output = self
+                    .backend
+                    .centered_round_divide(&input, &divisor)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::matrix(output));
             }
             NodeKind::RnsModUp { source_moduli, digit_size, normalize, .. } => {
                 let input = self.matrix(values, node.args[0])?;
@@ -5412,29 +6160,18 @@ where
                     .validate_gadget_layout(&target_type, &gadget_base, digit_count, small)
                     .map_err(Self::backend_error)?;
                 if self.gpu_plan.is_some() {
-                    let metadata = self
-                        .fixed_node_batch_request(
-                            scope_id,
-                            node.id,
-                            &[instance],
-                            &[paths[instance].clone()],
-                            envs,
-                            1,
-                        )?
-                        .ok_or_else(|| {
-                            ExecutionError::InvalidGpuPlan(
-                                "fixed gadget preimage is missing its plan".into(),
-                            )
-                        })?;
-                    fixed_gadget_requests.push((
-                        instance,
-                        FixedGadgetDecomposeRequest {
-                            metadata,
-                            input: target,
-                            small,
-                            digits: digit_count,
-                        },
-                    ));
+                    let request = self.lower_fixed_typed_request(
+                        scope_id, envs, paths, node, values, instance, 1, true, None, None, None,
+                    )?;
+                    let GpuCaptureRequest::Decomposition(mut requests) = request else {
+                        return Err(ExecutionError::InvalidGpuPlan(
+                            "gadget preimage lowered to an incompatible request".into(),
+                        ));
+                    };
+                    if requests.len() != 1 {
+                        return Err(ExecutionError::InvalidBatch(node.id));
+                    }
+                    fixed_gadget_requests.push((instance, requests.remove(0)));
                 } else {
                     let value = self
                         .backend
@@ -5464,22 +6201,29 @@ where
             )?;
             let randomness_seed =
                 preimage_request_seed(self.production.execution_nonce, &paths[instance], wire);
-            let fixed_metadata = if self.gpu_plan.is_some() {
-                Some(
-                    self.fixed_node_batch_request(
-                        scope_id,
-                        node.id,
-                        &[instance],
-                        &[paths[instance].clone()],
-                        envs,
-                        1,
-                    )?
-                    .ok_or_else(|| {
-                        ExecutionError::InvalidGpuPlan(
-                            "fixed preimage request has no plan metadata".into(),
-                        )
-                    })?,
-                )
+            let fixed_request = if self.gpu_plan.is_some() {
+                let request = self.lower_fixed_typed_request(
+                    scope_id,
+                    envs,
+                    paths,
+                    node,
+                    values,
+                    instance,
+                    1,
+                    true,
+                    None,
+                    None,
+                    Some(target.clone()),
+                )?;
+                let GpuCaptureRequest::Preimage(mut requests) = request else {
+                    return Err(ExecutionError::InvalidGpuPlan(
+                        "preimage lowered to an incompatible request".into(),
+                    ));
+                };
+                if requests.len() != 1 {
+                    return Err(ExecutionError::InvalidBatch(node.id));
+                }
+                Some(requests.remove(0))
             } else {
                 None
             };
@@ -5488,9 +6232,9 @@ where
                 placement: placements[instance],
                 wire,
                 path: paths[instance].clone(),
-                request: PreimageRequest {
+                request: fixed_request.unwrap_or(PreimageRequest {
                     instance_slot: fixed_global_instance_slot(&paths[instance], instance)?,
-                    fixed_metadata,
+                    fixed_metadata: None,
                     matrix_type: schema.matrix.clone(),
                     sigma,
                     gadget_base,
@@ -5500,7 +6244,7 @@ where
                     public,
                     target,
                     randomness_seed,
-                },
+                }),
                 schema,
             });
         }
@@ -6283,6 +7027,7 @@ where
     ) -> Result<BigInt, ExecutionError> {
         match self.value(values, wire)? {
             RuntimeValue::Int(value) => Ok(value),
+            RuntimeValue::NativeInteger(value) => Ok(BigInt::from(value)),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -6294,6 +7039,7 @@ where
     ) -> Result<HostPrimitiveValue, ExecutionError> {
         match self.value(values, wire)? {
             RuntimeValue::Int(value) => Ok(HostPrimitiveValue::Int(value)),
+            RuntimeValue::NativeInteger(value) => Ok(HostPrimitiveValue::Int(BigInt::from(value))),
             RuntimeValue::Real(value) => Ok(HostPrimitiveValue::Real(value)),
             RuntimeValue::Bool(value) => Ok(HostPrimitiveValue::Bool(value)),
             _ => Err(ExecutionError::ValueKind(wire)),
@@ -6410,6 +7156,7 @@ where
                     )
                 }
             }
+            RuntimeValue::IntegerValues(values) => RuntimeValue::IntegerValues(values),
             RuntimeValue::Trapdoor {
                 secret,
                 public,
@@ -6576,6 +7323,9 @@ where
                 }
                 families.into_iter().map(RuntimeValue::IndexedFamily).collect()
             }
+            RuntimeValue::IntegerValues(values) => {
+                vec![RuntimeValue::IntegerValues(values); placement_count]
+            }
             value @ (RuntimeValue::LazyArtifact { .. } | RuntimeValue::StagedArtifact { .. }) => {
                 self.set_placement(0)?;
                 let materialized = self.materialize_value(value)?;
@@ -6722,10 +7472,8 @@ where
                                 count: self.family_count(values, *wire)?,
                             },
                         )?;
-                        self.value_for_placement(
-                            self.family_member_value(values, *wire, index)?,
-                            placement,
-                        )?
+                        let member = self.family_member_value(values, *wire, index)?;
+                        self.value_for_placement(member, placement)?
                     }
                 };
                 Ok((name.clone(), value))
@@ -6796,7 +7544,34 @@ fn preimage_request_seed(
     hasher.finalize().into()
 }
 
-fn runtime_inputs_digest<B: Backend>(
+/// Remove values whose last consumer was submitted at `position`.
+///
+/// This is the sequential executor's ownership rule and is also used by the
+/// compiled capture path. The helper deliberately does not inspect Arc counts
+/// or introduce a second lifetime mechanism: the returned flag only tells the
+/// caller that dropping one of the values may enqueue backend release work.
+pub(crate) fn release_last_uses<B: Backend>(
+    schedule: &mxx_ir_core::LivenessSchedule,
+    position: usize,
+    arguments: &[WireRef],
+    values: &mut BTreeMap<WireRef, RuntimeValue<B>>,
+) -> bool {
+    let mut pending_releases = false;
+    for argument in arguments {
+        if schedule.last_use.get(argument) == Some(&position) &&
+            !schedule.retained.contains(argument)
+        {
+            if let Some(value) = values.remove(argument) {
+                pending_releases |= value.releases_backend_resources_on_drop();
+            }
+        }
+    }
+    pending_releases
+}
+
+/// Canonical digest used by the producer-session path. Transient execution
+/// must not call this helper; it serializes concrete input contents.
+pub(crate) fn runtime_inputs_digest<B: Backend>(
     validated: &ValidatedGraph,
     backend: &B,
     inputs: &BTreeMap<String, RuntimeValue<B>>,
@@ -6847,6 +7622,10 @@ fn hash_runtime_value<B: Backend>(
             hasher.update([0]);
             hash_sized(hasher, value.to_string().as_bytes());
         }
+        RuntimeValue::NativeInteger(value) => {
+            hasher.update([14]);
+            hasher.update(value.to_le_bytes());
+        }
         RuntimeValue::Real(value) => {
             hasher.update([1]);
             hasher.update(value.to_bits().to_le_bytes());
@@ -6872,6 +7651,10 @@ fn hash_runtime_value<B: Backend>(
         RuntimeValue::Matrix(value) => {
             hasher.update([5]);
             hash_sized(hasher, &backend.matrix_to_bytes(value));
+        }
+        RuntimeValue::IntegerValues(value) => {
+            hasher.update([15]);
+            hash_sized(hasher, format!("{value:?}").as_bytes());
         }
         RuntimeValue::SmallMatrix(value) => {
             let artifact_type = ArtifactType::from_wire_type(concrete).ok_or_else(|| {
@@ -7060,7 +7843,7 @@ fn collect_staged_families<B: Backend>(
     }
 }
 
-fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
+pub(crate) fn materialize_runtime_value<B: Backend, S: ArtifactStore>(
     value: RuntimeValue<B>,
     backend: &B,
     store: &mut S,
@@ -9420,6 +10203,7 @@ mod tests {
     impl Backend for PlacementProbeBackend {
         type Matrix = ();
         type SmallMatrix = PlacementProbeSmallMatrix;
+        type IntegerValues = Vec<BigInt>;
         type Trapdoor = ();
         type Error = PlacementProbeError;
 
@@ -9461,6 +10245,41 @@ mod tests {
             evaluation: bool,
         ) -> Result<Vec<BigInt>, Self::Error> {
             unused_probe_operation!(value, evaluation)
+        }
+
+        fn integer_values_from_host(
+            &mut self,
+            values: &[BigInt],
+        ) -> Result<Self::IntegerValues, Self::Error> {
+            Ok(values.to_vec())
+        }
+
+        fn polynomial_from_integer_values(
+            &mut self,
+            ty: &ConcreteMatrixType,
+            values: &Self::IntegerValues,
+            evaluation: bool,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(ty, values, evaluation)
+        }
+
+        fn polynomial_values_resident(
+            &mut self,
+            value: &Self::Matrix,
+            evaluation: bool,
+        ) -> Result<Self::IntegerValues, Self::Error> {
+            unused_probe_operation!(value, evaluation)
+        }
+
+        fn integer_values_to_host(
+            &mut self,
+            values: &Self::IntegerValues,
+        ) -> Result<Vec<BigInt>, Self::Error> {
+            Ok(values.clone())
+        }
+
+        fn integer_values_len(&self, values: &Self::IntegerValues) -> usize {
+            values.len()
         }
 
         fn placement_count(&self) -> usize {
@@ -9667,6 +10486,14 @@ mod tests {
             destination: &ConcreteMatrixType,
         ) -> Result<Self::Matrix, Self::Error> {
             unused_probe_operation!(value, destination)
+        }
+
+        fn centered_round_divide(
+            &mut self,
+            value: &Self::Matrix,
+            divisor: &BigInt,
+        ) -> Result<Self::Matrix, Self::Error> {
+            unused_probe_operation!(value, divisor)
         }
 
         fn centered_rebase_small(
@@ -11384,12 +12211,16 @@ mod tests {
                 assert_eq!(descriptor.family_count, Some(0));
             }
             RuntimeValue::Int(_) => panic!("empty range output became an integer"),
+            RuntimeValue::NativeInteger(_) => panic!("empty range output became a native integer"),
             RuntimeValue::Real(_) => panic!("empty range output became a real"),
             RuntimeValue::Bool(_) => panic!("empty range output became a bool"),
             RuntimeValue::Bytes(_) => panic!("empty range output became bytes"),
             RuntimeValue::TypedBlob(_) => panic!("empty range output became a blob"),
             RuntimeValue::Matrix(_) | RuntimeValue::HostMatrix { .. } => {
                 panic!("empty range output became a matrix")
+            }
+            RuntimeValue::IntegerValues(_) => {
+                panic!("empty range output became resident integer values")
             }
             RuntimeValue::SmallMatrix(_) => panic!("empty range output became a small matrix"),
             RuntimeValue::Preimage(_) => panic!("empty range output became a preimage"),

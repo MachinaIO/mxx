@@ -320,6 +320,222 @@ fn ordinary_graph(parameters: &GpuDCRTPolyParams) -> mxx_ir_core::ValidatedGraph
 
 #[test]
 #[serial_test::serial(gpu_context)]
+fn test_gpu_trapdoor_capture_replays_into_fresh_public_owners() {
+    use mxx_primitives::matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix};
+
+    let device = detected_gpu_device_ids().into_iter().next().expect("GPU required");
+    let parameters = GpuDCRTPolyParams::new_with_gpu(
+        8,
+        vec![131_009, 130_817],
+        8,
+        vec![device],
+        None,
+        None,
+        None,
+    );
+    let ring = Ring::new(
+        BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+        parameters.ring_dimension() as usize,
+    );
+    let trapdoor = ring.sample_trapdoor(1, 1, 256, parameters.modulus_digits(), 10_000_000);
+    let graph = DslContext::new("trapdoor-capture-replay")
+        .output("public", trapdoor.public_matrix())
+        .expect("public output")
+        .transferred_trapdoor_output("secret", trapdoor)
+        .expect("secret output")
+        .build()
+        .expect("trapdoor graph")
+        .validate(&ParamEnv::default())
+        .expect("validated graph");
+    let mut provider = ProductionGpuWarmupProvider::new(
+        vec![(gpu_backend_on([parameters.clone()], [device]), device)],
+        GpuWarmupMeasurementConfig {
+            warm_up_iterations: 0,
+            measured_iterations: 1,
+            memory_poll_interval: Duration::ZERO,
+        },
+    );
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
+        &graph,
+        &config(&graph, &parameters, device),
+        &mut provider,
+    )
+    .expect("measure trapdoor production path");
+    let measured_costs = provider.measured_costs().clone();
+    let backend = gpu_backend_on([parameters.clone()], [device]);
+    warmup.plan.contract = backend
+        .gpu_runtime_contract(&graph, &BTreeMap::new())
+        .expect("runtime contract")
+        .expect("GPU contract");
+    let prepared = super::GpuPreparedSetup {
+        validated: Arc::new(graph),
+        plan_index: crate::gpu_execution_plan::FrozenGpuPlanIndex::build(&warmup.plan)
+            .expect("plan index"),
+        plan: Arc::new(warmup.plan),
+        measured_costs,
+        report: warmup.report,
+    };
+    let mut runtime = crate::gpu_runtime::GpuRuntime::new(backend).expect("runtime");
+    let mut plan = runtime.plan_from_prepared(prepared, BTreeMap::new()).expect("trapdoor capture");
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        outputs.push(
+            runtime
+                .execute(&mut plan, BTreeMap::new(), &mut MemoryArtifactStore::default(), [0; 32])
+                .expect("trapdoor replay"),
+        );
+    }
+    let mut public_addresses = Vec::new();
+    for output in &outputs {
+        let RuntimeValue::Matrix(public) = &output.outputs["public"] else {
+            panic!("public matrix required")
+        };
+        let RuntimeValue::Trapdoor { public: secret_public, secret: Some(secret), .. } =
+            &output.outputs["secret"]
+        else {
+            panic!("resident trapdoor required")
+        };
+        assert_eq!(public.as_ref(), secret_public.as_ref());
+        let [shard] = public.shards() else { panic!("one public owner required") };
+        let identity = GpuDCRTPolyMatrix::identity_columns(&parameters, 1, 0, 1);
+        assert_eq!(shard.value.slice_columns(1, 2), identity);
+        public_addresses
+            .push(shard.value.binding_components().expect("public binding")[0].data_address);
+        for component in [
+            crate::gpu_compiled::NativeValueComponent::TrapdoorR,
+            crate::gpu_compiled::NativeValueComponent::TrapdoorE,
+            crate::gpu_compiled::NativeValueComponent::TrapdoorCovarianceA,
+            crate::gpu_compiled::NativeValueComponent::TrapdoorCovarianceB,
+            crate::gpu_compiled::NativeValueComponent::TrapdoorCovarianceD,
+        ] {
+            assert_eq!(
+                secret.capture_binding_components(component).expect("secret binding").len(),
+                1
+            );
+        }
+    }
+    assert_ne!(public_addresses[0], public_addresses[1], "replays need fresh output allocations");
+    assert!(plan.compiled_launch_count() >= 2);
+}
+
+#[test]
+#[serial_test::serial(gpu_context)]
+fn test_gpu_preimage_capture_replays_relation_into_fresh_owners() {
+    use mxx_primitives::matrix::{PolyMatrix, PolyMatrixSmallRhs, SmallPolyMatrix};
+    let device = detected_gpu_device_ids().into_iter().next().expect("GPU required");
+    // Keep the default small while permitting wider capture coverage locally.
+    let columns = std::env::var("MXX_TEST_PREIMAGE_COLUMNS")
+        .map(|value| value.parse::<usize>().expect("positive preimage test columns"))
+        .unwrap_or(1);
+    assert!(columns > 0);
+    let parameters = GpuDCRTPolyParams::new_with_gpu(
+        8,
+        vec![131_009, 130_817],
+        8,
+        vec![device],
+        None,
+        None,
+        None,
+    );
+    let ring = Ring::new(
+        BigInt::from_biguint(Sign::Plus, parameters.modulus().as_ref().clone()),
+        parameters.ring_dimension() as usize,
+    );
+    let trapdoor = ring.sample_trapdoor(1, 1, 256, parameters.modulus_digits(), 10_000_000);
+    let target = ring.uniform_residue((1, columns));
+    let preimage =
+        trapdoor.sample_preimage(target.clone(), (parameters.modulus_digits() + 2, columns));
+    let public = trapdoor.public_matrix();
+    let graph = DslContext::new("preimage-capture-replay-relation")
+        .output("target", target)
+        .expect("target output")
+        .output("preimage", preimage)
+        .expect("preimage output")
+        .output("public", public)
+        .expect("public output")
+        .build()
+        .expect("preimage graph")
+        .validate(&ParamEnv::default())
+        .expect("validated graph");
+    let mut provider = ProductionGpuWarmupProvider::new(
+        vec![(gpu_backend_on([parameters.clone()], [device]), device)],
+        GpuWarmupMeasurementConfig {
+            warm_up_iterations: 0,
+            measured_iterations: 1,
+            memory_poll_interval: Duration::ZERO,
+        },
+    );
+    let mut warmup = crate::gpu_warmup::warmup_gpu_from_validated_with_provider(
+        &graph,
+        &config(&graph, &parameters, device),
+        &mut provider,
+    )
+    .expect("measure preimage production path");
+    let measured_costs = provider.measured_costs().clone();
+    let backend = gpu_backend_on([parameters.clone()], [device]);
+    warmup.plan.contract = backend
+        .gpu_runtime_contract(&graph, &BTreeMap::new())
+        .expect("runtime contract")
+        .expect("GPU contract");
+    let prepared = super::GpuPreparedSetup {
+        validated: Arc::new(graph),
+        plan_index: crate::gpu_execution_plan::FrozenGpuPlanIndex::build(&warmup.plan)
+            .expect("plan index"),
+        plan: Arc::new(warmup.plan),
+        measured_costs,
+        report: warmup.report,
+    };
+    let mut runtime = crate::gpu_runtime::GpuRuntime::new(backend).expect("runtime");
+    let mut plan = runtime.plan_from_prepared(prepared, BTreeMap::new()).expect("preimage capture");
+    let mut outputs = Vec::new();
+    let mut oracle_backend = gpu_backend_on([parameters.clone()], [device]);
+    for replay in 0..2 {
+        let output = runtime
+            .execute(
+                &mut plan,
+                BTreeMap::new(),
+                &mut MemoryArtifactStore::default(),
+                rand::random(),
+            )
+            .expect("preimage graph replay");
+        let RuntimeValue::Matrix(target) = &output.outputs["target"] else {
+            panic!("matrix target required")
+        };
+        let RuntimeValue::Matrix(public) = &output.outputs["public"] else {
+            panic!("public matrix required")
+        };
+        let RuntimeValue::Preimage(preimage) = &output.outputs["preimage"] else {
+            panic!("compact preimage required")
+        };
+        let public = oracle_backend.gather_matrix_for_host(public).expect("public matrix");
+        let target = oracle_backend.gather_matrix_for_host(target).expect("target matrix");
+        for shard in preimage.shards() {
+            let relation = public.multiply_small_rhs(&shard.value).expect("GPU relation oracle");
+            assert_eq!(
+                relation,
+                target.slice_columns(
+                    shard.global_column_start,
+                    shard.global_column_start + shard.value.columns()
+                ),
+                "A * preimage must equal target on replay {replay}"
+            );
+        }
+        outputs.push(output);
+    }
+    let addresses = outputs
+        .iter()
+        .map(|output| {
+            let RuntimeValue::Preimage(preimage) = &output.outputs["preimage"] else {
+                panic!("compact preimage required")
+            };
+            preimage.binding_descriptors().expect("preimage binding")[0].payload_address
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(addresses[0], addresses[1], "replay must rebind fresh compact owners");
+}
+
+#[test]
+#[serial_test::serial(gpu_context)]
 fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
     let device = detected_gpu_device_ids()
         .into_iter()
@@ -416,6 +632,7 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
 
     let measured_calls = provider.warmup_measurement_call_count();
     let call_counter = provider.warmup_measurement_counter();
+    let measured_costs = provider.measured_costs().clone();
     drop(provider);
     gpu_device_sync();
 
@@ -439,18 +656,24 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         .expect("runtime contract")
         .expect("GPU contract");
     warmup.plan.validate().expect("frozen plan validation");
-    let output = execute(
-        &graph,
-        &mut backend,
-        BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32]))]),
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-        ExecutionConfig {
-            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
-            ..ExecutionConfig::default()
-        },
-    )
-    .expect("fixed execution must use the frozen measured plan");
+    let prepared = super::GpuPreparedSetup {
+        validated: Arc::new(graph.clone()),
+        plan_index: crate::gpu_execution_plan::FrozenGpuPlanIndex::build(&warmup.plan)
+            .expect("index measured plan"),
+        plan: Arc::new(warmup.plan.clone()),
+        measured_costs,
+        report: warmup.report,
+    };
+    let mut runtime =
+        crate::gpu_runtime::GpuRuntime::new(backend).expect("construct compiled runtime");
+    let inputs = BTreeMap::from([("hash-key".to_owned(), RuntimeValue::Bytes(vec![0x57; 32]))]);
+    let mut plan = runtime
+        .plan_from_prepared(prepared, inputs.clone())
+        .expect("compile the frozen measured plan");
+    let output = runtime
+        .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [0; 32])
+        .expect("fixed execution must use the frozen measured plan");
+    assert!(plan.compiled_launch_count() > 0, "ordinary primitives must launch compiled GPU work");
 
     assert_eq!(output.outputs.len(), graph.source.outputs().len());
     assert!(
@@ -486,12 +709,12 @@ fn dsl_ordinary_primitives_complete_measured_fixed_lifecycle() {
         "trapdoor sampling must be frozen"
     );
     assert_eq!(
-        backend.fixed_single_device_constant_call_count(),
+        runtime.backend().fixed_single_device_constant_call_count(),
         single_device_constant_count,
         "single-device constants must use the metadata-bearing fixed path"
     );
     assert_eq!(
-        backend.fixed_trapdoor_call_count(),
+        runtime.backend().fixed_trapdoor_call_count(),
         1,
         "trapdoor sampling must use the metadata-bearing fixed path"
     );

@@ -22,6 +22,7 @@ use crate::{
         poly_gpu::{GpuDcrtBackend, gpu_backend_on},
     },
     executor::{ExecutionConfig, ExecutionPlan, execute},
+    gpu_calibration::GpuColumnWidths,
     gpu_column_policy::{
         CanonicalWarmupProfileDomain, EffectiveGpuOperation, FusedWarmupOperation,
         WarmupMeasurementKind,
@@ -351,9 +352,20 @@ fn dsl_to_fixed_gpu_lifecycle_is_table_driven_and_measured() {
     ];
 
     for case in cases {
-        let mut execution_backend = gpu_backend_on([parameters.clone()], [device]);
-        execution_backend.select_operation([0xD0 + case as u8; 32]).expect("select operation");
-        let scenario = scenario(case, &parameters, &mut execution_backend);
+        let scenario = {
+            let mut oracle_backend = gpu_backend_on([parameters.clone()], [device]);
+            let oracle_operation = [0xD0 + case as u8; 32];
+            // The oracle needs a bounded wave, not an allocator-wide pilot.
+            // Production measurement and execution use independent backends
+            // below and must derive their widths from the measured plan.
+            oracle_backend.set_column_widths_for_operation(
+                oracle_operation,
+                GpuColumnWidths { gpu0: 1, nonzero: None },
+            );
+            oracle_backend.select_operation(oracle_operation).expect("select oracle operation");
+            scenario(case, &parameters, &mut oracle_backend)
+        };
+        let execution_backend = gpu_backend_on([parameters.clone()], [device]);
         let harness = GpuWarmupMeasurementConfig {
             warm_up_iterations: 0,
             measured_iterations: 1,
@@ -413,6 +425,7 @@ fn dsl_to_fixed_gpu_lifecycle_is_table_driven_and_measured() {
 
         let calls = provider.warmup_measurement_counter();
         let count = provider.warmup_measurement_call_count();
+        let measured_costs = provider.measured_costs().clone();
         drop(provider);
         gpu_device_sync();
 
@@ -421,23 +434,28 @@ fn dsl_to_fixed_gpu_lifecycle_is_table_driven_and_measured() {
             .expect("runtime contract query")
             .expect("GPU backend contract");
         warmup.plan.validate().expect("frozen plan validation");
-        let output = execute(
-            &scenario.graph,
-            &mut execution_backend,
-            scenario.inputs,
-            &mut MemoryArtifactStore::default(),
-            SamplingMode::Fresh,
-            ExecutionConfig {
-                plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
-                ..ExecutionConfig::default()
-            },
-        )
-        .unwrap_or_else(|error| panic!("{case:?} fixed execution must complete: {error}"));
+        let prepared = super::GpuPreparedSetup {
+            validated: Arc::new(scenario.graph.clone()),
+            plan_index: crate::gpu_execution_plan::FrozenGpuPlanIndex::build(&warmup.plan)
+                .expect("index measured plan"),
+            plan: Arc::new(warmup.plan),
+            measured_costs,
+            report: warmup.report,
+        };
+        let mut runtime = crate::gpu_runtime::GpuRuntime::new(execution_backend)
+            .expect("construct compiled runtime");
+        let mut plan = runtime
+            .plan_from_prepared(prepared, scenario.inputs.clone())
+            .unwrap_or_else(|error| panic!("{case:?} measured plan must compile: {error}"));
+        let output = runtime
+            .execute(&mut plan, scenario.inputs, &mut MemoryArtifactStore::default(), [0; 32])
+            .unwrap_or_else(|error| panic!("{case:?} fixed execution must complete: {error}"));
+        assert!(plan.compiled_launch_count() > 0, "{case:?} must launch compiled GPU work");
         for (name, expected) in scenario.expected_outputs {
             let RuntimeValue::Matrix(actual) = &output.outputs[&name] else {
                 panic!("{case:?} output {name} is not a matrix");
             };
-            assert_eq!(execution_backend.matrix_to_bytes(actual), expected, "{case:?}/{name}");
+            assert_eq!(runtime.backend().matrix_to_bytes(actual), expected, "{case:?}/{name}");
         }
         assert_eq!(calls.load(Ordering::SeqCst), count, "fixed execution re-entered provider");
     }
@@ -573,7 +591,7 @@ fn dsl_preimage_cold_warm_profile_and_fixed_sampling_are_one_lifecycle() {
 
 #[test]
 #[serial_test::serial(gpu_context)]
-fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
+fn dsl_polynomial_boundaries_measure_resident_gpu_then_execute_fixed() {
     let device = detected_gpu_device_ids()
         .into_iter()
         .next()
@@ -650,7 +668,7 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
         &mut provider,
     )
     .expect("host boundary warmup must complete");
-    let host_domains = [
+    let polynomial_domains = [
         CanonicalWarmupProfileDomain::ExtractCoefficient,
         CanonicalWarmupProfileDomain::ThresholdDecode,
         CanonicalWarmupProfileDomain::PackPolynomialCoefficients,
@@ -658,29 +676,23 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
         CanonicalWarmupProfileDomain::PolynomialValues,
     ];
     let records = provider.warmup_dispatch_records();
-    for domain in host_domains {
+    for domain in polynomial_domains {
         assert!(
             records.iter().any(|record| {
                 record.profile_domain == domain &&
-                    record.measurement == WarmupMeasurementKind::HostMeasured &&
+                    record.measurement == WarmupMeasurementKind::GpuMeasured &&
                     record.timing_scope == crate::backend::GpuWarmupTimingScope::LocalJob
             }),
-            "{domain:?} lacks measured host execution"
+            "{domain:?} lacks measured resident GPU execution"
+        );
+        assert!(
+            !records.iter().any(|record| {
+                record.profile_domain == domain &&
+                    record.timing_scope == crate::backend::GpuWarmupTimingScope::Transfer
+            }),
+            "{domain:?} must retain device-resident values between operations"
         );
     }
-    assert!(
-        records.iter().any(|record| {
-            matches!(
-                record.profile_domain,
-                CanonicalWarmupProfileDomain::ExtractCoefficient |
-                    CanonicalWarmupProfileDomain::ThresholdDecode |
-                    CanonicalWarmupProfileDomain::PackPolynomialCoefficients |
-                    CanonicalWarmupProfileDomain::PolynomialFromValues |
-                    CanonicalWarmupProfileDomain::PolynomialValues
-            ) && record.timing_scope == crate::backend::GpuWarmupTimingScope::Transfer
-        }),
-        "host-visible boundaries must also measure physical transfer"
-    );
     assert!(warmup.report.predicted_seconds.is_finite());
     assert!(warmup.report.predicted_seconds > 0.0);
     assert!(
@@ -693,6 +705,7 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
 
     let calls = provider.warmup_measurement_counter();
     let count = provider.warmup_measurement_call_count();
+    let measured_costs = provider.measured_costs().clone();
     drop(provider);
     gpu_device_sync();
     warmup.plan.contract = setup_backend
@@ -700,24 +713,38 @@ fn dsl_host_boundaries_measure_host_and_transfer_once_then_execute_fixed() {
         .expect("runtime contract query")
         .expect("GPU backend contract");
     warmup.plan.validate().expect("frozen host plan validation");
-    let output = execute(
-        &graph,
-        &mut setup_backend,
-        inputs,
-        &mut MemoryArtifactStore::default(),
-        SamplingMode::Fresh,
-        ExecutionConfig {
-            plan: ExecutionPlan::FrozenGpu(Arc::new(warmup.plan.clone())),
-            ..ExecutionConfig::default()
-        },
-    )
-    .expect("fixed host boundary execution must complete");
-    assert!(matches!(output.outputs["coefficient"], RuntimeValue::Int(_)));
-    assert!(matches!(output.outputs["decoded-0"], RuntimeValue::Int(_)));
-    assert!(matches!(output.outputs["decoded-1"], RuntimeValue::Int(_)));
+    let prepared = super::GpuPreparedSetup {
+        validated: Arc::new(graph.clone()),
+        plan_index: crate::gpu_execution_plan::FrozenGpuPlanIndex::build(&warmup.plan)
+            .expect("index measured plan"),
+        plan: Arc::new(warmup.plan),
+        measured_costs,
+        report: warmup.report,
+    };
+    let mut runtime =
+        crate::gpu_runtime::GpuRuntime::new(setup_backend).expect("construct compiled runtime");
+    let mut plan = runtime
+        .plan_from_prepared(prepared, inputs.clone())
+        .expect("compile resident polynomial boundaries");
+    let output = runtime
+        .execute(&mut plan, inputs, &mut MemoryArtifactStore::default(), [0; 32])
+        .expect("fixed resident polynomial execution must complete");
+    assert!(
+        plan.compiled_launch_count() > 0,
+        "polynomial boundaries must launch compiled GPU work"
+    );
+    for name in ["coefficient", "decoded-0", "decoded-1"] {
+        let RuntimeValue::IntegerValues(values) = &output.outputs[name] else {
+            panic!("{name} must remain a device-resident integer");
+        };
+        assert_eq!(runtime.backend().integer_values_len(values), 1);
+    }
     assert!(matches!(output.outputs["packed"], RuntimeValue::Matrix(_)));
     assert!(matches!(output.outputs["from-coefficients"], RuntimeValue::Matrix(_)));
-    assert!(matches!(output.outputs["values"], RuntimeValue::IndexedFamily(_)));
+    let RuntimeValue::IntegerValues(values) = &output.outputs["values"] else {
+        panic!("polynomial coefficients must remain device-resident");
+    };
+    assert_eq!(runtime.backend().integer_values_len(values), parameters.ring_dimension() as usize);
     assert_eq!(calls.load(Ordering::SeqCst), count, "fixed host execution re-entered provider");
     gpu_device_sync();
 }

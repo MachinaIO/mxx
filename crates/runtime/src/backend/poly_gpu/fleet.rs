@@ -5,11 +5,13 @@ use crate::{
     backend::{
         Backend, BackendStorageContract, BackendStorageDescriptor, DynamicFusedBatchRequest,
         FixedCompactOperationBatchRequest, FixedCompactUnaryOperation, FixedGadgetDecomposeRequest,
-        FixedGenerationOutput, FixedGenerationRequest, FixedOperationBatchRequest,
-        FixedTrapdoorRequest, FusedBatchOutput, FusedBatchRequest, IndexRange,
-        MatrixMulAccumulateRequest, PlannedLayoutMetadata, PlannedNodeBatchRequest,
-        PlannedOperandMetadata, RuntimeValue, SampleRange, validate_backend_storage_contract,
+        FixedGenerationOutput, FixedGenerationRequest, FixedOperationBatchOutput,
+        FixedOperationBatchRequest, FixedTrapdoorRequest, FusedBatchOutput, FusedBatchRequest,
+        IndexRange, MatrixMulAccumulateRequest, PlannedLayoutMetadata, PlannedNodeBatchRequest,
+        PlannedOperandMetadata, PreimageRequest, RuntimeValue, SampleRange,
+        validate_backend_storage_contract,
     },
+    executor::gpu_capture::{CaptureOperation, CaptureStep},
     gpu_calibration::{
         FrozenGpuCalibrationRegistry, GpuCalibrationError, GpuCalibrationKey,
         GpuCalibrationProfile, GpuColumnWidths, GpuDeviceCalibration, GpuDeviceMemory,
@@ -20,10 +22,24 @@ use crate::{
         GpuFragmentClass, GpuRouteResolutionInput, GpuTransferRoute,
         map_output_range_to_inputs_with_output, resolve_gpu_route,
     },
+    gpu_compiled::{
+        BindingAccess, BindingSource, CapturedMatrixInputLayout,
+        CompiledResidentControlInstruction, CompiledResidentControlProgram, NativeIntegerEncoding,
+        NativeValueComponent, RegionBinding, ResidentControlInstructionKind,
+        ResidentControlOperation, ResidentControlOutput, ResidentInstructionId,
+        ResidentNativeFused, ResidentNativeGeneration, ResidentNativeInstruction,
+        ResidentNativeOrdinary, ResidentNativePrepared, ResidentNativeUnary, ResidentPhaseId,
+        ResidentPhysicalBinding, ResidentPhysicalBindingSelection, ResidentRegionId,
+        ResidentSlotType, ResidentTypedSlot, ValueSlot,
+    },
     gpu_execution_plan::{
         FrozenGpuPlan, FrozenGpuPlanIndex, GpuDeviceBudget, GpuExecutionSiteKey, GpuFusedUnionJob,
         GpuNodeChoice, GpuPlanContract, fused_union_waves_lazy,
     },
+    gpu_preimage_scheduler::{
+        PreimageBodyCaptureAdapter, PreimageBodyCaptureRequest, PreimageRetryMetadata,
+    },
+    gpu_runtime_control::ResidentOwner,
     gpu_schedule::{GpuColumnInterval, GpuColumnJob, GpuColumnSchedule},
 };
 use mxx_ir_core::{
@@ -31,22 +47,29 @@ use mxx_ir_core::{
     artifact::{ConcreteBoundedMatrixSchema, SmallMatrixSemanticKind},
     encoding::{hash_canonical, spec_hash},
     expr::IntExpr,
-    node::{ConcatAxis, ConstantMatrix, MatrixBinaryOp, NodeKind},
-    types::{ConcreteMatrixType, ConcreteWireType},
+    node::{ConcatAxis, ConstantMatrix, IntBinaryOp, IntCompareOp, MatrixBinaryOp, NodeKind},
+    types::{ConcreteMatrixType, ConcreteWireType, WireRef},
 };
 use mxx_primitives::{
     matrix::{
         PolyMatrix, PolyMatrixColumnSource, PolyMatrixSmallRhs, SmallPolyMatrix,
         gpu_dcrt_poly::{
-            GpuCompactMatrixEncoding, GpuDCRTPolyMatrix, GpuSmallMatrix, GpuSmallMatrixColumnView,
-            decode_compact_matrix_bytes,
+            GpuCompactMatrixEncoding, GpuDCRTPolyMatrix, GpuMatrixBindingComponent,
+            GpuMatrixFamilyDescriptorTable, GpuMatrixLaneBinaryOperation,
+            GpuMatrixLaneDestinationTable, GpuMatrixOutputDescriptor, GpuSmallMatrix,
+            GpuSmallMatrixBindingDescriptor, GpuSmallMatrixColumnView,
+            GpuSmallMatrixOutputDescriptor, decode_compact_matrix_bytes,
         },
     },
     poly::{
-        Poly, PolyParams,
+        PolyParams,
         dcrt::gpu::{
-            GpuDCRTPolyParams, gpu_default_mempool_reset_high_water, gpu_default_mempool_usage,
-            gpu_device_identity, gpu_device_memory_usage,
+            GpuCaptureScope, GpuDCRTPoly, GpuDCRTPolyParams, GpuGraphBindingValue,
+            GpuIntegerOperation, GpuModulusConversionPlan, GpuNativeEvent, GpuNativeGraphError,
+            GpuNativeGraphExec, GpuNativeLaunchStream, GpuPreimageRetrySpec, GpuSignedValues,
+            GpuSignedValuesBinding, GpuSignedValuesEncoding, GpuThresholdDecodeScratch,
+            gpu_default_mempool_reset_high_water, gpu_default_mempool_usage, gpu_device_identity,
+            gpu_device_memory_usage,
         },
     },
     sampler::{
@@ -55,8 +78,10 @@ use mxx_primitives::{
         trapdoor::{
             GpuDCRTPolyTrapdoorSampler, GpuDCRTTrapdoor,
             gpu::{
-                FixedPreimageConfig, PreimageAllocationEvidence, PreimageAllocationEvidenceKind,
-                PreimageCacheState,
+                FixedPreimageConfig, GpuPreimageBodyAllocation, GpuPreimageBodyScratch,
+                GpuPreimageBodyTypedRequest, PreimageAllocationEvidence,
+                PreimageAllocationEvidenceKind, PreimageCacheState, PreimageLaunchControl,
+                PreimageStatus,
             },
         },
     },
@@ -67,7 +92,7 @@ use rayon::prelude::*;
 use std::{
     any::Any,
     borrow::Cow,
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     ops::Range,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -81,6 +106,715 @@ use std::{
 const SHARED_POOL_CALIBRATION_ERROR: &str =
     "GPU calibration cannot reset a pool shared by multiple contexts";
 const MAX_RUNTIME_PILOT_ATTEMPTS: usize = 4;
+
+fn prepare_capture_owner(owner: &GpuCaptureOwner<'_>) -> Result<(), GpuCaptureAdapterError> {
+    match owner {
+        GpuCaptureOwner::Matrix(value) => value.prepare_external_for_capture()?,
+        GpuCaptureOwner::SmallMatrix(value) => value.prepare_external_for_capture()?,
+        GpuCaptureOwner::TrapdoorPair { public, secret } => {
+            public.prepare_external_for_capture()?;
+            secret.prepare_external_for_capture()?;
+        }
+        GpuCaptureOwner::IntegerValues(value) => value.native().prepare_external_for_capture()?,
+    }
+    Ok(())
+}
+
+/// Resolve a primitive's typed local operand to the immutable region-global
+/// binding ID.  Native launch wrappers use small operation-local IDs; the
+/// region schema is the only authority for translating those IDs to replay
+/// owners.  In particular, do not use the vector position: schemas may be
+/// sparse and a repeated typed source is an error rather than an arbitrary
+/// first match.
+fn schema_binding_index(
+    bindings: &[RegionBinding],
+    slot: ValueSlot,
+    shard: u32,
+    component: NativeValueComponent,
+) -> Result<u32, GpuNativeGraphError> {
+    let mut matches = bindings.iter().filter_map(|binding| {
+        matches!(
+            binding.source,
+            BindingSource::ValueComponent {
+                slot: binding_slot,
+                shard: binding_shard,
+                component: binding_component,
+                address_addend: 0,
+            } if binding_slot == slot && binding_shard == shard && binding_component == component
+        )
+        .then_some(binding.index)
+    });
+    let Some(index) = matches.next() else {
+        return Err(GpuNativeGraphError::Native(format!(
+            "capture binding schema is missing slot {slot:?}, shard {shard}, component {component:?}"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(GpuNativeGraphError::Native(format!(
+            "capture binding schema duplicates slot {slot:?}, shard {shard}, component {component:?}"
+        )));
+    }
+    Ok(index)
+}
+
+fn schema_binding_source(
+    bindings: &[RegionBinding],
+    access: BindingAccess,
+    component: NativeValueComponent,
+) -> Result<(ValueSlot, u32), GpuNativeGraphError> {
+    let mut matches = bindings.iter().filter_map(|binding| {
+        (binding.access == access).then_some(&binding.source).and_then(|source| {
+            let BindingSource::ValueComponent {
+                slot,
+                shard,
+                component: source_component,
+                address_addend: 0,
+            } = *source
+            else {
+                return None;
+            };
+            (source_component == component).then_some((slot, shard))
+        })
+    });
+    let Some(source) = matches.next() else {
+        return Err(GpuNativeGraphError::Native(format!(
+            "capture binding schema has no {access:?} {component:?} source"
+        )));
+    };
+    if matches.next().is_some() {
+        return Err(GpuNativeGraphError::Native(format!(
+            "capture binding schema has multiple {access:?} {component:?} sources"
+        )));
+    }
+    Ok(source)
+}
+
+fn set_capture_binding_sources(
+    capture: &mut GpuCaptureScope,
+    bindings: &[RegionBinding],
+    sources: &[(u32, ValueSlot, u32, NativeValueComponent)],
+) -> Result<(), GpuNativeGraphError> {
+    let mappings = sources
+        .iter()
+        .map(|(local, slot, shard, component)| {
+            Ok((*local, schema_binding_index(bindings, *slot, *shard, *component)?))
+        })
+        .collect::<Result<Vec<_>, GpuNativeGraphError>>()?;
+    capture.set_binding_map(&mappings)
+}
+
+fn set_resident_integer_binding_map(
+    capture: &mut GpuCaptureScope,
+    program: &GpuResidentCaptureProgram,
+    output: ValueSlot,
+    lhs: Option<ValueSlot>,
+    rhs: Option<ValueSlot>,
+    status: Option<ValueSlot>,
+    auxiliary: Option<ValueSlot>,
+) -> Result<(), GpuNativeGraphError> {
+    let mut sources = vec![(0, output, 0, NativeValueComponent::IntegerValues)];
+    if let Some(lhs) = lhs {
+        sources.push((1, lhs, 0, NativeValueComponent::IntegerValues));
+    }
+    if let Some(rhs) = rhs {
+        sources.push((2, rhs, 0, NativeValueComponent::IntegerValues));
+    }
+    if let Some(status) = status {
+        sources.push((3, status, 0, NativeValueComponent::IntegerValues));
+    }
+    if let Some(auxiliary) = auxiliary {
+        sources.push((4, auxiliary, 0, NativeValueComponent::IntegerValues));
+    }
+    set_capture_binding_sources(capture, &program.bindings, &sources)
+}
+
+fn capture_schema_sources(
+    bindings: &[RegionBinding],
+    access: BindingAccess,
+    component: NativeValueComponent,
+) -> Vec<(ValueSlot, u32, NativeValueComponent)> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            if binding.access != access {
+                return None;
+            }
+            let BindingSource::ValueComponent {
+                slot,
+                shard,
+                component: source_component,
+                address_addend: 0,
+            } = binding.source
+            else {
+                return None;
+            };
+            (source_component == component).then_some((slot, shard, component))
+        })
+        .collect()
+}
+
+fn fixed_descriptor_input_bindings(
+    request: &GpuCaptureRequest,
+    operation: crate::gpu_column_policy::EffectiveGpuOperation,
+    physical_device: i32,
+    source_addresses: &[(u64, usize, u32)],
+) -> Result<Option<Vec<u32>>, GpuNativeGraphError> {
+    if let GpuCaptureRequest::Fused(requests) = request {
+        if let Some(FusedBatchRequest::TensorRowSums { source, right, .. }) = requests.first() {
+            if source_addresses.is_empty() {
+                return Ok(None);
+            }
+            let matrices = [source.as_ref(), right.as_ref()];
+            return matrices
+                .into_iter()
+                .map(|matrix| {
+                    let descriptor = matrix
+                        .binding_components()?
+                        .into_iter()
+                        .find(|component| component.physical_device == physical_device)
+                        .ok_or_else(|| {
+                            GpuNativeGraphError::Native(
+                                "fused tensor row-sum input has no capture-device binding".into(),
+                            )
+                        })?
+                        .device_descriptors_address;
+                    source_addresses
+                        .iter()
+                        .find(|(address, _, _)| *address == descriptor)
+                        .map(|(_, _, binding)| *binding)
+                        .ok_or_else(|| {
+                            GpuNativeGraphError::Native(
+                                "fused tensor row-sum input descriptor is not retained by the capture schema"
+                                    .into(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some);
+        }
+    }
+    if source_addresses.is_empty() {
+        return Ok(None);
+    }
+    let matrices = if !matches!(
+        operation,
+        crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixSubtract |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMultiply |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulAccumulate |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulSmallRhs |
+            crate::gpu_column_policy::EffectiveGpuOperation::Tensor
+    ) {
+        return Ok(None);
+    } else {
+        match operation {
+            crate::gpu_column_policy::EffectiveGpuOperation::Tensor => match request {
+                GpuCaptureRequest::Fused(requests) => {
+                    let Some(FusedBatchRequest::TensorRowSums { source, right, .. }) =
+                        requests.first()
+                    else {
+                        return Err(GpuNativeGraphError::Native(
+                            "fused tensor row-sum capture has no request".into(),
+                        ));
+                    };
+                    vec![source.as_ref(), right.as_ref()]
+                }
+                GpuCaptureRequest::Ordinary(requests) => {
+                    let Some(request) = requests.first() else {
+                        return Err(GpuNativeGraphError::Native(
+                            "descriptor-product capture has no request".into(),
+                        ));
+                    };
+                    match request {
+                        FixedOperationBatchRequest::Tensor { left, right, .. } => {
+                            vec![left.as_ref(), right.as_ref()]
+                        }
+                        _ => {
+                            return Err(GpuNativeGraphError::Native(
+                                "tensor descriptor operation has an incompatible request".into(),
+                            ));
+                        }
+                    }
+                }
+                _ => return Ok(None),
+            },
+            _ => {
+                let GpuCaptureRequest::Ordinary(requests) = request else {
+                    return Ok(None);
+                };
+                let Some(request) = requests.first() else {
+                    return Err(GpuNativeGraphError::Native(
+                        "descriptor-product capture has no request".into(),
+                    ));
+                };
+                match request {
+                    FixedOperationBatchRequest::MatrixBinary {
+                        operation:
+                            MatrixBinaryOp::Add | MatrixBinaryOp::Subtract | MatrixBinaryOp::Multiply,
+                        left,
+                        right,
+                        ..
+                    } => vec![left.as_ref(), right.as_ref()],
+                    FixedOperationBatchRequest::MatrixMulSmallRhs { left, .. } => {
+                        vec![left.as_ref()]
+                    }
+                    FixedOperationBatchRequest::Tensor { left, right, .. } => {
+                        vec![left.as_ref(), right.as_ref()]
+                    }
+                    FixedOperationBatchRequest::MatrixMulAccumulate { request, .. } => request
+                        .products
+                        .first()
+                        .map(|(_, left, right)| vec![left.as_ref(), right.as_ref()])
+                        .ok_or_else(|| {
+                            GpuNativeGraphError::Native(
+                                "matrix-accumulate capture has no product".into(),
+                            )
+                        })?,
+                    _ => {
+                        return Err(GpuNativeGraphError::Native(
+                            "descriptor-product operation has an incompatible request".into(),
+                        ));
+                    }
+                }
+            }
+        }
+    };
+    matrices
+        .into_iter()
+        .map(|matrix| {
+            let descriptor = matrix
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "descriptor-product input has no capture-device binding".into(),
+                    )
+                })?
+                .device_descriptors_address;
+            source_addresses
+                .iter()
+                .find(|(address, _, _)| *address == descriptor)
+                .map(|(_, _, binding)| *binding)
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "descriptor-product input owner is not retained by the capture schema"
+                            .into(),
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Install the local ABI for a fixed native leaf.  The native wrappers use
+/// operation-local pointer fields, while `binding_schema` carries sparse
+/// region-global identities.  This helper intentionally has no positional
+/// fallback: an operation with an unsupported or ambiguous schema fails
+/// before it can launch under an identity map.
+fn set_fixed_leaf_binding_map(
+    capture: &mut GpuCaptureScope,
+    request: &GpuCaptureRequest,
+    operation: crate::gpu_column_policy::EffectiveGpuOperation,
+    bindings: &[RegionBinding],
+    limb_count: usize,
+    descriptor_inputs: Option<&[u32]>,
+) -> Result<(), GpuNativeGraphError> {
+    let input_data =
+        capture_schema_sources(bindings, BindingAccess::Input, NativeValueComponent::MatrixData);
+    let output_data =
+        capture_schema_sources(bindings, BindingAccess::Output, NativeValueComponent::MatrixData);
+    let input_descriptors = capture_schema_sources(
+        bindings,
+        BindingAccess::Input,
+        NativeValueComponent::MatrixDescriptors,
+    );
+    let output_descriptors = capture_schema_sources(
+        bindings,
+        BindingAccess::Output,
+        NativeValueComponent::MatrixDescriptors,
+    );
+    let input_compact = capture_schema_sources(
+        bindings,
+        BindingAccess::Input,
+        NativeValueComponent::CompactPayload,
+    );
+    let output_compact = capture_schema_sources(
+        bindings,
+        BindingAccess::Output,
+        NativeValueComponent::CompactPayload,
+    );
+    let mut mappings = Vec::new();
+    let mut push_range = |base: usize,
+                          source: (ValueSlot, u32, NativeValueComponent)|
+     -> Result<(), GpuNativeGraphError> {
+        for limb in 0..limb_count {
+            let local = u32::try_from(base.checked_add(limb).ok_or_else(|| {
+                GpuNativeGraphError::Native("fixed leaf binding map overflows usize".into())
+            })?)
+            .map_err(|_| {
+                GpuNativeGraphError::Native("fixed leaf binding map overflows u32".into())
+            })?;
+            mappings.push((local, source.0, source.1, source.2));
+        }
+        Ok(())
+    };
+    let fused_tensor_row_sum = matches!(
+        request,
+        GpuCaptureRequest::Fused(requests)
+            if matches!(requests.first(), Some(FusedBatchRequest::TensorRowSums { .. }))
+    );
+    if fused_tensor_row_sum {
+        if output_descriptors.is_empty() {
+            return Err(GpuNativeGraphError::Native(
+                "fused tensor row-sum leaf lacks typed lhs/rhs/output descriptor bindings".into(),
+            ));
+        }
+        let input_sources = if let Some(descriptor_inputs) = descriptor_inputs {
+            if descriptor_inputs.len() < 2 {
+                return Err(GpuNativeGraphError::Native(
+                    "fused tensor row-sum leaf has fewer descriptor identities than operands"
+                        .into(),
+                ));
+            }
+            descriptor_inputs
+                .iter()
+                .take(2)
+                .map(|index| {
+                    bindings
+                        .iter()
+                        .find(|binding| binding.index == *index)
+                        .and_then(|binding| match binding.source {
+                            BindingSource::ValueComponent {
+                                slot,
+                                shard,
+                                component: NativeValueComponent::MatrixDescriptors,
+                                address_addend: 0,
+                            } => Some((slot, shard, NativeValueComponent::MatrixDescriptors)),
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            GpuNativeGraphError::Native(
+                                "fused tensor row-sum descriptor identity is not typed".into(),
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else if input_descriptors.len() >= 2 {
+            input_descriptors[..2].to_vec()
+        } else {
+            return Err(GpuNativeGraphError::Native(
+                "fused tensor row-sum leaf lacks two typed input descriptor identities".into(),
+            ));
+        };
+        mappings.push((0, input_sources[0].0, input_sources[0].1, input_sources[0].2));
+        mappings.push((1, input_sources[1].0, input_sources[1].1, input_sources[1].2));
+        mappings.push((
+            2,
+            output_descriptors[0].0,
+            output_descriptors[0].1,
+            output_descriptors[0].2,
+        ));
+    } else {
+        match operation {
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixAdd |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixSubtract => {
+                if input_data.is_empty() || output_data.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "matrix elementwise leaf lacks typed lhs/rhs/output data bindings".into(),
+                    ));
+                }
+                // Schema order follows wire IDs, not operand order. Resolve
+                // both operands through their retained descriptor identities;
+                // repeated operands must retain the same input owner as well.
+                let operands = descriptor_inputs
+                    .map(|indices| {
+                        indices.iter().map(|index| {
+                            bindings.iter().find(|binding| binding.index == *index)
+                                .map(|binding| {
+                                    let BindingSource::ValueComponent { slot, shard, .. } = binding.source;
+                                    (slot, shard, NativeValueComponent::MatrixData)
+                                })
+                                .ok_or_else(|| GpuNativeGraphError::Native(
+                                    "matrix elementwise operand has no retained descriptor identity".into(),
+                                ))
+                        }).collect::<Result<Vec<_>, _>>()
+                    })
+                    .transpose()?;
+                let (left, right) = match operands.as_deref() {
+                    Some([left, right]) => (*left, *right),
+                    Some(_) => {
+                        return Err(GpuNativeGraphError::Native(
+                            "matrix elementwise leaf requires two operand identities".into(),
+                        ))
+                    }
+                    None => (input_data[0], input_data.get(1).copied().unwrap_or(output_data[0])),
+                };
+                push_range(0, left)?;
+                push_range(limb_count, right)?;
+                push_range(
+                    limb_count.checked_mul(2).ok_or_else(|| {
+                        GpuNativeGraphError::Native("fixed leaf binding map overflows usize".into())
+                    })?,
+                    output_data[0],
+                )?;
+            }
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixScale |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixNegate => {
+                if input_data.is_empty() || output_data.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "matrix unary leaf lacks typed input/output data bindings".into(),
+                    ));
+                }
+                push_range(0, input_data[0])?;
+                push_range(limb_count, output_data[0])?;
+            }
+            crate::gpu_column_policy::EffectiveGpuOperation::RingAutomorphism |
+            crate::gpu_column_policy::EffectiveGpuOperation::ModulusSwitch |
+            crate::gpu_column_policy::EffectiveGpuOperation::ModulusReduce |
+            crate::gpu_column_policy::EffectiveGpuOperation::RnsModUp |
+            crate::gpu_column_policy::EffectiveGpuOperation::RnsModDown |
+            crate::gpu_column_policy::EffectiveGpuOperation::BlockModSwitch |
+            crate::gpu_column_policy::EffectiveGpuOperation::CenteredRebase |
+            crate::gpu_column_policy::EffectiveGpuOperation::CenteredRoundDivide => {
+                if input_data.is_empty() || output_data.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "matrix conversion leaf lacks typed input/output data bindings".into(),
+                    ));
+                }
+                // Matrix copies reached while a conversion normalizes an input
+                // use the native copy ABI: destination locals precede source
+                // locals.  Conversion outputs are graph-internal during capture,
+                // so their destination identity only satisfies the explicit map;
+                // the source range is the retained input descriptor owner.
+                mappings.extend((0..limb_count).map(|limb| {
+                    (limb as u32, output_data[0].0, output_data[0].1, output_data[0].2)
+                }));
+                mappings.extend((0..limb_count).map(|limb| {
+                    ((limb_count + limb) as u32, input_data[0].0, input_data[0].1, input_data[0].2)
+                }));
+                if operation == crate::gpu_column_policy::EffectiveGpuOperation::BlockModSwitch {
+                    if input_descriptors.len() != 1 || output_descriptors.len() != 1 {
+                        return Err(GpuNativeGraphError::Native(
+                            "block modulus switch requires explicit source/output descriptor owners".into(),
+                        ));
+                    }
+                    let descriptor_base = u32::try_from(2 * limb_count).map_err(|_| {
+                        GpuNativeGraphError::Native("block modulus descriptor ID overflow".into())
+                    })?;
+                    let (slot, shard, component) = input_descriptors[0];
+                    mappings.push((descriptor_base, slot, shard, component));
+                    let (slot, shard, component) = output_descriptors[0];
+                    mappings.push((descriptor_base + 1, slot, shard, component));
+                }
+            }
+            crate::gpu_column_policy::EffectiveGpuOperation::Transpose |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMultiply |
+            crate::gpu_column_policy::EffectiveGpuOperation::Tensor |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulAccumulate |
+            crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulSmallRhs |
+            crate::gpu_column_policy::EffectiveGpuOperation::CrtRecompose => {
+                if input_descriptors.is_empty() || output_descriptors.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "matrix descriptor leaf lacks typed input/output descriptor bindings"
+                            .into(),
+                    ));
+                }
+                let input_source = descriptor_inputs
+                    .and_then(|inputs| inputs.first().copied())
+                    .and_then(|index| bindings.iter().find(|binding| binding.index == index))
+                    .and_then(|binding| match binding.source {
+                        BindingSource::ValueComponent {
+                            slot,
+                            shard,
+                            component,
+                            address_addend: 0,
+                        } if component == NativeValueComponent::MatrixDescriptors => {
+                            Some((slot, shard, component))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(input_descriptors[0]);
+                mappings.push((0, input_source.0, input_source.1, input_source.2));
+                if matches!(
+                    operation,
+                    crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulSmallRhs
+                ) {
+                    if input_compact.is_empty() {
+                        return Err(GpuNativeGraphError::Native(
+                            "small-RHS matrix leaf lacks typed compact input binding".into(),
+                        ));
+                    }
+                    mappings.push((1, input_compact[0].0, input_compact[0].1, input_compact[0].2));
+                    mappings.push((
+                        2,
+                        output_descriptors[0].0,
+                        output_descriptors[0].1,
+                        output_descriptors[0].2,
+                    ));
+                } else if matches!(
+                    operation,
+                    crate::gpu_column_policy::EffectiveGpuOperation::MatrixMultiply |
+                        crate::gpu_column_policy::EffectiveGpuOperation::MatrixMulAccumulate |
+                        crate::gpu_column_policy::EffectiveGpuOperation::Tensor
+                ) && input_descriptors.len() > 1
+                {
+                    let input_source = descriptor_inputs
+                        .and_then(|inputs| inputs.get(1).copied())
+                        .and_then(|index| bindings.iter().find(|binding| binding.index == index))
+                        .and_then(|binding| match binding.source {
+                            BindingSource::ValueComponent {
+                                slot,
+                                shard,
+                                component,
+                                address_addend: 0,
+                            } if component == NativeValueComponent::MatrixDescriptors => {
+                                Some((slot, shard, component))
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| input_descriptors[1]);
+                    mappings.push((1, input_source.0, input_source.1, input_source.2));
+                    mappings.push((
+                        2,
+                        output_descriptors[0].0,
+                        output_descriptors[0].1,
+                        output_descriptors[0].2,
+                    ));
+                } else {
+                    mappings.push((
+                        1,
+                        output_descriptors[0].0,
+                        output_descriptors[0].1,
+                        output_descriptors[0].2,
+                    ));
+                }
+            }
+            crate::gpu_column_policy::EffectiveGpuOperation::GadgetDecompose => {
+                if input_data.is_empty() || output_compact.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "decomposition leaf lacks typed input/output bindings".into(),
+                    ));
+                }
+                push_range(0, input_data[0])?;
+                mappings.push((1, output_compact[0].0, output_compact[0].1, output_compact[0].2));
+            }
+            crate::gpu_column_policy::EffectiveGpuOperation::ConcatRows |
+            crate::gpu_column_policy::EffectiveGpuOperation::ConcatColumns |
+            crate::gpu_column_policy::EffectiveGpuOperation::ConcatDiagonal => {
+                if input_data.is_empty() || output_data.is_empty() {
+                    return Err(GpuNativeGraphError::Native(
+                        "matrix concat leaf lacks typed input/output data bindings".into(),
+                    ));
+                }
+                mappings.extend((0..limb_count).map(|limb| {
+                    (limb as u32, output_data[0].0, output_data[0].1, output_data[0].2)
+                }));
+                mappings.extend((0..limb_count).map(|limb| {
+                    ((limb_count + limb) as u32, input_data[0].0, input_data[0].1, input_data[0].2)
+                }));
+            }
+            _ => {
+                if !input_compact.is_empty() && !output_compact.is_empty() {
+                    mappings.push((0, input_compact[0].0, input_compact[0].1, input_compact[0].2));
+                    mappings.push((
+                        1,
+                        output_compact[0].0,
+                        output_compact[0].1,
+                        output_compact[0].2,
+                    ));
+                } else if !output_data.is_empty() {
+                    push_range(0, output_data[0])?;
+                } else if !input_data.is_empty() {
+                    push_range(0, input_data[0])?;
+                } else {
+                    return Err(GpuNativeGraphError::Native(
+                        "fixed native leaf has no typed pointer bindings".into(),
+                    ));
+                }
+            }
+        }
+    }
+    set_capture_binding_sources(capture, bindings, &mappings)
+}
+
+fn matrix_capture_bindings(
+    value: &GpuFleetMatrix,
+    slot: ValueSlot,
+) -> Result<Vec<BindingSource>, GpuCaptureAdapterError> {
+    let components = value.binding_components().map_err(GpuCaptureAdapterError::Native)?;
+    components.iter().enumerate().try_fold(Vec::new(), |mut bindings, (shard, _)| {
+        let shard =
+            u32::try_from(shard).map_err(|_| GpuCaptureAdapterError::MissingBinding(slot))?;
+        for component in [
+            NativeValueComponent::MatrixData,
+            NativeValueComponent::MatrixDescriptors,
+            NativeValueComponent::MatrixAuxiliary,
+        ] {
+            bindings.push(BindingSource::ValueComponent {
+                slot,
+                shard,
+                component,
+                address_addend: 0,
+            });
+        }
+        Ok(bindings)
+    })
+}
+
+fn captured_owner_bindings(
+    owner: &CapturedOwner,
+    slot: ValueSlot,
+    schema: &[RegionBinding],
+) -> Result<Vec<RegionBinding>, GpuCaptureAdapterError> {
+    let mut available = Vec::new();
+    match owner {
+        CapturedOwner::Matrix(value) => available.extend(matrix_capture_bindings(value, slot)?),
+        CapturedOwner::SmallMatrix(value) => {
+            let descriptors =
+                value.binding_descriptors().map_err(GpuCaptureAdapterError::Native)?;
+            for (shard, _) in descriptors.iter().enumerate() {
+                let shard = u32::try_from(shard)
+                    .map_err(|_| GpuCaptureAdapterError::MissingBinding(slot))?;
+                for component in [
+                    NativeValueComponent::CompactPayload,
+                    NativeValueComponent::CompactHardCutoffStaging,
+                    NativeValueComponent::CompactDeviceStatus,
+                    NativeValueComponent::CompactHostStatus,
+                ] {
+                    available.push(BindingSource::ValueComponent {
+                        slot,
+                        shard,
+                        component,
+                        address_addend: 0,
+                    });
+                }
+            }
+        }
+        CapturedOwner::IntegerValues(value) => {
+            value.binding().map_err(GpuCaptureAdapterError::Native)?;
+            available.push(BindingSource::ValueComponent {
+                slot,
+                shard: 0,
+                component: NativeValueComponent::IntegerValues,
+                address_addend: 0,
+            });
+        }
+    }
+    let bindings = schema
+        .iter()
+        .filter(|binding| {
+            let BindingSource::ValueComponent { slot: source_slot, .. } = binding.source;
+            source_slot == slot
+        })
+        .filter(|binding| available.iter().any(|source| source == &binding.source))
+        .cloned()
+        .collect::<Vec<_>>();
+    if bindings.is_empty() {
+        return Err(GpuCaptureAdapterError::MissingBinding(slot));
+    }
+    Ok(bindings)
+}
 
 /// Typed failure returned by the setup-time production measurement adapters.
 /// CUDA allocation failures are distinguished from all other backend errors
@@ -219,6 +953,382 @@ pub trait GpuProductionCompletion {
     fn complete(&self);
 }
 
+/// Runtime-owned executable for one fixed GPU region.  The native graph and
+/// stream remain together so a replay cannot accidentally use another CUDA
+/// context or placement.
+pub struct GpuCompiledRegion {
+    pub region_id: u32,
+    pub physical_device: i32,
+    pub operation_identity: [u8; 32],
+    pub(crate) exec: GpuNativeGraphExec,
+    pub(crate) launch_stream: GpuNativeLaunchStream,
+    pub(crate) resource: Option<GpuCompiledRegionResource>,
+}
+
+/// Native allocations which must outlive the graph executable.  These are
+/// prepared before capture and owned by the compiled plan; replay only binds
+/// run-local matrix owners into the graph.
+pub(crate) enum GpuCompiledRegionResource {
+    /// Resources retained by one graph may come from several resident leaves.
+    /// Keep every allocation alive until the graph is dropped instead of
+    /// allowing the last leaf to overwrite an earlier submission resource.
+    Resources(Vec<GpuCompiledRegionResource>),
+    IntegerConstants(Vec<GpuSignedValues>),
+    Preimage(Box<GpuPreimageBodyAllocation>),
+    // This plan is retained solely for its native metadata lifetime; its
+    // submit operation has already been recorded in the graph.
+    ModulusConversion(GpuModulusConversionPlan),
+    /// A capture-time constant materialized before CUDA capture. The graph
+    /// copies from this stable owner into its bound output owner; keeping it
+    /// here prevents the captured source pointer from becoming dangling.
+    MatrixConstants(Vec<GpuFleetMatrix>),
+    /// Replicas materialized for a captured fixed job.  These owners are
+    /// graph-internal: their addresses are frozen in the graph and therefore
+    /// must not consume a runtime RegionBinding slot.
+    MatrixReplicas(Vec<Arc<GpuDCRTPolyMatrix>>),
+    /// Device-resident descriptor tables for matrix-family gathers. The
+    /// tables retain every family member until the executable is released.
+    MatrixFamilyTables(Vec<GpuMatrixFamilyDescriptorTable>),
+    /// Independent per-lane destination tables retained by lane-aware family
+    /// gathers. Their shallow owners keep each destination descriptor alive.
+    MatrixLaneDestinations(Vec<GpuMatrixLaneDestinationTable>),
+    /// Resident protocol status/scratch allocated before graph capture.  The
+    /// status owner is deliberately retained with the executable so a replay
+    /// never allocates while capture is active or observes protocol data on
+    /// the host. Writers bind their destination directly into the graph.
+    ProtocolValues {
+        status: GpuFleetSignedValues,
+        scratch: Option<GpuFleetSignedValues>,
+        threshold: Option<GpuThresholdDecodeScratch>,
+    },
+}
+
+pub(crate) struct GpuCaptureProtocolOwners {
+    status: GpuFleetSignedValues,
+    scratch: Option<GpuFleetSignedValues>,
+    threshold: Option<GpuThresholdDecodeScratch>,
+}
+
+struct ResidentNativeCapturePreparation {
+    request: Option<GpuCaptureRequest>,
+    output_storage: Vec<GpuCaptureOwnedOwner>,
+    protocol: Option<GpuCaptureProtocolOwners>,
+    lane_requests: Vec<ResidentLaneCapturePreparation>,
+}
+
+struct ResidentLaneCapturePreparation {
+    request: GpuCaptureRequest,
+    output_storage: Vec<GpuCaptureOwnedOwner>,
+    protocol: Option<GpuCaptureProtocolOwners>,
+    bindings: Box<[RegionBinding]>,
+}
+
+struct ResidentFamilyCapturePreparation {
+    table: GpuMatrixFamilyDescriptorTable,
+    destination: ResidentFamilyCaptureDestination,
+    destination_shard: Option<u32>,
+    source_columns: usize,
+}
+
+struct ResidentDirectFamilyCapturePreparation {
+    table: GpuMatrixFamilyDescriptorTable,
+    source_columns: usize,
+}
+
+enum ResidentFamilyCaptureDestination {
+    Packed(GpuFleetMatrix),
+    Lanes(GpuMatrixLaneDestinationTable),
+}
+
+/// A concrete owner used for the output side of a captured region.  The
+/// owner is borrowed only while the capture schema is built; the returned
+/// region contains slots, never Rust or CUDA pointers.
+pub(crate) enum GpuCaptureOwner<'a> {
+    Matrix(&'a mut GpuFleetMatrix),
+    SmallMatrix(&'a mut GpuFleetSmallMatrix),
+    TrapdoorPair { public: &'a mut GpuFleetMatrix, secret: &'a mut GpuFleetTrapdoor },
+    IntegerValues(&'a mut GpuFleetSignedValues),
+}
+
+/// Fresh owner allocated from a frozen output wire contract. It is retained
+/// only by the plan builder or one execution frame and is never stored in the
+/// compiled schema.
+pub(crate) enum GpuCaptureOwnedOwner {
+    Matrix(GpuFleetMatrix),
+    SmallMatrix(GpuFleetSmallMatrix),
+    TrapdoorPair { public: GpuFleetMatrix, secret: GpuFleetTrapdoor },
+    IntegerValues(GpuFleetSignedValues),
+}
+
+impl GpuCaptureOwnedOwner {
+    /// Move a capture allocation into the run-local value table.  The owner is
+    /// deliberately consumed here: no exemplar allocation can leak into the
+    /// frozen plan or be reused by a later frame.
+    pub(crate) fn into_runtime_value(
+        self,
+        wire_type: &ConcreteWireType,
+    ) -> Result<RuntimeValue<GpuDcrtBackend>, GpuCaptureAdapterError> {
+        match (self, wire_type) {
+            (Self::Matrix(value), ConcreteWireType::Matrix(_)) => {
+                Ok(RuntimeValue::Matrix(Arc::new(value)))
+            }
+            (
+                Self::Matrix(value),
+                ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
+            ) => Ok(RuntimeValue::Trapdoor {
+                public: Arc::new(value),
+                secret: None,
+                matrix_type: matrix.clone(),
+                sigma: sigma.evaluate_f64(&ParamEnv::default()).map_err(|error| {
+                    GpuCaptureAdapterError::UnsupportedOperation(error.to_string())
+                })?,
+                gadget_base: gadget_base.clone(),
+                digit_count: *digit_count,
+                gadget_small: Some(false),
+            }),
+            (
+                Self::TrapdoorPair { public, secret },
+                ConcreteWireType::Trapdoor { matrix, sigma, gadget_base, digit_count, .. },
+            ) => {
+                let sigma = sigma.evaluate_f64(&ParamEnv::default()).map_err(|error| {
+                    GpuCaptureAdapterError::UnsupportedOperation(error.to_string())
+                })?;
+                Ok(RuntimeValue::Trapdoor {
+                    secret: Some(Arc::new(secret)),
+                    public: Arc::new(public),
+                    matrix_type: matrix.clone(),
+                    sigma,
+                    gadget_base: gadget_base.clone(),
+                    digit_count: *digit_count,
+                    gadget_small: None,
+                })
+            }
+            (Self::SmallMatrix(value), ConcreteWireType::SmallMatrix { .. }) => {
+                Ok(RuntimeValue::SmallMatrix(Arc::new(value)))
+            }
+            (Self::SmallMatrix(value), ConcreteWireType::Preimage { .. }) => {
+                Ok(RuntimeValue::Preimage(Arc::new(value)))
+            }
+            (Self::IntegerValues(value), ConcreteWireType::Int | ConcreteWireType::Bool) => {
+                Ok(RuntimeValue::integer_values(value.slice(0..1)?))
+            }
+            (Self::IntegerValues(value), ConcreteWireType::IndexedFamily { .. }) => {
+                Ok(RuntimeValue::integer_values(value))
+            }
+            (_, other) => Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                "capture owner does not match output wire type {other:?}"
+            ))),
+        }
+    }
+}
+
+impl GpuCaptureOwnedOwner {
+    pub(crate) fn destination<'a>(&'a mut self, slot: ValueSlot) -> GpuCaptureDestinationOwner<'a> {
+        let owner = match self {
+            Self::Matrix(value) => GpuCaptureOwner::Matrix(value),
+            Self::SmallMatrix(value) => GpuCaptureOwner::SmallMatrix(value),
+            Self::TrapdoorPair { public, secret } => {
+                GpuCaptureOwner::TrapdoorPair { public, secret }
+            }
+            Self::IntegerValues(value) => GpuCaptureOwner::IntegerValues(value),
+        };
+        GpuCaptureDestinationOwner { slot, owner }
+    }
+}
+
+/// Associates a destination owner with the frame slot patched on replay.
+/// Requiring the slot here prevents the adapter from guessing the scheduler's
+/// wire numbering from a vector position.
+pub(crate) struct GpuCaptureDestinationOwner<'a> {
+    pub slot: ValueSlot,
+    pub owner: GpuCaptureOwner<'a>,
+}
+
+/// Concrete fixed request supplied by the scheduler after it has materialized
+/// the run-local input owners. `CaptureStep` remains the owner-free plan
+/// description; this value is the one-shot request consumed by the backend.
+pub(crate) enum GpuCaptureRequest {
+    Ordinary(
+        Vec<FixedOperationBatchRequest<GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetSignedValues>>,
+    ),
+    Fused(Vec<FusedBatchRequest<GpuFleetMatrix, GpuFleetSmallMatrix>>),
+    Compact(Vec<FixedCompactOperationBatchRequest<GpuFleetSmallMatrix>>),
+    /// Generated-column operations are kept separate from ordinary matrix
+    /// operations because their fixed backend path owns a sampler schedule.
+    Generation(Vec<FixedGenerationRequest>),
+    /// Gadget decomposition consumes resident matrix owners and produces a
+    /// compact owner without a host round trip.
+    Decomposition(Vec<FixedGadgetDecomposeRequest<GpuFleetMatrix>>),
+    /// Trapdoor sampling has a pair result (public matrix, secret owner), so
+    /// it cannot be represented by the matrix-only ordinary batch response.
+    Trapdoor(FixedTrapdoorRequest),
+    /// Preimage requests are retained as a lowering seam for the conditional
+    /// body adapter. They are never dispatched through the legacy fixed batch
+    /// sampler or a host retry loop.
+    Preimage(Vec<PreimageRequest<GpuFleetMatrix, GpuFleetTrapdoor>>),
+}
+
+fn is_modulus_conversion_capture_request(request: &GpuCaptureRequest) -> bool {
+    match request {
+        GpuCaptureRequest::Ordinary(requests) => {
+            matches!(
+                requests.as_slice(),
+                [FixedOperationBatchRequest::UnaryTransform {
+                    operation: crate::backend::FixedUnaryOperation::ReduceModulus { .. } |
+                        crate::backend::FixedUnaryOperation::ModulusSwitch { .. },
+                    ..
+                }]
+            )
+        }
+        _ => false,
+    }
+}
+
+fn is_centered_rebase_capture_request(request: &GpuCaptureRequest) -> bool {
+    match request {
+        GpuCaptureRequest::Ordinary(requests) => matches!(
+            requests.as_slice(),
+            [FixedOperationBatchRequest::UnaryTransform {
+                operation: crate::backend::FixedUnaryOperation::CenteredRebase { .. },
+                ..
+            }]
+        ),
+        _ => false,
+    }
+}
+
+fn is_centered_round_divide_capture_request(request: &GpuCaptureRequest) -> bool {
+    match request {
+        GpuCaptureRequest::Ordinary(requests) => matches!(
+            requests.as_slice(),
+            [FixedOperationBatchRequest::UnaryTransform {
+                operation: crate::backend::FixedUnaryOperation::CenteredRoundDivide { .. },
+                ..
+            }]
+        ),
+        _ => false,
+    }
+}
+
+pub(crate) struct GpuCaptureSubmission {
+    /// Complete region schema, including input bindings. Captured output
+    /// owners are checked against this schema before it is returned.
+    pub bindings: Box<[RegionBinding]>,
+    pub resource: Option<GpuCompiledRegionResource>,
+}
+
+/// A capture-only result owner. It is intentionally not part of
+/// `GpuCaptureSubmission` or `GpuCapturedRegion`: this value exists only until
+/// native binding descriptors have been copied into the frozen schema.
+enum CapturedOwner {
+    Matrix(GpuFleetMatrix),
+    SmallMatrix(GpuFleetSmallMatrix),
+    IntegerValues(GpuFleetSignedValues),
+}
+
+pub(crate) struct GpuCapturedRegion {
+    /// The instantiated CUDA graph. Exemplar owners are capture-scoped and
+    /// are never retained by the compiled plan; replay resolves bindings from
+    /// fresh frame owners.
+    pub native: GpuCompiledRegion,
+    /// Optional graph for the authoritative tail phase. It is captured
+    /// independently from `native`; callers must select it when the replay
+    /// lane window is smaller than the full wave. Keeping the two executables
+    /// separate prevents a tail from being appended to a full-wave graph.
+    pub bindings: Box<[RegionBinding]>,
+    pub(crate) phase_bindings: Option<Box<[ResidentPhysicalBinding]>>,
+    pub(crate) phase_binding_base: Option<u32>,
+    /// Resident captures carry the exact phase and wave window used to build
+    /// the executable. Fixed captures leave these unset. The runtime worker
+    /// must select by this identity rather than infer tail state from a root
+    /// region or widened matrix shape.
+    pub phase: Option<ResidentPhaseId>,
+    pub wave_base: Option<usize>,
+}
+
+impl GpuCapturedRegion {
+    pub(crate) fn matches_resident_phase(&self, phase: ResidentPhaseId) -> bool {
+        self.phase == Some(phase)
+    }
+
+    pub(crate) fn resident_phase_bindings(&self) -> Option<(&[ResidentPhysicalBinding], u32)> {
+        Some((self.phase_bindings.as_deref()?, self.phase_binding_base?))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GpuCaptureAdapterError {
+    #[error("capture request is empty")]
+    EmptyRequest,
+    #[error("capture operation is not a supported fixed special operation: {0}")]
+    UnsupportedOperation(String),
+    #[error("capture region has no destination owners")]
+    EmptyDestinations,
+    #[error("capture destination slot {0:?} has no native binding components")]
+    MissingBinding(ValueSlot),
+    #[error("fixed capture submission failed: {0}")]
+    Backend(#[from] PolyBackendError),
+    #[error("native capture owner validation failed: {0}")]
+    Native(#[from] GpuNativeGraphError),
+}
+
+impl GpuCompiledRegion {
+    pub(crate) fn update_preimage_execution_nonce(
+        &self,
+        execution_nonce: [u8; 32],
+    ) -> Result<(), GpuNativeGraphError> {
+        fn update(
+            resource: &GpuCompiledRegionResource,
+            execution_nonce: [u8; 32],
+        ) -> Result<(), GpuNativeGraphError> {
+            match resource {
+                GpuCompiledRegionResource::Resources(resources) => {
+                    resources.iter().try_for_each(|resource| update(resource, execution_nonce))
+                }
+                GpuCompiledRegionResource::Preimage(allocation) => {
+                    allocation.update_execution_nonce(execution_nonce)
+                }
+                _ => Ok(()),
+            }
+        }
+        self.resource.as_ref().map_or(Ok(()), |resource| update(resource, execution_nonce))
+    }
+
+    pub(crate) fn gate_protocol_status(
+        &self,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        fn gate(
+            resource: &GpuCompiledRegionResource,
+            completion: &GpuNativeEvent,
+        ) -> Result<(), GpuNativeGraphError> {
+            match resource {
+                GpuCompiledRegionResource::Resources(resources) => {
+                    resources.iter().try_for_each(|resource| gate(resource, completion))
+                }
+                GpuCompiledRegionResource::ProtocolValues { status, .. } => status
+                    .native()
+                    .read_control_status(completion)
+                    .and_then(|status| status.into_result())
+                    .map_err(|error| {
+                        GpuNativeGraphError::Native(format!(
+                            "resident polynomial primitive failed: {error}; outputs suppressed"
+                        ))
+                    }),
+                _ => Ok(()),
+            }
+        }
+        if let Some(resource) = &self.resource {
+            gate(resource, completion)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn launch_stream(&self) -> &GpuNativeLaunchStream {
+        &self.launch_stream
+    }
+}
+
 impl GpuProductionCompletion for () {
     fn complete(&self) {}
 }
@@ -253,7 +1363,12180 @@ impl GpuProductionCompletion for GpuFleetTrapdoor {
     }
 }
 
+/// A device-resident integer family owned by one physical fleet device.
+///
+/// Polynomial families are scalar native inputs/outputs: they are not column
+/// sharded and must never be represented as `Vec<BigInt>` in a fixed request.
+/// The owner retains the stream-ordered allocation and exposes the same
+/// binding/lifetime operations as matrix owners so capture and replay can
+/// patch the address without a host round trip.
+#[derive(Clone, Debug)]
+pub struct GpuFleetSignedValues {
+    device_id: i32,
+    values: GpuSignedValues,
+}
+
+impl GpuFleetSignedValues {
+    fn new(device_id: i32, values: GpuSignedValues) -> Self {
+        Self { device_id, values }
+    }
+
+    pub(crate) fn from_i64(
+        parameters: &GpuDCRTPolyParams,
+        device_id: i32,
+        values: &[i64],
+    ) -> Result<Self, GpuNativeGraphError> {
+        GpuSignedValues::upload(parameters, device_id, values)
+            .map(|values| Self::new(device_id, values))
+    }
+
+    pub(crate) fn allocate(
+        parameters: &GpuDCRTPolyParams,
+        device_id: i32,
+        count: usize,
+        encoding: GpuSignedValuesEncoding,
+    ) -> Result<Self, GpuNativeGraphError> {
+        GpuSignedValues::allocate(parameters, device_id, count, encoding)
+            .map(|values| Self::new(device_id, values))
+    }
+
+    pub(crate) fn device_id(&self) -> i32 {
+        self.device_id
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.values.count()
+    }
+
+    pub(crate) fn encoding(&self) -> GpuSignedValuesEncoding {
+        self.values.encoding()
+    }
+
+    pub(crate) fn native(&self) -> &GpuSignedValues {
+        &self.values
+    }
+
+    pub(crate) fn binding(&self) -> Result<GpuSignedValuesBinding, GpuNativeGraphError> {
+        self.values.binding()
+    }
+
+    pub(crate) fn slice(&self, range: Range<usize>) -> Result<Self, GpuNativeGraphError> {
+        self.values.slice(range).map(|values| Self::new(self.device_id, values))
+    }
+
+    pub(crate) fn copy_range_into(
+        &self,
+        source_range: Range<usize>,
+        destination: &Self,
+        destination_offset: usize,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values.copy_range_into(source_range, &destination.values, destination_offset, stream)
+    }
+
+    pub(crate) fn gather_into(
+        &self,
+        indices: &Self,
+        destination: &Self,
+        status: Option<&Self>,
+    ) -> Result<(), GpuNativeGraphError> {
+        if self.device_id != destination.device_id {
+            return Err(GpuNativeGraphError::Native(
+                "integer family gather requires source and destination on the same GPU".into(),
+            ));
+        }
+        if indices.device_id == destination.device_id {
+            return destination.values.integer_operation(
+                GpuIntegerOperation::Gather,
+                &self.values,
+                Some(&indices.values),
+                None,
+                0,
+                status.map(Self::native),
+            );
+        }
+
+        // The native gather kernel executes on the destination stream and
+        // therefore cannot dereference an index pointer resident on another
+        // GPU.  Route only the index family through peer D2D memory, retaining
+        // the producer event, then launch the same asynchronous gather.  No
+        // host readback or CPU-side index materialization is involved.
+        let routed_indices = indices.values.copy_to_device_like(&destination.values)?;
+        destination.values.integer_operation(
+            GpuIntegerOperation::Gather,
+            &self.values,
+            Some(&routed_indices),
+            None,
+            0,
+            status.map(Self::native),
+        )
+    }
+
+    pub(crate) fn wait_until_ready(&self) -> Result<(), GpuNativeGraphError> {
+        self.values.wait_until_ready()
+    }
+
+    pub(crate) fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values.wait_compiled_inputs(consumer_device, launch_stream, read_only)
+    }
+
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values.protect_compiled_submission(
+            consumer_device,
+            launch_stream,
+            completion,
+            read_only,
+        )
+    }
+
+    pub(crate) fn record_compiled_write(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values.record_compiled_write(launch_stream)
+    }
+
+    pub(crate) fn download_u64(&self) -> Result<Vec<u64>, GpuNativeGraphError> {
+        self.values.download_u64()
+    }
+}
+
+/// Flat capture metadata owns the lowered resident program and its immutable
+/// binding schema. Native control wrappers register pointer-bearing graph
+/// updates at the launch site; the owner arena is supplied separately for
+/// each capture/replay frame.
+pub(crate) struct GpuResidentCaptureProgram {
+    pub schema: CompiledResidentControlProgram,
+    pub bindings: Box<[RegionBinding]>,
+}
+
+pub(crate) enum GpuResidentOwnerRef<'a> {
+    // Resident frame owners are Arc-backed. Preserve the Arc in this
+    // projection so capture preparation can retain the physical allocation
+    // instead of invoking a deep value clone.
+    Matrix(&'a Arc<GpuFleetMatrix>),
+    SmallMatrix(&'a Arc<GpuFleetSmallMatrix>),
+    Trapdoor { public: &'a Arc<GpuFleetMatrix>, secret: &'a Arc<GpuFleetTrapdoor> },
+    Integer(&'a Arc<GpuFleetSignedValues>),
+    Family(&'a ResidentOwner),
+}
+
+pub(crate) trait GpuResidentCaptureValue {
+    fn resident_owner(&self) -> GpuResidentOwnerRef<'_>;
+}
+
+impl GpuResidentCaptureValue for ResidentOwner {
+    fn resident_owner(&self) -> GpuResidentOwnerRef<'_> {
+        match self {
+            ResidentOwner::Matrix(value) => GpuResidentOwnerRef::Matrix(value),
+            ResidentOwner::SmallMatrix(value) => GpuResidentOwnerRef::SmallMatrix(value),
+            ResidentOwner::Trapdoor { public, secret } => {
+                GpuResidentOwnerRef::Trapdoor { public, secret }
+            }
+            ResidentOwner::Integer(value) => GpuResidentOwnerRef::Integer(value),
+            ResidentOwner::IndexedFamily { .. } => GpuResidentOwnerRef::Family(self),
+        }
+    }
+}
+
+pub(crate) struct GpuResidentCaptureOwner<'a> {
+    pub slot: ValueSlot,
+    pub value: &'a dyn GpuResidentCaptureValue,
+}
+
+pub(crate) struct GpuResidentCaptureOwners<'a> {
+    pub entries: &'a [GpuResidentCaptureOwner<'a>],
+}
+
+impl GpuResidentCaptureOwners<'_> {
+    fn resolve(
+        &self,
+        slot: ValueSlot,
+    ) -> Result<GpuResidentOwnerRef<'_>, GpuResidentControlAdapterError> {
+        self.entries
+            .iter()
+            .find(|entry| entry.slot == slot)
+            .map(|entry| entry.value.resident_owner())
+            .ok_or(GpuResidentControlAdapterError::MissingBinding(slot))
+    }
+
+    fn resolve_integer(
+        &self,
+        slot: ValueSlot,
+    ) -> Result<&GpuFleetSignedValues, GpuResidentControlAdapterError> {
+        match self.resolve(slot)? {
+            GpuResidentOwnerRef::Integer(value) => Ok(value),
+            GpuResidentOwnerRef::Matrix(_) |
+            GpuResidentOwnerRef::SmallMatrix(_) |
+            GpuResidentOwnerRef::Trapdoor { .. } => {
+                Err(GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident slot {slot:?} is not an integer owner"
+                )))
+            }
+            GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+                format!("resident slot {slot:?} is an indexed family, not a scalar integer"),
+            )),
+        }
+    }
+
+    /// FamilyGetStatic is the one scalar operation whose semantic source is
+    /// an integer/bool indexed family while its native source is the packed
+    /// backing allocation.  Keep ordinary integer resolution strict: callers
+    /// must opt into this family-only projection at the gather operation.
+    fn resolve_packed_integer(
+        &self,
+        slot: ValueSlot,
+    ) -> Result<&GpuFleetSignedValues, GpuResidentControlAdapterError> {
+        match self.resolve(slot)? {
+            GpuResidentOwnerRef::Family(family) => family
+                .packed_integer(slot)
+                .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string())),
+            GpuResidentOwnerRef::Integer(value) => Ok(value),
+            GpuResidentOwnerRef::Matrix(_) |
+            GpuResidentOwnerRef::SmallMatrix(_) |
+            GpuResidentOwnerRef::Trapdoor { .. } => {
+                Err(GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident slot {slot:?} is not an integer family source"
+                )))
+            }
+        }
+    }
+
+    fn validate(&self, physical_device: i32) -> Result<(), GpuResidentControlAdapterError> {
+        for owner in self.entries {
+            let on_device = match owner.value.resident_owner() {
+                GpuResidentOwnerRef::Matrix(value) => {
+                    value.shards().iter().all(|shard| shard.device_id == physical_device)
+                }
+                GpuResidentOwnerRef::SmallMatrix(value) => {
+                    value.shards().iter().all(|shard| shard.device_id == physical_device)
+                }
+                GpuResidentOwnerRef::Trapdoor { public, secret } => {
+                    public.shards().iter().all(|shard| shard.device_id == physical_device) &&
+                        secret
+                            .r_binding_components()
+                            .map(|components| {
+                                components
+                                    .iter()
+                                    .all(|component| component.physical_device == physical_device)
+                            })
+                            .unwrap_or(false) &&
+                        secret
+                            .e_binding_components()
+                            .map(|components| {
+                                components
+                                    .iter()
+                                    .all(|component| component.physical_device == physical_device)
+                            })
+                            .unwrap_or(false)
+                }
+                GpuResidentOwnerRef::Integer(value) => value.device_id() == physical_device,
+                GpuResidentOwnerRef::Family(owner) => owner_table_on_device(owner, physical_device),
+            };
+            if !on_device {
+                return Err(GpuResidentControlAdapterError::WrongOwner {
+                    expected: physical_device,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn prepare_resident_owner(owner: &dyn GpuResidentCaptureValue) -> Result<(), GpuNativeGraphError> {
+    match owner.resident_owner() {
+        GpuResidentOwnerRef::Matrix(value) => value.prepare_external_for_capture(),
+        GpuResidentOwnerRef::SmallMatrix(value) => value.prepare_external_for_capture(),
+        GpuResidentOwnerRef::Trapdoor { public, secret } => {
+            public.prepare_external_for_capture()?;
+            secret.prepare_external_for_capture()
+        }
+        GpuResidentOwnerRef::Integer(value) => value.native().prepare_external_for_capture(),
+        GpuResidentOwnerRef::Family(owner) => prepare_resident_family(owner),
+    }
+}
+
+fn wait_resident_owner(owner: &dyn GpuResidentCaptureValue) {
+    match owner.resident_owner() {
+        GpuResidentOwnerRef::Matrix(value) => value.wait_until_ready(),
+        GpuResidentOwnerRef::SmallMatrix(value) => value.wait_until_ready(),
+        GpuResidentOwnerRef::Trapdoor { public, secret } => {
+            public.wait_until_ready();
+            secret.wait_until_ready();
+        }
+        GpuResidentOwnerRef::Integer(value) => {
+            value.wait_until_ready().expect("resident integer owner readiness failed");
+        }
+        GpuResidentOwnerRef::Family(owner) => wait_resident_family(owner),
+    }
+}
+
+fn owner_table_on_device(owner: &ResidentOwner, physical_device: i32) -> bool {
+    match owner {
+        ResidentOwner::Matrix(value) => {
+            value.shards().iter().all(|shard| shard.device_id == physical_device)
+        }
+        ResidentOwner::SmallMatrix(value) => {
+            value.shards().iter().all(|shard| shard.device_id == physical_device)
+        }
+        ResidentOwner::Trapdoor { public, secret } => {
+            public.shards().iter().all(|shard| shard.device_id == physical_device) &&
+                secret
+                    .r_binding_components()
+                    .map(|components| {
+                        components
+                            .iter()
+                            .all(|component| component.physical_device == physical_device)
+                    })
+                    .unwrap_or(false) &&
+                secret
+                    .e_binding_components()
+                    .map(|components| {
+                        components
+                            .iter()
+                            .all(|component| component.physical_device == physical_device)
+                    })
+                    .unwrap_or(false)
+        }
+        ResidentOwner::Integer(value) => value.device_id() == physical_device,
+        ResidentOwner::IndexedFamily { elements, packed_integer, .. } => {
+            elements.iter().all(|element| owner_table_on_device(element, physical_device)) &&
+                packed_integer.as_ref().is_none_or(|value| value.device_id() == physical_device)
+        }
+    }
+}
+
+fn resident_matrix_family_table(
+    owner: &ResidentOwner,
+    physical_device: i32,
+) -> Result<(GpuMatrixFamilyDescriptorTable, usize), GpuResidentControlAdapterError> {
+    let ResidentOwner::IndexedFamily { elements, .. } = owner else {
+        return Err(GpuResidentControlAdapterError::Unsupported(
+            "matrix family gather requires an indexed family owner".into(),
+        ));
+    };
+    let mut matrices = Vec::with_capacity(elements.len());
+    let mut source_columns = None;
+    for element in elements.iter() {
+        let ResidentOwner::Matrix(matrix) = element else {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix family gather requires matrix family elements".into(),
+            ));
+        };
+        let shard = matrix
+            .shards()
+            .iter()
+            .find(|shard| shard.device_id == physical_device)
+            .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+        let (_, columns) = shard.value.size();
+        if source_columns.is_some_and(|expected| expected != columns) {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix family elements have different column counts".into(),
+            ));
+        }
+        source_columns = Some(columns);
+        // The descriptor table retains shallow handles for the duration of
+        // the graph.  Do not deep-clone the family elements: that would
+        // allocate and copy a second device matrix merely to build the table.
+        matrices.push(&shard.value);
+    }
+    let source_columns = source_columns.ok_or_else(|| {
+        GpuResidentControlAdapterError::Unsupported("matrix family is empty".into())
+    })?;
+    let table = GpuMatrixFamilyDescriptorTable::for_partition_borrowed(&matrices, physical_device)?;
+    Ok((table, source_columns))
+}
+
+fn resident_owner_same_allocation(
+    left: &GpuResidentOwnerRef<'_>,
+    right: &GpuResidentOwnerRef<'_>,
+) -> bool {
+    match (left, right) {
+        (GpuResidentOwnerRef::Matrix(left), GpuResidentOwnerRef::Matrix(right)) => {
+            Arc::ptr_eq(left, right)
+        }
+        (GpuResidentOwnerRef::SmallMatrix(left), GpuResidentOwnerRef::SmallMatrix(right)) => {
+            Arc::ptr_eq(left, right)
+        }
+        (GpuResidentOwnerRef::Integer(left), GpuResidentOwnerRef::Integer(right)) => {
+            Arc::ptr_eq(left, right)
+        }
+        (
+            GpuResidentOwnerRef::Trapdoor { public: left_public, secret: left_secret },
+            GpuResidentOwnerRef::Trapdoor { public: right_public, secret: right_secret },
+        ) => Arc::ptr_eq(left_public, right_public) && Arc::ptr_eq(left_secret, right_secret),
+        (GpuResidentOwnerRef::Family(left), GpuResidentOwnerRef::Family(right)) => {
+            std::ptr::eq(*left, *right)
+        }
+        _ => false,
+    }
+}
+
+fn resident_transfer_types_compatible(left: &ResidentSlotType, right: &ResidentSlotType) -> bool {
+    match (left, right) {
+        (ResidentSlotType::Matrix { .. }, ResidentSlotType::Matrix { .. }) |
+        (ResidentSlotType::SmallMatrix { .. }, ResidentSlotType::SmallMatrix { .. }) |
+        (ResidentSlotType::SmallMatrix { .. }, ResidentSlotType::Preimage { .. }) |
+        (ResidentSlotType::Preimage { .. }, ResidentSlotType::SmallMatrix { .. }) |
+        (ResidentSlotType::Preimage { .. }, ResidentSlotType::Preimage { .. }) |
+        (ResidentSlotType::Trapdoor { .. }, ResidentSlotType::Trapdoor { .. }) => true,
+        (
+            ResidentSlotType::Integer { encoding: left, .. },
+            ResidentSlotType::Integer { encoding: right, .. },
+        ) => left == right,
+        (ResidentSlotType::Boolean { .. }, ResidentSlotType::Boolean { .. }) => true,
+        (
+            ResidentSlotType::IndexedFamily { element: left, count: left_count, .. },
+            ResidentSlotType::IndexedFamily { element: right, count: right_count, .. },
+        ) => left_count == right_count && resident_transfer_types_compatible(left, right),
+        _ => false,
+    }
+}
+
+fn resident_matrix_gather_scratch(
+    backend: &GpuDcrtBackend,
+    destination: &GpuFleetMatrix,
+    child_type: &ConcreteWireType,
+    physical_device: i32,
+) -> Result<GpuFleetMatrix, GpuResidentControlAdapterError> {
+    let matrix_type = child_type.matrix_type().ok_or_else(|| {
+        GpuResidentControlAdapterError::Unsupported(
+            "matrix family gather destination is not a matrix type".into(),
+        )
+    })?;
+    let destination_shard = destination
+        .shards()
+        .iter()
+        .find(|shard| shard.device_id == physical_device)
+        .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+    let (_, local_columns) = destination_shard.value.size();
+    let mut scratch_type = matrix_type.clone();
+    scratch_type.columns = local_columns;
+    let scratch = backend
+        .allocate_capture_owner_on_device_with_domain(
+            &ConcreteWireType::Matrix(scratch_type),
+            physical_device,
+            None,
+            destination_shard.value.is_ntt(),
+        )
+        .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string()))?;
+    match scratch {
+        GpuCaptureOwnedOwner::Matrix(value) => Ok(value),
+        _ => Err(GpuResidentControlAdapterError::Unsupported(
+            "matrix family gather scratch allocation returned a non-matrix owner".into(),
+        )),
+    }
+}
+
+fn prepare_resident_family(owner: &ResidentOwner) -> Result<(), GpuNativeGraphError> {
+    match owner {
+        ResidentOwner::IndexedFamily { elements, packed_integer, .. } => {
+            for element in elements.iter() {
+                prepare_resident_owner(&ResidentOwnerCaptureValue(element))?;
+            }
+            if let Some(value) = packed_integer {
+                value.native().prepare_external_for_capture()?;
+            }
+            Ok(())
+        }
+        _ => Err(GpuNativeGraphError::Native("resident family owner is not indexed".into())),
+    }
+}
+
+fn wait_resident_family(owner: &ResidentOwner) {
+    if let ResidentOwner::IndexedFamily { elements, packed_integer, .. } = owner {
+        for element in elements.iter() {
+            wait_resident_owner(&ResidentOwnerCaptureValue(element));
+        }
+        if let Some(value) = packed_integer {
+            value.wait_until_ready().expect("resident packed family readiness failed");
+        }
+    }
+}
+
+fn protect_resident_family(
+    owner: &ResidentOwner,
+    physical_device: i32,
+    stream: &GpuNativeLaunchStream,
+    completion: &GpuNativeEvent,
+    writes: bool,
+) -> Result<(), GpuNativeGraphError> {
+    let ResidentOwner::IndexedFamily { elements, packed_integer, .. } = owner else {
+        return Err(GpuNativeGraphError::Native("resident family owner is not indexed".into()));
+    };
+    for element in elements.iter() {
+        match element {
+            ResidentOwner::Matrix(value) => {
+                value.protect_compiled_submission(physical_device, stream, completion, !writes)?
+            }
+            ResidentOwner::SmallMatrix(value) => {
+                value.protect_compiled_submission(stream, completion)?
+            }
+            ResidentOwner::Trapdoor { public, secret } => {
+                public.protect_compiled_submission(physical_device, stream, completion, !writes)?;
+                secret.protect_compiled_submission(physical_device, stream, completion)?;
+            }
+            ResidentOwner::Integer(value) => {
+                value.protect_compiled_submission(physical_device, stream, completion, !writes)?
+            }
+            ResidentOwner::IndexedFamily { .. } => {
+                protect_resident_family(element, physical_device, stream, completion, writes)?;
+            }
+        }
+    }
+    if let Some(value) = packed_integer {
+        value.protect_compiled_submission(physical_device, stream, completion, !writes)?;
+    }
+    Ok(())
+}
+
+struct ResidentOwnerCaptureValue<'a>(&'a ResidentOwner);
+
+impl GpuResidentCaptureValue for ResidentOwnerCaptureValue<'_> {
+    fn resident_owner(&self) -> GpuResidentOwnerRef<'_> {
+        match self.0 {
+            ResidentOwner::Matrix(value) => GpuResidentOwnerRef::Matrix(value),
+            ResidentOwner::SmallMatrix(value) => GpuResidentOwnerRef::SmallMatrix(value),
+            ResidentOwner::Trapdoor { public, secret } => {
+                GpuResidentOwnerRef::Trapdoor { public, secret }
+            }
+            ResidentOwner::Integer(value) => GpuResidentOwnerRef::Integer(value),
+            ResidentOwner::IndexedFamily { .. } => GpuResidentOwnerRef::Family(self.0),
+        }
+    }
+}
+
+fn resident_binding_address(
+    owner: GpuResidentOwnerRef<'_>,
+    shard: u32,
+    component: NativeValueComponent,
+) -> Result<(u64, usize), GpuNativeGraphError> {
+    let shard = shard as usize;
+    match (owner, component) {
+        (
+            GpuResidentOwnerRef::Matrix(value),
+            NativeValueComponent::MatrixData |
+            NativeValueComponent::MatrixDescriptors |
+            NativeValueComponent::MatrixAuxiliary,
+        ) => {
+            let native = value.binding_components()?.get(shard).copied().ok_or_else(|| {
+                GpuNativeGraphError::Native("matrix binding shard is missing".into())
+            })?;
+            Ok(match component {
+                NativeValueComponent::MatrixData => (native.data_address, native.data_bytes),
+                NativeValueComponent::MatrixDescriptors => (
+                    native.device_descriptors_address,
+                    native.device_descriptor_stride * native.limb_count,
+                ),
+                NativeValueComponent::MatrixAuxiliary => (
+                    native.auxiliary_address,
+                    native.auxiliary_slots_total * std::mem::size_of::<u64>(),
+                ),
+                _ => unreachable!(),
+            })
+        }
+        (
+            GpuResidentOwnerRef::SmallMatrix(value),
+            NativeValueComponent::CompactPayload |
+            NativeValueComponent::CompactDeviceStatus |
+            NativeValueComponent::CompactHostStatus |
+            NativeValueComponent::CompactHardCutoffStaging,
+        ) => {
+            let native = value.binding_descriptors()?.get(shard).copied().ok_or_else(|| {
+                GpuNativeGraphError::Native("compact binding shard is missing".into())
+            })?;
+            Ok(match component {
+                NativeValueComponent::CompactPayload => {
+                    (native.payload_address, native.payload_bytes)
+                }
+                NativeValueComponent::CompactDeviceStatus => (native.device_status_address, 1),
+                NativeValueComponent::CompactHostStatus => (native.host_status_address, 1),
+                NativeValueComponent::CompactHardCutoffStaging => {
+                    (native.hard_cutoff_staging_address, native.hard_cutoff_staging_bytes)
+                }
+                _ => unreachable!(),
+            })
+        }
+        (GpuResidentOwnerRef::Trapdoor { public, .. }, NativeValueComponent::TrapdoorPublic) => {
+            let native = public.binding_components()?.get(shard).copied().ok_or_else(|| {
+                GpuNativeGraphError::Native("trapdoor public shard is missing".into())
+            })?;
+            Ok((native.data_address, native.data_bytes))
+        }
+        (GpuResidentOwnerRef::Trapdoor { secret, .. }, NativeValueComponent::TrapdoorR) => {
+            let native =
+                secret.r_binding_components()?.get(shard).copied().ok_or_else(|| {
+                    GpuNativeGraphError::Native("trapdoor R shard is missing".into())
+                })?;
+            Ok((native.data_address, native.data_bytes))
+        }
+        (GpuResidentOwnerRef::Trapdoor { secret, .. }, NativeValueComponent::TrapdoorE) => {
+            let native =
+                secret.e_binding_components()?.get(shard).copied().ok_or_else(|| {
+                    GpuNativeGraphError::Native("trapdoor E shard is missing".into())
+                })?;
+            Ok((native.data_address, native.data_bytes))
+        }
+        (GpuResidentOwnerRef::Trapdoor { secret, .. }, component @ (
+            NativeValueComponent::TrapdoorCovarianceA |
+            NativeValueComponent::TrapdoorCovarianceB |
+            NativeValueComponent::TrapdoorCovarianceD
+        )) => {
+            let native = secret.capture_binding_components(component)?.get(shard).copied()
+                .ok_or_else(|| GpuNativeGraphError::Native("trapdoor covariance shard is missing".into()))?;
+            Ok((native.data_address, native.data_bytes))
+        }
+        (GpuResidentOwnerRef::Integer(value), NativeValueComponent::IntegerValues) => {
+            let native = value.binding()?;
+            Ok((native.device_address, native.count * native.encoding.words_per_value() * 8))
+        }
+        (
+            GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                packed_integer: Some(value),
+                ..
+            }),
+            NativeValueComponent::IntegerValues,
+        ) => {
+            let native = value.binding()?;
+            Ok((native.device_address, native.count * native.encoding.words_per_value() * 8))
+        }
+        (GpuResidentOwnerRef::Family(_), _) => Err(GpuNativeGraphError::Native(
+            "resident indexed family binding requires an explicit family element; refusing host-side selection"
+                .into(),
+        )),
+        _ => Err(GpuNativeGraphError::Native(
+            "resident binding component does not match owner".into(),
+        )),
+    }
+}
+
+fn resident_wire_owner<'a>(
+    program: &'a GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &'a GpuResidentCaptureOwners<'_>,
+    wire: WireRef,
+) -> Result<GpuResidentOwnerRef<'a>, GpuResidentControlAdapterError> {
+    let slot = program
+        .schema
+        .wire_slots
+        .iter()
+        .find(|candidate| candidate.scope == payload.scope && candidate.wire == wire)
+        .map(|candidate| candidate.value.slot)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(format!(
+                "resident native wire {wire:?} has no typed slot"
+            ))
+        })?;
+    owners.resolve(slot)
+}
+
+fn resident_matrix_arc(
+    owner: GpuResidentOwnerRef<'_>,
+) -> Result<Arc<GpuFleetMatrix>, GpuResidentControlAdapterError> {
+    match owner {
+        GpuResidentOwnerRef::Matrix(value) => Ok(Arc::clone(value)),
+        GpuResidentOwnerRef::Trapdoor { public, .. } => Ok(Arc::clone(public)),
+        GpuResidentOwnerRef::SmallMatrix(_) | GpuResidentOwnerRef::Integer(_) => {
+            Err(GpuResidentControlAdapterError::Unsupported(
+                "resident native request requires a matrix owner".into(),
+            ))
+        }
+        GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            "resident family matrix input requires explicit family element binding".into(),
+        )),
+    }
+}
+
+fn resident_small_arc(
+    owner: GpuResidentOwnerRef<'_>,
+) -> Result<Arc<GpuFleetSmallMatrix>, GpuResidentControlAdapterError> {
+    match owner {
+        GpuResidentOwnerRef::SmallMatrix(value) => Ok(Arc::clone(value)),
+        GpuResidentOwnerRef::Matrix(_) |
+        GpuResidentOwnerRef::Trapdoor { .. } |
+        GpuResidentOwnerRef::Integer(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            "resident native request requires a compact owner".into(),
+        )),
+        GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            "resident family compact input requires explicit family element binding".into(),
+        )),
+    }
+}
+
+fn resident_integer_arc(
+    owner: GpuResidentOwnerRef<'_>,
+) -> Result<Arc<GpuFleetSignedValues>, GpuResidentControlAdapterError> {
+    match owner {
+        GpuResidentOwnerRef::Integer(value) => Ok(Arc::clone(value)),
+        GpuResidentOwnerRef::Matrix(_) |
+        GpuResidentOwnerRef::SmallMatrix(_) |
+        GpuResidentOwnerRef::Trapdoor { .. } => Err(GpuResidentControlAdapterError::Unsupported(
+            "resident native request requires an integer owner".into(),
+        )),
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+            packed_integer: Some(value),
+            ..
+        }) => Ok(Arc::clone(value)),
+        GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            "resident family has no packed integer backing".into(),
+        )),
+    }
+}
+
+/// Resolve one matrix lane from the frozen physical owner schema.  A matrix
+/// value is a broadcast owner; an indexed family is the only representation
+/// that may provide distinct lane allocations.  Treating a widened matrix as
+/// one semantic lane would make every lane alias the same output, so that
+/// shape is rejected here and the caller fails closed.
+fn resident_physical_lane_index(
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    lane: usize,
+    wave_base: usize,
+) -> Result<usize, GpuResidentControlAdapterError> {
+    let component = layout
+        .components
+        .iter()
+        .find(|component| component.component == NativeValueComponent::MatrixData)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "lane matrix layout has no matrix-data component".into(),
+            )
+        })?;
+    match component.selection {
+        crate::gpu_compiled::ResidentLaneSelection::Broadcast => Ok(0),
+        crate::gpu_compiled::ResidentLaneSelection::Strided { lane_stride } => wave_base
+            .checked_add(lane.checked_mul(lane_stride).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported("resident lane index overflows".into())
+            })?)
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported("resident lane index overflows".into())
+            }),
+    }
+}
+
+fn resident_lane_matrix<'a>(
+    owner: &'a GpuResidentOwnerRef<'a>,
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<&'a GpuDCRTPolyMatrix, GpuResidentControlAdapterError> {
+    let component = layout
+        .components
+        .iter()
+        .find(|component| component.component == NativeValueComponent::MatrixData)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "lane matrix layout has no matrix-data component".into(),
+            )
+        })?;
+    if !matches!(&owner, GpuResidentOwnerRef::Family(_)) &&
+        matches!(component.selection, crate::gpu_compiled::ResidentLaneSelection::Strided { .. }) &&
+        layout.wave_capacity.get() > 1 &&
+        lane > 0
+    {
+        return Err(GpuResidentControlAdapterError::Unsupported(
+            "resident strided lanes require indexed physical owners".into(),
+        ));
+    }
+    let index = resident_physical_lane_index(layout, lane, wave_base)?;
+    let matrix = match owner {
+        GpuResidentOwnerRef::Matrix(value) => value.as_ref(),
+        GpuResidentOwnerRef::Trapdoor { public: value, .. } => value.as_ref(),
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily { elements, .. }) => {
+            let element = elements.get(index).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident lane {index} is outside the indexed family"
+                ))
+            })?;
+            match element {
+                ResidentOwner::Matrix(value) => value.as_ref(),
+                ResidentOwner::Trapdoor { public: value, .. } => value.as_ref(),
+                _ => {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident lane family element is not a matrix owner".into(),
+                    ));
+                }
+            }
+        }
+        GpuResidentOwnerRef::Family(_) => {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident lane family is not an indexed matrix family".into(),
+            ));
+        }
+        GpuResidentOwnerRef::SmallMatrix(_) | GpuResidentOwnerRef::Integer(_) => {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident lane primitive requires matrix owners".into(),
+            ));
+        }
+    };
+    if matrix.shards().iter().any(|shard| shard.device_id != physical_device) {
+        return Err(GpuResidentControlAdapterError::WrongOwner { expected: physical_device });
+    }
+    matrix
+        .shards()
+        .iter()
+        .find(|shard| shard.device_id == physical_device)
+        .map(|shard| &shard.value)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported("resident lane matrix has no shard".into())
+        })
+}
+
+fn resident_lane_small_matrix<'a>(
+    owner: &'a GpuResidentOwnerRef<'a>,
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<&'a GpuSmallMatrix, GpuResidentControlAdapterError> {
+    let component = layout
+        .components
+        .iter()
+        .find(|component| component.component == NativeValueComponent::CompactPayload)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "lane compact layout has no compact-payload component".into(),
+            )
+        })?;
+    let index = match component.selection {
+        crate::gpu_compiled::ResidentLaneSelection::Broadcast => 0,
+        crate::gpu_compiled::ResidentLaneSelection::Strided { lane_stride } => wave_base
+            .checked_add(lane.checked_mul(lane_stride).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported("resident lane index overflows".into())
+            })?)
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported("resident lane index overflows".into())
+            })?,
+    };
+    let value = match owner {
+        GpuResidentOwnerRef::SmallMatrix(value) => value
+            .shards()
+            .iter()
+            .find(|shard| shard.device_id == physical_device)
+            .map(|shard| &shard.value),
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily { elements, .. }) => {
+            elements.get(index).and_then(|element| match element {
+                ResidentOwner::SmallMatrix(value) => value
+                    .shards()
+                    .iter()
+                    .find(|shard| shard.device_id == physical_device)
+                    .map(|shard| &shard.value),
+                _ => None,
+            })
+        }
+        _ => None,
+    };
+    value.ok_or_else(|| GpuResidentControlAdapterError::WrongOwner { expected: physical_device })
+}
+
+fn resident_lane_matrix_arc(
+    program: &GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &GpuResidentCaptureOwners<'_>,
+    wire: WireRef,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<Arc<GpuFleetMatrix>, GpuResidentControlAdapterError> {
+    let layout = payload
+        .source_bindings
+        .iter()
+        .find(|binding| binding.wire == wire)
+        .map(|binding| &binding.physical)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident generic lane source has no physical layout".into(),
+            )
+        })?;
+    let owner = resident_wire_owner(program, payload, owners, wire)?;
+    let matrix = resident_lane_matrix(&owner, layout, lane, wave_base, physical_device)?;
+    Ok(Arc::new(GpuFleetMatrix::from_matrix(matrix.clone_shallow())))
+}
+
+fn resident_lane_small_arc(
+    program: &GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &GpuResidentCaptureOwners<'_>,
+    wire: WireRef,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<Arc<GpuFleetSmallMatrix>, GpuResidentControlAdapterError> {
+    let layout = payload
+        .source_bindings
+        .iter()
+        .find(|binding| binding.wire == wire)
+        .map(|binding| &binding.physical)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident generic lane compact source has no physical layout".into(),
+            )
+        })?;
+    let owner = resident_wire_owner(program, payload, owners, wire)?;
+    let small = resident_lane_small_matrix(&owner, layout, lane, wave_base, physical_device)?;
+    Ok(Arc::new(GpuFleetSmallMatrix::retained_clone(&Arc::new(GpuFleetSmallMatrix::from_matrix(
+        small.column_view(0, small.columns()).into_matrix(),
+    )))))
+}
+
+fn resident_lane_generic_request(
+    program: &GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &GpuResidentCaptureOwners<'_>,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<Option<GpuCaptureRequest>, GpuResidentControlAdapterError> {
+    let metadata = payload.metadata.clone();
+    let matrix = |wire| {
+        resident_lane_matrix_arc(program, payload, owners, wire, lane, wave_base, physical_device)
+    };
+    let request = match &payload.prepared {
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::MatrixMulSmallRhs {
+            left,
+            right,
+        }) => {
+            Some(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::MatrixMulSmallRhs {
+                metadata,
+                left: matrix(*left)?,
+                right: resident_lane_small_arc(
+                    program,
+                    payload,
+                    owners,
+                    *right,
+                    lane,
+                    wave_base,
+                    physical_device,
+                )?,
+            }]))
+        }
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::MatrixMulAccumulate {
+            products,
+            bias,
+        }) => {
+            let products = products
+                .iter()
+                .map(|product| {
+                    Ok((product.coefficient.clone(), matrix(product.left)?, matrix(product.right)?))
+                })
+                .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+            Some(GpuCaptureRequest::Ordinary(vec![
+                FixedOperationBatchRequest::MatrixMulAccumulate {
+                    metadata,
+                    request: MatrixMulAccumulateRequest {
+                        products,
+                        bias: bias.map(matrix).transpose()?,
+                    },
+                },
+            ]))
+        }
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Tensor { left, right }) => {
+            Some(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::Tensor {
+                metadata,
+                left: matrix(*left)?,
+                right: matrix(*right)?,
+            }]))
+        }
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Concat { inputs, axis }) => {
+            Some(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::Concat {
+                metadata,
+                inputs: inputs.iter().map(|wire| matrix(*wire)).collect::<Result<Vec<_>, _>>()?,
+                axis: *axis,
+            }]))
+        }
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::CrtRecompose {
+            levels,
+            plaintext_moduli,
+            reconstruction_coefficients,
+            destination,
+        }) => Some(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::CrtRecompose {
+            metadata,
+            levels: levels.iter().map(|wire| matrix(*wire)).collect::<Result<Vec<_>, _>>()?,
+            plaintext_moduli: plaintext_moduli.to_vec(),
+            reconstruction_coefficients: reconstruction_coefficients.to_vec(),
+            destination: destination.clone(),
+        }])),
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Unary { operation, value })
+            if !matches!(operation, ResidentNativeUnary::Transpose) =>
+        {
+            Some(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::UnaryTransform {
+                metadata,
+                operation: resident_unary_operation(operation),
+                value: matrix(*value)?,
+            }]))
+        }
+        _ => None,
+    };
+    Ok(request)
+}
+
+fn resident_lane_binary_operation(
+    operation: MatrixBinaryOp,
+) -> Option<GpuMatrixLaneBinaryOperation> {
+    match operation {
+        MatrixBinaryOp::Add => Some(GpuMatrixLaneBinaryOperation::Add),
+        MatrixBinaryOp::Subtract => Some(GpuMatrixLaneBinaryOperation::Sub),
+        MatrixBinaryOp::Multiply => None,
+    }
+}
+
+fn resident_lane_native_dispatch(prepared: &ResidentNativePrepared) -> bool {
+    matches!(
+        prepared,
+        ResidentNativePrepared::Ordinary(
+            ResidentNativeOrdinary::MatrixBinary { .. } |
+                ResidentNativeOrdinary::MatrixMulSmallRhs { .. } |
+                ResidentNativeOrdinary::MatrixMulAccumulate { .. } |
+                ResidentNativeOrdinary::Negate { .. } |
+                ResidentNativeOrdinary::Scale { .. } |
+                ResidentNativeOrdinary::Tensor { .. } |
+                ResidentNativeOrdinary::Concat { .. } |
+                ResidentNativeOrdinary::CrtRecompose { .. } |
+                ResidentNativeOrdinary::Unary { .. }
+        )
+    )
+}
+
+fn resident_phase_schema(
+    program: &GpuResidentCaptureProgram,
+    phase: ResidentPhaseId,
+) -> Result<&[ResidentPhysicalBinding], GpuResidentControlAdapterError> {
+    program
+        .schema
+        .phase_bindings
+        .iter()
+        .find(|schema| schema.phase == phase)
+        .map(|schema| schema.bindings.as_ref())
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident phase has no physical binding schema".into(),
+            )
+        })
+}
+
+fn resident_phase_schema_with_dynamic_family_sources(
+    program: &GpuResidentCaptureProgram,
+    phase: ResidentPhaseId,
+    physical_device: i32,
+) -> Result<Vec<ResidentPhysicalBinding>, GpuResidentControlAdapterError> {
+    let mut bindings = resident_phase_schema(program, phase)?.to_vec();
+    for instruction in &program.schema.instructions {
+        let ResidentControlInstructionKind::Scalar(ResidentControlOperation::FamilyGetDynamic {
+            family,
+            ..
+        }) = &instruction.kind
+        else {
+            continue;
+        };
+        let ResidentSlotType::IndexedFamily { element, count, .. } = family.as_ref() else {
+            continue;
+        };
+        if !matches!(element.as_ref(), ResidentSlotType::Matrix { .. }) {
+            continue;
+        }
+        let source_slot =
+            instruction.inputs.first().ok_or(GpuResidentControlAdapterError::MissingInput)?.slot;
+        let layout = program
+            .schema
+            .slot_layouts
+            .iter()
+            .find(|layout| layout.identity.slot == source_slot)
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "dynamic matrix family source has no physical layout".into(),
+                )
+            })?;
+        for element_index in 0..*count {
+            let key = crate::gpu_compiled::PhysicalBindingKey {
+                scope: layout.identity.scope.clone(),
+                slot: source_slot,
+                lane: 0,
+                device: physical_device,
+                shard: 0,
+                component: NativeValueComponent::MatrixDescriptors,
+                job: 0,
+                address_addend: 0,
+                selection: ResidentPhysicalBindingSelection::AbsoluteFamilyElement(element_index),
+            };
+            if bindings.iter().any(|binding| binding.key == key) {
+                continue;
+            }
+            let index = u32::try_from(bindings.len()).map_err(|_| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "dynamic matrix family binding index overflows".into(),
+                )
+            })?;
+            bindings.push(ResidentPhysicalBinding { key, index, access: BindingAccess::Input });
+        }
+    }
+    Ok(bindings)
+}
+
+fn resident_lane_region_bindings(
+    bindings: &[ResidentPhysicalBinding],
+    scope: &mxx_ir_core::graph::FrozenGraphScopeId,
+    physical_device: i32,
+    job: u32,
+    lane: usize,
+    base: u32,
+) -> Result<Box<[RegionBinding]>, GpuResidentControlAdapterError> {
+    bindings
+        .iter()
+        .filter(|binding| {
+            binding.key.scope == *scope &&
+                binding.key.device == physical_device &&
+                binding.key.job == job &&
+                binding.key.lane == lane &&
+                (matches!(
+                    binding.key.selection,
+                    ResidentPhysicalBindingSelection::SharedBroadcast
+                ) || matches!(
+                    binding.key.selection,
+                    ResidentPhysicalBindingSelection::WaveRelativeLane(selected)
+                        if selected == lane
+                ))
+        })
+        .map(|binding| {
+            Ok(RegionBinding {
+                index: base.checked_add(binding.index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident physical binding index overflows".into(),
+                    )
+                })?,
+                source: BindingSource::ValueComponent {
+                    slot: binding.key.slot,
+                    shard: binding.key.shard,
+                    component: binding.key.component,
+                    address_addend: binding.key.address_addend,
+                },
+                access: binding.access,
+            })
+        })
+        .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn resident_lane_selection(
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    component: NativeValueComponent,
+    lane: usize,
+) -> Result<ResidentPhysicalBindingSelection, GpuResidentControlAdapterError> {
+    let component =
+        layout.components.iter().find(|entry| entry.component == component).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident native binding has no physical component layout".into(),
+            )
+        })?;
+    Ok(match component.selection {
+        crate::gpu_compiled::ResidentLaneSelection::Broadcast => {
+            ResidentPhysicalBindingSelection::SharedBroadcast
+        }
+        crate::gpu_compiled::ResidentLaneSelection::Strided { .. } => {
+            ResidentPhysicalBindingSelection::WaveRelativeLane(lane)
+        }
+    })
+}
+
+/// Return the exact native binding set for one lane-captured operation.
+///
+/// A phase schema also contains bindings for sibling leaves, loop edges, and
+/// every frozen column job. Projecting that schema by lane/access alone makes
+/// distinct scope/job/selection keys look like duplicate `RegionBinding`s.
+/// Native capture must retain only this payload's scope and representative
+/// job, while preserving the key's shard and component identity for replay.
+fn resident_native_lane_region_bindings(
+    bindings: &[ResidentPhysicalBinding],
+    native_bindings: &[ResidentPhysicalBinding],
+    payload: &ResidentNativeInstruction,
+    lane: usize,
+    base: u32,
+) -> Result<Box<[RegionBinding]>, GpuResidentControlAdapterError> {
+    let job = 0u32;
+    if payload.jobs.get(job as usize).is_none() {
+        return Err(GpuResidentControlAdapterError::Unsupported(
+            "resident native binding has no representative job".into(),
+        ));
+    }
+    native_bindings
+        .iter()
+        .filter(|binding| {
+            binding.key.scope == payload.scope &&
+                binding.key.device == payload.physical_device &&
+                binding.key.job == job &&
+                binding.key.lane == lane
+        })
+        .map(|native| {
+            let matches = bindings
+                .iter()
+                .filter(|binding| binding.key == native.key)
+                .collect::<Vec<_>>();
+            let binding = match matches.as_slice() {
+                [binding] => *binding,
+                [] => {
+                    return Err(GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident native binding is missing from phase schema for scope {:?}, slot {:?}, lane {}, job {}, component {:?}, selection {:?}",
+                        native.key.scope,
+                        native.key.slot,
+                        native.key.lane,
+                        native.key.job,
+                        native.key.component,
+                        native.key.selection
+                    )));
+                }
+                _ => {
+                    return Err(GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident native binding is duplicated in phase schema for scope {:?}, slot {:?}, lane {}, job {}, component {:?}, selection {:?}",
+                        native.key.scope,
+                        native.key.slot,
+                        native.key.lane,
+                        native.key.job,
+                        native.key.component,
+                        native.key.selection
+                    )));
+                }
+            };
+            Ok(RegionBinding {
+                index: base.checked_add(binding.index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident physical binding index overflows".into(),
+                    )
+                })?,
+                source: BindingSource::ValueComponent {
+                    slot: binding.key.slot,
+                    shard: binding.key.shard,
+                    component: binding.key.component,
+                    address_addend: binding.key.address_addend,
+                },
+                access: binding.access,
+            })
+        })
+        .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()
+        .map(Vec::into_boxed_slice)
+}
+
+fn resident_exact_lane_binding_index(
+    bindings: &[ResidentPhysicalBinding],
+    native_bindings: &[ResidentPhysicalBinding],
+    program: &GpuResidentCaptureProgram,
+    owners: &GpuResidentCaptureOwners<'_>,
+    payload: &ResidentNativeInstruction,
+    slot: ValueSlot,
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    lane: usize,
+    matrix: &GpuDCRTPolyMatrix,
+    component: NativeValueComponent,
+    wave_base: usize,
+    base: u32,
+) -> Result<u32, GpuResidentControlAdapterError> {
+    let job = 0u32;
+    if payload.jobs.get(job as usize).is_none() {
+        return Err(GpuResidentControlAdapterError::Unsupported(
+            "resident native binding has no representative job".into(),
+        ));
+    }
+    let selection = resident_lane_selection(layout, component, lane)?;
+    let native_matches = native_bindings
+        .iter()
+        .filter(|binding| {
+            binding.key.scope == payload.scope &&
+                binding.key.device == payload.physical_device &&
+                binding.key.job == job &&
+                binding.key.lane == lane &&
+                binding.key.slot == slot &&
+                binding.key.component == component &&
+                binding.key.selection == selection
+        })
+        .collect::<Vec<_>>();
+    if native_matches.is_empty() {
+        return Err(GpuResidentControlAdapterError::Unsupported(format!(
+            "resident native binding is missing scope {:?}, slot {slot:?}, lane {lane}, job {job}, component {component:?}, selection {selection:?}",
+            payload.scope
+        )));
+    }
+
+    // The key's slot/lane/selection is necessary but not sufficient for a
+    // matrix pointer.  A phase can contain several physical shards for that
+    // semantic value, and the schedule's source interval is encoded in the
+    // key's shard.  Resolve every candidate against the actual matrix
+    // component and the replay owner address; accepting the first structural
+    // match can bind data to a descriptor (or to a different shard).
+    let mut resolved = native_matches.iter().filter_map(|native| {
+        let binding = bindings.iter().find(|binding| binding.key == native.key)?;
+        let (actual_address, actual_bytes) =
+            resident_matrix_component_address(matrix, native.key.shard, component).ok()?;
+        let component_info =
+            matrix.binding_components().ok()?.get(native.key.shard as usize).copied()?;
+        if component_info.physical_device != native.key.device {
+            return None;
+        }
+        let (replay_address, replay_bytes) =
+            resident_physical_binding_address(program, owners, binding, wave_base).ok()?;
+        (actual_address == replay_address && actual_bytes == replay_bytes).then_some(binding)
+    });
+    let Some(binding) = resolved.next() else {
+        return Err(GpuResidentControlAdapterError::Unsupported(format!(
+            "resident native binding has no phase-schema candidate for the matrix component address: scope {:?}, slot {slot:?}, lane {lane}, job {job}, component {component:?}, selection {selection:?}",
+            payload.scope
+        )));
+    };
+    if resolved.next().is_some() {
+        return Err(GpuResidentControlAdapterError::Unsupported(format!(
+            "resident native binding has multiple phase-schema candidates for the matrix component address: scope {:?}, slot {slot:?}, lane {lane}, job {job}, component {component:?}, selection {selection:?}",
+            payload.scope
+        )));
+    }
+    base.checked_add(binding.index).ok_or_else(|| {
+        GpuResidentControlAdapterError::Unsupported(
+            "resident physical binding index overflows".into(),
+        )
+    })
+}
+
+fn resident_matrix_component_address(
+    matrix: &GpuDCRTPolyMatrix,
+    shard: u32,
+    component: NativeValueComponent,
+) -> Result<(u64, usize), GpuResidentControlAdapterError> {
+    let native = matrix
+        .binding_components()
+        .map_err(GpuResidentControlAdapterError::Native)?
+        .get(shard as usize)
+        .copied()
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane matrix binding shard is missing".into(),
+            )
+        })?;
+    let result = match component {
+        NativeValueComponent::MatrixData => (native.data_address, native.data_bytes),
+        NativeValueComponent::MatrixDescriptors => {
+            (native.device_descriptors_address, native.device_descriptor_stride * native.limb_count)
+        }
+        NativeValueComponent::MatrixAuxiliary => {
+            (native.auxiliary_address, native.auxiliary_slots_total * std::mem::size_of::<u64>())
+        }
+        _ => {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident lane matrix binding component is not a matrix component".into(),
+            ));
+        }
+    };
+    Ok(result)
+}
+
+fn resident_physical_binding_address(
+    program: &GpuResidentCaptureProgram,
+    owners: &GpuResidentCaptureOwners<'_>,
+    binding: &ResidentPhysicalBinding,
+    wave_base: usize,
+) -> Result<(u64, usize), GpuResidentControlAdapterError> {
+    let owner = owners.resolve(binding.key.slot)?;
+    let owner_is_family = matches!(&owner, GpuResidentOwnerRef::Family(_));
+    let layout = program
+        .schema
+        .slot_layouts
+        .iter()
+        .find(|layout| {
+            layout.identity.scope == binding.key.scope && layout.identity.slot == binding.key.slot
+        })
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident physical binding has no slot layout".into(),
+            )
+        })?;
+    let (address, bytes) = match binding.key.component {
+        NativeValueComponent::MatrixData |
+        NativeValueComponent::MatrixDescriptors |
+        NativeValueComponent::MatrixAuxiliary => {
+            let matrix = match binding.key.selection {
+                ResidentPhysicalBindingSelection::AbsoluteFamilyElement(element) => {
+                    let family = match owner {
+                        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                            elements,
+                            ..
+                        }) => elements.get(element).ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(format!(
+                                "resident absolute family element {element} is out of range"
+                            ))
+                        })?,
+                        _ => {
+                            return Err(GpuResidentControlAdapterError::Unsupported(
+                                "absolute family binding requires an indexed family owner".into(),
+                            ));
+                        }
+                    };
+                    match family {
+                        ResidentOwner::Matrix(value) => {
+                            let shard = value
+                                .shards()
+                                .iter()
+                                .find(|shard| shard.device_id == binding.key.device)
+                                .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                    expected: binding.key.device,
+                                })?;
+                            &shard.value
+                        }
+                        ResidentOwner::Trapdoor { public: value, .. } => {
+                            let shard = value
+                                .shards()
+                                .iter()
+                                .find(|shard| shard.device_id == binding.key.device)
+                                .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                    expected: binding.key.device,
+                                })?;
+                            &shard.value
+                        }
+                        _ => {
+                            return Err(GpuResidentControlAdapterError::Unsupported(
+                                "absolute family matrix binding is not a matrix element".into(),
+                            ));
+                        }
+                    }
+                }
+                ResidentPhysicalBindingSelection::SharedBroadcast => {
+                    resident_lane_matrix(&owner, layout, 0, 0, binding.key.device)?
+                }
+                ResidentPhysicalBindingSelection::WaveRelativeLane(_) => resident_lane_matrix(
+                    &owner,
+                    layout,
+                    binding.key.lane,
+                    wave_base,
+                    binding.key.device,
+                )?,
+            };
+            resident_matrix_component_address(matrix, binding.key.shard, binding.key.component)?
+        }
+        NativeValueComponent::IntegerValues => {
+            let selected_owner = match binding.key.selection {
+                ResidentPhysicalBindingSelection::AbsoluteFamilyElement(element) => {
+                    let family = match owner {
+                        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                            elements,
+                            ..
+                        }) => elements.get(element).ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(format!(
+                                "resident absolute family element {element} is out of range"
+                            ))
+                        })?,
+                        _ => {
+                            return Err(GpuResidentControlAdapterError::Unsupported(
+                                "absolute family binding requires an indexed family owner".into(),
+                            ));
+                        }
+                    };
+                    Some(family.resident_owner())
+                }
+                ResidentPhysicalBindingSelection::SharedBroadcast |
+                ResidentPhysicalBindingSelection::WaveRelativeLane(_) => None,
+            };
+            let owner_for_binding = selected_owner
+                .or_else(|| {
+                    if !matches!(
+                        binding.key.selection,
+                        ResidentPhysicalBindingSelection::WaveRelativeLane(_)
+                    ) {
+                        return None;
+                    }
+                    let GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                        elements, ..
+                    }) = owner
+                    else {
+                        return None;
+                    };
+                    let component_layout = layout.components.iter().find(|component| {
+                        component.component == NativeValueComponent::IntegerValues
+                    })?;
+                    let element = match component_layout.selection {
+                        crate::gpu_compiled::ResidentLaneSelection::Broadcast => 0,
+                        crate::gpu_compiled::ResidentLaneSelection::Strided { lane_stride } => {
+                            wave_base.checked_add(binding.key.lane.checked_mul(lane_stride)?)?
+                        }
+                    };
+                    elements.get(element).and_then(|element| match element {
+                        ResidentOwner::Integer(value) => Some(GpuResidentOwnerRef::Integer(value)),
+                        _ => None,
+                    })
+                })
+                .unwrap_or(owner);
+            let element_count = match &owner_for_binding {
+                GpuResidentOwnerRef::Integer(value) => Some(value.count()),
+                GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                    packed_integer: Some(value),
+                    ..
+                }) => Some(value.count()),
+                _ => None,
+            };
+            let explicit_family_element =
+                owner_is_family && matches!(owner_for_binding, GpuResidentOwnerRef::Integer(_));
+            let shared_broadcast =
+                matches!(binding.key.selection, ResidentPhysicalBindingSelection::SharedBroadcast);
+            let (address, bytes) = resident_binding_address(
+                owner_for_binding,
+                binding.key.shard,
+                binding.key.component,
+            )?;
+            let stride = layout
+                .components
+                .iter()
+                .find(|component| component.component == NativeValueComponent::IntegerValues)
+                .map(|component| component.lane_stride)
+                .unwrap_or(1);
+            let lane_offset = if explicit_family_element || shared_broadcast {
+                0
+            } else {
+                binding.key.lane.checked_mul(stride).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident integer lane offset overflows".into(),
+                    )
+                })?
+            };
+            let element_bytes =
+                element_count.and_then(|count| bytes.checked_div(count)).unwrap_or(bytes);
+            (
+                address
+                    .checked_add(
+                        u64::try_from(lane_offset.checked_mul(element_bytes).ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "resident integer lane address overflows".into(),
+                            )
+                        })?)
+                        .map_err(|_| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "resident integer lane address overflows".into(),
+                            )
+                        })?,
+                    )
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "resident integer lane address overflows".into(),
+                        )
+                    })?,
+                bytes.saturating_sub(lane_offset.saturating_mul(element_bytes)),
+            )
+        }
+        _ => {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident physical binding component has no lane address".into(),
+            ));
+        }
+    };
+    let addend = usize::try_from(binding.key.address_addend).map_err(|_| {
+        GpuResidentControlAdapterError::Unsupported(
+            "resident physical binding address addend does not fit usize".into(),
+        )
+    })?;
+    if addend >= bytes {
+        return Err(GpuResidentControlAdapterError::Unsupported(
+            "resident physical binding address addend is outside its owner view".into(),
+        ));
+    }
+    Ok((
+        address.checked_add(binding.key.address_addend).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident physical binding device address overflows".into(),
+            )
+        })?,
+        bytes - addend,
+    ))
+}
+
+fn resident_capture_owned_owner(
+    owner: GpuResidentOwnerRef<'_>,
+) -> Result<GpuCaptureOwnedOwner, GpuResidentControlAdapterError> {
+    match owner {
+        GpuResidentOwnerRef::Matrix(value) => {
+            Ok(GpuCaptureOwnedOwner::Matrix(GpuFleetMatrix::retained_clone(value)))
+        }
+        GpuResidentOwnerRef::SmallMatrix(value) => {
+            Ok(GpuCaptureOwnedOwner::SmallMatrix(GpuFleetSmallMatrix::retained_clone(value)))
+        }
+        GpuResidentOwnerRef::Trapdoor { public, secret } => {
+            Ok(GpuCaptureOwnedOwner::TrapdoorPair {
+                public: GpuFleetMatrix::retained_clone(public),
+                secret: GpuFleetTrapdoor::retained_clone(secret),
+            })
+        }
+        GpuResidentOwnerRef::Integer(value) => {
+            Ok(GpuCaptureOwnedOwner::IntegerValues(value.as_ref().clone()))
+        }
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+            packed_integer: Some(value),
+            ..
+        }) => Ok(GpuCaptureOwnedOwner::IntegerValues(value.as_ref().clone())),
+        GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            "non-packed resident family has no fixed capture owner; use family element bindings"
+                .into(),
+        )),
+    }
+}
+
+fn resident_unary_operation(
+    operation: &ResidentNativeUnary,
+) -> crate::backend::FixedUnaryOperation {
+    match operation {
+        ResidentNativeUnary::RingAutomorphism { index } => {
+            crate::backend::FixedUnaryOperation::RingAutomorphism { index: *index }
+        }
+        ResidentNativeUnary::ModulusSwitch { destination } => {
+            crate::backend::FixedUnaryOperation::ModulusSwitch { destination: destination.clone() }
+        }
+        ResidentNativeUnary::ModulusReduce { destination } => {
+            crate::backend::FixedUnaryOperation::ReduceModulus { destination: destination.clone() }
+        }
+        ResidentNativeUnary::CenteredRebase { destination } => {
+            crate::backend::FixedUnaryOperation::CenteredRebase { destination: destination.clone() }
+        }
+        ResidentNativeUnary::CenteredRoundDivide { divisor } => {
+            crate::backend::FixedUnaryOperation::CenteredRoundDivide { divisor: divisor.clone() }
+        }
+        ResidentNativeUnary::BlockModSwitch { destination, source_moduli, plaintext_modulus } => {
+            crate::backend::FixedUnaryOperation::BlockModSwitch {
+                destination: destination.clone(),
+                source_moduli: source_moduli.to_vec(),
+                plaintext_modulus: plaintext_modulus.clone(),
+            }
+        }
+        ResidentNativeUnary::RnsModUp { destination, source_moduli, digit_size, normalize } => {
+            crate::backend::FixedUnaryOperation::RnsModUp {
+                destination: destination.clone(),
+                source_moduli: source_moduli.to_vec(),
+                digit_size: *digit_size,
+                normalize: *normalize,
+            }
+        }
+        ResidentNativeUnary::RnsModDown { destination, source_moduli, plaintext_modulus } => {
+            crate::backend::FixedUnaryOperation::RnsModDown {
+                destination: destination.clone(),
+                source_moduli: source_moduli.to_vec(),
+                plaintext_modulus: *plaintext_modulus,
+            }
+        }
+        ResidentNativeUnary::Transpose => crate::backend::FixedUnaryOperation::Transpose,
+        ResidentNativeUnary::Slice { rows, columns } => {
+            crate::backend::FixedUnaryOperation::Slice {
+                rows: rows.map(|(start, end)| IndexRange { start, end }),
+                columns: columns.map(|(start, end)| IndexRange { start, end }),
+            }
+        }
+    }
+}
+
+fn resident_native_request(
+    program: &GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &GpuResidentCaptureOwners<'_>,
+) -> Result<GpuCaptureRequest, GpuResidentControlAdapterError> {
+    let metadata = &payload.metadata;
+    let matrix = |wire| resident_matrix_arc(resident_wire_owner(program, payload, owners, wire)?);
+    let compact = |wire| resident_small_arc(resident_wire_owner(program, payload, owners, wire)?);
+    let integer = |wire| resident_integer_arc(resident_wire_owner(program, payload, owners, wire)?);
+    let ordinary = |request| {
+        Ok::<GpuCaptureRequest, GpuResidentControlAdapterError>(GpuCaptureRequest::Ordinary(vec![
+            request,
+        ]))
+    };
+    match &payload.prepared {
+        ResidentNativePrepared::Alias { .. } => Err(GpuResidentControlAdapterError::Unsupported(
+            "native alias has no capture request".into(),
+        )),
+        ResidentNativePrepared::Ordinary(operation) => match operation {
+            ResidentNativeOrdinary::Constant { ty, value, env, single_device } => {
+                ordinary(if *single_device {
+                    FixedOperationBatchRequest::SingleDeviceConstant {
+                        metadata: metadata.clone(),
+                        ty: ty.clone(),
+                        value: value.clone(),
+                        env: env.clone(),
+                    }
+                } else {
+                    FixedOperationBatchRequest::GeneratedConstant {
+                        metadata: metadata.clone(),
+                        ty: ty.clone(),
+                        value: value.clone(),
+                        env: env.clone(),
+                    }
+                })
+            }
+            ResidentNativeOrdinary::LiftIntegerToConstantPolynomial { ty, coefficient } => {
+                ordinary(FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                    metadata: metadata.clone(),
+                    ty: ty.clone(),
+                    coefficient: integer(*coefficient)?,
+                })
+            }
+            ResidentNativeOrdinary::PolynomialFromValues { ty, values, evaluation } => {
+                ordinary(FixedOperationBatchRequest::PolynomialFromValues {
+                    metadata: metadata.clone(),
+                    ty: ty.clone(),
+                    values: integer(*values)?,
+                    evaluation: *evaluation,
+                })
+            }
+            ResidentNativeOrdinary::PolynomialValues { value, evaluation } => {
+                ordinary(FixedOperationBatchRequest::PolynomialValues {
+                    metadata: metadata.clone(),
+                    value: matrix(*value)?,
+                    evaluation: *evaluation,
+                })
+            }
+            ResidentNativeOrdinary::ExtractCoefficient { value, position } => {
+                ordinary(FixedOperationBatchRequest::ExtractCoefficient {
+                    metadata: metadata.clone(),
+                    value: matrix(*value)?,
+                    position: *position,
+                })
+            }
+            ResidentNativeOrdinary::ThresholdDecode {
+                value,
+                plaintext_modulus,
+                length,
+                output_bool,
+            } => ordinary(FixedOperationBatchRequest::ThresholdDecode {
+                metadata: metadata.clone(),
+                value: matrix(*value)?,
+                plaintext_modulus: plaintext_modulus.clone(),
+                length: *length,
+                output_bool: *output_bool,
+            }),
+            ResidentNativeOrdinary::PackPolynomialCoefficients { ty, bits, coefficient_bits } => {
+                ordinary(FixedOperationBatchRequest::PackPolynomialCoefficients {
+                    metadata: metadata.clone(),
+                    ty: ty.clone(),
+                    bits: integer(*bits)?,
+                    coefficient_bits: *coefficient_bits,
+                })
+            }
+            ResidentNativeOrdinary::MatrixBinary { operation, left, right } => {
+                ordinary(FixedOperationBatchRequest::MatrixBinary {
+                    metadata: metadata.clone(),
+                    operation: *operation,
+                    left: matrix(*left)?,
+                    right: matrix(*right)?,
+                })
+            }
+            ResidentNativeOrdinary::MatrixMulSmallRhs { left, right } => {
+                ordinary(FixedOperationBatchRequest::MatrixMulSmallRhs {
+                    metadata: metadata.clone(),
+                    left: matrix(*left)?,
+                    right: compact(*right)?,
+                })
+            }
+            ResidentNativeOrdinary::MatrixMulAccumulate { products, bias } => {
+                ordinary(FixedOperationBatchRequest::MatrixMulAccumulate {
+                    metadata: metadata.clone(),
+                    request: MatrixMulAccumulateRequest {
+                        products: products
+                            .iter()
+                            .map(|product| {
+                                Ok((
+                                    product.coefficient.clone(),
+                                    matrix(product.left)?,
+                                    matrix(product.right)?,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?,
+                        bias: bias.map(|wire| matrix(wire)).transpose()?,
+                    },
+                })
+            }
+            ResidentNativeOrdinary::Negate { value } => {
+                ordinary(FixedOperationBatchRequest::Negate {
+                    metadata: metadata.clone(),
+                    value: matrix(*value)?,
+                })
+            }
+            ResidentNativeOrdinary::Scale { value, scalar } => {
+                ordinary(FixedOperationBatchRequest::Scale {
+                    metadata: metadata.clone(),
+                    value: matrix(*value)?,
+                    scalar: scalar.clone(),
+                })
+            }
+            ResidentNativeOrdinary::Unary { operation, value } => {
+                ordinary(FixedOperationBatchRequest::UnaryTransform {
+                    metadata: metadata.clone(),
+                    operation: resident_unary_operation(operation),
+                    value: matrix(*value)?,
+                })
+            }
+            ResidentNativeOrdinary::Tensor { left, right } => {
+                ordinary(FixedOperationBatchRequest::Tensor {
+                    metadata: metadata.clone(),
+                    left: matrix(*left)?,
+                    right: matrix(*right)?,
+                })
+            }
+            ResidentNativeOrdinary::Concat { inputs, axis } => {
+                ordinary(FixedOperationBatchRequest::Concat {
+                    metadata: metadata.clone(),
+                    inputs: inputs
+                        .iter()
+                        .map(|wire| matrix(*wire))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    axis: *axis,
+                })
+            }
+            ResidentNativeOrdinary::CrtRecompose {
+                levels,
+                plaintext_moduli,
+                reconstruction_coefficients,
+                destination,
+            } => ordinary(FixedOperationBatchRequest::CrtRecompose {
+                metadata: metadata.clone(),
+                levels: levels.iter().map(|wire| matrix(*wire)).collect::<Result<Vec<_>, _>>()?,
+                plaintext_moduli: plaintext_moduli.to_vec(),
+                reconstruction_coefficients: reconstruction_coefficients.to_vec(),
+                destination: destination.clone(),
+            }),
+        },
+        ResidentNativePrepared::CompactCenteredRebase { input, destination } => {
+            Ok(GpuCaptureRequest::Compact(vec![FixedCompactOperationBatchRequest {
+                metadata: metadata.clone(),
+                operation: FixedCompactUnaryOperation::CenteredRebase {
+                    destination: destination.clone(),
+                },
+                value: compact(*input)?,
+            }]))
+        }
+        ResidentNativePrepared::Fused(operation) => match operation {
+            ResidentNativeFused::RowSum { source, right, rows } => {
+                Ok(GpuCaptureRequest::Fused(vec![FusedBatchRequest::RowSum {
+                    metadata: metadata.clone(),
+                    source: matrix(*source)?,
+                    right: right.map(|wire| matrix(wire)).transpose()?,
+                    rows: rows.clone(),
+                }]))
+            }
+            ResidentNativeFused::TensorRowSums { source, right, rows } => {
+                Ok(GpuCaptureRequest::Fused(vec![FusedBatchRequest::TensorRowSums {
+                    metadata: metadata.clone(),
+                    source: matrix(*source)?,
+                    right: matrix(*right)?,
+                    rows: rows.clone(),
+                }]))
+            }
+            ResidentNativeFused::Decompose { blocks, small, digits } => {
+                Ok(GpuCaptureRequest::Fused(vec![FusedBatchRequest::Decompose {
+                    metadata: metadata.clone(),
+                    blocks: blocks
+                        .iter()
+                        .map(|block| {
+                            block
+                                .first()
+                                .copied()
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "empty resident decomposition block".into(),
+                                    )
+                                })
+                                .and_then(|wire| matrix(wire))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    small: *small,
+                    digits: *digits,
+                }]))
+            }
+            ResidentNativeFused::SmallProduct { blocks, rhs } => {
+                Ok(GpuCaptureRequest::Fused(vec![FusedBatchRequest::SmallProduct {
+                    metadata: metadata.clone(),
+                    blocks: blocks
+                        .iter()
+                        .map(|block| {
+                            block
+                                .first()
+                                .copied()
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "empty resident product block".into(),
+                                    )
+                                })
+                                .and_then(|wire| matrix(wire))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    rhs: compact(*rhs)?,
+                }]))
+            }
+            ResidentNativeFused::Add { blocks, right } => {
+                Ok(GpuCaptureRequest::Fused(vec![FusedBatchRequest::Add {
+                    metadata: metadata.clone(),
+                    blocks: blocks
+                        .iter()
+                        .map(|block| {
+                            block
+                                .first()
+                                .copied()
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "empty resident add block".into(),
+                                    )
+                                })
+                                .and_then(|wire| matrix(wire))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    right: matrix(*right)?,
+                }]))
+            }
+        },
+        ResidentNativePrepared::Generation(operation) => match operation {
+            ResidentNativeGeneration::Uniform { ty, minimum, maximum } => {
+                Ok(GpuCaptureRequest::Generation(vec![FixedGenerationRequest::Uniform {
+                    metadata: metadata.clone(),
+                    ty: ty.clone(),
+                    range: SampleRange { minimum: minimum.clone(), maximum: maximum.clone() },
+                }]))
+            }
+            ResidentNativeGeneration::Gaussian { ty, sigma_bits, max_coefficient_bound } => {
+                Ok(GpuCaptureRequest::Generation(vec![FixedGenerationRequest::Gaussian {
+                    metadata: metadata.clone(),
+                    ty: ty.clone(),
+                    sigma: f64::from_bits(*sigma_bits),
+                    max_coefficient_bound: max_coefficient_bound.clone(),
+                }]))
+            }
+            ResidentNativeGeneration::Hash { .. } |
+            ResidentNativeGeneration::HashDecomposed { .. } => {
+                Err(GpuResidentControlAdapterError::Unsupported(
+                    "resident hash request is missing the prepared key bytes and evaluated tag"
+                        .into(),
+                ))
+            }
+        },
+        ResidentNativePrepared::Trapdoor { ty, sigma_bits, gadget_base, digit_count } => {
+            Ok(GpuCaptureRequest::Trapdoor(FixedTrapdoorRequest {
+                metadata: metadata.clone(),
+                ty: ty.clone(),
+                sigma: f64::from_bits(*sigma_bits),
+                gadget_base: gadget_base.clone(),
+                digit_count: *digit_count,
+            }))
+        }
+        ResidentNativePrepared::Decomposition { input, small, digits } => {
+            Ok(GpuCaptureRequest::Decomposition(vec![FixedGadgetDecomposeRequest {
+                metadata: metadata.clone(),
+                input: matrix(*input)?,
+                small: *small,
+                digits: *digits,
+            }]))
+        }
+        ResidentNativePrepared::Preimage {
+            public,
+            trapdoor,
+            target,
+            matrix_type,
+            sigma_bits,
+            gadget_base,
+            digit_count,
+            max_coefficient_bound,
+            randomness_seed,
+        } => {
+            let GpuResidentOwnerRef::Trapdoor { secret, .. } =
+                resident_wire_owner(program, payload, owners, *trapdoor)?
+            else {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "resident preimage trapdoor owner is not a trapdoor".into(),
+                ));
+            };
+            Ok(GpuCaptureRequest::Preimage(vec![PreimageRequest {
+                instance_slot: metadata.instance_slots.first().copied().unwrap_or(0),
+                fixed_metadata: Some(metadata.clone()),
+                matrix_type: matrix_type.clone(),
+                sigma: f64::from_bits(*sigma_bits),
+                gadget_base: gadget_base.clone(),
+                digit_count: *digit_count,
+                max_coefficient_bound: max_coefficient_bound.clone(),
+                trapdoor: Arc::clone(secret),
+                public: matrix(*public)?,
+                target: resident_fleet_column_source(matrix(*target)?),
+                randomness_seed: *randomness_seed,
+            }]))
+        }
+    }
+}
+
+impl GpuResidentCaptureProgram {
+    /// Return every resident slot which can be written while the frozen
+    /// program is replayed.  Binding access is the primary source, but loop
+    /// imports/exports and loop-carried state are also writes even when they
+    /// are not represented by a scalar instruction binding.  Keeping this
+    /// derived from the immutable arena makes replay lifetime protection
+    /// cover internal/index/status owners as well as public outputs.
+    fn written_slots(&self) -> BTreeSet<ValueSlot> {
+        let mut written = self
+            .bindings
+            .iter()
+            .filter_map(|binding| {
+                let BindingSource::ValueComponent { slot, .. } = binding.source;
+                matches!(binding.access, BindingAccess::Output | BindingAccess::InOut)
+                    .then_some(slot)
+            })
+            .collect::<BTreeSet<_>>();
+
+        for instruction in &self.schema.instructions {
+            let mut mark_output = |output: &ResidentControlOutput| {
+                written.insert(Self::output_slot(output));
+            };
+            match &instruction.kind {
+                ResidentControlInstructionKind::Scalar(_) => {
+                    instruction.outputs.iter().for_each(&mut mark_output);
+                    if let Some(status) = &instruction.status {
+                        written.insert(status.slot);
+                    }
+                }
+                ResidentControlInstructionKind::Native { .. } => {
+                    instruction.outputs.iter().for_each(&mut mark_output);
+                    if let Some(status) = &instruction.status {
+                        written.insert(status.slot);
+                    }
+                }
+                ResidentControlInstructionKind::ParallelLoop {
+                    index_slot,
+                    imports,
+                    exports,
+                    ..
+                } => {
+                    written.insert(index_slot.slot);
+                    imports.iter().for_each(|import| {
+                        written.insert(import.child.slot);
+                    });
+                    exports.iter().for_each(|export| {
+                        written.insert(Self::output_slot(&export.parent));
+                    });
+                    if let Some(status) = &instruction.status {
+                        written.insert(status.slot);
+                    }
+                }
+                ResidentControlInstructionKind::SequentialLoop {
+                    index_slot,
+                    carried,
+                    imports,
+                    exports,
+                    ..
+                } => {
+                    written.insert(index_slot.slot);
+                    imports.iter().for_each(|import| {
+                        written.insert(import.child.slot);
+                    });
+                    exports.iter().for_each(|export| {
+                        written.insert(Self::output_slot(&export.parent));
+                    });
+                    carried.iter().for_each(|binding| {
+                        written.insert(binding.body.slot);
+                        written.insert(binding.output.slot);
+                    });
+                    if let Some(status) = &instruction.status {
+                        written.insert(status.slot);
+                    }
+                }
+                ResidentControlInstructionKind::SubgraphCall { imports, exports, .. } => {
+                    imports.iter().for_each(|import| {
+                        written.insert(import.child.slot);
+                    });
+                    exports.iter().for_each(|export| {
+                        written.insert(Self::output_slot(&export.parent));
+                    });
+                    if let Some(status) = &instruction.status {
+                        written.insert(status.slot);
+                    }
+                }
+            }
+        }
+
+        for region in &self.schema.regions {
+            for output in &region.outputs {
+                written.insert(Self::output_slot(output));
+            }
+            region.imports.iter().for_each(|import| {
+                written.insert(import.child.slot);
+            });
+            region.exports.iter().for_each(|export| {
+                written.insert(Self::output_slot(&export.parent));
+            });
+        }
+        written
+    }
+
+    fn instruction(
+        &self,
+        id: ResidentInstructionId,
+    ) -> Result<&CompiledResidentControlInstruction, GpuResidentControlAdapterError> {
+        self.schema.instructions.iter().find(|instruction| instruction.id == id).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident instruction id is out of range".into(),
+            )
+        })
+    }
+
+    fn region(
+        &self,
+        id: ResidentRegionId,
+    ) -> Result<&crate::gpu_compiled::CompiledResidentControlRegion, GpuResidentControlAdapterError>
+    {
+        self.schema.regions.iter().find(|region| region.id == id).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported("resident region id is out of range".into())
+        })
+    }
+
+    fn phase(
+        &self,
+        id: ResidentPhaseId,
+    ) -> Result<&crate::gpu_compiled::CompiledResidentControlPhase, GpuResidentControlAdapterError>
+    {
+        self.schema.phases.iter().find(|phase| phase.id == id).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported("resident phase id is out of range".into())
+        })
+    }
+
+    fn region_contains(
+        &self,
+        ancestor: ResidentRegionId,
+        target: ResidentRegionId,
+    ) -> Result<bool, GpuResidentControlAdapterError> {
+        if ancestor == target {
+            return Ok(true);
+        }
+        let region = self.region(ancestor)?;
+        for phase_id in &region.phases {
+            let phase = self.phase(*phase_id)?;
+            for instruction_id in &phase.instructions {
+                let instruction = self.instruction(*instruction_id)?;
+                let child = match &instruction.kind {
+                    ResidentControlInstructionKind::ParallelLoop { child, .. } => Some(*child),
+                    ResidentControlInstructionKind::SequentialLoop {
+                        child: Some(child), ..
+                    } |
+                    ResidentControlInstructionKind::SubgraphCall { child: Some(child), .. } => {
+                        Some(*child)
+                    }
+                    _ => None,
+                };
+                if let Some(child) = child &&
+                    self.region_contains(child, target)?
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    fn output_slot(output: &ResidentControlOutput) -> ValueSlot {
+        output.slot()
+    }
+}
+
+/// Validate the immutable global binding namespace before CUDA capture. The
+/// native self-registering control wrappers use these indices when remapping
+/// their just-captured pointer arguments. IDs may be sparse because they are
+/// schema-global, but duplicates remain invalid.
+fn resident_binding_count(
+    bindings: &[RegionBinding],
+) -> Result<u32, GpuResidentControlAdapterError> {
+    let mut maximum = None;
+    for (position, binding) in bindings.iter().enumerate() {
+        if bindings.iter().enumerate().any(|(other_position, other)| {
+            other_position != position && other.index == binding.index
+        }) {
+            return Err(GpuResidentControlAdapterError::DuplicateBinding(binding.index));
+        }
+        maximum = Some(maximum.map_or(binding.index, |value: u32| value.max(binding.index)));
+    }
+    let Some(maximum) = maximum else {
+        return Ok(0);
+    };
+    maximum.checked_add(1).ok_or_else(|| {
+        GpuResidentControlAdapterError::Unsupported("resident binding index overflows".into())
+    })
+}
+
+fn resident_const_i64(expression: &IntExpr) -> Result<i64, GpuResidentControlAdapterError> {
+    let IntExpr::Const(value) = expression else {
+        return Err(GpuResidentControlAdapterError::StructuralRequiresProgram);
+    };
+    value.to_i64().ok_or(GpuResidentControlAdapterError::StructuralRequiresProgram)
+}
+
+fn resident_const_usize(expression: &IntExpr) -> Result<usize, GpuResidentControlAdapterError> {
+    let IntExpr::Const(value) = expression else {
+        return Err(GpuResidentControlAdapterError::StructuralRequiresProgram);
+    };
+    value.to_usize().ok_or(GpuResidentControlAdapterError::StructuralRequiresProgram)
+}
+
+/// Validate the Select ABI shape. `count` is the number of branches, not the
+/// lane count of the result: lowering supplies `[selector, branch0, ...]`,
+/// while the native destination count is the actual lane count. Each input is
+/// therefore either scalar-broadcast or already vector-sized.
+fn validate_resident_select_shape<I>(
+    count: &IntExpr,
+    input_counts: I,
+    output_count: usize,
+) -> Result<(), GpuResidentControlAdapterError>
+where
+    I: IntoIterator<Item = usize>,
+{
+    let branch_count = resident_const_usize(count)?;
+    let mut input_count = 0usize;
+    for count in input_counts {
+        input_count =
+            input_count.checked_add(1).ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?;
+        if count != 1 && count != output_count {
+            return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+        }
+    }
+    if branch_count.checked_add(1) != Some(input_count) {
+        return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+    }
+    Ok(())
+}
+
+fn resident_expression_owner<'a>(
+    expression: &IntExpr,
+    owners: &'a GpuResidentCaptureOwners<'_>,
+) -> Result<&'a GpuFleetSignedValues, GpuResidentControlAdapterError> {
+    match expression {
+        IntExpr::LoopIndex(slot) => owners.resolve_integer(ValueSlot(*slot)),
+        _ => Err(GpuResidentControlAdapterError::StructuralRequiresProgram),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum GpuResidentControlAdapterError {
+    #[error("resident control request has inconsistent slot and owner counts")]
+    SlotOwnerCount,
+    #[error("resident control request has no output owner")]
+    MissingOutput,
+    #[error("resident control request has no input owner")]
+    MissingInput,
+    #[error("resident control operation is not supported by the native i64 ABI: {0}")]
+    Unsupported(String),
+    #[error("resident control owner is not on device {expected}")]
+    WrongOwner { expected: i32 },
+    #[error("resident control integer encoding mismatch: expected {expected:?}, got {actual:?}")]
+    WrongEncoding { expected: NativeIntegerEncoding, actual: GpuSignedValuesEncoding },
+    #[error("resident control schema is missing a binding for slot {0:?}")]
+    MissingBinding(ValueSlot),
+    #[error("resident control schema contains duplicate binding index {0}")]
+    DuplicateBinding(u32),
+    #[error("structural resident control requires a flat capture program")]
+    StructuralRequiresProgram,
+    #[error("resident control native operation failed: {0}")]
+    Native(#[from] GpuNativeGraphError),
+}
+
+fn require_native_encoding(
+    owner: &GpuFleetSignedValues,
+    encoding: NativeIntegerEncoding,
+) -> Result<(), GpuResidentControlAdapterError> {
+    let matches = match encoding {
+        NativeIntegerEncoding::SignedWords(words) => {
+            owner.encoding() == GpuSignedValuesEncoding::SignedWords(words)
+        }
+        NativeIntegerEncoding::UnsignedWord => {
+            owner.encoding() == GpuSignedValuesEncoding::CanonicalU64
+        }
+        NativeIntegerEncoding::SignedWord => owner.encoding() == GpuSignedValuesEncoding::SignedI64,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(GpuResidentControlAdapterError::WrongEncoding {
+            expected: encoding,
+            actual: owner.encoding(),
+        })
+    }
+}
+
+fn require_signed_owner(
+    owner: &GpuFleetSignedValues,
+) -> Result<(), GpuResidentControlAdapterError> {
+    require_native_encoding(owner, NativeIntegerEncoding::SignedWord)
+}
+
 impl GpuDcrtBackend {
+    /// Route resident control inputs before graph capture.  The only
+    /// cross-device transport here is a peer/device-to-device copy owned by
+    /// the destination stream; host reads, host staging, and CPU evaluation
+    /// are intentionally unavailable to this adapter.
+    pub(crate) fn route_resident_control_inputs(
+        &mut self,
+        destination_device: i32,
+        inputs: &[&GpuFleetSignedValues],
+    ) -> Result<Vec<GpuFleetSignedValues>, GpuResidentControlAdapterError> {
+        if !self.devices.iter().any(|(device, _)| *device == destination_device) {
+            return Err(GpuResidentControlAdapterError::WrongOwner { expected: destination_device });
+        }
+        inputs
+            .iter()
+            .map(|input| {
+                self.materialize_integer_values_on_device(input, destination_device).map_err(
+                    |error| {
+                        GpuResidentControlAdapterError::Native(GpuNativeGraphError::Native(
+                            error.to_string(),
+                        ))
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn resident_control_stream(
+        &self,
+        physical_device: i32,
+    ) -> Result<GpuNativeLaunchStream, GpuResidentControlAdapterError> {
+        let parameters = self
+            .devices
+            .iter()
+            .find(|(device, _)| *device == physical_device)
+            .and_then(|(_, backend)| {
+                backend.parameters.iter().flat_map(|values| values.values()).next()
+            })
+            .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+        parameters
+            .native_launch_stream(physical_device)
+            .map(|stream| stream.control_launch_stream())
+            .map_err(GpuResidentControlAdapterError::Native)
+    }
+
+    fn submit_resident_program_instruction(
+        &mut self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        instruction: &CompiledResidentControlInstruction,
+        physical_device: i32,
+        current_phase: ResidentPhaseId,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let ResidentControlInstructionKind::Scalar(operation) = &instruction.kind else {
+            return Err(GpuResidentControlAdapterError::StructuralRequiresProgram);
+        };
+        let input = |index: usize| {
+            instruction
+                .inputs
+                .get(index)
+                .ok_or(GpuResidentControlAdapterError::MissingInput)
+                .and_then(|slot| owners.resolve_integer(slot.slot))
+        };
+        let output = |index: usize| {
+            instruction
+                .outputs
+                .get(index)
+                .map(GpuResidentCaptureProgram::output_slot)
+                .ok_or(GpuResidentControlAdapterError::MissingOutput)
+                .and_then(|slot| owners.resolve_integer(slot))
+        };
+        let status = instruction
+            .status
+            .as_ref()
+            .map(|slot| owners.resolve_integer(slot.slot))
+            .transpose()?;
+        let input_slot = |index: usize| {
+            instruction
+                .inputs
+                .get(index)
+                .ok_or(GpuResidentControlAdapterError::MissingInput)
+                .map(|slot| slot.slot)
+        };
+        let output_slot = |index: usize| {
+            instruction
+                .outputs
+                .get(index)
+                .map(GpuResidentCaptureProgram::output_slot)
+                .ok_or(GpuResidentControlAdapterError::MissingOutput)
+        };
+        let status_slot = instruction.status.as_ref().map(|slot| slot.slot);
+        let signed = |owner: &GpuFleetSignedValues| require_signed_owner(owner);
+        match operation {
+            ResidentControlOperation::ConstantInt { .. } |
+            ResidentControlOperation::ConstantBool { .. } => {
+                let source = self
+                    .capture_integer_constants
+                    .get(&instruction.id)
+                    .ok_or(GpuResidentControlAdapterError::MissingInput)?;
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    None,
+                    None,
+                    status_slot,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    GpuIntegerOperation::CopyConstant,
+                    source,
+                    None,
+                    None,
+                    0,
+                    status.map(|s| s.native()),
+                )?;
+            }
+            ResidentControlOperation::EvaluateInt { expression } => {
+                signed(output(0)?)?;
+                match expression {
+                    IntExpr::Const(value) => output(0)?.native().fill_constant_i64_with_status(
+                        value
+                            .to_i64()
+                            .ok_or(GpuResidentControlAdapterError::StructuralRequiresProgram)?,
+                        status.map(|s| s.native()),
+                    )?,
+                    IntExpr::LoopIndex(index_slot) => {
+                        let source = resident_expression_owner(expression, owners)?;
+                        signed(source)?;
+                        set_capture_binding_sources(
+                            capture,
+                            &program.bindings,
+                            &[
+                                (0, output_slot(0)?, 0, NativeValueComponent::IntegerValues),
+                                (1, ValueSlot(*index_slot), 0, NativeValueComponent::IntegerValues),
+                            ],
+                        )?;
+                        source.copy_range_into(
+                            0..source.count(),
+                            output(0)?,
+                            0,
+                            &self.resident_control_stream(physical_device)?,
+                        )?;
+                    }
+                    IntExpr::Div(lhs, rhs) => {
+                        let numerator = resident_expression_owner(lhs, owners)?;
+                        let denominator = resident_expression_owner(rhs, owners)?;
+                        signed(numerator)?;
+                        signed(denominator)?;
+                        let status = status.ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "exact expression division requires a preallocated status owner"
+                                    .into(),
+                            )
+                        })?;
+                        set_capture_binding_sources(
+                            capture,
+                            &program.bindings,
+                            &[
+                                (0, output_slot(0)?, 0, NativeValueComponent::IntegerValues),
+                                (1, input_slot(0)?, 0, NativeValueComponent::IntegerValues),
+                                (2, input_slot(1)?, 0, NativeValueComponent::IntegerValues),
+                                (
+                                    3,
+                                    status_slot
+                                        .ok_or(GpuResidentControlAdapterError::MissingInput)?,
+                                    0,
+                                    NativeValueComponent::IntegerValues,
+                                ),
+                            ],
+                        )?;
+                        output(0)?.native().exact_div_i64_with_status(
+                            numerator.native(),
+                            denominator.native(),
+                            Some(status.native()),
+                        )?;
+                    }
+                    IntExpr::FloorDiv(lhs, rhs) | IntExpr::Rem(lhs, rhs) => {
+                        let numerator = resident_expression_owner(lhs, owners)?;
+                        let denominator = resident_expression_owner(rhs, owners)?;
+                        signed(numerator)?;
+                        signed(denominator)?;
+                        let secondary = output(1)?;
+                        signed(secondary)?;
+                        let status = status.ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "floor expression division requires a preallocated status owner"
+                                    .into(),
+                            )
+                        })?;
+                        let (quotient, remainder) = match expression {
+                            IntExpr::FloorDiv(_, _) => (output(0)?, secondary),
+                            IntExpr::Rem(_, _) => (secondary, output(0)?),
+                            _ => unreachable!(),
+                        };
+                        set_capture_binding_sources(
+                            capture,
+                            &program.bindings,
+                            &[
+                                (
+                                    0,
+                                    if matches!(expression, IntExpr::FloorDiv(_, _)) {
+                                        output_slot(0)?
+                                    } else {
+                                        output_slot(1)?
+                                    },
+                                    0,
+                                    NativeValueComponent::IntegerValues,
+                                ),
+                                (
+                                    1,
+                                    if matches!(expression, IntExpr::FloorDiv(_, _)) {
+                                        output_slot(1)?
+                                    } else {
+                                        output_slot(0)?
+                                    },
+                                    0,
+                                    NativeValueComponent::IntegerValues,
+                                ),
+                                (2, input_slot(0)?, 0, NativeValueComponent::IntegerValues),
+                                (3, input_slot(1)?, 0, NativeValueComponent::IntegerValues),
+                                (
+                                    4,
+                                    status_slot
+                                        .ok_or(GpuResidentControlAdapterError::MissingInput)?,
+                                    0,
+                                    NativeValueComponent::IntegerValues,
+                                ),
+                            ],
+                        )?;
+                        quotient.native().floor_div_rem_i64_with_status(
+                            remainder.native(),
+                            numerator.native(),
+                            denominator.native(),
+                            Some(status.native()),
+                        )?;
+                    }
+                    _ => return Err(GpuResidentControlAdapterError::StructuralRequiresProgram),
+                }
+            }
+            ResidentControlOperation::IntBinary { operation } => {
+                let status = status.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "signed arithmetic requires a preallocated status owner".into(),
+                    )
+                })?;
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    Some(input_slot(1)?),
+                    status_slot,
+                    None,
+                )?;
+                match operation {
+                    IntBinaryOp::Add => output(0)?.native().integer_operation(
+                        GpuIntegerOperation::Add,
+                        input(0)?.native(),
+                        Some(input(1)?.native()),
+                        None,
+                        0,
+                        Some(status.native()),
+                    )?,
+                    IntBinaryOp::Subtract => output(0)?.native().integer_operation(
+                        GpuIntegerOperation::Subtract,
+                        input(0)?.native(),
+                        Some(input(1)?.native()),
+                        None,
+                        0,
+                        Some(status.native()),
+                    )?,
+                    IntBinaryOp::Multiply => output(0)?.native().integer_operation(
+                        GpuIntegerOperation::Multiply,
+                        input(0)?.native(),
+                        Some(input(1)?.native()),
+                        None,
+                        0,
+                        Some(status.native()),
+                    )?,
+                    IntBinaryOp::Divide | IntBinaryOp::Remainder => {
+                        let (quotient, remainder) = if matches!(operation, IntBinaryOp::Divide) {
+                            (output(0)?, output(1)?)
+                        } else {
+                            (output(1)?, output(0)?)
+                        };
+                        quotient.native().integer_operation(
+                            GpuIntegerOperation::DivideRemainder,
+                            input(0)?.native(),
+                            Some(input(1)?.native()),
+                            Some(remainder.native()),
+                            0,
+                            Some(status.native()),
+                        )?;
+                    }
+                }
+            }
+            ResidentControlOperation::IntCompare { operation } => {
+                require_native_encoding(output(0)?, NativeIntegerEncoding::UnsignedWord)?;
+                let native_operation = match operation {
+                    IntCompareOp::Equal => GpuIntegerOperation::Equal,
+                    IntCompareOp::Less => GpuIntegerOperation::Less,
+                    IntCompareOp::LessEqual => GpuIntegerOperation::LessEqual,
+                };
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    Some(input_slot(1)?),
+                    None,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    native_operation,
+                    input(0)?.native(),
+                    Some(input(1)?.native()),
+                    None,
+                    0,
+                    None,
+                )?;
+            }
+            ResidentControlOperation::BoolToInt => {
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    None,
+                    None,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    GpuIntegerOperation::BitExtract,
+                    input(0)?.native(),
+                    None,
+                    None,
+                    0,
+                    None,
+                )?;
+            }
+            ResidentControlOperation::BitExtract { bit } => {
+                require_native_encoding(output(0)?, NativeIntegerEncoding::UnsignedWord)?;
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    None,
+                    None,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    GpuIntegerOperation::BitExtract,
+                    input(0)?.native(),
+                    None,
+                    None,
+                    resident_const_i64(bit)? as u64,
+                    None,
+                )?;
+            }
+            ResidentControlOperation::FamilyPack { element, count, .. } => {
+                // Matrix families are published by the resident frame as an
+                // owner table.  FamilyPack is therefore only the semantic
+                // owner propagation step; allocating or copying a second
+                // matrix family here would break the zero-copy contract. The
+                // runtime has already installed the output owner before
+                // capture, so there is no graph node to submit.
+                if matches!(element.as_ref(), ResidentSlotType::Matrix { .. }) {
+                    return Ok(());
+                }
+                let expected = resident_const_usize(count)?;
+                if expected != instruction.inputs.len() {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                let destination = owners.resolve_packed_integer(output_slot(0)?)?;
+                let mut offset = 0usize;
+                for index in 0..instruction.inputs.len() {
+                    let source = input(index)?;
+                    set_resident_integer_binding_map(
+                        capture,
+                        program,
+                        output_slot(0)?,
+                        Some(input_slot(index)?),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    destination.native().integer_operation(
+                        GpuIntegerOperation::Pack,
+                        source.native(),
+                        None,
+                        None,
+                        offset as u64,
+                        None,
+                    )?;
+                    offset = offset.checked_add(source.count()).ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "family pack size overflows".into(),
+                        )
+                    })?;
+                }
+            }
+            ResidentControlOperation::FamilyGetStatic { family, .. }
+                if matches!(
+                    family.as_ref(),
+                    ResidentSlotType::IndexedFamily { element, .. }
+                        if matches!(
+                            element.as_ref(),
+                            ResidentSlotType::Matrix { .. } |
+                                ResidentSlotType::SmallMatrix { .. } |
+                                ResidentSlotType::Preimage { .. }
+                        )
+                ) => {}
+            ResidentControlOperation::FamilyGetStatic { index, .. } => {
+                let index = resident_const_usize(index)?;
+                let source_slot = input_slot(0)?;
+                let source = owners.resolve_packed_integer(source_slot)?;
+                if index >= source.count() {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    None,
+                    None,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    GpuIntegerOperation::GatherStatic,
+                    source.native(),
+                    None,
+                    None,
+                    index as u64,
+                    None,
+                )?;
+            }
+            ResidentControlOperation::FamilyGetDynamic { .. } => {
+                let source_slot = input_slot(0)?;
+                let source_owner = owners.resolve(source_slot)?;
+                if let GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                    element_type,
+                    elements,
+                    packed_integer: None,
+                    ..
+                }) = &source_owner &&
+                    matches!(element_type.as_ref(), ResidentSlotType::Matrix { .. })
+                {
+                    let destination_slot = output_slot(0)?;
+                    let GpuResidentOwnerRef::Matrix(destination) =
+                        owners.resolve(destination_slot)?
+                    else {
+                        return Err(GpuResidentControlAdapterError::Unsupported(
+                            "direct matrix family gather requires a matrix destination".into(),
+                        ));
+                    };
+                    let index = input(1)?;
+                    let status = status.ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "matrix gather requires status".into(),
+                        )
+                    })?;
+                    require_signed_owner(index)?;
+                    require_signed_owner(status)?;
+                    let ResidentDirectFamilyCapturePreparation { table, source_columns } = self
+                        .capture_resident_direct_family_preparations
+                        .remove(&instruction.id)
+                        .ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "direct matrix family gather was not prepared before CUDA capture"
+                                    .into(),
+                            )
+                        })?;
+                    if elements.len() != table.family_count() {
+                        return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                    }
+                    let destination_shard = destination
+                        .shards()
+                        .iter()
+                        .enumerate()
+                        .find(|(_, shard)| shard.device_id == physical_device)
+                        .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                            expected: physical_device,
+                        })?;
+                    let (_, destination_columns) = destination_shard.1.value.size();
+                    if destination_columns != source_columns {
+                        return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                    }
+                    let phase_bindings = resident_phase_schema_with_dynamic_family_sources(
+                        program,
+                        current_phase,
+                        physical_device,
+                    )?;
+                    let phase_binding_base = resident_binding_count(&program.bindings)?;
+                    let source_binding_globals = (0..elements.len())
+                        .map(|element| {
+                            phase_bindings
+                                .iter()
+                                .find(|binding| {
+                                    binding.key.slot == source_slot &&
+                                        binding.key.device == physical_device &&
+                                        binding.key.component ==
+                                            NativeValueComponent::MatrixDescriptors &&
+                                        binding.key.selection ==
+                                            ResidentPhysicalBindingSelection::AbsoluteFamilyElement(
+                                                element,
+                                            )
+                                })
+                                .map(|binding| {
+                                    phase_binding_base.checked_add(binding.index).ok_or_else(|| {
+                                        GpuResidentControlAdapterError::Unsupported(
+                                            "direct matrix family source binding index overflows"
+                                                .into(),
+                                        )
+                                    })
+                                })
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(format!(
+                                        "direct matrix family source element {element} has no descriptor binding"
+                                    ))
+                                })?
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let source_local_indices = (0..elements.len())
+                        .map(|element| {
+                            u32::try_from(3usize.checked_add(element).ok_or_else(|| {
+                                GpuResidentControlAdapterError::Unsupported(
+                                    "direct matrix family source binding index overflows".into(),
+                                )
+                            })?)
+                            .map_err(|_| {
+                                GpuResidentControlAdapterError::Unsupported(
+                                    "direct matrix family source binding index overflows".into(),
+                                )
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let destination_binding = schema_binding_index(
+                        &program.bindings,
+                        destination_slot,
+                        u32::try_from(destination_shard.0).map_err(|_| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "direct matrix family destination shard overflows u32".into(),
+                            )
+                        })?,
+                        NativeValueComponent::MatrixDescriptors,
+                    )?;
+                    let index_binding = schema_binding_index(
+                        &program.bindings,
+                        input_slot(1)?,
+                        0,
+                        NativeValueComponent::IntegerValues,
+                    )?;
+                    let status_binding = schema_binding_index(
+                        &program.bindings,
+                        status_slot.ok_or(GpuResidentControlAdapterError::MissingBinding(
+                            input_slot(1)?,
+                        ))?,
+                        0,
+                        NativeValueComponent::IntegerValues,
+                    )?;
+                    let mut binding_map =
+                        vec![(0, destination_binding), (1, index_binding), (2, status_binding)];
+                    binding_map.extend(
+                        source_local_indices
+                            .iter()
+                            .copied()
+                            .zip(source_binding_globals.iter().copied()),
+                    );
+                    capture
+                        .set_binding_map(&binding_map)
+                        .map_err(GpuResidentControlAdapterError::Native)?;
+                    let stream = capture.launch_stream().clone();
+                    let source_owners = elements
+                        .iter()
+                        .map(|element| {
+                            let ResidentOwner::Matrix(matrix) = element else {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "direct matrix family source contains a non-matrix owner"
+                                        .into(),
+                                ));
+                            };
+                            matrix
+                                .shards()
+                                .iter()
+                                .find(|shard| shard.device_id == physical_device)
+                                .map(|shard| &shard.value)
+                                .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                    expected: physical_device,
+                                })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    table.bind_live_source_descriptors(
+                        &source_owners,
+                        &source_local_indices,
+                        &stream,
+                    )?;
+                    let destination_value =
+                        unsafe { &mut *std::ptr::addr_of!(destination_shard.1.value).cast_mut() };
+                    destination_value.gather_family_into(
+                        &table,
+                        index.native(),
+                        1,
+                        0,
+                        0,
+                        source_columns,
+                        Some(status.native()),
+                        &stream,
+                        0,
+                        1,
+                        2,
+                    )?;
+                    self.capture_resident_resources
+                        .push(GpuCompiledRegionResource::MatrixFamilyTables(vec![table]));
+                    return Ok(());
+                }
+                let source = owners.resolve_packed_integer(input_slot(0)?)?;
+                let indices = input(1)?;
+                let status = status.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported("gather requires status".into())
+                })?;
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    output_slot(0)?,
+                    Some(input_slot(0)?),
+                    Some(input_slot(1)?),
+                    status_slot,
+                    None,
+                )?;
+                output(0)?.native().integer_operation(
+                    GpuIntegerOperation::Gather,
+                    source.native(),
+                    Some(indices.native()),
+                    None,
+                    0,
+                    Some(status.native()),
+                )?;
+            }
+            ResidentControlOperation::Select { count } => {
+                let destination = output(0)?;
+                let input_counts = instruction
+                    .inputs
+                    .iter()
+                    .map(|slot| owners.resolve_integer(slot.slot).map(|value| value.count()))
+                    .collect::<Result<Vec<_>, _>>()?;
+                validate_resident_select_shape(count, input_counts, destination.count())?;
+                let selector = input(0)?;
+                let status = status.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "signed select requires status".into(),
+                    )
+                })?;
+                for index in 1..instruction.inputs.len() {
+                    set_resident_integer_binding_map(
+                        capture,
+                        program,
+                        output_slot(0)?,
+                        Some(input_slot(index)?),
+                        Some(input_slot(0)?),
+                        status_slot,
+                        None,
+                    )?;
+                    destination.native().integer_operation(
+                        GpuIntegerOperation::Select,
+                        input(index)?.native(),
+                        Some(selector.native()),
+                        None,
+                        ((instruction.inputs.len() as u64 - 1) << 32) | (index as u64 - 1),
+                        Some(status.native()),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_resident_matrix_transfer(
+        &self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        source_slot: ValueSlot,
+        source: &GpuFleetMatrix,
+        destination_slot: ValueSlot,
+        destination: &GpuFleetMatrix,
+        source_start: usize,
+        destination_start: usize,
+        columns: usize,
+        source_component: NativeValueComponent,
+        destination_component: NativeValueComponent,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let stream = capture.launch_stream().clone();
+        let source_end = source_start
+            .checked_add(columns)
+            .ok_or_else(|| GpuResidentControlAdapterError::SlotOwnerCount)?;
+        let destination_end = destination_start
+            .checked_add(columns)
+            .ok_or_else(|| GpuResidentControlAdapterError::SlotOwnerCount)?;
+        if source_end > source.columns || destination_end > destination.columns {
+            return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+        }
+        for (destination_shard_index, destination_shard) in destination.shards.iter().enumerate() {
+            let destination_range = destination_shard.global_column_start..
+                destination_shard.global_column_start + destination_shard.value.col_size();
+            let requested_destination = destination_start..destination_end;
+            let overlap_start = destination_range.start.max(requested_destination.start);
+            let overlap_end = destination_range.end.min(requested_destination.end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+            let source_global_start = source_start
+                .checked_add(overlap_start - destination_start)
+                .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?;
+            let source_global_end = source_global_start
+                .checked_add(overlap_end - overlap_start)
+                .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?;
+            let source_shard = source
+                .shards
+                .iter()
+                .find(|shard| {
+                    shard.device_id == destination_shard.device_id &&
+                        shard.global_column_start <= source_global_start &&
+                        source_global_end <= shard.global_column_start + shard.value.col_size()
+                })
+                .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                    expected: destination_shard.device_id,
+                })?;
+            // The source owner is the graph-local exemplar.  The destination
+            // pointer is the replay-varying value and is therefore rebound by
+            // the explicit schema identity passed to this capture primitive.
+            source_shard.value.wait_compiled_inputs(destination_shard.device_id, &stream, true)?;
+            destination_shard.value.wait_compiled_inputs(
+                destination_shard.device_id,
+                &stream,
+                false,
+            )?;
+            // The owner table is shared during capture, but this graph node
+            // exclusively writes the destination allocation. The native
+            // wrapper needs a mutable handle only to record writer metadata;
+            // ownership remains with the frame's Arc.
+            let destination_value =
+                unsafe { &mut *std::ptr::addr_of!(destination_shard.value).cast_mut() };
+            let limb_count = u32::try_from(source_shard.value.level() + 1)
+                .map_err(|_| GpuResidentControlAdapterError::SlotOwnerCount)?;
+            set_capture_binding_sources(
+                capture,
+                &program.bindings,
+                &[
+                    (
+                        0,
+                        destination_slot,
+                        u32::try_from(destination_shard_index)
+                            .map_err(|_| GpuResidentControlAdapterError::SlotOwnerCount)?,
+                        destination_component,
+                    ),
+                    (
+                        1,
+                        source_slot,
+                        u32::try_from(
+                            source
+                                .shards()
+                                .iter()
+                                .position(|shard| shard.device_id == source_shard.device_id)
+                                .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                    expected: source_shard.device_id,
+                                })?,
+                        )
+                        .map_err(|_| GpuResidentControlAdapterError::SlotOwnerCount)?,
+                        source_component,
+                    ),
+                ]
+                .into_iter()
+                .flat_map(|(base, slot, shard, component)| {
+                    (0..limb_count)
+                        .map(move |limb| (base * limb_count + limb, slot, shard, component))
+                })
+                .collect::<Vec<_>>(),
+            )
+            .map_err(GpuResidentControlAdapterError::Native)?;
+            source_shard.value.copy_columns_into_on_capture_stream(
+                destination_value,
+                source_global_start - source_shard.global_column_start,
+                overlap_start - destination_shard.global_column_start,
+                overlap_end - overlap_start,
+                &stream,
+                limb_count,
+                0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_resident_typed_transfer(
+        &self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        source_slot: &ResidentTypedSlot,
+        destination_slot: &ResidentTypedSlot,
+        source_owner: GpuResidentOwnerRef<'_>,
+        destination_owner: GpuResidentOwnerRef<'_>,
+        source_start: usize,
+        destination_start: usize,
+        columns: Option<usize>,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        if !resident_transfer_types_compatible(&source_slot.ty, &destination_slot.ty) {
+            return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+        }
+        match (source_owner, destination_owner, &source_slot.ty) {
+            (
+                GpuResidentOwnerRef::Matrix(source),
+                GpuResidentOwnerRef::Matrix(destination),
+                ResidentSlotType::Matrix { .. },
+            ) => {
+                let columns = columns.unwrap_or(source.columns);
+                self.capture_resident_matrix_transfer(
+                    capture,
+                    program,
+                    source_slot.slot,
+                    source,
+                    destination_slot.slot,
+                    destination,
+                    source_start,
+                    destination_start,
+                    columns,
+                    NativeValueComponent::MatrixData,
+                    NativeValueComponent::MatrixData,
+                )?;
+            }
+            (
+                GpuResidentOwnerRef::SmallMatrix(source),
+                GpuResidentOwnerRef::SmallMatrix(destination),
+                ResidentSlotType::SmallMatrix { .. } | ResidentSlotType::Preimage { .. },
+            ) => {
+                if source.size() != destination.size() ||
+                    source_start != 0 ||
+                    destination_start != 0
+                {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                for (source, destination) in source.shards.iter().zip(destination.shards.iter()) {
+                    // Compact copy likewise updates only native writer
+                    // metadata while retaining the frame-owned payload.
+                    let destination_value =
+                        unsafe { &mut *std::ptr::addr_of!(destination.value).cast_mut() };
+                    source.value.copy_into(destination_value)?;
+                }
+            }
+            (
+                GpuResidentOwnerRef::Trapdoor { public: source_public, secret: source_secret },
+                GpuResidentOwnerRef::Trapdoor {
+                    public: destination_public,
+                    secret: destination_secret,
+                },
+                ResidentSlotType::Trapdoor { .. },
+            ) => {
+                if source_start != 0 || destination_start != 0 || columns.is_some() {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                self.capture_resident_matrix_transfer(
+                    capture,
+                    program,
+                    source_slot.slot,
+                    source_public,
+                    destination_slot.slot,
+                    destination_public,
+                    0,
+                    0,
+                    source_public.columns,
+                    NativeValueComponent::TrapdoorPublic,
+                    NativeValueComponent::TrapdoorPublic,
+                )?;
+                source_secret.copy_into(destination_secret)?;
+            }
+            (
+                GpuResidentOwnerRef::Integer(source),
+                GpuResidentOwnerRef::Integer(destination),
+                ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. },
+            ) => {
+                if source_start != 0 ||
+                    destination_start != 0 ||
+                    columns.is_some_and(|columns| columns != source.count())
+                {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                source.native().copy_into(destination.native())?;
+            }
+            (
+                GpuResidentOwnerRef::Family(source),
+                GpuResidentOwnerRef::Family(destination),
+                ResidentSlotType::IndexedFamily { element, count, .. },
+            ) => {
+                if source_start != 0 || destination_start != 0 || columns.is_some() {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                let ResidentOwner::IndexedFamily {
+                    elements: source_elements,
+                    packed_integer: source_packed,
+                    ..
+                } = source
+                else {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                };
+                let ResidentOwner::IndexedFamily {
+                    elements: destination_elements,
+                    packed_integer: destination_packed,
+                    ..
+                } = destination
+                else {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                };
+                if source_elements.len() != *count || destination_elements.len() != *count {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                }
+                if let (Some(source), Some(destination)) = (source_packed, destination_packed) {
+                    source.native().copy_into(destination.native())?;
+                } else {
+                    for (source, destination) in
+                        source_elements.iter().zip(destination_elements.iter())
+                    {
+                        self.capture_resident_typed_transfer(
+                            capture,
+                            program,
+                            &ResidentTypedSlot::new(source_slot.slot, element.as_ref().clone()),
+                            &ResidentTypedSlot::new(
+                                destination_slot.slot,
+                                element.as_ref().clone(),
+                            ),
+                            ResidentOwnerCaptureValue(source).resident_owner(),
+                            ResidentOwnerCaptureValue(destination).resident_owner(),
+                            0,
+                            0,
+                            None,
+                        )?;
+                    }
+                }
+            }
+            _ => return Err(GpuResidentControlAdapterError::SlotOwnerCount),
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_imports(
+        &mut self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        region_id: ResidentRegionId,
+        owners: &GpuResidentCaptureOwners<'_>,
+        imports: &[crate::gpu_compiled::ResidentLoopImport],
+        status_slot: Option<ValueSlot>,
+        physical_device: i32,
+        tail: bool,
+        wave_base: usize,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let region = program.region(region_id)?;
+        let lane_count = if tail {
+            region
+                .tail
+                .and_then(|phase_id| {
+                    program.schema.phases.iter().find(|phase| phase.id == phase_id)
+                })
+                .map(|phase| phase.width.get())
+                .ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident tail import has no active lane width".into(),
+                    )
+                })?
+        } else {
+            region.wave_width.get()
+        };
+        if wave_base.checked_add(lane_count).is_none() {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident wave base overflows lane window".into(),
+            ));
+        }
+        let phase_id = if tail {
+            region.tail.or_else(|| region.phases.first().copied())
+        } else {
+            region.phases.first().copied()
+        }
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident import region has no capture phase".into(),
+            )
+        })?;
+        let physical_bindings = resident_phase_schema(program, phase_id)?;
+        let physical_binding_base = resident_binding_count(&program.bindings)?;
+        let lane_binding_schema = resident_lane_region_bindings(
+            physical_bindings,
+            &region.scope,
+            physical_device,
+            0,
+            0,
+            physical_binding_base,
+        )?;
+        if let Some(wave) = &region.wave {
+            let status = status_slot.map(|slot| owners.resolve_integer(slot)).transpose()?;
+            let index = owners.resolve_integer(wave.index.slot)?;
+            require_signed_owner(index)?;
+            set_capture_binding_sources(
+                capture,
+                &program.bindings,
+                &[
+                    (0, wave.index.slot, 0, NativeValueComponent::IntegerValues),
+                    (
+                        1,
+                        status_slot.ok_or(GpuResidentControlAdapterError::MissingBinding(
+                            wave.index.slot,
+                        ))?,
+                        0,
+                        NativeValueComponent::IntegerValues,
+                    ),
+                ],
+            )
+            .map_err(GpuResidentControlAdapterError::Native)?;
+            index.native().fill_loop_index_i64_with_status(
+                i64::try_from(wave_base).map_err(|_| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident wave base does not fit signed loop index".into(),
+                    )
+                })?,
+                1,
+                status.map(|value| value.native()),
+            )?;
+            let wave_base_owner = owners.resolve_integer(wave.wave_base.slot)?;
+            set_capture_binding_sources(
+                capture,
+                &program.bindings,
+                &[(0, wave.wave_base.slot, 0, NativeValueComponent::IntegerValues)],
+            )
+            .map_err(GpuResidentControlAdapterError::Native)?;
+            wave_base_owner.native().fill_constant_i64_with_status(
+                i64::try_from(wave_base).map_err(|_| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident wave base does not fit signed loop index".into(),
+                    )
+                })?,
+                None,
+            )?;
+            let active_lane = owners.resolve_integer(wave.active_lane.slot)?;
+            set_capture_binding_sources(
+                capture,
+                &program.bindings,
+                &[(0, wave.active_lane.slot, 0, NativeValueComponent::IntegerValues)],
+            )
+            .map_err(GpuResidentControlAdapterError::Native)?;
+            active_lane.native().fill_constant_i64_with_status(
+                i64::try_from(lane_count).map_err(|_| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident active lane count does not fit signed integer".into(),
+                    )
+                })?,
+                None,
+            )?;
+        }
+        for import in imports {
+            let typed = program
+                .schema
+                .typed_imports
+                .iter()
+                .find(|candidate| {
+                    candidate.region == region_id &&
+                        candidate.parent.slot == import.parent.slot &&
+                        candidate.child.slot == import.child.slot
+                })
+                .ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident typed import is missing for {:?}->{:?}",
+                        import.parent.slot, import.child.slot
+                    ))
+                })?;
+            match &typed.selection {
+                crate::gpu_compiled::ResidentImportSelection::Broadcast => continue,
+                crate::gpu_compiled::ResidentImportSelection::Zip { loop_index, offset } => {
+                    let source = owners.resolve(import.parent.slot)?;
+                    let destination = owners.resolve(import.child.slot)?;
+                    match (source, destination) {
+                        (
+                            GpuResidentOwnerRef::Integer(source),
+                            GpuResidentOwnerRef::Integer(destination),
+                        ) => {
+                            let index = owners.resolve_integer(loop_index.slot)?;
+                            require_signed_owner(index)?;
+                            let status = status_slot
+                                .map(|slot| owners.resolve_integer(slot))
+                                .transpose()?
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "zip loop import requires a preallocated status owner"
+                                            .into(),
+                                    )
+                                })?;
+                            require_signed_owner(status)?;
+                            if *offset != 0 {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "integer zip offset requires a device-side shifted-index primitive"
+                                        .into(),
+                                ));
+                            }
+                            set_resident_integer_binding_map(
+                                capture,
+                                program,
+                                import.child.slot,
+                                Some(import.parent.slot),
+                                Some(loop_index.slot),
+                                status_slot,
+                                None,
+                            )
+                            .map_err(GpuResidentControlAdapterError::Native)?;
+                            source.gather_into(index, destination, Some(status))?;
+                        }
+                        (
+                            GpuResidentOwnerRef::Matrix(source),
+                            GpuResidentOwnerRef::Matrix(destination),
+                        ) => {
+                            let (source_start, columns) = if source.columns == destination.columns {
+                                (0, source.columns)
+                            } else {
+                                (
+                                    wave_base
+                                        .checked_mul(destination.columns)
+                                        .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?
+                                        .checked_add(*offset)
+                                        .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?,
+                                    destination.columns,
+                                )
+                            };
+                            self.capture_resident_typed_transfer(
+                                capture,
+                                program,
+                                &typed.parent,
+                                &typed.child,
+                                GpuResidentOwnerRef::Matrix(source),
+                                GpuResidentOwnerRef::Matrix(destination),
+                                source_start,
+                                0,
+                                Some(columns),
+                            )?;
+                        }
+                        (source, destination) => {
+                            self.capture_resident_typed_transfer(
+                                capture,
+                                program,
+                                &typed.parent,
+                                &typed.child,
+                                source,
+                                destination,
+                                0,
+                                0,
+                                None,
+                            )?;
+                        }
+                    }
+                }
+                crate::gpu_compiled::ResidentImportSelection::FamilyElement {
+                    loop_index,
+                    offset,
+                } => {
+                    let source = owners.resolve(import.parent.slot)?;
+                    let destination = owners.resolve(import.child.slot)?;
+                    let status = status_slot
+                        .map(|slot| owners.resolve_integer(slot))
+                        .transpose()?
+                        .ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "family import requires a preallocated status owner".into(),
+                            )
+                        })?;
+                    require_signed_owner(status)?;
+                    let index = owners.resolve_integer(loop_index.slot)?;
+                    require_signed_owner(index)?;
+                    match (source, destination) {
+                        (
+                            GpuResidentOwnerRef::Family(
+                                family @ ResidentOwner::IndexedFamily {
+                                    packed_integer: Some(_),
+                                    ..
+                                },
+                            ),
+                            GpuResidentOwnerRef::Integer(destination),
+                        ) => {
+                            if *offset != 0 {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "integer family offset requires a device-side shifted-index primitive"
+                                        .into(),
+                                ));
+                            }
+                            set_resident_integer_binding_map(
+                                capture,
+                                program,
+                                import.child.slot,
+                                Some(import.parent.slot),
+                                Some(loop_index.slot),
+                                status_slot,
+                                None,
+                            )
+                            .map_err(GpuResidentControlAdapterError::Native)?;
+                            let packed =
+                                family.packed_integer(import.parent.slot).map_err(|error| {
+                                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                                })?;
+                            packed.gather_into(index, destination, Some(status))?;
+                        }
+                        (
+                            GpuResidentOwnerRef::Family(family),
+                            GpuResidentOwnerRef::Matrix(_) | GpuResidentOwnerRef::Family(_),
+                        ) => {
+                            let ResidentFamilyCapturePreparation {
+                                table,
+                                destination,
+                                destination_shard,
+                                source_columns,
+                            } = self
+                                .capture_resident_family_preparations
+                                .remove(&(region_id, import.parent.slot, import.child.slot))
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "resident matrix family gather was not prepared before CUDA capture".into(),
+                                    )
+                                })?;
+                            let stream = capture.launch_stream().clone();
+                            let index_binding = schema_binding_index(
+                                &program.bindings,
+                                loop_index.slot,
+                                0,
+                                NativeValueComponent::IntegerValues,
+                            )?;
+                            let status_slot = status_slot.ok_or_else(|| {
+                                GpuResidentControlAdapterError::MissingBinding(loop_index.slot)
+                            })?;
+                            let status_binding = schema_binding_index(
+                                &program.bindings,
+                                status_slot,
+                                0,
+                                NativeValueComponent::IntegerValues,
+                            )?;
+                            let ResidentOwner::IndexedFamily { elements, .. } = family else {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "matrix family gather source is not indexed".into(),
+                                ));
+                            };
+                            let mut source_owners = Vec::with_capacity(elements.len());
+                            for element in elements.iter() {
+                                let ResidentOwner::Matrix(matrix) = element else {
+                                    return Err(GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family gather source lanes must be matrix owners"
+                                            .into(),
+                                    ));
+                                };
+                                let source = matrix
+                                    .shards()
+                                    .iter()
+                                    .find(|shard| shard.device_id == physical_device)
+                                    .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                        expected: physical_device,
+                                    })?;
+                                source_owners.push(&source.value);
+                            }
+                            if source_owners.is_empty() {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "matrix family gather source is empty".into(),
+                                ));
+                            }
+                            // The descriptor table is a retained graph resource, but its
+                            // entries must be patched from the current replay owners as
+                            // well.  Bind one physical descriptor identity per family
+                            // element before recording the gather node; the table helper
+                            // emits the device-side pointer-table update on the capture
+                            // stream, so no capture-exemplar pointer survives replay.
+                            let source_binding_globals = (0..source_owners.len())
+                                .map(|element| {
+                                    let binding = physical_bindings
+                                        .iter()
+                                        .find(|binding| {
+                                            binding.key.slot == import.parent.slot &&
+                                                binding.key.lane == 0 &&
+                                                binding.key.shard == 0 &&
+                                                binding.key.component ==
+                                                    NativeValueComponent::MatrixDescriptors &&
+                                                binding.key.selection ==
+                                                    ResidentPhysicalBindingSelection::AbsoluteFamilyElement(
+                                                        element,
+                                                    )
+                                        })
+                                        .ok_or_else(|| {
+                                            GpuResidentControlAdapterError::Unsupported(format!(
+                                                "resident family source element {element} has no physical descriptor binding"
+                                            ))
+                                        })?;
+                                    physical_binding_base
+                                        .checked_add(binding.index)
+                                        .ok_or_else(|| {
+                                            GpuResidentControlAdapterError::Unsupported(
+                                                "resident family source binding index overflows"
+                                                    .into(),
+                                            )
+                                        })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let source_local_base =
+                                3usize.checked_add(lane_count).ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family source binding index overflows".into(),
+                                    )
+                                })?;
+                            let source_local_indices = (0..source_owners.len())
+                                .map(|element| {
+                                    u32::try_from(
+                                        source_local_base.checked_add(element).ok_or_else(
+                                            || {
+                                                GpuResidentControlAdapterError::Unsupported(
+                                                    "matrix family source binding index overflows"
+                                                        .into(),
+                                                )
+                                            },
+                                        )?,
+                                    )
+                                    .map_err(|_| {
+                                        GpuResidentControlAdapterError::Unsupported(
+                                            "matrix family source binding index overflows".into(),
+                                        )
+                                    })
+                                })
+                                .collect::<Result<Vec<_>, _>>()?;
+                            let source_binding_map = source_local_indices
+                                .iter()
+                                .copied()
+                                .zip(source_binding_globals.iter().copied())
+                                .collect::<Vec<_>>();
+                            capture
+                                .set_binding_map(&source_binding_map)
+                                .map_err(GpuResidentControlAdapterError::Native)?;
+                            table.bind_live_source_descriptors(
+                                &source_owners,
+                                &source_local_indices,
+                                &stream,
+                            )?;
+                            match destination {
+                                ResidentFamilyCaptureDestination::Packed(mut scratch) => {
+                                    let destination_shard_index = scratch
+                                        .shards()
+                                        .iter()
+                                        .position(|shard| shard.device_id == physical_device)
+                                        .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                            expected: physical_device,
+                                        })?;
+                                    let destination_binding = schema_binding_index(
+                                        &lane_binding_schema,
+                                        import.child.slot,
+                                        u32::try_from(destination_shard_index).map_err(|_| {
+                                            GpuResidentControlAdapterError::Unsupported(
+                                                "matrix family destination shard overflows u32"
+                                                    .into(),
+                                            )
+                                        })?,
+                                        NativeValueComponent::MatrixDescriptors,
+                                    )?;
+                                    capture
+                                        .set_binding_map(
+                                            &[
+                                                (0, destination_binding),
+                                                (1, index_binding),
+                                                (2, status_binding),
+                                            ]
+                                            .into_iter()
+                                            .chain(source_binding_map.iter().copied())
+                                            .collect::<Vec<_>>(),
+                                        )
+                                        .map_err(GpuResidentControlAdapterError::Native)?;
+                                    let scratch_shard = scratch
+                                        .shards
+                                        .iter_mut()
+                                        .find(|shard| shard.device_id == physical_device)
+                                        .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                            expected: physical_device,
+                                        })?;
+                                    scratch_shard.value.gather_family_into(
+                                        &table,
+                                        index.native(),
+                                        lane_count,
+                                        i64::try_from(wave_base).map_err(|_| {
+                                            GpuResidentControlAdapterError::Unsupported(
+                                                "matrix family gather wave base overflows signed index"
+                                                    .into(),
+                                            )
+                                        })?,
+                                        i64::try_from(*offset).map_err(|_| {
+                                            GpuResidentControlAdapterError::Unsupported(
+                                                "matrix family import offset overflows signed index"
+                                                    .into(),
+                                            )
+                                        })?,
+                                        source_columns,
+                                        Some(status.native()),
+                                        &stream,
+                                        0,
+                                        1,
+                                        2,
+                                    )?;
+                                    self.capture_resident_resources.push(
+                                        GpuCompiledRegionResource::MatrixConstants(vec![scratch]),
+                                    );
+                                }
+                                ResidentFamilyCaptureDestination::Lanes(destinations) => {
+                                    if destinations.lane_count() != lane_count {
+                                        return Err(GpuResidentControlAdapterError::Unsupported(
+                                            "resident family gather destination window does not match active lanes"
+                                                .into(),
+                                        ));
+                                    }
+                                    let active_lane_mask = if lane_count == 64 {
+                                        u64::MAX
+                                    } else {
+                                        (1u64 << lane_count) - 1
+                                    };
+                                    let destination_binding_indices = (0..lane_count)
+                                        .map(|lane| {
+                                            let lane_bindings = resident_lane_region_bindings(
+                                                physical_bindings,
+                                                &region.scope,
+                                                physical_device,
+                                                0,
+                                                lane,
+                                                physical_binding_base,
+                                            )?;
+                                            schema_binding_index(
+                                                &lane_bindings,
+                                                import.child.slot,
+                                                destination_shard.ok_or_else(|| {
+                                                    GpuResidentControlAdapterError::Unsupported(
+                                                        "matrix family destination shard is missing"
+                                                            .into(),
+                                                    )
+                                                })?,
+                                                NativeValueComponent::MatrixDescriptors,
+                                            )
+                                            .map_err(GpuResidentControlAdapterError::Native)
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    let local_destination_binding_indices = (0..lane_count)
+                                        .map(|lane| {
+                                            u32::try_from(3usize.checked_add(lane).ok_or_else(
+                                                || {
+                                                    GpuResidentControlAdapterError::Unsupported(
+                                                        "matrix lane gather local binding index overflows"
+                                                            .into(),
+                                                    )
+                                                },
+                                            )?)
+                                            .map_err(|_| {
+                                                GpuResidentControlAdapterError::Unsupported(
+                                                    "matrix lane gather local binding index overflows"
+                                                        .into(),
+                                                )
+                                            })
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    let mut binding_map =
+                                        Vec::with_capacity(3 + destination_binding_indices.len());
+                                    binding_map.push((0, index_binding));
+                                    binding_map.push((1, status_binding));
+                                    binding_map.extend(
+                                        local_destination_binding_indices
+                                            .iter()
+                                            .copied()
+                                            .zip(destination_binding_indices.iter().copied()),
+                                    );
+                                    binding_map.extend(source_binding_map.iter().copied());
+                                    capture
+                                        .set_binding_map(&binding_map)
+                                        .map_err(GpuResidentControlAdapterError::Native)?;
+                                    GpuDCRTPolyMatrix::gather_family_lanes_into(
+                                        &table,
+                                        &destinations,
+                                        index.native(),
+                                        lane_count,
+                                        active_lane_mask,
+                                        i64::try_from(*offset).map_err(|_| {
+                                            GpuResidentControlAdapterError::Unsupported(
+                                                "matrix family import offset overflows signed index"
+                                                    .into(),
+                                            )
+                                        })?,
+                                        source_columns,
+                                        Some(status.native()),
+                                        &stream,
+                                        &local_destination_binding_indices,
+                                        0,
+                                        1,
+                                    )?;
+                                    self.capture_resident_resources.push(
+                                        GpuCompiledRegionResource::MatrixLaneDestinations(vec![
+                                            destinations,
+                                        ]),
+                                    );
+                                }
+                            }
+                            self.capture_resident_resources
+                                .push(GpuCompiledRegionResource::MatrixFamilyTables(vec![table]));
+                        }
+                        _ => {
+                            return Err(GpuResidentControlAdapterError::Unsupported(
+                                "family import owner types are not matrix/integer compatible"
+                                    .into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_exports(
+        &self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        region_id: ResidentRegionId,
+        owners: &GpuResidentCaptureOwners<'_>,
+        exports: &[crate::gpu_compiled::ResidentLoopExport],
+        physical_device: i32,
+        tail: bool,
+        wave_base: usize,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let region = program.region(region_id)?;
+        let lane_count = if tail {
+            region
+                .tail
+                .and_then(|phase_id| {
+                    program.schema.phases.iter().find(|phase| phase.id == phase_id)
+                })
+                .map(|phase| phase.width.get())
+                .ok_or_else(|| GpuResidentControlAdapterError::SlotOwnerCount)?
+        } else {
+            region.wave_width.get()
+        };
+        if wave_base.checked_add(lane_count).is_none() {
+            return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+        }
+        let phase_id = if tail {
+            region.tail.or_else(|| region.phases.first().copied())
+        } else {
+            region.phases.first().copied()
+        }
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident export region has no capture phase".into(),
+            )
+        })?;
+        let physical_bindings = resident_phase_schema(program, phase_id)?;
+        let physical_binding_base = resident_binding_count(&program.bindings)?;
+        // These edges belong to the enclosing structural instruction. The
+        // child region's own export list describes its nested instructions,
+        // not the boundary from this child's outputs to its parent.
+        for export in exports {
+            let source_slot = export.child.value();
+            let destination_slot = export.parent.value();
+            let source = owners.resolve(source_slot.slot)?;
+            let destination = owners.resolve(destination_slot.slot)?;
+            if resident_owner_same_allocation(&source, &destination) {
+                continue;
+            }
+            if matches!(
+                (&source_slot.ty, &destination_slot.ty),
+                (
+                    ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. },
+                    ResidentSlotType::IndexedFamily { element, .. }
+                ) if matches!(
+                    element.as_ref(),
+                    ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. }
+                ) && resident_transfer_types_compatible(&source_slot.ty, element)
+            ) {
+                let GpuResidentOwnerRef::Integer(source) = source else {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                };
+                let GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                    packed_integer: Some(destination),
+                    ..
+                }) = destination
+                else {
+                    return Err(GpuResidentControlAdapterError::SlotOwnerCount);
+                };
+                set_resident_integer_binding_map(
+                    capture,
+                    program,
+                    destination_slot.slot,
+                    Some(source_slot.slot),
+                    None,
+                    None,
+                    None,
+                )
+                .map_err(GpuResidentControlAdapterError::Native)?;
+                // The source is one reusable wave, while the destination is
+                // the whole logical family. Export only the active lanes to
+                // this wave's range, including a shorter final wave.
+                let active_source = source.slice(0..lane_count)?;
+                destination.native().integer_operation(
+                    GpuIntegerOperation::Pack,
+                    active_source.native(),
+                    None,
+                    None,
+                    wave_base as u64,
+                    None,
+                )?;
+                continue;
+            }
+            let ResidentSlotType::Matrix { .. } = &source_slot.ty else {
+                // Non-matrix exports continue through the ordinary typed
+                // transfer path below.
+                let (source_start, destination_start, columns) = (0, 0, None);
+                self.capture_resident_typed_transfer(
+                    capture,
+                    program,
+                    source_slot,
+                    destination_slot,
+                    source,
+                    destination,
+                    source_start,
+                    destination_start,
+                    columns,
+                )?;
+                continue;
+            };
+            if let ResidentSlotType::IndexedFamily { element, .. } = &destination_slot.ty {
+                if matches!(element.as_ref(), ResidentSlotType::Matrix { .. }) {
+                    let child_physical = export.child_physical.as_ref().ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "matrix family export has no child physical layout".into(),
+                        )
+                    })?;
+                    let parent_physical = export.parent_physical.as_ref().ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "matrix family export has no parent physical layout".into(),
+                        )
+                    })?;
+                    self.capture_resident_matrix_family_export(
+                        capture,
+                        source_slot,
+                        destination_slot,
+                        source,
+                        destination,
+                        child_physical,
+                        parent_physical,
+                        physical_bindings,
+                        physical_binding_base,
+                        lane_count,
+                        wave_base,
+                        physical_device,
+                    )?;
+                    continue;
+                }
+            }
+            let (source_start, destination_start, columns) = match (&source, &destination) {
+                (GpuResidentOwnerRef::Matrix(source), GpuResidentOwnerRef::Matrix(destination)) => {
+                    let source_columns = source.columns;
+                    let destination_columns = destination.columns;
+                    if source_columns == destination_columns {
+                        (0, 0, Some(source_columns))
+                    } else if source_columns < destination_columns {
+                        let columns_per_lane = source_columns
+                            .checked_div(lane_count.max(1))
+                            .filter(|columns| *columns > 0)
+                            .unwrap_or(source_columns);
+                        let destination_start = wave_base
+                            .checked_mul(columns_per_lane)
+                            .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?;
+                        (0, destination_start, Some(source_columns))
+                    } else {
+                        let source_start = wave_base
+                            .checked_mul(destination_columns)
+                            .ok_or(GpuResidentControlAdapterError::SlotOwnerCount)?;
+                        (source_start, 0, Some(destination_columns))
+                    }
+                }
+                _ => (0, 0, None),
+            };
+            self.capture_resident_typed_transfer(
+                capture,
+                program,
+                source_slot,
+                destination_slot,
+                source,
+                destination,
+                source_start,
+                destination_start,
+                columns,
+            )?;
+        }
+        let _ = physical_device;
+        Ok(())
+    }
+
+    fn capture_resident_matrix_family_export(
+        &self,
+        capture: &mut GpuCaptureScope,
+        source_slot: &ResidentTypedSlot,
+        destination_slot: &ResidentTypedSlot,
+        source_owner: GpuResidentOwnerRef<'_>,
+        destination_owner: GpuResidentOwnerRef<'_>,
+        source_layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+        destination_layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+        physical_bindings: &[ResidentPhysicalBinding],
+        physical_binding_base: u32,
+        lane_count: usize,
+        wave_base: usize,
+        physical_device: i32,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let GpuResidentOwnerRef::Family(source_family) = source_owner else {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix export source has no indexed physical owner".into(),
+            ));
+        };
+        let GpuResidentOwnerRef::Family(destination_family) = destination_owner else {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix export destination has no indexed physical owner".into(),
+            ));
+        };
+        let ResidentOwner::IndexedFamily { elements: destination_elements, .. } =
+            destination_family
+        else {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix export destination is not an indexed family".into(),
+            ));
+        };
+        let ResidentOwner::IndexedFamily { elements: source_elements, .. } = source_family else {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "matrix export source is not an indexed family".into(),
+            ));
+        };
+        for layout in [source_layout, destination_layout] {
+            let indexed = layout
+                .components
+                .iter()
+                .find(|component| component.component == NativeValueComponent::MatrixData)
+                .is_some_and(|component| {
+                    matches!(
+                        component.selection,
+                        crate::gpu_compiled::ResidentLaneSelection::Strided { .. }
+                    )
+                });
+            if !indexed {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "matrix family export requires indexed physical lane layouts".into(),
+                ));
+            }
+        }
+        let source_owner = GpuResidentOwnerRef::Family(source_family);
+        let destination_owner = GpuResidentOwnerRef::Family(destination_family);
+        let stream = capture.launch_stream().clone();
+        for lane in 0..lane_count {
+            let source = resident_lane_matrix(
+                &source_owner,
+                source_layout,
+                lane,
+                wave_base,
+                physical_device,
+            )?;
+            let destination = resident_lane_matrix(
+                &destination_owner,
+                destination_layout,
+                lane,
+                wave_base,
+                physical_device,
+            )?;
+            let (source_rows, source_columns) = source.size();
+            let (destination_rows, destination_columns) = destination.size();
+            if source_rows != destination_rows || source_columns != destination_columns {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "matrix export lane source/destination shapes differ".into(),
+                ));
+            }
+            let destination_index =
+                resident_physical_lane_index(destination_layout, lane, wave_base)?;
+            let ResidentOwner::Matrix(destination_owner) =
+                destination_elements.get(destination_index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "matrix export destination lane is outside its family".into(),
+                    )
+                })?
+            else {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "matrix export destination lane is not a matrix owner".into(),
+                ));
+            };
+            let destination_shard_index = destination_owner
+                .shards()
+                .iter()
+                .position(|shard| shard.device_id == physical_device)
+                .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+            let source_index = resident_physical_lane_index(source_layout, lane, wave_base)?;
+            let ResidentOwner::Matrix(source_owner) =
+                source_elements.get(source_index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "matrix export source lane is outside its family".into(),
+                    )
+                })?
+            else {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "matrix export source lane is not a matrix owner".into(),
+                ));
+            };
+            let source_shard_index = source_owner
+                .shards()
+                .iter()
+                .position(|shard| shard.device_id == physical_device)
+                .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+            let binding_for = |slot, shard: usize, element| {
+                let binding = physical_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.key.slot == slot &&
+                            binding.key.device == physical_device &&
+                            binding.key.shard as usize == shard &&
+                            binding.key.component == NativeValueComponent::MatrixData &&
+                            match binding.key.selection {
+                                ResidentPhysicalBindingSelection::SharedBroadcast => {
+                                    binding.key.lane == lane
+                                }
+                                ResidentPhysicalBindingSelection::AbsoluteFamilyElement(
+                                    selected,
+                                ) => selected == element,
+                                ResidentPhysicalBindingSelection::WaveRelativeLane(selected) => {
+                                    selected == lane && binding.key.lane == lane
+                                }
+                            }
+                    })
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "matrix export lane has no physical data binding".into(),
+                        )
+                    })?;
+                physical_binding_base.checked_add(binding.index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "matrix export binding index overflows".into(),
+                    )
+                })
+            };
+            let destination_binding =
+                binding_for(destination_slot.slot, destination_shard_index, destination_index)?;
+            let source_binding = binding_for(source_slot.slot, source_shard_index, source_index)?;
+            // The copy ABI allocates a local binding for each limb. All limbs
+            // belong to the same physical allocation; capture records their
+            // byte offsets against that allocation's current replay binding.
+            let limb_count = u32::try_from(source.level() + 1)
+                .map_err(|_| GpuResidentControlAdapterError::SlotOwnerCount)?;
+            let binding_map = (0..limb_count)
+                .map(|limb| (limb, destination_binding))
+                .chain((0..limb_count).map(|limb| (limb_count + limb, source_binding)))
+                .collect::<Vec<_>>();
+            capture
+                .set_binding_map(&binding_map)
+                .map_err(GpuResidentControlAdapterError::Native)?;
+            source.wait_compiled_inputs(physical_device, &stream, true)?;
+            destination.wait_compiled_inputs(physical_device, &stream, false)?;
+            let destination = unsafe { &mut *std::ptr::addr_of!(*destination).cast_mut() };
+            source.copy_columns_into_on_capture_stream(
+                destination,
+                0,
+                0,
+                source_columns,
+                &stream,
+                limb_count,
+                0,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prepare_resident_native_captures(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        physical_device: i32,
+        phase_id: ResidentPhaseId,
+        wave_base: usize,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        self.capture_resident_native_preparations.clear();
+        for instruction in &program.schema.instructions {
+            let ResidentControlInstructionKind::Native { payload } = &instruction.kind else {
+                continue;
+            };
+            if matches!(payload.prepared, ResidentNativePrepared::Alias { .. }) {
+                continue;
+            }
+            let preparation_phase_id = if instruction.phase == Some(phase_id) ||
+                instruction.tail_phase == Some(phase_id)
+            {
+                phase_id
+            } else {
+                instruction.phase.unwrap_or(phase_id)
+            };
+            let preparation_phase = program.phase(preparation_phase_id)?;
+            let preparation_tail = matches!(
+                preparation_phase.geometry.kind,
+                crate::gpu_compiled::ResidentPhaseKind::Tail
+            );
+            // Request construction owns the native input handles.  It must
+            // happen before CUDA capture: matrix/compact request values may
+            // materialize shallow or device-backed handles while lowering.
+            let lane_dispatch = payload.dispatch_geometry.is_some() &&
+                resident_lane_native_dispatch(&payload.prepared);
+            let request = if lane_dispatch {
+                None
+            } else {
+                Some(resident_native_request(program, payload, owners)?)
+            };
+            let mut output_storage = Vec::new();
+            for output in &instruction.outputs {
+                let owner = owners.resolve(GpuResidentCaptureProgram::output_slot(output))?;
+                if lane_dispatch && matches!(&owner, GpuResidentOwnerRef::Family(_)) {
+                    continue;
+                }
+                output_storage.push(resident_capture_owned_owner(owner)?);
+            }
+            for output in &mut output_storage {
+                let mut destination = match output {
+                    GpuCaptureOwnedOwner::Matrix(value) => GpuCaptureOwner::Matrix(value),
+                    GpuCaptureOwnedOwner::SmallMatrix(value) => GpuCaptureOwner::SmallMatrix(value),
+                    GpuCaptureOwnedOwner::TrapdoorPair { public, secret } => {
+                        GpuCaptureOwner::TrapdoorPair { public, secret }
+                    }
+                    GpuCaptureOwnedOwner::IntegerValues(value) => {
+                        GpuCaptureOwner::IntegerValues(value)
+                    }
+                };
+                prepare_capture_owner(&mut destination).map_err(|error| {
+                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                })?;
+            }
+            let mut protocol = request
+                .as_ref()
+                .map(|request| {
+                    self.allocate_capture_protocol_owners(request, parameters, physical_device)
+                        .map_err(|error| {
+                            GpuResidentControlAdapterError::Unsupported(error.to_string())
+                        })
+                })
+                .transpose()?
+                .flatten();
+            if let Some(protocol) = &protocol {
+                protocol.status.native().prepare_external_for_capture()?;
+                if let Some(scratch) = &protocol.scratch {
+                    scratch.native().prepare_external_for_capture()?;
+                }
+                if let Some(threshold) = &protocol.threshold {
+                    threshold.prepare_external_for_capture()?;
+                }
+            }
+            let mut lane_requests = Vec::new();
+            if lane_dispatch &&
+                matches!(
+                    &payload.prepared,
+                    ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Scale { .. })
+                )
+            {
+                let geometry = payload.dispatch_geometry.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident lane capture has no dispatch geometry".into(),
+                    )
+                })?;
+                let active_lanes = if preparation_tail {
+                    geometry.tail_active_lanes.ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "resident tail lane capture has no tail geometry".into(),
+                        )
+                    })?
+                } else {
+                    geometry.full_active_lanes
+                };
+                if active_lanes == 0 || active_lanes > geometry.wave_capacity.get() {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident lane capture active width is invalid".into(),
+                    ));
+                }
+                let phase_bindings = resident_phase_schema(program, preparation_phase_id)?;
+                let phase_binding_base = resident_binding_count(&program.bindings)?;
+                match &payload.prepared {
+                    ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Scale {
+                        value,
+                        scalar,
+                    }) => {
+                        let input_layout = payload
+                            .source_bindings
+                            .iter()
+                            .find(|binding| binding.wire == *value)
+                            .map(|binding| &binding.physical)
+                            .ok_or_else(|| {
+                                GpuResidentControlAdapterError::Unsupported(
+                                    "resident scale lane source has no physical layout".into(),
+                                )
+                            })?;
+                        let input_owner = resident_wire_owner(program, payload, owners, *value)?;
+                        let output = instruction
+                            .outputs
+                            .first()
+                            .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+                        let output_slot = GpuResidentCaptureProgram::output_slot(output);
+                        let output_owner = owners.resolve(output_slot)?;
+                        let output_layout = payload
+                            .physical_outputs
+                            .first()
+                            .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+                        let active_lane_mask =
+                            if active_lanes == 64 { u64::MAX } else { (1u64 << active_lanes) - 1 };
+                        if active_lane_mask == 0 {
+                            return Err(GpuResidentControlAdapterError::Unsupported(
+                                "resident scale lane mask is empty".into(),
+                            ));
+                        }
+                        for lane in 0..active_lanes {
+                            let input = resident_lane_matrix(
+                                &input_owner,
+                                input_layout,
+                                lane,
+                                wave_base,
+                                physical_device,
+                            )?;
+                            let output = resident_lane_matrix(
+                                &output_owner,
+                                output_layout,
+                                lane,
+                                wave_base,
+                                physical_device,
+                            )?;
+                            let input =
+                                Arc::new(GpuFleetMatrix::from_matrix(input.clone_shallow()));
+                            let request = GpuCaptureRequest::Ordinary(vec![
+                                FixedOperationBatchRequest::Scale {
+                                    metadata: payload.metadata.clone(),
+                                    value: Arc::clone(&input),
+                                    scalar: scalar.clone(),
+                                },
+                            ]);
+                            let mut output_storage = vec![GpuCaptureOwnedOwner::Matrix(
+                                GpuFleetMatrix::from_matrix(output.clone_shallow()),
+                            )];
+                            for owner in &mut output_storage {
+                                let mut destination = match owner {
+                                    GpuCaptureOwnedOwner::Matrix(value) => {
+                                        GpuCaptureOwner::Matrix(value)
+                                    }
+                                    _ => unreachable!("scale lane output is a matrix"),
+                                };
+                                prepare_capture_owner(&mut destination).map_err(|error| {
+                                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                                })?;
+                            }
+                            let protocol = self
+                                .allocate_capture_protocol_owners(
+                                    &request,
+                                    parameters,
+                                    physical_device,
+                                )
+                                .map_err(|error| {
+                                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                                })?;
+                            if let Some(protocol) = &protocol {
+                                protocol.status.native().prepare_external_for_capture()?;
+                                if let Some(scratch) = &protocol.scratch {
+                                    scratch.native().prepare_external_for_capture()?;
+                                }
+                                if let Some(threshold) = &protocol.threshold {
+                                    threshold.prepare_external_for_capture()?;
+                                }
+                            }
+                            lane_requests.push(ResidentLaneCapturePreparation {
+                                request,
+                                output_storage,
+                                protocol,
+                                bindings: resident_native_lane_region_bindings(
+                                    phase_bindings,
+                                    if preparation_tail {
+                                        &payload.tail_physical_bindings
+                                    } else {
+                                        &payload.physical_bindings
+                                    },
+                                    payload,
+                                    lane,
+                                    phase_binding_base,
+                                )?,
+                            });
+                        }
+                    }
+                    _ => unreachable!("generic resident lane preparation classification changed"),
+                }
+            }
+            if lane_dispatch &&
+                lane_requests.is_empty() &&
+                !matches!(
+                    &payload.prepared,
+                    ResidentNativePrepared::Ordinary(
+                        ResidentNativeOrdinary::MatrixBinary { .. } |
+                            ResidentNativeOrdinary::Negate { .. } |
+                            ResidentNativeOrdinary::Unary {
+                                operation: ResidentNativeUnary::Transpose,
+                                ..
+                            } |
+                            ResidentNativeOrdinary::Scale { .. }
+                    )
+                )
+            {
+                let geometry = payload.dispatch_geometry.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident generic lane capture has no dispatch geometry".into(),
+                    )
+                })?;
+                let active_lanes = if preparation_tail {
+                    geometry.tail_active_lanes.ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "resident generic tail capture has no tail geometry".into(),
+                        )
+                    })?
+                } else {
+                    geometry.full_active_lanes
+                };
+                if active_lanes == 0 || active_lanes > geometry.wave_capacity.get() {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident generic lane capture active width is invalid".into(),
+                    ));
+                }
+                let phase_bindings = resident_phase_schema(program, preparation_phase_id)?;
+                let phase_binding_base = resident_binding_count(&program.bindings)?;
+                let output = instruction
+                    .outputs
+                    .first()
+                    .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+                let output_slot = GpuResidentCaptureProgram::output_slot(output);
+                let output_owner = owners.resolve(output_slot)?;
+                let output_layout = payload
+                    .physical_outputs
+                    .first()
+                    .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+                for lane in 0..active_lanes {
+                    let request = resident_lane_generic_request(
+                        program,
+                        payload,
+                        owners,
+                        lane,
+                        wave_base,
+                        physical_device,
+                    )?
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "resident native operation has no lane capture request".into(),
+                        )
+                    })?;
+                    let output = resident_lane_matrix(
+                        &output_owner,
+                        output_layout,
+                        lane,
+                        wave_base,
+                        physical_device,
+                    )?;
+                    let mut lane_output = vec![GpuCaptureOwnedOwner::Matrix(
+                        GpuFleetMatrix::from_matrix(output.clone_shallow()),
+                    )];
+                    for owner in &mut lane_output {
+                        let mut destination = match owner {
+                            GpuCaptureOwnedOwner::Matrix(value) => GpuCaptureOwner::Matrix(value),
+                            _ => unreachable!("generic lane output is a matrix"),
+                        };
+                        prepare_capture_owner(&mut destination).map_err(|error| {
+                            GpuResidentControlAdapterError::Unsupported(error.to_string())
+                        })?;
+                    }
+                    let protocol = self
+                        .allocate_capture_protocol_owners(&request, parameters, physical_device)
+                        .map_err(|error| {
+                            GpuResidentControlAdapterError::Unsupported(error.to_string())
+                        })?;
+                    if let Some(protocol) = &protocol {
+                        protocol.status.native().prepare_external_for_capture()?;
+                        if let Some(scratch) = &protocol.scratch {
+                            scratch.native().prepare_external_for_capture()?;
+                        }
+                        if let Some(threshold) = &protocol.threshold {
+                            threshold.prepare_external_for_capture()?;
+                        }
+                    }
+                    lane_requests.push(ResidentLaneCapturePreparation {
+                        request,
+                        output_storage: lane_output,
+                        protocol,
+                        bindings: resident_native_lane_region_bindings(
+                            phase_bindings,
+                            if preparation_tail {
+                                &payload.tail_physical_bindings
+                            } else {
+                                &payload.physical_bindings
+                            },
+                            payload,
+                            lane,
+                            phase_binding_base,
+                        )?,
+                    });
+                }
+            }
+            self.capture_resident_native_preparations.insert(
+                (instruction.id, preparation_phase_id),
+                ResidentNativeCapturePreparation {
+                    request,
+                    output_storage,
+                    protocol: protocol.take(),
+                    lane_requests,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_resident_family_captures(
+        &mut self,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        physical_device: i32,
+        lane_count: usize,
+        wave_base: usize,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        if lane_count == 0 || lane_count > 64 {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident family gather lane count is invalid".into(),
+            ));
+        }
+        self.capture_resident_family_preparations.clear();
+        self.capture_resident_direct_family_preparations.clear();
+        for instruction in &program.schema.instructions {
+            let ResidentControlInstructionKind::Scalar(
+                ResidentControlOperation::FamilyGetDynamic { family, .. },
+            ) = &instruction.kind
+            else {
+                continue;
+            };
+            let ResidentSlotType::IndexedFamily { element, .. } = family.as_ref() else {
+                continue;
+            };
+            if !matches!(element.as_ref(), ResidentSlotType::Matrix { .. }) {
+                continue;
+            }
+            let source_slot = instruction
+                .inputs
+                .first()
+                .ok_or(GpuResidentControlAdapterError::MissingInput)?
+                .slot;
+            let destination_slot = instruction
+                .outputs
+                .first()
+                .map(GpuResidentCaptureProgram::output_slot)
+                .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+            let source = owners.resolve(source_slot)?;
+            let destination = owners.resolve(destination_slot)?;
+            let GpuResidentOwnerRef::Family(family) = source else {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "dynamic matrix family source is not an indexed family".into(),
+                ));
+            };
+            let GpuResidentOwnerRef::Matrix(_) = destination else {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "direct dynamic matrix family output is not a matrix owner".into(),
+                ));
+            };
+            let (table, source_columns) = resident_matrix_family_table(family, physical_device)?;
+            table.prepare_external_for_capture()?;
+            self.capture_resident_direct_family_preparations.insert(
+                instruction.id,
+                ResidentDirectFamilyCapturePreparation { table, source_columns },
+            );
+        }
+        for region in &program.schema.regions {
+            for import in &region.imports {
+                let typed = program.schema.typed_imports.iter().find(|candidate| {
+                    candidate.region == region.id &&
+                        candidate.parent.slot == import.parent.slot &&
+                        candidate.child.slot == import.child.slot
+                });
+                if !matches!(
+                    typed.map(|binding| &binding.selection),
+                    Some(crate::gpu_compiled::ResidentImportSelection::FamilyElement { .. })
+                ) {
+                    continue;
+                }
+                let source = owners.resolve(import.parent.slot)?;
+                let destination = owners.resolve(import.child.slot)?;
+                let GpuResidentOwnerRef::Family(family) = source else {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "family import source is not an indexed family".into(),
+                    ));
+                };
+                // Packed numeric/bool families are backed by one integer
+                // allocation and are gathered by the integer ABI. They have
+                // no matrix descriptor table; only matrix-valued families
+                // need the lane table prepared below.
+                if matches!(
+                    family,
+                    ResidentOwner::IndexedFamily {
+                        element_type,
+                        ..
+                    } if matches!(
+                        element_type.as_ref(),
+                        ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. }
+                    )
+                ) {
+                    if !matches!(destination, GpuResidentOwnerRef::Integer(_)) {
+                        return Err(GpuResidentControlAdapterError::Unsupported(
+                            "packed integer family import requires an integer destination".into(),
+                        ));
+                    }
+                    continue;
+                }
+                let (table, source_columns) =
+                    resident_matrix_family_table(family, physical_device)?;
+                let (destination, destination_shard) = match destination {
+                    GpuResidentOwnerRef::Matrix(destination) => (
+                        ResidentFamilyCaptureDestination::Packed(resident_matrix_gather_scratch(
+                            self,
+                            destination,
+                            import.child.ty.wire_type(),
+                            physical_device,
+                        )?),
+                        None,
+                    ),
+                    GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                        elements, ..
+                    }) => {
+                        let end = wave_base.checked_add(lane_count).ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "resident family destination window overflows".into(),
+                            )
+                        })?;
+                        let window = elements.get(wave_base..end).ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(format!(
+                                "resident family destination window {wave_base}..{end} exceeds owner count {}",
+                                elements.len()
+                            ))
+                        })?;
+                        let mut destination_shard = None;
+                        let matrices = window
+                            .iter()
+                            .map(|element| {
+                                let ResidentOwner::Matrix(matrix) = element else {
+                                    return Err(GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family gather destination lanes must be matrix owners"
+                                            .into(),
+                                    ));
+                                };
+                                let shard = matrix
+                                    .shards()
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, shard)| shard.device_id == physical_device)
+                                    .ok_or(GpuResidentControlAdapterError::WrongOwner {
+                                        expected: physical_device,
+                                    })?;
+                                if destination_shard.is_some_and(|expected| expected != shard.0) {
+                                    return Err(GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family destination lanes have different shard placement"
+                                            .into(),
+                                    ));
+                                }
+                                destination_shard = Some(shard.0);
+                                Ok(&shard.1.value)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        (
+                            ResidentFamilyCaptureDestination::Lanes(
+                                GpuMatrixLaneDestinationTable::for_partition_borrowed(
+                                    &matrices,
+                                    physical_device,
+                                )
+                                .map_err(GpuResidentControlAdapterError::Native)?,
+                            ),
+                            Some(
+                                u32::try_from(destination_shard.ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family destination window is empty".into(),
+                                    )
+                                })?)
+                                .map_err(|_| {
+                                    GpuResidentControlAdapterError::Unsupported(
+                                        "matrix family destination shard overflows u32".into(),
+                                    )
+                                })?,
+                            ),
+                        )
+                    }
+                    _ => {
+                        return Err(GpuResidentControlAdapterError::Unsupported(
+                            "matrix family import destination is not a matrix family".into(),
+                        ));
+                    }
+                };
+                // Both the descriptor-table upload and the preallocated
+                // gather destination have producer state outside the graph
+                // stream. Resolve those dependencies before begin_capture;
+                // gather_family_lanes_into may then wait only on capture-safe
+                // registrations while recording the kernel.
+                table.prepare_external_for_capture()?;
+                match &destination {
+                    ResidentFamilyCaptureDestination::Packed(scratch) => {
+                        scratch.prepare_external_for_capture()?
+                    }
+                    ResidentFamilyCaptureDestination::Lanes(destinations) => {
+                        destinations.prepare_external_for_capture()?
+                    }
+                }
+                self.capture_resident_family_preparations.insert(
+                    (region.id, import.parent.slot, import.child.slot),
+                    ResidentFamilyCapturePreparation {
+                        table,
+                        destination,
+                        destination_shard,
+                        source_columns,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture a resident matrix leaf through the bounded physical-lane
+    /// primitive.  The graph records one lane-aware CUDA node for the whole
+    /// wave; replay never launches or waits once per lane on the host.
+    fn capture_resident_lane_native(
+        &mut self,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        instruction: &CompiledResidentControlInstruction,
+        payload: &ResidentNativeInstruction,
+        output_storage: &mut [GpuCaptureOwnedOwner],
+        physical_device: i32,
+        current_phase: ResidentPhaseId,
+        tail: bool,
+        wave_base: usize,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let geometry = payload.dispatch_geometry.ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane capture has no frozen dispatch geometry".into(),
+            )
+        })?;
+        let active_lanes = if tail {
+            geometry.tail_active_lanes.ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident tail lane capture has no tail geometry".into(),
+                )
+            })?
+        } else {
+            geometry.full_active_lanes
+        };
+        if active_lanes == 0 || active_lanes > geometry.wave_capacity.get() || active_lanes > 64 {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident lane capture active width is invalid".into(),
+            ));
+        }
+        if payload.physical_inputs.is_empty() || payload.physical_outputs.len() != 1 {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident lane capture has incomplete physical layouts".into(),
+            ));
+        }
+        let find_layout = |wire: WireRef| {
+            payload
+                .source_bindings
+                .iter()
+                .find(|binding| binding.wire == wire)
+                .map(|binding| &binding.physical)
+                .ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident lane source {wire:?} has no physical layout"
+                    ))
+                })
+        };
+        if instruction.outputs.first().is_none() {
+            return Err(GpuResidentControlAdapterError::MissingOutput);
+        }
+        let output_slot = instruction
+            .outputs
+            .first()
+            .map(GpuResidentCaptureProgram::output_slot)
+            .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+        let output_owner = owners.resolve(output_slot)?;
+        let output_layout = payload
+            .physical_outputs
+            .first()
+            .ok_or(GpuResidentControlAdapterError::MissingOutput)?;
+        let output_lanes = (0..active_lanes)
+            .map(|lane| {
+                resident_lane_matrix(&output_owner, output_layout, lane, wave_base, physical_device)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let active_lane_mask =
+            if active_lanes == 64 { u64::MAX } else { (1u64 << active_lanes) - 1 };
+        let physical_bindings = resident_phase_schema(program, current_phase)?;
+        let physical_binding_base = resident_binding_count(&program.bindings)?;
+
+        // A lane-batched primitive uploads a metadata record containing six
+        // pointers per CRT limb.  Give every record field an explicit local
+        // graph identity, translated from the current physical phase schema;
+        // otherwise replay would retain the capture exemplar's pointers.
+        let matrix_binding = |slot: ValueSlot,
+                              layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+                              lane: usize,
+                              matrix: &GpuDCRTPolyMatrix,
+                              component: NativeValueComponent|
+         -> Result<u32, GpuResidentControlAdapterError> {
+            let selected_lane = layout
+                .components
+                .iter()
+                .find(|entry| entry.component == component)
+                .map(|entry| match entry.selection {
+                    crate::gpu_compiled::ResidentLaneSelection::Broadcast => 0,
+                    crate::gpu_compiled::ResidentLaneSelection::Strided { .. } => lane,
+                })
+                .unwrap_or(lane);
+            let index = resident_exact_lane_binding_index(
+                physical_bindings,
+                if tail { &payload.tail_physical_bindings } else { &payload.physical_bindings },
+                program,
+                owners,
+                payload,
+                slot,
+                layout,
+                selected_lane,
+                matrix,
+                component,
+                wave_base,
+                physical_binding_base,
+            )?;
+            Ok(index)
+        };
+
+        let binary_binding_map =
+            |left_slot: ValueSlot,
+             left_layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+             left_lanes: &[&GpuDCRTPolyMatrix],
+             right_slot: ValueSlot,
+             right_layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+             right_lanes: &[&GpuDCRTPolyMatrix]|
+             -> Result<Vec<u32>, GpuResidentControlAdapterError> {
+                let mut local_to_global = Vec::with_capacity(active_lanes * 6);
+                for lane in 0..active_lanes {
+                    let right_lane = if right_layout.components.iter().any(|entry| {
+                        entry.component == NativeValueComponent::MatrixData &&
+                            matches!(
+                                entry.selection,
+                                crate::gpu_compiled::ResidentLaneSelection::Broadcast
+                            )
+                    }) {
+                        0
+                    } else {
+                        lane
+                    };
+                    let values = [
+                        matrix_binding(
+                            left_slot,
+                            left_layout,
+                            lane,
+                            left_lanes[lane],
+                            NativeValueComponent::MatrixData,
+                        )?,
+                        matrix_binding(
+                            right_slot,
+                            right_layout,
+                            right_lane,
+                            right_lanes[right_lane],
+                            NativeValueComponent::MatrixData,
+                        )?,
+                        matrix_binding(
+                            output_slot,
+                            output_layout,
+                            lane,
+                            output_lanes[lane],
+                            NativeValueComponent::MatrixData,
+                        )?,
+                        matrix_binding(
+                            left_slot,
+                            left_layout,
+                            lane,
+                            left_lanes[lane],
+                            NativeValueComponent::MatrixDescriptors,
+                        )?,
+                        matrix_binding(
+                            right_slot,
+                            right_layout,
+                            right_lane,
+                            right_lanes[right_lane],
+                            NativeValueComponent::MatrixDescriptors,
+                        )?,
+                        matrix_binding(
+                            output_slot,
+                            output_layout,
+                            lane,
+                            output_lanes[lane],
+                            NativeValueComponent::MatrixDescriptors,
+                        )?,
+                    ];
+                    local_to_global.extend(values);
+                }
+                Ok(local_to_global)
+            };
+        let limb_count = output_lanes
+            .first()
+            .ok_or(GpuResidentControlAdapterError::MissingOutput)?
+            .binding_components()
+            .map_err(GpuResidentControlAdapterError::Native)?
+            .first()
+            .map(|component| component.limb_count)
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident lane matrix has no CRT limbs".into(),
+                )
+            })?;
+        let mut lane_metadata_bindings =
+            |lane_fields: Vec<Vec<u32>>| -> Result<Vec<u32>, GpuResidentControlAdapterError> {
+                if lane_fields.len() != active_lanes ||
+                    lane_fields.iter().any(|fields| fields.is_empty())
+                {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident lane metadata shape is invalid".into(),
+                    ));
+                }
+                let fields_per_lane = lane_fields[0].len();
+                if lane_fields.iter().any(|fields| fields.len() != fields_per_lane) {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident lane metadata field count differs".into(),
+                    ));
+                }
+                let mut globals = Vec::with_capacity(active_lanes * limb_count * fields_per_lane);
+                for fields in lane_fields {
+                    for _ in 0..limb_count {
+                        globals.extend_from_slice(&fields);
+                    }
+                }
+                let binding_map = globals
+                    .iter()
+                    .enumerate()
+                    .map(|(local, global)| {
+                        Ok((
+                            u32::try_from(local).map_err(|_| {
+                                GpuResidentControlAdapterError::Unsupported(
+                                    "resident lane metadata binding overflows u32".into(),
+                                )
+                            })?,
+                            *global,
+                        ))
+                    })
+                    .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+                capture
+                    .set_binding_map(&binding_map)
+                    .map_err(GpuResidentControlAdapterError::Native)?;
+                Ok((0..globals.len())
+                    .map(|local| u32::try_from(local).unwrap_or(u32::MAX))
+                    .collect())
+            };
+        let _ = output_storage;
+        match &payload.prepared {
+            ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::MatrixBinary {
+                operation,
+                left,
+                right,
+            }) => {
+                let left_layout = find_layout(*left)?;
+                let right_layout = find_layout(*right)?;
+                let left_owner = resident_wire_owner(program, payload, owners, *left)?;
+                let right_owner = resident_wire_owner(program, payload, owners, *right)?;
+                let left_lanes = (0..active_lanes)
+                    .map(|lane| {
+                        resident_lane_matrix(
+                            &left_owner,
+                            left_layout,
+                            lane,
+                            wave_base,
+                            physical_device,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let right_lanes = (0..active_lanes)
+                    .map(|lane| {
+                        resident_lane_matrix(
+                            &right_owner,
+                            right_layout,
+                            lane,
+                            wave_base,
+                            physical_device,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                match operation {
+                    MatrixBinaryOp::Add | MatrixBinaryOp::Subtract => {
+                        let operation = resident_lane_binary_operation(*operation).unwrap();
+                        let rhs_broadcast = matches!(
+                            right_layout
+                                .components
+                                .iter()
+                                .find(|component| {
+                                    component.component == NativeValueComponent::MatrixData
+                                })
+                                .map(|component| component.selection),
+                            Some(crate::gpu_compiled::ResidentLaneSelection::Broadcast)
+                        );
+                        let output_layouts = output_lanes
+                            .iter()
+                            .map(|matrix| matrix.physical_lane_layout())
+                            .collect::<Vec<_>>();
+                        let left_layouts = left_lanes
+                            .iter()
+                            .map(|matrix| matrix.physical_lane_layout())
+                            .collect::<Vec<_>>();
+                        let right_layouts = right_lanes
+                            .iter()
+                            .map(|matrix| matrix.physical_lane_layout())
+                            .collect::<Vec<_>>();
+                        let lane_binding_indices = binary_binding_map(
+                            payload
+                                .source_bindings
+                                .iter()
+                                .find(|binding| binding.wire == *left)
+                                .map(|binding| binding.child.slot)
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(format!(
+                                        "resident binary lhs wire {left:?} has no typed slot"
+                                    ))
+                                })?,
+                            left_layout,
+                            &left_lanes,
+                            payload
+                                .source_bindings
+                                .iter()
+                                .find(|binding| binding.wire == *right)
+                                .map(|binding| binding.child.slot)
+                                .ok_or_else(|| {
+                                    GpuResidentControlAdapterError::Unsupported(format!(
+                                        "resident binary rhs wire {right:?} has no typed slot"
+                                    ))
+                                })?,
+                            right_layout,
+                            &right_lanes,
+                        )?;
+                        let mut metadata_binding_indices =
+                            Vec::with_capacity(active_lanes * limb_count * 6);
+                        for lane in lane_binding_indices.chunks_exact(6) {
+                            for _ in 0..limb_count {
+                                metadata_binding_indices.extend_from_slice(lane);
+                            }
+                        }
+                        let binding_map = metadata_binding_indices
+                            .iter()
+                            .enumerate()
+                            .map(|(local, global)| {
+                                Ok((
+                                    u32::try_from(local).map_err(|_| {
+                                        GpuResidentControlAdapterError::Unsupported(
+                                            "resident lane metadata binding overflows u32".into(),
+                                        )
+                                    })?,
+                                    *global,
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+                        capture
+                            .set_binding_map(&binding_map)
+                            .map_err(GpuResidentControlAdapterError::Native)?;
+                        GpuDCRTPolyMatrix::binary_lane_batch_layout_with_bindings(
+                            &output_layouts,
+                            &left_layouts,
+                            &right_layouts,
+                            active_lanes,
+                            active_lane_mask,
+                            operation,
+                            rhs_broadcast,
+                            &(0..metadata_binding_indices.len())
+                                .map(|index| u32::try_from(index).unwrap_or(u32::MAX))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                    MatrixBinaryOp::Multiply => {
+                        let left_slot = payload
+                            .source_bindings
+                            .iter()
+                            .find(|binding| binding.wire == *left)
+                            .map(|binding| binding.child.slot)
+                            .ok_or_else(|| {
+                                GpuResidentControlAdapterError::Unsupported(format!(
+                                    "resident binary lhs wire {left:?} has no typed slot"
+                                ))
+                            })?;
+                        let right_slot = payload
+                            .source_bindings
+                            .iter()
+                            .find(|binding| binding.wire == *right)
+                            .map(|binding| binding.child.slot)
+                            .ok_or_else(|| {
+                                GpuResidentControlAdapterError::Unsupported(format!(
+                                    "resident binary rhs wire {right:?} has no typed slot"
+                                ))
+                            })?;
+                        let fields = (0..active_lanes)
+                            .map(|lane| {
+                                let right_lane = if right_layout.components.iter().any(|entry| {
+                                    entry.component == NativeValueComponent::MatrixData &&
+                                        matches!(
+                                            entry.selection,
+                                            crate::gpu_compiled::ResidentLaneSelection::Broadcast
+                                        )
+                                }) {
+                                    0
+                                } else {
+                                    lane
+                                };
+                                Ok(vec![
+                                    matrix_binding(
+                                        left_slot,
+                                        left_layout,
+                                        lane,
+                                        left_lanes[lane],
+                                        NativeValueComponent::MatrixData,
+                                    )?,
+                                    matrix_binding(
+                                        right_slot,
+                                        right_layout,
+                                        right_lane,
+                                        right_lanes[right_lane],
+                                        NativeValueComponent::MatrixData,
+                                    )?,
+                                    matrix_binding(
+                                        output_slot,
+                                        output_layout,
+                                        lane,
+                                        output_lanes[lane],
+                                        NativeValueComponent::MatrixData,
+                                    )?,
+                                ])
+                            })
+                            .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+                        let metadata_binding_indices = lane_metadata_bindings(fields)?;
+                        GpuDCRTPolyMatrix::mul_lane_batch_with_bindings(
+                            &output_lanes,
+                            &left_lanes,
+                            &right_lanes,
+                            active_lanes,
+                            active_lane_mask,
+                            &metadata_binding_indices,
+                        );
+                    }
+                }
+            }
+            ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Negate { value }) => {
+                let input_layout = find_layout(*value)?;
+                let input_owner = resident_wire_owner(program, payload, owners, *value)?;
+                let inputs = (0..active_lanes)
+                    .map(|lane| {
+                        resident_lane_matrix(
+                            &input_owner,
+                            input_layout,
+                            lane,
+                            wave_base,
+                            physical_device,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let input_slot = payload
+                    .source_bindings
+                    .iter()
+                    .find(|binding| binding.wire == *value)
+                    .map(|binding| binding.child.slot)
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(format!(
+                            "resident negate wire {value:?} has no typed slot"
+                        ))
+                    })?;
+                let fields = (0..active_lanes)
+                    .map(|lane| {
+                        let input_binding = matrix_binding(
+                            input_slot,
+                            input_layout,
+                            lane,
+                            inputs[lane],
+                            NativeValueComponent::MatrixData,
+                        )?;
+                        Ok(vec![
+                            input_binding,
+                            input_binding,
+                            matrix_binding(
+                                output_slot,
+                                output_layout,
+                                lane,
+                                output_lanes[lane],
+                                NativeValueComponent::MatrixData,
+                            )?,
+                        ])
+                    })
+                    .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+                let metadata_binding_indices = lane_metadata_bindings(fields)?;
+                GpuDCRTPolyMatrix::negate_lane_batch_with_bindings(
+                    &output_lanes,
+                    &inputs,
+                    active_lanes,
+                    active_lane_mask,
+                    &metadata_binding_indices,
+                );
+            }
+            ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Unary {
+                operation: ResidentNativeUnary::Transpose,
+                value,
+            }) => {
+                let input_layout = find_layout(*value)?;
+                let input_owner = resident_wire_owner(program, payload, owners, *value)?;
+                let inputs = (0..active_lanes)
+                    .map(|lane| {
+                        resident_lane_matrix(
+                            &input_owner,
+                            input_layout,
+                            lane,
+                            wave_base,
+                            physical_device,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let input_slot = payload
+                    .source_bindings
+                    .iter()
+                    .find(|binding| binding.wire == *value)
+                    .map(|binding| binding.child.slot)
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(format!(
+                            "resident transpose wire {value:?} has no typed slot"
+                        ))
+                    })?;
+                let fields = (0..active_lanes)
+                    .map(|lane| {
+                        Ok(vec![
+                            matrix_binding(
+                                input_slot,
+                                input_layout,
+                                lane,
+                                inputs[lane],
+                                NativeValueComponent::MatrixData,
+                            )?,
+                            matrix_binding(
+                                output_slot,
+                                output_layout,
+                                lane,
+                                output_lanes[lane],
+                                NativeValueComponent::MatrixData,
+                            )?,
+                        ])
+                    })
+                    .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()?;
+                let metadata_binding_indices = lane_metadata_bindings(fields)?;
+                GpuDCRTPolyMatrix::transpose_lane_batch_with_bindings(
+                    &output_lanes,
+                    &inputs,
+                    active_lanes,
+                    active_lane_mask,
+                    &metadata_binding_indices,
+                );
+            }
+            ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Scale { .. }) => {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "resident scale lane capture requires a scalar physical binding".into(),
+                ));
+            }
+            _ => {
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "resident lane capture has no matrix primitive".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_instruction(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        instruction: &CompiledResidentControlInstruction,
+        physical_device: i32,
+        current_phase: ResidentPhaseId,
+        binding_phase: ResidentPhaseId,
+        tail: bool,
+        wave_base: usize,
+        target_phase: Option<ResidentPhaseId>,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        match &instruction.kind {
+            ResidentControlInstructionKind::Scalar(_) => {
+                self.submit_resident_program_instruction(
+                    capture,
+                    program,
+                    owners,
+                    instruction,
+                    physical_device,
+                    current_phase,
+                )
+                .map_err(|error| {
+                    GpuResidentControlAdapterError::Unsupported(format!(
+                        "instruction {:?} {:?}: {error}",
+                        instruction.id, instruction.kind
+                    ))
+                })?;
+            }
+            ResidentControlInstructionKind::Native { payload } => {
+                if matches!(payload.prepared, ResidentNativePrepared::Alias { .. }) {
+                    return Ok(());
+                }
+                self.prepare_fixed_node_batch(&payload.metadata).map_err(|error| {
+                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                })?;
+                let ResidentNativeCapturePreparation {
+                    request,
+                    mut output_storage,
+                    protocol,
+                    lane_requests,
+                } = self
+                    .capture_resident_native_preparations
+                    .remove(&(instruction.id, current_phase))
+                    .ok_or_else(|| {
+                        GpuResidentControlAdapterError::Unsupported(
+                            "resident native capture was not prepared before CUDA capture".into(),
+                        )
+                    })?;
+                // The outer resident capture has already bound every payload
+                // entry in the flat schema. Re-registering this leaf's local
+                // view here used to create duplicate CUDA worker updates and,
+                // before index relocation, could bind a local index to the
+                // wrong instruction. The payload indices are schema-global by
+                // this point; launch-site registration remains the sole
+                // registration point for pointer patches.
+                if !lane_requests.is_empty() {
+                    let step = CaptureStep {
+                        order: 0,
+                        node: payload.node,
+                        kind: payload.kind.clone(),
+                        original_arguments: payload.original_arguments.clone(),
+                        effective_inputs: payload.effective_inputs.clone(),
+                        fused_result_owners: BTreeMap::new(),
+                        row_sum: payload.row_sum.clone(),
+                        row_blocks: payload.row_blocks.clone(),
+                        release_after: Box::new([]),
+                        operation: CaptureOperation::Fixed {
+                            request: payload.metadata.clone(),
+                            operation: payload.operation,
+                            jobs: payload.jobs.clone(),
+                        },
+                    };
+                    for mut lane in lane_requests {
+                        let mut destination_owners = lane
+                            .output_storage
+                            .iter_mut()
+                            .zip(instruction.outputs.iter())
+                            .map(|(owner, output)| {
+                                owner.destination(GpuResidentCaptureProgram::output_slot(output))
+                            })
+                            .collect::<Vec<_>>();
+                        let protocol_ref = lane.protocol.as_ref();
+                        let submission = self
+                            .submit_capture_step(
+                                &step,
+                                lane.request,
+                                &mut destination_owners,
+                                &lane.bindings,
+                                physical_device,
+                                &[],
+                                capture,
+                                protocol_ref,
+                            )
+                            .map_err(|error| {
+                                GpuResidentControlAdapterError::Unsupported(error.to_string())
+                            })?;
+                        if let Some(resource) = submission.resource {
+                            self.capture_resident_resources.push(resource);
+                        }
+                        if let Some(protocol) = lane.protocol {
+                            self.capture_resident_resources.push(
+                                GpuCompiledRegionResource::ProtocolValues {
+                                    status: protocol.status,
+                                    scratch: protocol.scratch,
+                                    threshold: protocol.threshold,
+                                },
+                            );
+                        }
+                    }
+                    return Ok(());
+                }
+                if payload.dispatch_geometry.is_some() &&
+                    resident_lane_native_dispatch(&payload.prepared)
+                {
+                    self.capture_resident_lane_native(
+                        capture,
+                        program,
+                        owners,
+                        instruction,
+                        payload,
+                        &mut output_storage,
+                        physical_device,
+                        binding_phase,
+                        tail,
+                        wave_base,
+                    )?;
+                    if let Some(protocol) = protocol {
+                        self.capture_resident_resources.push(
+                            GpuCompiledRegionResource::ProtocolValues {
+                                status: protocol.status,
+                                scratch: protocol.scratch,
+                                threshold: protocol.threshold,
+                            },
+                        );
+                    }
+                    return Ok(());
+                }
+                let mut destination_owners = output_storage
+                    .iter_mut()
+                    .zip(instruction.outputs.iter())
+                    .map(|(owner, output)| {
+                        owner.destination(GpuResidentCaptureProgram::output_slot(output))
+                    })
+                    .collect::<Vec<_>>();
+                let request = request.ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident native lane dispatch did not select a capture primitive".into(),
+                    )
+                })?;
+                let step = CaptureStep {
+                    order: 0,
+                    node: payload.node,
+                    kind: payload.kind.clone(),
+                    original_arguments: payload.original_arguments.clone(),
+                    effective_inputs: payload.effective_inputs.clone(),
+                    fused_result_owners: BTreeMap::new(),
+                    row_sum: payload.row_sum.clone(),
+                    row_blocks: payload.row_blocks.clone(),
+                    release_after: Box::new([]),
+                    operation: CaptureOperation::Fixed {
+                        request: payload.metadata.clone(),
+                        operation: payload.operation,
+                        jobs: payload.jobs.clone(),
+                    },
+                };
+                let submission = self
+                    .submit_capture_step(
+                        &step,
+                        request,
+                        &mut destination_owners,
+                        &payload.bindings,
+                        physical_device,
+                        &[],
+                        capture,
+                        protocol.as_ref(),
+                    )
+                    .map_err(|error| {
+                        GpuResidentControlAdapterError::Unsupported(error.to_string())
+                    })?;
+                if let Some(resource) = submission.resource {
+                    self.capture_resident_resources.push(resource);
+                }
+                // Keep protocol allocations alive even when the primitive did
+                // not report them as a submission resource.
+                if let Some(protocol) = protocol {
+                    self.capture_resident_resources.push(
+                        GpuCompiledRegionResource::ProtocolValues {
+                            status: protocol.status,
+                            scratch: protocol.scratch,
+                            threshold: protocol.threshold,
+                        },
+                    );
+                }
+            }
+            ResidentControlInstructionKind::ParallelLoop {
+                child,
+                index_slot: _,
+                imports,
+                exports,
+                ..
+            } => {
+                let child_tail = if let Some(target_phase) = target_phase {
+                    let selected = program.phase(target_phase)?;
+                    selected.region == *child &&
+                        matches!(
+                            selected.geometry.kind,
+                            crate::gpu_compiled::ResidentPhaseKind::Tail
+                        )
+                } else {
+                    tail
+                };
+                self.capture_resident_program_imports(
+                    capture,
+                    program,
+                    *child,
+                    owners,
+                    imports,
+                    instruction.status.as_ref().map(|slot| slot.slot),
+                    physical_device,
+                    child_tail,
+                    wave_base,
+                )?;
+                if child_tail {
+                    self.capture_resident_program_tail(
+                        parameters,
+                        capture,
+                        program,
+                        owners,
+                        *child,
+                        physical_device,
+                        wave_base,
+                        target_phase,
+                        binding_phase,
+                    )?;
+                } else {
+                    self.capture_resident_program_region(
+                        parameters,
+                        capture,
+                        program,
+                        owners,
+                        *child,
+                        physical_device,
+                        wave_base,
+                        target_phase,
+                        binding_phase,
+                    )?;
+                }
+                self.capture_resident_program_exports(
+                    capture,
+                    program,
+                    *child,
+                    owners,
+                    exports,
+                    physical_device,
+                    child_tail,
+                    wave_base,
+                )?;
+            }
+            ResidentControlInstructionKind::SequentialLoop {
+                count,
+                child: Some(child),
+                index_slot,
+                carried,
+                imports,
+                exports,
+                ..
+            } => {
+                let child_tail = if let Some(target_phase) = target_phase {
+                    let selected = program.phase(target_phase)?;
+                    selected.region == *child &&
+                        matches!(
+                            selected.geometry.kind,
+                            crate::gpu_compiled::ResidentPhaseKind::Tail
+                        )
+                } else {
+                    tail
+                };
+                // A sequential body is a bounded template, not a
+                // count-sized unrolling. Capture the initial orientation and
+                // one carried transition at most; replay selects/patches the
+                // corresponding current/next owners for longer runs.
+                let body_passes =
+                    resident_const_usize(count).map(|count| count.min(2)).unwrap_or(2);
+                if body_passes == 0 {
+                    // Zero-iteration publication is an owner alias handled
+                    // by the frame scheduler; there is no body/export node
+                    // to capture here.
+                    return Ok(());
+                }
+                for pass in 0..body_passes {
+                    if pass == 0 {
+                        self.capture_resident_program_imports(
+                            capture,
+                            program,
+                            *child,
+                            owners,
+                            imports,
+                            instruction.status.as_ref().map(|slot| slot.slot),
+                            physical_device,
+                            child_tail,
+                            wave_base,
+                        )?;
+                    } else {
+                        for import in imports.iter().skip(carried.len()) {
+                            self.capture_resident_program_imports(
+                                capture,
+                                program,
+                                *child,
+                                owners,
+                                std::slice::from_ref(import),
+                                instruction.status.as_ref().map(|slot| slot.slot),
+                                physical_device,
+                                child_tail,
+                                wave_base,
+                            )?;
+                        }
+                        for binding in carried {
+                            let source_slot = &binding.output;
+                            let destination_slot = &binding.body;
+                            let source = owners.resolve(source_slot.slot)?;
+                            let destination = owners.resolve(destination_slot.slot)?;
+                            self.capture_resident_typed_transfer(
+                                capture,
+                                program,
+                                source_slot,
+                                destination_slot,
+                                source,
+                                destination,
+                                0,
+                                0,
+                                None,
+                            )?;
+                        }
+                        set_capture_binding_sources(
+                            capture,
+                            &program.bindings,
+                            &[
+                                (0, index_slot.slot, 0, NativeValueComponent::IntegerValues),
+                                (
+                                    1,
+                                    instruction
+                                        .status
+                                        .as_ref()
+                                        .ok_or(GpuResidentControlAdapterError::MissingBinding(
+                                            index_slot.slot,
+                                        ))?
+                                        .slot,
+                                    0,
+                                    NativeValueComponent::IntegerValues,
+                                ),
+                            ],
+                        )
+                        .map_err(GpuResidentControlAdapterError::Native)?;
+                        owners
+                            .resolve_integer(index_slot.slot)?
+                            .native()
+                            .fill_loop_index_i64_with_status(
+                                1,
+                                1,
+                                instruction
+                                    .status
+                                    .as_ref()
+                                    .map(|slot| owners.resolve_integer(slot.slot))
+                                    .transpose()?
+                                    .map(|owner| owner.native()),
+                            )?;
+                    }
+                    if child_tail {
+                        self.capture_resident_program_tail(
+                            parameters,
+                            capture,
+                            program,
+                            owners,
+                            *child,
+                            physical_device,
+                            wave_base,
+                            target_phase,
+                            binding_phase,
+                        )?;
+                    } else {
+                        self.capture_resident_program_region(
+                            parameters,
+                            capture,
+                            program,
+                            owners,
+                            *child,
+                            physical_device,
+                            wave_base,
+                            target_phase,
+                            binding_phase,
+                        )?;
+                    }
+                }
+                self.capture_resident_program_exports(
+                    capture,
+                    program,
+                    *child,
+                    owners,
+                    exports,
+                    physical_device,
+                    child_tail,
+                    wave_base,
+                )?;
+            }
+            ResidentControlInstructionKind::SubgraphCall {
+                child: Some(child),
+                imports,
+                exports,
+                ..
+            } => {
+                let child_tail = if let Some(target_phase) = target_phase {
+                    let selected = program.phase(target_phase)?;
+                    selected.region == *child &&
+                        matches!(
+                            selected.geometry.kind,
+                            crate::gpu_compiled::ResidentPhaseKind::Tail
+                        )
+                } else {
+                    tail
+                };
+                // Subgraph calls have no loop index. Their frozen bindings
+                // are still device-resident aliases/copies and must be
+                // applied before the child body is replayed.
+                self.capture_resident_program_imports(
+                    capture,
+                    program,
+                    *child,
+                    owners,
+                    imports,
+                    instruction.status.as_ref().map(|slot| slot.slot),
+                    physical_device,
+                    child_tail,
+                    wave_base,
+                )?;
+                if child_tail {
+                    self.capture_resident_program_tail(
+                        parameters,
+                        capture,
+                        program,
+                        owners,
+                        *child,
+                        physical_device,
+                        wave_base,
+                        target_phase,
+                        binding_phase,
+                    )?;
+                } else {
+                    self.capture_resident_program_region(
+                        parameters,
+                        capture,
+                        program,
+                        owners,
+                        *child,
+                        physical_device,
+                        wave_base,
+                        target_phase,
+                        binding_phase,
+                    )?;
+                }
+                self.capture_resident_program_exports(
+                    capture,
+                    program,
+                    *child,
+                    owners,
+                    exports,
+                    physical_device,
+                    child_tail,
+                    wave_base,
+                )?;
+            }
+            ResidentControlInstructionKind::SequentialLoop { child: None, .. } |
+            ResidentControlInstructionKind::SubgraphCall { child: None, .. } => {}
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        region_id: ResidentRegionId,
+        physical_device: i32,
+        wave_base: usize,
+        target_phase: Option<ResidentPhaseId>,
+        binding_phase: ResidentPhaseId,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let region =
+            program.schema.regions.iter().find(|region| region.id == region_id).ok_or_else(
+                || {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident region id is out of range".into(),
+                    )
+                },
+            )?;
+        // Full waves and the tail are distinct graph templates. When a child
+        // phase is selected, retain the ancestor's structural full phase and
+        // let the target child phase be selected below.
+        let phase_ids = if let Some(target_phase) = target_phase {
+            let target_region = program.phase(target_phase)?.region;
+            if target_region == region_id { vec![target_phase] } else { region.phases.to_vec() }
+        } else {
+            region.phases.to_vec()
+        };
+        for phase_id in phase_ids {
+            let phase = program.phase(phase_id)?;
+            self.capture_resident_program_phase(
+                parameters,
+                capture,
+                program,
+                owners,
+                phase,
+                physical_device,
+                matches!(phase.geometry.kind, crate::gpu_compiled::ResidentPhaseKind::Tail),
+                wave_base,
+                target_phase,
+                binding_phase,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_tail(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        region_id: ResidentRegionId,
+        physical_device: i32,
+        wave_base: usize,
+        target_phase: Option<ResidentPhaseId>,
+        binding_phase: ResidentPhaseId,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let region = program.region(region_id)?;
+        if let Some(target_phase) = target_phase {
+            if program.phase(target_phase)?.region != region_id {
+                return self.capture_resident_program_region(
+                    parameters,
+                    capture,
+                    program,
+                    owners,
+                    region_id,
+                    physical_device,
+                    wave_base,
+                    Some(target_phase),
+                    binding_phase,
+                );
+            }
+        }
+        let Some(phase_id) = region.tail else {
+            return Ok(());
+        };
+        let phase = program.phase(phase_id)?;
+        self.capture_resident_program_phase(
+            parameters,
+            capture,
+            program,
+            owners,
+            phase,
+            physical_device,
+            true,
+            wave_base,
+            target_phase,
+            binding_phase,
+        )
+    }
+
+    /// Dispatch one frozen phase in arena order. `ranges` is authoritative
+    /// for leaf runs; structural instructions remain in `instructions` only
+    /// to preserve the exact ordering of imports/body/exports. The cursors
+    /// validate that every leaf is covered by exactly one range without
+    /// constructing a temporary set or expanding by instance count.
+    fn capture_resident_program_phase(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        capture: &mut GpuCaptureScope,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        phase: &crate::gpu_compiled::CompiledResidentControlPhase,
+        physical_device: i32,
+        tail: bool,
+        wave_base: usize,
+        target_phase: Option<ResidentPhaseId>,
+        binding_phase: ResidentPhaseId,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        let mut range_index = 0usize;
+        let mut range_offset = 0usize;
+        let target_region = target_phase
+            .map(|phase_id| program.phase(phase_id).map(|phase| phase.region))
+            .transpose()?;
+        for instruction_id in &phase.instructions {
+            let instruction = program.instruction(*instruction_id)?;
+            let structural = matches!(
+                &instruction.kind,
+                ResidentControlInstructionKind::ParallelLoop { .. } |
+                    ResidentControlInstructionKind::SequentialLoop { .. } |
+                    ResidentControlInstructionKind::SubgraphCall { .. }
+            );
+            if let Some(target_region) = target_region {
+                if phase.region != target_region {
+                    let child = match &instruction.kind {
+                        ResidentControlInstructionKind::ParallelLoop { child, .. } => Some(*child),
+                        ResidentControlInstructionKind::SequentialLoop {
+                            child: Some(child),
+                            ..
+                        } |
+                        ResidentControlInstructionKind::SubgraphCall {
+                            child: Some(child), ..
+                        } => Some(*child),
+                        _ => None,
+                    };
+                    let reaches = child
+                        .map(|child| program.region_contains(child, target_region))
+                        .transpose()?
+                        .unwrap_or(false);
+                    if !reaches {
+                        continue;
+                    }
+                }
+            }
+            if !structural {
+                let range = phase.ranges.get(range_index).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident phase leaf is missing a range".into(),
+                    )
+                })?;
+                if range.instructions.get(range_offset) != Some(instruction_id) {
+                    return Err(GpuResidentControlAdapterError::Unsupported(
+                        "resident phase leaf/range order mismatch".into(),
+                    ));
+                }
+                range_offset += 1;
+                if range_offset == range.instructions.len() {
+                    range_index += 1;
+                    range_offset = 0;
+                }
+            }
+            self.capture_resident_program_instruction(
+                parameters,
+                capture,
+                program,
+                owners,
+                instruction,
+                physical_device,
+                phase.id,
+                binding_phase,
+                tail,
+                wave_base,
+                target_phase,
+            )?;
+        }
+        if range_index != phase.ranges.len() || range_offset != 0 {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident phase range does not cover its leaf instructions".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn capture_resident_program_graph(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        physical_device: i32,
+        operation_identity: [u8; 32],
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        phase_id: ResidentPhaseId,
+        wave_base: usize,
+    ) -> Result<GpuCompiledRegion, GpuResidentControlAdapterError> {
+        let binding_count = resident_binding_count(&program.bindings)?;
+        let phase_bindings =
+            resident_phase_schema_with_dynamic_family_sources(program, phase_id, physical_device)?;
+        let phase_binding_base = binding_count;
+        let phase_binding_slots =
+            phase_bindings.iter().map(|binding| binding.key.slot).collect::<BTreeSet<_>>();
+        let total_binding_count = phase_binding_base
+            .checked_add(u32::try_from(phase_bindings.len()).map_err(|_| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident phase binding count overflows".into(),
+                )
+            })?)
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident phase binding count overflows".into(),
+                )
+            })?;
+        self.capture_integer_constants.clear();
+        for instruction in &program.schema.instructions {
+            let constant = match &instruction.kind {
+                ResidentControlInstructionKind::Scalar(ResidentControlOperation::ConstantInt {
+                    value,
+                }) => Some(GpuSignedValues::from_bigints(
+                    parameters,
+                    physical_device,
+                    std::slice::from_ref(value),
+                )?),
+                ResidentControlInstructionKind::Scalar(
+                    ResidentControlOperation::ConstantBool { value },
+                ) => Some(GpuSignedValues::from_canonical_u64(
+                    parameters,
+                    physical_device,
+                    &[u64::from(*value)],
+                )?),
+                _ => None,
+            };
+            if let Some(constant) = constant {
+                constant.prepare_external_for_capture()?;
+                self.capture_integer_constants.insert(instruction.id, constant);
+            }
+        }
+        self.prepare_resident_native_captures(
+            parameters,
+            program,
+            owners,
+            physical_device,
+            phase_id,
+            wave_base,
+        )?;
+        let phase = program.phase(phase_id)?;
+        self.prepare_resident_family_captures(
+            program,
+            owners,
+            physical_device,
+            phase.geometry.active_lanes,
+            wave_base,
+        )?;
+        let mut capture = parameters
+            .begin_capture(physical_device)
+            .map_err(GpuResidentControlAdapterError::Native)?;
+        // Reserve the complete immutable schema range before any native
+        // wrapper self-registers a launch. Control wrappers use operation-
+        // local patch indices plus this capture offset; the resident runtime
+        // binding vector is the range itself, so a nonzero offset would make
+        // replay indices diverge from `RegionBinding.index`.
+        capture
+            .claim_binding_range(total_binding_count)
+            .map_err(GpuResidentControlAdapterError::Native)?;
+        for binding in &program.bindings {
+            let BindingSource::ValueComponent { slot, address_addend, .. } = binding.source;
+            let owner = match owners.resolve(slot) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    let _ = capture.abort();
+                    return Err(error);
+                }
+            };
+            let BindingSource::ValueComponent { shard, component, .. } = binding.source;
+            let retain_packed_integer_family =
+                matches!(component, NativeValueComponent::IntegerValues) &&
+                    matches!(
+                        &owner,
+                        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+                            element_type,
+                            packed_integer: Some(_),
+                            ..
+                        }) if matches!(
+                            element_type.as_ref(),
+                            ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. }
+                        )
+                    );
+            if phase_binding_slots.contains(&slot) && !retain_packed_integer_family {
+                continue;
+            }
+            let (native_address, owner_bytes) = resident_binding_address(owner, shard, component)
+                .map_err(GpuResidentControlAdapterError::Native)?;
+            let addend = usize::try_from(address_addend).map_err(|_| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident binding address addend does not fit host usize".into(),
+                )
+            })?;
+            if addend % std::mem::size_of::<u64>() != 0 || addend >= owner_bytes {
+                let _ = capture.abort();
+                return Err(GpuResidentControlAdapterError::Unsupported(
+                    "resident binding address addend is outside its owner view".into(),
+                ));
+            }
+            let address = native_address.checked_add(address_addend).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident binding device address overflows".into(),
+                )
+            })?;
+            if let Err(error) =
+                capture.bind_resident_address(address, owner_bytes - addend, binding.index)
+            {
+                let _ = capture.abort();
+                return Err(GpuResidentControlAdapterError::Native(error));
+            }
+        }
+        for binding in phase_bindings {
+            let index = phase_binding_base.checked_add(binding.index).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident phase binding index overflows".into(),
+                )
+            })?;
+            let (address, bytes) = resident_physical_binding_address(
+                program, owners, &binding, wave_base,
+            )
+            .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string()))?;
+            capture
+                .bind_resident_address(address, bytes, index)
+                .map_err(GpuResidentControlAdapterError::Native)?;
+        }
+        if total_binding_count == 0 {
+            let _ = capture.abort();
+            return Err(GpuResidentControlAdapterError::MissingOutput);
+        }
+        self.capture_resident_resources.clear();
+        self.capture_active = true;
+        // Each executable gets one device-side status reset at its capture
+        // boundary.  Do not clear the latch between family gathers: an
+        // invalid lane must survive through the remainder of the graph.
+        for instruction in &program.schema.instructions {
+            if let Some(status) = &instruction.status {
+                set_capture_binding_sources(
+                    &mut capture,
+                    &program.bindings,
+                    &[(0, status.slot, 0, NativeValueComponent::IntegerValues)],
+                )
+                .map_err(GpuResidentControlAdapterError::Native)?;
+                owners.resolve_integer(status.slot)?.native().fill_constant_i64(0)?;
+            }
+        }
+        let selected_phase = program.phase(phase_id)?;
+        let target_region = selected_phase.region;
+        let target_path = (target_region != program.schema.root).then_some(phase_id);
+        if target_path.is_some() && !program.region_contains(program.schema.root, target_region)? {
+            return Err(GpuResidentControlAdapterError::Unsupported(
+                "resident phase is not reachable from the capture root".into(),
+            ));
+        }
+        let phase = if target_path.is_some() {
+            let root = program.region(program.schema.root)?;
+            let root_phase = root.phases.first().copied().ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident capture root has no full phase".into(),
+                )
+            })?;
+            program.phase(root_phase)?
+        } else {
+            selected_phase
+        };
+        let result = self.capture_resident_program_phase(
+            parameters,
+            &mut capture,
+            program,
+            owners,
+            phase,
+            physical_device,
+            matches!(phase.geometry.kind, crate::gpu_compiled::ResidentPhaseKind::Tail),
+            wave_base,
+            target_path,
+            phase_id,
+        );
+        self.capture_active = false;
+        if let Err(error) = result {
+            let _ = capture.abort();
+            return Err(error);
+        }
+        // Resident phases share one capture scope. Resolve fixed addresses
+        // only after every phase/leaf has registered its bindings.
+        capture.resolve_fixed_addresses().map_err(GpuResidentControlAdapterError::Native)?;
+        let mut exec = capture.finish().map_err(GpuResidentControlAdapterError::Native)?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream).map_err(GpuResidentControlAdapterError::Native)?;
+        let mut resources = std::mem::take(&mut self.capture_resident_resources);
+        let integer_constants =
+            self.capture_integer_constants.drain().map(|(_, value)| value).collect::<Vec<_>>();
+        if !integer_constants.is_empty() {
+            resources.push(GpuCompiledRegionResource::IntegerConstants(integer_constants));
+        }
+        Ok(GpuCompiledRegion {
+            region_id: phase.region.0,
+            physical_device,
+            operation_identity,
+            exec,
+            launch_stream,
+            resource: (!resources.is_empty())
+                .then_some(GpuCompiledRegionResource::Resources(resources)),
+        })
+    }
+
+    /// Capture one explicit resident phase and wave window. The runtime worker
+    /// uses this entry point to cache separate full/tail executables and to
+    /// replay successive waves with their frozen `wave_base`; no root-region
+    /// tail inference or host per-lane launch loop is involved.
+    pub(crate) fn capture_resident_control_region_phase(
+        &mut self,
+        operation_identity: [u8; 32],
+        physical_device: i32,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        phase_id: ResidentPhaseId,
+        wave_base: usize,
+    ) -> Result<GpuCapturedRegion, GpuResidentControlAdapterError> {
+        owners.validate(physical_device)?;
+        // Use the same execution context as integer arena allocation and
+        // resident_control_stream, independently of matrix parameter order.
+        let parameters = self
+            .devices
+            .iter()
+            .find(|(device, _)| *device == physical_device)
+            .and_then(|(_, backend)| {
+                backend.parameters.iter().flat_map(|values| values.values()).next()
+            })
+            .cloned()
+            .ok_or(GpuResidentControlAdapterError::WrongOwner { expected: physical_device })?;
+        // Resolve asynchronous allocations, uploads, and prior releases before
+        // capture. Control launches then use stream order for internal values
+        // without importing uncaptured producer events into the graph.
+        for owner in owners.entries {
+            wait_resident_owner(owner.value);
+        }
+        parameters.fence_released_memory();
+        // External matrix owners must enter CUDA capture preparation exactly
+        // once, before the first graph begins. The full and tail templates
+        // share these owners; preparing them again between captures is
+        // rejected by the native matrix wrapper and would also invalidate
+        // the replay binding contract.
+        for owner in owners.entries {
+            prepare_resident_owner(owner.value)?;
+        }
+        let native = self.capture_resident_program_graph(
+            &parameters,
+            physical_device,
+            operation_identity,
+            program,
+            owners,
+            phase_id,
+            wave_base,
+        )?;
+        let phase_bindings = Some(
+            resident_phase_schema_with_dynamic_family_sources(program, phase_id, physical_device)?
+                .into_boxed_slice(),
+        );
+        let phase_binding_base =
+            phase_bindings.as_ref().map(|_| resident_binding_count(&program.bindings).unwrap_or(0));
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: program.bindings.clone(),
+            phase_bindings,
+            phase_binding_base,
+            phase: Some(phase_id),
+            wave_base: Some(wave_base),
+        })
+    }
+
+    /// Protect every owner referenced by the flat program. Access is derived
+    /// from the global binding namespace, so nested imports/exports and loop
+    /// state cannot be dropped before replay completion.
+    pub(crate) fn protect_resident_capture_program(
+        &self,
+        physical_device: i32,
+        program: &GpuResidentCaptureProgram,
+        owners: &GpuResidentCaptureOwners<'_>,
+        completion: &GpuNativeEvent,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuResidentControlAdapterError> {
+        owners.validate(physical_device)?;
+        let written = program.written_slots();
+        // Fail before replay if an internal loop/index/status slot was not
+        // materialized in the frame arena.  Silently omitting it would let a
+        // graph write race with owner release even though public bindings are
+        // complete.
+        for slot in &written {
+            owners.resolve(*slot)?;
+        }
+        for owner in owners.entries {
+            let writes = written.contains(&owner.slot);
+            match owner.value.resident_owner() {
+                GpuResidentOwnerRef::Matrix(value) => value.protect_compiled_submission(
+                    physical_device,
+                    stream,
+                    completion,
+                    !writes,
+                )?,
+                GpuResidentOwnerRef::SmallMatrix(value) => {
+                    value.protect_compiled_submission(stream, completion)?;
+                }
+                GpuResidentOwnerRef::Trapdoor { public, secret } => {
+                    public.protect_compiled_submission(
+                        physical_device,
+                        stream,
+                        completion,
+                        !writes,
+                    )?;
+                    secret.protect_compiled_submission(physical_device, stream, completion)?;
+                }
+                GpuResidentOwnerRef::Integer(value) => value.protect_compiled_submission(
+                    physical_device,
+                    stream,
+                    completion,
+                    !writes,
+                )?,
+                GpuResidentOwnerRef::Family(owner) => {
+                    protect_resident_family(owner, physical_device, stream, &completion, writes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl GpuProductionCompletion for GpuFleetSignedValues {
+    fn complete(&self) {
+        self.wait_until_ready().expect("GPU integer values completion failed");
+    }
+}
+
+impl GpuDcrtBackend {
+    /// Allocate a capture exemplar on the physical device selected by the
+    /// frozen job.  The old capture allocation helpers intentionally used the
+    /// first fleet device, which is not a valid placement once a preceding
+    /// family gather has selected another owner.
+    pub(crate) fn allocate_capture_owner_on_device(
+        &self,
+        wire_type: &ConcreteWireType,
+        device_id: i32,
+        integer_encoding: Option<GpuSignedValuesEncoding>,
+    ) -> Result<GpuCaptureOwnedOwner, GpuCaptureAdapterError> {
+        self.allocate_capture_owner_on_device_with_domain(
+            wire_type,
+            device_id,
+            integer_encoding,
+            true,
+        )
+    }
+
+    /// Allocate a capture owner with an explicit CRT representation. Most
+    /// producers write NTT-domain matrices. CRT conversion preparation may
+    /// require coefficient storage; replay uses the captured owner's final domain.
+    pub(crate) fn allocate_capture_owner_on_device_with_domain(
+        &self,
+        wire_type: &ConcreteWireType,
+        device_id: i32,
+        integer_encoding: Option<GpuSignedValuesEncoding>,
+        matrix_is_ntt: bool,
+    ) -> Result<GpuCaptureOwnedOwner, GpuCaptureAdapterError> {
+        let device_index =
+            self.devices.iter().position(|(device, _)| *device == device_id).ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "capture output device {device_id} is not registered"
+                ))
+            })?;
+        match wire_type {
+            ConcreteWireType::Matrix(matrix) => {
+                let params = self.devices[device_index].1.parameters(matrix)?;
+                let level = params.crt_depth().checked_sub(1).ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix output has empty CRT depth".into(),
+                    )
+                })?;
+                let descriptor = GpuMatrixOutputDescriptor::for_shape(
+                    params,
+                    matrix.rows,
+                    matrix.columns,
+                    level,
+                    matrix_is_ntt,
+                )
+                .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+                Ok(GpuCaptureOwnedOwner::Matrix(GpuFleetMatrix::from_matrix(descriptor.allocate())))
+            }
+            ConcreteWireType::Trapdoor { matrix, .. } => {
+                let source_params = self.devices[device_index].1.parameters(matrix)?;
+                let source_descriptor = GpuDCRTTrapdoor::output_descriptor_for_shape(
+                    source_params,
+                    matrix.rows,
+                    matrix.columns,
+                )
+                .map_err(GpuCaptureAdapterError::UnsupportedOperation)?;
+                let public = source_descriptor.public.allocate();
+                let mut values = Vec::with_capacity(self.devices.len());
+                for (_, device) in self.devices.iter() {
+                    let params = device.parameters(matrix)?.clone();
+                    let descriptor = GpuDCRTTrapdoor::output_descriptor_for_shape(
+                        &params,
+                        matrix.rows,
+                        matrix.columns,
+                    )
+                    .map_err(GpuCaptureAdapterError::UnsupportedOperation)?;
+                    let (_, secret) = GpuDCRTTrapdoor::allocate_from_descriptor(&descriptor);
+                    values.push(secret);
+                }
+                Ok(GpuCaptureOwnedOwner::TrapdoorPair {
+                    public: GpuFleetMatrix::from_matrix(public),
+                    secret: GpuFleetTrapdoor { values },
+                })
+            }
+            ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+            ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                let params = self.devices[device_index].1.parameters(matrix)?;
+                let bound = max_coefficient_bound.to_biguint().ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "compact output coefficient bound must be nonnegative".into(),
+                    )
+                })?;
+                let descriptor = GpuSmallMatrixOutputDescriptor::for_shape(
+                    params,
+                    matrix.rows,
+                    matrix.columns,
+                    bound,
+                )
+                .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+                Ok(GpuCaptureOwnedOwner::SmallMatrix(GpuFleetSmallMatrix::from_matrix(
+                    descriptor.allocate().map_err(|error| {
+                        GpuCaptureAdapterError::UnsupportedOperation(error.to_string())
+                    })?,
+                )))
+            }
+            ConcreteWireType::IndexedFamily { element, count }
+                if matches!(element.as_ref(), ConcreteWireType::Int | ConcreteWireType::Bool) =>
+            {
+                let params = self.devices[device_index]
+                    .1
+                    .parameters
+                    .iter()
+                    .flat_map(|parameters| parameters.values())
+                    .next()
+                    .ok_or(GpuCaptureAdapterError::UnsupportedOperation(
+                        "integer output has no registered parameters".into(),
+                    ))?;
+                let values = GpuFleetSignedValues::allocate(
+                    params,
+                    device_id,
+                    *count,
+                    integer_encoding.unwrap_or(GpuSignedValuesEncoding::CanonicalU64),
+                )
+                .map_err(GpuCaptureAdapterError::Native)?;
+                Ok(GpuCaptureOwnedOwner::IntegerValues(values))
+            }
+            other => Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                "wire type {other:?} has no native capture owner"
+            ))),
+        }
+    }
+
+    /// Enqueue one complete preimage retry body into an active native graph
+    /// capture. The caller owns the fixed destination and scratch matrices;
+    /// this adapter only supplies the concrete fleet-side sampler inputs and
+    /// never performs a host retry loop or status readback.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_preimage_retry_body(
+        &self,
+        capture: &mut GpuCaptureScope,
+        params: &GpuDCRTPolyParams,
+        sigma: f64,
+        spec: GpuPreimageRetrySpec,
+        scratch: GpuPreimageBodyScratch,
+        device_control: *mut std::ffi::c_void,
+        device_status: *mut std::ffi::c_void,
+        destination: &mut GpuSmallMatrix,
+        target: &GpuDCRTPolyMatrix,
+        public_matrix: &GpuDCRTPolyMatrix,
+        trapdoor: &GpuDCRTTrapdoor,
+        p2: &mut GpuDCRTPolyMatrix,
+        tp2: &mut GpuDCRTPolyMatrix,
+        p1: &mut GpuDCRTPolyMatrix,
+        residual: &mut GpuDCRTPolyMatrix,
+        z_hat: &mut GpuDCRTPolyMatrix,
+        candidate: &mut GpuDCRTPolyMatrix,
+        stream_target_column: usize,
+    ) -> Result<(), GpuNativeGraphError> {
+        let sampler = GpuDCRTPolyTrapdoorSampler::new(params, sigma);
+        sampler.add_preimage_retry_with_candidate_body(
+            capture,
+            spec,
+            scratch,
+            device_control,
+            device_status,
+            destination,
+            target,
+            public_matrix,
+            trapdoor,
+            p2,
+            tp2,
+            p1,
+            residual,
+            z_hat,
+            candidate,
+            stream_target_column,
+        )
+    }
+
+    /// Resolve the mutable compact owner held by one retry region. The
+    /// returned owner is the actual output shard, not a temporary gathered
+    /// matrix, so its native status, staging, and release state remain tied to
+    /// the runtime value that the graph binding patches on replay.
+    pub(crate) fn resolve_preimage_compact_shard_mut(
+        value: &mut GpuFleetSmallMatrix,
+        physical_device: i32,
+        range: Range<usize>,
+    ) -> Result<(usize, &mut GpuSmallMatrix), GpuNativeGraphError> {
+        value
+            .shards
+            .iter_mut()
+            .enumerate()
+            .find(|(_, shard)| {
+                shard.device_id == physical_device &&
+                    range.start >= shard.global_column_start &&
+                    range.end <= shard.global_column_start + shard.value.columns()
+            })
+            .map(|(index, shard)| (index, &mut shard.value))
+            .ok_or_else(|| {
+                GpuNativeGraphError::Native(format!(
+                    "mutable compact retry range {}..{} is not resident on physical device {}",
+                    range.start, range.end, physical_device
+                ))
+            })
+    }
+}
+
+/// Adapter state for one concrete fleet shard.  All owners are supplied
+/// by the runtime frame and outlive capture/replay; this type does not
+/// allocate, gather, retry on the host, or retain a capture exemplar.
+pub(crate) struct GpuFleetPreimageCaptureAdapter<'a> {
+    backend: &'a GpuDcrtBackend,
+    capture: &'a mut GpuCaptureScope,
+    params: &'a GpuDCRTPolyParams,
+    sigma: f64,
+    scratch: GpuPreimageBodyScratch,
+    device_control: *mut std::ffi::c_void,
+    device_status: *mut std::ffi::c_void,
+    destination: &'a mut GpuSmallMatrix,
+    target: &'a GpuDCRTPolyMatrix,
+    public_matrix: &'a GpuDCRTPolyMatrix,
+    trapdoor: &'a GpuDCRTTrapdoor,
+    p2: &'a mut GpuDCRTPolyMatrix,
+    tp2: &'a mut GpuDCRTPolyMatrix,
+    p1: &'a mut GpuDCRTPolyMatrix,
+    residual: &'a mut GpuDCRTPolyMatrix,
+    z_hat: &'a mut GpuDCRTPolyMatrix,
+    candidate: &'a mut GpuDCRTPolyMatrix,
+    stream_target_column: usize,
+}
+
+impl<'a> GpuFleetPreimageCaptureAdapter<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        backend: &'a GpuDcrtBackend,
+        capture: &'a mut GpuCaptureScope,
+        params: &'a GpuDCRTPolyParams,
+        sigma: f64,
+        scratch: GpuPreimageBodyScratch,
+        device_control: *mut std::ffi::c_void,
+        destination: &'a mut GpuSmallMatrix,
+        target: &'a GpuDCRTPolyMatrix,
+        public_matrix: &'a GpuDCRTPolyMatrix,
+        trapdoor: &'a GpuDCRTTrapdoor,
+        p2: &'a mut GpuDCRTPolyMatrix,
+        tp2: &'a mut GpuDCRTPolyMatrix,
+        p1: &'a mut GpuDCRTPolyMatrix,
+        residual: &'a mut GpuDCRTPolyMatrix,
+        z_hat: &'a mut GpuDCRTPolyMatrix,
+        candidate: &'a mut GpuDCRTPolyMatrix,
+        stream_target_column: usize,
+    ) -> Result<Self, GpuNativeGraphError> {
+        let descriptor = destination.binding_descriptor()?;
+        let device_status = descriptor.device_status_address as usize as *mut std::ffi::c_void;
+        Ok(Self {
+            backend,
+            capture,
+            params,
+            sigma,
+            scratch,
+            device_control,
+            device_status,
+            destination,
+            target,
+            public_matrix,
+            trapdoor,
+            p2,
+            tp2,
+            p1,
+            residual,
+            z_hat,
+            candidate,
+            stream_target_column,
+        })
+    }
+}
+
+impl PreimageBodyCaptureAdapter for GpuFleetPreimageCaptureAdapter<'_> {
+    type Error = GpuNativeGraphError;
+
+    fn capture_preimage_body(
+        &mut self,
+        metadata: &PreimageRetryMetadata,
+        request: PreimageBodyCaptureRequest,
+    ) -> Result<(), Self::Error> {
+        let expected_attempts = metadata.bindings.max_attempts;
+        if request.max_attempts != expected_attempts {
+            return Err(GpuNativeGraphError::Native(format!(
+                "preimage retry bound changed for region {:?}",
+                metadata.region
+            )));
+        }
+        self.backend.capture_preimage_retry_body(
+            self.capture,
+            self.params,
+            self.sigma,
+            GpuPreimageRetrySpec {
+                max_attempts: request.max_attempts,
+                attempt_binding_index: request.attempt_binding_index,
+                control_binding_index: request.control_binding_index,
+                status_binding_index: request.status_binding_index,
+            },
+            self.scratch.clone(),
+            self.device_control,
+            self.device_status,
+            self.destination,
+            self.target,
+            self.public_matrix,
+            self.trapdoor,
+            self.p2,
+            self.tp2,
+            self.p1,
+            self.residual,
+            self.z_hat,
+            self.candidate,
+            self.stream_target_column,
+        )
+    }
+
+    #[cfg(test)]
+    fn copy_final_preimage_status(
+        &mut self,
+        _metadata: &PreimageRetryMetadata,
+    ) -> Result<(), Self::Error> {
+        Err(GpuNativeGraphError::Native(
+            "fleet preimage status copy is owned by the runtime replay path".into(),
+        ))
+    }
+}
+
+/// Resolve the mutable compact owner held by a runtime value.  The runtime
+/// value remains the source of truth for semantic kind (`SmallMatrix` versus
+/// `Preimage`); callers must not manufacture a compact owner from a wire
+/// descriptor just to enter the retry adapter.
+pub(crate) fn resolve_runtime_preimage_compact_shard_mut(
+    value: &mut RuntimeValue<GpuDcrtBackend>,
+    physical_device: i32,
+    range: Range<usize>,
+) -> Result<(usize, &mut GpuSmallMatrix), GpuNativeGraphError> {
+    let owner = match value {
+        RuntimeValue::SmallMatrix(owner) | RuntimeValue::Preimage(owner) => Arc::get_mut(owner)
+            .ok_or_else(|| {
+                GpuNativeGraphError::Native(
+                    "preimage output owner is shared during capture/replay".into(),
+                )
+            })?,
+        _ => {
+            return Err(GpuNativeGraphError::Native(
+                "preimage retry output is not a compact runtime owner".into(),
+            ));
+        }
+    };
+    GpuDcrtBackend::resolve_preimage_compact_shard_mut(owner, physical_device, range)
+}
+
+impl GpuDcrtBackend {
+    /// Allocate the cutoff staging and status storage on the actual replay
+    /// output before its binding addresses are resolved.
+    pub(crate) fn prepare_preimage_output_for_region(
+        &self,
+        region: &crate::gpu_compiled::CompiledRegion,
+        value: &mut RuntimeValue<GpuDcrtBackend>,
+    ) -> Result<(), GpuNativeGraphError> {
+        let crate::gpu_compiled::NativeComponent::PreimageRetry { jobs, .. } = &region.component
+        else {
+            return Err(GpuNativeGraphError::Native(
+                "preimage output preparation requires a retry region".into(),
+            ));
+        };
+        let job = jobs
+            .iter()
+            .find(|job| {
+                self.devices
+                    .get(job.device)
+                    .is_some_and(|device| device.0 == region.physical_device)
+            })
+            .ok_or_else(|| GpuNativeGraphError::Native("preimage retry job is missing".into()))?;
+        let (_, destination) = resolve_runtime_preimage_compact_shard_mut(
+            value,
+            region.physical_device,
+            job.start..job.end,
+        )?;
+        destination
+            .prepare_preimage_hard_cutoff_for_tile(destination.rows_count(), job.end - job.start);
+        Ok(())
+    }
+
+    /// Queue the final status D2H for a replayed preimage region and consume
+    /// the run-local status record. The caller must have attached the graph's
+    /// completion event to the output owner before invoking this method.
+    pub(crate) fn copy_preimage_status_for_region(
+        &mut self,
+        region: &crate::gpu_compiled::CompiledRegion,
+        value: &mut RuntimeValue<GpuDcrtBackend>,
+    ) -> Result<PreimageStatus, GpuNativeGraphError> {
+        let metadata = PreimageRetryMetadata::from_region(region).ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage status requested for non-retry region".into())
+        })?;
+        let job = match &region.component {
+            crate::gpu_compiled::NativeComponent::PreimageRetry { jobs, .. } => jobs
+                .iter()
+                .find(|job| {
+                    self.devices
+                        .get(job.device)
+                        .is_some_and(|device| device.0 == region.physical_device)
+                })
+                .copied()
+                .ok_or_else(|| {
+                    GpuNativeGraphError::Native(
+                        "preimage region has no status job on its physical device".into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuNativeGraphError::Native(
+                    "preimage status requested for non-retry region".into(),
+                ));
+            }
+        };
+        let status_binding = *metadata.bindings.status.first().ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage region has no status binding".into())
+        })?;
+        let host_status_binding = *metadata.bindings.host_status.first().ok_or_else(|| {
+            GpuNativeGraphError::Native("preimage region has no host-status binding".into())
+        })?;
+        let (_, destination) = resolve_runtime_preimage_compact_shard_mut(
+            value,
+            region.physical_device,
+            job.start..job.end,
+        )?;
+        destination.copy_preimage_status_async_with_bindings(status_binding, host_status_binding);
+        Ok(destination.wait_preimage_status())
+    }
+}
+
+impl GpuDcrtBackend {
+    fn prepare_capture_request(
+        &mut self,
+        request: &GpuCaptureRequest,
+    ) -> Result<(), PolyBackendError> {
+        let metadata = match request {
+            GpuCaptureRequest::Ordinary(requests) => {
+                requests.first().map(|request| match request {
+                    FixedOperationBatchRequest::SingleDeviceConstant { metadata, .. } |
+                    FixedOperationBatchRequest::GeneratedConstant { metadata, .. } |
+                    FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                        metadata,
+                        ..
+                    } |
+                    FixedOperationBatchRequest::PolynomialFromValues { metadata, .. } |
+                    FixedOperationBatchRequest::PolynomialValues { metadata, .. } |
+                    FixedOperationBatchRequest::ExtractCoefficient { metadata, .. } |
+                    FixedOperationBatchRequest::ThresholdDecode { metadata, .. } |
+                    FixedOperationBatchRequest::PackPolynomialCoefficients { metadata, .. } |
+                    FixedOperationBatchRequest::MatrixBinary { metadata, .. } |
+                    FixedOperationBatchRequest::MatrixMulSmallRhs { metadata, .. } |
+                    FixedOperationBatchRequest::MatrixMulAccumulate { metadata, .. } |
+                    FixedOperationBatchRequest::Negate { metadata, .. } |
+                    FixedOperationBatchRequest::Scale { metadata, .. } |
+                    FixedOperationBatchRequest::UnaryTransform { metadata, .. } |
+                    FixedOperationBatchRequest::Tensor { metadata, .. } |
+                    FixedOperationBatchRequest::Concat { metadata, .. } |
+                    FixedOperationBatchRequest::CrtRecompose { metadata, .. } => metadata,
+                })
+            }
+            GpuCaptureRequest::Fused(requests) => requests.first().map(|request| match request {
+                FusedBatchRequest::RowSum { metadata, .. } |
+                FusedBatchRequest::TensorRowSums { metadata, .. } |
+                FusedBatchRequest::Decompose { metadata, .. } |
+                FusedBatchRequest::SmallProduct { metadata, .. } |
+                FusedBatchRequest::Add { metadata, .. } => metadata,
+            }),
+            GpuCaptureRequest::Compact(requests) => {
+                requests.first().map(|request| &request.metadata)
+            }
+            GpuCaptureRequest::Generation(requests) => {
+                requests.first().map(|request| match request {
+                    FixedGenerationRequest::Uniform { metadata, .. } |
+                    FixedGenerationRequest::Gaussian { metadata, .. } |
+                    FixedGenerationRequest::Hash { metadata, .. } |
+                    FixedGenerationRequest::HashDecomposed { metadata, .. } => metadata,
+                })
+            }
+            GpuCaptureRequest::Decomposition(requests) => {
+                requests.first().map(|request| &request.metadata)
+            }
+            GpuCaptureRequest::Trapdoor(request) => Some(&request.metadata),
+            GpuCaptureRequest::Preimage(requests) => {
+                requests.first().and_then(|request| request.fixed_metadata.as_ref())
+            }
+        };
+        if let Some(metadata) = metadata {
+            self.prepare_fixed_node_batch(metadata)?;
+        }
+        Ok(())
+    }
+
+    fn allocate_capture_protocol_owners(
+        &self,
+        request: &GpuCaptureRequest,
+        parameters: &GpuDCRTPolyParams,
+        physical_device: i32,
+    ) -> Result<Option<GpuCaptureProtocolOwners>, GpuCaptureAdapterError> {
+        let (status_count, scratch_count) = match request {
+            GpuCaptureRequest::Ordinary(requests) if requests.len() == 1 => match &requests[0] {
+                FixedOperationBatchRequest::ExtractCoefficient { .. } => (1, None),
+                FixedOperationBatchRequest::ThresholdDecode { .. } => (1, None),
+                FixedOperationBatchRequest::PackPolynomialCoefficients { .. } => {
+                    (1, Some(parameters.ring_dimension() as usize))
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let status = GpuFleetSignedValues::allocate(
+            parameters,
+            physical_device,
+            status_count,
+            GpuSignedValuesEncoding::SignedI64,
+        )
+        .map_err(GpuCaptureAdapterError::Native)?;
+        let scratch = scratch_count
+            .map(|count| {
+                GpuFleetSignedValues::allocate(
+                    parameters,
+                    physical_device,
+                    count.max(parameters.ring_dimension() as usize),
+                    GpuSignedValuesEncoding::SignedWords(parameters.modulus_bits().div_ceil(64)),
+                )
+                .map_err(GpuCaptureAdapterError::Native)
+            })
+            .transpose()?;
+        let threshold = match request {
+            GpuCaptureRequest::Ordinary(requests) => match &requests[0] {
+                FixedOperationBatchRequest::ThresholdDecode {
+                    plaintext_modulus, length, ..
+                } => Some(GpuThresholdDecodeScratch::new(
+                    parameters,
+                    physical_device,
+                    plaintext_modulus,
+                    *length,
+                )?),
+                _ => None,
+            },
+            _ => None,
+        };
+        Ok(Some(GpuCaptureProtocolOwners { status, scratch, threshold }))
+    }
+
+    /// Capture one fixed operation with a value-free binding schema. Native
+    /// graph-local allocations retain their destruction callbacks until the
+    /// executable is released; externally visible destinations are rebound.
+    pub(crate) fn capture_step_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        region: &crate::gpu_compiled::CompiledRegion,
+        step: &CaptureStep,
+        request: GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        source_addresses: &[(u64, usize, u32)],
+    ) -> Result<GpuCapturedRegion, GpuCaptureAdapterError> {
+        region
+            .validate_schema()
+            .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+        if !parameters.gpu_ids().contains(&region.physical_device) {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                "compiled region {} is not owned by physical device {}",
+                region.id.0, region.physical_device
+            )));
+        }
+        for destination in &mut *destination_owners {
+            prepare_capture_owner(&mut destination.owner)?;
+        }
+        if is_modulus_conversion_capture_request(&request) {
+            return self.capture_modulus_conversion_region(
+                parameters,
+                region,
+                request,
+                destination_owners,
+            );
+        }
+        if is_centered_rebase_capture_request(&request) ||
+            is_centered_round_divide_capture_request(&request) ||
+            matches!(
+                &step.operation,
+                CaptureOperation::Fixed {
+                    operation: crate::gpu_column_policy::EffectiveGpuOperation::CenteredRebase |
+                        crate::gpu_column_policy::EffectiveGpuOperation::CenteredRoundDivide,
+                    ..
+                }
+            )
+        {
+            return self.capture_centered_rebase_region(
+                parameters,
+                region,
+                request,
+                destination_owners,
+            );
+        }
+        let materialize_constant = match &request {
+            GpuCaptureRequest::Ordinary(requests) if !requests.is_empty() => {
+                requests.iter().all(|request| {
+                    matches!(
+                        request,
+                        FixedOperationBatchRequest::SingleDeviceConstant { .. } |
+                            FixedOperationBatchRequest::GeneratedConstant { .. }
+                    )
+                })
+            }
+            _ => false,
+        };
+        if materialize_constant {
+            self.prepare_capture_request(&request)?;
+            let mut captured = match request {
+                GpuCaptureRequest::Ordinary(requests) => {
+                    <Self as Backend>::fixed_operation_batch(self, requests)?
+                        .into_iter()
+                        .map(|output| match output {
+                            FixedOperationBatchOutput::Matrix(value) => Ok(value),
+                            FixedOperationBatchOutput::IntegerValues(_) => {
+                                Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                    "materialized constant produced integer values".into(),
+                                ))
+                            }
+                            FixedOperationBatchOutput::IntegerValuesMany(_) => {
+                                Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                    "materialized constant produced multi-port integer values"
+                                        .into(),
+                                ))
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?
+                }
+                _ => unreachable!("constant capture request classification changed"),
+            };
+            for value in &mut captured {
+                if value.shards.len() > 1 {
+                    *value =
+                        self.materialize_capture_matrix_on_device(value, region.physical_device)?;
+                }
+            }
+            return self.capture_materialized_constant_region(
+                parameters,
+                region,
+                captured,
+                destination_owners,
+                &region.bindings,
+            );
+        }
+        let direct_bound_primitive = matches!(
+            &request,
+            GpuCaptureRequest::Ordinary(requests)
+                if requests.len() == 1 &&
+                    matches!(
+                        requests.first(),
+                        Some(FixedOperationBatchRequest::PolynomialValues { .. }) |
+                        Some(FixedOperationBatchRequest::PolynomialFromValues { .. }) |
+                        Some(FixedOperationBatchRequest::LiftIntegerToConstantPolynomial { .. }) |
+                        Some(FixedOperationBatchRequest::ExtractCoefficient { .. }) |
+                        Some(FixedOperationBatchRequest::ThresholdDecode { .. }) |
+                        Some(FixedOperationBatchRequest::PackPolynomialCoefficients { .. })
+                    )
+        );
+        self.capture_resources.clear();
+        // Replicas computed by another graph contain exemplar data. Each
+        // region must capture its own copies from the rebound source owners.
+        self.matrix_replicas.clear();
+        if !direct_bound_primitive {
+            self.prepare_capture_request(&request)?;
+        }
+        // Protocol status and scratch are native graph resources, not runtime
+        // values. Allocate them before beginning capture and retain them with
+        // the executable so no CUDA allocation occurs on the capture stream.
+        let mut protocol_owners =
+            self.allocate_capture_protocol_owners(&request, parameters, region.physical_device)?;
+        if let Some(protocol) = &protocol_owners {
+            protocol.status.native().prepare_external_for_capture()?;
+            if let Some(scratch) = &protocol.scratch {
+                scratch.native().prepare_external_for_capture()?;
+            }
+            if let Some(threshold) = &protocol.threshold {
+                threshold.prepare_external_for_capture()?;
+            }
+        }
+        let mut capture = parameters.begin_capture(region.physical_device)?;
+        capture.claim_binding_range(region.bindings.len() as u32)?;
+        // Launch-site graph patch registration resolves resident pointers at
+        // registration time whenever the capture already has external
+        // bindings.  Inputs therefore have to be registered before the
+        // captured operation launches; registering them after the operation
+        // leaves the primitive unable to associate its descriptor patches
+        // with the replay schema.
+        for &(address, bytes, binding) in source_addresses {
+            if address != 0 && bytes != 0 {
+                capture.bind_resident_address(address, bytes, binding)?;
+            }
+        }
+        // Output owners are also resident allocations for the direct bound
+        // capture paths (for example PolynomialFromValues).  Register them
+        // before the primitive launch, since those wrappers resolve their
+        // descriptor patches while the launch node is being recorded.
+        if direct_bound_primitive ||
+            matches!(&request, GpuCaptureRequest::Decomposition(_)) ||
+            matches!(&request, GpuCaptureRequest::Fused(requests)
+                if matches!(requests.first(), Some(FusedBatchRequest::Decompose { .. })))
+        {
+            for binding in
+                region.bindings.iter().filter(|binding| binding.access == BindingAccess::Output)
+            {
+                let BindingSource::ValueComponent { slot, shard, component, address_addend } =
+                    binding.source;
+                let destination = destination_owners
+                    .iter_mut()
+                    .find(|destination| destination.slot == slot)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                let (address, bytes) = match (&mut destination.owner, component) {
+                    (
+                        GpuCaptureOwner::Matrix(matrix),
+                        NativeValueComponent::MatrixData |
+                        NativeValueComponent::MatrixDescriptors |
+                        NativeValueComponent::MatrixAuxiliary,
+                    ) => {
+                        let native = matrix
+                            .shards
+                            .get(shard as usize)
+                            .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?
+                            .value
+                            .binding_components()?
+                            .first()
+                            .copied()
+                            .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                        match component {
+                            NativeValueComponent::MatrixData => {
+                                (native.data_address, native.data_bytes)
+                            }
+                            NativeValueComponent::MatrixDescriptors => (
+                                native.device_descriptors_address,
+                                native.device_descriptor_stride * native.limb_count,
+                            ),
+                            NativeValueComponent::MatrixAuxiliary => {
+                                (native.auxiliary_address, native.auxiliary_slots_total * 8)
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    (
+                        GpuCaptureOwner::SmallMatrix(matrix),
+                        NativeValueComponent::CompactPayload |
+                        NativeValueComponent::CompactHardCutoffStaging |
+                        NativeValueComponent::CompactHostStatus |
+                        NativeValueComponent::CompactDeviceStatus,
+                    ) => {
+                        let native = matrix
+                            .shards
+                            .get(shard as usize)
+                            .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?
+                            .value
+                            .binding_descriptor()?;
+                        match component {
+                            NativeValueComponent::CompactPayload => {
+                                (native.payload_address, native.payload_bytes)
+                            }
+                            NativeValueComponent::CompactHardCutoffStaging => (
+                                native.hard_cutoff_staging_address,
+                                native.hard_cutoff_staging_bytes,
+                            ),
+                            NativeValueComponent::CompactHostStatus => {
+                                (native.host_status_address, 1)
+                            }
+                            NativeValueComponent::CompactDeviceStatus => {
+                                (native.device_status_address, 1)
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    (
+                        GpuCaptureOwner::IntegerValues(values),
+                        NativeValueComponent::IntegerValues,
+                    ) => {
+                        let native = values.binding()?;
+                        (
+                            native.device_address,
+                            native.count * native.encoding.words_per_value() * 8,
+                        )
+                    }
+                    _ => continue,
+                };
+                let addend = usize::try_from(address_addend)
+                    .map_err(|_| GpuCaptureAdapterError::MissingBinding(slot))?;
+                if address != 0 && bytes > addend {
+                    capture.bind_resident_address(
+                        address + address_addend,
+                        bytes - addend,
+                        binding.index,
+                    )?;
+                }
+            }
+        }
+        self.capture_active = true;
+        let mut submission = match self.submit_capture_step(
+            step,
+            request,
+            destination_owners,
+            &region.bindings,
+            region.physical_device,
+            source_addresses,
+            &mut capture,
+            protocol_owners.as_ref(),
+        ) {
+            Ok(submission) => submission,
+            Err(error) => {
+                self.capture_active = false;
+                let _ = capture.abort();
+                return Err(error);
+            }
+        };
+        // All pointer-bearing launches in this graph have now registered
+        // their bindings. Finalize the fixed-address table once at the outer
+        // capture boundary; leaf adapters must not finalize it independently.
+        capture.resolve_fixed_addresses()?;
+        self.capture_active = false;
+        if submission.resource.is_none() && !self.capture_resources.is_empty() {
+            submission.resource = Some(GpuCompiledRegionResource::MatrixReplicas(std::mem::take(
+                &mut self.capture_resources,
+            )));
+        }
+        if submission.resource.is_none() {
+            if let Some(protocol) = protocol_owners.take() {
+                submission.resource = Some(GpuCompiledRegionResource::ProtocolValues {
+                    status: protocol.status,
+                    scratch: protocol.scratch,
+                    threshold: protocol.threshold,
+                });
+            }
+        }
+        let mut exec = capture.finish()?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream)?;
+        let native = GpuCompiledRegion {
+            region_id: region.id.0,
+            physical_device: region.physical_device,
+            operation_identity: region.operation_identity,
+            exec,
+            launch_stream,
+            resource: submission.resource,
+        };
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: submission.bindings,
+            phase_bindings: None,
+            phase_binding_base: None,
+            phase: None,
+            wave_base: None,
+        })
+    }
+
+    /// Capture modulus reduction or rounded switching with a plan prepared
+    /// before graph capture.
+    /// The legacy fixed unary dispatcher allocates its output while the
+    /// capture stream is active, which is not a valid replay contract for a
+    /// compiled region.  This path binds the source and destination
+    /// descriptors directly and keeps only the immutable conversion metadata
+    /// with the graph executable.
+    fn capture_modulus_conversion_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        region: &crate::gpu_compiled::CompiledRegion,
+        request: GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+    ) -> Result<GpuCapturedRegion, GpuCaptureAdapterError> {
+        let (source, round_scale) = match request {
+            GpuCaptureRequest::Ordinary(mut requests) if requests.len() == 1 => {
+                match requests.pop().expect("request length checked") {
+                    FixedOperationBatchRequest::UnaryTransform {
+                        operation: crate::backend::FixedUnaryOperation::ReduceModulus { .. },
+                        value,
+                        ..
+                    } => (value, false),
+                    FixedOperationBatchRequest::UnaryTransform {
+                        operation: crate::backend::FixedUnaryOperation::ModulusSwitch { .. },
+                        value,
+                        ..
+                    } => (value, true),
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "reduce-modulus capture request variant changed".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus capture requires one ordinary request".into(),
+                ));
+            }
+        };
+        let job = match &region.component {
+            crate::gpu_compiled::NativeComponent::Fixed { jobs, .. } => jobs
+                .iter()
+                .find(|job| {
+                    self.devices
+                        .get(job.device)
+                        .is_some_and(|device| device.0 == region.physical_device)
+                })
+                .copied()
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "reduce-modulus region has no job on its physical device".into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus region is not a fixed region".into(),
+                ));
+            }
+        };
+        let source = source
+            .shards
+            .iter()
+            .find(|shard| {
+                shard.device_id == region.physical_device &&
+                    shard.global_column_start == job.start &&
+                    shard.global_column_start + shard.value.col_size() == job.end
+            })
+            .map(|shard| &shard.value)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus source is not resident on the capture job range".into(),
+                )
+            })?;
+        let output_slot =
+            *region.outputs.first().ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+        let output = destination_owners
+            .iter_mut()
+            .find(|owner| owner.slot == output_slot)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(output_slot))?;
+        let output = match &mut output.owner {
+            GpuCaptureOwner::Matrix(value) => value
+                .shards
+                .iter_mut()
+                .find(|shard| {
+                    shard.device_id == region.physical_device &&
+                        shard.global_column_start == job.start &&
+                        shard.global_column_start + shard.value.col_size() == job.end
+                })
+                .map(|shard| &mut shard.value)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "reduce-modulus destination is not resident on the capture job range"
+                            .into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus output must be a matrix owner".into(),
+                ));
+            }
+        };
+        source.prepare_external_for_capture()?;
+        output.prepare_external_for_capture()?;
+        let conversion = source.prepare_modulus_conversion(output, round_scale)?;
+        let source_shard = source
+            .binding_components()?
+            .iter()
+            .position(|component| component.physical_device == region.physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus source has no capture-device binding".into(),
+                )
+            })?;
+        let output_shard = output
+            .binding_components()?
+            .iter()
+            .position(|component| component.physical_device == region.physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "reduce-modulus destination has no capture-device binding".into(),
+                )
+            })?;
+        let source_slot =
+            *region.inputs.first().ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+
+        let mut capture = parameters.begin_capture(region.physical_device)?;
+        capture.claim_binding_range(region.bindings.len() as u32)?;
+        set_capture_binding_sources(
+            &mut capture,
+            &region.bindings,
+            &[
+                (0, source_slot, source_shard as u32, NativeValueComponent::MatrixDescriptors),
+                (1, output_slot, output_shard as u32, NativeValueComponent::MatrixDescriptors),
+            ],
+        )
+        .map_err(GpuCaptureAdapterError::Native)?;
+        self.capture_active = true;
+        let submit = source.submit_modulus_conversion_into(output, &conversion, 0, 1);
+        if let Err(error) = submit {
+            self.capture_active = false;
+            let _ = capture.abort();
+            return Err(error.into());
+        }
+        self.capture_active = false;
+        let mut exec = capture.finish()?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream)?;
+        let native = GpuCompiledRegion {
+            region_id: region.id.0,
+            physical_device: region.physical_device,
+            operation_identity: region.operation_identity,
+            exec,
+            launch_stream,
+            resource: Some(GpuCompiledRegionResource::ModulusConversion(conversion)),
+        };
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: region.bindings.clone(),
+            phase_bindings: None,
+            phase_binding_base: None,
+            phase: None,
+            wave_base: None,
+        })
+    }
+
+    /// Capture centered coefficient conversions with all native metadata
+    /// prepared before graph capture. The allocating backend paths create
+    /// conversion metadata during the operation, which CUDA rejects once
+    /// capture is active. The same owner/binding schema serves CenteredRebase
+    /// and CenteredRoundDivide; only the immutable conversion plan differs.
+    fn capture_centered_rebase_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        region: &crate::gpu_compiled::CompiledRegion,
+        request: GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+    ) -> Result<GpuCapturedRegion, GpuCaptureAdapterError> {
+        let (source, round_divisor) = match request {
+            GpuCaptureRequest::Ordinary(mut requests) if requests.len() == 1 => {
+                match requests.pop().expect("request length checked") {
+                    FixedOperationBatchRequest::UnaryTransform {
+                        operation: crate::backend::FixedUnaryOperation::CenteredRebase { .. },
+                        value,
+                        ..
+                    } => (value, None),
+                    FixedOperationBatchRequest::UnaryTransform {
+                        operation:
+                            crate::backend::FixedUnaryOperation::CenteredRoundDivide { divisor },
+                        value,
+                        ..
+                    } => (value, Some(divisor)),
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "centered-rebase capture request variant changed".into(),
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase capture requires one ordinary request".into(),
+                ));
+            }
+        };
+        let job = match &region.component {
+            crate::gpu_compiled::NativeComponent::Fixed { jobs, .. } => jobs
+                .iter()
+                .find(|job| {
+                    self.devices
+                        .get(job.device)
+                        .is_some_and(|device| device.0 == region.physical_device)
+                })
+                .copied()
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "centered-rebase region has no job on its physical device".into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase region is not a fixed region".into(),
+                ));
+            }
+        };
+        let source = source
+            .shards
+            .iter()
+            .find(|shard| {
+                shard.device_id == region.physical_device &&
+                    shard.global_column_start == job.start &&
+                    shard.global_column_start + shard.value.col_size() == job.end
+            })
+            .map(|shard| &shard.value)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase source is not resident on the capture job range".into(),
+                )
+            })?;
+        let expected_output_slot =
+            *region.outputs.first().ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+        let output = destination_owners
+            .iter_mut()
+            .find(|owner| owner.slot == expected_output_slot)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(expected_output_slot))?;
+        let output_slot = output.slot;
+        let output = match &mut output.owner {
+            GpuCaptureOwner::Matrix(value) => value
+                .shards
+                .iter_mut()
+                .find(|shard| {
+                    shard.device_id == region.physical_device &&
+                        shard.global_column_start == job.start &&
+                        shard.global_column_start + shard.value.col_size() == job.end
+                })
+                .map(|shard| &mut shard.value)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "centered-rebase destination is not resident on the capture job range"
+                            .into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase output must be a matrix owner".into(),
+                ));
+            }
+        };
+        source.prepare_external_for_capture()?;
+        output.prepare_external_for_capture()?;
+        let conversion = match round_divisor.as_ref() {
+            Some(divisor) => source.prepare_centered_round_divide(
+                output,
+                &divisor.to_biguint().ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "centered-round-divide divisor is not positive".into(),
+                    )
+                })?,
+            )?,
+            None => source.prepare_centered_rebase(output)?,
+        };
+        let source_shard = source
+            .binding_components()?
+            .iter()
+            .position(|component| component.physical_device == region.physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase source has no capture-device binding".into(),
+                )
+            })?;
+        let output_shard = output
+            .binding_components()?
+            .iter()
+            .position(|component| component.physical_device == region.physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "centered-rebase destination has no capture-device binding".into(),
+                )
+            })?;
+        let source_slot =
+            *region.inputs.first().ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+        let mut capture = parameters.begin_capture(region.physical_device)?;
+        capture.claim_binding_range(region.bindings.len() as u32)?;
+        set_capture_binding_sources(
+            &mut capture,
+            &region.bindings,
+            &[
+                (0, source_slot, source_shard as u32, NativeValueComponent::MatrixDescriptors),
+                (1, output_slot, output_shard as u32, NativeValueComponent::MatrixDescriptors),
+            ],
+        )
+        .map_err(GpuCaptureAdapterError::Native)?;
+        self.capture_active = true;
+        let submit = if round_divisor.is_some() {
+            source.submit_centered_round_divide_into(output, &conversion, 0, 1)
+        } else {
+            source.submit_centered_rebase_into(output, &conversion, 0, 1)
+        };
+        if let Err(error) = submit {
+            self.capture_active = false;
+            let _ = capture.abort();
+            return Err(error.into());
+        }
+        self.capture_active = false;
+        let mut exec = capture.finish()?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream)?;
+        let native = GpuCompiledRegion {
+            region_id: region.id.0,
+            physical_device: region.physical_device,
+            operation_identity: region.operation_identity,
+            exec,
+            launch_stream,
+            resource: Some(GpuCompiledRegionResource::ModulusConversion(conversion)),
+        };
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: region.bindings.clone(),
+            phase_bindings: None,
+            phase_binding_base: None,
+            phase: None,
+            wave_base: None,
+        })
+    }
+
+    fn copy_materialized_constant_into_capture_destination(
+        source: &GpuFleetMatrix,
+        destination: &mut GpuCaptureOwner<'_>,
+        destination_slot: ValueSlot,
+        stream: &GpuNativeLaunchStream,
+        capture: &mut GpuCaptureScope,
+        binding_schema: &[RegionBinding],
+    ) -> Result<(), GpuCaptureAdapterError> {
+        let destination = match destination {
+            GpuCaptureOwner::Matrix(value) => value,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "materialized constant capture requires a matrix destination".into(),
+                ));
+            }
+        };
+        if source.rows != destination.rows || source.columns != destination.columns {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "materialized constant shape disagrees with capture destination".into(),
+            ));
+        }
+        if source.shards.len() != destination.shards.len() {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "materialized constant placement disagrees with capture destination".into(),
+            ));
+        }
+        for (shard, destination_shard) in destination.shards.iter_mut().enumerate() {
+            let source_shard = source
+                .shards
+                .iter()
+                .find(|shard| {
+                    shard.device_id == destination_shard.device_id &&
+                        shard.global_column_start == destination_shard.global_column_start &&
+                        shard.value.col_size() == destination_shard.value.col_size()
+                })
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "materialized constant shard placement disagrees with capture destination"
+                            .into(),
+                    )
+                })?;
+            let binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.source ==
+                        BindingSource::ValueComponent {
+                            slot: destination_slot,
+                            shard: shard as u32,
+                            component: NativeValueComponent::MatrixData,
+                            address_addend: 0,
+                        }
+                })
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let native = destination_shard.value.binding_components()?;
+            let native =
+                native.first().ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            if native.data_address == 0 || native.data_bytes == 0 {
+                return Err(GpuCaptureAdapterError::MissingBinding(destination_slot));
+            }
+            capture.bind_resident_address(native.data_address, native.data_bytes, binding.index)?;
+            // Copy metadata has one pointer patch per local limb. Each limb
+            // is an offset within this physical data allocation, so all local
+            // identities map to its exact replay binding.
+            let limb_count = u32::try_from(native.limb_count)
+                .map_err(|_| GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let binding_map = (0..limb_count).map(|limb| (limb, binding.index)).collect::<Vec<_>>();
+            capture.set_binding_map(&binding_map).map_err(GpuCaptureAdapterError::Native)?;
+            source_shard.value.copy_into_on_stream(&mut destination_shard.value, stream, 0, 0)?;
+        }
+        Ok(())
+    }
+
+    /// Materialize constant/lift outputs before entering CUDA capture. Their
+    /// normal constructors may upload RNS bytes or allocate staging buffers;
+    /// replay only captures a stable device-to-device copy into the bound
+    /// destination owner.
+    fn capture_materialized_constant_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        region: &crate::gpu_compiled::CompiledRegion,
+        captured: Vec<GpuFleetMatrix>,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+    ) -> Result<GpuCapturedRegion, GpuCaptureAdapterError> {
+        if captured.is_empty() || captured.len() != destination_owners.len() {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "materialized constant output count disagrees with capture destinations".into(),
+            ));
+        }
+        for source in &captured {
+            source.prepare_external_for_capture()?;
+        }
+        let mut capture = parameters.begin_capture(region.physical_device)?;
+        capture
+            .claim_binding_range(u32::try_from(binding_schema.len()).map_err(|_| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "materialized constant binding schema is too large".into(),
+                )
+            })?)
+            .map_err(GpuCaptureAdapterError::Native)?;
+        self.capture_active = true;
+        let stream = capture.launch_stream().clone();
+        let copy_result = captured.iter().zip(destination_owners.iter_mut()).try_for_each(
+            |(source, destination)| {
+                Self::copy_materialized_constant_into_capture_destination(
+                    source,
+                    &mut destination.owner,
+                    destination.slot,
+                    &stream,
+                    &mut capture,
+                    binding_schema,
+                )
+            },
+        );
+        if let Err(error) = copy_result {
+            self.capture_active = false;
+            let _ = capture.abort();
+            return Err(error);
+        }
+        capture.resolve_fixed_addresses()?;
+        self.capture_active = false;
+        let mut exec = capture.finish()?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream)?;
+        for (source, destination) in captured.iter().zip(destination_owners.iter()) {
+            let produced = matrix_capture_bindings(source, destination.slot)?;
+            if produced
+                .iter()
+                .any(|binding| !binding_schema.iter().any(|schema| schema.source == *binding))
+            {
+                return Err(GpuCaptureAdapterError::MissingBinding(destination.slot));
+            }
+        }
+        let native = GpuCompiledRegion {
+            region_id: region.id.0,
+            physical_device: region.physical_device,
+            operation_identity: region.operation_identity,
+            exec,
+            launch_stream,
+            resource: Some(GpuCompiledRegionResource::MatrixConstants(captured)),
+        };
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            phase_bindings: None,
+            phase_binding_base: None,
+            phase: None,
+            wave_base: None,
+        })
+    }
+
+    /// Capture the allocation-free conditional preimage body and retain every
+    /// plan-owned matrix/buffer needed by its native graph. The returned
+    /// region contains only the graph and schema; replay supplies fresh
+    /// compact output/status owners through the ordinary binding resolver.
+    pub(crate) fn capture_preimage_region(
+        &mut self,
+        parameters: &GpuDCRTPolyParams,
+        region: &crate::gpu_compiled::CompiledRegion,
+        request: PreimageRequest<GpuFleetMatrix, GpuFleetTrapdoor>,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        source_addresses: &[(u64, usize, u32)],
+    ) -> Result<GpuCapturedRegion, GpuCaptureAdapterError> {
+        region
+            .validate_schema()
+            .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+        if let Some(metadata) = request.fixed_metadata.as_ref() {
+            self.prepare_fixed_node_batch(metadata)?;
+        }
+        let metadata = PreimageRetryMetadata::from_region(region).ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage capture requires a retry region schema".into(),
+            )
+        })?;
+        let schema = &metadata.bindings;
+        schema.attempt.first().ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage retry schema has no attempt binding".into(),
+            )
+        })?;
+        schema.control.first().ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage retry schema has no control binding".into(),
+            )
+        })?;
+        schema.status.first().ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage retry schema has no status binding".into(),
+            )
+        })?;
+        let output_slot =
+            *region.outputs.first().ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+        let destination = destination_owners
+            .iter_mut()
+            .find(|owner| owner.slot == output_slot)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(output_slot))?;
+        let destination_fleet = match &mut destination.owner {
+            GpuCaptureOwner::SmallMatrix(value) => &mut **value,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "preimage retry output must be a compact owner".into(),
+                ));
+            }
+        };
+        let job = match &region.component {
+            crate::gpu_compiled::NativeComponent::PreimageRetry { jobs, .. } => jobs
+                .iter()
+                .find(|job| {
+                    self.devices
+                        .get(job.device)
+                        .is_some_and(|device| device.0 == region.physical_device)
+                })
+                .copied()
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "preimage retry region has no job on its physical device".into(),
+                    )
+                })?,
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture request is not a preimage retry region".into(),
+                ));
+            }
+        };
+        if job.start >= job.end {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage retry job has an empty column range".into(),
+            ));
+        }
+        let logical_device = self
+            .devices
+            .iter()
+            .position(|(physical, _)| *physical == region.physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "physical device {} is not registered",
+                    region.physical_device
+                ))
+            })?;
+        let target_fleet = request.target.resident_matrix().ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage capture requires resident target columns".into(),
+            )
+        })?;
+        let trapdoor = request.trapdoor.values.get(logical_device).ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "preimage trapdoor has no matching physical-device owner".into(),
+            )
+        })?;
+        let allocate_input = |rows, columns| {
+            GpuMatrixOutputDescriptor::for_shape(
+                parameters,
+                rows,
+                columns,
+                parameters.crt_depth() - 1,
+                true,
+            )
+            .map(|descriptor| descriptor.allocate())
+            .map_err(GpuCaptureAdapterError::UnsupportedOperation)
+        };
+        let mut public_matrix = allocate_input(request.public.rows, request.public.columns)?;
+        let mut target = allocate_input(target_fleet.rows, job.end - job.start)?;
+        // Capture runs on the physical device selected for this job.  A
+        // fleet input may be sharded across other devices, so materialize the
+        // two source ranges on the capture device before recording the graph.
+        // The copies are graph-internal replicas; they are retained with the
+        // executable below and never become runtime bindings.
+        let public_source = Self::matrix_piece_on_device(
+            &mut self.devices[logical_device].1,
+            request.public.as_ref(),
+            0,
+            request.public.columns,
+        )
+        .map_err(GpuCaptureAdapterError::Backend)?;
+        let target_source = Self::matrix_piece_on_device(
+            &mut self.devices[logical_device].1,
+            target_fleet,
+            job.start,
+            job.end,
+        )
+        .map_err(GpuCaptureAdapterError::Backend)?;
+        let (_, destination) = Self::resolve_preimage_compact_shard_mut(
+            destination_fleet,
+            region.physical_device,
+            job.start..job.end,
+        )
+        .map_err(GpuCaptureAdapterError::Native)?;
+        let destination_params = destination.params.clone();
+        destination.prepare_external_for_capture()?;
+        destination
+            .prepare_preimage_hard_cutoff_for_tile(destination.rows_count(), job.end - job.start);
+        target.prepare_external_for_capture()?;
+        public_matrix.prepare_external_for_capture()?;
+        trapdoor.prepare_external_for_capture()?;
+        public_source.prepare_external_for_capture()?;
+        target_source.prepare_external_for_capture()?;
+        let allocation_stream = parameters.native_launch_stream(region.physical_device)?;
+        let mut resources = Box::new(
+            GpuPreimageBodyAllocation::allocate_from_typed_request(
+                GpuPreimageBodyTypedRequest {
+                    params: &destination_params,
+                    sigma: request.sigma,
+                    public_matrix: &public_matrix,
+                    target: &target,
+                    trapdoor,
+                    tile_columns: job.end - job.start,
+                    total_columns: request.target.col_size(),
+                },
+                &allocation_stream,
+            )
+            .map_err(GpuCaptureAdapterError::Native)?,
+        );
+        for matrix in [
+            &resources.p2,
+            &resources.tp2,
+            &resources.p1,
+            &resources.residual,
+            &resources.z_hat,
+            &resources.candidate,
+        ] {
+            matrix.prepare_external_for_capture()?;
+        }
+        let mut capture = allocation_stream.begin_capture()?;
+        capture.claim_binding_range(region.bindings.len() as u32)?;
+        for &(address, bytes, binding) in source_addresses {
+            if address != 0 && bytes != 0 {
+                capture.bind_resident_address(address, bytes, binding)?;
+            }
+        }
+        let output_descriptor = destination.binding_descriptor()?;
+        for binding in &region.bindings {
+            let BindingSource::ValueComponent { slot, component, address_addend, .. } =
+                binding.source;
+            if slot != output_slot {
+                continue;
+            }
+            let (address, bytes) = match component {
+                NativeValueComponent::CompactPayload => {
+                    (output_descriptor.payload_address, output_descriptor.payload_bytes)
+                }
+                NativeValueComponent::CompactHardCutoffStaging => (
+                    output_descriptor.hard_cutoff_staging_address,
+                    output_descriptor.hard_cutoff_staging_bytes,
+                ),
+                NativeValueComponent::CompactDeviceStatus => {
+                    (output_descriptor.device_status_address, std::mem::size_of::<PreimageStatus>())
+                }
+                _ => continue,
+            };
+            if bytes > address_addend as usize {
+                capture.bind_resident_address(
+                    address + address_addend,
+                    bytes - address_addend as usize,
+                    binding.index,
+                )?;
+            }
+        }
+        // Materialize gathered inputs as graph work, so every replay reads
+        // the current resident source owners rather than capture-time data.
+        let stream = capture.launch_stream().clone();
+        resources.initialize_retry(
+            &PreimageLaunchControl {
+                execution_nonce: request.randomness_seed,
+                logical_instance: request.instance_slot as u64,
+                global_column_start: preimage_seed_column_start(
+                    request.target.global_column_start(),
+                    job.start,
+                )
+                .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?
+                    as u64,
+                max_attempts: schema.max_attempts,
+                attempt: 0,
+                binding_table: 0,
+            },
+            output_descriptor.device_status_address as usize as *mut std::ffi::c_void,
+            &stream,
+        );
+        if request.public.shards.iter().all(|shard| shard.device_id == region.physical_device) &&
+            target_fleet.shards.iter().all(|shard| shard.device_id == region.physical_device)
+        {
+            for (source, output, start, end) in [
+                (request.public.as_ref(), &mut public_matrix, 0, request.public.columns),
+                (target_fleet, &mut target, job.start, job.end),
+            ] {
+                for shard in &source.shards {
+                    let begin = start.max(shard.global_column_start);
+                    let finish = end.min(shard.global_column_start + shard.value.col_size());
+                    if begin < finish {
+                        shard.value.copy_block_into_on_capture_stream(
+                            output,
+                            0,
+                            begin - shard.global_column_start,
+                            0,
+                            begin - start,
+                            source.rows,
+                            finish - begin,
+                            &stream,
+                            0,
+                            parameters.crt_depth() as u32,
+                        )?;
+                    }
+                }
+            }
+        } else {
+            public_source.copy_block_into_on_capture_stream(
+                &mut public_matrix,
+                0,
+                0,
+                0,
+                0,
+                request.public.rows,
+                request.public.columns,
+                &stream,
+                0,
+                parameters.crt_depth() as u32,
+            )?;
+            target_source.copy_block_into_on_capture_stream(
+                &mut target,
+                0,
+                0,
+                0,
+                0,
+                target_fleet.rows,
+                job.end - job.start,
+                &stream,
+                0,
+                parameters.crt_depth() as u32,
+            )?;
+        }
+        // The retry body owns eleven graph-local scratch resources. Only the
+        // attempt/control/status wires are replay-visible schema bindings;
+        // the sampler primitive receives the remaining scratch identities as
+        // fixed graph resources. No synthetic RegionBinding is fabricated for
+        // those internal allocations.
+        let mut adapter = GpuFleetPreimageCaptureAdapter::new(
+            self,
+            &mut capture,
+            &destination_params,
+            request.sigma,
+            resources.scratch(),
+            resources.control_ptr(),
+            destination,
+            &target,
+            &public_matrix,
+            trapdoor,
+            &mut resources.p2,
+            &mut resources.tp2,
+            &mut resources.p1,
+            &mut resources.residual,
+            &mut resources.z_hat,
+            &mut resources.candidate,
+            job.start,
+        )?;
+        let mut scheduler = crate::gpu_preimage_scheduler::PreimageRetryScheduler::new(region)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "preimage retry scheduler could not be created".into(),
+                )
+            })?;
+        scheduler
+            .capture_body(
+                &mut adapter,
+                // The body control pointers are capture-local identities;
+                // the gate resolves the status owner separately.
+                0,
+                1,
+                2,
+            )
+            .map_err(|error| match error {
+                crate::gpu_preimage_scheduler::PreimageCaptureError::Adapter(error) => {
+                    GpuCaptureAdapterError::Native(error)
+                }
+                crate::gpu_preimage_scheduler::PreimageCaptureError::InvalidPhase(region) => {
+                    GpuCaptureAdapterError::UnsupportedOperation(format!(
+                        "preimage scheduler entered invalid phase for region {region:?}"
+                    ))
+                }
+            })?;
+        drop(adapter);
+        capture.resolve_fixed_addresses()?;
+        let mut exec = capture.finish()?;
+        let launch_stream = exec.launch_stream().clone();
+        exec.upload(&launch_stream)?;
+        let native = GpuCompiledRegion {
+            region_id: region.id.0,
+            physical_device: region.physical_device,
+            operation_identity: region.operation_identity,
+            exec,
+            launch_stream,
+            resource: Some(GpuCompiledRegionResource::Resources(vec![
+                GpuCompiledRegionResource::Preimage(resources),
+                GpuCompiledRegionResource::MatrixReplicas(vec![
+                    Arc::new(target),
+                    Arc::new(public_matrix),
+                    Arc::new(public_source),
+                    Arc::new(target_source),
+                ]),
+            ])),
+        };
+        Ok(GpuCapturedRegion {
+            native,
+            bindings: region.bindings.clone(),
+            phase_bindings: None,
+            phase_binding_base: None,
+            phase: None,
+            wave_base: None,
+        })
+    }
+
+    /// Capture a small, single-shard matrix product directly into the
+    /// preallocated destination owner.  The ordinary fixed dispatcher
+    /// allocates an exemplar output during capture, which cannot be rebound
+    /// to the frozen output wire.  `mul_into` writes the planned owner and
+    /// uses either the descriptor ABI (small products) or data-pointer ABI
+    /// (larger products); install the matching typed map before recording it.
+    fn submit_capture_matrix_accumulate(
+        &mut self,
+        request: &MatrixMulAccumulateRequest<GpuFleetMatrix>,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        if request.products.is_empty() ||
+            (request.products.len() == 1 &&
+                request.products[0].0 == BigInt::from(1u8) &&
+                request.bias.as_ref().is_none_or(|bias| bias.size() != (1, 1)))
+        {
+            return Ok(None);
+        }
+        if destination_owners.len() != 1 {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture matrix accumulate requires one destination owner".into(),
+            ));
+        }
+        let destination_slot = destination_owners[0].slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owners[0].owner else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture matrix accumulate requires a matrix destination owner".into(),
+            ));
+        };
+        let destination_size = destination.size();
+        let Some((destination_shard_index, destination_shard)) =
+            destination
+                .shards
+                .iter_mut()
+                .enumerate()
+                .find(|(_, shard)| shard.device_id == physical_device)
+        else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "matrix accumulate capture has no output shard on the capture device".into(),
+            ));
+        };
+        if request.products.iter().any(|(_, left, right)| {
+            let product_size = if left.size() == (1, 1) {
+                right.size()
+            } else if right.size() == (1, 1) {
+                left.size()
+            } else {
+                (left.rows, right.columns)
+            };
+            product_size != destination_size
+        }) {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "matrix accumulate products do not share the output shape".into(),
+            ));
+        }
+        let source_binding = |address: u64, bytes: usize| {
+            let matches = source_addresses
+                .iter()
+                .filter(|(candidate, candidate_bytes, _)| {
+                    *candidate == address && *candidate_bytes == bytes
+                })
+                .map(|(_, _, binding)| *binding)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [binding] => Ok(*binding),
+                [] => Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate source is not retained by the capture schema".into(),
+                )),
+                _ => Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate source has ambiguous capture bindings".into(),
+                )),
+            }
+        };
+
+        let destination_component = destination_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+        let destination_descriptor_binding = binding_schema
+            .iter()
+            .find(|binding| {
+                binding.access == BindingAccess::Output &&
+                    binding.source ==
+                        BindingSource::ValueComponent {
+                            slot: destination_slot,
+                            shard: destination_shard_index as u32,
+                            component: NativeValueComponent::MatrixDescriptors,
+                            address_addend: 0,
+                        }
+            })
+            .map(|binding| binding.index);
+        let destination_data_binding = binding_schema
+            .iter()
+            .find(|binding| {
+                binding.access == BindingAccess::Output &&
+                    binding.source ==
+                        BindingSource::ValueComponent {
+                            slot: destination_slot,
+                            shard: destination_shard_index as u32,
+                            component: NativeValueComponent::MatrixData,
+                            address_addend: 0,
+                        }
+            })
+            .map(|binding| binding.index)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+        let destination_address = destination_component.device_descriptors_address;
+        let destination_bytes =
+            destination_component.device_descriptor_stride * destination_component.limb_count;
+        if let Some(destination_descriptor_binding) = destination_descriptor_binding {
+            capture.bind_resident_address(
+                destination_address,
+                destination_bytes,
+                destination_descriptor_binding,
+            )?;
+        }
+        capture.bind_resident_address(
+            destination_component.data_address,
+            destination_component.data_bytes,
+            destination_data_binding,
+        )?;
+
+        let output_start = destination_shard.global_column_start;
+        let output_end = output_start + destination_shard.value.col_size();
+        let destination_tile_size = destination_shard.value.size();
+        for (product_index, (coefficient, left, right)) in request.products.iter().enumerate() {
+            let left_is_scalar = left.size() == (1, 1);
+            let right_is_scalar = right.size() == (1, 1);
+            let scalar_product = left_is_scalar || right_is_scalar;
+            let descriptor_product = !scalar_product &&
+                left.rows <= 4 &&
+                right.columns <= 4 &&
+                left.columns <= 16;
+            let left_shard = left.shards.iter().find(|shard| {
+                shard.device_id == physical_device &&
+                if left_is_scalar || right_is_scalar {
+                        (left_is_scalar && left.size() == (1, 1)) ||
+                            (right_is_scalar && shard.global_column_start == output_start &&
+                                shard.global_column_start + shard.value.col_size() == output_end)
+                    } else {
+                        shard.global_column_start == 0 && shard.value.size() == left.size()
+                    }
+            });
+            let right_shard = right.shards.iter().find(|shard| {
+                shard.device_id == physical_device &&
+                    if right_is_scalar || left_is_scalar {
+                        (right_is_scalar && right.size() == (1, 1)) ||
+                            (left_is_scalar && shard.global_column_start == output_start &&
+                                shard.global_column_start + shard.value.col_size() == output_end)
+                    } else {
+                        shard.global_column_start == output_start &&
+                            shard.global_column_start + shard.value.col_size() == output_end
+                }
+            });
+            let assembled_right = if right_shard.is_some() || right_is_scalar {
+                None
+            } else {
+                Some((|| -> Result<_, GpuCaptureAdapterError> {
+                    let mut source_shards = right
+                        .shards
+                        .iter()
+                        .filter(|shard| {
+                            shard.device_id == physical_device &&
+                                shard.global_column_start < output_end &&
+                                shard.global_column_start + shard.value.col_size() > output_start
+                        })
+                        .collect::<Vec<_>>();
+                    source_shards.sort_by_key(|shard| shard.global_column_start);
+                    if source_shards.is_empty() {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate RHS has no resident source shards on capture device"
+                                .into(),
+                        ));
+                    }
+                    let first = source_shards[0];
+                    let level = first.value.level();
+                    if !source_shards.iter().all(|shard| {
+                        shard.value.is_ntt() &&
+                            shard.value.level() == level &&
+                            shard.value.size().0 == right.rows
+                    }) {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate RHS shards have incompatible domains".into(),
+                        ));
+                    }
+                    let mut next_column = output_start;
+                    for shard in &source_shards {
+                        let start = output_start.max(shard.global_column_start);
+                        let end = output_end.min(
+                            shard.global_column_start + shard.value.col_size(),
+                        );
+                        if start != next_column {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate RHS shards are not contiguous over the output tile"
+                                    .into(),
+                            ));
+                        }
+                        next_column = end;
+                    }
+                    if next_column != output_end {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate RHS shards do not cover the output tile".into(),
+                        ));
+                    }
+                    let params = first.value.params().clone();
+                    let mut assembled = GpuMatrixOutputDescriptor::for_shape(
+                        &params,
+                        right.rows,
+                        output_end - output_start,
+                        level,
+                        true,
+                    )
+                    .map_err(GpuCaptureAdapterError::UnsupportedOperation)?
+                    .allocate();
+                    let data_binding = capture.claim_binding_range(1)?;
+                    let descriptor_binding = if descriptor_product {
+                        Some(capture.claim_binding_range(1)?)
+                    } else {
+                        None
+                    };
+                    let limbs = u32::try_from(level + 1).map_err(|_| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate RHS limb count exceeds capture ABI".into(),
+                        )
+                    })?;
+                    for shard in &source_shards {
+                        let start = output_start.max(shard.global_column_start);
+                        let end = output_end.min(
+                            shard.global_column_start + shard.value.col_size(),
+                        );
+                        let source_component = shard
+                            .value
+                            .binding_components()?
+                            .into_iter()
+                            .find(|component| component.physical_device == physical_device)
+                            .ok_or_else(|| {
+                                GpuCaptureAdapterError::UnsupportedOperation(
+                                    "matrix accumulate RHS shard has no capture-device allocation"
+                                        .into(),
+                                )
+                            })?;
+                        if source_component.limb_count != limbs as usize {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate RHS shard limb layout differs from output".into(),
+                            ));
+                        }
+                        let source_binding = source_binding(
+                            source_component.data_address,
+                            source_component.data_bytes,
+                        )?;
+                        let mappings = (0..limbs)
+                            .map(|limb| (limb, data_binding))
+                            .chain((0..limbs).map(|limb| (limbs + limb, source_binding)))
+                            .collect::<Vec<_>>();
+                        capture.set_binding_map(&mappings)?;
+                        shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                        shard.value.copy_columns_into_on_capture_stream(
+                            &mut assembled,
+                            start - shard.global_column_start,
+                            start - output_start,
+                            end - start,
+                            capture_stream,
+                            limbs,
+                            0,
+                        )?;
+                    }
+                    let assembled_ref = assembled.clone_shallow();
+                    self.capture_resources.push(Arc::new(assembled_ref));
+                    Ok((assembled, data_binding, descriptor_binding))
+                })()?)
+            };
+            let right_value = match (right_shard, assembled_right.as_ref()) {
+                (Some(shard), _) => &shard.value,
+                (None, Some((assembled, _, _))) => assembled,
+                (None, None) => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate capture has no resident RHS shard for the output tile"
+                            .into(),
+                    ));
+                }
+            };
+            let assembled_right_data_binding =
+                assembled_right.as_ref().map(|(_, data_binding, _)| *data_binding);
+            let assembled_right_descriptor_binding = assembled_right
+                .as_ref()
+                .and_then(|(_, _, descriptor_binding)| *descriptor_binding);
+            let assembled_left = if left_shard.is_some() || left_is_scalar {
+                None
+            } else {
+                Some((|| -> Result<_, GpuCaptureAdapterError> {
+                // Matrix-matrix accumulation replicates the complete left
+                // operand on each output device.  A caller may provide that
+                // operand as several resident column shards, so assemble a
+                // graph-owned contiguous copy and refresh it from every
+                // source shard on each replay.
+                let left_target_start = if right_is_scalar { output_start } else { 0 };
+                let left_target_end = if right_is_scalar { output_end } else { left.columns };
+                let mut source_shards = left
+                    .shards
+                    .iter()
+                    .filter(|shard| {
+                        shard.device_id == physical_device &&
+                            shard.global_column_start < left_target_end &&
+                            shard.global_column_start + shard.value.col_size() > left_target_start
+                    })
+                    .collect::<Vec<_>>();
+                source_shards.sort_by_key(|shard| shard.global_column_start);
+                if source_shards.is_empty() ||
+                    source_shards.first().is_some_and(|shard| {
+                        shard.global_column_start.max(left_target_start) != left_target_start
+                    })
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate LHS has no resident source shards on capture device"
+                            .into(),
+                    ));
+                }
+                let first = source_shards[0];
+                let level = first.value.level();
+                if !source_shards.iter().all(|shard| {
+                    shard.value.is_ntt() &&
+                        shard.value.level() == level &&
+                        shard.value.size().0 == left.rows
+                }) {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate LHS shards have incompatible domains".into(),
+                    ));
+                }
+                let mut next_column = left_target_start;
+                for shard in &source_shards {
+                    let start = left_target_start.max(shard.global_column_start);
+                    let shard_end = shard
+                        .global_column_start
+                        .checked_add(shard.value.col_size())
+                        .ok_or_else(|| {
+                            GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate LHS shard range overflows".into(),
+                            )
+                        })?;
+                    let end = left_target_end.min(shard_end);
+                    if start != next_column {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS shards are not contiguous".into(),
+                        ));
+                    }
+                    next_column = end;
+                }
+                if next_column != left_target_end {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate LHS shards do not cover the complete operand".into(),
+                    ));
+                }
+                let params = first.value.params().clone();
+                let mut assembled = GpuMatrixOutputDescriptor::for_shape(
+                    &params,
+                    left.rows,
+                    left_target_end - left_target_start,
+                    level,
+                    true,
+                )
+                .map_err(GpuCaptureAdapterError::UnsupportedOperation)?
+                .allocate();
+                let data_binding = capture.claim_binding_range(1)?;
+                let descriptor_binding = if descriptor_product {
+                    Some(capture.claim_binding_range(1)?)
+                } else {
+                    None
+                };
+                let limbs = u32::try_from(level + 1).map_err(|_| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate LHS limb count exceeds capture ABI".into(),
+                    )
+                })?;
+                for shard in &source_shards {
+                    let source_component = shard
+                        .value
+                        .binding_components()?
+                        .into_iter()
+                        .find(|component| component.physical_device == physical_device)
+                        .ok_or_else(|| {
+                            GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate LHS shard has no capture-device allocation"
+                                    .into(),
+                            )
+                        })?;
+                    if source_component.limb_count != limbs as usize {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS shard limb layout differs from output".into(),
+                        ));
+                    }
+                    let source_binding = source_binding(
+                        source_component.data_address,
+                        source_component.data_bytes,
+                    )?;
+                    let mappings = (0..limbs)
+                        .map(|limb| (limb, data_binding))
+                        .chain((0..limbs).map(|limb| (limbs + limb, source_binding)))
+                        .collect::<Vec<_>>();
+                    capture.set_binding_map(&mappings)?;
+                    shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                    let start = left_target_start.max(shard.global_column_start);
+                    let shard_end = shard
+                        .global_column_start
+                        .checked_add(shard.value.col_size())
+                        .ok_or_else(|| {
+                            GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate LHS shard range overflows".into(),
+                            )
+                        })?;
+                    let end = left_target_end.min(shard_end);
+                    shard.value.copy_columns_into_on_capture_stream(
+                        &mut assembled,
+                        start - shard.global_column_start,
+                        start - left_target_start,
+                        end - start,
+                        capture_stream,
+                        limbs,
+                        0,
+                    )?;
+                }
+                let assembled_ref = assembled.clone_shallow();
+                self.capture_resources.push(Arc::new(assembled_ref));
+                    Ok((assembled, data_binding, descriptor_binding))
+                })()?)
+            };
+            let left_value = match (left_shard, assembled_left.as_ref()) {
+                (Some(shard), _) => &shard.value,
+                (None, Some((assembled, _, _))) => assembled,
+                (None, None) => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate capture has no resident scalar LHS shard".into(),
+                    ));
+                }
+            };
+            let assembled_left_data_binding =
+                assembled_left.as_ref().map(|(_, data_binding, _)| *data_binding);
+            let assembled_left_descriptor_binding =
+                assembled_left.as_ref().and_then(|(_, _, descriptor_binding)| *descriptor_binding);
+            if !left_value.is_ntt() ||
+                !right_value.is_ntt() ||
+                left_value.level() != right_value.level() ||
+                left_value.level() != destination_shard.value.level()
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate capture has incompatible input domains".into(),
+                ));
+            }
+            let left_component = left_value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate lhs has no capture-device allocation".into(),
+                    )
+                })?;
+            let right_component = right_value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "matrix accumulate rhs has no capture-device allocation".into(),
+                    )
+                })?;
+            if left_component.limb_count != right_component.limb_count ||
+                left_component.limb_count != destination_component.limb_count
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate capture has incompatible limb layouts".into(),
+                ));
+            }
+            let destination_binding = if descriptor_product {
+                destination_descriptor_binding.ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "descriptor product has no resident output descriptor binding".into(),
+                    )
+                })?
+            } else {
+                destination_data_binding
+            };
+            let (left_address, left_bytes) = if descriptor_product {
+                (
+                    left_component.device_descriptors_address,
+                    left_component.device_descriptor_stride * left_component.limb_count,
+                )
+            } else {
+                (left_component.data_address, left_component.data_bytes)
+            };
+            let (right_address, right_bytes) = if descriptor_product {
+                (
+                    right_component.device_descriptors_address,
+                    right_component.device_descriptor_stride * right_component.limb_count,
+                )
+            } else {
+                (right_component.data_address, right_component.data_bytes)
+            };
+            let left_binding = if descriptor_product {
+                assembled_left_descriptor_binding.unwrap_or(source_binding(left_address, left_bytes)?)
+            } else {
+                assembled_left_data_binding.unwrap_or(source_binding(left_address, left_bytes)?)
+            };
+            let right_binding = if descriptor_product {
+                assembled_right_descriptor_binding
+                    .unwrap_or(source_binding(right_address, right_bytes)?)
+            } else {
+                assembled_right_data_binding.unwrap_or(source_binding(right_address, right_bytes)?)
+            };
+            left_value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+            right_value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+
+            let coefficient_is_one = coefficient == &BigInt::from(1u8);
+            let needs_product_temporary = product_index != 0 || !coefficient_is_one;
+            let mut product_temporary = needs_product_temporary.then(|| {
+                GpuMatrixOutputDescriptor::for_shape(
+                    destination_shard.value.params(),
+                    destination_tile_size.0,
+                    destination_tile_size.1,
+                    destination_shard.value.level(),
+                    true,
+                )
+                .map_err(GpuCaptureAdapterError::UnsupportedOperation)
+                .map(|descriptor| descriptor.allocate())
+            });
+            let mut product_temporary = match product_temporary.take() {
+                Some(result) => Some(result?),
+                None => None,
+            };
+            let mut product_binding = if product_temporary.is_some() {
+                capture.claim_binding_range(1)?
+            } else {
+                destination_binding
+            };
+            if scalar_product {
+                let (matrix, scalar, matrix_binding, scalar_binding) = if left.size() == (1, 1) {
+                    (right_value, left_value, right_binding, left_binding)
+                } else {
+                    (left_value, right_value, left_binding, right_binding)
+                };
+                let limbs = destination_component.limb_count as u32;
+                let mappings = (0..limbs)
+                    .map(|limb| (limb, matrix_binding))
+                    .chain((0..limbs).map(|limb| (limbs + limb, scalar_binding)))
+                    .chain((0..limbs).map(|limb| (2 * limbs + limb, product_binding)))
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings)?;
+                if let Some(output) = product_temporary.as_mut() {
+                    matrix.mul_scalar_into(scalar, output)?;
+                } else {
+                    matrix.mul_scalar_into(scalar, &mut destination_shard.value)?;
+                }
+            } else {
+                capture.set_binding_map(&[
+                    (0, left_binding),
+                    (1, right_binding),
+                    (2, product_binding),
+                ])?;
+                if let Some(output) = product_temporary.as_mut() {
+                    left_value.mul_into(right_value, output)?;
+                } else {
+                    left_value.mul_into(right_value, &mut destination_shard.value)?;
+                }
+            }
+            if !coefficient_is_one {
+                let coefficient = GpuDCRTPoly::from_bigint_to_constant_at_level(
+                    destination_shard.value.params(),
+                    coefficient,
+                    destination_shard.value.level(),
+                )
+                .map_err(GpuCaptureAdapterError::UnsupportedOperation)?;
+                let coefficient_binding = capture.claim_binding_range(1)?;
+                let mut scaled_temporary = (product_index != 0).then(|| {
+                    GpuMatrixOutputDescriptor::for_shape(
+                        destination_shard.value.params(),
+                        destination_tile_size.0,
+                        destination_tile_size.1,
+                        destination_shard.value.level(),
+                        true,
+                    )
+                    .map_err(GpuCaptureAdapterError::UnsupportedOperation)
+                    .map(|descriptor| descriptor.allocate())
+                });
+                let mut scaled_temporary = match scaled_temporary.take() {
+                    Some(result) => Some(result?),
+                    None => None,
+                };
+                let scaled_binding = scaled_temporary
+                    .is_some()
+                    .then(|| capture.claim_binding_range(1))
+                    .transpose()?
+                    .unwrap_or(destination_data_binding);
+                let output = product_temporary
+                    .as_ref()
+                    .expect("non-unit matrix accumulate coefficient has product temporary");
+                let limbs = destination_component.limb_count as u32;
+                let mappings = (0..limbs)
+                    .map(|limb| (limb, product_binding))
+                    .chain((0..limbs).map(|limb| (limbs + limb, coefficient_binding)))
+                    .chain((0..limbs).map(|limb| (2 * limbs + limb, scaled_binding)))
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings)?;
+                if let Some(scaled) = scaled_temporary.as_mut() {
+                    output.mul_scalar_poly_into(&coefficient, scaled)?;
+                } else {
+                    output.mul_scalar_poly_into(&coefficient, &mut destination_shard.value)?;
+                }
+                product_temporary = scaled_temporary;
+                product_binding = scaled_binding;
+            }
+            if let Some(output) = product_temporary {
+                let limbs = destination_component.limb_count as u32;
+                let mappings = (0..limbs)
+                    .map(|limb| (limb, destination_data_binding))
+                    .chain((0..limbs).map(|limb| (limbs + limb, product_binding)))
+                    .chain((0..limbs).map(|limb| (2 * limbs + limb, destination_data_binding)))
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings)?;
+                destination_shard.value.add_in_place(&output);
+            }
+        }
+
+        if let Some(bias) = request.bias.as_ref() {
+            let bias_is_scalar = bias.size() == (1, 1);
+            let Some(bias_shard) = bias.shards.iter().find(|shard| {
+                shard.device_id == physical_device &&
+                    if bias_is_scalar {
+                        shard.global_column_start == 0 && shard.value.size() == (1, 1)
+                    } else {
+                        shard.global_column_start == output_start &&
+                            shard.global_column_start + shard.value.col_size() == output_end
+                    }
+            }) else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate bias has no resident output or scalar shard".into(),
+                ));
+            };
+            if (!bias_is_scalar && bias.size() != destination_size) ||
+                !bias_shard.value.is_ntt() ||
+                bias_shard.value.level() != destination_shard.value.level()
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix accumulate bias does not match the output tile or scalar shape".into(),
+                ));
+            }
+            let bias_component = bias_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let bias_binding =
+                source_binding(bias_component.data_address, bias_component.data_bytes)?;
+            bias_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+            let limbs = destination_component.limb_count as u32;
+            let mappings = (0..limbs)
+                .map(|limb| (limb, destination_data_binding))
+                .chain((0..limbs).map(|limb| (limbs + limb, bias_binding)))
+                .chain((0..limbs).map(|limb| (2 * limbs + limb, destination_data_binding)))
+                .collect::<Vec<_>>();
+            capture.set_binding_map(&mappings)?;
+            if bias_is_scalar {
+                destination_shard.value.add_scalar_in_place(&bias_shard.value)?;
+            } else {
+                destination_shard.value.add_in_place(&bias_shard.value);
+            }
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    fn submit_capture_matrix_product(
+        &mut self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Ordinary(requests) = request else {
+            return Ok(None);
+        };
+        if let [FixedOperationBatchRequest::MatrixMulAccumulate { request, .. }] =
+            requests.as_slice()
+        {
+            if let Some(submission) = self.submit_capture_matrix_accumulate(
+                request,
+                destination_owners,
+                binding_schema,
+                physical_device,
+                source_addresses,
+                capture,
+                capture_stream,
+            )? {
+                return Ok(Some(submission));
+            }
+        }
+        let (left, right, bias, tensor_product) = match requests.as_slice() {
+            [FixedOperationBatchRequest::MatrixMulAccumulate { request, .. }] => {
+                let [(coefficient, left, right)] = request.products.as_slice() else {
+                    return Ok(None);
+                };
+                if coefficient != &BigInt::from(1u8) {
+                    return Ok(None);
+                }
+                (left, right, request.bias.as_ref(), false)
+            }
+            [
+                FixedOperationBatchRequest::MatrixBinary {
+                    operation: MatrixBinaryOp::Multiply,
+                    left,
+                    right,
+                    ..
+                },
+            ] => (left, right, None, false),
+            [FixedOperationBatchRequest::Tensor { left, right, .. }] => (left, right, None, true),
+            _ => return Ok(None),
+        };
+        if destination_owners.len() != 1 {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture matrix multiply requires one destination owner".into(),
+            ));
+        }
+        let destination_slot = destination_owners[0].slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owners[0].owner else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture matrix multiply requires a matrix destination owner".into(),
+            ));
+        };
+        let left_shard = left
+            .shards
+            .iter()
+            .find(|shard| shard.device_id == physical_device && shard.global_column_start == 0);
+        let right_shard = right
+            .shards
+            .iter()
+            .find(|shard| shard.device_id == physical_device && shard.global_column_start == 0);
+        let destination_size = destination.size();
+        let destination_shard_count = destination.shards.len();
+        let destination_shard = destination.shards.iter_mut().enumerate().find(|(_, shard)| {
+            shard.device_id == physical_device && shard.global_column_start == 0
+        });
+        let (
+            Some(left_shard),
+            Some(right_shard),
+            Some((destination_shard_index, destination_shard)),
+        ) = (left_shard, right_shard, destination_shard)
+        else {
+            return Ok(None);
+        };
+        let scalar_product = !tensor_product && (left.size() == (1, 1) || right.size() == (1, 1));
+        let product_size = if tensor_product {
+            (
+                left.rows.checked_mul(right.rows).ok_or(PolyBackendError::InvalidConstantShape)?,
+                left.columns
+                    .checked_mul(right.columns)
+                    .ok_or(PolyBackendError::InvalidConstantShape)?,
+            )
+        } else if left.size() == (1, 1) {
+            right.size()
+        } else if right.size() == (1, 1) {
+            left.size()
+        } else {
+            (left.rows, right.columns)
+        };
+        if left.shards.len() != 1 ||
+            right.shards.len() != 1 ||
+            destination_shard_count != 1 ||
+            (!tensor_product && !scalar_product && left.size().1 != right.size().0) ||
+            destination_size != product_size ||
+            left_shard.value.size() != left.size() ||
+            right_shard.value.size() != right.size() ||
+            destination_shard.value.size() != destination_size ||
+            !left_shard.value.is_ntt() ||
+            !right_shard.value.is_ntt() ||
+            !destination_shard.value.is_ntt()
+        {
+            return Ok(None);
+        }
+        let left_component = left_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix multiply lhs has no capture-device allocation".into(),
+                )
+            })?;
+        let right_component = right_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix multiply rhs has no capture-device allocation".into(),
+                )
+            })?;
+        let destination_component = destination_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+        if left_component.limb_count != right_component.limb_count ||
+            left_component.limb_count != destination_component.limb_count ||
+            left_shard.value.level() != right_shard.value.level() ||
+            left_shard.value.level() != destination_shard.value.level()
+        {
+            return Ok(None);
+        }
+        let descriptor_product = tensor_product ||
+            (!scalar_product &&
+                left.size().0 <= 4 &&
+                right.size().1 <= 4 &&
+                left.size().1 <= 16);
+        let (
+            left_address,
+            right_address,
+            destination_address,
+            left_bytes,
+            right_bytes,
+            destination_bytes,
+            component,
+        ) = if descriptor_product {
+            (
+                left_component.device_descriptors_address,
+                right_component.device_descriptors_address,
+                destination_component.device_descriptors_address,
+                left_component.device_descriptor_stride * left_component.limb_count,
+                right_component.device_descriptor_stride * right_component.limb_count,
+                destination_component.device_descriptor_stride * destination_component.limb_count,
+                NativeValueComponent::MatrixDescriptors,
+            )
+        } else {
+            (
+                left_component.data_address,
+                right_component.data_address,
+                destination_component.data_address,
+                left_component.data_bytes,
+                right_component.data_bytes,
+                destination_component.data_bytes,
+                NativeValueComponent::MatrixData,
+            )
+        };
+        let source_binding = |address: u64, bytes: usize| {
+            let matches = source_addresses
+                .iter()
+                .filter(|(candidate, candidate_bytes, _)| {
+                    *candidate == address && *candidate_bytes == bytes
+                })
+                .map(|(_, _, binding)| *binding)
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [binding] => Ok(*binding),
+                [] => Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix multiply source is not retained by the capture schema".into(),
+                )),
+                _ => Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "matrix multiply source has ambiguous capture bindings".into(),
+                )),
+            }
+        };
+        let left_binding = source_binding(left_address, left_bytes)?;
+        let right_binding = source_binding(right_address, right_bytes)?;
+        let bias_launch = if let Some(bias) = bias {
+            let [bias_shard] = bias.shards.as_slice() else {
+                return Ok(None);
+            };
+            if bias_shard.device_id != physical_device ||
+                bias_shard.global_column_start != 0 ||
+                bias.size() != destination_size ||
+                bias_shard.value.size() != destination_size ||
+                !bias_shard.value.is_ntt() ||
+                bias_shard.value.level() != destination_shard.value.level()
+            {
+                return Ok(None);
+            }
+            let bias_component = bias_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            if bias_component.limb_count != destination_component.limb_count {
+                return Ok(None);
+            }
+            let bias_binding =
+                source_binding(bias_component.data_address, bias_component.data_bytes)?;
+            let output_data_binding = schema_binding_index(
+                binding_schema,
+                destination_slot,
+                destination_shard_index as u32,
+                NativeValueComponent::MatrixData,
+            )?;
+            capture.bind_resident_address(
+                destination_component.data_address,
+                destination_component.data_bytes,
+                output_data_binding,
+            )?;
+            Some((bias_shard, bias_binding, output_data_binding))
+        } else {
+            None
+        };
+        let destination_binding = binding_schema
+            .iter()
+            .find(|binding| {
+                binding.access == BindingAccess::Output &&
+                    binding.source ==
+                        BindingSource::ValueComponent {
+                            slot: destination_slot,
+                            shard: destination_shard_index as u32,
+                            component,
+                            address_addend: 0,
+                        }
+            })
+            .map(|binding| binding.index)
+            .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+        capture.bind_resident_address(
+            destination_address,
+            destination_bytes,
+            destination_binding,
+        )?;
+        left_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+        right_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+        if scalar_product {
+            let (matrix, scalar, matrix_binding, scalar_binding) = if left.size() == (1, 1) {
+                (&right_shard.value, &left_shard.value, right_binding, left_binding)
+            } else {
+                (&left_shard.value, &right_shard.value, left_binding, right_binding)
+            };
+            // Scalar broadcast uses the elementwise limb ABI. Keep its
+            // singleton owner resident instead of extracting a captured copy.
+            let limbs = destination_component.limb_count as u32;
+            let mappings = (0..limbs)
+                .map(|limb| (limb, matrix_binding))
+                .chain((0..limbs).map(|limb| (limbs + limb, scalar_binding)))
+                .chain((0..limbs).map(|limb| (2 * limbs + limb, destination_binding)))
+                .collect::<Vec<_>>();
+            capture.set_binding_map(&mappings)?;
+            matrix.mul_scalar_into(scalar, &mut destination_shard.value)?;
+        } else {
+            capture.set_binding_map(&[
+                (0, left_binding),
+                (1, right_binding),
+                (2, destination_binding),
+            ])?;
+            if tensor_product {
+                // Complete resident operands need no column-piece copies.
+                // The native tensor kernel retains all three descriptor owners.
+                left_shard.value.tensor_into(&right_shard.value, &mut destination_shard.value)?;
+            } else {
+                left_shard.value.mul_into(&right_shard.value, &mut destination_shard.value)?;
+            }
+        }
+        if let Some((bias_shard, bias_binding, output_data_binding)) = bias_launch {
+            // The elementwise add uses one data-pointer local per limb for
+            // lhs, rhs, and output, unlike the product's descriptor ABI.
+            let limbs = destination_component.limb_count as u32;
+            let mappings = (0..limbs)
+                .map(|limb| (limb, output_data_binding))
+                .chain((0..limbs).map(|limb| (limbs + limb, bias_binding)))
+                .chain((0..limbs).map(|limb| (2 * limbs + limb, output_data_binding)))
+                .collect::<Vec<_>>();
+            capture.set_binding_map(&mappings)?;
+            bias_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+            destination_shard.value.add_in_place(&bias_shard.value);
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    /// Capture a fused compact-RHS product directly into its planned matrix
+    /// outputs.  The compact primitive has one local source and destination
+    /// descriptor per row block, followed by one local compact-payload input;
+    /// all of those locals are explicitly mapped to the retained region
+    /// schema before the primitive records its kernels.
+    fn submit_capture_fused_small_product(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Fused(requests) = request else {
+            return Ok(None);
+        };
+        let [FusedBatchRequest::SmallProduct { blocks, rhs, .. }] = requests.as_slice() else {
+            return Ok(None);
+        };
+        let block_count = blocks.len();
+        if block_count == 0 || block_count > 32 || destination_owners.len() != block_count {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused compact product requires one destination per row block".into(),
+            ));
+        }
+
+        let rhs_shards = rhs
+            .shards
+            .iter()
+            .filter(|shard| shard.device_id == physical_device)
+            .collect::<Vec<_>>();
+        let [rhs_shard] = rhs_shards.as_slice() else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused compact product requires one resident RHS shard".into(),
+            ));
+        };
+        let rhs_descriptor = rhs_shard.value.binding_descriptor()?;
+        let rhs_payload_binding = source_addresses
+            .iter()
+            .filter(|(address, bytes, _)| {
+                *address == rhs_descriptor.payload_address && *bytes == rhs_descriptor.payload_bytes
+            })
+            .map(|(_, _, binding)| *binding)
+            .collect::<Vec<_>>();
+        let rhs_payload_binding = match rhs_payload_binding.as_slice() {
+            [binding] => *binding,
+            [] => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product RHS payload is not retained by the capture schema"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product RHS payload has ambiguous capture bindings".into(),
+                ));
+            }
+        };
+        if !binding_schema.iter().any(|binding| {
+            binding.index == rhs_payload_binding &&
+                binding.access == BindingAccess::Input &&
+                matches!(
+                    binding.source,
+                    BindingSource::ValueComponent {
+                        component: NativeValueComponent::CompactPayload,
+                        address_addend: 0,
+                        ..
+                    }
+                )
+        }) {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused compact product RHS binding is not a typed compact-payload input".into(),
+            ));
+        }
+        rhs_shard.value.wait_compiled_inputs(physical_device, capture_stream)?;
+
+        let mut source_refs = Vec::with_capacity(block_count);
+        let mut source_bindings = Vec::with_capacity(block_count);
+        let mut block_fragment_ends = Vec::with_capacity(block_count);
+        for block in blocks {
+            let mut shards = block
+                .shards
+                .iter()
+                .filter(|shard| shard.device_id == physical_device)
+                .collect::<Vec<_>>();
+            shards.sort_by_key(|shard| shard.global_column_start);
+            let mut covered = 0;
+            for source_shard in shards {
+                if source_shard.global_column_start != covered || !source_shard.value.is_ntt() {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product source fragments must be contiguous and evaluation-domain".into(),
+                ));
+                }
+                covered += source_shard.value.ncol;
+                let component = source_shard
+                    .value
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "fused compact product source has no capture-device allocation".into(),
+                        )
+                    })?;
+                let address = component.device_descriptors_address;
+                let bytes = component.device_descriptor_stride * component.limb_count;
+                let matches = source_addresses
+                    .iter()
+                    .filter(|(candidate, candidate_bytes, _)| {
+                        *candidate == address && *candidate_bytes == bytes
+                    })
+                    .map(|(_, _, binding)| *binding)
+                    .collect::<Vec<_>>();
+                let binding = match matches.as_slice() {
+                    [binding] => *binding,
+                    [] => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused compact product source descriptor is not retained by the capture schema"
+                            .into(),
+                    ));
+                    }
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused compact product source descriptor has ambiguous capture bindings"
+                            .into(),
+                    ));
+                    }
+                };
+                if !binding_schema.iter().any(|entry| {
+                    entry.index == binding &&
+                        entry.access == BindingAccess::Input &&
+                        matches!(
+                            entry.source,
+                            BindingSource::ValueComponent {
+                                component: NativeValueComponent::MatrixDescriptors,
+                                address_addend: 0,
+                                ..
+                            }
+                        )
+                }) {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused compact product source is not a typed descriptor input".into(),
+                    ));
+                }
+                source_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                source_refs.push(&source_shard.value);
+                source_bindings.push(binding);
+            }
+            if covered != rhs_shard.value.rows() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product fragments do not cover the inner dimension".into(),
+                ));
+            }
+            block_fragment_ends.push(source_refs.len());
+        }
+
+        let mut destination_bindings = Vec::with_capacity(block_count);
+        for (block_index, destination) in destination_owners.iter_mut().enumerate() {
+            let GpuCaptureOwner::Matrix(matrix) = &mut destination.owner else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product destination is not a matrix owner".into(),
+                ));
+            };
+            let shards = matrix
+                .shards
+                .iter()
+                .filter(|shard| shard.device_id == physical_device)
+                .collect::<Vec<_>>();
+            let [destination_shard] = shards.as_slice() else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product requires one resident destination shard per block"
+                        .into(),
+                ));
+            };
+            let source = blocks[block_index]
+                .shards
+                .iter()
+                .find(|shard| shard.device_id == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused compact product source shard disappeared during capture".into(),
+                    )
+                })?;
+            if destination_shard.value.nrow != source.value.nrow ||
+                destination_shard.value.ncol != rhs_shard.value.columns() ||
+                !destination_shard.value.is_ntt()
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused compact product destination shape or domain does not match".into(),
+                ));
+            }
+            let component = destination_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination.slot))?;
+            let address = component.device_descriptors_address;
+            let bytes = component.device_descriptor_stride * component.limb_count;
+            let binding = binding_schema
+                .iter()
+                .find(|entry| {
+                    entry.access == BindingAccess::Output &&
+                        entry.source ==
+                            BindingSource::ValueComponent {
+                                slot: destination.slot,
+                                shard: 0,
+                                component: NativeValueComponent::MatrixDescriptors,
+                                address_addend: 0,
+                            }
+                })
+                .map(|entry| entry.index)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination.slot))?;
+            capture.bind_resident_address(address, bytes, binding)?;
+            destination_bindings.push(binding);
+        }
+
+        let source_count = source_refs.len();
+        let mut binding_map = Vec::with_capacity(source_count + block_count + 1);
+        for (index, binding) in source_bindings.iter().copied().enumerate() {
+            binding_map.push((index as u32, binding));
+        }
+        for (index, binding) in destination_bindings.iter().copied().enumerate() {
+            binding_map.push(((source_count + index) as u32, binding));
+        }
+        binding_map.push(((source_count + block_count) as u32, rhs_payload_binding));
+        capture.set_binding_map(&binding_map).map_err(GpuCaptureAdapterError::Native)?;
+
+        let mut output_refs = destination_owners
+            .iter_mut()
+            .map(|destination| match &mut destination.owner {
+                GpuCaptureOwner::Matrix(matrix) => matrix
+                    .shards
+                    .iter_mut()
+                    .find(|shard| shard.device_id == physical_device)
+                    .map(|shard| &mut shard.value)
+                    .ok_or(GpuCaptureAdapterError::EmptyDestinations),
+                _ => Err(GpuCaptureAdapterError::EmptyDestinations),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let source_local_bindings = (0..source_count).map(|index| index as u32).collect::<Vec<_>>();
+        let destination_local_bindings =
+            (0..block_count).map(|index| (source_count + index) as u32).collect::<Vec<_>>();
+        GpuDCRTPolyMatrix::multiply_small_rhs_row_blocks_into_bound(
+            &source_refs,
+            &rhs_shard.value,
+            &mut output_refs,
+            capture_stream,
+            &source_local_bindings,
+            &destination_local_bindings,
+            (source_count + block_count) as u32,
+            &block_fragment_ends,
+        )
+        .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    /// Capture a slice directly into the planned destination owner.  The
+    /// generic unary dispatcher materializes a temporary piece with the
+    /// ordinary copy ABI, which has no graph-local identity.  Record the
+    /// semantic rectangular copy here with the explicit destination/source
+    /// local ranges used by the capture ABI.
+    fn submit_capture_slice(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Ordinary(requests) = request else {
+            return Ok(None);
+        };
+        let [FixedOperationBatchRequest::UnaryTransform { value, operation, .. }] =
+            requests.as_slice()
+        else {
+            return Ok(None);
+        };
+        let crate::backend::FixedUnaryOperation::Slice { rows, columns } = operation else {
+            return Ok(None);
+        };
+        if destination_owners.len() != 1 {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture slice requires one destination owner".into(),
+            ));
+        }
+        let destination_slot = destination_owners[0].slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owners[0].owner else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture slice requires a matrix destination owner".into(),
+            ));
+        };
+        let row_range = rows.clone().unwrap_or(IndexRange { start: 0, end: value.rows });
+        let column_range = columns.clone().unwrap_or(IndexRange { start: 0, end: value.columns });
+        if row_range.start > row_range.end ||
+            row_range.end > value.rows ||
+            column_range.start > column_range.end ||
+            column_range.end > value.columns ||
+            destination.size() !=
+                (row_range.end - row_range.start, column_range.end - column_range.start)
+        {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture slice range or destination shape is invalid".into(),
+            ));
+        }
+        let mut covered_columns = 0usize;
+        for source_shard in value.shards.iter().filter(|shard| shard.device_id == physical_device) {
+            let source_component = source_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice source shard has no capture-device allocation".into(),
+                    )
+                })?;
+            let source_bindings = source_addresses
+                .iter()
+                .filter(|(address, bytes, _)| {
+                    *address == source_component.data_address &&
+                        *bytes == source_component.data_bytes
+                })
+                .map(|(_, _, binding)| *binding)
+                .collect::<Vec<_>>();
+            let source_binding = match source_bindings.as_slice() {
+                [binding] => *binding,
+                [] => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice source shard is not retained by the capture schema".into(),
+                    ));
+                }
+                _ => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice source shard has ambiguous capture bindings".into(),
+                    ));
+                }
+            };
+            if !binding_schema.iter().any(|binding| {
+                binding.index == source_binding &&
+                    binding.access == BindingAccess::Input &&
+                    matches!(
+                        binding.source,
+                        BindingSource::ValueComponent {
+                            component: NativeValueComponent::MatrixData,
+                            address_addend: 0,
+                            ..
+                        }
+                    )
+            }) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "slice source binding is not a typed input matrix-data binding".into(),
+                ));
+            }
+            let source_start = source_shard.global_column_start.max(column_range.start);
+            let source_end = (source_shard
+                .global_column_start
+                .checked_add(source_shard.value.col_size())
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice source shard range overflows usize".into(),
+                    )
+                })?)
+            .min(column_range.end);
+            if source_start >= source_end {
+                continue;
+            }
+            let mut shard_covered = 0usize;
+            for (destination_shard_index, destination_shard) in
+                destination.shards.iter_mut().enumerate()
+            {
+                if destination_shard.device_id != physical_device {
+                    continue;
+                }
+                let destination_end = destination_shard
+                    .global_column_start
+                    .checked_add(destination_shard.value.col_size())
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "slice destination shard range overflows usize".into(),
+                        )
+                    })?;
+                let overlap_start = source_start - column_range.start;
+                let overlap_end = source_end - column_range.start;
+                let destination_start = overlap_start.max(destination_shard.global_column_start);
+                let destination_end = overlap_end.min(destination_end);
+                if destination_start >= destination_end {
+                    continue;
+                }
+                let destination_binding = binding_schema
+                    .iter()
+                    .find(|binding| {
+                        binding.access == BindingAccess::Output &&
+                            binding.source ==
+                                BindingSource::ValueComponent {
+                                    slot: destination_slot,
+                                    shard: destination_shard_index as u32,
+                                    component: NativeValueComponent::MatrixData,
+                                    address_addend: 0,
+                                }
+                    })
+                    .map(|binding| binding.index)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                let destination_component = destination_shard
+                    .value
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                if source_shard.value.level() != destination_shard.value.level() ||
+                    source_component.limb_count != destination_component.limb_count
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice source and destination CRT layouts differ".into(),
+                    ));
+                }
+                capture.bind_resident_address(
+                    destination_component.data_address,
+                    destination_component.data_bytes,
+                    destination_binding,
+                )?;
+                let limb_count = u32::try_from(source_component.limb_count).map_err(|_| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "slice CRT limb count exceeds binding ABI".into(),
+                    )
+                })?;
+                let mappings = (0..limb_count)
+                    .flat_map(|limb| {
+                        [(limb, destination_binding), (limb_count + limb, source_binding)]
+                    })
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings).map_err(GpuCaptureAdapterError::Native)?;
+                source_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                source_shard.value.copy_block_into_on_capture_stream(
+                    &mut destination_shard.value,
+                    row_range.start,
+                    source_start - source_shard.global_column_start,
+                    0,
+                    destination_start - destination_shard.global_column_start,
+                    row_range.end - row_range.start,
+                    destination_end - destination_start,
+                    capture_stream,
+                    limb_count,
+                    0,
+                )?;
+                shard_covered = shard_covered
+                    .checked_add(destination_end - destination_start)
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "slice shard coverage overflows usize".into(),
+                        )
+                    })?;
+            }
+            if shard_covered != source_end - source_start {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "slice source shard is not fully covered by destination shards".into(),
+                ));
+            }
+            covered_columns = covered_columns.checked_add(shard_covered).ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "slice input coverage overflows usize".into(),
+                )
+            })?;
+        }
+        if covered_columns != column_range.end - column_range.start {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "slice input has no complete physical destination coverage".into(),
+            ));
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    /// Capture concat directly into the planned destination owner.  The
+    /// generic fixed dispatcher cannot be used here: its copy ABI has local
+    /// destination limbs in `0..L` and source limbs in `L..2L`, and every
+    /// concat shard must therefore install its own ordered source/destination
+    /// identities before recording the copy node.
+    fn submit_capture_concat(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Ordinary(requests) = request else {
+            return Ok(None);
+        };
+        let [FixedOperationBatchRequest::Concat { inputs, axis, .. }] = requests.as_slice() else {
+            return Ok(None);
+        };
+        if destination_owners.len() != 1 {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture concat requires one destination owner".into(),
+            ));
+        }
+        let destination_slot = destination_owners[0].slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owners[0].owner else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "capture concat requires a matrix destination owner".into(),
+            ));
+        };
+        let expected_rows = match axis {
+            ConcatAxis::Rows | ConcatAxis::Diagonal => {
+                inputs.iter().try_fold(0usize, |total, input| total.checked_add(input.rows))
+            }
+            ConcatAxis::Columns => inputs.first().map(|input| input.rows),
+        };
+        let expected_columns = match axis {
+            ConcatAxis::Columns | ConcatAxis::Diagonal => {
+                inputs.iter().try_fold(0usize, |total, input| total.checked_add(input.columns))
+            }
+            ConcatAxis::Rows => inputs.first().map(|input| input.columns),
+        };
+        let expected_rows = expected_rows.ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "capture concat row extent overflows usize".into(),
+            )
+        })?;
+        let expected_columns = expected_columns.ok_or_else(|| {
+            GpuCaptureAdapterError::UnsupportedOperation(
+                "capture concat column extent overflows usize".into(),
+            )
+        })?;
+        if destination.size() != (expected_rows, expected_columns) {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                "capture concat destination shape {:?} differs from planned {:?}",
+                destination.size(),
+                (expected_rows, expected_columns)
+            )));
+        }
+
+        let mut row_offsets = Vec::with_capacity(inputs.len());
+        let mut column_offsets = Vec::with_capacity(inputs.len());
+        let mut row_offset = 0usize;
+        let mut column_offset = 0usize;
+        for input in inputs {
+            row_offsets.push(row_offset);
+            column_offsets.push(column_offset);
+            if matches!(axis, ConcatAxis::Rows | ConcatAxis::Diagonal) {
+                row_offset = row_offset.checked_add(input.rows).ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "capture concat row offset overflows usize".into(),
+                    )
+                })?;
+            }
+            if matches!(axis, ConcatAxis::Columns | ConcatAxis::Diagonal) {
+                column_offset = column_offset.checked_add(input.columns).ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "capture concat column offset overflows usize".into(),
+                    )
+                })?;
+            }
+        }
+        let mut covered_columns = vec![0usize; inputs.len()];
+
+        for (input_index, input) in inputs.iter().enumerate() {
+            let row_offset = if matches!(axis, ConcatAxis::Rows | ConcatAxis::Diagonal) {
+                row_offsets[input_index]
+            } else {
+                0
+            };
+            let column_offset = if matches!(axis, ConcatAxis::Columns | ConcatAxis::Diagonal) {
+                column_offsets[input_index]
+            } else {
+                0
+            };
+            for source_shard in
+                input.shards.iter().filter(|shard| shard.device_id == physical_device)
+            {
+                let source_components = source_shard.value.binding_components()?;
+                let source_component = source_components
+                    .iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .copied()
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source shard has no capture-device allocation".into(),
+                        )
+                    })?;
+                let source_bindings = source_addresses
+                    .iter()
+                    .filter(|(address, bytes, _)| {
+                        *address == source_component.data_address &&
+                            *bytes == source_component.data_bytes
+                    })
+                    .map(|(_, _, binding)| *binding)
+                    .collect::<Vec<_>>();
+                let source_binding = match source_bindings.as_slice() {
+                    [binding] => *binding,
+                    [] => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source shard is not retained by the capture schema".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source shard has ambiguous capture bindings".into(),
+                        ));
+                    }
+                };
+                let source_schema_binding = binding_schema.iter().find(|binding| {
+                    binding.index == source_binding &&
+                        binding.access == BindingAccess::Input &&
+                        matches!(
+                            binding.source,
+                            BindingSource::ValueComponent {
+                                component: NativeValueComponent::MatrixData,
+                                address_addend: 0,
+                                ..
+                            }
+                        )
+                });
+                if source_schema_binding.is_none() {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "concat source binding is not a typed input matrix-data binding".into(),
+                    ));
+                }
+                let source_start = column_offset
+                    .checked_add(source_shard.global_column_start)
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source shard range overflows usize".into(),
+                        )
+                    })?;
+                let source_end =
+                    source_start.checked_add(source_shard.value.col_size()).ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source shard range overflows usize".into(),
+                        )
+                    })?;
+                let mut shard_covered = 0usize;
+                for (destination_shard_index, destination_shard) in
+                    destination.shards.iter_mut().enumerate()
+                {
+                    if destination_shard.device_id != physical_device {
+                        continue;
+                    }
+                    let overlap_start = source_start.max(destination_shard.global_column_start);
+                    let destination_end = destination_shard
+                        .global_column_start
+                        .checked_add(destination_shard.value.col_size())
+                        .ok_or_else(|| {
+                            GpuCaptureAdapterError::UnsupportedOperation(
+                                "concat destination shard range overflows usize".into(),
+                            )
+                        })?;
+                    let overlap_end = source_end.min(destination_end);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+                    let columns = overlap_end - overlap_start;
+                    let destination_binding = binding_schema
+                        .iter()
+                        .find(|binding| {
+                            binding.access == BindingAccess::Output &&
+                                binding.source ==
+                                    BindingSource::ValueComponent {
+                                        slot: destination_slot,
+                                        shard: destination_shard_index as u32,
+                                        component: NativeValueComponent::MatrixData,
+                                        address_addend: 0,
+                                    }
+                        })
+                        .map(|binding| binding.index)
+                        .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                    let destination_component = destination_shard
+                        .value
+                        .binding_components()?
+                        .into_iter()
+                        .find(|component| component.physical_device == physical_device)
+                        .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                    if source_shard.value.level() != destination_shard.value.level() ||
+                        source_component.limb_count != destination_component.limb_count
+                    {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat source and destination CRT layouts differ".into(),
+                        ));
+                    }
+                    capture.bind_resident_address(
+                        destination_component.data_address,
+                        destination_component.data_bytes,
+                        destination_binding,
+                    )?;
+                    let limb_count = u32::try_from(source_component.limb_count).map_err(|_| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat CRT limb count exceeds binding ABI".into(),
+                        )
+                    })?;
+                    let mappings = (0..limb_count)
+                        .flat_map(|limb| {
+                            [(limb, destination_binding), (limb_count + limb, source_binding)]
+                        })
+                        .collect::<Vec<_>>();
+                    capture.set_binding_map(&mappings).map_err(GpuCaptureAdapterError::Native)?;
+                    source_shard.value.wait_compiled_inputs(
+                        physical_device,
+                        capture_stream,
+                        true,
+                    )?;
+                    source_shard.value.copy_block_into_on_capture_stream(
+                        &mut destination_shard.value,
+                        0,
+                        overlap_start - source_start,
+                        row_offset,
+                        overlap_start - destination_shard.global_column_start,
+                        source_shard.value.row_size(),
+                        columns,
+                        capture_stream,
+                        limb_count,
+                        0,
+                    )?;
+                    shard_covered = shard_covered.checked_add(columns).ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat shard coverage overflows usize".into(),
+                        )
+                    })?;
+                }
+                if shard_covered != source_shard.value.col_size() {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "concat source shard is not fully covered by destination shards".into(),
+                    ));
+                }
+                covered_columns[input_index] =
+                    covered_columns[input_index].checked_add(shard_covered).ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "concat input coverage overflows usize".into(),
+                        )
+                    })?;
+            }
+        }
+        for (input_index, input) in inputs.iter().enumerate() {
+            if covered_columns[input_index] != input.columns {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "concat input has no complete physical destination coverage".into(),
+                ));
+            }
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    /// Add resident row-block/column-fragment intersections directly into the
+    /// planned output. Every descriptor remains an explicit replay binding.
+    fn submit_capture_fused_add(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Fused(requests) = request else {
+            return Ok(None);
+        };
+        let [FusedBatchRequest::Add { blocks, right, .. }] = requests.as_slice() else {
+            return Ok(None);
+        };
+        if blocks.is_empty() || blocks.len() > 16 {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused add capture requires one to sixteen row blocks".into(),
+            ));
+        }
+        let [destination_owner] = destination_owners else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused add capture requires one destination".into(),
+            ));
+        };
+        let slot = destination_owner.slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owner.owner else {
+            return Err(GpuCaptureAdapterError::MissingBinding(slot));
+        };
+        for (shard_index, destination_shard) in destination
+            .shards
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, shard)| shard.device_id == physical_device)
+        {
+            let start = destination_shard.global_column_start;
+            let end = start + destination_shard.value.col_size();
+            let output_descriptor = schema_binding_index(
+                binding_schema,
+                slot,
+                shard_index as u32,
+                NativeValueComponent::MatrixDescriptors,
+            )?;
+            let output_component = destination_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+            capture.bind_resident_address(
+                output_component.device_descriptors_address,
+                output_component.device_descriptor_stride * output_component.limb_count,
+                output_descriptor,
+            )?;
+            let mut fragments = Vec::new();
+            let mut row = 0;
+            for block in blocks {
+                if block.rows == 0 {
+                    continue;
+                }
+                let mut ranges = Vec::new();
+                for left in block.shards.iter().filter(|shard| shard.device_id == physical_device) {
+                    for rhs in
+                        right.shards.iter().filter(|shard| shard.device_id == physical_device)
+                    {
+                        let begin =
+                            start.max(left.global_column_start).max(rhs.global_column_start);
+                        let finish = end
+                            .min(left.global_column_start + left.value.col_size())
+                            .min(rhs.global_column_start + rhs.value.col_size());
+                        if begin >= finish {
+                            continue;
+                        }
+                        ranges.push((begin, finish));
+                        fragments.push(
+                            mxx_primitives::matrix::gpu_dcrt_poly::GpuRowBlockAddFragment {
+                                left: &left.value,
+                                right: &rhs.value,
+                                left_column: begin - left.global_column_start,
+                                right_row: row,
+                                right_column: begin - rhs.global_column_start,
+                                destination_row: row,
+                                destination_column: begin - start,
+                                rows: block.rows,
+                                columns: finish - begin,
+                            },
+                        );
+                    }
+                }
+                ranges.sort_unstable();
+                let mut covered = start;
+                for (begin, finish) in ranges {
+                    if begin != covered {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "fused add fragments overlap or leave an uncovered column".into(),
+                        ));
+                    }
+                    covered = finish;
+                }
+                if covered != end {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused add source fragments do not cover the capture-device destination"
+                            .into(),
+                    ));
+                }
+                row += block.rows;
+            }
+            if row != right.rows || row != destination_shard.value.row_size() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused add row coverage mismatch".into(),
+                ));
+            }
+            for batch in fragments.chunks(16) {
+                let mut descriptor_map = Vec::with_capacity(batch.len() * 2 + 1);
+                for (index, input) in
+                    batch.iter().flat_map(|fragment| [fragment.left, fragment.right]).enumerate()
+                {
+                    let component = input
+                        .binding_components()?
+                        .into_iter()
+                        .find(|component| component.physical_device == physical_device)
+                        .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                    let identities = source_addresses
+                        .iter()
+                        .filter_map(|(address, _, binding)| {
+                            (*address == component.device_descriptors_address &&
+                                binding_schema.iter().any(|schema| {
+                                    schema.index == *binding &&
+                                        schema.access == BindingAccess::Input &&
+                                        matches!(
+                                            schema.source,
+                                            BindingSource::ValueComponent {
+                                                component: NativeValueComponent::MatrixDescriptors,
+                                                address_addend: 0,
+                                                ..
+                                            }
+                                        )
+                                }))
+                            .then_some(*binding)
+                        })
+                        .collect::<Vec<_>>();
+                    let [identity] = identities.as_slice() else {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "fused add fragment requires one explicit resident descriptor identity"
+                                .into(),
+                        ));
+                    };
+                    descriptor_map.push((index as u32, *identity));
+                    input.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                }
+                descriptor_map.push((2 * batch.len() as u32, output_descriptor));
+                capture.set_binding_map(&descriptor_map)?;
+                GpuDCRTPolyMatrix::add_row_blocks_into(batch, &mut destination_shard.value)?;
+            }
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    fn submit_capture_crt_recompose(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Ordinary(requests) = request else { return Ok(None) };
+        let [
+            FixedOperationBatchRequest::CrtRecompose {
+                levels,
+                plaintext_moduli,
+                reconstruction_coefficients,
+                ..
+            },
+        ] = requests.as_slice()
+        else {
+            return Ok(None)
+        };
+        if levels.is_empty() ||
+            levels.len() != plaintext_moduli.len() ||
+            levels.len() != reconstruction_coefficients.len()
+        {
+            return Err(PolyBackendError::InvalidInteger.into());
+        }
+        let plaintext_moduli = plaintext_moduli
+            .iter()
+            .map(|value| value.to_u64().filter(|value| *value != 0))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        let [destination_owner] = destination_owners else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "CRT recomposition capture requires one destination".into(),
+            ));
+        };
+        let slot = destination_owner.slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owner.owner else {
+            return Err(GpuCaptureAdapterError::MissingBinding(slot));
+        };
+        for (shard_index, output) in destination
+            .shards
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, shard)| shard.device_id == physical_device)
+        {
+            let start = output.global_column_start;
+            let end = start + output.value.col_size();
+            let output_data = schema_binding_index(
+                binding_schema,
+                slot,
+                shard_index as u32,
+                NativeValueComponent::MatrixData,
+            )?;
+            let output_descriptor = schema_binding_index(
+                binding_schema,
+                slot,
+                shard_index as u32,
+                NativeValueComponent::MatrixDescriptors,
+            )?;
+            let output_component = output
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+            capture.bind_resident_address(
+                output_component.device_descriptors_address,
+                output_component.device_descriptor_stride * output_component.limb_count,
+                output_descriptor,
+            )?;
+            let mut coefficients = Vec::with_capacity(levels.len());
+            let mut descriptors = Vec::with_capacity(levels.len() + 1);
+            for (index, level) in levels.iter().enumerate() {
+                let source = level
+                    .shards
+                    .iter()
+                    .find(|shard| {
+                        shard.device_id == physical_device &&
+                            shard.global_column_start <= start &&
+                            shard.global_column_start + shard.value.col_size() >= end
+                    })
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "CRT recomposition source range must be resident on its capture device"
+                                .into(),
+                        )
+                    })?;
+                let component = source
+                    .value
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                let source_binding = |address, kind| {
+                    let matches = source_addresses
+                        .iter()
+                        .filter_map(|(candidate, _, binding)| {
+                            (*candidate == address &&
+                                binding_schema.iter().any(|schema| {
+                                    schema.index == *binding &&
+                                        schema.access == BindingAccess::Input &&
+                                        matches!(schema.source, BindingSource::ValueComponent {
+                                    component, address_addend: 0, ..
+                                } if component == kind)
+                                }))
+                            .then_some(*binding)
+                        })
+                        .collect::<Vec<_>>();
+                    match matches.as_slice() {
+                        [binding] => Ok(*binding),
+                        _ => Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                            "CRT source {kind:?} requires one explicit schema identity"
+                        ))),
+                    }
+                };
+                let data =
+                    source_binding(component.data_address, NativeValueComponent::MatrixData)?;
+                // Resolve both components from the same retained source owner.
+                let data_schema = binding_schema
+                    .iter()
+                    .find(|binding| binding.index == data)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                let BindingSource::ValueComponent {
+                    slot: source_slot, shard: source_shard, ..
+                } = data_schema.source;
+                let descriptor = schema_binding_index(
+                    binding_schema,
+                    source_slot,
+                    source_shard,
+                    NativeValueComponent::MatrixDescriptors,
+                )?;
+                source.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                let limbs = component.limb_count as u32;
+                capture.set_binding_map(
+                    &(0..limbs)
+                        .map(|limb| (limb, output_data))
+                        .chain((0..limbs).map(|limb| (limbs + limb, data)))
+                        .collect::<Vec<_>>(),
+                )?;
+                // The inverse NTT must act on a graph-owned copy, never on the
+                // retained input, even when this job covers the entire shard.
+                let piece = source
+                    .value
+                    .slice_columns(
+                        start - source.global_column_start,
+                        end - source.global_column_start,
+                    )
+                    .into_coeff_domain();
+                coefficients.push(piece);
+                descriptors.push((
+                    u32::try_from(index).map_err(|_| PolyBackendError::InvalidInteger)?,
+                    descriptor,
+                ));
+            }
+            descriptors.push((
+                u32::try_from(levels.len()).map_err(|_| PolyBackendError::InvalidInteger)?,
+                output_descriptor,
+            ));
+            capture.set_binding_map(&descriptors)?;
+            let residues = reconstruction_coefficients
+                .iter()
+                .flat_map(|coefficient| {
+                    output.value.params().moduli().iter().map(move |modulus| {
+                        let modulus = BigInt::from(*modulus);
+                        (((coefficient % &modulus) + &modulus) % &modulus).to_u64()
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or(PolyBackendError::InvalidInteger)?;
+            GpuDCRTPolyMatrix::crt_recompose_coefficients_into(
+                &coefficients,
+                &plaintext_moduli,
+                &residues,
+                &mut output.value,
+            );
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    fn submit_capture_unary_descriptors(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let (source, row_groups) = match request {
+            GpuCaptureRequest::Fused(requests) => match requests.as_slice() {
+                [FusedBatchRequest::RowSum { source, right: None, rows, .. }] => {
+                    (source, Some(rows.as_slice()))
+                }
+                _ => return Ok(None),
+            },
+            GpuCaptureRequest::Ordinary(requests) => match requests.as_slice() {
+                [
+                    FixedOperationBatchRequest::UnaryTransform {
+                        value,
+                        operation: crate::backend::FixedUnaryOperation::Transpose,
+                        ..
+                    },
+                ] => (value, None),
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        let [destination_owner] = destination_owners else {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "descriptor unary capture requires one destination".into(),
+            ));
+        };
+        let destination_slot = destination_owner.slot;
+        let GpuCaptureOwner::Matrix(destination) = &mut destination_owner.owner else {
+            return Err(GpuCaptureAdapterError::MissingBinding(destination_slot));
+        };
+        for (destination_index, destination_shard) in destination
+            .shards
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, shard)| shard.device_id == physical_device)
+        {
+            let column_start = destination_shard.global_column_start;
+            let column_end = column_start + destination_shard.value.col_size();
+            if let Some(rows) = row_groups {
+                let mut fragments = source
+                    .shards
+                    .iter()
+                    .filter_map(|shard| {
+                        if shard.device_id != physical_device {
+                            return None;
+                        }
+                        let start = column_start.max(shard.global_column_start);
+                        let end =
+                            column_end.min(shard.global_column_start + shard.value.col_size());
+                        (start < end).then_some((shard, start, end))
+                    })
+                    .collect::<Vec<_>>();
+                fragments.sort_by_key(|(_, start, _)| *start);
+                let mut covered = column_start;
+                for (_, start, end) in &fragments {
+                    if *start != covered {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "row sum source fragments must cover the destination without gaps or overlaps".into(),
+                        ));
+                    }
+                    covered = *end;
+                }
+                if covered != column_end {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "row sum source fragments do not cover the capture-device destination"
+                            .into(),
+                    ));
+                }
+                let output_descriptor = schema_binding_index(
+                    binding_schema,
+                    destination_slot,
+                    destination_index as u32,
+                    NativeValueComponent::MatrixDescriptors,
+                )?;
+                let component = destination_shard
+                    .value
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                capture.bind_resident_address(
+                    component.device_descriptors_address,
+                    component.device_descriptor_stride * component.limb_count,
+                    output_descriptor,
+                )?;
+                for batch in fragments.chunks(16) {
+                    let mut mappings = Vec::with_capacity(batch.len() + 1);
+                    let mut sources = Vec::with_capacity(batch.len());
+                    for (index, (shard, start, end)) in batch.iter().enumerate() {
+                        let component = shard
+                            .value
+                            .binding_components()?
+                            .into_iter()
+                            .find(|component| component.physical_device == physical_device)
+                            .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                        let identities = source_addresses
+                            .iter()
+                            .filter_map(|(address, _, binding)| {
+                                (*address == component.device_descriptors_address &&
+                                    binding_schema.iter().any(|schema| {
+                                        schema.index == *binding &&
+                                            schema.access == BindingAccess::Input &&
+                                            matches!(
+                                                schema.source,
+                                                BindingSource::ValueComponent {
+                                                    component:
+                                                        NativeValueComponent::MatrixDescriptors,
+                                                    address_addend: 0,
+                                                    ..
+                                                }
+                                            )
+                                    }))
+                                .then_some(*binding)
+                            })
+                            .collect::<Vec<_>>();
+                        let [identity] = identities.as_slice() else {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "row sum fragment requires one explicit resident descriptor identity".into(),
+                            ));
+                        };
+                        mappings.push((index as u32, *identity));
+                        shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                        sources.push((
+                            &shard.value,
+                            start - shard.global_column_start..end - shard.global_column_start,
+                            start - column_start,
+                        ));
+                    }
+                    mappings.push((batch.len() as u32, output_descriptor));
+                    capture.set_binding_map(&mappings)?;
+                    GpuDCRTPolyMatrix::sum_rows_into(&sources, rows, &mut destination_shard.value)?;
+                }
+                continue;
+            }
+            let source_shard = source.shards.iter().find(|shard| {
+                shard.device_id == physical_device && {
+                    shard.global_column_start == 0 && shard.value.col_size() == source.columns
+                }
+            }).ok_or_else(|| GpuCaptureAdapterError::UnsupportedOperation(
+                "descriptor unary source must retain the complete input range on the capture device".into(),
+            ))?;
+            let source_component = source_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let source_binding = |address, component| {
+                let matches = source_addresses
+                    .iter()
+                    .filter_map(|(candidate, _, binding)| {
+                        (*candidate == address &&
+                            binding_schema.iter().any(|schema| {
+                                schema.index == *binding &&
+                                    schema.access == BindingAccess::Input &&
+                                    matches!(schema.source, BindingSource::ValueComponent {
+                                component: candidate_component, address_addend: 0, ..
+                            } if candidate_component == component)
+                            }))
+                        .then_some(*binding)
+                    })
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [binding] => Ok(*binding),
+                    _ => Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "descriptor unary input requires one explicit schema identity".into(),
+                    )),
+                }
+            };
+            let input_descriptor = source_binding(
+                source_component.device_descriptors_address,
+                NativeValueComponent::MatrixDescriptors,
+            )?;
+            let output_descriptor = schema_binding_index(
+                binding_schema,
+                destination_slot,
+                destination_index as u32,
+                NativeValueComponent::MatrixDescriptors,
+            )?;
+            let destination_component = destination_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            capture.bind_resident_address(
+                destination_component.device_descriptors_address,
+                destination_component.device_descriptor_stride * destination_component.limb_count,
+                output_descriptor,
+            )?;
+            source_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+            let (row_start, row_end, local_start, local_end) =
+                (column_start, column_end, 0, source.columns);
+            // A partial operand uses the copy's own limb namespace before
+            // switching to the descriptor namespace of the consuming kernel.
+            // The temporary is graph-owned; resident source identity remains
+            // exact and all range checks remain active.
+            let source_piece = if row_start == 0 &&
+                row_end == source.rows &&
+                local_start == 0 &&
+                local_end == source_shard.value.col_size()
+            {
+                Cow::Borrowed(&source_shard.value)
+            } else {
+                let input_data = source_binding(
+                    source_component.data_address,
+                    NativeValueComponent::MatrixData,
+                )?;
+                let output_data = schema_binding_index(
+                    binding_schema,
+                    destination_slot,
+                    destination_index as u32,
+                    NativeValueComponent::MatrixData,
+                )?;
+                let limbs = source_component.limb_count as u32;
+                let mappings = (0..limbs)
+                    .map(|limb| (limb, output_data))
+                    .chain((0..limbs).map(|limb| (limbs + limb, input_data)))
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings)?;
+                Cow::Owned(source_shard.value.slice(row_start, row_end, local_start, local_end))
+            };
+            capture.set_binding_map(&[(0, input_descriptor), (1, output_descriptor)])?;
+            source_piece.transpose_into(&mut destination_shard.value)?;
+        }
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    fn submit_capture_fused_tensor_row_sums(
+        &self,
+        request: &GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        capture_stream: &GpuNativeLaunchStream,
+    ) -> Result<Option<GpuCaptureSubmission>, GpuCaptureAdapterError> {
+        let GpuCaptureRequest::Fused(requests) = request else {
+            return Ok(None);
+        };
+        let [FusedBatchRequest::TensorRowSums { source, right, rows, .. }] = requests.as_slice()
+        else {
+            return Ok(None);
+        };
+        if rows.len() != destination_owners.len() || rows.is_empty() {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused tensor row sums require one planned destination per output group".into(),
+            ));
+        }
+
+        let source_shard = {
+            let mut matches =
+                source.shards.iter().filter(|shard| shard.device_id == physical_device);
+            let Some(shard) = matches.next() else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum lhs has no capture-device shard".into(),
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum lhs has ambiguous capture-device shards".into(),
+                ));
+            }
+            shard
+        };
+        let right_shard = {
+            let mut matches =
+                right.shards.iter().filter(|shard| shard.device_id == physical_device);
+            let Some(shard) = matches.next() else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum rhs has no capture-device shard".into(),
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum rhs has ambiguous capture-device shards".into(),
+                ));
+            }
+            shard
+        };
+        if source_shard.global_column_start != 0 ||
+            right_shard.global_column_start != 0 ||
+            source_shard.value.col_size() != source.columns ||
+            right_shard.value.col_size() != right.columns ||
+            !source_shard.value.is_ntt() ||
+            !right_shard.value.is_ntt()
+        {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused tensor row sums require complete NTT input shards".into(),
+            ));
+        }
+        let source_component = source_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum lhs has no capture-device allocation".into(),
+                )
+            })?;
+        let right_component = right_shard
+            .value
+            .binding_components()?
+            .into_iter()
+            .find(|component| component.physical_device == physical_device)
+            .ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum rhs has no capture-device allocation".into(),
+                )
+            })?;
+        if source_component.limb_count != right_component.limb_count ||
+            source_shard.value.level() != right_shard.value.level()
+        {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                "fused tensor row-sum inputs have incompatible CRT layouts".into(),
+            ));
+        }
+        let descriptor_binding = |address: u64, bytes: usize, role: &str| {
+            let matches = source_addresses
+                .iter()
+                .filter(|(candidate, candidate_bytes, _)| {
+                    *candidate == address && *candidate_bytes == bytes
+                })
+                .map(|(_, _, binding)| *binding)
+                .collect::<Vec<_>>();
+            let binding = match matches.as_slice() {
+                [binding] => *binding,
+                [] => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                        "fused tensor row-sum {role} descriptor is not retained by the capture schema"
+                    )));
+                }
+                _ => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                        "fused tensor row-sum {role} descriptor has ambiguous capture bindings"
+                    )));
+                }
+            };
+            if !binding_schema.iter().any(|schema| {
+                schema.index == binding &&
+                    schema.access == BindingAccess::Input &&
+                    matches!(
+                        schema.source,
+                        BindingSource::ValueComponent {
+                            component: NativeValueComponent::MatrixDescriptors,
+                            address_addend: 0,
+                            ..
+                        }
+                    )
+            }) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "fused tensor row-sum {role} descriptor is not a typed input binding"
+                )));
+            }
+            Ok(binding)
+        };
+        let source_binding = descriptor_binding(
+            source_component.device_descriptors_address,
+            source_component.device_descriptor_stride * source_component.limb_count,
+            "lhs",
+        )?;
+        let right_binding = descriptor_binding(
+            right_component.device_descriptors_address,
+            right_component.device_descriptor_stride * right_component.limb_count,
+            "rhs",
+        )?;
+
+        let mut destinations = Vec::with_capacity(destination_owners.len());
+        let mut destination_bindings = Vec::with_capacity(destination_owners.len());
+        for (group_index, destination_owner) in destination_owners.iter_mut().enumerate() {
+            let destination_slot = destination_owner.slot;
+            let GpuCaptureOwner::Matrix(destination) = &mut destination_owner.owner else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum output is not a matrix owner".into(),
+                ));
+            };
+            let mut shards = destination
+                .shards
+                .iter_mut()
+                .enumerate()
+                .filter(|(_, shard)| shard.device_id == physical_device);
+            let Some((destination_shard_index, destination_shard)) = shards.next() else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum output has no capture-device shard".into(),
+                ));
+            };
+            if shards.next().is_some() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum output has ambiguous capture-device shards".into(),
+                ));
+            }
+            let expected_columns = source_shard
+                .value
+                .col_size()
+                .checked_mul(right_shard.value.col_size())
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "fused tensor row-sum output columns overflow usize".into(),
+                    )
+                })?;
+            if destination_shard.global_column_start != 0 ||
+                destination_shard.value.col_size() != expected_columns ||
+                destination_shard.value.row_size() != rows[group_index].len() ||
+                !destination_shard.value.is_ntt()
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum output shape or domain disagrees with its group".into(),
+                ));
+            }
+            let destination_component = destination_shard
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            if destination_component.limb_count != source_component.limb_count ||
+                destination_shard.value.level() != source_shard.value.level()
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum output has incompatible CRT layout".into(),
+                ));
+            }
+            let destination_binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.access == BindingAccess::Output &&
+                        binding.source ==
+                            BindingSource::ValueComponent {
+                                slot: destination_slot,
+                                shard: destination_shard_index as u32,
+                                component: NativeValueComponent::MatrixDescriptors,
+                                address_addend: 0,
+                            }
+                })
+                .map(|binding| binding.index)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            capture.bind_resident_address(
+                destination_component.device_descriptors_address,
+                destination_component.device_descriptor_stride * destination_component.limb_count,
+                destination_binding,
+            )?;
+            destinations.push(destination_shard.value.clone_shallow());
+            destination_bindings.push(destination_binding);
+        }
+
+        let mut binding_map = vec![(0, source_binding), (1, right_binding)];
+        for (index, binding) in destination_bindings.iter().copied().enumerate() {
+            let local = u32::try_from(index.checked_add(2).ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum descriptor local ID overflows usize".into(),
+                )
+            })?)
+            .map_err(|_| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "fused tensor row-sum descriptor local ID exceeds ABI width".into(),
+                )
+            })?;
+            binding_map.push((local, binding));
+        }
+        capture.set_binding_map(&binding_map).map_err(GpuCaptureAdapterError::Native)?;
+        source_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+        right_shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+        source_shard.value.tensor_sum_row_groups_into(
+            &right_shard.value,
+            rows,
+            &mut destinations,
+        )?;
+        Ok(Some(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        }))
+    }
+
+    /// Submit one ordinary or fused fixed-plan request while a caller-owned
+    /// capture stream is active. MatrixArith's native launch sites resolve the
+    /// active stream from their execution owner, so the existing fixed batch
+    /// implementations are reused without a synchronous wrapper or a host
+    /// readback. The returned schema is deliberately slot based and can be
+    /// installed by the scheduler in the surrounding compiled region.
+    pub(crate) fn submit_capture_step(
+        &mut self,
+        step: &CaptureStep,
+        request: GpuCaptureRequest,
+        destination_owners: &mut [GpuCaptureDestinationOwner<'_>],
+        binding_schema: &[RegionBinding],
+        physical_device: i32,
+        source_addresses: &[(u64, usize, u32)],
+        capture: &mut GpuCaptureScope,
+        protocol_owners: Option<&GpuCaptureProtocolOwners>,
+    ) -> Result<GpuCaptureSubmission, GpuCaptureAdapterError> {
+        let capture_stream_owner = capture.launch_stream().clone();
+        let capture_stream = &capture_stream_owner;
+        let operation_debug = format!("{:?}", &step.operation);
+        let operation_label = match &step.operation {
+            CaptureOperation::Fixed { operation, .. } => format!("{operation:?}"),
+            CaptureOperation::Trapdoor { .. } => "trapdoor".to_owned(),
+            CaptureOperation::Generation { .. } => "generation".to_owned(),
+            CaptureOperation::Decomposition { .. } => "decomposition".to_owned(),
+            CaptureOperation::Preimage { .. } => "preimage".to_owned(),
+            CaptureOperation::ResidentControl { .. } => "resident-control".to_owned(),
+            CaptureOperation::HostBoundary { .. } | CaptureOperation::NativeAlias => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(operation_debug));
+            }
+        };
+        if destination_owners.is_empty() {
+            return Err(GpuCaptureAdapterError::EmptyDestinations);
+        }
+        // Native owner metadata is queried only to validate that every output
+        // has a patchable device allocation. These calls do not wait, copy, or
+        // expose coefficient data to the host.
+        let mut slots = BTreeSet::new();
+        for destination in &mut *destination_owners {
+            if !slots.insert(destination.slot) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "duplicate destination slot {:?} for {operation_label}",
+                    destination.slot
+                )));
+            }
+            let has_binding = match &mut destination.owner {
+                GpuCaptureOwner::Matrix(owner) => !owner.binding_components()?.is_empty(),
+                GpuCaptureOwner::SmallMatrix(owner) => !owner.binding_descriptors()?.is_empty(),
+                GpuCaptureOwner::TrapdoorPair { public, .. } => {
+                    !public.binding_components()?.is_empty()
+                }
+                GpuCaptureOwner::IntegerValues(owner) => owner.binding().is_ok(),
+            };
+            if !has_binding {
+                return Err(GpuCaptureAdapterError::MissingBinding(destination.slot));
+            }
+        }
+
+        if let GpuCaptureRequest::Trapdoor(request) = request {
+            // The sampler is a compound graph producer: its transpose,
+            // multiplication, NTT and concatenation leaves operate solely on
+            // graph-owned scratch. Give those leaves a private namespace;
+            // only the explicit boundary copies below address replay owners.
+            let params = self.parameters_on_device(&request.ty, physical_device)?;
+            let limbs = u32::try_from(params.crt_depth()).map_err(|_| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "trapdoor CRT depth exceeds capture ABI".into(),
+                )
+            })?;
+            let scratch_count = limbs.checked_mul(4).ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "trapdoor scratch binding overflow".into(),
+                )
+            })?;
+            let scratch = capture.claim_binding_range(scratch_count)?;
+            let (public, secret) = <Self as Backend>::fixed_sample_trapdoor(self, request)?;
+            let copy = |source: &GpuDCRTPolyMatrix,
+                        output: &mut GpuDCRTPolyMatrix,
+                        slot: ValueSlot,
+                        shard: u32,
+                        component: NativeValueComponent,
+                        source_column: usize,
+                        capture: &mut GpuCaptureScope|
+             -> Result<(), GpuCaptureAdapterError> {
+                let binding = schema_binding_index(binding_schema, slot, shard, component)?;
+                let native = output
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(slot))?;
+                capture.bind_resident_address(native.data_address, native.data_bytes, binding)?;
+                let limb_count = u32::try_from(native.limb_count).map_err(|_| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "trapdoor limb count exceeds capture ABI".into(),
+                    )
+                })?;
+                let mappings = (0..limb_count)
+                    .flat_map(|limb| [(limb, binding), (limb_count + limb, scratch + limb)])
+                    .collect::<Vec<_>>();
+                capture.set_binding_map(&mappings)?;
+                source.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                let columns = output.size().1;
+                source.copy_columns_into_on_capture_stream(
+                    output,
+                    source_column,
+                    0,
+                    columns,
+                    capture_stream,
+                    limb_count,
+                    0,
+                )?;
+                Ok(())
+            };
+            let source_public = public
+                .shards
+                .iter()
+                .find(|shard| shard.device_id == physical_device && shard.global_column_start == 0)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "trapdoor public origin is missing".into(),
+                    )
+                })?;
+            for destination in destination_owners.iter_mut() {
+                match &mut destination.owner {
+                    GpuCaptureOwner::Matrix(output) => {
+                        for (shard, output) in output.shards.iter_mut().enumerate() {
+                            copy(
+                                &source_public.value,
+                                &mut output.value,
+                                destination.slot,
+                                shard as u32,
+                                NativeValueComponent::MatrixData,
+                                output.global_column_start,
+                                capture,
+                            )?;
+                        }
+                    }
+                    GpuCaptureOwner::TrapdoorPair {
+                        public: output_public,
+                        secret: output_secret,
+                    } => {
+                        for (shard, output) in output_public.shards.iter_mut().enumerate() {
+                            copy(
+                                &source_public.value,
+                                &mut output.value,
+                                destination.slot,
+                                shard as u32,
+                                NativeValueComponent::TrapdoorPublic,
+                                output.global_column_start,
+                                capture,
+                            )?;
+                        }
+                        if secret.values.len() != output_secret.values.len() {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "trapdoor fleet ownership differs from output".into(),
+                            ));
+                        }
+                        let components = [
+                            NativeValueComponent::TrapdoorR,
+                            NativeValueComponent::TrapdoorE,
+                            NativeValueComponent::TrapdoorCovarianceA,
+                            NativeValueComponent::TrapdoorCovarianceB,
+                            NativeValueComponent::TrapdoorCovarianceD,
+                        ];
+                        for (shard, (source, output)) in
+                            secret.values.iter().zip(&mut output_secret.values).enumerate()
+                        {
+                            for ((source, output), component) in source
+                                .capture_components()
+                                .into_iter()
+                                .zip(output.capture_components_mut())
+                                .zip(components)
+                            {
+                                copy(
+                                    source,
+                                    output,
+                                    destination.slot,
+                                    shard as u32,
+                                    component,
+                                    0,
+                                    capture,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "trapdoor capture requires public and secret destinations".into(),
+                        ))
+                    }
+                }
+            }
+            // Native capture owns the scratch allocations after these retained
+            // wrappers are released; no sampled pointer is a replay binding.
+            self.capture_resources
+                .extend(public.shards.into_iter().map(|shard| Arc::new(shard.value)));
+            for value in &secret.values {
+                self.capture_resources.extend(
+                    value
+                        .capture_components()
+                        .into_iter()
+                        .map(|matrix| Arc::new(matrix.clone_shallow())),
+                );
+            }
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        // PolynomialValues is the one fixed operation whose result is a
+        // resident integer owner rather than a matrix allocation.  During
+        // capture the source is already a resident 1x1 shard and the output
+        // owner was allocated from the frozen schema before capture began.
+        // Borrow that shard directly so placement routing cannot reject a
+        // physically valid source before the native extraction kernel runs.
+        if matches!(
+            &request,
+            GpuCaptureRequest::Ordinary(requests)
+                if requests.len() == 1 &&
+                    matches!(requests.first(), Some(FixedOperationBatchRequest::PolynomialValues { .. }))
+        ) {
+            let GpuCaptureRequest::Ordinary(requests) = &request else {
+                unreachable!("polynomial-values request classification changed");
+            };
+            let FixedOperationBatchRequest::PolynomialValues { value, evaluation, .. } =
+                &requests[0]
+            else {
+                unreachable!("polynomial-values request classification changed");
+            };
+            {
+                let value = value.as_ref();
+                if value.shards.len() != 1 || value.size() != (1, 1) {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "polynomial-values capture requires one resident 1x1 shard".into(),
+                    ));
+                }
+                let source = value
+                    .shards
+                    .iter()
+                    .find(|shard| shard.device_id == physical_device)
+                    .map(|shard| &shard.value)
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "polynomial-values source shard is not resident on the capture device"
+                                .into(),
+                        )
+                    })?;
+                let _source_binding = binding_schema
+                    .iter()
+                    .find(|binding| {
+                        binding.access == BindingAccess::Input &&
+                            matches!(
+                                &binding.source,
+                                BindingSource::ValueComponent {
+                                    component: NativeValueComponent::MatrixDescriptors,
+                                    ..
+                                }
+                            )
+                    })
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(ValueSlot(0)))?;
+                let _output_binding = binding_schema
+                    .iter()
+                    .find(|binding| {
+                        binding.access == BindingAccess::Output &&
+                            matches!(
+                                &binding.source,
+                                BindingSource::ValueComponent {
+                                    component: NativeValueComponent::IntegerValues,
+                                    ..
+                                }
+                            )
+                    })
+                    .ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+                let destination = destination_owners
+                    .iter_mut()
+                    .find(|destination| {
+                        matches!(&destination.owner, GpuCaptureOwner::IntegerValues(_))
+                    })
+                    .ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+                let GpuCaptureOwner::IntegerValues(destination) = &mut destination.owner else {
+                    unreachable!("integer-values destination classification changed");
+                };
+                if destination.device_id() != physical_device ||
+                    destination.encoding() !=
+                        GpuSignedValuesEncoding::SignedWords(
+                            source.params().modulus_bits().div_ceil(64),
+                        ) ||
+                    destination.count() != source.params().ring_dimension() as usize
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "polynomial-values capture output owner has the wrong device, encoding, or count"
+                            .into(),
+                    ));
+                }
+                let (source_slot, source_shard) = schema_binding_source(
+                    binding_schema,
+                    BindingAccess::Input,
+                    NativeValueComponent::MatrixDescriptors,
+                )
+                .map_err(GpuCaptureAdapterError::Native)?;
+                let (output_slot, output_shard) = schema_binding_source(
+                    binding_schema,
+                    BindingAccess::Output,
+                    NativeValueComponent::IntegerValues,
+                )
+                .map_err(GpuCaptureAdapterError::Native)?;
+                set_capture_binding_sources(
+                    capture,
+                    binding_schema,
+                    &[
+                        (0, source_slot, source_shard, NativeValueComponent::MatrixDescriptors),
+                        (1, output_slot, output_shard, NativeValueComponent::IntegerValues),
+                    ],
+                )
+                .map_err(GpuCaptureAdapterError::Native)?;
+                source.store_values_into_bound(
+                    destination.native(),
+                    *evaluation,
+                    capture_stream,
+                    0,
+                    1,
+                )?;
+                return Ok(GpuCaptureSubmission {
+                    bindings: binding_schema.to_vec().into_boxed_slice(),
+                    resource: None,
+                });
+            }
+        }
+
+        // Protocol primitives use their bound native entry points here.  The
+        // output and status owners were allocated before capture; the only
+        // pointers installed during this call are graph bindings, so the
+        // generic fixed dispatcher cannot accidentally allocate an exemplar
+        // and drop it after capture.
+        if matches!(
+            &request,
+            GpuCaptureRequest::Ordinary(requests)
+                if requests.len() == 1 &&
+                    matches!(
+                        requests.first(),
+                        Some(FixedOperationBatchRequest::ExtractCoefficient { .. }) |
+                            Some(FixedOperationBatchRequest::ThresholdDecode { .. })
+                    )
+        ) {
+            let GpuCaptureRequest::Ordinary(requests) = &request else {
+                unreachable!("protocol request classification changed");
+            };
+            let (value, output_bool, position, length) = match &requests[0] {
+                FixedOperationBatchRequest::ExtractCoefficient { value, position, .. } => {
+                    (value.as_ref(), false, Some(*position), None)
+                }
+                FixedOperationBatchRequest::ThresholdDecode {
+                    value, length, output_bool, ..
+                } => (value.as_ref(), *output_bool, None, Some(*length)),
+                _ => unreachable!("protocol request classification changed"),
+            };
+            if value.shards.len() != 1 || destination_owners.len() != length.unwrap_or(1) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "resident protocol capture requires one source and one output owner".into(),
+                ));
+            }
+            let source =
+                value.shards.iter().find(|shard| shard.device_id == physical_device).ok_or_else(
+                    || {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "resident protocol source is not on the capture device".into(),
+                        )
+                    },
+                )?;
+            // Threshold decoding writes one packed allocation; the remaining
+            // output slots are scalar views of that allocation. Resolve the
+            // full owner explicitly rather than requiring a single output
+            // component in the schema (or depending on destination order).
+            let output_count = length.unwrap_or(1);
+            let mut packed_owners = destination_owners.iter().filter(|destination| {
+                matches!(&destination.owner, GpuCaptureOwner::IntegerValues(values)
+                    if values.count() == output_count)
+            });
+            let packed = packed_owners.next().ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "resident protocol has no full-length integer output owner".into(),
+                )
+            })?;
+            if packed_owners.next().is_some() {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "resident protocol has multiple full-length integer output owners".into(),
+                ));
+            }
+            let output_slot = packed.slot;
+            let GpuCaptureOwner::IntegerValues(destination) = &packed.owner else {
+                unreachable!("packed integer output classification changed");
+            };
+            let packed_binding = destination.binding()?;
+            let stride = (packed_binding.encoding.words_per_value() * 8) as u64;
+            let mut offsets = BTreeSet::new();
+            for owner in destination_owners.iter() {
+                let GpuCaptureOwner::IntegerValues(values) = &owner.owner else {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "resident protocol output is not an integer owner".into(),
+                    ));
+                };
+                let binding = values.binding()?;
+                let offset = binding.device_address.checked_sub(packed_binding.device_address);
+                if values.device_id() != physical_device ||
+                    binding.encoding != packed_binding.encoding ||
+                    offset.is_none_or(|offset| {
+                        offset % stride != 0 ||
+                            offset / stride >= output_count as u64 ||
+                            !offsets.insert(offset / stride)
+                    })
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "resident protocol outputs do not cover one packed integer owner".into(),
+                    ));
+                }
+            }
+            let protocol = protocol_owners.ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "resident protocol capture has no preallocated status owner".into(),
+                )
+            })?;
+            let (source_slot, source_shard) = schema_binding_source(
+                binding_schema,
+                BindingAccess::Input,
+                NativeValueComponent::MatrixDescriptors,
+            )
+            .map_err(GpuCaptureAdapterError::Native)?;
+            set_capture_binding_sources(
+                capture,
+                binding_schema,
+                &[
+                    (0, source_slot, source_shard, NativeValueComponent::MatrixDescriptors),
+                    (1, output_slot, 0, NativeValueComponent::IntegerValues),
+                ],
+            )
+            .map_err(GpuCaptureAdapterError::Native)?;
+            if let Some(position) = position {
+                if destination.count() != 1 ||
+                    destination.encoding() !=
+                        GpuSignedValuesEncoding::SignedWords(
+                            source.value.params().modulus_bits().div_ceil(64),
+                        )
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "coefficient extraction output owner has the wrong shape".into(),
+                    ));
+                }
+                mxx_primitives::poly::dcrt::gpu::GpuDCRTPoly::extract_coefficient_resident_bound(
+                    &source.value,
+                    position,
+                    destination.native(),
+                    Some(protocol.status.native()),
+                    0,
+                    1,
+                    u32::MAX,
+                )?;
+            } else {
+                let length = length.expect("threshold length is present");
+                let scratch = protocol.threshold.as_ref().ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "threshold scratch owner is missing".into(),
+                    )
+                })?;
+                if destination.count() < length ||
+                    destination.encoding() != scratch.output_encoding(output_bool)
+                {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "threshold output owner has the wrong shape".into(),
+                    ));
+                }
+                mxx_primitives::poly::dcrt::gpu::GpuDCRTPoly::threshold_decode_resident_bound(
+                    &source.value,
+                    scratch,
+                    length,
+                    output_bool,
+                    destination.native(),
+                    Some(protocol.status.native()),
+                    0,
+                    1,
+                    u32::MAX,
+                )?;
+            }
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        if matches!(
+            &request,
+            GpuCaptureRequest::Ordinary(requests)
+                if requests.len() == 1 &&
+                    matches!(
+                        requests.first(),
+                        Some(FixedOperationBatchRequest::PackPolynomialCoefficients { .. }) |
+                        Some(FixedOperationBatchRequest::PolynomialFromValues { .. }) |
+                        Some(FixedOperationBatchRequest::LiftIntegerToConstantPolynomial { .. })
+                    )
+        ) {
+            let GpuCaptureRequest::Ordinary(requests) = &request else { unreachable!() };
+            let (source_slot, source_shard) = schema_binding_source(
+                binding_schema,
+                BindingAccess::Input,
+                NativeValueComponent::IntegerValues,
+            )
+            .map_err(GpuCaptureAdapterError::Native)?;
+            let (destination_slot, destination_shard) = schema_binding_source(
+                binding_schema,
+                BindingAccess::Output,
+                NativeValueComponent::MatrixDescriptors,
+            )
+            .map_err(GpuCaptureAdapterError::Native)?;
+            set_capture_binding_sources(
+                capture,
+                binding_schema,
+                &[
+                    (0, source_slot, source_shard, NativeValueComponent::IntegerValues),
+                    (
+                        1,
+                        destination_slot,
+                        destination_shard,
+                        NativeValueComponent::MatrixDescriptors,
+                    ),
+                ],
+            )
+            .map_err(GpuCaptureAdapterError::Native)?;
+            let GpuCaptureOwner::Matrix(destination) = &mut destination_owners[0].owner else {
+                return Err(GpuCaptureAdapterError::EmptyDestinations);
+            };
+            let destination = destination
+                .shards
+                .iter_mut()
+                .find(|shard| shard.device_id == physical_device)
+                .ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+            match &requests[0] {
+                FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                    coefficient, ..
+                } => {
+                    destination.value.write_integer_constant_into_bound(
+                        coefficient.native(),
+                        destination.global_column_start,
+                        capture_stream,
+                        0,
+                        1,
+                    )?;
+                }
+                FixedOperationBatchRequest::PolynomialFromValues { values, evaluation, .. } => {
+                    destination.value.write_values_into_bound(
+                        values.native(),
+                        *evaluation,
+                        capture_stream,
+                        0,
+                        1,
+                    )?;
+                }
+                FixedOperationBatchRequest::PackPolynomialCoefficients {
+                    bits,
+                    coefficient_bits,
+                    ..
+                } => {
+                    let protocol =
+                        protocol_owners.ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+                    let scratch = protocol
+                        .scratch
+                        .as_ref()
+                        .ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+                    mxx_primitives::poly::dcrt::gpu::GpuDCRTPoly::pack_polynomial_coefficients_resident_bound(
+                        bits.native(), *coefficient_bits, scratch.native(), &mut destination.value,
+                        protocol.status.native(), 0, u32::MAX, u32::MAX, 1)?;
+                }
+                _ => unreachable!(),
+            }
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        let fused_decomposition = matches!(
+            &request,
+            GpuCaptureRequest::Fused(requests)
+                if requests.len() == 1 &&
+                    matches!(requests.first(), Some(FusedBatchRequest::Decompose { .. }))
+        );
+        if fused_decomposition {
+            let GpuCaptureRequest::Fused(mut requests) = request else {
+                unreachable!("fused decomposition classification changed");
+            };
+            let FusedBatchRequest::Decompose { blocks, small, digits, .. } =
+                requests.pop().expect("fused decomposition request length checked")
+            else {
+                unreachable!("fused decomposition request classification changed");
+            };
+            if destination_owners.len() != 1 {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition requires one destination".into(),
+                ));
+            }
+            let destination = match &mut destination_owners[0].owner {
+                GpuCaptureOwner::SmallMatrix(destination) => destination,
+                _ => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition destination is not a compact owner".into(),
+                    ));
+                }
+            };
+            if destination.shards.len() != 1 {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition destination must be one resident shard".into(),
+                ));
+            }
+            let mut source_refs = Vec::with_capacity(blocks.len());
+            let mut source_ranges = Vec::new();
+            let output_start = destination.shards[0].global_column_start;
+            let output_end = output_start + destination.shards[0].value.columns_count();
+            let mut row_offset = 0;
+            for block in &blocks {
+                let mut coverage = Vec::new();
+                for source in block.shards.iter().filter(|shard| shard.device_id == physical_device)
+                {
+                    let start = output_start.max(source.global_column_start);
+                    let end = output_end.min(source.global_column_start + source.value.col_size());
+                    if start >= end {
+                        continue;
+                    }
+                    coverage.push((start, end));
+                    source_refs.push(&source.value);
+                    source_ranges.push((
+                        start - source.global_column_start..end - source.global_column_start,
+                        row_offset,
+                        start - output_start,
+                    ));
+                }
+                coverage.sort_unstable();
+                let mut covered = output_start;
+                for (start, end) in coverage {
+                    if start != covered {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "decomposition fragments overlap or leave an uncovered column".into(),
+                        ));
+                    }
+                    covered = end;
+                }
+                if covered != output_end {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition fragments do not cover the destination".into(),
+                    ));
+                }
+                row_offset += block.rows;
+            }
+            let output = &mut destination.shards[0];
+            if output.device_id != physical_device || output.global_column_start != 0 {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition requires a resident destination shard".into(),
+                ));
+            }
+            let destination_slot = destination_owners[0].slot;
+            let destination_binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.access == BindingAccess::Output &&
+                        binding.source ==
+                            BindingSource::ValueComponent {
+                                slot: destination_slot,
+                                shard: 0,
+                                component: NativeValueComponent::CompactPayload,
+                                address_addend: 0,
+                            }
+                })
+                .map(|binding| binding.index)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let output_descriptor = output.value.binding_descriptor()?;
+            capture.bind_resident_address(
+                output_descriptor.payload_address,
+                output_descriptor.payload_bytes,
+                destination_binding,
+            )?;
+            let mut source_bindings = Vec::with_capacity(source_refs.len());
+            for source in &source_refs {
+                let component = source
+                    .binding_components()?
+                    .into_iter()
+                    .find(|component| component.physical_device == physical_device)
+                    .ok_or_else(|| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "decomposition source has no capture-device allocation".into(),
+                        )
+                    })?;
+                let address = component.device_descriptors_address;
+                let bytes = component.device_descriptor_stride * component.limb_count;
+                let source_binding = source_addresses
+                    .iter()
+                    .filter(|(candidate, candidate_bytes, _)| {
+                        *candidate == address && *candidate_bytes == bytes
+                    })
+                    .map(|(_, _, binding)| *binding)
+                    .collect::<Vec<_>>();
+                let source_binding = match source_binding.as_slice() {
+                    [binding] => *binding,
+                    [] => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "decomposition source descriptor is not retained by the capture schema"
+                                .into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "decomposition source descriptor has ambiguous capture bindings".into(),
+                        ));
+                    }
+                };
+                if !binding_schema.iter().any(|binding| {
+                    binding.index == source_binding &&
+                        binding.access == BindingAccess::Input &&
+                        matches!(
+                            binding.source,
+                            BindingSource::ValueComponent {
+                                component: NativeValueComponent::MatrixDescriptors,
+                                address_addend: 0,
+                                ..
+                            }
+                        )
+                }) {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition source binding is not a typed matrix descriptor input"
+                            .into(),
+                    ));
+                }
+                source_bindings.push(source_binding);
+            }
+            for (batch_index, batch) in source_refs.chunks(32).enumerate() {
+                let offset = batch_index * 32;
+                let mut binding_map = source_bindings[offset..offset + batch.len()]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, binding)| (index as u32, *binding))
+                    .collect::<Vec<_>>();
+                binding_map.push((batch.len() as u32, destination_binding));
+                let source_binding_indices =
+                    (0..batch.len()).map(|index| index as u32).collect::<Vec<_>>();
+                capture.set_binding_map(&binding_map).map_err(GpuCaptureAdapterError::Native)?;
+                GpuDCRTPolyMatrix::gadget_decompose_row_blocks_ref_into_bound(
+                    batch,
+                    small,
+                    Some(digits),
+                    &mut output.value,
+                    capture_stream,
+                    &source_binding_indices,
+                    Some(&source_ranges[offset..offset + batch.len()]),
+                )
+                .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+            }
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        if let GpuCaptureRequest::Generation(requests) = &request {
+            if let [
+                FixedGenerationRequest::HashDecomposed {
+                    ty,
+                    key,
+                    tag,
+                    gadget_base,
+                    digit_count,
+                    small,
+                    ..
+                },
+            ] = requests.as_slice()
+            {
+                self.validate_gadget_layout(ty, gadget_base, *digit_count, *small)?;
+                if destination_owners.len() != 1 {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposed hash capture requires one destination".into(),
+                    ));
+                }
+                let destination_slot = destination_owners[0].slot;
+                let GpuCaptureOwner::SmallMatrix(destination) = &mut destination_owners[0].owner
+                else {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposed hash destination is not compact".into(),
+                    ));
+                };
+                let [output] = destination.shards.as_mut_slice() else {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposed hash capture requires one resident output shard".into(),
+                    ));
+                };
+                if output.device_id != physical_device {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposed hash output is on another device".into(),
+                    ));
+                }
+                let binding = binding_schema
+                    .iter()
+                    .find(|binding| {
+                        binding.access == BindingAccess::Output &&
+                            binding.source ==
+                                BindingSource::ValueComponent {
+                                    slot: destination_slot,
+                                    shard: 0,
+                                    component: NativeValueComponent::CompactPayload,
+                                    address_addend: 0,
+                                }
+                    })
+                    .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+                let descriptor = output.value.binding_descriptor()?;
+                capture.bind_resident_address(
+                    descriptor.payload_address,
+                    descriptor.payload_bytes,
+                    binding.index,
+                )?;
+                // The hash source is internal graph scratch. Only the final
+                // compact payload is rebound to the planned runtime owner.
+                capture.set_binding_map(&[])?;
+                let params = self.parameters_on_device(ty, physical_device)?;
+                let source = GpuDCRTPolyHashSampler::<keccak_asm::Keccak256>::new()
+                    .sample_hash_gadget_source_columns(
+                        params,
+                        *key,
+                        tag,
+                        ty.rows / *digit_count,
+                        ty.columns,
+                        output.global_column_start,
+                        output.value.columns_count(),
+                        DistType::FinRingDist,
+                    );
+                let scratch_binding = capture.claim_binding_range(1)?;
+                capture.set_binding_map(&[(0, scratch_binding), (1, binding.index)])?;
+                source
+                    .gadget_decompose_ref_into(
+                        *small,
+                        Some(*digit_count),
+                        &mut output.value,
+                        capture_stream,
+                    )
+                    .map_err(|error| {
+                        GpuCaptureAdapterError::UnsupportedOperation(error.to_string())
+                    })?;
+                self.capture_resources.push(Arc::new(source));
+                return Ok(GpuCaptureSubmission {
+                    bindings: binding_schema.to_vec().into_boxed_slice(),
+                    resource: None,
+                });
+            }
+        }
+
+        // Decomposition is a compact producer whose destination owner
+        // is already allocated by the capture planner. Use that owner as the
+        // native output directly; routing through the fixed batch allocator
+        // would create a fresh compact owner while the stream is capturing.
+        if let GpuCaptureRequest::Decomposition(requests) = request {
+            if requests.len() != 1 || destination_owners.len() != 1 {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition requires one request and one destination".into(),
+                ));
+            }
+            let destination = match &mut destination_owners[0].owner {
+                GpuCaptureOwner::SmallMatrix(destination) => destination,
+                _ => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition destination is not a compact owner".into(),
+                    ));
+                }
+            };
+            if destination.shards.len() != 1 {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition destination must be one resident shard".into(),
+                ));
+            }
+            let request = &requests[0];
+            let source = request
+                .input
+                .shards
+                .iter()
+                .find(|shard| shard.device_id == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition source is not resident on the capture device".into(),
+                    )
+                })?;
+            let output = &mut destination.shards[0];
+            if output.device_id != physical_device ||
+                output.global_column_start != 0 ||
+                source.global_column_start != 0 ||
+                source.value.col_size() != request.input.columns
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "capture decomposition requires full resident source and destination shards"
+                        .into(),
+                ));
+            }
+            let destination_slot = destination_owners[0].slot;
+            let destination_binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.access == BindingAccess::Output &&
+                        binding.source ==
+                            BindingSource::ValueComponent {
+                                slot: destination_slot,
+                                shard: 0,
+                                component: NativeValueComponent::CompactPayload,
+                                address_addend: 0,
+                            }
+                })
+                .map(|binding| binding.index)
+                .ok_or(GpuCaptureAdapterError::MissingBinding(destination_slot))?;
+            let output_descriptor = output.value.binding_descriptor()?;
+            capture.bind_resident_address(
+                output_descriptor.payload_address,
+                output_descriptor.payload_bytes,
+                destination_binding,
+            )?;
+            let source_component = source
+                .value
+                .binding_components()?
+                .into_iter()
+                .find(|component| component.physical_device == physical_device)
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition source has no capture-device allocation".into(),
+                    )
+                })?;
+            let source_address = source_component.device_descriptors_address;
+            let source_bytes =
+                source_component.device_descriptor_stride * source_component.limb_count;
+            let source_binding = source_addresses
+                .iter()
+                .filter(|(address, bytes, _)| *address == source_address && *bytes == source_bytes)
+                .map(|(_, _, binding)| *binding)
+                .collect::<Vec<_>>();
+            let source_binding = match source_binding.as_slice() {
+                [binding] => *binding,
+                [] => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition source descriptor is not retained by the capture schema"
+                            .into(),
+                    ));
+                }
+                _ => {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                        "decomposition source descriptor has ambiguous capture bindings".into(),
+                    ));
+                }
+            };
+            if !binding_schema.iter().any(|binding| {
+                binding.index == source_binding &&
+                    binding.access == BindingAccess::Input &&
+                    matches!(
+                        binding.source,
+                        BindingSource::ValueComponent {
+                            component: NativeValueComponent::MatrixDescriptors,
+                            address_addend: 0,
+                            ..
+                        }
+                    )
+            }) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "decomposition source binding is not a typed matrix descriptor input".into(),
+                ));
+            }
+            capture
+                .set_binding_map(&[(0, source_binding), (1, destination_binding)])
+                .map_err(GpuCaptureAdapterError::Native)?;
+            source
+                .value
+                .gadget_decompose_ref_into_bound(
+                    request.small,
+                    Some(request.digits),
+                    &mut output.value,
+                    capture_stream,
+                    0,
+                )
+                .map_err(|error| GpuCaptureAdapterError::UnsupportedOperation(error.to_string()))?;
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        if let Some(submission) = self.submit_capture_fused_small_product(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_matrix_product(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_slice(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_concat(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_fused_add(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_crt_recompose(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_unary_descriptors(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+        if let Some(submission) = self.submit_capture_fused_tensor_row_sums(
+            &request,
+            destination_owners,
+            binding_schema,
+            physical_device,
+            source_addresses,
+            capture,
+            capture_stream,
+        )? {
+            return Ok(submission);
+        }
+
+        // Fixed dispatch allocates output exemplars while capture is active.
+        // They are deliberately dropped at the end of this method: only the
+        // native patch schema may survive into the compiled plan.
+        let effective_operation = match &step.operation {
+            CaptureOperation::Fixed { operation, .. } => *operation,
+            CaptureOperation::Generation { .. } => {
+                crate::gpu_column_policy::EffectiveGpuOperation::UniformResidueSample
+            }
+            CaptureOperation::Trapdoor { .. } => {
+                crate::gpu_column_policy::EffectiveGpuOperation::TrapdoorSample
+            }
+            CaptureOperation::Decomposition { .. } => {
+                crate::gpu_column_policy::EffectiveGpuOperation::GadgetDecompose
+            }
+            other => {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "fixed capture has unsupported operation schema: {other:?}"
+                )))
+            }
+        };
+        // Modulus conversion first clones an NTT source into coefficient domain.
+        // That normalization copy uses the source's S-limb ABI even when the
+        // planned destination has D limbs. Keep the copy's local namespace
+        // tied to the typed source owner; using the destination count leaves
+        // locals S..2S unresolved when S > D.
+        let source_limb_count = if matches!(
+            effective_operation,
+            crate::gpu_column_policy::EffectiveGpuOperation::RnsModUp |
+                crate::gpu_column_policy::EffectiveGpuOperation::RnsModDown |
+                crate::gpu_column_policy::EffectiveGpuOperation::BlockModSwitch |
+                crate::gpu_column_policy::EffectiveGpuOperation::ModulusSwitch
+        ) {
+            let GpuCaptureRequest::Ordinary(requests) = &request else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "modulus conversion capture requires an ordinary unary request".into(),
+                ));
+            };
+            let [FixedOperationBatchRequest::UnaryTransform { operation, value, .. }] =
+                requests.as_slice()
+            else {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "modulus conversion capture requires one unary source".into(),
+                ));
+            };
+            if !matches!(
+                operation,
+                crate::backend::FixedUnaryOperation::RnsModUp { .. } |
+                    crate::backend::FixedUnaryOperation::RnsModDown { .. } |
+                    crate::backend::FixedUnaryOperation::BlockModSwitch { .. } |
+                    crate::backend::FixedUnaryOperation::ModulusSwitch { .. }
+            ) {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "modulus conversion operation does not match its fixed request".into(),
+                ));
+            }
+            let components = value.binding_components()?;
+            components.first().map(|component| component.limb_count).ok_or_else(|| {
+                GpuCaptureAdapterError::UnsupportedOperation(
+                    "modulus conversion source has no CRT binding component".into(),
+                )
+            })?
+        } else {
+            0
+        };
+        let limb_count = if source_limb_count != 0 {
+            source_limb_count
+        } else {
+            destination_owners
+                .iter()
+                .find_map(|destination| match &destination.owner {
+                    GpuCaptureOwner::Matrix(value) => {
+                        value.binding_components().ok().and_then(|components| {
+                            components.first().map(|component| component.limb_count)
+                        })
+                    }
+                    _ => None,
+                })
+                .unwrap_or(1)
+        };
+        let descriptor_inputs = fixed_descriptor_input_bindings(
+            &request,
+            effective_operation,
+            physical_device,
+            source_addresses,
+        )?;
+        set_fixed_leaf_binding_map(
+            capture,
+            &request,
+            effective_operation,
+            binding_schema,
+            limb_count,
+            descriptor_inputs.as_deref(),
+        )
+        .map_err(GpuCaptureAdapterError::Native)?;
+        let captured = match request {
+            GpuCaptureRequest::Ordinary(requests) => {
+                if requests.is_empty() {
+                    return Err(GpuCaptureAdapterError::EmptyRequest);
+                }
+                <Self as Backend>::fixed_operation_batch(self, requests)?
+                    .into_iter()
+                    .map(|output| match output {
+                        FixedOperationBatchOutput::Matrix(value) => {
+                            Ok(CapturedOwner::Matrix(value))
+                        }
+                        FixedOperationBatchOutput::IntegerValues(value) => {
+                            Ok(CapturedOwner::IntegerValues(value))
+                        }
+                        FixedOperationBatchOutput::IntegerValuesMany(_) => {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "multi-port integer output requires resident capture owners".into(),
+                            ));
+                        }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+            }
+            GpuCaptureRequest::Fused(requests) => {
+                if requests.is_empty() {
+                    return Err(GpuCaptureAdapterError::EmptyRequest);
+                }
+                <Self as Backend>::fixed_fused_batch(self, requests)?
+                    .into_iter()
+                    .flat_map(|output| match output {
+                        FusedBatchOutput::Matrices(values) => {
+                            values.into_iter().map(CapturedOwner::Matrix).collect::<Vec<_>>()
+                        }
+                        FusedBatchOutput::Small(value) => vec![CapturedOwner::SmallMatrix(value)],
+                    })
+                    .collect::<Vec<_>>()
+            }
+            GpuCaptureRequest::Compact(requests) => {
+                if requests.is_empty() {
+                    return Err(GpuCaptureAdapterError::EmptyRequest);
+                }
+                <Self as Backend>::fixed_compact_operation_batch(self, requests)?
+                    .into_iter()
+                    .map(CapturedOwner::SmallMatrix)
+                    .collect::<Vec<_>>()
+            }
+            GpuCaptureRequest::Generation(requests) => {
+                if requests.is_empty() {
+                    return Err(GpuCaptureAdapterError::EmptyRequest);
+                }
+                <Self as Backend>::fixed_generation_batch(self, requests)?
+                    .into_iter()
+                    .map(|output| match output {
+                        FixedGenerationOutput::Matrix(value) => CapturedOwner::Matrix(value),
+                        FixedGenerationOutput::Small(value) => CapturedOwner::SmallMatrix(value),
+                    })
+                    .collect::<Vec<_>>()
+            }
+            GpuCaptureRequest::Decomposition(requests) => {
+                if requests.is_empty() {
+                    return Err(GpuCaptureAdapterError::EmptyRequest);
+                }
+                <Self as Backend>::fixed_gadget_decompose_batch(self, requests)?
+                    .into_iter()
+                    .map(CapturedOwner::SmallMatrix)
+                    .collect::<Vec<_>>()
+            }
+            GpuCaptureRequest::Trapdoor(_) => unreachable!("trapdoor pair uses dedicated capture"),
+            GpuCaptureRequest::Preimage(requests) => {
+                let request_count = requests.len();
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                    "preimage capture requires a conditional retry body ({request_count} requests)",
+                )));
+            }
+        };
+        if captured.is_empty() {
+            return Err(GpuCaptureAdapterError::EmptyRequest);
+        }
+
+        if captured.len() != destination_owners.len() {
+            return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                "capture produced {} outputs for {} destination slots",
+                captured.len(),
+                destination_owners.len()
+            )));
+        }
+        let mut bindings = Vec::new();
+        for (destination, captured) in destination_owners.iter_mut().zip(captured) {
+            if let (CapturedOwner::Matrix(source), GpuCaptureOwner::Matrix(output)) =
+                (&captured, &mut destination.owner)
+            {
+                if source.size() != output.size() {
+                    return Err(GpuCaptureAdapterError::UnsupportedOperation(format!(
+                        "capture output {:?} shape {:?} differs from planned {:?}",
+                        destination.slot,
+                        source.size(),
+                        output.size()
+                    )));
+                }
+                let output_bindings = matrix_capture_bindings(output, destination.slot)?;
+                for source_binding in &output_bindings {
+                    let binding = binding_schema
+                        .iter()
+                        .find(|binding| binding.source == *source_binding)
+                        .ok_or(GpuCaptureAdapterError::MissingBinding(destination.slot))?;
+                    let BindingSource::ValueComponent { shard, component, .. } = source_binding;
+                    let native = output.binding_components()?[*shard as usize];
+                    let (address, bytes) = match component {
+                        NativeValueComponent::MatrixData => {
+                            (native.data_address, native.data_bytes)
+                        }
+                        NativeValueComponent::MatrixDescriptors => (
+                            native.device_descriptors_address,
+                            native.device_descriptor_stride * native.limb_count,
+                        ),
+                        NativeValueComponent::MatrixAuxiliary => {
+                            (native.auxiliary_address, native.auxiliary_slots_total * 8)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if address != 0 && bytes != 0 {
+                        capture.bind_resident_address(address, bytes, binding.index)?;
+                    }
+                }
+                // Captured column jobs may have narrower row strides than
+                // the replay owner. Keep those graph-local allocations and
+                // copy their semantic ranges into the actual destination;
+                // redirecting their raw pointers would change row layout.
+                for (output_shard_index, output_shard) in output.shards.iter_mut().enumerate() {
+                    for source_shard in &source.shards {
+                        let start =
+                            output_shard.global_column_start.max(source_shard.global_column_start);
+                        let end = (output_shard.global_column_start +
+                            output_shard.value.col_size())
+                        .min(source_shard.global_column_start + source_shard.value.col_size());
+                        if start < end {
+                            // Expand both copy binding ranges by local limb;
+                            // offsets within the physical allocation are
+                            // retained by resident pointer registration.
+                            let destination_shard =
+                                u32::try_from(output_shard_index).map_err(|_| {
+                                    GpuCaptureAdapterError::MissingBinding(destination.slot)
+                                })?;
+                            let limb_count = u32::try_from(source_shard.value.level() + 1)
+                                .map_err(|_| {
+                                    GpuCaptureAdapterError::MissingBinding(destination.slot)
+                                })?;
+                            // The fixed producer's result is graph-internal.  Its
+                            // output pointer is nevertheless the authoritative
+                            // replay owner, so register that physical output as
+                            // both the source and destination of the copy node.
+                            // This gives the capture ABI an explicit source
+                            // identity while avoiding a frozen exemplar pointer.
+                            let destination_binding = binding_schema
+                                .iter()
+                                .find(|binding| {
+                                    binding.source ==
+                                        BindingSource::ValueComponent {
+                                            slot: destination.slot,
+                                            shard: destination_shard,
+                                            component: NativeValueComponent::MatrixData,
+                                            address_addend: 0,
+                                        }
+                                })
+                                .map(|binding| binding.index)
+                                .ok_or(GpuCaptureAdapterError::MissingBinding(destination.slot))?;
+                            let source_binding = source_shard
+                                .value
+                                .binding_components()?
+                                .into_iter()
+                                .find_map(|component| {
+                                    source_addresses.iter().find_map(|(address, _, binding)| {
+                                        (*address == component.data_address).then_some(*binding)
+                                    })
+                                })
+                                .unwrap_or(destination_binding);
+                            let mappings = (0..limb_count)
+                                .flat_map(|limb| {
+                                    [
+                                        (limb, destination_binding),
+                                        (limb_count + limb, source_binding),
+                                    ]
+                                })
+                                .map(|(local, global)| (local, global))
+                                .collect::<Vec<_>>();
+                            capture
+                                .set_binding_map(&mappings)
+                                .map_err(GpuCaptureAdapterError::Native)?;
+                            // Fixed generation may allocate/fill the captured
+                            // source on a producer stream distinct from the
+                            // capture stream.  The copy is a graph node on
+                            // `capture_stream`, so join every source limb's
+                            // producer event before recording that node.  A
+                            // graph capture does not infer this dependency
+                            // from the raw pointer alone, especially for
+                            // stream-ordered cudaMallocAsync allocations.
+                            source_shard.value.wait_compiled_inputs(
+                                physical_device,
+                                capture_stream,
+                                true,
+                            )?;
+                            source_shard.value.copy_columns_into_on_capture_stream(
+                                &mut output_shard.value,
+                                start - source_shard.global_column_start,
+                                start - output_shard.global_column_start,
+                                end - start,
+                                capture_stream,
+                                limb_count,
+                                0,
+                            )?;
+                        }
+                    }
+                }
+                for source in output_bindings {
+                    let binding = binding_schema
+                        .iter()
+                        .find(|binding| binding.source == source)
+                        .ok_or(GpuCaptureAdapterError::MissingBinding(destination.slot))?;
+                    let BindingSource::ValueComponent { shard, component, .. } = source;
+                    let native = output.binding_components()?[shard as usize];
+                    let (address, bytes) = match component {
+                        NativeValueComponent::MatrixData => {
+                            (native.data_address, native.data_bytes)
+                        }
+                        NativeValueComponent::MatrixDescriptors => (
+                            native.device_descriptors_address,
+                            native.device_descriptor_stride * native.limb_count,
+                        ),
+                        NativeValueComponent::MatrixAuxiliary => {
+                            (native.auxiliary_address, native.auxiliary_slots_total * 8)
+                        }
+                        _ => unreachable!(),
+                    };
+                    if address != 0 && bytes != 0 {
+                        capture.bind_resident_address(address, bytes, binding.index)?;
+                    }
+                    bindings.push(binding.clone());
+                }
+                continue;
+            }
+            let produced = captured_owner_bindings(&captured, destination.slot, binding_schema)?;
+            for binding in &produced {
+                let BindingSource::ValueComponent { shard, component, .. } = binding.source;
+                let matrix_component = match &captured {
+                    CapturedOwner::Matrix(matrix) => {
+                        matrix.binding_components()?.get(shard as usize).copied()
+                    }
+                    _ => None,
+                };
+                if let Some(native) = matrix_component {
+                    let (address, bytes) = match component {
+                        NativeValueComponent::MatrixDescriptors => (
+                            native.device_descriptors_address,
+                            native.device_descriptor_stride * native.limb_count,
+                        ),
+                        NativeValueComponent::MatrixAuxiliary => {
+                            (native.auxiliary_address, native.auxiliary_slots_total * 8)
+                        }
+                        _ => (native.data_address, native.data_bytes),
+                    };
+                    if address != 0 && bytes != 0 {
+                        capture.bind_resident_address(address, bytes, binding.index)?;
+                    }
+                } else if let CapturedOwner::SmallMatrix(matrix) = &captured {
+                    let native = matrix.binding_descriptors()?[shard as usize];
+                    let (address, bytes) = match component {
+                        NativeValueComponent::CompactPayload => {
+                            (native.payload_address, native.payload_bytes)
+                        }
+                        NativeValueComponent::CompactHardCutoffStaging => {
+                            (native.hard_cutoff_staging_address, native.hard_cutoff_staging_bytes)
+                        }
+                        NativeValueComponent::CompactHostStatus => (native.host_status_address, 1),
+                        _ => (native.device_status_address, 1),
+                    };
+                    if address != 0 && bytes != 0 {
+                        capture.bind_resident_address(address, bytes, binding.index)?;
+                    }
+                }
+            }
+            for produced in produced {
+                if !binding_schema.iter().any(|binding| {
+                    binding.index == produced.index && binding.source == produced.source
+                }) {
+                    return Err(GpuCaptureAdapterError::MissingBinding(destination.slot));
+                }
+                bindings.push(produced);
+            }
+        }
+        if bindings.is_empty() {
+            return Err(GpuCaptureAdapterError::EmptyDestinations);
+        }
+        // The native graph also patches input descriptors. Preserve the
+        // frozen input schema and only use the captured owners above to prove
+        // that every output slot has a matching native binding.
+        Ok(GpuCaptureSubmission {
+            bindings: binding_schema.to_vec().into_boxed_slice(),
+            resource: None,
+        })
+    }
+
+    /// Queue producer dependencies, patch flat bindings, and launch a region
+    /// asynchronously. Waiting is device-side and therefore does not turn a
+    /// replay into a host synchronization point.
+    pub(crate) fn bind_and_launch_compiled_region(
+        &self,
+        region: &mut GpuCompiledRegion,
+        bindings: &[GpuGraphBindingValue],
+        producer_events: &[&GpuNativeEvent],
+    ) -> Result<GpuNativeEvent, GpuNativeGraphError> {
+        for event in producer_events {
+            event.enqueue_wait(&region.launch_stream)?;
+        }
+        region.exec.bind(bindings)?;
+        let completion = region.exec.launch(&region.launch_stream)?;
+        fn protect_resource(
+            resource: &GpuCompiledRegionResource,
+            physical_device: i32,
+            launch_stream: &GpuNativeLaunchStream,
+            completion: &GpuNativeEvent,
+        ) -> Result<(), GpuNativeGraphError> {
+            match resource {
+                GpuCompiledRegionResource::Resources(resources) => {
+                    resources.iter().try_for_each(|resource| {
+                        protect_resource(resource, physical_device, launch_stream, completion)
+                    })
+                }
+                GpuCompiledRegionResource::Preimage(allocation) => {
+                    for matrix in [
+                        &allocation.p2,
+                        &allocation.tp2,
+                        &allocation.p1,
+                        &allocation.residual,
+                        &allocation.z_hat,
+                        &allocation.candidate,
+                    ] {
+                        matrix.protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                            false,
+                        )?;
+                    }
+                    Ok(())
+                }
+                GpuCompiledRegionResource::ModulusConversion(plan) => {
+                    plan.protect_compiled_submission(physical_device, launch_stream, completion)
+                }
+                GpuCompiledRegionResource::MatrixConstants(constants) => {
+                    constants.iter().try_for_each(|matrix| {
+                        matrix.protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                            true,
+                        )
+                    })
+                }
+                GpuCompiledRegionResource::MatrixReplicas(replicas) => {
+                    replicas.iter().try_for_each(|matrix| {
+                        matrix.protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                            true,
+                        )
+                    })
+                }
+                GpuCompiledRegionResource::MatrixFamilyTables(tables) => {
+                    if tables.iter().any(|table| {
+                        table.physical_device() != physical_device ||
+                            table.family_count() == 0 ||
+                            table.limb_count() == 0
+                    }) {
+                        return Err(GpuNativeGraphError::Native(
+                            "matrix-family capture resource is incompatible with its graph device"
+                                .into(),
+                        ));
+                    }
+                    Ok(())
+                }
+                GpuCompiledRegionResource::MatrixLaneDestinations(tables) => {
+                    if tables.iter().any(|table| {
+                        table.physical_device() != physical_device || table.lane_count() == 0
+                    }) {
+                        return Err(GpuNativeGraphError::Native(
+                            "matrix lane destination resource is incompatible with its graph device"
+                                .into(),
+                        ));
+                    }
+                    Ok(())
+                }
+                GpuCompiledRegionResource::ProtocolValues { status, scratch, threshold } => {
+                    status.native().protect_compiled_submission(
+                        physical_device,
+                        launch_stream,
+                        completion,
+                        false,
+                    )?;
+                    if let Some(scratch) = scratch {
+                        scratch.native().protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                            false,
+                        )?;
+                    }
+                    if let Some(threshold) = threshold {
+                        threshold.protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                        )?;
+                    }
+                    Ok(())
+                }
+                GpuCompiledRegionResource::IntegerConstants(values) => {
+                    for value in values {
+                        value.protect_compiled_submission(
+                            physical_device,
+                            launch_stream,
+                            completion,
+                            true,
+                        )?;
+                    }
+                    Ok(())
+                }
+            }
+        }
+        if let Some(resource) = &region.resource {
+            protect_resource(resource, region.physical_device, &region.launch_stream, &completion)?;
+        }
+        Ok(completion)
+    }
+
+    /// Drain a launch-quarantine boundary. Callers use this only after a
+    /// `LaunchUncertain` result; until this boundary returns, every input,
+    /// output, and executable owner associated with that launch must remain
+    /// retained. The device-wide fence is conservative but fail-closed: it
+    /// prevents an uncertain launch from racing owner destruction.
+    pub(crate) fn drain_uncertain_launches(&mut self) -> Result<(), GpuNativeGraphError> {
+        mxx_primitives::poly::dcrt::gpu::gpu_device_sync();
+        self.fence_released_memory().map_err(|error| GpuNativeGraphError::Native(error.to_string()))
+    }
+
     /// Resolve the registered native parameters without creating a matrix
     /// owner. Compact preparation and production use the same registry.
     pub fn parameters(
@@ -262,6 +13545,22 @@ impl GpuDcrtBackend {
     ) -> Result<&GpuDCRTPolyParams, PolyBackendError> {
         self.devices
             .first()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?
+            .1
+            .parameters(matrix_type)
+    }
+
+    /// Resolve the native parameter context for a selected capture device.
+    /// Capture setup must not borrow the fleet's first context when the frozen
+    /// job was admitted on another physical GPU.
+    pub(crate) fn parameters_on_device(
+        &self,
+        matrix_type: &ConcreteMatrixType,
+        device_id: i32,
+    ) -> Result<&GpuDCRTPolyParams, PolyBackendError> {
+        self.devices
+            .iter()
+            .find(|(device, _)| *device == device_id)
             .ok_or(PolyBackendError::UnsupportedPlacement)?
             .1
             .parameters(matrix_type)
@@ -300,49 +13599,350 @@ impl GpuDcrtBackend {
             .len()
     }
 
-    /// Native polynomial boundary shared by production codecs and their
-    /// separately timed warmup transport stage.
-    pub fn download_polynomial_values(
-        &mut self,
-        value: &GpuFleetMatrix,
-        evaluation: bool,
-    ) -> Result<Vec<num_bigint::BigUint>, PolyBackendError> {
-        if value.size() != (1, 1) {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        let full = self.gather_matrix(value)?;
-        self.devices[0].1.parameters_for_matrix(&full)?;
-        let polynomial = full.entry(0, 0);
-        Ok(if evaluation { polynomial.evals_biguints() } else { polynomial.coeffs_biguints() })
-    }
-
-    pub fn upload_polynomial_values(
-        &mut self,
-        ty: &ConcreteMatrixType,
-        values: &[num_bigint::BigUint],
-        evaluation: bool,
-    ) -> Result<GpuFleetMatrix, PolyBackendError> {
-        if !ty.is_scalar() || values.len() != ty.ring_dimension {
-            return Err(PolyBackendError::InvalidInteger);
-        }
-        let parameters = self.devices[0].1.parameters(ty)?;
-        let polynomial = if evaluation {
-            <GpuDCRTPolyMatrix as PolyMatrix>::P::from_biguints_eval(parameters, values)
-        } else {
-            <GpuDCRTPolyMatrix as PolyMatrix>::P::from_biguints(parameters, values)
-        };
-        Ok(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::from_poly_vec_row(
-            parameters,
-            vec![polynomial],
-        )))
-    }
-
     /// Physical CUDA owners retained by this fleet backend.  Setup-time
     /// measurement uses this value to keep the complete source-owner set in
     /// its session; reducing a fleet backend to its first destination device
     /// would make cross-device ranges look resident.
     pub fn physical_device_ids(&self) -> Vec<i32> {
         self.devices.iter().map(|(device, _)| *device).collect()
+    }
+
+    pub(crate) fn integer_values_from_host_on_device(
+        &mut self,
+        device_id: i32,
+        values: &[BigInt],
+    ) -> Result<GpuFleetSignedValues, PolyBackendError> {
+        let device = self
+            .devices
+            .iter()
+            .find(|(device, _)| *device == device_id)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = device
+            .1
+            .parameters
+            .iter()
+            .flat_map(|parameters| parameters.values())
+            .next()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        if let Some(small) = values.iter().map(ToPrimitive::to_i64).collect::<Option<Vec<_>>>() {
+            GpuFleetSignedValues::from_i64(parameters, device_id, &small)
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))
+        } else {
+            GpuSignedValues::from_bigints(parameters, device_id, values)
+                .map(|values| GpuFleetSignedValues::new(device_id, values))
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))
+        }
+    }
+
+    /// Upload boolean boundaries in the encoding required by Boolean slots.
+    pub(crate) fn boolean_values_from_host_on_device(
+        &self,
+        device_id: i32,
+        values: &[bool],
+    ) -> Result<GpuFleetSignedValues, PolyBackendError> {
+        let device = self
+            .devices
+            .iter()
+            .find(|(device, _)| *device == device_id)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = device
+            .1
+            .parameters
+            .iter()
+            .flat_map(|parameters| parameters.values())
+            .next()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let words = values.iter().copied().map(u64::from).collect::<Vec<_>>();
+        GpuSignedValues::from_canonical_u64(parameters, device_id, &words)
+            .map(|values| GpuFleetSignedValues::new(device_id, values))
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))
+    }
+
+    /// Route a resident integer owner to the frozen capture device.  This is
+    /// always a device-to-device copy; in particular, integer gather inputs
+    /// are never read back to the host while compiling a graph.
+    pub(crate) fn materialize_integer_values_on_device(
+        &mut self,
+        source: &GpuFleetSignedValues,
+        destination_device: i32,
+    ) -> Result<GpuFleetSignedValues, PolyBackendError> {
+        if source.device_id() == destination_device {
+            return Ok(source.clone());
+        }
+        let device = self
+            .devices
+            .iter()
+            .find(|(device, _)| *device == destination_device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = device
+            .1
+            .parameters
+            .iter()
+            .flat_map(|parameters| parameters.values())
+            .next()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let target = GpuFleetSignedValues::allocate(
+            parameters,
+            destination_device,
+            source.count(),
+            source.encoding(),
+        )
+        .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        source
+            .native()
+            .copy_into(target.native())
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        Ok(target)
+    }
+
+    /// Materialize a matrix exemplar on one capture device.  The route is
+    /// selected from the frozen owner geometry and native peer capability;
+    /// once selected, the helper invokes only that route.  A peer failure is
+    /// surfaced as an unsupported placement instead of being retried through
+    /// a different transport.
+    pub(crate) fn materialize_capture_matrix_on_device(
+        &mut self,
+        source: &GpuFleetMatrix,
+        destination_device: i32,
+    ) -> Result<GpuFleetMatrix, PolyBackendError> {
+        if source.columns == 0 {
+            return Ok(source.clone());
+        }
+        let destination = self
+            .devices
+            .iter()
+            .position(|(device, _)| *device == destination_device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let backend = &self.devices[destination].1;
+        let all_resident = source.shards.iter().all(|shard| {
+            shard.device_id == destination_device &&
+                backend.matrix_is_on_active_placement(&shard.value)
+        });
+        let peer_available = !all_resident &&
+            source.shards.iter().all(|shard| {
+                backend
+                    .parameters_for_matrix(&shard.value)
+                    .ok()
+                    .and_then(|target| shard.value.can_copy_to_params_direct(target).ok())
+                    .unwrap_or(false)
+            });
+        let route = if all_resident {
+            GpuTransferRoute::Resident
+        } else if peer_available {
+            GpuTransferRoute::Peer
+        } else {
+            GpuTransferRoute::HostStaging
+        };
+        let source_devices = source.shards.iter().map(|shard| shard.device_id).collect::<Vec<_>>();
+        let (value, _) = self.materialize_matrix_job_input(
+            source,
+            ColumnRange { start: 0, end: source.columns },
+            destination,
+            route,
+        )
+        .map_err(|error| {
+            PolyBackendError::GpuCalibration(format!(
+                "capture matrix materialization failed: route={route:?}, source_devices={source_devices:?}, destination_device={destination_device}: {error}"
+            ))
+        })?;
+        Ok(GpuFleetMatrix::from_matrix(value))
+    }
+
+    /// Retain matching replay owners, including a frozen column-fragment
+    /// topology. Repartition incompatible resident/peer inputs on the device;
+    /// never silently replace a fragmented binding ABI by a single owner.
+    pub(crate) fn materialize_capture_matrix_shared_on_device(
+        &mut self,
+        source: Arc<GpuFleetMatrix>,
+        destination_device: i32,
+        layout: Option<&CapturedMatrixInputLayout>,
+    ) -> Result<Arc<GpuFleetMatrix>, PolyBackendError> {
+        if layout.is_some_and(|layout| {
+            self.capture_matrix_layout_compatible(&source, destination_device, layout)
+        }) {
+            return Ok(source);
+        }
+        if let Some(layout) = layout.filter(|layout| !layout.fragments.is_empty()) {
+            if source.rows != layout.rows || source.columns != layout.columns {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            }
+            let destination = self
+                .devices
+                .iter()
+                .position(|(device, _)| *device == destination_device)
+                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let backend = &self.devices[destination].1;
+            let route = if source.shards.iter().all(|shard| {
+                shard.device_id == destination_device &&
+                    backend.matrix_is_on_active_placement(&shard.value)
+            }) {
+                GpuTransferRoute::Resident
+            } else if source.shards.iter().all(|shard| {
+                backend
+                    .parameters_for_matrix(&shard.value)
+                    .ok()
+                    .and_then(|target| shard.value.can_copy_to_params_direct(target).ok())
+                    .unwrap_or(false)
+            }) {
+                GpuTransferRoute::Peer
+            } else {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            };
+            let mut shards = Vec::with_capacity(layout.fragments.len());
+            for fragment in &layout.fragments {
+                let (value, _) = self
+                    .materialize_matrix_job_input(
+                        &source,
+                        ColumnRange {
+                            start: fragment.column_start,
+                            end: fragment.column_start + fragment.columns,
+                        },
+                        destination,
+                        route,
+                    )
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                shards.push(GpuColumnShard {
+                    device_id: destination_device,
+                    global_column_start: fragment.column_start,
+                    value,
+                });
+            }
+            let materialized = Arc::new(GpuFleetMatrix::new(source.rows, source.columns, shards));
+            if !self.capture_matrix_layout_compatible(&materialized, destination_device, layout) {
+                return Err(PolyBackendError::UnsupportedPlacement);
+            }
+            return Ok(materialized);
+        }
+        self.materialize_capture_matrix_on_device(&source, destination_device).map(Arc::new)
+    }
+
+    fn capture_matrix_layout_compatible(
+        &self,
+        source: &GpuFleetMatrix,
+        destination_device: i32,
+        layout: &CapturedMatrixInputLayout,
+    ) -> bool {
+        if source.rows != layout.rows || source.columns != layout.columns {
+            return false;
+        }
+        if layout.fragments.is_empty() {
+            if !layout.single_owner || source.shards.len() != 1 {
+                return false;
+            }
+        } else if source.shards.len() != layout.fragments.len() {
+            return false;
+        }
+        for (index, shard) in source.shards.iter().enumerate() {
+            let (column_start, columns, components) = match layout.fragments.get(index) {
+                Some(fragment) => {
+                    (fragment.column_start, fragment.columns, fragment.components.as_ref())
+                }
+                None => (0, source.columns, layout.components.as_ref()),
+            };
+            if shard.device_id != destination_device ||
+                shard.global_column_start != column_start ||
+                shard.value.col_size() != columns ||
+                shard.value.size().0 != layout.rows ||
+                shard.value.level() != layout.level ||
+                shard.value.is_ntt() != layout.is_ntt
+            {
+                return false;
+            }
+            let Some((_, backend)) =
+                self.devices.iter().find(|(device, _)| *device == destination_device)
+            else {
+                return false;
+            };
+            let Ok(target) = backend.parameters_for_matrix(&shard.value) else {
+                return false;
+            };
+            if !backend.matrix_is_on_active_placement(&shard.value) ||
+                shard.value.params().context_execution_identity() !=
+                    target.context_execution_identity()
+            {
+                return false;
+            }
+            let Ok(actual) = shard.value.binding_components() else {
+                return false;
+            };
+            if actual.len() != components.len() ||
+                !actual.iter().zip(components.iter()).all(|(actual, captured)| {
+                    actual.physical_device == captured.physical_device &&
+                        actual.limb_count == captured.limb_count &&
+                        actual.bytes_per_poly == captured.bytes_per_poly &&
+                        actual.data_bytes == captured.data_bytes &&
+                        actual.ring_dimension == captured.ring_dimension &&
+                        actual.device_descriptor_stride == captured.device_descriptor_stride &&
+                        actual.auxiliary_slots_per_poly == captured.auxiliary_slots_per_poly &&
+                        actual.auxiliary_slots_total == captured.auxiliary_slots_total
+                })
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Materialize a compact exemplar on the capture device.  Compact owners
+    /// have no direct peer-copy primitive, so the frozen non-resident route is
+    /// host-staged; a resident complete shard remains borrowed in place.
+    pub(crate) fn materialize_capture_compact_on_device(
+        &mut self,
+        source: &GpuFleetSmallMatrix,
+        destination_device: i32,
+    ) -> Result<GpuFleetSmallMatrix, PolyBackendError> {
+        if source.columns == 0 {
+            return Ok(source.clone());
+        }
+        let destination = self
+            .devices
+            .iter()
+            .position(|(device, _)| *device == destination_device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let route = if source.shards.iter().all(|shard| {
+            shard.device_id == destination_device &&
+                self.devices[destination].1.small_matrix_is_on_active_placement(&shard.value)
+        }) {
+            GpuTransferRoute::Resident
+        } else {
+            GpuTransferRoute::HostStaging
+        };
+        let source_devices = source.shards.iter().map(|shard| shard.device_id).collect::<Vec<_>>();
+        let (pieces, _) = self.materialize_compact_job_input(
+            source,
+            ColumnRange { start: 0, end: source.columns },
+            destination,
+            route,
+        )
+        .map_err(|error| {
+            PolyBackendError::GpuCalibration(format!(
+                "capture compact materialization failed: route={route:?}, source_devices={source_devices:?}, destination_device={destination_device}: {error}"
+            ))
+        })?;
+        GpuFleetSmallMatrix::from_column_pieces(pieces)
+    }
+
+    /// Construct the setup-only measurement backend from this fleet's
+    /// registered native parameter tables.  Preparation used to accept a
+    /// second caller-owned parameter slice here, which could silently omit a
+    /// registered ring or reorder devices.  Keep the physical fleet order
+    /// and every parameter/context descriptor from the production backend;
+    /// the returned backend owns independent setup contexts and never shares
+    /// run-local owners with production.
+    pub(crate) fn measurement_backend(&self) -> Result<Self, PolyBackendError> {
+        let placements = self
+            .devices
+            .iter()
+            .map(|(_, backend)| {
+                backend
+                    .parameters
+                    .first()
+                    .filter(|parameters| !parameters.is_empty())
+                    .map(|parameters| parameters.values().cloned().collect::<Vec<_>>())
+                    .ok_or(PolyBackendError::UnsupportedPlacement)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self::new(placements))
     }
 
     fn parameters_on_physical_device(
@@ -775,8 +14375,76 @@ impl GpuFleetMatrix {
     pub fn shards(&self) -> &[GpuColumnShard<GpuDCRTPolyMatrix>] {
         &self.shards
     }
+
+    /// Retain the resident native allocations while producing the owned
+    /// value shape required by fixed request APIs. This is intentionally
+    /// separate from `Clone`, whose public semantics remain a deep copy.
+    fn retained_clone(value: &Arc<Self>) -> Self {
+        let shards = value
+            .shards
+            .iter()
+            .map(|shard| GpuColumnShard {
+                device_id: shard.device_id,
+                global_column_start: shard.global_column_start,
+                value: shard.value.clone_shallow(),
+            })
+            .collect();
+        Self { id: value.id, rows: value.rows, columns: value.columns, shards }
+    }
+
     pub fn wait_until_ready(&self) {
         self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+    }
+
+    pub(crate) fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| shard.value.prepare_external_for_capture())
+    }
+
+    pub(crate) fn binding_components(
+        &self,
+    ) -> Result<Vec<GpuMatrixBindingComponent>, GpuNativeGraphError> {
+        self.shards.iter().try_fold(Vec::new(), |mut components, shard| {
+            components.extend(shard.value.binding_components()?.into_vec());
+            Ok(components)
+        })
+    }
+
+    /// Queue compiled-region readiness and lifetime protection for each
+    /// physical shard. The shard owners retain their native device placement;
+    /// no host readiness observation is introduced by this adapter.
+    pub(crate) fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| {
+            shard.value.wait_compiled_inputs(consumer_device, launch_stream, read_only)
+        })
+    }
+
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+        read_only: bool,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| {
+            shard.value.protect_compiled_submission(
+                consumer_device,
+                launch_stream,
+                completion,
+                read_only,
+            )
+        })
+    }
+
+    pub(crate) fn record_compiled_write(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| shard.value.record_compiled_write(launch_stream))
     }
 }
 
@@ -816,13 +14484,19 @@ impl PolyMatrixColumnSource<GpuFleetMatrix> for FleetStagedColumnSource {
 
 #[derive(Clone, Debug)]
 struct OffsetFleetColumnSource {
-    value: GpuFleetMatrix,
+    value: Arc<GpuFleetMatrix>,
     global_column_start: usize,
+}
+
+pub(crate) fn resident_fleet_column_source(
+    value: Arc<GpuFleetMatrix>,
+) -> Arc<dyn PolyMatrixColumnSource<GpuFleetMatrix>> {
+    Arc::new(OffsetFleetColumnSource { value, global_column_start: 0 })
 }
 
 impl PolyMatrixColumnSource<GpuFleetMatrix> for OffsetFleetColumnSource {
     fn resident_matrix(&self) -> Option<&GpuFleetMatrix> {
-        Some(&self.value)
+        Some(self.value.as_ref())
     }
 
     fn row_size(&self) -> usize {
@@ -895,6 +14569,11 @@ pub struct GpuFleetSmallMatrix {
     rows: usize,
     columns: usize,
     shards: Vec<GpuColumnShard<GpuSmallMatrix>>,
+    /// Keep source owners alive when a shard is represented by a borrowed
+    /// compact column view.  The native view itself deliberately owns no
+    /// payload; these anchors make its lifetime explicit without copying the
+    /// source payload during measurement placement.
+    source_owners: Vec<Arc<GpuFleetSmallMatrix>>,
 }
 
 /// A compact RHS range can remain a zero-copy CUDA view while it is consumed
@@ -925,6 +14604,21 @@ where
     F: FnOnce(T, Vec<T>) -> T,
 {
     if rest.is_empty() { first } else { concat(first, rest) }
+}
+
+fn concat_matrix_groups(
+    groups: Vec<Vec<GpuDCRTPolyMatrix>>,
+) -> Result<Vec<GpuDCRTPolyMatrix>, PolyBackendError> {
+    groups
+        .into_iter()
+        .map(|group| {
+            let mut pieces = group.into_iter();
+            let first = pieces.next().ok_or(PolyBackendError::InvalidConstantShape)?;
+            Ok(concat_owned_if_needed(first, pieces.collect(), |first, pieces| {
+                first.concat_columns_owned(pieces)
+            }))
+        })
+        .collect()
 }
 
 impl PartialEq for GpuFleetSmallMatrix {
@@ -960,7 +14654,39 @@ impl GpuFleetSmallMatrix {
 
     fn new(rows: usize, columns: usize, shards: Vec<GpuColumnShard<GpuSmallMatrix>>) -> Self {
         validate_shards(rows, columns, &shards, |matrix| matrix.size());
-        Self { rows, columns, shards }
+        Self { rows, columns, shards, source_owners: Vec::new() }
+    }
+
+    fn new_with_source_owners(
+        rows: usize,
+        columns: usize,
+        shards: Vec<GpuColumnShard<GpuSmallMatrix>>,
+        source_owners: Vec<Arc<GpuFleetSmallMatrix>>,
+    ) -> Self {
+        validate_shards(rows, columns, &shards, |matrix| matrix.size());
+        Self { rows, columns, shards, source_owners }
+    }
+
+    /// Retain the resident compact owner while producing an owned fleet value
+    /// for a fixed request. Each shard is a native column view and the source
+    /// Arc anchors the backing payload until the view is no longer used.
+    fn retained_clone(value: &Arc<Self>) -> Self {
+        let shards = value
+            .shards
+            .iter()
+            .map(|shard| {
+                let columns = shard.value.columns();
+                let view = (columns != 0)
+                    .then(|| shard.value.column_view(0, columns).into_matrix())
+                    .expect("resident compact shard must have nonzero columns");
+                GpuColumnShard {
+                    device_id: shard.device_id,
+                    global_column_start: shard.global_column_start,
+                    value: view,
+                }
+            })
+            .collect();
+        Self::new_with_source_owners(value.rows, value.columns, shards, vec![Arc::clone(value)])
     }
 
     pub fn from_matrix(value: GpuSmallMatrix) -> Self {
@@ -975,8 +14701,52 @@ impl GpuFleetSmallMatrix {
     pub fn shards(&self) -> &[GpuColumnShard<GpuSmallMatrix>] {
         &self.shards
     }
+
+    /// Number of retained owners backing non-owning compact views.
+    #[doc(hidden)]
+    pub fn source_owner_count(&self) -> usize {
+        self.source_owners.len()
+    }
+
     pub fn wait_until_ready(&self) {
         self.shards.iter().for_each(|shard| shard.value.wait_until_ready());
+    }
+
+    pub(crate) fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| shard.value.prepare_external_for_capture())
+    }
+
+    pub(crate) fn binding_descriptors(
+        &self,
+    ) -> Result<Vec<GpuSmallMatrixBindingDescriptor>, GpuNativeGraphError> {
+        self.shards.iter().map(|shard| shard.value.binding_descriptor()).collect()
+    }
+
+    pub(crate) fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards
+            .iter()
+            .try_for_each(|shard| shard.value.wait_compiled_inputs(consumer_device, launch_stream))
+    }
+
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| {
+            shard.value.protect_compiled_submission(launch_stream, completion)
+        })
+    }
+
+    pub(crate) fn record_compiled_write(
+        &self,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.shards.iter().try_for_each(|shard| shard.value.record_compiled_write(launch_stream))
     }
 }
 
@@ -1008,8 +14778,103 @@ pub struct GpuFleetTrapdoor {
 }
 
 impl GpuFleetTrapdoor {
+    /// Retain every resident trapdoor component while producing the owned
+    /// fleet shape required by fixed request APIs. Primitive Clone is a deep
+    /// copy, so each component uses its explicit shallow owner handle here.
+    fn retained_clone(value: &Arc<Self>) -> Self {
+        Self { values: value.values.iter().map(GpuDCRTTrapdoor::clone_shallow).collect() }
+    }
+
+    fn copy_into(&self, destination: &GpuFleetTrapdoor) -> Result<(), GpuNativeGraphError> {
+        if self.values.len() != destination.values.len() {
+            return Err(GpuNativeGraphError::Native(
+                "resident trapdoor copy has incompatible component counts".into(),
+            ));
+        }
+        for (source, destination) in self.values.iter().zip(destination.values.iter()) {
+            // Component writer events are updated in place; the CUDA
+            // allocations remain owned by the destination Arc.
+            let destination = unsafe { &mut *std::ptr::addr_of!(*destination).cast_mut() };
+            source.copy_into(destination)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn record_compiled_write(
+        &self,
+        stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        for value in &self.values {
+            value.r.record_compiled_write(stream)?;
+            value.e.record_compiled_write(stream)?;
+        }
+        Ok(())
+    }
     pub fn wait_until_ready(&self) {
         self.values.iter().for_each(GpuDCRTTrapdoor::wait_until_ready);
+    }
+
+    pub(crate) fn prepare_external_for_capture(&self) -> Result<(), GpuNativeGraphError> {
+        self.values.iter().try_for_each(GpuDCRTTrapdoor::prepare_external_for_capture)
+    }
+
+    pub(crate) fn r_binding_components(
+        &self,
+    ) -> Result<Vec<GpuMatrixBindingComponent>, GpuNativeGraphError> {
+        self.values.iter().try_fold(Vec::new(), |mut components, value| {
+            components.extend(value.r.binding_components()?.into_vec());
+            Ok(components)
+        })
+    }
+
+    pub(crate) fn capture_binding_components(
+        &self,
+        component: NativeValueComponent,
+    ) -> Result<Vec<GpuMatrixBindingComponent>, GpuNativeGraphError> {
+        let index = match component {
+            NativeValueComponent::TrapdoorR => 0,
+            NativeValueComponent::TrapdoorE => 1,
+            NativeValueComponent::TrapdoorCovarianceA => 2,
+            NativeValueComponent::TrapdoorCovarianceB => 3,
+            NativeValueComponent::TrapdoorCovarianceD => 4,
+            _ => {
+                return Err(GpuNativeGraphError::Native("invalid trapdoor secret component".into()))
+            }
+        };
+        self.values.iter().try_fold(Vec::new(), |mut components, value| {
+            components.extend(value.capture_components()[index].binding_components()?.into_vec());
+            Ok(components)
+        })
+    }
+
+    pub(crate) fn e_binding_components(
+        &self,
+    ) -> Result<Vec<GpuMatrixBindingComponent>, GpuNativeGraphError> {
+        self.values.iter().try_fold(Vec::new(), |mut components, value| {
+            components.extend(value.e.binding_components()?.into_vec());
+            Ok(components)
+        })
+    }
+
+    pub(crate) fn wait_compiled_inputs(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values
+            .iter()
+            .try_for_each(|value| value.wait_compiled_inputs(consumer_device, launch_stream))
+    }
+
+    pub(crate) fn protect_compiled_submission(
+        &self,
+        consumer_device: i32,
+        launch_stream: &GpuNativeLaunchStream,
+        completion: &GpuNativeEvent,
+    ) -> Result<(), GpuNativeGraphError> {
+        self.values.iter().try_for_each(|value| {
+            value.protect_compiled_submission(consumer_device, launch_stream, completion)
+        })
     }
 
     /// Resident trapdoor owners grouped by their physical CUDA context.
@@ -1173,6 +15038,19 @@ pub struct GpuDcrtBackend {
     calibration_registry: FrozenGpuCalibrationRegistry,
     vram_percent: u32,
     matrix_replicas: HashMap<(u64, usize), Weak<GpuDCRTPolyMatrix>>,
+    /// Strong references for capture-internal replicas.  The graph owns raw
+    /// pointers to these allocations; keeping them here until the compiled
+    /// region takes ownership prevents a replay from observing a dropped
+    /// temporary without exposing it as a runtime binding.
+    capture_resources: Vec<Arc<GpuDCRTPolyMatrix>>,
+    capture_resident_resources: Vec<GpuCompiledRegionResource>,
+    capture_resident_native_preparations:
+        HashMap<(ResidentInstructionId, ResidentPhaseId), ResidentNativeCapturePreparation>,
+    capture_resident_family_preparations:
+        HashMap<(ResidentRegionId, ValueSlot, ValueSlot), ResidentFamilyCapturePreparation>,
+    capture_resident_direct_family_preparations:
+        HashMap<ResidentInstructionId, ResidentDirectFamilyCapturePreparation>,
+    capture_integer_constants: HashMap<ResidentInstructionId, GpuSignedValues>,
     /// A frozen plan is deliberately kept separate from calibration state.
     /// Installing one never turns a cache miss into a runtime pilot; fixed
     /// dispatch consumes only its value-only metadata.
@@ -1180,6 +15058,7 @@ pub struct GpuDcrtBackend {
     frozen_plan_index: Option<Arc<FrozenGpuPlanIndex>>,
     fixed_node: Option<GpuNodeChoice>,
     fixed_instance_slots: Vec<usize>,
+    capture_active: bool,
     execution_identity: u64,
     plan_budgets: Option<Vec<GpuDeviceBudget>>,
     /// Number of fixed gadget-decompose batches dispatched after a frozen
@@ -1266,15 +15145,38 @@ impl GpuDcrtBackend {
 
     pub fn place_measurement_compact(
         &self,
-        value: &GpuFleetSmallMatrix,
+        value: &Arc<GpuFleetSmallMatrix>,
         layout: &crate::backend::GpuWarmupStorageLayout,
     ) -> Result<GpuFleetSmallMatrix, PolyBackendError> {
         let owners =
             self.measurement_owners.as_ref().ok_or(PolyBackendError::UnsupportedPlacement)?;
         if layout.owner_intervals.is_empty() {
-            return Ok(value.clone());
+            if value.columns == 0 {
+                return Ok(GpuFleetSmallMatrix::new_with_source_owners(
+                    value.rows,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+            }
+            let shards = value
+                .shards
+                .iter()
+                .map(|shard| GpuColumnShard {
+                    device_id: shard.device_id,
+                    global_column_start: shard.global_column_start,
+                    value: shard.value.column_view(0, shard.value.columns()).into_matrix(),
+                })
+                .collect();
+            return Ok(GpuFleetSmallMatrix::new_with_source_owners(
+                value.rows,
+                value.columns,
+                shards,
+                vec![Arc::clone(value)],
+            ));
         }
         let mut shards = Vec::new();
+        let mut retains_source = false;
         for &(owner, start, end) in &layout.owner_intervals {
             let physical = *owners.get(owner).ok_or(PolyBackendError::UnsupportedPlacement)?;
             for shard in &value.shards {
@@ -1287,15 +15189,26 @@ impl GpuDcrtBackend {
                     first - shard.global_column_start,
                     last - shard.global_column_start,
                 );
-                let local = local.as_ref();
-                let params = local.params.params_for_device(physical, None);
-                let value = GpuSmallMatrix::from_canonical_coefficients(
-                    &params,
-                    local.rows(),
-                    local.columns(),
-                    local.max_coefficient_bound().clone(),
-                    &local.to_canonical_coefficients()?,
-                )?;
+                let value = if shard.device_id == physical &&
+                    self.devices.iter().find(|(device, _)| *device == physical).is_some_and(
+                        |(_, backend)| backend.small_matrix_is_on_active_placement(&shard.value),
+                    ) {
+                    // The view aliases the already resident payload. Keep
+                    // the source fleet owner alive in the returned value so
+                    // dropping the caller's Arc cannot free the payload.
+                    retains_source = true;
+                    local.into_matrix()
+                } else {
+                    let local = local.as_ref();
+                    let params = local.params.params_for_device(physical, None);
+                    GpuSmallMatrix::from_canonical_coefficients(
+                        &params,
+                        local.rows(),
+                        local.columns(),
+                        local.max_coefficient_bound().clone(),
+                        &local.to_canonical_coefficients()?,
+                    )?
+                };
                 shards.push(GpuColumnShard {
                     device_id: physical,
                     global_column_start: first,
@@ -1303,139 +15216,13 @@ impl GpuDcrtBackend {
                 });
             }
         }
-        Ok(GpuFleetSmallMatrix::new(value.rows, value.columns, shards))
-    }
-
-    /// Resolve the physical transfer class for the exact lowered range used
-    /// by a production dispatch.  Warmup callers must pass this descriptor
-    /// through unchanged; deriving a route from only shape/width would merge
-    /// peer and host-staged executions in one profile table.
-    pub fn route_descriptor_for_range(
-        &self,
-        execution: &GpuExecutionRange,
-        source: &GpuFleetMatrix,
-        destination_device: i32,
-        source_compact: bool,
-        destination_compact: bool,
-    ) -> Result<GpuExecutionRouteDescriptor, PolyBackendError> {
-        let input = execution.inputs.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-        let source_start = input.range.start;
-        let source_end = input.range.end;
-        if source_start >= source_end || source_end > source.columns {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let overlapping = source
-            .shards
-            .iter()
-            .filter_map(|shard| {
-                let shard_end = shard.global_column_start + shard.value.col_size();
-                let start = source_start.max(shard.global_column_start);
-                let end = source_end.min(shard_end);
-                (start < end).then_some((shard, start, end))
-            })
-            .collect::<Vec<_>>();
-        let (first, _, _) =
-            overlapping.first().copied().ok_or(PolyBackendError::InvalidConstantShape)?;
-        let source_device = first.device_id;
-        let destination = self
-            .devices
-            .iter()
-            .position(|(device, _)| *device == destination_device)
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let resident = overlapping.iter().all(|(shard, _, _)| {
-            shard.device_id == destination_device &&
-                self.devices[destination].1.matrix_is_on_active_placement(&shard.value)
-        });
-        let (route, source_staging_bytes, host_staging_bytes) = if resident {
-            (GpuTransferRoute::Resident, 0, 0)
-        } else {
-            let peer = overlapping
-                .iter()
-                .map(|(shard, start, end)| {
-                    let local = shard.value.slice_columns(
-                        *start - shard.global_column_start,
-                        *end - shard.global_column_start,
-                    );
-                    let target = self.devices[destination].1.parameters_for_matrix(&local)?;
-                    local
-                        .can_copy_to_params_direct(target)
-                        .map_err(PolyBackendError::GpuCalibration)
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .all(|available| available);
-            if peer {
-                (GpuTransferRoute::Peer, 0, 0)
-            } else {
-                let bytes = overlapping
-                    .iter()
-                    .map(|(shard, start, end)| {
-                        shard
-                            .value
-                            .slice_columns(
-                                *start - shard.global_column_start,
-                                *end - shard.global_column_start,
-                            )
-                            .allocation_bytes()
-                            .map(|allocation| allocation.total_bytes)
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(PolyBackendError::GpuCalibration)?
-                    .into_iter()
-                    .try_fold(0usize, usize::checked_add)
-                    .ok_or(PolyBackendError::InvalidInteger)?;
-                (GpuTransferRoute::HostStaging, bytes, bytes)
-            }
-        };
-        let mut descriptor = resolve_gpu_route(GpuRouteResolutionInput {
-            source_device: Some(self.route_owner(source_device)?),
-            destination_device: Some(self.route_owner(self.devices[destination].0)?),
-            source_range: input.range,
-            destination_range: execution.output,
-            source_is_resident: resident,
-            peer_available: route == GpuTransferRoute::Peer,
-            source_compact,
-            destination_compact,
-            fragment: execution.fragment,
-            source_staging_bytes,
-            host_staging_bytes,
-            pinned_host_staging_bytes: 0,
-        });
-        if overlapping.len() > 1 &&
-            descriptor.fragment == crate::gpu_column_policy::GpuFragmentClass::Full
-        {
-            descriptor.fragment = crate::gpu_column_policy::GpuFragmentClass::ConcatFragment;
-        }
-        let source_routes = overlapping
-            .iter()
-            .map(|(shard, start, end)| {
-                let source_range = ColumnRange { start: *start, end: *end };
-                let bytes = shard
-                    .value
-                    .slice_columns(
-                        *start - shard.global_column_start,
-                        *end - shard.global_column_start,
-                    )
-                    .allocation_bytes()
-                    .map(|allocation| allocation.total_bytes)
-                    .map_err(PolyBackendError::GpuCalibration)?;
-                Ok(crate::gpu_column_policy::GpuExecutionSourceRoute::new(
-                    self.route_owner(shard.device_id)?,
-                    source_range,
-                    route,
-                    if route == GpuTransferRoute::Resident { 0 } else { bytes },
-                    if route == GpuTransferRoute::HostStaging { bytes } else { 0 },
-                    0,
-                ))
-            })
-            .collect::<Result<Vec<_>, PolyBackendError>>()?;
-        descriptor = descriptor
-            .with_source_routes(source_routes)
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        if !descriptor.validate() {
-            return Err(PolyBackendError::UnsupportedPlacement);
-        }
-        Ok(descriptor)
+        let source_owners = retains_source.then(|| vec![Arc::clone(value)]).unwrap_or_default();
+        Ok(GpuFleetSmallMatrix::new_with_source_owners(
+            value.rows,
+            value.columns,
+            shards,
+            source_owners,
+        ))
     }
 
     /// Resolve one exact mapped input fragment.  Unlike the legacy
@@ -1479,13 +15266,12 @@ impl GpuDcrtBackend {
         let peer = !resident &&
             overlapping
                 .iter()
-                .map(|(shard, start, end)| {
-                    let local = shard.value.slice_columns(
-                        *start - shard.global_column_start,
-                        *end - shard.global_column_start,
-                    );
-                    let target = self.devices[destination].1.parameters_for_matrix(&local)?;
-                    local
+                .map(|(shard, _, _)| {
+                    // Query the original native owner. Slicing is a real
+                    // allocation/copy and must not happen during inspection.
+                    let target = self.devices[destination].1.parameters_for_matrix(&shard.value)?;
+                    shard
+                        .value
                         .can_copy_to_params_direct(target)
                         .map_err(PolyBackendError::GpuCalibration)
                 })
@@ -1500,13 +15286,16 @@ impl GpuDcrtBackend {
             let bytes = overlapping
                 .iter()
                 .map(|(shard, start, end)| {
+                    let columns = end - *start;
                     shard
                         .value
-                        .slice_columns(
-                            *start - shard.global_column_start,
-                            *end - shard.global_column_start,
+                        .params()
+                        .matrix_allocation_bytes(
+                            shard.value.level(),
+                            shard.value.nrow,
+                            columns,
+                            shard.value.is_ntt(),
                         )
-                        .allocation_bytes()
                         .map(|allocation| allocation.total_bytes)
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -1537,13 +15326,16 @@ impl GpuDcrtBackend {
             .iter()
             .map(|(shard, start, end)| {
                 let source_range = ColumnRange { start: *start, end: *end };
+                let columns = *end - *start;
                 let bytes = shard
                     .value
-                    .slice_columns(
-                        *start - shard.global_column_start,
-                        *end - shard.global_column_start,
+                    .params()
+                    .matrix_allocation_bytes(
+                        shard.value.level(),
+                        shard.value.nrow,
+                        columns,
+                        shard.value.is_ntt(),
                     )
-                    .allocation_bytes()
                     .map(|allocation| allocation.total_bytes)
                     .map_err(PolyBackendError::GpuCalibration)?;
                 Ok(crate::gpu_column_policy::GpuExecutionSourceRoute::new(
@@ -1766,7 +15558,7 @@ impl GpuDcrtBackend {
                 // resulting value on its active device.
                 GpuTransferRoute::Peer => local
                     .copy_to_params_direct(target)
-                    .ok_or(PolyBackendError::UnsupportedPlacement)?,
+                    .map_err(|_| PolyBackendError::UnsupportedPlacement)?,
                 GpuTransferRoute::HostStaging => {
                     let bytes = local.to_cpu_staging_bytes();
                     GpuDCRTPolyMatrix::from_cpu_staging_bytes(target, &bytes)
@@ -2008,8 +15800,17 @@ impl GpuDcrtBackend {
         Ok(GpuLocalProductionJobResult { value, elapsed: started.elapsed(), routes, resources })
     }
 
-    pub(super) fn new(placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
+    pub(super) fn new(mut placements: Vec<Vec<GpuDCRTPolyParams>>) -> Self {
         assert!(!placements.is_empty(), "a GPU fleet needs at least one device");
+        // Logical device indices are part of the frozen plan contract. Make
+        // their physical order backend-owned so every constructor observes
+        // the same mapping, even when detected IDs arrive in arbitrary order.
+        placements.sort_by_key(|parameters| {
+            parameters
+                .first()
+                .and_then(|parameters| parameters.device_ids().first().copied())
+                .expect("each GPU placement needs device parameters")
+        });
         let vram_percent = fleet_context_vram_percent(
             &placements,
             GpuDCRTPolyParams::vram_percent,
@@ -2038,11 +15839,18 @@ impl GpuDcrtBackend {
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent,
             matrix_replicas: HashMap::new(),
+            capture_resources: Vec::new(),
+            capture_resident_resources: Vec::new(),
+            capture_resident_native_preparations: HashMap::new(),
+            capture_resident_family_preparations: HashMap::new(),
+            capture_resident_direct_family_preparations: HashMap::new(),
+            capture_integer_constants: HashMap::new(),
             measurement_owners: None,
             frozen_plan: None,
             frozen_plan_index: None,
             fixed_node: None,
             fixed_instance_slots: Vec::new(),
+            capture_active: false,
             plan_budgets: None,
             execution_identity: {
                 static NEXT_BACKEND: AtomicU64 = AtomicU64::new(1);
@@ -2092,6 +15900,75 @@ impl GpuDcrtBackend {
 
     pub fn fixed_dispatch_enabled(&self) -> bool {
         self.frozen_plan.is_some()
+    }
+
+    /// Return the native execution-owner identity for each physical fleet
+    /// device, in the same order used by the frozen logical-to-physical
+    /// contract.  The identity comes from the registered parameter context;
+    /// it is never derived from a pointer or allocator address.
+    pub(crate) fn execution_owner_ids(&self) -> Result<Vec<u64>, PolyBackendError> {
+        self.devices
+            .iter()
+            .map(|(_, backend)| {
+                backend
+                    .parameters
+                    .iter()
+                    .flat_map(|parameters| parameters.values())
+                    .next()
+                    .map(GpuDCRTPolyParams::context_execution_identity)
+                    .ok_or(PolyBackendError::UnsupportedPlacement)
+            })
+            .collect()
+    }
+
+    /// Return the native CUDA context generation for each physical fleet
+    /// device. A context recreation changes this generation even when the
+    /// physical device id and operation plan are unchanged.
+    pub(crate) fn context_generations(&self) -> Result<Vec<u64>, PolyBackendError> {
+        self.devices
+            .iter()
+            .map(|(physical_device, backend)| {
+                let parameters = backend
+                    .parameters
+                    .iter()
+                    .flat_map(|parameters| parameters.values())
+                    .next()
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                let identity = parameters
+                    .context_runtime_identity()
+                    .map_err(PolyBackendError::GpuCalibration)?;
+                let index = parameters
+                    .device_ids()
+                    .iter()
+                    .position(|device| device == physical_device)
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                identity
+                    .devices
+                    .get(index)
+                    .map(|device| device.context_generation)
+                    .ok_or(PolyBackendError::UnsupportedPlacement)
+            })
+            .collect()
+    }
+
+    /// Snapshot and validate the native owner contract used by a prepared
+    /// runtime plan. This check is intentionally independent of the value-only
+    /// graph contract: replacing a context must stale an otherwise identical
+    /// plan before any execution or session mutation.
+    pub(crate) fn runtime_owner_contract(&self) -> Result<(Vec<u64>, Vec<u64>), PolyBackendError> {
+        Ok((self.execution_owner_ids()?, self.context_generations()?))
+    }
+
+    pub(crate) fn validate_runtime_owner_contract(
+        &self,
+        expected_owner_ids: &[u64],
+        expected_generations: &[u64],
+    ) -> Result<(), PolyBackendError> {
+        let (owner_ids, generations) = self.runtime_owner_contract()?;
+        if owner_ids != expected_owner_ids || generations != expected_generations {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        Ok(())
     }
 
     /// Return the number of frozen-plan gadget decomposition batches that
@@ -2213,7 +16090,9 @@ impl GpuDcrtBackend {
             Domain::MatrixNegate => Op::Negate,
             Domain::MatrixScale => Op::Scale,
             Domain::RingAutomorphism => Op::RingAutomorphism,
-            Domain::ModulusSwitch | Domain::ModulusReduce => Op::ModulusConversion,
+            Domain::ModulusSwitch | Domain::ModulusReduce | Domain::CenteredRoundDivide => {
+                Op::ModulusConversion
+            }
             Domain::CenteredRebase => Op::CenteredRebase,
             Domain::BlockModSwitch => Op::BlockModSwitch,
             Domain::RnsModUp | Domain::RnsModDown => Op::RnsConversion,
@@ -2792,6 +16671,7 @@ impl GpuDcrtBackend {
                 domain,
                 CanonicalWarmupProfileDomain::ModulusSwitch |
                     CanonicalWarmupProfileDomain::CenteredRebase |
+                    CanonicalWarmupProfileDomain::CenteredRoundDivide |
                     CanonicalWarmupProfileDomain::BlockModSwitch |
                     CanonicalWarmupProfileDomain::RnsModUp |
                     CanonicalWarmupProfileDomain::RnsModDown
@@ -3754,26 +17634,6 @@ impl GpuDcrtBackend {
                     return Err(PolyBackendError::UnsupportedPlacement);
                 }
             }
-            if !metadata.grouped_output_layout_metadata.is_empty() {
-                if metadata.grouped_output_layout_metadata.len() != 1 || ids.len() != 1 {
-                    return Err(PolyBackendError::InvalidConstantShape);
-                }
-                let grouped = &metadata.grouped_output_layout_metadata[0];
-                let mut layout = index
-                    .layout(plan, ids[0])
-                    .ok_or(PolyBackendError::UnsupportedPlacement)?
-                    .clone();
-                if grouped.layout_id != Some(ids[0]) ||
-                    grouped.columns != layout.columns ||
-                    grouped.ring_dimension != layout.ring_dimension ||
-                    grouped.representation != layout.representation ||
-                    grouped.rows == 0
-                {
-                    return Err(PolyBackendError::UnsupportedPlacement);
-                }
-                layout.rows = grouped.rows;
-                return Ok(vec![layout]);
-            }
             ids
         } else {
             node.output_layouts.clone()
@@ -4260,6 +18120,18 @@ impl GpuDcrtBackend {
                         let public_layout = Self::runtime_shape_descriptor(&std::collections::BTreeMap::from([("public".into(), RuntimeValue::Matrix(public.clone()))]));
                         format!("trapdoor:{matrix_type:?}:{sigma:?}:{gadget_base}:{digit_count}:{gadget_small:?}:{public_layout:?}")
                     }
+                    RuntimeValue::IntegerValues(values) => {
+                        format!("integer-family:{}", values.count())
+                    }
+                    RuntimeValue::IndexedFamily(values)
+                        if values.iter().all(|value| {
+                            matches!(
+                                value,
+                                RuntimeValue::Int(_) |
+                                    RuntimeValue::NativeInteger(_) |
+                                    RuntimeValue::Bool(_)
+                            )
+                        }) => format!("integer-family:{}", values.len()),
                     RuntimeValue::IndexedFamily(values) => {
                         let children = values.iter().enumerate().map(|(index, value)| (index.to_string(), value.clone())).collect();
                         format!("family:{:?}", Self::runtime_shape_descriptor(&children))
@@ -4338,6 +18210,12 @@ impl GpuDcrtBackend {
                     Self::validate_runtime_input_shape(value, element)?;
                 }
                 values.len() == *count
+            }
+            (
+                RuntimeValue::IntegerValues(values),
+                ConcreteWireType::IndexedFamily { element, count },
+            ) if matches!(element.as_ref(), ConcreteWireType::Int | ConcreteWireType::Bool) => {
+                values.count() == *count
             }
             (
                 RuntimeValue::LazyArtifact { descriptor, .. } |
@@ -4472,7 +18350,11 @@ impl GpuDcrtBackend {
             let local =
                 shard.value.slice_columns(overlap_start - shard_start, overlap_end - shard_start);
             // Use the same peer-or-host-staging transport measured by warmup.
-            pieces.push(backend.matrix_to_active_placement(&local)?);
+            pieces.push(if backend.matrix_is_on_active_placement(&local) {
+                local
+            } else {
+                backend.matrix_to_active_placement(&local)?
+            });
         }
         let mut pieces = pieces.into_iter();
         let first = pieces.next().ok_or(PolyBackendError::InvalidConstantShape)?;
@@ -4512,7 +18394,11 @@ impl GpuDcrtBackend {
             .iter()
             .map(|shard| {
                 let local = shard.value.slice(row_start, row_end, 0, shard.value.col_size());
-                backend.matrix_to_active_placement(&local)
+                if backend.matrix_is_on_active_placement(&local) {
+                    Ok(local)
+                } else {
+                    backend.matrix_to_active_placement(&local)
+                }
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter();
@@ -4580,6 +18466,13 @@ impl GpuDcrtBackend {
             0,
             value.columns,
         )?);
+        if self.capture_active {
+            // This allocation can be referenced by a captured multiply, but
+            // it is not part of the runtime schema. Transfer ownership to the
+            // compiled-region resource at capture completion instead of
+            // claiming a fabricated binding for its address.
+            self.capture_resources.push(Arc::clone(&replica));
+        }
         self.matrix_replicas.retain(|_, value| value.strong_count() > 0);
         self.matrix_replicas.insert((value.id, device), Arc::downgrade(&replica));
         Ok(replica)
@@ -5001,17 +18894,8 @@ impl GpuDcrtBackend {
             .get(binding_port)
             .ok_or(PolyBackendError::InvalidConstantShape)?
             .columns;
-        let replicas = match &request {
-            FusedBatchRequest::SmallProduct { blocks, .. } => Some(
-                blocks
-                    .iter()
-                    .map(|block| self.full_matrix_on_device(0, block))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ),
-            _ => None,
-        };
         let (device, backend) = &mut self.devices[0];
-        match Self::execute_fused_range(backend, &request, range, columns, replicas.as_ref())? {
+        match Self::execute_fused_range(backend, &request, range, columns)? {
             FusedBatchOutput::Matrices(values) => Ok(FusedBatchOutput::Matrices(
                 values
                     .into_iter()
@@ -5044,7 +18928,6 @@ impl GpuDcrtBackend {
         request: &FusedBatchRequest<GpuFleetMatrix, GpuFleetSmallMatrix>,
         binding_range: ColumnRange,
         output_columns: usize,
-        replicas: Option<&Vec<Arc<GpuDCRTPolyMatrix>>>,
     ) -> Result<FusedBatchOutput<GpuDCRTPolyMatrix, GpuSmallMatrix>, PolyBackendError> {
         let read = |mapped: &[crate::gpu_column_policy::InputColumnRange], operand| {
             mapped
@@ -5121,24 +19004,20 @@ impl GpuDcrtBackend {
                         pair[1].range.start,
                         pair[1].range.end,
                     )?;
-                    let groups = rows.iter().flatten().cloned().collect::<Vec<_>>();
-                    pieces.push(vec![backend.tensor_sum_rows(
-                        &left_piece,
-                        &right_piece,
-                        &groups,
-                    )?]);
+                    pieces.push(backend.tensor_sum_row_groups(&left_piece, &right_piece, rows)?);
                 }
-                let first = pieces.first().ok_or(PolyBackendError::InvalidConstantShape)?;
-                let mut values = first.clone();
-                for piece in pieces.into_iter().skip(1) {
-                    if piece.len() != values.len() {
+                let mut pieces = pieces.into_iter();
+                let first = pieces.next().ok_or(PolyBackendError::InvalidConstantShape)?;
+                let mut groups = first.into_iter().map(|value| vec![value]).collect::<Vec<_>>();
+                for piece in pieces {
+                    if piece.len() != groups.len() {
                         return Err(PolyBackendError::InvalidConstantShape);
                     }
-                    for (value, next) in values.iter_mut().zip(piece) {
-                        *value = value.clone().concat_columns_owned(vec![next]);
+                    for (group, value) in groups.iter_mut().zip(piece) {
+                        group.push(value);
                     }
                 }
-                Ok(FusedBatchOutput::Matrices(values))
+                Ok(FusedBatchOutput::Matrices(concat_matrix_groups(groups)?))
             }
             FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => {
                 let refs = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
@@ -5173,26 +19052,27 @@ impl GpuDcrtBackend {
                 let range = read(&mapped, 1)?;
                 let rhs_pieces =
                     Self::small_matrix_piece_on_device(backend, rhs, range.start, range.end)?;
-                let references = replicas
-                    .ok_or(PolyBackendError::UnsupportedPlacement)?
+                let blocks = blocks
                     .iter()
-                    .map(Arc::as_ref)
-                    .collect::<Vec<_>>();
+                    .map(|block| Self::matrix_operand_on_device(backend, block, 0, block.columns))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let references = blocks.iter().map(|block| block.as_ref()).collect::<Vec<_>>();
                 let mut outputs = rhs_pieces
                     .iter()
                     .map(|rhs| backend.multiply_small_rhs_row_blocks(&references, rhs.as_matrix()))
                     .collect::<Result<Vec<_>, _>>()?;
-                let mut values =
+                let first =
                     outputs.drain(..1).next().ok_or(PolyBackendError::InvalidConstantShape)?;
+                let mut groups = first.into_iter().map(|value| vec![value]).collect::<Vec<_>>();
                 for output in outputs {
-                    if output.len() != values.len() {
+                    if output.len() != groups.len() {
                         return Err(PolyBackendError::InvalidConstantShape);
                     }
-                    for (value, piece) in values.iter_mut().zip(output) {
-                        *value = value.clone().concat_columns_owned(vec![piece]);
+                    for (group, value) in groups.iter_mut().zip(output) {
+                        group.push(value);
                     }
                 }
-                Ok(FusedBatchOutput::Matrices(values))
+                Ok(FusedBatchOutput::Matrices(concat_matrix_groups(groups)?))
             }
             FusedBatchRequest::Add { blocks, right, metadata: _ } => {
                 let mut refs = blocks.iter().map(Arc::as_ref).collect::<Vec<_>>();
@@ -5250,9 +19130,7 @@ impl GpuDcrtBackend {
     }
 
     /// Execute the GPU implementation of integer-to-constant-polynomial lift
-    /// for one output range.  The identity columns are generated with their
-    /// original global offset before scaling, preserving the production
-    /// column semantics instead of timing a shortened zero/identity value.
+    /// for one output range, using the same resident scalar writer as replay.
     #[doc(hidden)]
     pub fn lift_integer_to_constant_polynomial_range_for_measurement(
         &mut self,
@@ -5266,9 +19144,25 @@ impl GpuDcrtBackend {
         }
         let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
         let (device_id, backend) = &mut self.devices[0];
-        let params = backend.parameters(&local_ty)?;
-        let identity = GpuDCRTPolyMatrix::identity_columns(params, ty.rows, start, end - start);
-        let value = backend.scale_integer(&identity, coefficient)?;
+        let params = backend.parameters(&local_ty)?.clone();
+        let coefficient =
+            GpuSignedValues::from_bigints(&params, *device_id, std::slice::from_ref(coefficient))
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        let descriptor = GpuMatrixOutputDescriptor::for_shape(
+            &params,
+            ty.rows,
+            end - start,
+            params.crt_depth().saturating_sub(1),
+            true,
+        )
+        .map_err(PolyBackendError::GpuCalibration)?;
+        let mut value = descriptor.allocate();
+        let stream = params
+            .native_launch_stream(*device_id)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        value
+            .write_integer_constant_into_bound(&coefficient, start, &stream, 0, 1)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
         Ok(GpuFleetMatrix::new(
             ty.rows,
             end - start,
@@ -5583,6 +19477,7 @@ impl GpuDcrtBackend {
         operation: impl Fn(&mut DeviceBackend, usize, GpuColumnJob) -> Result<T, PolyBackendError>
         + Sync,
     ) -> Result<Vec<(usize, GpuColumnJob, T)>, PolyBackendError> {
+        let capture_active = self.capture_active;
         crate::gpu_execution_plan::dispatch_column_batch(
             &mut self.devices,
             schedules,
@@ -5590,7 +19485,9 @@ impl GpuDcrtBackend {
                 let value = operation(backend, instance, job);
                 // Scratch owners enqueue frees behind their GPU use events.
                 // Fence only those releases before the next job is admitted.
-                backend.fence_released_memory()?;
+                if !capture_active {
+                    backend.fence_released_memory()?;
+                }
                 value
             },
         )
@@ -5607,6 +19504,7 @@ impl GpuDcrtBackend {
         + Sync,
     ) -> Result<Vec<(usize, GpuFusedUnionJob, T)>, PolyBackendError> {
         let mut results = Vec::new();
+        let capture_active = self.capture_active;
         let waves = fused_union_waves_lazy(schedules_by_port, instances)
             .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
         for wave in waves {
@@ -5620,7 +19518,9 @@ impl GpuDcrtBackend {
                         .filter(|job| job.device == device)
                         .map(|job| {
                             let value = operation(backend, job.instance, job)?;
-                            backend.fence_released_memory()?;
+                            if !capture_active {
+                                backend.fence_released_memory()?;
+                            }
                             Ok((job.instance, job.clone(), value))
                         })
                         .collect::<Result<Vec<_>, PolyBackendError>>()
@@ -5742,11 +19642,71 @@ mod tests {
         backend::{GpuEffectiveInputs, PlannedLayoutMetadata},
         gpu_column_policy::{ColumnCapability, EffectiveGpuOperation},
         gpu_execution_plan::{GpuLayout, build_fused_union_jobs, fused_union_waves},
-        gpu_measurement::{GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare},
     };
     use mxx_ir_core::IntExpr;
     use mxx_primitives::poly::dcrt::gpu::detected_gpu_device_ids;
     use num_bigint::BigInt;
+
+    #[test]
+    fn resident_select_shape_uses_branch_count_separately_from_lane_count() {
+        let branches = IntExpr::constant(2i64);
+        assert!(validate_resident_select_shape(&branches, [1, 1, 1], 1).is_ok());
+        assert!(validate_resident_select_shape(&branches, [4, 1, 4], 4).is_ok());
+        assert!(validate_resident_select_shape(&branches, [2, 1, 1], 1).is_err());
+        assert!(validate_resident_select_shape(&branches, [1, 1], 1).is_err());
+    }
+
+    #[test]
+    fn resident_capture_binding_namespace_allows_sparse_unique_ids() {
+        let binding = |index| RegionBinding {
+            index,
+            source: BindingSource::ValueComponent {
+                slot: ValueSlot(index),
+                shard: 0,
+                component: NativeValueComponent::IntegerValues,
+                address_addend: 0,
+            },
+            access: BindingAccess::InOut,
+        };
+        assert!(matches!(resident_binding_count(&[binding(0), binding(1)]), Ok(2)));
+        assert!(matches!(
+            resident_binding_count(&[binding(0), binding(0)]),
+            Err(GpuResidentControlAdapterError::DuplicateBinding(0))
+        ));
+        assert!(matches!(resident_binding_count(&[binding(0), binding(2)]), Ok(3)));
+    }
+
+    #[test]
+    fn capture_binding_lookup_uses_typed_sparse_schema_identity() {
+        let make = |index, slot, shard, component| RegionBinding {
+            index,
+            source: BindingSource::ValueComponent {
+                slot: ValueSlot(slot),
+                shard,
+                component,
+                address_addend: 0,
+            },
+            access: BindingAccess::InOut,
+        };
+        let bindings = [
+            make(19, 4, 1, NativeValueComponent::IntegerValues),
+            make(7, 4, 0, NativeValueComponent::MatrixData),
+        ];
+        assert_eq!(
+            schema_binding_index(&bindings, ValueSlot(4), 1, NativeValueComponent::IntegerValues,)
+                .unwrap(),
+            19
+        );
+        assert!(
+            schema_binding_index(
+                &bindings,
+                ValueSlot(4),
+                0,
+                NativeValueComponent::MatrixDescriptors,
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     #[serial_test::serial(gpu_context)]
@@ -5953,6 +19913,40 @@ mod tests {
         assert_eq!(value.size(), (0, 7));
         let empty_columns = GpuFleetMatrix::new(4, 0, Vec::new());
         assert_eq!(empty_columns.size(), (4, 0));
+    }
+
+    #[test]
+    fn resident_column_source_keeps_shared_matrix_owner() {
+        let value = Arc::new(GpuFleetMatrix::new(0, 0, Vec::new()));
+        let source = resident_fleet_column_source(Arc::clone(&value));
+        let resident = source.resident_matrix().expect("resident source must expose its owner");
+        assert_eq!(resident as *const GpuFleetMatrix, Arc::as_ptr(&value));
+    }
+
+    #[test]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_resident_retained_matrix_preserves_native_addresses() {
+        let parameters = GpuDCRTPolyParams::new(32, vec![131_009, 130_817], 8, None);
+        let device = detected_gpu_device_ids()[0];
+        let backend = super::super::gpu_backend_on([parameters], [device]);
+        let params = backend.devices[0]
+            .1
+            .parameters
+            .iter()
+            .flat_map(|map| map.values())
+            .next()
+            .expect("resident address test has matrix parameters");
+        let owner = Arc::new(GpuFleetMatrix::from_matrix(GpuDCRTPolyMatrix::zero(params, 2, 2)));
+        let retained = GpuFleetMatrix::retained_clone(&owner);
+        let original = owner.binding_components().expect("original bindings");
+        let shared = retained.binding_components().expect("retained bindings");
+        assert_eq!(original.len(), shared.len());
+        assert!(original.iter().zip(shared.iter()).all(|(original, shared)| {
+            original.physical_device == shared.physical_device &&
+                original.data_address == shared.data_address &&
+                original.device_descriptors_address == shared.device_descriptors_address &&
+                original.auxiliary_address == shared.auxiliary_address
+        }));
     }
 
     #[test]
@@ -6163,7 +20157,6 @@ mod tests {
             source_layouts: block_layouts,
             effective_operands,
             output_layout_metadata,
-            grouped_output_layout_metadata: Vec::new(),
             columns_per_job: columns_per_job.to_vec(),
             instance_slots: vec![slot],
             instance_paths: vec![Vec::new()],
@@ -6215,15 +20208,16 @@ mod tests {
             &request,
             ColumnRange { start: 0, end: 1 },
             1,
-            None,
         )
         .expect("fixed TensorRowSums range executes");
         let FusedBatchOutput::Matrices(values) = output else {
             panic!("fixed TensorRowSums returned a non-matrix output");
         };
-        assert_eq!(values.len(), 1);
-        assert_eq!(values[0].row_size(), groups.len());
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].row_size(), 1);
+        assert_eq!(values[1].row_size(), 2);
         assert_eq!(values[0].col_size(), 1);
+        assert_eq!(values[1].col_size(), 1);
     }
 
     #[test]
@@ -6766,6 +20760,10 @@ mod tests {
             gpu_calibration::{
                 gpu_calibration_operation_identity, gpu_operation_is_column_separable_for_types,
             },
+            gpu_measurement::{
+                GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare_gpu_setup,
+            },
+            gpu_runtime::GpuRuntime,
         };
         use mxx_dsl::{DslContext, Mat, Ring};
         let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
@@ -6856,10 +20854,11 @@ mod tests {
             })
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut store = MemoryArtifactStore::default();
+        let mut runtime = GpuRuntime::new(backend).expect("construct GPU fleet runtime");
         let mut run = |inputs: std::collections::BTreeMap<String, RuntimeValue<GpuDcrtBackend>>| {
-            let prepared = prepare(GpuPreparationRequest {
+            let setup = prepare_gpu_setup(GpuPreparationRequest {
                 validated: graph.clone(),
-                backend: &mut backend,
+                backend: runtime.backend_mut(),
                 inputs: &inputs,
                 parameters: std::slice::from_ref(&parameters),
                 default_tile_widths: vec![1, 2, 3, 4, 8],
@@ -6868,7 +20867,9 @@ mod tests {
                 execution_config: crate::ExecutionConfig::default(),
             })
             .expect("prepare GPU fleet graph");
-            prepared.run(&mut backend, inputs, &mut store, [0; 32]).expect("run GPU fleet graph")
+            let mut plan =
+                runtime.plan_from_prepared(setup, inputs.clone()).expect("compile GPU fleet graph");
+            runtime.execute(&mut plan, inputs, &mut store, [0; 32]).expect("run GPU fleet graph")
         };
         let optimized = run(inputs.clone());
         let reference = run(inputs);
@@ -6879,7 +20880,10 @@ mod tests {
             let RuntimeValue::Matrix(expected) = &reference.outputs[name] else {
                 panic!("resident output")
             };
-            assert_eq!(backend.matrix_to_bytes(actual), backend.matrix_to_bytes(expected));
+            assert_eq!(
+                runtime.backend().matrix_to_bytes(actual),
+                runtime.backend().matrix_to_bytes(expected)
+            );
         }
     }
 
@@ -6921,11 +20925,11 @@ mod tests {
                 let left_params = parameters.params_for_device(left_device, None);
                 let right_params = parameters.params_for_device(right_device, None);
                 let left = GpuDCRTPolyMatrix::zero(&left_params, 1, 1);
-                if left.copy_to_params_direct(&right_params).is_none() {
+                if left.copy_to_params_direct(&right_params).is_err() {
                     continue;
                 }
                 let right = GpuDCRTPolyMatrix::zero(&right_params, 1, 1);
-                if right.copy_to_params_direct(&left_params).is_some() {
+                if right.copy_to_params_direct(&left_params).is_ok() {
                     return Some([left_device, right_device]);
                 }
             }
@@ -7074,7 +21078,7 @@ mod tests {
         backend.devices.par_iter_mut().for_each(|(device, destination_backend)| {
             let destination = destination_backend.parameters(&ty).unwrap();
             let host_staging_required =
-                source.shards()[0].value.copy_to_params_direct(destination).is_none();
+                source.shards()[0].value.copy_to_params_direct(destination).is_err();
             let transferred =
                 GpuDcrtBackend::matrix_piece_on_device(destination_backend, &source, 1, 4);
             if host_staging_required {
@@ -7299,6 +21303,12 @@ mod tests {
             calibration_registry: FrozenGpuCalibrationRegistry::default(),
             vram_percent: 100,
             matrix_replicas: HashMap::new(),
+            capture_resources: Vec::new(),
+            capture_resident_resources: Vec::new(),
+            capture_resident_native_preparations: HashMap::new(),
+            capture_resident_family_preparations: HashMap::new(),
+            capture_resident_direct_family_preparations: HashMap::new(),
+            capture_integer_constants: HashMap::new(),
             frozen_plan: Some(Arc::new(FrozenGpuPlan {
                 contract: GpuPlanContract {
                     graph_specification_hash: [0; 32],
@@ -7320,6 +21330,7 @@ mod tests {
             frozen_plan_index: None,
             fixed_node: None,
             fixed_instance_slots: Vec::new(),
+            capture_active: false,
             measurement_owners: None,
             execution_identity: 0,
             plan_budgets: None,
@@ -8160,32 +22171,6 @@ impl GpuDcrtBackend {
         let slots = self.fixed_slots(inputs.len())?;
         let schedules_owned = self.fixed_batch_schedules_checked(output_columns[0], &slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
-        let active_devices_by_instance = schedules
-            .iter()
-            .map(|schedule| self.active_devices_for_schedules(std::iter::once(*schedule)))
-            .collect::<Vec<_>>();
-        let mut left_replicas = Vec::with_capacity(inputs.len());
-        let mut right_replicas = Vec::with_capacity(inputs.len());
-        for (instance, (left, right)) in inputs.iter().enumerate() {
-            left_replicas.push(if left.size() == (1, 1) || right.size() != (1, 1) {
-                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
-                for &device in &active_devices_by_instance[instance] {
-                    replicas[device] = Some(self.full_matrix_on_device(device, left)?);
-                }
-                Some(replicas)
-            } else {
-                None
-            });
-            right_replicas.push(if right.size() == (1, 1) {
-                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
-                for &device in &active_devices_by_instance[instance] {
-                    replicas[device] = Some(self.full_matrix_on_device(device, right)?);
-                }
-                Some(replicas)
-            } else {
-                None
-            });
-        }
         let jobs = match self.launch_fixed_column_batch(&schedules, |backend, instance, job| {
             let (left, right) = &inputs[instance];
             let mapped = Self::fixed_policy_ranges(
@@ -8205,44 +22190,10 @@ impl GpuDcrtBackend {
                 .find(|range| range.operand == 1)
                 .map(|range| range.range)
                 .ok_or(PolyBackendError::UnsupportedPlacement)?;
-            let (left, right) = if left.size() == (1, 1) {
-                (
-                    left_replicas[instance].as_ref().unwrap()[job.device]
-                        .as_ref()
-                        .ok_or(PolyBackendError::UnsupportedPlacement)?
-                        .as_ref()
-                        .clone(),
-                    Self::matrix_piece_on_device(
-                        backend,
-                        right,
-                        right_range.start,
-                        right_range.end,
-                    )?,
-                )
-            } else if right.size() == (1, 1) {
-                (
-                    Self::matrix_piece_on_device(backend, left, left_range.start, left_range.end)?,
-                    right_replicas[instance].as_ref().unwrap()[job.device]
-                        .as_ref()
-                        .ok_or(PolyBackendError::UnsupportedPlacement)?
-                        .as_ref()
-                        .clone(),
-                )
-            } else {
-                (
-                    left_replicas[instance].as_ref().unwrap()[job.device]
-                        .as_ref()
-                        .ok_or(PolyBackendError::UnsupportedPlacement)?
-                        .as_ref()
-                        .clone(),
-                    Self::matrix_piece_on_device(
-                        backend,
-                        right,
-                        right_range.start,
-                        right_range.end,
-                    )?,
-                )
-            };
+            let left =
+                Self::matrix_operand_on_device(backend, left, left_range.start, left_range.end)?;
+            let right =
+                Self::matrix_operand_on_device(backend, right, right_range.start, right_range.end)?;
             backend.multiply(&left, &right)
         }) {
             Ok(jobs) => jobs,
@@ -8514,26 +22465,6 @@ impl GpuDcrtBackend {
         let slots = self.fixed_slots(inputs.len())?;
         let schedules_owned = self.fixed_batch_schedules_checked(output_columns, &slots)?;
         let schedules = schedules_owned.iter().collect::<Vec<_>>();
-        let active_devices_by_instance = schedules
-            .iter()
-            .map(|schedule| self.active_devices_for_schedules(std::iter::once(*schedule)))
-            .collect::<Vec<_>>();
-        let mut lhs_replicas = Vec::with_capacity(inputs.len());
-        for (instance, (lhs, _)) in inputs.iter().enumerate() {
-            let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
-            for &device in &active_devices_by_instance[instance] {
-                replicas[device] = Some(
-                    Self::matrix_operand_on_device(
-                        &mut self.devices[device].1,
-                        lhs,
-                        0,
-                        lhs.columns,
-                    )?
-                    .into_owned(),
-                );
-            }
-            lhs_replicas.push(replicas);
-        }
         let jobs = match self.launch_fixed_column_batch(&schedules, |backend, instance, job| {
             let (lhs, rhs) = &inputs[instance];
             let arguments = [Self::policy_matrix_type(lhs)?, Self::policy_small_matrix_type(rhs)?];
@@ -8551,12 +22482,10 @@ impl GpuDcrtBackend {
                 .ok_or(PolyBackendError::UnsupportedPlacement)?;
             let rhs_pieces =
                 Self::small_matrix_piece_on_device(backend, rhs, rhs_range.start, rhs_range.end)?;
-            let lhs = lhs_replicas[instance][job.device]
-                .as_ref()
-                .ok_or(PolyBackendError::UnsupportedPlacement)?;
+            let lhs = Self::matrix_operand_on_device(backend, lhs, 0, lhs.columns)?;
             let mut outputs = rhs_pieces
                 .iter()
-                .map(|rhs| backend.multiply_small_rhs(lhs, rhs.as_matrix()))
+                .map(|rhs| backend.multiply_small_rhs(&lhs, rhs.as_matrix()))
                 .collect::<Result<Vec<_>, _>>()?;
             let first = outputs.drain(..1).next().ok_or(PolyBackendError::InvalidConstantShape)?;
             Ok(concat_owned_if_needed(first, outputs, |first, outputs| {
@@ -8610,6 +22539,9 @@ impl GpuDcrtBackend {
                 crate::backend::FixedUnaryOperation::RingAutomorphism { .. } => {
                     (value.rows, value.columns)
                 }
+                crate::backend::FixedUnaryOperation::CenteredRoundDivide { .. } => {
+                    (value.rows, value.columns)
+                }
             })
             .collect::<Vec<_>>();
         let output_columns = output_shapes[0].1;
@@ -8656,6 +22588,12 @@ impl GpuDcrtBackend {
                 crate::backend::FixedUnaryOperation::CenteredRebase { destination } => {
                     let kind = NodeKind::CenteredRebase {
                         modulus: IntExpr::constant(destination.modulus.clone()),
+                    };
+                    (kind.clone(), map_input(&kind)?)
+                }
+                crate::backend::FixedUnaryOperation::CenteredRoundDivide { divisor } => {
+                    let kind = NodeKind::CenteredRoundDivide {
+                        divisor: IntExpr::constant(divisor.clone()),
                     };
                     (kind.clone(), map_input(&kind)?)
                 }
@@ -8764,6 +22702,9 @@ impl GpuDcrtBackend {
                 }
                 crate::backend::FixedUnaryOperation::CenteredRebase { destination } => {
                     backend.centered_rebase(&input, destination)?
+                }
+                crate::backend::FixedUnaryOperation::CenteredRoundDivide { divisor } => {
+                    backend.centered_round_divide(&input, divisor)?
                 }
                 crate::backend::FixedUnaryOperation::BlockModSwitch {
                     destination,
@@ -9288,9 +23229,343 @@ impl GpuDcrtBackend {
         Ok(outputs)
     }
 
+    /// Materialize indexed integer values directly on the selected native
+    /// owner. PolynomialFromValues is scalar and therefore has one indivisible
+    /// destination; keeping this in the fixed fleet path prevents the old
+    /// executor from trying to interpret the family as a resident matrix.
+    pub(crate) fn fixed_batch_polynomial_from_values(
+        &mut self,
+        inputs: Vec<(ConcreteMatrixType, Arc<GpuFleetSignedValues>, bool)>,
+        slots: &[usize],
+    ) -> Result<Vec<GpuFleetMatrix>, PolyBackendError> {
+        if inputs.len() != slots.len() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        inputs
+            .into_iter()
+            .zip(slots.iter().copied())
+            .map(|((ty, values, evaluation), slot)| {
+                if !ty.is_scalar() {
+                    return Err(PolyBackendError::InvalidConstantShape);
+                }
+                let schedule = self
+                    .fixed_batch_schedules_checked(1, &[slot])?
+                    .into_iter()
+                    .next()
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                let owner = schedule
+                    .intervals()
+                    .first()
+                    .map(|interval| interval.device)
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                if schedule.intervals().iter().any(|interval| interval.device != owner) {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let parameters = self.devices[owner].1.parameters(&ty)?.clone();
+                let values = values.as_ref();
+                if values.device_id() != self.devices[owner].0 ||
+                    values.count() != parameters.ring_dimension() as usize
+                {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let descriptor = GpuMatrixOutputDescriptor::for_shape(
+                    &parameters,
+                    1,
+                    1,
+                    parameters.crt_depth().saturating_sub(1),
+                    evaluation,
+                )
+                .map_err(PolyBackendError::GpuCalibration)?;
+                let mut destination = descriptor.allocate();
+                destination
+                    .write_values_into(values.native(), evaluation)
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                Ok(GpuFleetMatrix::new(
+                    ty.rows,
+                    ty.columns,
+                    vec![GpuColumnShard {
+                        device_id: self.devices[owner].0,
+                        global_column_start: 0,
+                        value: destination,
+                    }],
+                ))
+            })
+            .collect()
+    }
+
+    fn fixed_batch_polynomial_values(
+        &mut self,
+        inputs: Vec<(Arc<GpuFleetMatrix>, bool)>,
+        slots: &[usize],
+    ) -> Result<Vec<GpuFleetSignedValues>, PolyBackendError> {
+        if inputs.len() != slots.len() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        inputs
+            .into_iter()
+            .zip(slots.iter().copied())
+            .map(|((value, evaluation), slot)| {
+                if value.size() != (1, 1) {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                let schedule = self
+                    .fixed_batch_schedules_checked(1, &[slot])?
+                    .into_iter()
+                    .next()
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                let owner = schedule
+                    .intervals()
+                    .first()
+                    .map(|interval| interval.device)
+                    .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                if schedule.intervals().iter().any(|interval| interval.device != owner) {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let (device_id, backend) = &mut self.devices[owner];
+                let source = Self::matrix_piece_on_device(backend, value.as_ref(), 0, 1)?;
+                let parameters = source.params().clone();
+                let values = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    *device_id,
+                    parameters.ring_dimension() as usize,
+                    GpuSignedValuesEncoding::SignedWords(parameters.modulus_bits().div_ceil(64)),
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                source
+                    .store_values_into(values.native(), evaluation)
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                Ok(values)
+            })
+            .collect()
+    }
+
+    /// Measurement has no frozen schedule yet. Execute its representative on
+    /// the input owner; compiled execution must obey the frozen destination.
+    fn native_scalar_primitive_owner(
+        &mut self,
+        slot: usize,
+        source: i32,
+    ) -> Result<usize, PolyBackendError> {
+        if self.fixed_node.is_none() {
+            return self
+                .devices
+                .iter()
+                .position(|(device, _)| *device == source)
+                .ok_or(PolyBackendError::UnsupportedPlacement);
+        }
+        let schedule = self
+            .fixed_batch_schedules_checked(1, &[slot])?
+            .into_iter()
+            .next()
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let owner = schedule
+            .intervals()
+            .first()
+            .map(|interval| interval.device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        if schedule.intervals().iter().any(|interval| interval.device != owner) {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        Ok(owner)
+    }
+
+    pub(crate) fn fixed_batch_extract_coefficient(
+        &mut self,
+        inputs: Vec<(Arc<GpuFleetMatrix>, usize)>,
+        slots: &[usize],
+    ) -> Result<Vec<GpuFleetSignedValues>, PolyBackendError> {
+        if inputs.len() != slots.len() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        inputs
+            .into_iter()
+            .zip(slots.iter().copied())
+            .map(|((value, position), slot)| {
+                if value.size() != (1, 1) || value.shards.len() != 1 {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let owner = self.native_scalar_primitive_owner(slot, value.shards[0].device_id)?;
+                let device_id = self.devices[owner].0;
+                let shard = value.shards.first().ok_or(PolyBackendError::UnsupportedPlacement)?;
+                if shard.device_id != device_id || shard.global_column_start != 0 {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let parameters = shard.value.params().clone();
+                let output = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    1,
+                    GpuSignedValuesEncoding::SignedWords(parameters.modulus_bits().div_ceil(64)),
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let status = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    1,
+                    GpuSignedValuesEncoding::SignedI64,
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let polynomial = shard.value.entry(0, 0);
+                polynomial
+                    .extract_coefficient_resident(position, output.native(), Some(status.native()))
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                if status
+                    .native()
+                    .download_i64()
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))? !=
+                    [0]
+                {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                Ok(output)
+            })
+            .collect()
+    }
+
+    pub(crate) fn fixed_batch_threshold_decode(
+        &mut self,
+        inputs: Vec<(Arc<GpuFleetMatrix>, BigInt, usize, bool)>,
+        slots: &[usize],
+    ) -> Result<Vec<Vec<GpuFleetSignedValues>>, PolyBackendError> {
+        if inputs.len() != slots.len() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        inputs
+            .into_iter()
+            .zip(slots.iter().copied())
+            .map(|((value, plaintext_modulus, length, output_bool), slot)| {
+                if value.size() != (1, 1) || value.shards.len() != 1 {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let owner = self.native_scalar_primitive_owner(slot, value.shards[0].device_id)?;
+                let device_id = self.devices[owner].0;
+                let shard = value.shards.first().ok_or(PolyBackendError::UnsupportedPlacement)?;
+                if shard.device_id != device_id || shard.global_column_start != 0 {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let parameters = shard.value.params().clone();
+                let output = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    length,
+                    if output_bool || plaintext_modulus.bits() <= 64 {
+                        GpuSignedValuesEncoding::CanonicalU64
+                    } else {
+                        GpuSignedValuesEncoding::SignedWords(
+                            plaintext_modulus.bits().div_ceil(64) as usize
+                        )
+                    },
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let status = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    1,
+                    GpuSignedValuesEncoding::SignedI64,
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let polynomial = shard.value.entry(0, 0);
+                polynomial
+                    .threshold_decode_resident(
+                        &plaintext_modulus,
+                        length,
+                        output_bool,
+                        output.native(),
+                        Some(status.native()),
+                    )
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                if status
+                    .native()
+                    .download_i64()
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))? !=
+                    [0]
+                {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                Ok((0..length)
+                    .map(|index| output.slice(index..index + 1))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?)
+            })
+            .collect()
+    }
+
+    pub(crate) fn fixed_batch_pack_polynomial_coefficients(
+        &mut self,
+        inputs: Vec<(ConcreteMatrixType, Arc<GpuFleetSignedValues>, usize)>,
+        slots: &[usize],
+    ) -> Result<Vec<GpuFleetMatrix>, PolyBackendError> {
+        if inputs.len() != slots.len() {
+            return Err(PolyBackendError::InvalidConstantShape);
+        }
+        inputs
+            .into_iter()
+            .zip(slots.iter().copied())
+            .map(|((ty, bits, coefficient_bits), slot)| {
+                if !ty.is_scalar() ||
+                    bits.count() != ty.ring_dimension.saturating_mul(coefficient_bits)
+                {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                let owner = self.native_scalar_primitive_owner(slot, bits.device_id())?;
+                let device_id = self.devices[owner].0;
+                if bits.device_id() != device_id {
+                    return Err(PolyBackendError::UnsupportedPlacement);
+                }
+                let parameters = self.devices[owner].1.parameters(&ty)?.clone();
+                let descriptor = GpuMatrixOutputDescriptor::for_shape(
+                    &parameters,
+                    1,
+                    1,
+                    parameters.crt_depth().saturating_sub(1),
+                    false,
+                )
+                .map_err(PolyBackendError::GpuCalibration)?;
+                let mut destination = descriptor.allocate();
+                let packed = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    parameters.ring_dimension() as usize,
+                    GpuSignedValuesEncoding::SignedWords(parameters.modulus_bits().div_ceil(64)),
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let status = GpuFleetSignedValues::allocate(
+                    &parameters,
+                    device_id,
+                    1,
+                    GpuSignedValuesEncoding::SignedI64,
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                let mut polynomial = destination.entry(0, 0);
+                mxx_primitives::poly::dcrt::gpu::GpuDCRTPoly::pack_polynomial_coefficients_resident(
+                    bits.native(),
+                    coefficient_bits,
+                    packed.native(),
+                    &mut polynomial,
+                    status.native(),
+                )
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                if status
+                    .native()
+                    .download_i64()
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))? !=
+                    [0]
+                {
+                    return Err(PolyBackendError::InvalidInteger);
+                }
+                destination.set_entry(0, 0, polynomial);
+                Ok(GpuFleetMatrix::new(
+                    1,
+                    1,
+                    vec![GpuColumnShard { device_id, global_column_start: 0, value: destination }],
+                ))
+            })
+            .collect()
+    }
+
     fn fixed_batch_lift_integer_to_constant_polynomial(
         &mut self,
-        inputs: Vec<(ConcreteMatrixType, BigInt)>,
+        inputs: Vec<(ConcreteMatrixType, Arc<GpuFleetSignedValues>)>,
         slots: &[usize],
     ) -> Result<Vec<GpuFleetMatrix>, PolyBackendError> {
         if inputs.len() != slots.len() || inputs.is_empty() {
@@ -9315,17 +23590,43 @@ impl GpuDcrtBackend {
             .iter()
             .zip(slots.iter().copied())
             .map(|((ty, coefficient), slot)| {
+                let devices: Vec<_> = self.devices.iter().map(|(device, _)| *device).collect();
+                let routed = devices
+                    .into_iter()
+                    .map(|device| {
+                        self.materialize_integer_values_on_device(coefficient, device)
+                            .map(|value| (device, value))
+                    })
+                    .collect::<Result<HashMap<_, _>, _>>()?;
                 let shards =
                     self.fixed_generated_columns_for_slot(columns, slot, |backend, start, end| {
                         let local_ty = ConcreteMatrixType { columns: end - start, ..ty.clone() };
                         let params = backend.parameters(&local_ty)?;
-                        let identity = GpuDCRTPolyMatrix::identity_columns(
+                        let values = routed
+                            .get(&params.gpu_ids()[0])
+                            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                        let descriptor = GpuMatrixOutputDescriptor::for_shape(
                             params,
                             ty.rows,
-                            start,
                             end - start,
-                        );
-                        backend.scale_integer(&identity, coefficient)
+                            params.crt_depth().saturating_sub(1),
+                            true,
+                        )
+                        .map_err(PolyBackendError::GpuCalibration)?;
+                        let mut destination = descriptor.allocate();
+                        let stream = params
+                            .native_launch_stream(values.device_id())
+                            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                        destination
+                            .write_integer_constant_into_bound(
+                                values.native(),
+                                start,
+                                &stream,
+                                u32::MAX,
+                                u32::MAX,
+                            )
+                            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+                        Ok(destination)
                     })?;
                 Ok(GpuFleetMatrix::new(ty.rows, columns, shards))
             })
@@ -9388,50 +23689,47 @@ impl GpuDcrtBackend {
                             .find(|range| range.operand == 1)
                             .ok_or(PolyBackendError::UnsupportedPlacement)?
                             .range;
-                        let (local_left, local_right) = if left_scalar {
-                            (
-                                left_replicas.as_ref().unwrap()[device]
-                                    .as_ref()
-                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
-                                    .as_ref()
-                                    .clone(),
-                                Self::matrix_piece_on_device(
-                                    backend,
-                                    right,
-                                    right_range.start,
-                                    right_range.end,
-                                )?,
-                            )
+                        let value = if left_scalar {
+                            let local_left = left_replicas.as_ref().unwrap()[device]
+                                .as_ref()
+                                .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                .as_ref()
+                                .clone();
+                            let local_right = Self::matrix_operand_on_device(
+                                backend,
+                                right,
+                                right_range.start,
+                                right_range.end,
+                            )?;
+                            backend.multiply(&local_left, &local_right)?
                         } else if right_scalar {
-                            (
-                                Self::matrix_piece_on_device(
-                                    backend,
-                                    left,
-                                    left_range.start,
-                                    left_range.end,
-                                )?,
-                                right_replicas.as_ref().unwrap()[device]
-                                    .as_ref()
-                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
-                                    .as_ref()
-                                    .clone(),
-                            )
+                            let local_left = Self::matrix_operand_on_device(
+                                backend,
+                                left,
+                                left_range.start,
+                                left_range.end,
+                            )?;
+                            let local_right = right_replicas.as_ref().unwrap()[device]
+                                .as_ref()
+                                .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                .as_ref()
+                                .clone();
+                            backend.multiply(&local_left, &local_right)?
                         } else {
-                            (
-                                left_replicas.as_ref().unwrap()[device]
-                                    .as_ref()
-                                    .ok_or(PolyBackendError::UnsupportedPlacement)?
-                                    .as_ref()
-                                    .clone(),
-                                Self::matrix_piece_on_device(
-                                    backend,
-                                    right,
-                                    right_range.start,
-                                    right_range.end,
-                                )?,
-                            )
+                            let local_left = left_replicas.as_ref().unwrap()[device]
+                                .as_ref()
+                                .ok_or(PolyBackendError::UnsupportedPlacement)?
+                                .as_ref()
+                                .clone();
+                            let local_right = Self::matrix_operand_on_device(
+                                backend,
+                                right,
+                                right_range.start,
+                                right_range.end,
+                            )?;
+                            backend.multiply(&local_left, &local_right)?
                         };
-                        backend.multiply(&local_left, &local_right).map(|value| GpuColumnShard {
+                        Ok::<_, PolyBackendError>(GpuColumnShard {
                             device_id: *device_id,
                             global_column_start: job.start,
                             value,
@@ -9529,10 +23827,11 @@ impl GpuDcrtBackend {
         Ok(GpuFleetMatrix::new(lhs.rows, rhs.columns, shards))
     }
 
-    /// Fixed preimage dispatch. The fleet owns the upper-level column jobs;
-    /// each logical wave starts one job per participating GPU and each GPU
-    /// executes its assigned jobs in schedule order. The device sampler is
-    /// called only for the supplied range and cannot influence owner/width.
+    /// Setup-measurement-only preimage dispatch. Production compiled replay
+    /// uses [`Self::capture_preimage_retry_body`] and never enters this
+    /// host-controlled range loop. The fleet owns the upper-level column
+    /// jobs; each logical wave starts one job per participating GPU and each
+    /// GPU executes its assigned jobs in schedule order.
     fn fixed_sample_preimage_dispatch(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -9580,7 +23879,7 @@ impl GpuDcrtBackend {
         }
         let mut metadata = request.fixed_metadata.ok_or(PolyBackendError::UnsupportedPlacement)?;
         let target = OffsetFleetColumnSource {
-            value: request.target.load_columns(range.start, range.end),
+            value: Arc::new(request.target.load_columns(range.start, range.end)),
             global_column_start: request
                 .target
                 .global_column_start()
@@ -9644,7 +23943,7 @@ impl GpuDcrtBackend {
         self.install_frozen_plan(plan)?;
         let result = catch_unwind(AssertUnwindSafe(|| {
             self.prepare_fixed_node_batch(&metadata)?;
-            self.fixed_sample_preimage(
+            self.fixed_sample_preimage_dispatch(
                 &ty,
                 request.sigma,
                 &request.gadget_base,
@@ -9720,7 +24019,7 @@ impl GpuDcrtBackend {
             return Err(PolyBackendError::InvalidConstantShape);
         }
         let target = OffsetFleetColumnSource {
-            value: target.load_columns(start, end),
+            value: Arc::new(target.load_columns(start, end)),
             global_column_start: target
                 .global_column_start()
                 .checked_add(start)
@@ -10006,11 +24305,9 @@ impl GpuDcrtBackend {
                         };
                         Ok(FusedBatchOutput::Matrices(vec![value]))
                     }
-                    DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => {
-                        let groups = rows.into_iter().flatten().collect::<Vec<_>>();
-                        self.tensor_sum_rows(&source, &right, &groups)
-                            .map(|value| FusedBatchOutput::Matrices(vec![value]))
-                    }
+                    DynamicFusedBatchRequest::TensorRowSums { source, right, rows } => self
+                        .tensor_sum_row_groups(&source, &right, &rows)
+                        .map(FusedBatchOutput::Matrices),
                     DynamicFusedBatchRequest::Decompose { blocks, small, digits } => self
                         .gadget_decompose_row_blocks(
                             &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -10054,6 +24351,7 @@ impl GpuDcrtBackend {
 impl Backend for GpuDcrtBackend {
     type Matrix = GpuFleetMatrix;
     type SmallMatrix = GpuFleetSmallMatrix;
+    type IntegerValues = GpuFleetSignedValues;
     type Trapdoor = GpuFleetTrapdoor;
     type Error = PolyBackendError;
 
@@ -10074,8 +24372,8 @@ impl Backend for GpuDcrtBackend {
         values: &[BigInt],
         evaluation: bool,
     ) -> Result<Self::Matrix, Self::Error> {
-        let canonical = super::super::poly::canonical_polynomial_values(ty, values)?;
-        self.upload_polynomial_values(ty, &canonical, evaluation)
+        let values = self.integer_values_from_host(values)?;
+        self.polynomial_from_integer_values(ty, &values, evaluation)
     }
 
     fn polynomial_values(
@@ -10083,8 +24381,119 @@ impl Backend for GpuDcrtBackend {
         value: &Self::Matrix,
         evaluation: bool,
     ) -> Result<Vec<BigInt>, Self::Error> {
-        let values = self.download_polynomial_values(value, evaluation)?;
-        Ok(super::super::poly::polynomial_host_values(values))
+        let values = self.polynomial_values_resident(value, evaluation)?;
+        self.integer_values_to_host(&values)
+    }
+
+    fn integer_values_from_host(
+        &mut self,
+        values: &[BigInt],
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        let device_id = self
+            .devices
+            .first()
+            .map(|(device, _)| *device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        self.integer_values_from_host_on_device(device_id, values)
+    }
+
+    fn polynomial_from_integer_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &Self::IntegerValues,
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        if !ty.is_scalar() {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let device = self
+            .devices
+            .iter()
+            .position(|(device, _)| *device == values.device_id())
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = self.devices[device].1.parameters(ty)?.clone();
+        if values.count() != parameters.ring_dimension() as usize {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let descriptor = GpuMatrixOutputDescriptor::for_shape(
+            &parameters,
+            1,
+            1,
+            parameters.crt_depth().saturating_sub(1),
+            evaluation,
+        )
+        .map_err(PolyBackendError::GpuCalibration)?;
+        let mut destination = descriptor.allocate();
+        destination
+            .write_values_into(values.native(), evaluation)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        Ok(GpuFleetMatrix::new(
+            1,
+            1,
+            vec![GpuColumnShard {
+                device_id: values.device_id(),
+                global_column_start: 0,
+                value: destination,
+            }],
+        ))
+    }
+
+    fn polynomial_values_resident(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        if value.size() != (1, 1) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let shard = value.shards.first().ok_or(PolyBackendError::InvalidInteger)?;
+        if value.shards.len() != 1 || shard.global_column_start != 0 {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        if !self.devices.iter().any(|(device, _)| *device == shard.device_id) {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
+        let parameters = shard.value.params().clone();
+        let output = GpuFleetSignedValues::allocate(
+            &parameters,
+            shard.device_id,
+            parameters.ring_dimension() as usize,
+            GpuSignedValuesEncoding::SignedWords(parameters.modulus_bits().div_ceil(64)),
+        )
+        .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        shard
+            .value
+            .store_values_into(output.native(), evaluation)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        Ok(output)
+    }
+
+    fn integer_values_to_host(
+        &mut self,
+        values: &Self::IntegerValues,
+    ) -> Result<Vec<BigInt>, Self::Error> {
+        values
+            .wait_until_ready()
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        match values.encoding() {
+            GpuSignedValuesEncoding::SignedWords(_) => values
+                .native()
+                .download_bigints()
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string())),
+            GpuSignedValuesEncoding::SignedI64 => values
+                .native()
+                .download_i64()
+                .map(|values| values.into_iter().map(BigInt::from).collect())
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string())),
+            GpuSignedValuesEncoding::CanonicalU64 => values
+                .download_u64()
+                .map(|values| values.into_iter().map(BigInt::from).collect())
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string())),
+        }
+    }
+
+    fn integer_values_len(&self, values: &Self::IntegerValues) -> usize {
+        values.count()
     }
 
     fn select_gpu_operation(&mut self, operation: [u8; 32]) -> Result<(), Self::Error> {
@@ -10282,11 +24691,9 @@ impl Backend for GpuDcrtBackend {
                         }?;
                         Ok(FusedBatchOutput::Matrices(vec![value]))
                     }
-                    FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => {
-                        let groups = rows.into_iter().flatten().collect::<Vec<_>>();
-                        self.tensor_sum_rows(&source, &right, &groups)
-                            .map(|value| FusedBatchOutput::Matrices(vec![value]))
-                    }
+                    FusedBatchRequest::TensorRowSums { source, right, rows, metadata: _ } => self
+                        .tensor_sum_row_groups(&source, &right, &rows)
+                        .map(FusedBatchOutput::Matrices),
                     FusedBatchRequest::Decompose { blocks, small, digits, metadata: _ } => self
                         .gadget_decompose_row_blocks(
                             &blocks.iter().map(Arc::as_ref).collect::<Vec<_>>(),
@@ -10401,38 +24808,6 @@ impl Backend for GpuDcrtBackend {
                 }
             }
         }
-        // Keep fixed block replicas alive across every tile of this stage, but
-        // derive participation from each original instance.  A union wave may
-        // contain jobs from several instances; using the union owner set here
-        // would allocate replicas on GPUs that never execute that instance.
-        let active_devices_by_instance = (0..requests.len())
-            .map(|instance| {
-                self.active_devices_for_schedules(
-                    schedules_by_port.iter().map(|port| &port[instance]),
-                )
-            })
-            .collect::<Vec<_>>();
-        let mut replicas = Vec::with_capacity(requests.len());
-        for (instance, request) in requests.iter().enumerate() {
-            let mut by_device = Vec::new();
-            if let FusedBatchRequest::SmallProduct { blocks, .. } = request {
-                by_device = (0..self.devices.len()).map(|_| None).collect();
-                for &device in &active_devices_by_instance[instance] {
-                    let replica = blocks
-                        .iter()
-                        .map(|block| self.full_matrix_on_device(device, block))
-                        .collect::<Result<Vec<_>, _>>();
-                    match replica {
-                        Ok(replica) => by_device[device] = Some(replica),
-                        Err(error) => {
-                            self.clear_fixed_batch_state();
-                            return Err(error);
-                        }
-                    }
-                }
-            }
-            replicas.push(by_device);
-        }
         let jobs = match self.launch_fixed_fused_union_batch(
             &schedules_by_port,
             requests.len(),
@@ -10538,7 +24913,6 @@ impl Backend for GpuDcrtBackend {
                     &requests[instance],
                     binding_range,
                     layouts[binding_port].columns,
-                    replicas[instance].get(job.device).and_then(Option::as_ref),
                 )
             },
         ) {
@@ -10727,24 +25101,6 @@ impl Backend for GpuDcrtBackend {
                         };
                         let local_ty =
                             ConcreteMatrixType { columns: job.end - job.start, ..ty.clone() };
-                        Self::fixed_policy_ranges(
-                            &NodeKind::UniformIntervalSample {
-                                matrix_type: mxx_ir_core::types::MatrixType {
-                                    modulus: IntExpr::constant(ty.modulus.clone()),
-                                    ring_dimension: IntExpr::constant(ty.ring_dimension as i64),
-                                    rows: IntExpr::constant(ty.rows as i64),
-                                    columns: IntExpr::constant(ty.columns as i64),
-                                },
-                                range: mxx_ir_core::node::SampleRange {
-                                    minimum: IntExpr::constant(range.minimum.clone()),
-                                    maximum: IntExpr::constant(range.maximum.clone()),
-                                },
-                            },
-                            &[],
-                            columns,
-                            job.start,
-                            job.end,
-                        )?;
                         backend.sample_uniform(&local_ty, range)
                     })?;
                 self.assemble_generated_matrix_batch(jobs, &vec![rows; requests.len()], columns)
@@ -10931,8 +25287,11 @@ impl Backend for GpuDcrtBackend {
 
     fn fixed_operation_batch(
         &mut self,
-        requests: Vec<FixedOperationBatchRequest<Self::Matrix, Self::SmallMatrix>>,
-    ) -> Result<Vec<Self::Matrix>, Self::Error> {
+        requests: Vec<
+            FixedOperationBatchRequest<Self::Matrix, Self::SmallMatrix, Self::IntegerValues>,
+        >,
+    ) -> Result<Vec<FixedOperationBatchOutput<Self::Matrix, Self::IntegerValues>>, Self::Error>
+    {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
@@ -10951,7 +25310,7 @@ impl Backend for GpuDcrtBackend {
                     source_moduli, ..
                 } = operation
                 {
-                    Self::validate_block_mod_switch_source(value, source_moduli)?;
+                    Self::validate_block_mod_switch_source(value.as_ref(), source_moduli)?;
                 }
             }
         }
@@ -10970,6 +25329,11 @@ impl Backend for GpuDcrtBackend {
                         metadata,
                         ..
                     } |
+                    FixedOperationBatchRequest::PolynomialFromValues { metadata, .. } |
+                    FixedOperationBatchRequest::PolynomialValues { metadata, .. } |
+                    FixedOperationBatchRequest::ExtractCoefficient { metadata, .. } |
+                    FixedOperationBatchRequest::ThresholdDecode { metadata, .. } |
+                    FixedOperationBatchRequest::PackPolynomialCoefficients { metadata, .. } |
                     FixedOperationBatchRequest::MatrixBinary { metadata, .. } |
                     FixedOperationBatchRequest::MatrixMulSmallRhs { metadata, .. } |
                     FixedOperationBatchRequest::MatrixMulAccumulate { metadata, .. } |
@@ -10987,7 +25351,7 @@ impl Backend for GpuDcrtBackend {
                 {
                     return Err(PolyBackendError::InvalidConstantShape);
                 }
-                self.fixed_metadata_layouts(Some(metadata), &node, &plan)?;
+                self.fixed_metadata_layouts(Some(&metadata), &node, &plan)?;
                 Ok(metadata.instance_slots[0])
             })
             .collect::<Result<Vec<_>, _>>()
@@ -11003,6 +25367,92 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
         self.fixed_instance_slots = slots.clone();
+
+        if matches!(requests.first(), Some(FixedOperationBatchRequest::PolynomialValues { .. })) {
+            let inputs = requests
+                .into_iter()
+                .map(|request| match request {
+                    FixedOperationBatchRequest::PolynomialValues { value, evaluation, .. } => {
+                        Ok((value, evaluation))
+                    }
+                    _ => Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                        expected: "polynomial values",
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = self.fixed_batch_polynomial_values(inputs, &slots).map(|values| {
+                values.into_iter().map(FixedOperationBatchOutput::IntegerValues).collect()
+            });
+            self.clear_fixed_batch_state();
+            return result;
+        }
+
+        if matches!(requests.first(), Some(FixedOperationBatchRequest::ExtractCoefficient { .. })) {
+            let inputs = requests
+                .into_iter()
+                .map(|request| match request {
+                    FixedOperationBatchRequest::ExtractCoefficient { value, position, .. } => {
+                        Ok((value, position))
+                    }
+                    _ => Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                        expected: "extract coefficient",
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = self.fixed_batch_extract_coefficient(inputs, &slots).map(|values| {
+                values.into_iter().map(FixedOperationBatchOutput::IntegerValues).collect()
+            });
+            self.clear_fixed_batch_state();
+            return result;
+        }
+
+        if matches!(requests.first(), Some(FixedOperationBatchRequest::ThresholdDecode { .. })) {
+            let inputs = requests
+                .into_iter()
+                .map(|request| match request {
+                    FixedOperationBatchRequest::ThresholdDecode {
+                        value,
+                        plaintext_modulus,
+                        length,
+                        output_bool,
+                        ..
+                    } => Ok((value, plaintext_modulus, length, output_bool)),
+                    _ => Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                        expected: "threshold decode",
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = self.fixed_batch_threshold_decode(inputs, &slots).map(|values| {
+                values.into_iter().map(FixedOperationBatchOutput::IntegerValuesMany).collect()
+            });
+            self.clear_fixed_batch_state();
+            return result;
+        }
+
+        if matches!(
+            requests.first(),
+            Some(FixedOperationBatchRequest::PackPolynomialCoefficients { .. })
+        ) {
+            let inputs = requests
+                .into_iter()
+                .map(|request| match request {
+                    FixedOperationBatchRequest::PackPolynomialCoefficients {
+                        ty,
+                        bits,
+                        coefficient_bits,
+                        ..
+                    } => Ok((ty, bits, coefficient_bits)),
+                    _ => Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                        expected: "pack polynomial coefficients",
+                    }),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let result = self
+                .fixed_batch_pack_polynomial_coefficients(inputs, &slots)
+                .map(|values| values.into_iter().map(FixedOperationBatchOutput::Matrix).collect());
+            self.clear_fixed_batch_state();
+            return result;
+        }
 
         let result = (|| {
             let first = requests.first().ok_or(PolyBackendError::InvalidConstantShape)?;
@@ -11063,8 +25513,33 @@ impl Backend for GpuDcrtBackend {
                         .collect::<Result<Vec<_>, _>>()?;
                     self.fixed_batch_lift_integer_to_constant_polynomial(inputs, &slots)
                 }
+                FixedOperationBatchRequest::PolynomialFromValues { .. } => {
+                    let inputs = requests
+                        .into_iter()
+                        .map(|request| match request {
+                            FixedOperationBatchRequest::PolynomialFromValues {
+                                ty,
+                                values,
+                                evaluation,
+                                ..
+                            } => Ok((ty, values, evaluation)),
+                            _ => Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                                expected: "polynomial from indexed values",
+                            }),
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    self.fixed_batch_polynomial_from_values(inputs, &slots)
+                }
+                FixedOperationBatchRequest::PolynomialValues { .. } => {
+                    unreachable!("polynomial values are handled before matrix fixed dispatch")
+                }
+                FixedOperationBatchRequest::ExtractCoefficient { .. } |
+                FixedOperationBatchRequest::ThresholdDecode { .. } |
+                FixedOperationBatchRequest::PackPolynomialCoefficients { .. } => {
+                    unreachable!("protocol primitive is handled before matrix fixed dispatch")
+                }
                 FixedOperationBatchRequest::MatrixBinary { operation, .. } => {
-                    let operation = *operation;
+                    let operation = operation.clone();
                     let inputs = requests
                         .into_iter()
                         .map(|request| match request {
@@ -11192,7 +25667,7 @@ impl Backend for GpuDcrtBackend {
                                 destination,
                                 ..
                             } => Ok((
-                                levels,
+                                levels.iter().map(GpuFleetMatrix::retained_clone).collect(),
                                 plaintext_moduli,
                                 reconstruction_coefficients,
                                 destination,
@@ -11207,7 +25682,7 @@ impl Backend for GpuDcrtBackend {
             }
         })();
         self.clear_fixed_batch_state();
-        result
+        result.map(|values| values.into_iter().map(FixedOperationBatchOutput::Matrix).collect())
     }
 
     fn fixed_compact_operation_batch(
@@ -12017,6 +26492,14 @@ impl Backend for GpuDcrtBackend {
         destination: &ConcreteMatrixType,
     ) -> Result<Self::Matrix, Self::Error> {
         self.unary_columns(value, |backend, input| backend.centered_rebase(input, destination))
+    }
+
+    fn centered_round_divide(
+        &mut self,
+        value: &Self::Matrix,
+        divisor: &BigInt,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.unary_columns(value, |backend, input| backend.centered_round_divide(input, divisor))
     }
 
     fn centered_rebase_small(
@@ -13098,13 +27581,31 @@ impl Backend for GpuDcrtBackend {
     ) -> Result<(Self::Matrix, Self::Trapdoor), Self::Error> {
         let (public, first) =
             self.devices[0].1.sample_trapdoor(ty, sigma, gadget_base, digit_count)?;
-        let bytes = self.devices[0].1.trapdoor_to_bytes(&first);
         let mut values = Vec::with_capacity(self.devices.len());
+        // The sampler's origin owner is already in the correct context for
+        // device zero. Move it into the fleet and only replicate it for the
+        // remaining devices; cloning it for the origin used to add a full
+        // matrix copy to every trapdoor sample.
         values.push(first);
-        for (_, backend) in self.devices.iter().skip(1) {
-            values.push(backend.trapdoor_from_bytes(ty, &bytes)?);
+        for device in 1..self.devices.len() {
+            let target = self.devices[device].1.parameters(ty)?.clone();
+            let source = values.first().expect("trapdoor origin owner is present");
+            let value = if target.gpu_ids() == source.r.params.gpu_ids() &&
+                target.context_execution_identity() ==
+                    source.r.params.context_execution_identity()
+            {
+                source.clone()
+            } else {
+                source
+                    .copy_to_params_direct(&target)
+                    .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
+            };
+            values.push(value);
         }
         let public = self.scatter_matrix(public)?;
+        if values.len() != self.devices.len() {
+            return Err(PolyBackendError::UnsupportedPlacement);
+        }
         Ok((public, GpuFleetTrapdoor { values }))
     }
 
@@ -13154,14 +27655,39 @@ impl Backend for GpuDcrtBackend {
                 &request.gadget_base,
                 request.digit_count,
             )?;
-            let bytes = self.devices[owner].1.trapdoor_to_bytes(&first);
-            let values = self
-                .devices
-                .iter()
-                .skip(0)
-                .map(|(_, backend)| backend.trapdoor_from_bytes(&request.ty, &bytes))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((GpuFleetMatrix::from(public), GpuFleetTrapdoor { values }))
+            let mut values = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
+            // Keep the sampled owner at its origin index. Other devices can
+            // replicate from it without making an additional origin clone.
+            values[owner] = Some(first);
+            for device in 0..self.devices.len() {
+                if device == owner {
+                    continue;
+                }
+                let target = self.devices[device].1.parameters(&request.ty)?.clone();
+                let value = {
+                    let source = values[owner].as_ref().expect("trapdoor origin owner is present");
+                    if target.gpu_ids() == source.r.params.gpu_ids() &&
+                        target.context_execution_identity() ==
+                            source.r.params.context_execution_identity()
+                    {
+                        source.clone()
+                    } else {
+                        source
+                            .copy_to_params_direct(&target)
+                            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
+                    }
+                };
+                values[device] = Some(value);
+            }
+            Ok((
+                GpuFleetMatrix::from(public),
+                GpuFleetTrapdoor {
+                    values: values
+                        .into_iter()
+                        .map(|value| value.expect("every trapdoor device receives an owner"))
+                        .collect(),
+                },
+            ))
         })();
         self.clear_fixed_batch_state();
         result
@@ -13180,17 +27706,7 @@ impl Backend for GpuDcrtBackend {
         randomness_seed: [u8; 32],
     ) -> Result<Self::SmallMatrix, Self::Error> {
         if self.frozen_plan.is_some() {
-            return self.fixed_sample_preimage_dispatch(
-                ty,
-                sigma,
-                gadget_base,
-                digit_count,
-                max_coefficient_bound,
-                trapdoor,
-                public,
-                target,
-                randomness_seed,
-            );
+            return Err(PolyBackendError::UnsupportedPlacement);
         }
         self.validate_preimage_bound(ty, sigma, gadget_base, digit_count, max_coefficient_bound)?;
         if trapdoor.values.len() != self.devices.len() {
@@ -13257,203 +27773,32 @@ impl Backend for GpuDcrtBackend {
         Ok(GpuFleetSmallMatrix::new(rows, target.col_size(), shards))
     }
 
-    fn fixed_sample_preimage(
-        &mut self,
-        ty: &ConcreteMatrixType,
-        sigma: f64,
-        gadget_base: &BigInt,
-        digit_count: usize,
-        max_coefficient_bound: &BigInt,
-        trapdoor: &Self::Trapdoor,
-        public: &Self::Matrix,
-        target: &dyn PolyMatrixColumnSource<Self::Matrix>,
-        randomness_seed: [u8; 32],
-    ) -> Result<Self::SmallMatrix, Self::Error> {
-        self.fixed_sample_preimage_dispatch(
-            ty,
-            sigma,
-            gadget_base,
-            digit_count,
-            max_coefficient_bound,
-            trapdoor,
-            public,
-            target,
-            randomness_seed,
-        )
-    }
-
+    /// Ordinary sampler batches are retained for setup/noncompiled work only.
+    /// A frozen plan must enter through the conditional capture adapter; the
+    /// former fixed host-loop batch is intentionally unavailable.
     fn sample_preimage_batch(
         &mut self,
         requests: Vec<crate::backend::PreimageRequest<Self::Matrix, Self::Trapdoor>>,
     ) -> Result<Vec<Self::SmallMatrix>, Self::Error> {
-        if self.frozen_plan.is_none() {
-            return requests
-                .into_iter()
-                .map(|request| {
-                    self.sample_preimage(
-                        &request.matrix_type,
-                        request.sigma,
-                        &request.gadget_base,
-                        request.digit_count,
-                        &request.max_coefficient_bound,
-                        request.trapdoor.as_ref(),
-                        request.public.as_ref(),
-                        request.target.as_ref(),
-                        request.randomness_seed,
-                    )
-                })
-                .collect();
-        }
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-        let columns = requests[0].target.col_size();
-        if requests.iter().any(|request| request.target.col_size() != columns) {
-            return Err(PolyBackendError::InvalidConstantShape);
-        }
-        let request_slots =
-            requests.iter().map(|request| request.instance_slot).collect::<Vec<_>>();
-        let fixed_metadata = requests
-            .iter()
-            .map(|request| request.fixed_metadata.as_ref())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let metadata_slots = self.validate_fixed_batch_metadata(&fixed_metadata)?;
-        if metadata_slots != request_slots ||
-            fixed_metadata
-                .iter()
-                .any(|metadata| metadata.draw_sites.first().and_then(Option::as_ref).is_none())
-        {
-            self.clear_fixed_batch_state();
+        if self.frozen_plan.is_some() {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
-        if !self.fixed_instance_slots.is_empty() && self.fixed_instance_slots != request_slots {
-            self.clear_fixed_batch_state();
-            return Err(PolyBackendError::UnsupportedPlacement);
-        }
-        if self.fixed_instance_slots.is_empty() {
-            self.fixed_instance_slots = request_slots.clone();
-        }
-        if columns == 0 {
-            let result = requests
-                .iter()
-                .map(|request| GpuFleetSmallMatrix::new(request.matrix_type.rows, 0, Vec::new()))
-                .collect();
-            self.clear_fixed_batch_state();
-            return Ok(result);
-        }
-        let schedules_owned = self.fixed_batch_schedules_checked(columns, &request_slots)?;
-        let schedules = schedules_owned.iter().collect::<Vec<_>>();
-        let active_devices_by_instance = schedules
-            .iter()
-            .map(|schedule| self.active_devices_for_schedules(std::iter::once(*schedule)))
-            .collect::<Vec<_>>();
-        let public_replicas = match requests
-            .iter()
-            .enumerate()
-            .map(|(instance, request)| {
-                let mut replicas = (0..self.devices.len()).map(|_| None).collect::<Vec<_>>();
-                for &device in &active_devices_by_instance[instance] {
-                    replicas[device] =
-                        Some(self.full_matrix_on_device(device, request.public.as_ref())?);
-                }
-                Ok(replicas)
-            })
-            .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(replicas) => replicas,
-            Err(error) => {
-                self.clear_fixed_batch_state();
-                return Err(error);
-            }
-        };
-        let attempts = match self
-            .fixed_node
-            .as_ref()
-            .and_then(|node| node.preimage_max_attempts)
-            .ok_or(PolyBackendError::UnsupportedPlacement)
-        {
-            Ok(attempts) => attempts,
-            Err(error) => {
-                self.clear_fixed_batch_state();
-                return Err(error);
-            }
-        };
-        let jobs = match self.launch_fixed_column_batch(&schedules, |backend, instance, job| {
-            let request = &requests[instance];
-            let target_value = request.target.load_columns(job.start, job.end);
-            let public_ty = Self::policy_matrix_type(&request.public)?;
-            let mapped = crate::gpu_column_policy::preimage_input_ranges(
-                &[public_ty.clone(), public_ty, Self::policy_matrix_type(&target_value)?],
-                ColumnRange { start: 0, end: job.end - job.start },
-            )
-            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
-            let target_range = mapped
-                .iter()
-                .find(|range| range.operand == 2)
-                .ok_or(PolyBackendError::UnsupportedPlacement)?
-                .range;
-            let target = Self::matrix_piece_on_device(
-                backend,
-                &target_value,
-                target_range.start,
-                target_range.end,
-            )?;
-            let local_ty =
-                ConcreteMatrixType { columns: job.end - job.start, ..request.matrix_type.clone() };
-            let global_column_start =
-                preimage_seed_column_start(request.target.global_column_start(), job.start)?;
-            let target = OffsetGpuColumnSource { value: target, global_column_start };
-            let params = backend.parameters(&local_ty)?.clone();
-            let sampler = GpuDCRTPolyTrapdoorSampler::new(&params, request.sigma);
-            let bound = request
-                .max_coefficient_bound
-                .to_biguint()
-                .ok_or(PolyBackendError::InvalidInteger)?;
-            let config = FixedPreimageConfig::new(job.end - job.start, attempts)
-                .ok_or(PolyBackendError::InvalidInteger)?;
-            sampler
-                .bounded_preimage_with_config(
-                    &params,
-                    &requests[instance].trapdoor.values[job.device],
-                    public_replicas[instance][job.device]
-                        .as_ref()
-                        .ok_or(PolyBackendError::UnsupportedPlacement)?,
-                    &target,
-                    bound,
-                    config,
+        requests
+            .into_iter()
+            .map(|request| {
+                self.sample_preimage(
+                    &request.matrix_type,
+                    request.sigma,
+                    &request.gadget_base,
+                    request.digit_count,
+                    &request.max_coefficient_bound,
+                    request.trapdoor.as_ref(),
+                    request.public.as_ref(),
+                    request.target.as_ref(),
                     request.randomness_seed,
                 )
-                .map_err(PolyBackendError::from)
-        }) {
-            Ok(jobs) => jobs,
-            Err(error) => {
-                self.clear_fixed_batch_state();
-                return Err(error);
-            }
-        };
-        let mut outputs = (0..requests.len()).map(|_| Vec::new()).collect::<Vec<Vec<_>>>();
-        for (instance, job, value) in jobs {
-            outputs[instance].push(GpuColumnShard {
-                device_id: self.devices[job.device].0,
-                global_column_start: job.start,
-                value,
-            });
-        }
-        let result = outputs
-            .into_iter()
-            .zip(&requests)
-            .map(|(mut shards, request)| {
-                shards.sort_by_key(|shard| shard.global_column_start);
-                let rows = shards
-                    .first()
-                    .map(|shard| shard.value.rows())
-                    .unwrap_or(request.matrix_type.rows);
-                Ok(GpuFleetSmallMatrix::new(rows, columns, shards))
             })
-            .collect();
-        self.clear_fixed_batch_state();
-        result
+            .collect()
     }
 
     fn validate_gadget_layout(
@@ -13737,18 +28082,23 @@ impl Backend for GpuDcrtBackend {
                         Ok(outputs) => outputs,
                         Err(error) => return Some(Err(error)),
                     };
-                    let mut values = match outputs.drain(..1).next() {
+                    let first = match outputs.drain(..1).next() {
                         Some(values) => values,
                         None => return Some(Err(PolyBackendError::InvalidConstantShape)),
                     };
+                    let mut groups = first.into_iter().map(|value| vec![value]).collect::<Vec<_>>();
                     for output in outputs {
-                        if output.len() != values.len() {
+                        if output.len() != groups.len() {
                             return Some(Err(PolyBackendError::InvalidConstantShape));
                         }
-                        for (value, piece) in values.iter_mut().zip(output) {
-                            *value = value.clone().concat_columns_owned(vec![piece]);
+                        for (group, value) in groups.iter_mut().zip(output) {
+                            group.push(value);
                         }
                     }
+                    let values = match concat_matrix_groups(groups) {
+                        Ok(values) => values,
+                        Err(error) => return Some(Err(error)),
+                    };
                     Some(Ok(values
                         .into_iter()
                         .map(|value| GpuColumnShard {
@@ -13780,8 +28130,11 @@ impl Backend for GpuDcrtBackend {
         value: &Self::Matrix,
         position: usize,
     ) -> Result<BigInt, Self::Error> {
-        let coefficients = self.download_polynomial_values(value, false)?;
-        super::super::poly::extract_host_coefficient(&coefficients, position)
+        let output = self
+            .fixed_batch_extract_coefficient(vec![(Arc::new(value.clone()), position)], &[0])?
+            .pop()
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        self.integer_values_to_host(&output)?.pop().ok_or(PolyBackendError::InvalidInteger)
     }
 
     fn threshold_decode(
@@ -13790,14 +28143,19 @@ impl Backend for GpuDcrtBackend {
         plaintext_modulus: &BigInt,
         length: usize,
     ) -> Result<Vec<BigInt>, Self::Error> {
-        let coefficients = self.download_polynomial_values(value, false)?;
-        let ty = Self::policy_matrix_type(value)?;
-        Ok(super::super::poly::threshold_decode_coefficients(
-            coefficients,
-            &ty.matrix_type().ok_or(PolyBackendError::InvalidInteger)?.modulus,
-            plaintext_modulus,
-            length,
-        ))
+        let outputs = self
+            .fixed_batch_threshold_decode(
+                vec![(Arc::new(value.clone()), plaintext_modulus.clone(), length, false)],
+                &[0],
+            )?
+            .pop()
+            .ok_or(PolyBackendError::InvalidInteger)?;
+        outputs
+            .iter()
+            .map(|output| {
+                self.integer_values_to_host(output)?.pop().ok_or(PolyBackendError::InvalidInteger)
+            })
+            .collect()
     }
 
     fn pack_polynomial_coefficients(
@@ -13806,8 +28164,14 @@ impl Backend for GpuDcrtBackend {
         bits: &[bool],
         coefficient_bits: usize,
     ) -> Result<Self::Matrix, Self::Error> {
-        let coefficients = super::super::poly::pack_polynomial_bits(ty, bits, coefficient_bits)?;
-        self.upload_polynomial_values(ty, &coefficients, false)
+        let values = bits.iter().map(|value| BigInt::from(u8::from(*value))).collect::<Vec<_>>();
+        let bits = self.integer_values_from_host(&values)?;
+        self.fixed_batch_pack_polynomial_coefficients(
+            vec![(ty.clone(), Arc::new(bits), coefficient_bits)],
+            &[0],
+        )?
+        .pop()
+        .ok_or(PolyBackendError::InvalidInteger)
     }
 
     fn crt_recompose(

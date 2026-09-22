@@ -437,16 +437,6 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
         source_moduli.push_back(tower.GetModulus().ConvertToInt());
     if (centered) {
         if (moduli.empty()) throw std::invalid_argument("centered rebase requires a nonempty destination basis");
-        // A multi-limb centered rebase is an exact extension, rather than a
-        // per-tower recentering.  The source basis therefore has to be
-        // contained in the destination basis.  Keep the one-limb behaviour
-        // deliberately permissive: it is the established API and can map a
-        // signed native residue into any compatible destination modulus.
-        if (source_moduli.size() > 1) {
-            for (const auto source_modulus : source_moduli)
-                if (std::find(moduli.begin(), moduli.end(), source_modulus) == moduli.end())
-                    throw std::invalid_argument("multi-limb centered rebase destination must contain the source basis");
-        }
         parameters = parameters_for_basis(dimension, moduli);
     } else {
         std::vector<lbcrypto::NativeInteger> primes, roots;
@@ -625,6 +615,67 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_block_mod_switch(
         output.GetAllElements()[target].SetValues(std::move(values), Format::COEFFICIENT);
     }
     transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_centered_round_divide(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> divisor_words) {
+    if (divisor_words.empty())
+        throw std::invalid_argument("CenteredRoundDivide divisor must be positive");
+    lbcrypto::BigInteger divisor(0);
+    for (size_t word = divisor_words.size(); word-- > 0;) {
+        divisor <<= 64;
+        divisor += lbcrypto::BigInteger(divisor_words[word]);
+    }
+    if (divisor <= 0)
+        throw std::invalid_argument("CenteredRoundDivide divisor must be positive");
+
+    auto source = input.GetPoly();
+    const auto format = source.GetFormat();
+    const auto dimension = source.GetRingDimension();
+    std::vector<uint64_t> moduli;
+    moduli.reserve(source.GetNumOfElements());
+    for (const auto &tower : source.GetAllElements())
+        moduli.push_back(tower.GetModulus().ConvertToInt());
+    if (moduli.empty()) throw std::invalid_argument("CenteredRoundDivide requires a nonempty CRT basis");
+    transform_format(source, Format::COEFFICIENT);
+
+    lbcrypto::BigInteger modulus_product(1);
+    for (const auto modulus : moduli) modulus_product *= lbcrypto::BigInteger(modulus);
+    const lbcrypto::BigInteger half = (modulus_product - 1).DividedBy(2);
+    lbcrypto::DCRTPoly output(source);
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(source.GetNumOfElements()))
+    for (size_t limb = 0; limb < moduli.size(); ++limb) {
+        const uint64_t q = moduli[limb];
+        lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+        const auto q_big = lbcrypto::BigInteger(q);
+        for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+            lbcrypto::BigInteger value(0);
+            for (size_t index = 0; index < moduli.size(); ++index) {
+                const auto residue = source.GetElementAtIndex(index).GetValues()[coefficient].ConvertToInt();
+                const auto q_i = lbcrypto::BigInteger(moduli[index]);
+                const auto q_over_qi = modulus_product / q_i;
+                const auto inverse = lbcrypto::NativeInteger(
+                    q_over_qi.Mod(q_i).ConvertToInt())
+                    .ModInverse(lbcrypto::NativeInteger(moduli[index])).ConvertToInt();
+                value += lbcrypto::BigInteger(residue) * q_over_qi * inverse;
+            }
+            value = value.Mod(modulus_product);
+            const bool negative = value > half;
+            const lbcrypto::BigInteger magnitude = negative ? modulus_product - value : value;
+            auto quotient = magnitude.DividedBy(divisor);
+            const auto remainder = magnitude.Mod(divisor);
+            const auto doubled_remainder = remainder * 2;
+            if ((!negative && doubled_remainder >= divisor) ||
+                (negative && doubled_remainder > divisor))
+                quotient += 1;
+            auto residue = quotient.Mod(q_big).ConvertToInt();
+            if (negative && residue) residue = q - residue;
+            values[coefficient] = residue;
+        }
+        output.GetAllElements()[limb].SetValues(std::move(values), Format::COEFFICIENT);
+    }
+    transform_format(output, format);
     return std::make_unique<openfhe::DCRTPoly>(std::move(output));
 }
 

@@ -9,6 +9,17 @@ __device__ __forceinline__ uint64_t matrix_reduce_barrett_u128(
 
 int set_error(const char *msg);
 int set_error(cudaError_t err);
+// Error paths must not fall back to host synchronization while a capture is
+// active or invalidated. This query is intentionally side-effect free.
+bool matrix_stream_is_capturing(cudaStream_t stream);
+cudaStream_t matrix_capture_stream_for_device(
+    const GpuContext *ctx,
+    int device,
+    cudaStream_t fallback);
+MxxGpuCaptureEvent *matrix_capture_event_for_owner(
+    GpuContext *ctx,
+    int device,
+    MxxGpuCaptureEvent **slot);
 bool parse_format(int format, GpuPolyFormat &out);
 size_t matrix_poly_count(const GpuMatrix *mat);
 int matrix_limb_device(const GpuMatrix *mat, const dim3 &limb_id, int *out_device);

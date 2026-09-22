@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <type_traits>
 #include <vector>
 
@@ -13,6 +14,29 @@
  * magnitude byte stream.  The host-side bound is metadata supplied by the
  * already validated Rust schema; it is never inferred from the stream.
  */
+// Immutable CRT reconstruction metadata is shared with captured graphs.  The
+// payload, acceptance status and staging bytes remain per-invocation owners.
+struct SmallHardCutoffMetadata
+{
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    uint64_t *garner_inverses = nullptr;
+    int *subset_indices = nullptr;
+    uint64_t *modulus_words = nullptr;
+    uint64_t *half_modulus_words = nullptr;
+    uint64_t *bound_words = nullptr;
+
+    ~SmallHardCutoffMetadata()
+    {
+        cudaSetDevice(device);
+        if (bound_words) cudaFreeAsync(bound_words, stream);
+        if (half_modulus_words) cudaFreeAsync(half_modulus_words, stream);
+        if (modulus_words) cudaFreeAsync(modulus_words, stream);
+        if (subset_indices) cudaFreeAsync(subset_indices, stream);
+        if (garner_inverses) cudaFreeAsync(garner_inverses, stream);
+    }
+};
+
 struct GpuSmallMatrix
 {
     GpuContext *ctx = nullptr;
@@ -38,10 +62,17 @@ struct GpuSmallMatrix
     uint64_t *hard_cutoff_modulus_words = nullptr;
     uint64_t *hard_cutoff_half_modulus_words = nullptr;
     uint64_t *hard_cutoff_bound_words = nullptr;
-    int *hard_cutoff_device_accepted = nullptr;
-    int *hard_cutoff_host_accepted = nullptr;
+    std::shared_ptr<SmallHardCutoffMetadata> hard_cutoff_metadata;
+    // One fixed status record is reused by every retry invocation.  It is
+    // never allocated, copied, or synchronised from inside the attempt body.
+    MxxPreimageStatus *hard_cutoff_device_status = nullptr;
+    MxxPreimageStatus *hard_cutoff_host_status = nullptr;
+    uint8_t *hard_cutoff_staging = nullptr;
+    size_t hard_cutoff_staging_bytes = 0;
     cudaEvent_t hard_cutoff_decision_ready = nullptr;
+    bool hard_cutoff_decision_recorded = false;
     cudaEvent_t write_done = nullptr;
+    MxxGpuCaptureEvent *capture_write_done = nullptr;
     bool write_done_valid = false;
 };
 
@@ -50,6 +81,46 @@ namespace
 constexpr int kSmallThreads = 256;
 constexpr size_t kMaxSmallLimbCount = GPU_RUNTIME_MAX_LIMBS;
 constexpr uint32_t kCompactNttSuffixSize = 4096;
+
+MxxGraphPatch small_kernel_pointer_patch(
+    uint32_t argument_index,
+    size_t byte_offset,
+    uint32_t binding_index,
+    size_t byte_count = sizeof(void *))
+{
+    MxxGraphPatch patch{};
+    patch.node = nullptr;
+    patch.target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+    patch.argument_index = argument_index;
+    patch.byte_offset = static_cast<uint32_t>(byte_offset);
+    patch.byte_count = static_cast<uint32_t>(byte_count);
+    patch.binding_index = binding_index;
+    patch.address_addend = 0;
+    return patch;
+}
+
+int register_compact_rhs_update(
+    GpuContext *ctx,
+    cudaStream_t stream,
+    uint32_t rhs_binding_index)
+{
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(uint32_t), sizeof(size_t), sizeof(size_t),
+    };
+    // Only the compact payload is an externally rebound pointer.  The
+    // twiddle/modulus/workspace addresses belong to this captured executable
+    // and remain graph-local across replay.  Keeping them out of the binding
+    // schema also leaves the low binding indices available for the row-block
+    // matrix descriptors used by the accumulate phase.
+    const MxxGraphPatch patches[] = {
+        small_kernel_pointer_patch(0, 0, rhs_binding_index),
+    };
+    return mxx_graph_register_kernel_update_for_stream(
+        ctx, reinterpret_cast<void *>(stream), argument_sizes, std::size(argument_sizes),
+        patches, std::size(patches));
+}
 
 bool small_mul_size(size_t a, size_t b, size_t *out)
 {
@@ -72,9 +143,16 @@ int small_set_device(const GpuSmallMatrix *mat)
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
+cudaStream_t small_capture_stream(const GpuSmallMatrix *mat)
+{
+    if (!mat) return nullptr;
+    return matrix_capture_stream_for_device(mat->ctx, mat->device, mat->stream);
+}
+
 int small_wait(const GpuSmallMatrix *mat, cudaStream_t stream)
 {
     if (!mat || !stream) return set_error("invalid compact matrix wait arguments");
+    if (matrix_stream_is_capturing(stream)) return 0;
     if (!mat->write_done_valid) return 0;
     const cudaError_t err = cudaStreamWaitEvent(stream, mat->write_done, 0);
     return err == cudaSuccess ? 0 : set_error(err);
@@ -84,6 +162,17 @@ int small_record(GpuSmallMatrix *mat, cudaStream_t stream)
 {
     if (!mat || !stream || !mat->write_done)
         return set_error("invalid compact matrix event arguments");
+    if (matrix_stream_is_capturing(stream))
+    {
+        MxxGpuCaptureEvent *capture_event = matrix_capture_event_for_owner(
+            mat->ctx, mat->device, &mat->capture_write_done);
+        if (!capture_event)
+        {
+            return 1;
+        }
+        const cudaError_t capture_error = cudaEventRecord(capture_event->event, stream);
+        return capture_error == cudaSuccess ? 0 : set_error(capture_error);
+    }
     const cudaError_t err = cudaEventRecord(mat->write_done, stream);
     if (err != cudaSuccess) return set_error(err);
     mat->write_done_valid = true;
@@ -102,8 +191,18 @@ cudaError_t small_fence_stream_with_event(cudaStream_t stream)
         // No event can establish a completion dependency when creation or
         // recording itself fails. This is the sole stream-wide fallback and
         // is confined to an already failing path.
+        if (matrix_stream_is_capturing(stream))
+        {
+            return err;
+        }
         const cudaError_t sync_err = cudaStreamSynchronize(stream);
         return sync_err == cudaSuccess ? err : sync_err;
+    }
+    if (matrix_stream_is_capturing(stream))
+    {
+        // Host observation is not part of a captured region. Leave the
+        // event for abort-time cleanup and fail closed without synchronizing.
+        return cudaErrorStreamCaptureUnsupported;
     }
     const cudaError_t sync_err = cudaEventSynchronize(completion);
     if (sync_err == cudaSuccess)
@@ -117,22 +216,32 @@ int small_track_consumer(const GpuSmallMatrix *mat, cudaStream_t consumer_stream
 {
     if (!mat || !mat->ctx || !consumer_stream || mat->device < 0)
         return set_error("invalid compact matrix consumer arguments");
-    cudaStream_t release_stream = mat->stream;
+    const cudaStream_t producer_stream = small_capture_stream(mat);
+    cudaStream_t release_stream = producer_stream;
     if (!mat->ctx->execution->release_streams_by_partition.empty() &&
         mat->ctx->execution->release_streams_by_partition.front())
     {
-        release_stream = mat->ctx->execution->release_streams_by_partition.front();
+        release_stream = matrix_capture_stream_for_device(
+            mat->ctx,
+            mat->device,
+            mat->ctx->execution->release_streams_by_partition.front());
     }
     if (!release_stream) return set_error("missing compact matrix release stream");
 
     cudaError_t err = cudaSetDevice(mat->device);
     if (err != cudaSuccess) return set_error(err);
+    if (matrix_stream_is_capturing(consumer_stream))
+    {
+        // Capture stream order covers the compact consumer. Its replay owner
+        // receives a fresh non-captured completion event after launch.
+        return 0;
+    }
     // The caller retains this dominating completion until the release wait
     // is enqueued. Reuse it without creating or destroying another event.
     if (!completion) return set_error("missing compact consumer completion");
     err = cudaStreamWaitEvent(release_stream, completion, 0);
-    if (err == cudaSuccess && mat->stream != consumer_stream && mat->stream != release_stream)
-        err = cudaStreamWaitEvent(mat->stream, completion, 0);
+    if (err == cudaSuccess && producer_stream != consumer_stream && producer_stream != release_stream)
+        err = cudaStreamWaitEvent(producer_stream, completion, 0);
     if (err != cudaSuccess)
         (void)small_fence_stream_with_event(consumer_stream);
     return err == cudaSuccess ? 0 : set_error(err);
@@ -192,11 +301,14 @@ __device__ __forceinline__ void compact_store_signed(
 
 // One descriptor per owned row block, bounded independently of matrix size.
 constexpr size_t kCompactRowBlocks = 32;
+constexpr size_t kCompactSourceFragments = 128;
 struct CompactRowBlocks
 {
-    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *inputs[kCompactRowBlocks];
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *inputs[kCompactSourceFragments];
     const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *outputs[kCompactRowBlocks];
     size_t ends[kCompactRowBlocks];
+    size_t fragment_ends[kCompactRowBlocks];
+    size_t column_ends[kCompactSourceFragments];
     __device__ size_t locate(size_t &row) const
     {
         size_t block = 0;
@@ -205,15 +317,60 @@ struct CompactRowBlocks
         return block;
     }
 };
-static_assert(sizeof(CompactRowBlocks) < 1024, "bounded compact block metadata");
+static_assert(sizeof(CompactRowBlocks) + 9 * sizeof(size_t) < 4096, "bounded compact block metadata");
+
+int register_compact_accumulate_update(
+    GpuContext *ctx,
+    cudaStream_t stream,
+    size_t block_count,
+    size_t source_count,
+    const uint32_t *source_binding_indices,
+    const uint32_t *destination_binding_indices)
+{
+    const size_t argument_sizes[] = {
+        sizeof(CompactRowBlocks), sizeof(void *), sizeof(size_t), sizeof(void *),
+        sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(bool),
+    };
+    std::vector<MxxGraphPatch> patches;
+    patches.reserve(source_count + block_count);
+    for (size_t block = 0; block < source_count; ++block)
+    {
+        const uint32_t source_binding = source_binding_indices
+            ? source_binding_indices[block]
+            : static_cast<uint32_t>(block);
+        patches.push_back(small_kernel_pointer_patch(
+            0, offsetof(CompactRowBlocks, inputs) + block * sizeof(void *), source_binding));
+    }
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        if (destination_binding_indices)
+        {
+            patches.push_back(small_kernel_pointer_patch(
+                0,
+                offsetof(CompactRowBlocks, outputs) + block * sizeof(void *),
+                destination_binding_indices[block]));
+        }
+    }
+    if (block_count == 0 || block_count > kCompactRowBlocks) return set_error("invalid compact accumulate block count");
+    return mxx_graph_register_kernel_update_for_stream(
+        ctx, reinterpret_cast<void *>(stream), argument_sizes, std::size(argument_sizes),
+        patches.data(), patches.size());
+}
+
+struct CompactDecomposeFragments
+{
+    const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *inputs[kCompactRowBlocks];
+    size_t ends[kCompactRowBlocks], source_columns[kCompactRowBlocks];
+    MxxDecomposeFragmentRange ranges[kCompactRowBlocks];
+};
 
 __global__ void compact_decompose_kernel(
-    CompactRowBlocks blocks,
+    CompactDecomposeFragments blocks,
     const uint64_t *src_moduli,
     uint8_t *dst,
-    size_t src_rows,
-    size_t src_cols,
-    size_t out_rows,
+    size_t poly_count,
+    size_t out_cols,
+    size_t slots,
     size_t n,
     size_t digits,
     size_t magnitude_bytes,
@@ -224,15 +381,20 @@ __global__ void compact_decompose_kernel(
     const size_t coeff = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const size_t poly = static_cast<size_t>(blockIdx.y);
     const size_t slot = static_cast<size_t>(blockIdx.z);
-    if (coeff >= n || poly >= src_rows * src_cols || slot >= out_rows / src_rows) return;
+    if (coeff >= n || poly >= poly_count || slot >= slots) return;
     const size_t source_limb = small ? 0 : slot / digits;
     const size_t digit_idx = slot % digits;
     const uint64_t modulus = src_moduli[source_limb];
-    size_t local_row = poly / src_cols;
-    const size_t block = blocks.locate(local_row);
+    size_t block = 0;
+    while (poly >= blocks.ends[block]) ++block;
+    const size_t local_poly = poly - (block ? blocks.ends[block - 1] : 0);
+    const auto range = blocks.ranges[block];
+    const size_t local_row = local_poly / range.columns;
+    const size_t local_col = local_poly % range.columns;
     const auto descriptor = blocks.inputs[block][source_limb];
     const uint64_t residue = matrix_load_limb_u64(
-        descriptor.base, local_row * src_cols + poly % src_cols, coeff, descriptor.stride, descriptor.width);
+        descriptor.base, local_row * blocks.source_columns[block] + range.source_column + local_col,
+        coeff, descriptor.stride, descriptor.width);
     int64_t digit = 0;
     if (balanced)
     {
@@ -253,10 +415,8 @@ __global__ void compact_decompose_kernel(
         const uint64_t mask = bits == 64 ? ~uint64_t{0} : (bits == 0 ? 0 : ((uint64_t{1} << bits) - 1));
         digit = static_cast<int64_t>((residue >> shift) & mask);
     }
-    const size_t row = poly / src_cols;
-    const size_t col = poly % src_cols;
-    const size_t out_row = row * (out_rows / src_rows) + slot;
-    const size_t out_poly = out_row * src_cols + col;
+    const size_t out_row = (range.destination_row + local_row) * slots + slot;
+    const size_t out_poly = out_row * out_cols + range.destination_column + local_col;
     const size_t out_idx = (out_poly * n + coeff) * (1 + magnitude_bytes);
     compact_store_signed(dst + out_idx, magnitude_bytes, digit);
 }
@@ -489,7 +649,8 @@ __global__ void compact_accumulate_kernel(
     const size_t global = limb_offset + local;
     const uint64_t modulus = moduli[global];
     const size_t block = blocks.locate(row);
-    const auto lhs_descriptor = blocks.inputs[block][global];
+    const size_t first_fragment = block ? blocks.fragment_ends[block - 1] : 0;
+    size_t fragment = first_fragment;
     const auto out_descriptor = blocks.outputs[block][global];
     uint64_t acc = 0;
     if (lazy_reduce)
@@ -497,9 +658,12 @@ __global__ void compact_accumulate_kernel(
         unsigned __int128 wide_acc = acc;
         for (size_t k = 0; k < inner; ++k)
         {
+            while (k >= blocks.column_ends[fragment]) ++fragment;
+            const size_t start = fragment == first_fragment ? 0 : blocks.column_ends[fragment - 1];
+            const auto lhs_descriptor = blocks.inputs[fragment][global];
             const uint64_t lhs = matrix_load_limb_u64(
                 lhs_descriptor.base,
-                row * inner + k,
+                row * (blocks.column_ends[fragment] - start) + k - start,
                 coeff,
                 lhs_descriptor.stride,
                 lhs_descriptor.width);
@@ -513,9 +677,12 @@ __global__ void compact_accumulate_kernel(
     {
         for (size_t k = 0; k < inner; ++k)
         {
+            while (k >= blocks.column_ends[fragment]) ++fragment;
+            const size_t start = fragment == first_fragment ? 0 : blocks.column_ends[fragment - 1];
+            const auto lhs_descriptor = blocks.inputs[fragment][global];
             const uint64_t lhs = matrix_load_limb_u64(
                 lhs_descriptor.base,
-                row * inner + k,
+                row * (blocks.column_ends[fragment] - start) + k - start,
                 coeff,
                 lhs_descriptor.stride,
                 lhs_descriptor.width);
@@ -582,9 +749,10 @@ __global__ void compact_check_pack_preimage_kernel(
     const uint64_t *subset_half_words,
     const uint64_t *bound_words,
     size_t magnitude_bytes,
-    int *accepted,
+    MxxPreimageStatus *status,
     uint8_t *staging)
 {
+    if (status->reserved != 0U) return;
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= coefficient_count) return;
     const size_t poly = idx / n;
@@ -678,7 +846,7 @@ __global__ void compact_check_pack_preimage_kernel(
     }
     if (!valid)
     {
-        atomicExch(accepted, 0);
+        atomicExch(&status->accepted, 0U);
         return;
     }
 
@@ -694,6 +862,228 @@ __global__ void compact_check_pack_preimage_kernel(
                             ? static_cast<uint8_t>(magnitude[word] >> (8 * (byte % sizeof(uint64_t))))
                             : 0;
     }
+}
+
+// The Rust sampler defines the retry transcript as
+//
+//   Keccak256("mxx-preimage-sampler/v2" || nonce || instance || column ||
+//             len("candidate") || "candidate" || attempt)
+//
+// with the integer fields encoded little-endian.  Keep this implementation
+// local to the allocation-free retry primitive so a conditional body can
+// regenerate a candidate seed from device control on every replay.  This is
+// Keccak-256 (domain byte 0x01), not SHA3-256 (domain byte 0x06).
+__device__ __forceinline__ uint64_t preimage_seed_rotl64(uint64_t value, int count)
+{
+    return count == 0 ? value : (value << count) | (value >> (64 - count));
+}
+
+__device__ __forceinline__ void preimage_seed_keccak_f(uint64_t state[25])
+{
+    constexpr uint64_t round_constants[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL,
+        0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL,
+        0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL,
+        0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL,
+        0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL,
+        0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL,
+        0x0000000080000001ULL, 0x8000000080008008ULL,
+    };
+    constexpr int rotation[25] = {
+        0, 1, 62, 28, 27,
+        36, 44, 6, 55, 20,
+        3, 10, 43, 25, 39,
+        41, 45, 15, 21, 8,
+        18, 2, 61, 56, 14,
+    };
+
+    for (int round = 0; round < 24; ++round)
+    {
+        uint64_t column_parity[5];
+        for (int x = 0; x < 5; ++x)
+        {
+            column_parity[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^
+                               state[x + 15] ^ state[x + 20];
+        }
+        uint64_t theta[5];
+        for (int x = 0; x < 5; ++x)
+        {
+            theta[x] = column_parity[(x + 4) % 5] ^
+                       preimage_seed_rotl64(column_parity[(x + 1) % 5], 1);
+        }
+        for (int x = 0; x < 5; ++x)
+        {
+            for (int y = 0; y < 5; ++y) state[x + 5 * y] ^= theta[x];
+        }
+
+        uint64_t rho_pi[25];
+        for (int x = 0; x < 5; ++x)
+        {
+            for (int y = 0; y < 5; ++y)
+            {
+                const int destination_x = y;
+                const int destination_y = (2 * x + 3 * y) % 5;
+                rho_pi[destination_x + 5 * destination_y] =
+                    preimage_seed_rotl64(state[x + 5 * y], rotation[x + 5 * y]);
+            }
+        }
+        for (int x = 0; x < 5; ++x)
+        {
+            for (int y = 0; y < 5; ++y)
+            {
+                state[x + 5 * y] = rho_pi[x + 5 * y] ^
+                    ((~rho_pi[(x + 1) % 5 + 5 * y]) & rho_pi[(x + 2) % 5 + 5 * y]);
+            }
+        }
+        state[0] ^= round_constants[round];
+    }
+}
+
+__device__ __forceinline__ uint64_t preimage_seed_load_le64(const uint8_t *bytes)
+{
+    uint64_t value = 0;
+    for (int byte = 0; byte < 8; ++byte)
+        value |= static_cast<uint64_t>(bytes[byte]) << (8 * byte);
+    return value;
+}
+
+__device__ __forceinline__ void preimage_seed_from_control_stage_body(
+    const MxxPreimageLaunchControl *control,
+    gpu_chacha::GpuRngSeed *seed,
+    uint32_t stage_id)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0 || !control || !seed) return;
+
+    // The transcript is 92 bytes, so one 136-byte Keccak rate block suffices.
+    uint8_t message[136] = {};
+    size_t offset = 0;
+    const bool host_stage_abi = stage_id <= 2U;
+    constexpr char v1_prefix[] = "mxx-preimage-sampler/v1";
+    constexpr char v2_prefix[] = "mxx-preimage-sampler/v2";
+    const char *prefix = host_stage_abi ? v1_prefix : v2_prefix;
+    const size_t prefix_length = host_stage_abi ? sizeof(v1_prefix) - 1 : sizeof(v2_prefix) - 1;
+    for (size_t i = 0; i < prefix_length; ++i) message[offset++] = static_cast<uint8_t>(prefix[i]);
+    for (size_t i = 0; i < sizeof(control->execution_nonce); ++i)
+        message[offset++] = control->execution_nonce[i];
+    const char *stage = nullptr;
+    size_t stage_length = 0;
+    if (stage_id == 0U) { stage = "p2"; stage_length = 2; }
+    else if (stage_id == 1U) { stage = "p1"; stage_length = 2; }
+    else if (stage_id == 2U) { stage = "z"; stage_length = 1; }
+    else { stage = "candidate"; stage_length = 9; }
+    if (!host_stage_abi)
+    {
+        for (int byte = 0; byte < 8; ++byte)
+            message[offset++] = static_cast<uint8_t>(control->logical_instance >> (8 * byte));
+        for (int byte = 0; byte < 8; ++byte)
+            message[offset++] = static_cast<uint8_t>(control->global_column_start >> (8 * byte));
+    }
+    for (int byte = 0; byte < 8; ++byte)
+        message[offset++] = static_cast<uint8_t>(stage_length >> (8 * byte));
+    for (size_t i = 0; i < stage_length; ++i) message[offset++] = static_cast<uint8_t>(stage[i]);
+    if (host_stage_abi)
+    {
+        for (int byte = 0; byte < 8; ++byte)
+            message[offset++] = static_cast<uint8_t>(control->global_column_start >> (8 * byte));
+        for (int byte = 0; byte < 8; ++byte)
+            message[offset++] = static_cast<uint8_t>(control->attempt >> (8 * byte));
+    }
+    else
+    {
+        for (int byte = 0; byte < 4; ++byte)
+            message[offset++] = static_cast<uint8_t>(control->attempt >> (8 * byte));
+    }
+
+    // Keccak's pad10*1 with the Keccak domain suffix 0x01.
+    message[offset] ^= 0x01U;
+    message[135] ^= 0x80U;
+    uint64_t state[25] = {};
+    constexpr size_t rate_lanes = 17;
+    for (size_t lane = 0; lane < rate_lanes; ++lane)
+        state[lane] ^= preimage_seed_load_le64(message + lane * sizeof(uint64_t));
+    preimage_seed_keccak_f(state);
+    for (int word = 0; word < 4; ++word) seed->words[word] = state[word];
+}
+
+__global__ void preimage_seed_from_control_stage_kernel(
+    const MxxPreimageLaunchControl *control,
+    gpu_chacha::GpuRngSeed *seed,
+    uint32_t stage_id)
+{
+    preimage_seed_from_control_stage_body(control, seed, stage_id);
+}
+
+__global__ void preimage_status_init_kernel(MxxPreimageStatus *status, uint32_t attempt)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        if (attempt == 0U) status->reserved = 0U;
+        if (status->reserved == 0U)
+        {
+            status->attempts = attempt + 1U;
+            status->accepted = 1U;
+        }
+        status->error_code = MXX_PREIMAGE_SUCCESS;
+    }
+}
+
+__global__ void preimage_status_init_control_kernel(
+    MxxPreimageStatus *status,
+    const MxxPreimageLaunchControl *control)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0 && control)
+    {
+        const uint32_t attempt = control->attempt;
+        if (attempt == 0U) status->reserved = 0U;
+        if (status->reserved == 0U)
+        {
+            status->attempts = attempt + 1U;
+            status->accepted = 1U;
+        }
+        status->error_code = MXX_PREIMAGE_SUCCESS;
+    }
+}
+
+__global__ void preimage_status_latch_accept_kernel(MxxPreimageStatus *status)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0 && status->accepted == 1U)
+        status->reserved = 1U;
+}
+
+__global__ void preimage_status_mark_exhausted_kernel(MxxPreimageStatus *status)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0 && status->accepted != 1U)
+        status->error_code = MXX_PREIMAGE_EXHAUSTED;
+}
+
+__global__ void compact_commit_preimage_tile_if_accepted_kernel(
+    uint8_t *payload,
+    const uint8_t *staging,
+    const MxxPreimageStatus *status,
+    size_t n,
+    size_t rows,
+    size_t tile_cols,
+    size_t dst_cols,
+    size_t dst_row,
+    size_t dst_col,
+    size_t width)
+{
+    if (status->accepted != 1U || status->error_code != MXX_PREIMAGE_SUCCESS) return;
+    const size_t idx = static_cast<size_t>(blockIdx.x) * kSmallThreads + threadIdx.x;
+    const size_t total = rows * tile_cols * n * width;
+    if (idx >= total) return;
+    const size_t byte = idx % width;
+    const size_t coefficient = idx / width;
+    const size_t coeff = coefficient % n;
+    const size_t column = (coefficient / n) % tile_cols;
+    const size_t row = coefficient / (n * tile_cols);
+    const size_t dst_index = (((dst_row + row) * dst_cols + dst_col + column) * n + coeff) * width + byte;
+    payload[dst_index] = staging[idx];
 }
 
 __global__ void compact_commit_preimage_tile_kernel(
@@ -761,32 +1151,69 @@ bool compact_double_words(
 void small_release_hard_cutoff_plan(GpuSmallMatrix *mat, cudaStream_t stream)
 {
     if (!mat) return;
-    if (mat->hard_cutoff_device_accepted)
-        cudaFreeAsync(mat->hard_cutoff_device_accepted, stream);
-    if (mat->hard_cutoff_bound_words) cudaFreeAsync(mat->hard_cutoff_bound_words, stream);
-    if (mat->hard_cutoff_half_modulus_words)
-        cudaFreeAsync(mat->hard_cutoff_half_modulus_words, stream);
-    if (mat->hard_cutoff_modulus_words)
-        cudaFreeAsync(mat->hard_cutoff_modulus_words, stream);
-    if (mat->hard_cutoff_subset_indices)
-        cudaFreeAsync(mat->hard_cutoff_subset_indices, stream);
-    if (mat->hard_cutoff_garner_inverses)
-        cudaFreeAsync(mat->hard_cutoff_garner_inverses, stream);
+    if (mat->hard_cutoff_decision_ready && mat->hard_cutoff_decision_recorded && stream)
+    {
+        // The final D2H status copy is ordered by decision_ready.  Preserve
+        // that dependency before handing the pinned page to the reclaimer.
+        if (cudaStreamWaitEvent(stream, mat->hard_cutoff_decision_ready, 0) != cudaSuccess)
+            set_error(cudaGetLastError());
+    }
+    if (mat->hard_cutoff_device_status)
+        cudaFreeAsync(mat->hard_cutoff_device_status, stream);
+    if (mat->hard_cutoff_staging)
+        cudaFreeAsync(mat->hard_cutoff_staging, stream);
+    if (mat->hard_cutoff_metadata)
+    {
+        mat->hard_cutoff_metadata.reset();
+    }
+    else
+    {
+        // Failed partial initialization has not transferred metadata ownership.
+        if (mat->hard_cutoff_bound_words) cudaFreeAsync(mat->hard_cutoff_bound_words, stream);
+        if (mat->hard_cutoff_half_modulus_words)
+            cudaFreeAsync(mat->hard_cutoff_half_modulus_words, stream);
+        if (mat->hard_cutoff_modulus_words)
+            cudaFreeAsync(mat->hard_cutoff_modulus_words, stream);
+        if (mat->hard_cutoff_subset_indices)
+            cudaFreeAsync(mat->hard_cutoff_subset_indices, stream);
+        if (mat->hard_cutoff_garner_inverses)
+            cudaFreeAsync(mat->hard_cutoff_garner_inverses, stream);
+    }
     if (mat->hard_cutoff_decision_ready)
         cudaEventDestroy(mat->hard_cutoff_decision_ready);
-    if (mat->hard_cutoff_host_accepted)
-        cudaFreeHost(mat->hard_cutoff_host_accepted);
-    mat->hard_cutoff_device_accepted = nullptr;
+    if (mat->hard_cutoff_host_status)
+    {
+        void *host_status = mat->hard_cutoff_host_status;
+        if (mat->ctx && stream && mat->device >= 0)
+        {
+            // The reclaimer records a completion event on the dependency
+            // ordered release stream and only then calls cudaFreeHost.
+            if (gpu_defer_pinned_frees(mat->ctx, mat->device, stream, &host_status, 1) != 0)
+                set_error("failed to defer compact preimage status page release");
+        }
+        else
+        {
+            // Partial construction has not submitted a status copy.
+            cudaFreeHost(host_status);
+        }
+    }
+    mat->hard_cutoff_device_status = nullptr;
+    mat->hard_cutoff_staging = nullptr;
+    mat->hard_cutoff_staging_bytes = 0;
     mat->hard_cutoff_bound_words = nullptr;
     mat->hard_cutoff_half_modulus_words = nullptr;
     mat->hard_cutoff_modulus_words = nullptr;
     mat->hard_cutoff_subset_indices = nullptr;
     mat->hard_cutoff_garner_inverses = nullptr;
     mat->hard_cutoff_decision_ready = nullptr;
-    mat->hard_cutoff_host_accepted = nullptr;
+    mat->hard_cutoff_decision_recorded = false;
+    mat->hard_cutoff_host_status = nullptr;
 }
 
-int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
+int small_initialize_hard_cutoff_plan(
+    GpuSmallMatrix *mat,
+    size_t scratch_rows,
+    size_t scratch_cols)
 {
     if (!mat || !mat->ctx || !mat->stream || mat->device < 0 || mat->bound_words.empty())
         return set_error("invalid compact hard-cutoff plan owner");
@@ -888,23 +1315,72 @@ int small_initialize_hard_cutoff_plan(GpuSmallMatrix *mat)
             pinned_uploads.data(), pinned_uploads.size()) != 0)
         return 1;
     if (err != cudaSuccess) return set_error(err);
+    mat->hard_cutoff_metadata = std::make_shared<SmallHardCutoffMetadata>();
+    mat->hard_cutoff_metadata->device = mat->device;
+    mat->hard_cutoff_metadata->stream = mat->stream;
+    mat->hard_cutoff_metadata->garner_inverses = mat->hard_cutoff_garner_inverses;
+    mat->hard_cutoff_metadata->subset_indices = mat->hard_cutoff_subset_indices;
+    mat->hard_cutoff_metadata->modulus_words = mat->hard_cutoff_modulus_words;
+    mat->hard_cutoff_metadata->half_modulus_words = mat->hard_cutoff_half_modulus_words;
+    mat->hard_cutoff_metadata->bound_words = mat->hard_cutoff_bound_words;
+    size_t staging_coefficients = 0;
+    size_t staging_bytes = 0;
+    if (!small_mul_size(scratch_rows, scratch_cols, &staging_coefficients) ||
+        !small_mul_size(staging_coefficients, mat->n, &staging_coefficients) ||
+        !small_mul_size(staging_coefficients, 1 + mat->magnitude_bytes, &staging_bytes) ||
+        staging_bytes == 0)
+        return set_error("compact preimage scratch size overflow");
     err = cudaMallocAsync(
-        reinterpret_cast<void **>(&mat->hard_cutoff_device_accepted),
-        sizeof(int), mat->stream);
+        reinterpret_cast<void **>(&mat->hard_cutoff_staging), staging_bytes, mat->stream);
     if (err == cudaSuccess)
         err = cudaHostAlloc(
-            reinterpret_cast<void **>(&mat->hard_cutoff_host_accepted),
-            sizeof(int), cudaHostAllocPortable);
+            reinterpret_cast<void **>(&mat->hard_cutoff_host_status),
+            sizeof(MxxPreimageStatus), cudaHostAllocPortable);
+    if (err == cudaSuccess)
+        err = cudaMallocAsync(
+            reinterpret_cast<void **>(&mat->hard_cutoff_device_status),
+            sizeof(MxxPreimageStatus), mat->stream);
     if (err == cudaSuccess)
         err = cudaEventCreateWithFlags(
             &mat->hard_cutoff_decision_ready, cudaEventDisableTiming);
     if (err != cudaSuccess) return set_error(err);
+    mat->hard_cutoff_staging_bytes = staging_bytes;
     mat->hard_cutoff_limb_count = limb_count;
     mat->hard_cutoff_subset_count = static_cast<int>(subset_indices.size());
     mat->hard_cutoff_words_per_coeff = static_cast<int>(words_per_coeff);
-    return 0;
+    err = cudaMemsetAsync(
+        mat->hard_cutoff_device_status, 0, sizeof(MxxPreimageStatus), mat->stream);
+    return err == cudaSuccess ? 0 : set_error(err);
 }
 
+}
+
+extern "C" int gpu_preimage_seed_from_control_stage_async(
+    GpuContext *ctx,
+    const void *device_control,
+    void *device_seed,
+    uint32_t stage_id,
+    void *stream_raw,
+    uint32_t control_binding_index,
+    uint32_t seed_binding_index)
+{
+    if (!ctx || !device_control || !device_seed || !stream_raw || stage_id > 2U)
+        return set_error("invalid preimage stage seed derivation arguments");
+    if (control_binding_index == seed_binding_index)
+        return set_error("preimage stage seed bindings must be distinct");
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    preimage_seed_from_control_stage_kernel<<<1, 1, 0, stream>>>(
+        static_cast<const MxxPreimageLaunchControl *>(device_control),
+        static_cast<gpu_chacha::GpuRngSeed *>(device_seed), stage_id);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return set_error(err);
+    const size_t argument_sizes[] = {sizeof(void *), sizeof(void *), sizeof(uint32_t)};
+    const MxxGraphPatch patches[] = {
+        small_kernel_pointer_patch(0, 0, control_binding_index),
+        small_kernel_pointer_patch(1, 0, seed_binding_index),
+    };
+    return mxx_graph_register_kernel_update_for_stream(
+        ctx, stream_raw, argument_sizes, std::size(argument_sizes), patches, std::size(patches));
 }
 
 extern "C" int gpu_small_matrix_create(
@@ -984,17 +1460,53 @@ extern "C" int gpu_small_matrix_query_allocation_bytes(
     return 0;
 }
 
+extern "C" int gpu_small_matrix_binding_descriptor(
+    const GpuSmallMatrix *mat,
+    GpuSmallMatrixBindingDescriptor *out)
+{
+    if (!mat || !out || !mat->ctx)
+    {
+        return set_error("invalid gpu_small_matrix_binding_descriptor arguments");
+    }
+    // A column view borrows the owner's allocation but its payload begins at
+    // the view's first column.  Return the address of that logical payload,
+    // not the owner's base pointer, so graph bindings patch the exact byte
+    // range consumed by the compact launch.
+    const size_t coefficient_bytes = 1 + mat->magnitude_bytes;
+    const size_t payload_offset = mat->column_offset * mat->n * coefficient_bytes;
+    void *payload = mat->payload ? mat->payload + payload_offset : nullptr;
+    *out = GpuSmallMatrixBindingDescriptor{
+        mat->device,
+        mat->rows,
+        mat->cols,
+        mat->n,
+        mat->magnitude_bytes,
+        mat->payload_bytes,
+        payload,
+        mat->hard_cutoff_device_status,
+        mat->hard_cutoff_host_status,
+        mat->hard_cutoff_staging,
+        mat->hard_cutoff_staging_bytes};
+    return 0;
+}
+
 extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
 {
     if (!mat) return;
+    if (mxx_graph_retain_released_resource(mat->ctx, mat, [](void *resource) {
+        gpu_small_matrix_destroy(static_cast<GpuSmallMatrix *>(resource));
+    })) return;
     if (mat->device >= 0 && cudaSetDevice(mat->device) == cudaSuccess)
     {
-        cudaStream_t release_stream = mat->stream;
+        cudaStream_t release_stream = small_capture_stream(mat);
         const size_t partition = 0;
         if (mat->ctx && partition < mat->ctx->execution->release_streams_by_partition.size() &&
             mat->ctx->execution->release_streams_by_partition[partition])
         {
-            release_stream = mat->ctx->execution->release_streams_by_partition[partition];
+            release_stream = matrix_capture_stream_for_device(
+                mat->ctx,
+                mat->device,
+                mat->ctx->execution->release_streams_by_partition[partition]);
             if (mat->write_done_valid) cudaStreamWaitEvent(release_stream, mat->write_done, 0);
         }
         if (mat->owns_payload)
@@ -1003,6 +1515,8 @@ extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
             if (mat->payload && release_stream) cudaFreeAsync(mat->payload, release_stream);
         }
         if (mat->owns_write_event && mat->write_done) cudaEventDestroy(mat->write_done);
+        if (mat->capture_write_done)
+            mxx_gpu_capture_event_release(mat->capture_write_done);
     }
     delete mat;
 }
@@ -1017,12 +1531,82 @@ extern "C" int gpu_small_matrix_wait(const GpuSmallMatrix *mat)
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
+extern "C" int gpu_small_matrix_wait_compiled_inputs(
+    const GpuSmallMatrix *mat,
+    int consumer_device,
+    void *consumer_stream_raw)
+{
+    if (!mat || consumer_device < 0 || !consumer_stream_raw)
+    {
+        return set_error("invalid gpu_small_matrix_wait_compiled_inputs arguments");
+    }
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(consumer_stream_raw);
+    if (matrix_stream_is_capturing(stream)) return 0;
+    const cudaError_t device_status = cudaSetDevice(consumer_device);
+    if (device_status != cudaSuccess)
+    {
+        return set_error(device_status);
+    }
+    return small_wait(mat, stream);
+}
+
+extern "C" int gpu_small_matrix_track_compiled_consumer(
+    const GpuSmallMatrix *mat,
+    void *consumer_stream_raw,
+    void *completion_event_raw)
+{
+    if (!mat || !consumer_stream_raw || !completion_event_raw)
+    {
+        return set_error("invalid gpu_small_matrix_track_compiled_consumer arguments");
+    }
+    return small_track_consumer(
+        mat,
+        reinterpret_cast<cudaStream_t>(consumer_stream_raw),
+        reinterpret_cast<cudaEvent_t>(completion_event_raw));
+}
+
+extern "C" int gpu_small_matrix_record_compiled_write(
+    GpuSmallMatrix *mat,
+    void *stream_raw)
+{
+    if (!mat || !stream_raw)
+    {
+        return set_error("invalid gpu_small_matrix_record_compiled_write arguments");
+    }
+    if (small_set_device(mat) != 0)
+    {
+        return 1;
+    }
+    return small_record(mat, reinterpret_cast<cudaStream_t>(stream_raw));
+}
+
+extern "C" int gpu_small_matrix_prepare_external_for_capture(GpuSmallMatrix *mat)
+{
+    if (!mat || !mat->write_done)
+    {
+        return set_error("invalid compact capture preparation arguments");
+    }
+    if (matrix_stream_is_capturing(mat->stream))
+    {
+        return set_error("external capture preparation must precede CUDA capture");
+    }
+    if (gpu_small_matrix_wait(mat) != 0)
+    {
+        return 1;
+    }
+    // Preserve the event object for writes recorded during capture; only the
+    // pre-capture writer dependency is cleared.
+    mat->write_done_valid = false;
+    return 0;
+}
+
 extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *src)
 {
     if (!out || !src || out->ctx != src->ctx || out->rows != src->rows || out->cols != src->cols ||
         out->n != src->n || out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
         return set_error("incompatible compact matrix copy");
-    if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;
+    const cudaStream_t stream = small_capture_stream(out);
+    if (small_set_device(out) != 0 || small_wait(src, stream) != 0) return 1;
     const size_t row_bytes = out->cols * out->n * (1 + out->magnitude_bytes);
     const size_t out_pitch = out->storage_cols * out->n * (1 + out->magnitude_bytes);
     const size_t src_pitch = src->storage_cols * src->n * (1 + src->magnitude_bytes);
@@ -1030,10 +1614,10 @@ extern "C" int gpu_small_matrix_copy(GpuSmallMatrix *out, const GpuSmallMatrix *
     const auto *source = src->payload + src->column_offset * src->n * (1 + src->magnitude_bytes);
     const cudaError_t err = cudaMemcpy2DAsync(
         destination, out_pitch, source, src_pitch, row_bytes, out->rows,
-        cudaMemcpyDeviceToDevice, out->stream);
+        cudaMemcpyDeviceToDevice, stream);
     if (err != cudaSuccess) return set_error(err);
-    if (small_record(out, out->stream) != 0) return 1;
-    return small_track_consumer(src, out->stream, out->write_done);
+    if (small_record(out, stream) != 0) return 1;
+    return small_track_consumer(src, stream, out->write_done);
 }
 
 extern "C" int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const GpuSmallMatrix *src)
@@ -1042,7 +1626,8 @@ extern "C" int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const Gp
         out->cols != src->cols || out->n != src->n ||
         out->magnitude_bytes != src->magnitude_bytes || out->payload_bytes != src->payload_bytes)
         return set_error("incompatible cross-context compact matrix copy");
-    if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;
+    const cudaStream_t stream = small_capture_stream(out);
+    if (small_set_device(out) != 0 || small_wait(src, stream) != 0) return 1;
     const size_t row_bytes = out->cols * out->n * (1 + out->magnitude_bytes);
     const size_t out_pitch = out->storage_cols * out->n * (1 + out->magnitude_bytes);
     const size_t src_pitch = src->storage_cols * src->n * (1 + src->magnitude_bytes);
@@ -1050,10 +1635,10 @@ extern "C" int gpu_small_matrix_copy_cross_context(GpuSmallMatrix *out, const Gp
     const auto *source = src->payload + src->column_offset * src->n * (1 + src->magnitude_bytes);
     const cudaError_t err = cudaMemcpy2DAsync(
         destination, out_pitch, source, src_pitch, row_bytes, out->rows,
-        cudaMemcpyDeviceToDevice, out->stream);
+        cudaMemcpyDeviceToDevice, stream);
     if (err != cudaSuccess) return set_error(err);
-    if (small_record(out, out->stream) != 0) return 1;
-    return small_track_consumer(src, out->stream, out->write_done);
+    if (small_record(out, stream) != 0) return 1;
+    return small_track_consumer(src, stream, out->write_done);
 }
 
 extern "C" int gpu_small_matrix_copy_columns(
@@ -1065,7 +1650,8 @@ extern "C" int gpu_small_matrix_copy_columns(
         out->n != src->n || out->magnitude_bytes != src->magnitude_bytes ||
         source_column_start > src->cols || out->cols > src->cols - source_column_start)
         return set_error("incompatible compact matrix column slice");
-    if (small_set_device(out) != 0 || small_wait(src, out->stream) != 0) return 1;
+    const cudaStream_t stream = small_capture_stream(out);
+    if (small_set_device(out) != 0 || small_wait(src, stream) != 0) return 1;
     const size_t coefficient_bytes = 1 + out->magnitude_bytes;
     const size_t column_bytes = out->n * coefficient_bytes;
     const size_t destination_pitch = out->storage_cols * column_bytes;
@@ -1074,10 +1660,10 @@ extern "C" int gpu_small_matrix_copy_columns(
     const auto *source = src->payload + (src->column_offset + source_column_start) * column_bytes;
     const cudaError_t err = cudaMemcpy2DAsync(
         destination, destination_pitch, source, source_pitch,
-        out->cols * column_bytes, out->rows, cudaMemcpyDeviceToDevice, out->stream);
+        out->cols * column_bytes, out->rows, cudaMemcpyDeviceToDevice, stream);
     if (err != cudaSuccess) return set_error(err);
-    if (small_record(out, out->stream) != 0) return 1;
-    return small_track_consumer(src, out->stream, out->write_done);
+    if (small_record(out, stream) != 0) return 1;
+    return small_track_consumer(src, stream, out->write_done);
 }
 
 extern "C" int gpu_small_matrix_view_columns(
@@ -1124,25 +1710,26 @@ extern "C" int gpu_small_matrix_load_coefficients(
         return set_error("compact matrix payload length mismatch");
     if (small_set_device(mat) != 0) return 1;
     if (payload_len == 0) return 0;
+    const cudaStream_t stream = small_capture_stream(mat);
     uint8_t *staging = nullptr;
     cudaError_t err = cudaHostAlloc(
         reinterpret_cast<void **>(&staging), payload_len, cudaHostAllocPortable);
     if (err != cudaSuccess) return set_error(err);
     std::memcpy(staging, payload, payload_len);
     err = cudaMemcpyAsync(
-        mat->payload, staging, payload_len, cudaMemcpyHostToDevice, mat->stream);
+        mat->payload, staging, payload_len, cudaMemcpyHostToDevice, stream);
     if (err != cudaSuccess)
     {
         cudaFreeHost(staging);
         return set_error(err);
     }
-    const int record_status = small_record(mat, mat->stream);
+    const int record_status = small_record(mat, stream);
     void *deferred[] = {staging};
     const int defer_status = gpu_defer_pinned_frees(
-        mat->ctx, mat->device, mat->stream, deferred, 1);
+        mat->ctx, mat->device, stream, deferred, 1);
     if (record_status != 0)
     {
-        (void)small_fence_stream_with_event(mat->stream);
+        (void)small_fence_stream_with_event(stream);
         return record_status;
     }
     return defer_status;
@@ -1153,7 +1740,8 @@ extern "C" int gpu_small_matrix_store_coefficients(
 {
     if (!mat || !payload || payload_len != mat->payload_bytes)
         return set_error("compact matrix payload length mismatch");
-    if (small_set_device(mat) != 0 || small_wait(mat, mat->stream) != 0) return 1;
+    const cudaStream_t stream = small_capture_stream(mat);
+    if (small_set_device(mat) != 0 || small_wait(mat, stream) != 0) return 1;
     if (payload_len == 0) return 0;
     const size_t coefficient_bytes = 1 + mat->magnitude_bytes;
     const size_t row_bytes = mat->cols * mat->n * coefficient_bytes;
@@ -1161,8 +1749,8 @@ extern "C" int gpu_small_matrix_store_coefficients(
     const auto *source = mat->payload + mat->column_offset * mat->n * coefficient_bytes;
     cudaError_t err = cudaMemcpy2DAsync(
         payload, row_bytes, source, source_pitch, row_bytes, mat->rows,
-        cudaMemcpyDeviceToHost, mat->stream);
-    if (err == cudaSuccess) err = small_fence_stream_with_event(mat->stream);
+        cudaMemcpyDeviceToHost, stream);
+    if (err == cudaSuccess) err = small_fence_stream_with_event(stream);
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
@@ -1174,7 +1762,8 @@ extern "C" int gpu_small_matrix_decompose_base(
     const uint64_t *max_coefficient_bound,
     size_t bound_word_count,
     GpuSmallMatrix *out,
-    size_t dropped_moduli)
+    size_t dropped_moduli,
+    const MxxDecomposeFragmentRange *ranges)
 {
     if (!sources || block_count == 0 || block_count > kCompactRowBlocks)
         return set_error("invalid compact decomposition blocks");
@@ -1186,16 +1775,38 @@ extern "C" int gpu_small_matrix_decompose_base(
     const size_t limbs = static_cast<size_t>(src->level + 1);
     if (src->level < 0 || limbs == 0 || limbs > kMaxSmallLimbCount || src->ctx->limb_gpu_ids.size() < limbs)
         return set_error("invalid compact decomposition level");
-    CompactRowBlocks blocks{};
+    CompactDecomposeFragments blocks{};
     size_t rows = 0;
+    size_t poly_count = 0;
     for (size_t block = 0; block < block_count; ++block)
     {
         const auto *source = sources[block];
         if (!source || source->ctx != src->ctx || source->level != src->level ||
-            source->format != GPU_POLY_FORMAT_COEFF || source->cols != src->cols ||
-            !small_add_size(rows, source->rows, &rows))
+            source->format != GPU_POLY_FORMAT_COEFF)
             return set_error("incompatible compact decomposition block");
-        blocks.ends[block] = rows;
+        const MxxDecomposeFragmentRange range = ranges
+            ? ranges[block] : MxxDecomposeFragmentRange{0, rows, 0, source->cols};
+        size_t row_end = 0, polynomials = 0;
+        if (range.columns == 0 || range.source_column > source->cols ||
+            range.columns > source->cols - range.source_column ||
+            range.destination_column > out->cols || range.columns > out->cols - range.destination_column ||
+            !small_add_size(range.destination_row, source->rows, &row_end) ||
+            !small_mul_size(source->rows, range.columns, &polynomials) ||
+            !small_add_size(poly_count, polynomials, &poly_count))
+            return set_error("invalid compact decomposition fragment range");
+        for (size_t previous = 0; previous < block; ++previous)
+        {
+            const auto other = blocks.ranges[previous];
+            if (range.destination_row < other.destination_row + sources[previous]->rows &&
+                other.destination_row < row_end &&
+                range.destination_column < other.destination_column + other.columns &&
+                other.destination_column < range.destination_column + range.columns)
+                return set_error("overlapping compact decomposition fragments");
+        }
+        rows = std::max(rows, row_end);
+        blocks.ends[block] = poly_count;
+        blocks.source_columns[block] = source->cols;
+        blocks.ranges[block] = range;
     }
     uint32_t crt_bits = 0;
     for (size_t limb = 0; limb < limbs; ++limb)
@@ -1209,7 +1820,7 @@ extern "C" int gpu_small_matrix_decompose_base(
         return set_error("compact decomposition shape overflow");
     const uint64_t base = uint64_t{1} << base_bits;
     const uint64_t expected_bound = small ? base - 1 : (base + 1) / 2;
-    if (out->rows != expected_rows || out->cols != src->cols || out->bound_words.size() != 1 ||
+    if (out->rows < expected_rows || (!ranges && (out->rows != expected_rows || out->cols != src->cols)) || out->bound_words.size() != 1 ||
         out->bound_words[0] != expected_bound)
         return set_error("compact decomposition shape or bound mismatch");
     if (small_set_device(out) != 0) return 1;
@@ -1217,7 +1828,13 @@ extern "C" int gpu_small_matrix_decompose_base(
                                           max_coefficient_bound + bound_word_count);
     if (requested_bound != out->bound_words)
         return set_error("compact decomposition bound metadata mismatch");
-    cudaStream_t stream = out->stream;
+    // The compact output is created on a pool stream, but decomposition may
+    // run inside the runtime's active graph-capture stream.  Route every
+    // input wait and the launch through the capture stream; using out->stream
+    // here makes the launch uncaptured while matrix_wait_all_limb_streams has
+    // already attempted to establish dependencies for the captured region.
+    cudaStream_t stream = small_capture_stream(out);
+    if (!stream) return set_error("missing compact decomposition stream");
     size_t dispatch_slot = std::numeric_limits<size_t>::max();
     for (size_t block = 0; block < block_count; ++block)
     {
@@ -1243,15 +1860,35 @@ extern "C" int gpu_small_matrix_decompose_base(
     const auto &constants = src->ctx->ntt_device_constants[dispatch_slot];
     if (constants.device != out->device || constants.limb_count < limbs || !constants.moduli)
         return set_error("invalid compact decomposition constants");
-    size_t poly_count = 0;
-    if (!small_mul_size(rows, src->cols, &poly_count))
-        return set_error("compact decomposition polynomial count overflow");
     const size_t slots = digits * (small ? 1 : limbs - dropped_moduli);
     const dim3 grid((out->n + kSmallThreads - 1) / kSmallThreads,
                     static_cast<uint32_t>(poly_count), static_cast<uint32_t>(slots));
     compact_decompose_kernel<<<grid, kSmallThreads, 0, stream>>>(
         blocks, constants.moduli, out->payload,
-        rows, src->cols, out->rows, out->n, digits, out->magnitude_bytes, base_bits, !small, small);
+        poly_count, out->cols, slots, out->n, digits, out->magnitude_bytes, base_bits, !small, small);
+    {
+        const size_t argument_sizes[] = {
+            sizeof(CompactDecomposeFragments), sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(uint32_t), sizeof(bool), sizeof(bool),
+        };
+        std::vector<MxxGraphPatch> patches;
+        patches.reserve(block_count + 1);
+        for (size_t block = 0; block < block_count; ++block)
+        {
+            patches.push_back(small_kernel_pointer_patch(
+                0, offsetof(CompactDecomposeFragments, inputs) + block * sizeof(blocks.inputs[0]),
+                static_cast<uint32_t>(block)));
+        }
+        patches.push_back(small_kernel_pointer_patch(2, 0, static_cast<uint32_t>(block_count)));
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches.data(), patches.size());
+        if (registration_status != 0)
+        {
+            (void)small_fence_stream_with_event(stream);
+            return registration_status;
+        }
+    }
     const cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess || small_record(out, stream) != 0)
     {
@@ -1272,7 +1909,7 @@ extern "C" int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat
     if (!mat) return set_error("invalid compact preimage hard-cutoff owner");
     if (mat->hard_cutoff_subset_count > 0) return 0;
     if (small_set_device(mat) != 0 || small_wait(mat, mat->stream) != 0) return 1;
-    const int status = small_initialize_hard_cutoff_plan(mat);
+    const int status = small_initialize_hard_cutoff_plan(mat, mat->rows, mat->cols);
     if (status != 0)
     {
         small_release_hard_cutoff_plan(mat, mat->stream);
@@ -1281,7 +1918,35 @@ extern "C" int gpu_small_matrix_prepare_preimage_hard_cutoff(GpuSmallMatrix *mat
     return small_record(mat, mat->stream);
 }
 
-extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
+extern "C" int gpu_small_matrix_prepare_preimage_hard_cutoff_for_tile(
+    GpuSmallMatrix *mat,
+    size_t rows,
+    size_t cols)
+{
+    if (!mat || rows == 0 || cols == 0 || rows > mat->rows || cols > mat->cols)
+        return set_error("invalid compact preimage tile scratch shape");
+    if (mat->hard_cutoff_subset_count > 0)
+    {
+        size_t required_coefficients = 0;
+        size_t required_bytes = 0;
+        if (!small_mul_size(rows, cols, &required_coefficients) ||
+            !small_mul_size(required_coefficients, mat->n, &required_coefficients) ||
+            !small_mul_size(required_coefficients, 1 + mat->magnitude_bytes, &required_bytes) ||
+            required_bytes > mat->hard_cutoff_staging_bytes)
+            return set_error("compact preimage tile scratch exceeds prepared workspace");
+        return 0;
+    }
+    if (small_set_device(mat) != 0 || small_wait(mat, mat->stream) != 0) return 1;
+    const int status = small_initialize_hard_cutoff_plan(mat, rows, cols);
+    if (status != 0)
+    {
+        small_release_hard_cutoff_plan(mat, mat->stream);
+        return status;
+    }
+    return small_record(mat, mat->stream);
+}
+
+int small_submit_preimage_hard_cutoff_tile(
     GpuSmallMatrix *dst,
     const GpuMatrix *src,
     size_t dst_row,
@@ -1290,9 +1955,11 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
     size_t cols,
     const uint64_t *bound_words,
     size_t bound_word_count,
-    int32_t *accepted_out)
+    uint32_t attempt,
+    void *stream_raw,
+    void *control_raw)
 {
-    if (!dst || !src || !bound_words || bound_word_count == 0 || !accepted_out ||
+    if (!dst || !src || !bound_words || bound_word_count == 0 ||
         src->ctx != dst->ctx || src->format != GPU_POLY_FORMAT_COEFF ||
         rows == 0 || cols == 0 || src->rows != rows || src->cols != cols ||
         dst_row > dst->rows || rows > dst->rows - dst_row ||
@@ -1300,7 +1967,19 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         bound_word_count != dst->bound_words.size() ||
         !std::equal(bound_words, bound_words + bound_word_count, dst->bound_words.begin()))
         return set_error("invalid compact tile arguments");
-    if (small_set_device(dst) != 0 || small_wait(dst, dst->stream) != 0) return 1;
+    if (small_set_device(dst) != 0) return 1;
+    const cudaStream_t stream = stream_raw
+        ? reinterpret_cast<cudaStream_t>(stream_raw)
+        : small_capture_stream(dst);
+    if (!stream || small_wait(dst, stream) != 0) return 1;
+    if (!dst->hard_cutoff_metadata)
+        return set_error("missing compact preimage reconstruction metadata owner");
+    auto *metadata_owner =
+        new std::shared_ptr<SmallHardCutoffMetadata>(dst->hard_cutoff_metadata);
+    if (!mxx_graph_retain_released_resource(dst->ctx, metadata_owner, [](void *resource) {
+            delete static_cast<std::shared_ptr<SmallHardCutoffMetadata> *>(resource);
+        }))
+        delete metadata_owner;
     if (src->level < 0) return set_error("invalid compact tile source level");
     const size_t limb_count = static_cast<size_t>(src->level + 1);
     if (limb_count == 0 || limb_count > static_cast<size_t>(kMaxRnsLimbs) ||
@@ -1309,8 +1988,8 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         dst->hard_cutoff_subset_count <= 0 || dst->hard_cutoff_words_per_coeff <= 0 ||
         !dst->hard_cutoff_garner_inverses || !dst->hard_cutoff_subset_indices ||
         !dst->hard_cutoff_modulus_words || !dst->hard_cutoff_half_modulus_words ||
-        !dst->hard_cutoff_bound_words || !dst->hard_cutoff_device_accepted ||
-        !dst->hard_cutoff_host_accepted || !dst->hard_cutoff_decision_ready)
+        !dst->hard_cutoff_bound_words || !dst->hard_cutoff_device_status ||
+        !dst->hard_cutoff_staging || !dst->hard_cutoff_decision_ready)
         return set_error("invalid compact tile active CRT basis");
     size_t poly_count = 0;
     size_t total_coefficients = 0;
@@ -1328,7 +2007,7 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         if (limb == 0) dispatch_slot = static_cast<size_t>(id.x);
         else if (static_cast<size_t>(id.x) != dispatch_slot)
             return set_error("compact tile active CRT limbs span devices");
-        if (id.y != limb || matrix_wait_limb_stream(src, id, dst->device, dst->stream, true, true) != 0)
+        if (id.y != limb || matrix_wait_limb_stream(src, id, dst->device, stream, true, true) != 0)
             return set_error("invalid compact tile active CRT limb");
     }
     if (dispatch_slot >= src->shared_limb_buffers.size() ||
@@ -1341,18 +2020,48 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
         !constants.moduli)
         return set_error("missing compact tile device moduli");
 
-    uint8_t *d_staging = nullptr;
     cudaError_t err = cudaSuccess;
     size_t staging_bytes = 0;
     if (!small_mul_size(total_coefficients, 1 + dst->magnitude_bytes, &staging_bytes))
         return set_error("compact tile staging size overflow");
-    err = cudaMallocAsync(reinterpret_cast<void **>(&d_staging), staging_bytes, dst->stream);
-    if (err == cudaSuccess)
-        err = cudaMemsetAsync(dst->hard_cutoff_device_accepted, 1, sizeof(int), dst->stream);
+    if (staging_bytes > dst->hard_cutoff_staging_bytes)
+        return set_error("compact tile staging exceeds fixed retry workspace");
+    if (control_raw)
+    {
+        preimage_status_init_control_kernel<<<1, 1, 0, stream>>>(
+            dst->hard_cutoff_device_status,
+            static_cast<const MxxPreimageLaunchControl *>(control_raw));
+    }
+    else
+    {
+        preimage_status_init_kernel<<<1, 1, 0, stream>>>(
+            dst->hard_cutoff_device_status, attempt);
+    }
+    if (control_raw)
+    {
+        const size_t argument_sizes[] = {sizeof(void *), sizeof(void *)};
+        const MxxGraphPatch patches[] = {
+            small_kernel_pointer_patch(0, 0, 7), small_kernel_pointer_patch(1, 0, 10),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
+    }
+    else
+    {
+        const size_t argument_sizes[] = {sizeof(void *), sizeof(uint32_t)};
+        const MxxGraphPatch patches[] = {small_kernel_pointer_patch(0, 0, 7)};
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
+    }
+    err = cudaGetLastError();
     if (err == cudaSuccess)
         compact_check_pack_preimage_kernel<<<
             (total_coefficients + kSmallThreads - 1) / kSmallThreads,
-            kSmallThreads, 0, dst->stream>>>(
+            kSmallThreads, 0, stream>>>(
                 src->shared_limb_buffers[dispatch_slot].device_descriptors,
                 constants.moduli,
                 dst->hard_cutoff_garner_inverses,
@@ -1367,58 +2076,316 @@ extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
                 dst->hard_cutoff_half_modulus_words,
                 dst->hard_cutoff_bound_words,
                 dst->magnitude_bytes,
-                dst->hard_cutoff_device_accepted,
-                d_staging);
+                dst->hard_cutoff_device_status,
+                dst->hard_cutoff_staging);
+    if (err == cudaSuccess)
+    {
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(int), sizeof(void *),
+            sizeof(int), sizeof(int), sizeof(size_t), sizeof(size_t), sizeof(int),
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(void *),
+            sizeof(void *),
+        };
+        const MxxGraphPatch patches[] = {
+            small_kernel_pointer_patch(0, 0, 0), small_kernel_pointer_patch(1, 0, 1),
+            small_kernel_pointer_patch(2, 0, 2), small_kernel_pointer_patch(4, 0, 3),
+            small_kernel_pointer_patch(10, 0, 4), small_kernel_pointer_patch(11, 0, 5),
+            small_kernel_pointer_patch(12, 0, 6), small_kernel_pointer_patch(14, 0, 7),
+            small_kernel_pointer_patch(15, 0, 8),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
+    }
     if (err == cudaSuccess) err = cudaGetLastError();
+    if (err == cudaSuccess)
+    {
+        preimage_status_latch_accept_kernel<<<1, 1, 0, stream>>>(dst->hard_cutoff_device_status);
+        const size_t argument_sizes[] = {sizeof(void *)};
+        const MxxGraphPatch patches[] = {small_kernel_pointer_patch(0, 0, 7)};
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
+        err = cudaGetLastError();
+    }
     for (size_t limb = 0; limb < limb_count && err == cudaSuccess; ++limb)
     {
         if (matrix_track_limb_consumer_readonly(
-                src, src->ctx->limb_gpu_ids[limb], dst->device, dst->stream) != 0)
+                src, src->ctx->limb_gpu_ids[limb], dst->device, stream) != 0)
             err = cudaErrorInvalidResourceHandle;
     }
     if (err == cudaSuccess)
-        err = cudaMemcpyAsync(
-            dst->hard_cutoff_host_accepted, dst->hard_cutoff_device_accepted,
-            sizeof(int), cudaMemcpyDeviceToHost, dst->stream);
-    if (err == cudaSuccess)
-        err = cudaEventRecord(dst->hard_cutoff_decision_ready, dst->stream);
-    if (err == cudaSuccess)
-        err = cudaEventSynchronize(dst->hard_cutoff_decision_ready);
-    if (err != cudaSuccess)
-    {
-        if (d_staging) cudaFreeAsync(d_staging, dst->stream);
-        return set_error(err);
-    }
-    *accepted_out = *dst->hard_cutoff_host_accepted;
-    if (*accepted_out != 0)
     {
         const dim3 commit_grid((staging_bytes + kSmallThreads - 1) / kSmallThreads);
-        compact_commit_preimage_tile_kernel<<<commit_grid, kSmallThreads, 0, dst->stream>>>(
-            dst->payload, d_staging, dst->n, rows, cols, dst->cols, dst_row, dst_col,
+        compact_commit_preimage_tile_if_accepted_kernel<<<commit_grid, kSmallThreads, 0, stream>>>(
+            dst->payload,
+            dst->hard_cutoff_staging,
+            dst->hard_cutoff_device_status,
+            dst->n,
+            rows,
+            cols,
+            dst->cols,
+            dst_row,
+            dst_col,
             1 + dst->magnitude_bytes);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        };
+        const MxxGraphPatch patches[] = {
+            small_kernel_pointer_patch(0, 0, 9), small_kernel_pointer_patch(1, 0, 8),
+            small_kernel_pointer_patch(2, 0, 7),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
         err = cudaGetLastError();
-        if (err == cudaSuccess && small_record(dst, dst->stream) != 0)
-            err = cudaErrorInvalidResourceHandle;
     }
-    if (d_staging) cudaFreeAsync(d_staging, dst->stream);
+    if (err == cudaSuccess && small_record(dst, stream) != 0)
+        err = cudaErrorInvalidResourceHandle;
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
-extern "C" int gpu_matrix_mul_small_rhs(
+extern "C" int gpu_small_matrix_submit_preimage_hard_cutoff_tile_on_stream(
+    GpuSmallMatrix *dst,
+    const GpuMatrix *src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t rows,
+    size_t cols,
+    const uint64_t *bound_words,
+    size_t bound_word_count,
+    uint32_t attempt,
+    void *stream)
+{
+    return small_submit_preimage_hard_cutoff_tile(
+        dst,
+        src,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        bound_words,
+        bound_word_count,
+        attempt,
+        stream,
+        nullptr);
+}
+
+extern "C" int gpu_small_matrix_submit_preimage_hard_cutoff_tile_control(
+    GpuSmallMatrix *dst,
+    const GpuMatrix *src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t rows,
+    size_t cols,
+    const uint64_t *bound_words,
+    size_t bound_word_count,
+    void *device_control,
+    void *stream)
+{
+    return small_submit_preimage_hard_cutoff_tile(
+        dst,
+        src,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        bound_words,
+        bound_word_count,
+        0,
+        stream,
+        device_control);
+}
+
+extern "C" int gpu_small_matrix_submit_preimage_hard_cutoff_tile(
+    GpuSmallMatrix *dst,
+    const GpuMatrix *src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t rows,
+    size_t cols,
+    const uint64_t *bound_words,
+    size_t bound_word_count,
+    uint32_t attempt)
+{
+    return small_submit_preimage_hard_cutoff_tile(
+        dst,
+        src,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        bound_words,
+        bound_word_count,
+        attempt,
+        nullptr,
+        nullptr);
+}
+
+static int gpu_small_matrix_copy_preimage_status_async_impl(
+    GpuSmallMatrix *mat,
+    uint32_t status_binding_index,
+    uint32_t host_status_binding_index)
+{
+    if (!mat || !mat->hard_cutoff_device_status || !mat->hard_cutoff_host_status ||
+        !mat->hard_cutoff_decision_ready)
+        return set_error("invalid compact preimage status owner");
+    if (small_set_device(mat) != 0) return 1;
+    const cudaStream_t stream = small_capture_stream(mat);
+    if (!stream) return set_error("missing compact preimage status stream");
+    cudaError_t err = cudaMemcpyAsync(
+        mat->hard_cutoff_host_status,
+        mat->hard_cutoff_device_status,
+        sizeof(MxxPreimageStatus),
+        cudaMemcpyDeviceToHost,
+        stream);
+    if (err == cudaSuccess)
+    {
+        MxxGraphPatch patches[2]{};
+        patches[0].target = MXX_GRAPH_PATCH_MEMCPY_1D_DST;
+        patches[0].byte_count = sizeof(uint64_t);
+        patches[0].binding_index = host_status_binding_index;
+        patches[1].target = MXX_GRAPH_PATCH_MEMCPY_1D_SRC;
+        patches[1].byte_count = sizeof(uint64_t);
+        patches[1].binding_index = status_binding_index;
+        const int registration_status = mxx_graph_register_memcpy1d_update_for_stream(
+            mat->ctx, reinterpret_cast<void *>(stream), sizeof(MxxPreimageStatus),
+            static_cast<int>(cudaMemcpyDeviceToHost), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
+    }
+    if (err == cudaSuccess)
+    {
+        err = cudaEventRecord(mat->hard_cutoff_decision_ready, stream);
+        if (err == cudaSuccess) mat->hard_cutoff_decision_recorded = true;
+    }
+    return err == cudaSuccess ? 0 : set_error(err);
+}
+
+extern "C" int gpu_small_matrix_copy_preimage_status_async(GpuSmallMatrix *mat)
+{
+    // Legacy ordinary execution schema.  Captured production retry regions
+    // call the explicit variant below with the MxxPreimageRetrySpec indices.
+    return gpu_small_matrix_copy_preimage_status_async_impl(mat, 7, 10);
+}
+
+extern "C" int gpu_small_matrix_copy_preimage_status_async_with_bindings(
+    GpuSmallMatrix *mat,
+    uint32_t status_binding_index,
+    uint32_t host_status_binding_index)
+{
+    if (status_binding_index == UINT32_MAX || host_status_binding_index == UINT32_MAX ||
+        status_binding_index == host_status_binding_index)
+        return set_error("invalid compact preimage status binding schema");
+    return gpu_small_matrix_copy_preimage_status_async_impl(
+        mat, status_binding_index, host_status_binding_index);
+}
+
+extern "C" int gpu_small_matrix_mark_preimage_exhausted(GpuSmallMatrix *mat)
+{
+    if (!mat || !mat->hard_cutoff_device_status)
+        return set_error("invalid compact preimage exhaustion status owner");
+    const cudaStream_t stream = small_capture_stream(mat);
+    if (!stream) return set_error("missing compact preimage exhaustion stream");
+    preimage_status_mark_exhausted_kernel<<<1, 1, 0, stream>>>(mat->hard_cutoff_device_status);
+    const size_t argument_sizes[] = {sizeof(void *)};
+    const MxxGraphPatch patches[] = {small_kernel_pointer_patch(0, 0, 7)};
+    const int registration_status = mxx_graph_register_kernel_update_for_stream(
+        mat->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+        std::size(argument_sizes), patches, std::size(patches));
+    if (registration_status != 0) return registration_status;
+    const cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : set_error(err);
+}
+
+extern "C" int gpu_small_matrix_wait_preimage_status(
+    GpuSmallMatrix *mat,
+    MxxPreimageStatus *out_status)
+{
+    if (!mat || !out_status || !mat->hard_cutoff_host_status ||
+        !mat->hard_cutoff_decision_ready)
+        return set_error("invalid compact preimage status wait arguments");
+    cudaError_t err = cudaEventSynchronize(mat->hard_cutoff_decision_ready);
+    if (err != cudaSuccess) return set_error(err);
+    *out_status = *mat->hard_cutoff_host_status;
+    return 0;
+}
+
+// Compatibility entry point for legacy callers. Production retry graphs use
+// submit + one final copy/wait; this wrapper retains the old synchronous
+// result shape without allocating an attempt-local staging buffer.
+extern "C" int gpu_small_matrix_try_pack_preimage_hard_cutoff_tile(
+    GpuSmallMatrix *dst,
+    const GpuMatrix *src,
+    size_t dst_row,
+    size_t dst_col,
+    size_t rows,
+    size_t cols,
+    const uint64_t *bound_words,
+    size_t bound_word_count,
+    int32_t *accepted_out)
+{
+    if (!accepted_out) return set_error("null compact preimage acceptance output");
+    int status = gpu_small_matrix_submit_preimage_hard_cutoff_tile(
+        dst,
+        src,
+        dst_row,
+        dst_col,
+        rows,
+        cols,
+        bound_words,
+        bound_word_count,
+        0);
+    if (status != 0) return status;
+    status = gpu_small_matrix_copy_preimage_status_async(dst);
+    if (status != 0) return status;
+    MxxPreimageStatus result{};
+    status = gpu_small_matrix_wait_preimage_status(dst, &result);
+    if (status == 0) *accepted_out = result.accepted == 1U ? 1 : 0;
+    return status;
+}
+
+int gpu_matrix_mul_small_rhs_impl(
     GpuMatrix *const *outputs,
     const GpuMatrix *const *inputs,
     size_t block_count,
     const GpuSmallMatrix *rhs_small,
     size_t residency_budget_bytes,
-    GpuSmallMatrixAllocationReport *allocation_report)
+    GpuSmallMatrixAllocationReport *allocation_report,
+    cudaStream_t requested_stream,
+    const uint32_t *source_binding_indices,
+    const uint32_t *destination_binding_indices,
+    uint32_t rhs_payload_binding_index,
+    const size_t *block_fragment_ends)
 {
     if (!outputs || !inputs || block_count == 0 || block_count > kCompactRowBlocks)
         return set_error("invalid compact multiplication blocks");
+    const size_t source_count = block_fragment_ends ? block_fragment_ends[block_count - 1] : block_count;
+    if (source_count == 0 || source_count > kCompactSourceFragments)
+        return set_error("compact multiplication source fragment limit exceeded");
+    const bool bound = requested_stream != nullptr;
+    if (bound && (!source_binding_indices || !destination_binding_indices ||
+                  rhs_payload_binding_index == UINT32_MAX))
+        return set_error("invalid compact multiplication binding schema");
+    if (bound)
+    {
+        for (size_t block = 0; block < source_count; ++block)
+        {
+            if (source_binding_indices[block] == UINT32_MAX)
+                return set_error("invalid compact multiplication binding index");
+        }
+        for (size_t block = 0; block < block_count; ++block)
+            if (destination_binding_indices[block] == UINT32_MAX)
+                return set_error("invalid compact multiplication destination binding index");
+    }
     GpuMatrix *out = outputs[0];
     const GpuMatrix *lhs_eval = inputs[0];
     if (!out || !lhs_eval || !rhs_small || !out->ctx || out->ctx != lhs_eval->ctx || out->ctx != rhs_small->ctx ||
         lhs_eval->format != GPU_POLY_FORMAT_EVAL || out->format != GPU_POLY_FORMAT_EVAL ||
-        lhs_eval->cols != rhs_small->rows || out->rows != lhs_eval->rows || out->cols != rhs_small->cols ||
+        out->rows != lhs_eval->rows || out->cols != rhs_small->cols ||
         !allocation_report)
         return set_error("invalid compact RHS multiplication arguments");
     const size_t limbs = static_cast<size_t>(lhs_eval->level + 1);
@@ -1430,24 +2397,38 @@ extern "C" int gpu_matrix_mul_small_rhs(
     size_t rows = 0;
     for (size_t block = 0; block < block_count; ++block)
     {
-        const auto *left = inputs[block];
         const auto *output = outputs[block];
-        if (!left || !output || left->ctx != lhs_eval->ctx || output->ctx != out->ctx ||
-            left->level != lhs_eval->level || output->level != out->level ||
-            left->format != GPU_POLY_FORMAT_EVAL || output->format != GPU_POLY_FORMAT_EVAL ||
-            left->cols != lhs_eval->cols || output->cols != out->cols || output->rows != left->rows ||
-            !small_add_size(rows, left->rows, &rows))
+        if (!output || output->ctx != out->ctx || output->level != out->level ||
+            output->format != GPU_POLY_FORMAT_EVAL || output->cols != out->cols ||
+            !small_add_size(rows, output->rows, &rows))
             return set_error("incompatible compact multiplication block");
         blocks.ends[block] = rows;
+        const size_t start = block ? blocks.fragment_ends[block - 1] : 0;
+        const size_t end = block_fragment_ends ? block_fragment_ends[block] : block + 1;
+        if (end <= start || end > source_count) return set_error("invalid compact source fragment offsets");
+        size_t columns = 0;
+        for (size_t fragment = start; fragment < end; ++fragment)
+        {
+            const auto *left = inputs[fragment];
+            if (!left || left->ctx != lhs_eval->ctx || left->level != lhs_eval->level ||
+                left->format != GPU_POLY_FORMAT_EVAL || left->rows != output->rows || left->cols == 0 ||
+                !small_add_size(columns, left->cols, &columns))
+                return set_error("incompatible compact multiplication source fragment");
+            blocks.column_ends[fragment] = columns;
+        }
+        if (columns != rhs_small->rows) return set_error("compact fragments do not cover the inner dimension");
+        blocks.fragment_ends[block] = end;
     }
     if (small_set_device(rhs_small) != 0) return 1;
-    cudaStream_t stream = nullptr;
+    cudaStream_t stream = requested_stream;
     int dispatch_device = -1;
     size_t dispatch_slot = std::numeric_limits<size_t>::max();
-    for (size_t block = 0; block < block_count; ++block)
+    size_t output_block = 0;
+    for (size_t block = 0; block < source_count; ++block)
     {
+        while (block >= blocks.fragment_ends[output_block]) ++output_block;
         const auto *lhs_eval = inputs[block];
-        auto *out = outputs[block];
+        auto *out = outputs[output_block];
         for (size_t limb = 0; limb < limbs; ++limb)
         {
             const dim3 id = out->ctx->limb_gpu_ids[limb];
@@ -1472,7 +2453,15 @@ extern "C" int gpu_matrix_mul_small_rhs(
             {
                 dispatch_device = out_device;
                 dispatch_slot = static_cast<size_t>(id.x);
-                if (matrix_limb_stream(out, id, &stream) != 0) return 1;
+                if (!stream && matrix_limb_stream(out, id, &stream) != 0) return 1;
+                // The owner stream is the normal asynchronous launch stream,
+                // but a fused compact product can be captured on the
+                // execution context's capture stream.  Route the complete
+                // dependency chain (waits, workspace, and kernels) through
+                // that stream so CUDA never sees an uncaptured wait created
+                // by this operation.
+                if (!requested_stream)
+                    stream = matrix_capture_stream_for_device(out->ctx, out_device, stream);
             }
             else if (out_device != dispatch_device)
                 return set_error("compact RHS multiplication requires one device");
@@ -1480,12 +2469,12 @@ extern "C" int gpu_matrix_mul_small_rhs(
         if (matrix_wait_all_limb_streams(lhs_eval, rhs_small->device, stream, true, true) != 0 ||
             matrix_wait_all_limb_streams(out, rhs_small->device, stream, true) != 0) return 1;
         blocks.inputs[block] = lhs_eval->shared_limb_buffers[dispatch_slot].device_descriptors;
-        blocks.outputs[block] = out->shared_limb_buffers[dispatch_slot].device_descriptors;
+        blocks.outputs[output_block] = out->shared_limb_buffers[dispatch_slot].device_descriptors;
     }
     if (!stream) return set_error("missing compact multiplication stream");
     if (small_wait(rhs_small, stream) != 0) return 1;
     const size_t n = rhs_small->n;
-    const size_t inner = lhs_eval->cols;
+    const size_t inner = rhs_small->rows;
     const size_t cols = rhs_small->cols;
     if (dispatch_slot >= out->ctx->ntt_device_constants.size())
         return set_error("missing compact multiplication NTT partition");
@@ -1553,16 +2542,22 @@ extern "C" int gpu_matrix_mul_small_rhs(
     };
     size_t lhs_eval_bytes = 0;
     size_t full_output_bytes = 0;
-    for (size_t block = 0; block < block_count; ++block)
+    for (size_t block = 0; block < source_count; ++block)
     {
-        GpuMatrixAllocationBytes lhs_allocation{}, output_allocation{};
+        GpuMatrixAllocationBytes lhs_allocation{};
         const auto *left = inputs[block];
-        const auto *output = outputs[block];
         if (gpu_matrix_query_allocation_bytes(left->ctx, left->level, left->rows, left->cols,
                 left->format, &lhs_allocation) != 0 ||
+            !small_add_size(lhs_eval_bytes, lhs_allocation.total_bytes, &lhs_eval_bytes))
+            return set_error("compact source allocation overflow");
+    }
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        GpuMatrixAllocationBytes output_allocation{};
+        const auto *output = outputs[block];
+        if (
             gpu_matrix_query_allocation_bytes(output->ctx, output->level, output->rows, output->cols,
                 output->format, &output_allocation) != 0 ||
-            !small_add_size(lhs_eval_bytes, lhs_allocation.total_bytes, &lhs_eval_bytes) ||
             !small_add_size(full_output_bytes, output_allocation.total_bytes, &full_output_bytes))
             return set_error("compact block allocation overflow");
     }
@@ -1656,6 +2651,11 @@ extern "C" int gpu_matrix_mul_small_rhs(
                     rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
                     rhs_small->column_offset);
             }
+            if (register_compact_rhs_update(
+                    rhs_small->ctx,
+                    stream,
+                    bound ? rhs_payload_binding_index : static_cast<uint32_t>(block_count)) != 0)
+                return fail(cudaErrorInvalidResourceHandle);
             err = cudaGetLastError();
         }
         else
@@ -1691,6 +2691,11 @@ extern "C" int gpu_matrix_mul_small_rhs(
                     rhs_small->storage_cols, n_u32, rhs_small->magnitude_bytes,
                     rhs_small->column_offset);
             }
+            if (register_compact_rhs_update(
+                    rhs_small->ctx,
+                    stream,
+                    bound ? rhs_payload_binding_index : static_cast<uint32_t>(block_count)) != 0)
+                return fail(cudaErrorInvalidResourceHandle);
             err = cudaGetLastError();
             for (uint32_t len = n_u32 >> 1;
                  err == cudaSuccess && len > kCompactNttSuffixSize;
@@ -1789,6 +2794,14 @@ extern "C" int gpu_matrix_mul_small_rhs(
                     group.limb_offset, group_workspace, group.limb_count,
                     rows, inner, cols, n, lazy_reduce);
             }
+            if (register_compact_accumulate_update(
+                    rhs_small->ctx,
+                    stream,
+                    block_count,
+                    source_count,
+                    bound ? source_binding_indices : nullptr,
+                    bound ? destination_binding_indices : nullptr) != 0)
+                return fail(cudaErrorInvalidResourceHandle);
             err = cudaGetLastError();
             if (err != cudaSuccess) break;
         }
@@ -1800,7 +2813,7 @@ extern "C" int gpu_matrix_mul_small_rhs(
     const dim3 first = out->ctx->limb_gpu_ids[0];
     const auto &states = out->exec_limb_states[first.x];
     const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
-    for (size_t block = 0; block < block_count; ++block)
+    for (size_t block = 0; block < source_count; ++block)
         if (matrix_track_all_limb_consumers(inputs[block], rhs_small->device, stream, completion, true, true) != 0)
             return fail(cudaErrorInvalidResourceHandle);
     if (small_track_consumer(rhs_small, stream, completion) != 0)
@@ -1808,4 +2821,54 @@ extern "C" int gpu_matrix_mul_small_rhs(
     const cudaError_t cleanup_err = release();
     if (cleanup_err != cudaSuccess) return set_error(cleanup_err);
     return 0;
+}
+
+extern "C" int gpu_matrix_mul_small_rhs(
+    GpuMatrix *const *outputs,
+    const GpuMatrix *const *inputs,
+    size_t block_count,
+    const GpuSmallMatrix *rhs_small,
+    size_t residency_budget_bytes,
+    GpuSmallMatrixAllocationReport *allocation_report)
+{
+    return gpu_matrix_mul_small_rhs_impl(
+        outputs,
+        inputs,
+        block_count,
+        rhs_small,
+        residency_budget_bytes,
+        allocation_report,
+        nullptr,
+        nullptr,
+        nullptr,
+        UINT32_MAX,
+        nullptr);
+}
+
+extern "C" int gpu_matrix_mul_small_rhs_into_bound(
+    GpuMatrix *const *outputs,
+    const GpuMatrix *const *inputs,
+    size_t block_count,
+    const GpuSmallMatrix *rhs_small,
+    size_t residency_budget_bytes,
+    GpuSmallMatrixAllocationReport *allocation_report,
+    void *stream,
+    const uint32_t *source_binding_indices,
+    const uint32_t *destination_binding_indices,
+    uint32_t rhs_payload_binding_index,
+    const size_t *block_fragment_ends)
+{
+    if (!stream) return set_error("missing compact multiplication capture stream");
+    return gpu_matrix_mul_small_rhs_impl(
+        outputs,
+        inputs,
+        block_count,
+        rhs_small,
+        residency_budget_bytes,
+        allocation_report,
+        reinterpret_cast<cudaStream_t>(stream),
+        source_binding_indices,
+        destination_binding_indices,
+        rhs_payload_binding_index,
+        block_fragment_ends);
 }

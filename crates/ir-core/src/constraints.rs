@@ -125,6 +125,13 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         label: format!("{prefix}: gadget base must exceed one"),
                     })
                 }
+                NodeKind::CenteredRoundDivide { divisor } => {
+                    positive(
+                        &mut constraints,
+                        divisor,
+                        format!("{prefix}: centered round divisor"),
+                    );
+                }
                 NodeKind::Slice { rows, columns } => {
                     for (axis, range) in [("row", rows), ("column", columns)] {
                         if let Some(range) = range {

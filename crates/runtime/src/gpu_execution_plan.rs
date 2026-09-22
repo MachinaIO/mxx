@@ -1061,6 +1061,37 @@ impl FrozenGpuPlanIndex {
     ) -> Option<&'a GpuNodeChoice> {
         self.nodes.get(&key).and_then(|index| plan.nodes.get(*index))
     }
+
+    /// Return the first frozen job selected for one node instance.
+    ///
+    /// The job is the only authoritative placement for a resident operation
+    /// whose lowering does not itself carry a native request.  In particular,
+    /// callers must not derive a device from the vector position or fall back
+    /// to logical GPU zero when a control operation is adjacent to a resident
+    /// producer/consumer.
+    #[cfg(any(feature = "gpu", test))]
+    pub(crate) fn selected_job(
+        &self,
+        plan: &FrozenGpuPlan,
+        key: GpuExecutionSiteKey,
+        instance: usize,
+    ) -> Result<Option<GpuColumnJob>, GpuPlanError> {
+        let Some(choice) = self.node_choice(plan, key) else { return Ok(None) };
+        let mut selected = None;
+        for layout_id in &choice.output_layouts {
+            let layout = self
+                .layout(plan, *layout_id)
+                .ok_or(GpuPlanError::UnknownLayout { site: key, layout: *layout_id })?;
+            let schedule = layout
+                .schedule(&choice.columns_per_job, instance)
+                .map_err(GpuPlanError::InvalidLayoutSchedule)?;
+            if let Some(job) = schedule.waves().flatten().next() {
+                selected = Some(job);
+                break;
+            }
+        }
+        Ok(selected)
+    }
 }
 
 impl FrozenGpuPlan {
@@ -1485,6 +1516,56 @@ mod tests {
             FrozenGpuPlanIndex::build(&duplicate_node),
             Err(GpuPlanError::DuplicateNodeSite(site)) if site == key
         ));
+    }
+
+    #[test]
+    fn selected_job_uses_frozen_output_layout_owner() {
+        let key = GpuExecutionSiteKey { site: 19, shape_class: 0, instance_class: 0 };
+        let node = GpuNodeChoice {
+            key,
+            loop_site: None,
+            operation_identity: [7; 32],
+            effective_operation: EffectiveGpuOperation::HostOrControl,
+            column_capability: ColumnCapability::HostOrControl,
+            output_layouts: vec![1],
+            columns_per_job: vec![2, 2],
+            implementation_variant: "resident-family".into(),
+            preimage_max_attempts: None,
+        };
+        let plan = FrozenGpuPlan::new(contract(2), vec![layout()], vec![], vec![node]).unwrap();
+        let index = FrozenGpuPlanIndex::build(&plan).unwrap();
+        let job = index.selected_job(&plan, key, 0).unwrap().unwrap();
+        assert_eq!(job.device, 0);
+        assert_eq!(job.start, 0);
+        assert_eq!(job.end, 2);
+    }
+
+    #[test]
+    fn selected_job_reports_empty_zero_width_schedule_without_a_fallback_device() {
+        let key = GpuExecutionSiteKey { site: 20, shape_class: 0, instance_class: 0 };
+        let empty_layout = GpuLayout {
+            id: 1,
+            columns: 0,
+            rows: 1,
+            ring_dimension: 1,
+            representation: "empty".into(),
+            instance_device_stride: 0,
+            owner_intervals: Vec::new(),
+        };
+        let node = GpuNodeChoice {
+            key,
+            loop_site: None,
+            operation_identity: [8; 32],
+            effective_operation: EffectiveGpuOperation::HostOrControl,
+            column_capability: ColumnCapability::HostOrControl,
+            output_layouts: vec![1],
+            columns_per_job: vec![0, 0],
+            implementation_variant: "empty-family".into(),
+            preimage_max_attempts: None,
+        };
+        let plan = FrozenGpuPlan::new(contract(2), vec![empty_layout], vec![], vec![node]).unwrap();
+        let index = FrozenGpuPlanIndex::build(&plan).unwrap();
+        assert!(index.selected_job(&plan, key, 0).unwrap().is_none());
     }
 
     #[test]

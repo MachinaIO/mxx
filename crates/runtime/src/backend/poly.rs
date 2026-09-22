@@ -660,6 +660,7 @@ where
 {
     type Matrix = M;
     type SmallMatrix = M::SmallMatrix;
+    type IntegerValues = Vec<BigInt>;
     type Trapdoor = T::Trapdoor;
     type Error = PolyBackendError;
 
@@ -692,6 +693,41 @@ where
         let output =
             if evaluation { polynomial.evals_biguints() } else { polynomial.coeffs_biguints() };
         Ok(polynomial_host_values(output))
+    }
+
+    fn integer_values_from_host(
+        &mut self,
+        values: &[BigInt],
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        Ok(values.to_vec())
+    }
+
+    fn polynomial_from_integer_values(
+        &mut self,
+        ty: &ConcreteMatrixType,
+        values: &Self::IntegerValues,
+        evaluation: bool,
+    ) -> Result<Self::Matrix, Self::Error> {
+        self.polynomial_from_values(ty, values, evaluation)
+    }
+
+    fn polynomial_values_resident(
+        &mut self,
+        value: &Self::Matrix,
+        evaluation: bool,
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        self.polynomial_values(value, evaluation)
+    }
+
+    fn integer_values_to_host(
+        &mut self,
+        values: &Self::IntegerValues,
+    ) -> Result<Vec<BigInt>, Self::Error> {
+        Ok(values.clone())
+    }
+
+    fn integer_values_len(&self, values: &Self::IntegerValues) -> usize {
+        values.len()
     }
 
     fn placement_count(&self) -> usize {
@@ -1096,6 +1132,11 @@ where
         value
             .centered_rebase(self.parameters(destination)?)
             .map_err(PolyBackendError::BasisConversion)
+    }
+
+    fn centered_round_divide(&mut self, value: &M, divisor: &BigInt) -> Result<M, Self::Error> {
+        let divisor = divisor.to_biguint().ok_or(PolyBackendError::InvalidInteger)?;
+        value.centered_round_divide(&divisor).map_err(PolyBackendError::BasisConversion)
     }
 
     fn centered_rebase_small(
@@ -1829,6 +1870,10 @@ pub fn cpu_backend(parameters: impl IntoIterator<Item = DCRTPolyParams>) -> CpuD
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{
+        FixedOperationBatchOutput, FixedOperationBatchRequest, GpuEffectiveInputs,
+        PlannedNodeBatchRequest,
+    };
     use mxx_primitives::poly::{PolyParams, dcrt::poly::DCRTPoly};
 
     #[test]
@@ -1854,6 +1899,11 @@ mod tests {
         let mut backend = cpu_backend([parameters.clone()]);
         let coefficients = backend.polynomial_from_values(&ty, &input, false).unwrap();
         assert_eq!(backend.polynomial_values(&coefficients, false).unwrap(), expected);
+        let resident = backend.polynomial_values_resident(&coefficients, false).unwrap();
+        assert_eq!(backend.integer_values_to_host(&resident).unwrap(), expected);
+        let resident_reconstructed =
+            backend.polynomial_from_integer_values(&ty, &resident, false).unwrap();
+        assert_eq!(resident_reconstructed, coefficients);
         let evaluations = backend.polynomial_values(&coefficients, true).unwrap();
         let reconstructed = backend.polynomial_from_values(&ty, &evaluations, true).unwrap();
         assert_eq!(reconstructed, coefficients);
@@ -1870,6 +1920,107 @@ mod tests {
             backend.polynomial_from_values(&unknown_ring, &input, false),
             Err(PolyBackendError::MissingParameters(_))
         ));
+    }
+
+    #[test]
+    fn fixed_integer_primitive_requests_keep_cpu_reference_semantics() {
+        let parameters = DCRTPolyParams::new(8, 1, 17, 2, None, None);
+        let ty = ConcreteMatrixType::scalar(
+            BigInt::from(parameters.modulus().as_ref().clone()),
+            parameters.ring_dimension() as usize,
+        );
+        let coefficients = (0..ty.ring_dimension)
+            .map(|index| BigUint::from((index * 3 + 1) as u32))
+            .collect::<Vec<_>>();
+        let matrix = Arc::new(DCRTPolyMatrix::from_poly_vec_row(
+            &parameters,
+            vec![DCRTPoly::from_biguints(&parameters, &coefficients)],
+        ));
+        let metadata = || {
+            PlannedNodeBatchRequest::for_lowered_operation(
+                crate::gpu_execution_plan::GpuExecutionSiteKey {
+                    site: 1,
+                    shape_class: 1,
+                    instance_class: 1,
+                },
+                [0; 32],
+                "cpu-fixed-primitive-test".into(),
+                GpuEffectiveInputs::default(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let mut backend = cpu_backend([parameters]);
+
+        let extracted = backend
+            .fixed_operation_batch(vec![FixedOperationBatchRequest::ExtractCoefficient {
+                metadata: metadata(),
+                value: matrix.clone(),
+                position: 3,
+            }])
+            .unwrap();
+        let FixedOperationBatchOutput::IntegerValues(extracted) = &extracted[0] else {
+            panic!("coefficient extraction must return integer values")
+        };
+        assert_eq!(extracted, &vec![BigInt::from(10u8)]);
+
+        let decoded = backend
+            .fixed_operation_batch(vec![FixedOperationBatchRequest::ThresholdDecode {
+                metadata: metadata(),
+                value: matrix,
+                plaintext_modulus: BigInt::from(5u8),
+                length: 3,
+                output_bool: false,
+            }])
+            .unwrap();
+        let FixedOperationBatchOutput::IntegerValuesMany(decoded) = &decoded[0] else {
+            panic!("threshold decoding must return one integer owner per port")
+        };
+        assert_eq!(decoded.len(), 3);
+        assert_eq!(
+            decoded.iter().map(|value| value[0].clone()).collect::<Vec<_>>(),
+            threshold_decode_coefficients(
+                coefficients[..3].to_vec(),
+                &ty.modulus,
+                &BigInt::from(5u8),
+                3,
+            )
+        );
+
+        let bits = Arc::new(vec![
+            BigInt::from(1u8),
+            BigInt::from(0u8),
+            BigInt::from(1u8),
+            BigInt::from(0u8),
+            BigInt::from(1u8),
+            BigInt::from(0u8),
+            BigInt::from(0u8),
+            BigInt::from(1u8),
+        ]);
+        let packed = backend
+            .fixed_operation_batch(vec![FixedOperationBatchRequest::PackPolynomialCoefficients {
+                metadata: metadata(),
+                ty: ty.clone(),
+                bits,
+                coefficient_bits: 1,
+            }])
+            .unwrap();
+        let FixedOperationBatchOutput::Matrix(packed) = &packed[0] else {
+            panic!("packing must return a matrix")
+        };
+        assert_eq!(
+            packed.entry(0, 0).coeffs_biguints(),
+            &[
+                BigUint::from(1u8),
+                BigUint::zero(),
+                BigUint::from(1u8),
+                BigUint::zero(),
+                BigUint::from(1u8),
+                BigUint::zero(),
+                BigUint::zero(),
+                BigUint::from(1u8)
+            ]
+        );
     }
 
     #[test]
@@ -1973,10 +2124,13 @@ mod tests {
         let input = make(&source);
         let rebased = backend.centered_rebase(&input, &ty(&destination)).unwrap();
         assert_eq!(rebased, make(&destination));
-        assert!(matches!(
-            backend.centered_rebase(&rebased, &ty(&source)),
-            Err(PolyBackendError::BasisConversion(_))
-        ));
+        // Centered rebase is defined over the represented signed integer,
+        // rather than over a CRT-basis containment relation.  The reverse
+        // conversion therefore remains valid for these bounded values even
+        // though the two bases are unrelated; verify the exact signed
+        // round-trip instead of rejecting the conversion by basis shape.
+        let round_trip = backend.centered_rebase(&rebased, &ty(&source)).unwrap();
+        assert_eq!(round_trip, make(&source));
         // A one-limb target smaller than the source exercises negative reduction
         // when a centered magnitude exceeds the destination prime.
         let small = DCRTPolyParams::new(n, 1, 10, 2, None, None);

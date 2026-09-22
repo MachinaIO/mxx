@@ -14,9 +14,10 @@ use mxx_ir_core::ValidatedGraph;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A backend owner that performs the prepare-then-run lifecycle for a graph.
-pub trait ExecutionAuthority {
+pub trait ExecutionAuthority<S: SessionStore> {
     type Backend: Backend;
     type Prepared;
+    type Result;
 
     fn prepare(
         &mut self,
@@ -24,13 +25,13 @@ pub trait ExecutionAuthority {
         inputs: &BTreeMap<String, RuntimeValue<Self::Backend>>,
     ) -> Result<Self::Prepared, String>;
 
-    fn run<S: SessionStore>(
+    fn run(
         &mut self,
-        prepared: Self::Prepared,
+        prepared: &mut Self::Prepared,
         inputs: BTreeMap<String, RuntimeValue<Self::Backend>>,
         store: &mut S,
         execution_nonce: [u8; 32],
-    ) -> Result<ExecutionResult<Self::Backend>, String>;
+    ) -> Result<Self::Result, String>;
 }
 
 /// CPU authority. It deliberately exposes no GPU plan configuration.
@@ -58,9 +59,14 @@ impl<B: Backend> CpuExecution<B> {
     }
 }
 
-impl<B: Backend> ExecutionAuthority for CpuExecution<B> {
+impl<B, S> ExecutionAuthority<S> for CpuExecution<B>
+where
+    B: Backend,
+    S: SessionStore,
+{
     type Backend = B;
     type Prepared = PreparedCpuExecution;
+    type Result = ExecutionResult<B>;
 
     fn prepare(
         &mut self,
@@ -74,9 +80,9 @@ impl<B: Backend> ExecutionAuthority for CpuExecution<B> {
         })
     }
 
-    fn run<S: SessionStore>(
+    fn run(
         &mut self,
-        prepared: Self::Prepared,
+        prepared: &mut Self::Prepared,
         inputs: BTreeMap<String, RuntimeValue<Self::Backend>>,
         store: &mut S,
         execution_nonce: [u8; 32],
@@ -91,7 +97,7 @@ impl<B: Backend> ExecutionAuthority for CpuExecution<B> {
             inputs,
             store,
             execution_nonce,
-            prepared.config,
+            prepared.config.clone(),
         )
         .map_err(|error| error.to_string())
     }
@@ -100,94 +106,33 @@ impl<B: Backend> ExecutionAuthority for CpuExecution<B> {
 #[cfg(feature = "gpu")]
 mod gpu {
     use super::*;
-    use crate::{
-        backend::poly_gpu::GpuDcrtBackend,
-        gpu_measurement::{
-            GpuPreparationRequest, GpuWarmupMeasurementConfig, PreparedGpuExecution,
-            prepare as prepare_gpu,
-        },
-    };
-    use mxx_primitives::poly::dcrt::gpu::GpuDCRTPolyParams;
+    use crate::{backend::poly_gpu::GpuDcrtBackend, gpu_runtime::GpuExecutionPlan};
 
-    /// GPU authority owning native parameters, backend state, and the pure
-    /// preparation reports produced for each graph identity.
-    pub struct GpuExecution {
-        backend: GpuDcrtBackend,
-        parameters: Vec<GpuDCRTPolyParams>,
-        measurement_config: GpuWarmupMeasurementConfig,
-        implementation_variant: String,
-        preparations: Vec<PreparedGpuExecution>,
-    }
-
-    impl GpuExecution {
-        pub fn new(
-            backend: GpuDcrtBackend,
-            parameters: impl IntoIterator<Item = GpuDCRTPolyParams>,
-            measurement_config: GpuWarmupMeasurementConfig,
-            implementation_variant: impl Into<String>,
-        ) -> Self {
-            Self {
-                backend,
-                parameters: parameters.into_iter().collect(),
-                measurement_config,
-                implementation_variant: implementation_variant.into(),
-                preparations: Vec::new(),
-            }
-        }
-
-        pub fn backend(&self) -> &GpuDcrtBackend {
-            &self.backend
-        }
-
-        pub fn backend_mut(&mut self) -> &mut GpuDcrtBackend {
-            &mut self.backend
-        }
-
-        pub fn preparations(&self) -> &[PreparedGpuExecution] {
-            &self.preparations
-        }
-    }
-
-    impl ExecutionAuthority for GpuExecution {
+    impl<S> ExecutionAuthority<S> for crate::gpu_runtime::GpuRuntime
+    where
+        S: SessionStore + Send,
+    {
         type Backend = GpuDcrtBackend;
-        type Prepared = PreparedGpuExecution;
+        type Prepared = GpuExecutionPlan;
+        type Result = crate::gpu_runtime::GpuExecutionResult;
 
         fn prepare(
             &mut self,
             validated: ValidatedGraph,
             inputs: &BTreeMap<String, RuntimeValue<Self::Backend>>,
         ) -> Result<Self::Prepared, String> {
-            let execution_config = ExecutionConfig::default();
-            let prepared = prepare_gpu(GpuPreparationRequest {
-                validated,
-                backend: &mut self.backend,
-                inputs,
-                parameters: &self.parameters,
-                default_tile_widths: vec![1, 2, 4, 8],
-                implementation_variant: self.implementation_variant.clone(),
-                measurement_config: self.measurement_config.clone(),
-                execution_config,
-            })
-            .map_err(|error| error.to_string())?;
-            self.preparations.push(prepared.clone());
-            Ok(prepared)
+            self.plan(validated, inputs).map_err(|error| error.to_string())
         }
 
-        fn run<S: SessionStore>(
+        fn run(
             &mut self,
-            prepared: Self::Prepared,
+            prepared: &mut Self::Prepared,
             inputs: BTreeMap<String, RuntimeValue<Self::Backend>>,
             store: &mut S,
             execution_nonce: [u8; 32],
-        ) -> Result<ExecutionResult<Self::Backend>, String> {
-            prepared
-                .run(&mut self.backend, inputs, store, execution_nonce)
+        ) -> Result<Self::Result, String> {
+            self.execute(prepared, inputs, store, execution_nonce)
                 .map_err(|error| error.to_string())
         }
     }
-
-    pub use GpuExecution as PublicGpuExecution;
 }
-
-#[cfg(feature = "gpu")]
-pub use gpu::PublicGpuExecution as GpuExecution;

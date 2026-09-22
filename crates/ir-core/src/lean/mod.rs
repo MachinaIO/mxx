@@ -61,6 +61,7 @@ pub struct PrimitiveNames {
     pub modulus_switch: String,
     pub modulus_reduce: String,
     pub centered_rebase: String,
+    pub centered_round_divide: String,
     pub compact_centered_rebase: String,
     pub rns_mod_up: String,
     pub rns_mod_down: String,
@@ -114,6 +115,7 @@ impl Default for PrimitiveNames {
             modulus_switch: "MxxRuntime.modulusSwitchRuns".into(),
             modulus_reduce: "MxxRuntime.modulusReduceRuns".into(),
             centered_rebase: "MxxRuntime.centeredRebaseRuns".into(),
+            centered_round_divide: "MxxRuntime.centeredRoundDivideRuns".into(),
             compact_centered_rebase: "MxxRuntime.compactCenteredRebaseRuns".into(),
             rns_mod_up: "MxxRuntime.rnsModUpRuns".into(),
             rns_mod_down: "MxxRuntime.rnsModDownRuns".into(),
@@ -1452,6 +1454,17 @@ impl<'a> Emitter<'a> {
                 } else {
                     relations.push(format!("{relation} {} {}", arg(0)?, output(0)));
                 }
+            }
+            NodeKind::CenteredRoundDivide { divisor } => {
+                append_expression_guards(divisor, env, relations);
+                self.bind_existential(&output(0), &self.output_type(scope, node_id, 0));
+                relations.push(format!(
+                    "{} {} {} {}",
+                    self.options.primitives.centered_round_divide,
+                    env.expr(divisor),
+                    arg(0)?,
+                    output(0)
+                ));
             }
             NodeKind::RnsModUp { modulus, source_moduli, digit_size, normalize } => {
                 append_expression_guards(modulus, env, relations);

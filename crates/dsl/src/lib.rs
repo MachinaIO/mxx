@@ -1106,14 +1106,25 @@ impl Mat {
     }
 
     /// Re-encodes the centered coefficients of the complete source CRT basis
-    /// in another ring.  The backend uses the whole source modulus when
-    /// choosing the centered integer, so this remains exact for multi-limb
-    /// inputs as well as the historical single-limb case.
+    /// in another ring. The backend uses the whole source modulus when
+    /// choosing the centered integer, including for multi-limb inputs.
     #[track_caller]
     pub fn centered_rebase(self, modulus: impl Into<IntExpr>) -> Self {
         let modulus = modulus.into();
         let ty = MatrixType { modulus: modulus.clone(), ..self.matrix_type.clone() };
         Self::from_node(NodeKind::CenteredRebase { modulus }, vec![self], ty)
+    }
+
+    /// Divides centered coefficients by a positive compile-time divisor and
+    /// rounds to the nearest integer, retaining the ring and matrix shape.
+    #[track_caller]
+    pub fn centered_round_divide(self, divisor: impl Into<IntExpr>) -> Self {
+        let matrix_type = self.matrix_type.clone();
+        Self::from_node(
+            NodeKind::CenteredRoundDivide { divisor: divisor.into() },
+            vec![self],
+            matrix_type,
+        )
     }
 
     /// Performs an exact CRT block modulus switch. The source basis must be
@@ -2166,6 +2177,21 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn centered_round_divide_is_a_typed_matrix_operation() {
+        let ring = Ring::new(257, 8);
+        let output = ring.input("matrix", (2, 3)).centered_round_divide(17);
+        let built = DslContext::new("centered-round-divide")
+            .output("result", output)
+            .unwrap()
+            .build()
+            .unwrap();
+        built.validate(&mxx_ir_core::ParamEnv::default()).unwrap();
+        assert!(built.graph.root_scope().nodes().iter().any(|node| {
+            matches!(node.kind(), NodeKind::CenteredRoundDivide { divisor } if divisor == &IntExpr::constant(17))
+        }));
     }
 
     #[test]

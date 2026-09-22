@@ -78,10 +78,16 @@ use mxx_primitives::{
 mod fleet;
 pub use fleet::{
     GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEnvelope,
-    GpuAllocationEvidenceKind, GpuAllocationQueryError, GpuColumnShard, GpuDcrtBackend,
-    GpuFleetMatrix, GpuFleetSmallMatrix, GpuFleetTrapdoor, GpuLocalProductionInput,
-    GpuLocalProductionJobContext, GpuLocalProductionJobRequest, GpuLocalProductionJobResult,
-    GpuLocalProductionSource, GpuMeasurementError, GpuProductionCompletion,
+    GpuAllocationEvidenceKind, GpuAllocationQueryError, GpuColumnShard, GpuCompiledRegion,
+    GpuDcrtBackend, GpuFleetMatrix, GpuFleetSignedValues, GpuFleetSmallMatrix, GpuFleetTrapdoor,
+    GpuLocalProductionInput, GpuLocalProductionJobContext, GpuLocalProductionJobRequest,
+    GpuLocalProductionJobResult, GpuLocalProductionSource, GpuMeasurementError,
+    GpuProductionCompletion,
+};
+pub(crate) use fleet::{
+    GpuCaptureDestinationOwner, GpuCaptureOwnedOwner, GpuCaptureRequest, GpuCapturedRegion,
+    GpuResidentCaptureOwner, GpuResidentCaptureOwners, GpuResidentCaptureProgram,
+    resident_fleet_column_source,
 };
 
 #[cfg(test)]
@@ -121,7 +127,8 @@ pub fn gpu_backend_on(
     device_ids: impl IntoIterator<Item = i32>,
 ) -> GpuDcrtBackend {
     let parameters = parameters.into_iter().collect::<Vec<_>>();
-    let device_ids = device_ids.into_iter().collect::<Vec<_>>();
+    let mut device_ids = device_ids.into_iter().collect::<Vec<_>>();
+    device_ids.sort_unstable();
     assert!(!device_ids.is_empty(), "mxx-runtime GPU backend requires at least one detected GPU");
     let placements = device_ids
         .into_iter()
@@ -318,7 +325,10 @@ mod tests {
                 GpuColumnWidths, gpu_calibration_operation_identity,
                 gpu_operation_is_column_separable_for_types,
             },
-            gpu_measurement::{GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare},
+            gpu_measurement::{
+                GpuPreparationRequest, GpuWarmupMeasurementConfig, prepare_gpu_setup,
+            },
+            gpu_runtime::GpuRuntime,
         };
         use mxx_dsl::{DslContext, Ring};
         use mxx_ir_core::ParamEnv;
@@ -354,24 +364,6 @@ mod tests {
             .validate(&ParamEnv::default())
             .unwrap();
         let mut backend = gpu_backend_on([parameters.clone()], [detected_gpu_device_ids()[0]]);
-        let run = |graph: &mxx_ir_core::ValidatedGraph,
-                   backend: &mut super::GpuDcrtBackend,
-                   inputs: BTreeMap<String, RuntimeValue<super::GpuDcrtBackend>>,
-                   store: &mut MemoryArtifactStore,
-                   config: ExecutionConfig| {
-            let prepared = prepare(GpuPreparationRequest {
-                validated: graph.clone(),
-                backend,
-                inputs: &inputs,
-                parameters: std::slice::from_ref(&parameters),
-                default_tile_widths: vec![1, 2, 3, 4, 8],
-                implementation_variant: "runtime-poly-gpu-test".to_owned(),
-                measurement_config: GpuWarmupMeasurementConfig::default(),
-                execution_config: config,
-            })
-            .expect("prepare GPU release graph");
-            prepared.run(backend, inputs, store, [0; 32]).expect("run GPU release graph")
-        };
         for graph in [&generate, &producer, &consumer] {
             let scope = graph.source.root_scope();
             let validated = graph.root_scope();
@@ -404,19 +396,41 @@ mod tests {
                 );
             }
         }
+        let mut runtime = GpuRuntime::new(backend).expect("construct GPU release runtime");
+        let run = |graph: &mxx_ir_core::ValidatedGraph,
+                   runtime: &mut GpuRuntime,
+                   inputs: BTreeMap<String, RuntimeValue<super::GpuDcrtBackend>>,
+                   store: &mut MemoryArtifactStore,
+                   config: ExecutionConfig| {
+            let setup = prepare_gpu_setup(GpuPreparationRequest {
+                validated: graph.clone(),
+                backend: runtime.backend_mut(),
+                inputs: &inputs,
+                parameters: std::slice::from_ref(&parameters),
+                default_tile_widths: vec![1, 2, 3, 4, 8],
+                implementation_variant: "runtime-poly-gpu-test".to_owned(),
+                measurement_config: GpuWarmupMeasurementConfig::default(),
+                execution_config: config,
+            })
+            .expect("prepare GPU release graph");
+            let mut plan = runtime
+                .plan_from_prepared(setup, inputs.clone())
+                .expect("compile GPU release graph");
+            runtime.execute(&mut plan, inputs, store, [0; 32]).expect("run GPU release graph")
+        };
         for release_fence_interval in [None, NonZeroUsize::new(1)] {
             let config = ExecutionConfig { release_fence_interval, ..ExecutionConfig::default() };
             for _ in 0..5 {
                 let mut store = MemoryArtifactStore::default();
                 let mut generated =
-                    run(&generate, &mut backend, BTreeMap::new(), &mut store, config.clone());
+                    run(&generate, &mut runtime, BTreeMap::new(), &mut store, config.clone());
                 let sample = generated.outputs.remove("matrix").unwrap();
                 let RuntimeValue::Matrix(matrix) = &sample else { panic!("resident matrix") };
-                let expected = backend.matrix_to_bytes(matrix);
+                let expected = runtime.backend().matrix_to_bytes(matrix);
                 drop(generated);
                 let mut produced = run(
                     &producer,
-                    &mut backend,
+                    &mut runtime,
                     BTreeMap::from([("matrix".into(), sample)]),
                     &mut store,
                     config.clone(),
@@ -428,7 +442,7 @@ mod tests {
                 // the last intermediate owner into the next execute invocation.
                 let mut consumed = run(
                     &consumer,
-                    &mut backend,
+                    &mut runtime,
                     BTreeMap::from([("matrix".into(), intermediate)]),
                     &mut store,
                     config.clone(),
@@ -440,15 +454,15 @@ mod tests {
                 drop(consumed);
                 drop(store);
                 output.wait_until_ready();
-                assert_eq!(backend.matrix_to_bytes(&output), expected);
+                assert_eq!(runtime.backend().matrix_to_bytes(&output), expected);
             }
         }
         // Context teardown must also own pending releases when a caller discards
         // a result without explicitly waiting for its completion.
         let mut store = MemoryArtifactStore::default();
         let discarded =
-            run(&generate, &mut backend, BTreeMap::new(), &mut store, ExecutionConfig::default());
+            run(&generate, &mut runtime, BTreeMap::new(), &mut store, ExecutionConfig::default());
         drop(discarded);
-        drop(backend);
+        drop(runtime);
     }
 }

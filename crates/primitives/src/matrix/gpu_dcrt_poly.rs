@@ -18,16 +18,15 @@ use crate::{
                 GpuSmallMatrixAllocationReportRaw, GpuSmallMatrixBindingDescriptorRaw,
                 GpuSmallMatrixOpaque, PinnedHostBuffer, bind_family_descriptor_table_live_sources,
                 check_status, gpu_event_set_destroy, gpu_event_set_wait, gpu_matrix_add,
-                gpu_matrix_add_scalar,
-                gpu_matrix_add_block, gpu_matrix_add_row_blocks, gpu_matrix_binary_batch,
-                gpu_matrix_binary_lane_batch_layout, gpu_matrix_binding_component,
-                gpu_matrix_binding_component_count, gpu_matrix_block_mod_switch,
-                gpu_matrix_centered_rebase, gpu_matrix_centered_rebase_prepare,
-                gpu_matrix_centered_rebase_submit, gpu_matrix_centered_round_divide_prepare,
-                gpu_matrix_centered_round_divide_submit, gpu_matrix_copy, gpu_matrix_copy_block,
-                gpu_matrix_copy_block_on_capture_stream, gpu_matrix_copy_block_on_stream,
-                gpu_matrix_copy_peer, gpu_matrix_copy_peer_query, gpu_matrix_create,
-                gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
+                gpu_matrix_add_block, gpu_matrix_add_row_blocks, gpu_matrix_add_scalar,
+                gpu_matrix_binary_batch, gpu_matrix_binary_lane_batch_layout,
+                gpu_matrix_binding_component, gpu_matrix_binding_component_count,
+                gpu_matrix_block_mod_switch, gpu_matrix_centered_rebase,
+                gpu_matrix_centered_rebase_prepare, gpu_matrix_centered_rebase_submit,
+                gpu_matrix_centered_round_divide_prepare, gpu_matrix_centered_round_divide_submit,
+                gpu_matrix_copy, gpu_matrix_copy_block, gpu_matrix_copy_block_on_capture_stream,
+                gpu_matrix_copy_block_on_stream, gpu_matrix_copy_peer, gpu_matrix_copy_peer_query,
+                gpu_matrix_create, gpu_matrix_create_p1_covariance_cache, gpu_matrix_crt_recompose,
                 gpu_matrix_decompose_base, gpu_matrix_decompose_base_small, gpu_matrix_destroy,
                 gpu_matrix_destroy_p1_covariance_cache, gpu_matrix_equal,
                 gpu_matrix_fill_gadget_columns, gpu_matrix_fill_identity_columns,
@@ -6098,10 +6097,7 @@ impl GpuDCRTPolyMatrix {
         scalar: &Self,
         destination: &mut Self,
     ) -> Result<(), GpuNativeGraphError> {
-        if self.params != scalar.params ||
-            self.level != scalar.level ||
-            scalar.size() != (1, 1)
-        {
+        if self.params != scalar.params || self.level != scalar.level || scalar.size() != (1, 1) {
             return Err(GpuNativeGraphError::Native("add_scalar_into shape mismatch".into()));
         }
         self.validate_destination(destination, self.nrow, self.ncol, self.level, self.is_ntt)?;

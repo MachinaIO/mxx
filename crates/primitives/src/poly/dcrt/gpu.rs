@@ -5223,14 +5223,7 @@ impl GpuDCRTPoly {
                 .to_u64()
                 .ok_or_else(|| "GPU scalar coefficient residue does not fit u64".to_owned())?;
         }
-        let mut inner = GpuDCRTPolyMatrix::new_empty_with_state(
-            params,
-            1,
-            1,
-            level,
-            false,
-            None,
-        );
+        let mut inner = GpuDCRTPolyMatrix::new_empty_with_state(params, 1, 1, level, false, None);
         let bytes = unsafe {
             std::slice::from_raw_parts(
                 flat.as_ptr() as *const u8,

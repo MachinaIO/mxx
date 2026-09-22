@@ -9388,12 +9388,11 @@ impl GpuDcrtBackend {
             ));
         };
         let destination_size = destination.size();
-        let Some((destination_shard_index, destination_shard)) =
-            destination
-                .shards
-                .iter_mut()
-                .enumerate()
-                .find(|(_, shard)| shard.device_id == physical_device)
+        let Some((destination_shard_index, destination_shard)) = destination
+            .shards
+            .iter_mut()
+            .enumerate()
+            .find(|(_, shard)| shard.device_id == physical_device)
         else {
             return Err(GpuCaptureAdapterError::UnsupportedOperation(
                 "matrix accumulate capture has no output shard on the capture device".into(),
@@ -9488,16 +9487,16 @@ impl GpuDcrtBackend {
             let left_is_scalar = left.size() == (1, 1);
             let right_is_scalar = right.size() == (1, 1);
             let scalar_product = left_is_scalar || right_is_scalar;
-            let descriptor_product = !scalar_product &&
-                left.rows <= 4 &&
-                right.columns <= 4 &&
-                left.columns <= 16;
+            let descriptor_product =
+                !scalar_product && left.rows <= 4 && right.columns <= 4 && left.columns <= 16;
             let left_shard = left.shards.iter().find(|shard| {
                 shard.device_id == physical_device &&
-                if left_is_scalar || right_is_scalar {
+                    if left_is_scalar || right_is_scalar {
                         (left_is_scalar && left.size() == (1, 1)) ||
-                            (right_is_scalar && shard.global_column_start == output_start &&
-                                shard.global_column_start + shard.value.col_size() == output_end)
+                            (right_is_scalar &&
+                                shard.global_column_start == output_start &&
+                                shard.global_column_start + shard.value.col_size() ==
+                                    output_end)
                     } else {
                         shard.global_column_start == 0 && shard.value.size() == left.size()
                     }
@@ -9506,12 +9505,14 @@ impl GpuDcrtBackend {
                 shard.device_id == physical_device &&
                     if right_is_scalar || left_is_scalar {
                         (right_is_scalar && right.size() == (1, 1)) ||
-                            (left_is_scalar && shard.global_column_start == output_start &&
-                                shard.global_column_start + shard.value.col_size() == output_end)
+                            (left_is_scalar &&
+                                shard.global_column_start == output_start &&
+                                shard.global_column_start + shard.value.col_size() ==
+                                    output_end)
                     } else {
                         shard.global_column_start == output_start &&
                             shard.global_column_start + shard.value.col_size() == output_end
-                }
+                    }
             });
             let assembled_right = if right_shard.is_some() || right_is_scalar {
                 None
@@ -9547,9 +9548,8 @@ impl GpuDcrtBackend {
                     let mut next_column = output_start;
                     for shard in &source_shards {
                         let start = output_start.max(shard.global_column_start);
-                        let end = output_end.min(
-                            shard.global_column_start + shard.value.col_size(),
-                        );
+                        let end =
+                            output_end.min(shard.global_column_start + shard.value.col_size());
                         if start != next_column {
                             return Err(GpuCaptureAdapterError::UnsupportedOperation(
                                 "matrix accumulate RHS shards are not contiguous over the output tile"
@@ -9586,9 +9586,8 @@ impl GpuDcrtBackend {
                     })?;
                     for shard in &source_shards {
                         let start = output_start.max(shard.global_column_start);
-                        let end = output_end.min(
-                            shard.global_column_start + shard.value.col_size(),
-                        );
+                        let end =
+                            output_end.min(shard.global_column_start + shard.value.col_size());
                         let source_component = shard
                             .value
                             .binding_components()?
@@ -9602,7 +9601,8 @@ impl GpuDcrtBackend {
                             })?;
                         if source_component.limb_count != limbs as usize {
                             return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                                "matrix accumulate RHS shard limb layout differs from output".into(),
+                                "matrix accumulate RHS shard limb layout differs from output"
+                                    .into(),
                             ));
                         }
                         let source_binding = source_binding(
@@ -9642,145 +9642,146 @@ impl GpuDcrtBackend {
             };
             let assembled_right_data_binding =
                 assembled_right.as_ref().map(|(_, data_binding, _)| *data_binding);
-            let assembled_right_descriptor_binding = assembled_right
-                .as_ref()
-                .and_then(|(_, _, descriptor_binding)| *descriptor_binding);
+            let assembled_right_descriptor_binding =
+                assembled_right.as_ref().and_then(|(_, _, descriptor_binding)| *descriptor_binding);
             let assembled_left = if left_shard.is_some() || left_is_scalar {
                 None
             } else {
                 Some((|| -> Result<_, GpuCaptureAdapterError> {
-                // Matrix-matrix accumulation replicates the complete left
-                // operand on each output device.  A caller may provide that
-                // operand as several resident column shards, so assemble a
-                // graph-owned contiguous copy and refresh it from every
-                // source shard on each replay.
-                let left_target_start = if right_is_scalar { output_start } else { 0 };
-                let left_target_end = if right_is_scalar { output_end } else { left.columns };
-                let mut source_shards = left
-                    .shards
-                    .iter()
-                    .filter(|shard| {
-                        shard.device_id == physical_device &&
-                            shard.global_column_start < left_target_end &&
-                            shard.global_column_start + shard.value.col_size() > left_target_start
-                    })
-                    .collect::<Vec<_>>();
-                source_shards.sort_by_key(|shard| shard.global_column_start);
-                if source_shards.is_empty() ||
-                    source_shards.first().is_some_and(|shard| {
-                        shard.global_column_start.max(left_target_start) != left_target_start
-                    })
-                {
-                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                        "matrix accumulate LHS has no resident source shards on capture device"
-                            .into(),
-                    ));
-                }
-                let first = source_shards[0];
-                let level = first.value.level();
-                if !source_shards.iter().all(|shard| {
-                    shard.value.is_ntt() &&
-                        shard.value.level() == level &&
-                        shard.value.size().0 == left.rows
-                }) {
-                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                        "matrix accumulate LHS shards have incompatible domains".into(),
-                    ));
-                }
-                let mut next_column = left_target_start;
-                for shard in &source_shards {
-                    let start = left_target_start.max(shard.global_column_start);
-                    let shard_end = shard
-                        .global_column_start
-                        .checked_add(shard.value.col_size())
-                        .ok_or_else(|| {
-                            GpuCaptureAdapterError::UnsupportedOperation(
-                                "matrix accumulate LHS shard range overflows".into(),
-                            )
-                        })?;
-                    let end = left_target_end.min(shard_end);
-                    if start != next_column {
-                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                            "matrix accumulate LHS shards are not contiguous".into(),
-                        ));
-                    }
-                    next_column = end;
-                }
-                if next_column != left_target_end {
-                    return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                        "matrix accumulate LHS shards do not cover the complete operand".into(),
-                    ));
-                }
-                let params = first.value.params().clone();
-                let mut assembled = GpuMatrixOutputDescriptor::for_shape(
-                    &params,
-                    left.rows,
-                    left_target_end - left_target_start,
-                    level,
-                    true,
-                )
-                .map_err(GpuCaptureAdapterError::UnsupportedOperation)?
-                .allocate();
-                let data_binding = capture.claim_binding_range(1)?;
-                let descriptor_binding = if descriptor_product {
-                    Some(capture.claim_binding_range(1)?)
-                } else {
-                    None
-                };
-                let limbs = u32::try_from(level + 1).map_err(|_| {
-                    GpuCaptureAdapterError::UnsupportedOperation(
-                        "matrix accumulate LHS limb count exceeds capture ABI".into(),
-                    )
-                })?;
-                for shard in &source_shards {
-                    let source_component = shard
-                        .value
-                        .binding_components()?
-                        .into_iter()
-                        .find(|component| component.physical_device == physical_device)
-                        .ok_or_else(|| {
-                            GpuCaptureAdapterError::UnsupportedOperation(
-                                "matrix accumulate LHS shard has no capture-device allocation"
-                                    .into(),
-                            )
-                        })?;
-                    if source_component.limb_count != limbs as usize {
-                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
-                            "matrix accumulate LHS shard limb layout differs from output".into(),
-                        ));
-                    }
-                    let source_binding = source_binding(
-                        source_component.data_address,
-                        source_component.data_bytes,
-                    )?;
-                    let mappings = (0..limbs)
-                        .map(|limb| (limb, data_binding))
-                        .chain((0..limbs).map(|limb| (limbs + limb, source_binding)))
+                    // Matrix-matrix accumulation replicates the complete left
+                    // operand on each output device.  A caller may provide that
+                    // operand as several resident column shards, so assemble a
+                    // graph-owned contiguous copy and refresh it from every
+                    // source shard on each replay.
+                    let left_target_start = if right_is_scalar { output_start } else { 0 };
+                    let left_target_end = if right_is_scalar { output_end } else { left.columns };
+                    let mut source_shards = left
+                        .shards
+                        .iter()
+                        .filter(|shard| {
+                            shard.device_id == physical_device &&
+                                shard.global_column_start < left_target_end &&
+                                shard.global_column_start + shard.value.col_size() >
+                                    left_target_start
+                        })
                         .collect::<Vec<_>>();
-                    capture.set_binding_map(&mappings)?;
-                    shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
-                    let start = left_target_start.max(shard.global_column_start);
-                    let shard_end = shard
-                        .global_column_start
-                        .checked_add(shard.value.col_size())
-                        .ok_or_else(|| {
-                            GpuCaptureAdapterError::UnsupportedOperation(
-                                "matrix accumulate LHS shard range overflows".into(),
-                            )
-                        })?;
-                    let end = left_target_end.min(shard_end);
-                    shard.value.copy_columns_into_on_capture_stream(
-                        &mut assembled,
-                        start - shard.global_column_start,
-                        start - left_target_start,
-                        end - start,
-                        capture_stream,
-                        limbs,
-                        0,
-                    )?;
-                }
-                let assembled_ref = assembled.clone_shallow();
-                self.capture_resources.push(Arc::new(assembled_ref));
+                    source_shards.sort_by_key(|shard| shard.global_column_start);
+                    if source_shards.is_empty() ||
+                        source_shards.first().is_some_and(|shard| {
+                            shard.global_column_start.max(left_target_start) != left_target_start
+                        })
+                    {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS has no resident source shards on capture device"
+                                .into(),
+                        ));
+                    }
+                    let first = source_shards[0];
+                    let level = first.value.level();
+                    if !source_shards.iter().all(|shard| {
+                        shard.value.is_ntt() &&
+                            shard.value.level() == level &&
+                            shard.value.size().0 == left.rows
+                    }) {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS shards have incompatible domains".into(),
+                        ));
+                    }
+                    let mut next_column = left_target_start;
+                    for shard in &source_shards {
+                        let start = left_target_start.max(shard.global_column_start);
+                        let shard_end = shard
+                            .global_column_start
+                            .checked_add(shard.value.col_size())
+                            .ok_or_else(|| {
+                                GpuCaptureAdapterError::UnsupportedOperation(
+                                    "matrix accumulate LHS shard range overflows".into(),
+                                )
+                            })?;
+                        let end = left_target_end.min(shard_end);
+                        if start != next_column {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate LHS shards are not contiguous".into(),
+                            ));
+                        }
+                        next_column = end;
+                    }
+                    if next_column != left_target_end {
+                        return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS shards do not cover the complete operand".into(),
+                        ));
+                    }
+                    let params = first.value.params().clone();
+                    let mut assembled = GpuMatrixOutputDescriptor::for_shape(
+                        &params,
+                        left.rows,
+                        left_target_end - left_target_start,
+                        level,
+                        true,
+                    )
+                    .map_err(GpuCaptureAdapterError::UnsupportedOperation)?
+                    .allocate();
+                    let data_binding = capture.claim_binding_range(1)?;
+                    let descriptor_binding = if descriptor_product {
+                        Some(capture.claim_binding_range(1)?)
+                    } else {
+                        None
+                    };
+                    let limbs = u32::try_from(level + 1).map_err(|_| {
+                        GpuCaptureAdapterError::UnsupportedOperation(
+                            "matrix accumulate LHS limb count exceeds capture ABI".into(),
+                        )
+                    })?;
+                    for shard in &source_shards {
+                        let source_component = shard
+                            .value
+                            .binding_components()?
+                            .into_iter()
+                            .find(|component| component.physical_device == physical_device)
+                            .ok_or_else(|| {
+                                GpuCaptureAdapterError::UnsupportedOperation(
+                                    "matrix accumulate LHS shard has no capture-device allocation"
+                                        .into(),
+                                )
+                            })?;
+                        if source_component.limb_count != limbs as usize {
+                            return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                                "matrix accumulate LHS shard limb layout differs from output"
+                                    .into(),
+                            ));
+                        }
+                        let source_binding = source_binding(
+                            source_component.data_address,
+                            source_component.data_bytes,
+                        )?;
+                        let mappings = (0..limbs)
+                            .map(|limb| (limb, data_binding))
+                            .chain((0..limbs).map(|limb| (limbs + limb, source_binding)))
+                            .collect::<Vec<_>>();
+                        capture.set_binding_map(&mappings)?;
+                        shard.value.wait_compiled_inputs(physical_device, capture_stream, true)?;
+                        let start = left_target_start.max(shard.global_column_start);
+                        let shard_end = shard
+                            .global_column_start
+                            .checked_add(shard.value.col_size())
+                            .ok_or_else(|| {
+                                GpuCaptureAdapterError::UnsupportedOperation(
+                                    "matrix accumulate LHS shard range overflows".into(),
+                                )
+                            })?;
+                        let end = left_target_end.min(shard_end);
+                        shard.value.copy_columns_into_on_capture_stream(
+                            &mut assembled,
+                            start - shard.global_column_start,
+                            start - left_target_start,
+                            end - start,
+                            capture_stream,
+                            limbs,
+                            0,
+                        )?;
+                    }
+                    let assembled_ref = assembled.clone_shallow();
+                    self.capture_resources.push(Arc::new(assembled_ref));
                     Ok((assembled, data_binding, descriptor_binding))
                 })()?)
             };
@@ -9857,7 +9858,8 @@ impl GpuDcrtBackend {
                 (right_component.data_address, right_component.data_bytes)
             };
             let left_binding = if descriptor_product {
-                assembled_left_descriptor_binding.unwrap_or(source_binding(left_address, left_bytes)?)
+                assembled_left_descriptor_binding
+                    .unwrap_or(source_binding(left_address, left_bytes)?)
             } else {
                 assembled_left_data_binding.unwrap_or(source_binding(left_address, left_bytes)?)
             };

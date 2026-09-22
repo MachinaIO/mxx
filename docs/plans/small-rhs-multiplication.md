@@ -193,11 +193,7 @@ no leading zero byte.  The payload follows with exactly
 `coefficient_count * (1 + magnitude_bytes)` bytes under the linear index above.
 The payload need not carry modulus data: the decoder uses the complete expected
 concrete schema and does not recompute modulus products, NTT parameters,
-relation facts, content hashes, or bounds.
-The artifact layer hashes exactly this header plus payload (including
-dimensions and bound) when a public content hash is required; any content-hash
-verification remains the existing artifact-store check and is not repeated by
-the codec.  Public hashes remain allowed and private hashes remain forbidden.
+relation facts, or bounds.
 CPU store/load and
 GPU store/load must produce identical canonical bytes and reject malformed
 input before allocating a large destination.  `encode_artifact` passes the
@@ -627,14 +623,14 @@ its gate, and records the exact result for the next daily review.
    lwe_lookup,naive_vec,public_key,slot_operation,tall_encoding,
    wee25_commitment,wee25_opening,wee25_public_parameters}.rs`,
    `crates/gadgets/src/input_injector.rs`, and
-   `crates/we/src/diamond/{graph,estimate,estimate_gpu}.rs`.  Replace `.as_mat()` at
+   `crates/we/src/diamond/graph.rs`.  Replace `.as_mat()` at
    each actual small-RHS consumer with `mul_small_rhs`; preserve ordinary
    matrix operations where the RHS is not bounded.  Update application
    artifact declarations and family imports rather than adding adapters.
-7. **Estimator/benchmarks:** `crates/bench-estimator/src/{lib.rs,gpu.rs,
-   harness.rs}`, primitive benches, and owning WE estimators.  Measure the same
-   one-call production path, compact RHS bytes, exact `L*K*W*N` workspace, and
-   full-output persistence; remove estimates that count Preimage as full DCRT.
+7. **Warmup/benchmarks:** runtime GPU warmup, primitive benches, and owning
+   application integrations. Measure the same one-call production path, compact
+   RHS bytes, exact `L*K*W*N` workspace, and full-output persistence; remove
+   reports that count Preimage as full DCRT.
 
 ## Validation matrix and review gates
 

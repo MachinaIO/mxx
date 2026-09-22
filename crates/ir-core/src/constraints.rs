@@ -125,6 +125,13 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         label: format!("{prefix}: gadget base must exceed one"),
                     })
                 }
+                NodeKind::CenteredRoundDivide { divisor } => {
+                    positive(
+                        &mut constraints,
+                        divisor,
+                        format!("{prefix}: centered round divisor"),
+                    );
+                }
                 NodeKind::Slice { rows, columns } => {
                     for (axis, range) in [("row", rows), ("column", columns)] {
                         if let Some(range) = range {
@@ -209,6 +216,20 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                 NodeKind::PolynomialValues { .. } |
                 NodeKind::SubgraphCall(_) |
                 NodeKind::FamilyGetDynamic => {}
+                NodeKind::BlockModSwitch { modulus, plaintext_modulus, .. } => {
+                    constraints.push(ParamConstraint::IntGreaterThan {
+                        left: modulus.clone(),
+                        right: IntExpr::constant(1),
+                        label: format!(
+                            "{prefix}: block modulus switch destination must exceed one"
+                        ),
+                    });
+                    positive(
+                        &mut constraints,
+                        plaintext_modulus,
+                        format!("{prefix}: block modulus switch correction factor"),
+                    );
+                }
             }
         }
     }

@@ -2,13 +2,13 @@
 
 The GPU-only integration targets in `crates/fhe/tests` exercise production DSL
 execution, key generation, encryption, evaluation, and decryption. They require
-the `gpu` feature and a working CUDA device. Parameter and security calculations
-run on the host; polynomial cryptography uses the GPU backend without a CPU
-fallback. Existing unit tests remain separate.
+the `gpu` feature and a working CUDA device. Parameter calculations run on the
+host; polynomial cryptography uses the GPU backend without a CPU fallback.
+Existing unit tests remain separate.
 
 ## Correctness contracts
 
-`gpu_bgv_round_trip` encrypts two independently sampled batching-slot vectors,
+`gpu_bgv` encrypts two independently sampled batching-slot vectors,
 multiplies the ciphertexts, relinearizes with the Hybrid evaluation key, and drops
 one CRT limb by default. It verifies every slot after each stage, including the
 fresh ciphertexts. The product must equal the slotwise product modulo `t`. It also
@@ -24,7 +24,7 @@ For each stage at modulus `Q_level`, the test requires
 and measures coefficient noise from the actual decryption phase. The measured
 maximum must not exceed the tracked bound `E`.
 
-`gpu_ring_gsw_round_trip` encrypts `X^a` as a Ring-Regev ciphertext and a constant
+`gpu_ring_gsw` encrypts `X^a` as a Ring-Regev ciphertext and a constant
 bit `b` as a Ring-GSW ciphertext, where `a` is sampled from `[0, 2N)`. It applies
 external product and compares all decrypted coefficients with `b X^a` in
 `Z[X]/(X^N + 1)`. Both bits are mandatory, with a third independently sampled bit
@@ -46,7 +46,7 @@ native torus and truncated decomposition.
 Both `crates/fhe/src/utils.rs` and integration `tests/utils.rs` derive the default
 error cutoff from the existing primitive helper
 `hard_cutoff_from_sigma_bound`: `floor(6.5 * sigma)`. The same cutoff feeds
-sampling and correctness bounds. Security estimation uses the specified sigma.
+sampling and correctness bounds.
 
 ## Parameters and overrides
 
@@ -80,8 +80,6 @@ security and correctness are checked using the actual generated parameters.
 | `FHE_TEST_CRT_BITS` | Ring-GSW generated prime width; default 60 |
 | `FHE_TEST_CRT_DEPTH` | Ring-GSW generated prime count; default 1 |
 | `FHE_TEST_SCALE` | Ring-GSW integer Delta; default `floor(Q / (4N))` |
-| `FHE_TEST_SECURITY_BITS` | Optional minimum in the selected estimator cost model; default 0 (report only) |
-| `FHE_TEST_ESTIMATOR_MODE` | `rough` (default, matching the CLI) or explicit `exact` |
 | `FHE_BENCH_REPEATS` | Positive timing-sample count; default 100 |
 
 Manifest values override the selected BGV profile; explicit environment settings
@@ -90,56 +88,12 @@ or plaintext differences, so such overrides cannot silently produce a matched
 comparison. Inputs in an existing manifest are reused exactly; generating a new
 manifest uses fresh randomness, not a fixed seed.
 
-## Security estimator and cache
-
-`lattice-estimator-cli` and its Sage runtime must be available on `PATH`. Missing
-executables and failed estimates are errors. By default the test reports bits
-without imposing a numeric security threshold. An explicit positive
-`FHE_TEST_SECURITY_BITS` enforces a minimum in the named estimator cost model. BGV evaluates both Q and the actual evaluation-key modulus QP; Ring-GSW
-evaluates Q. Requests use the actual ring dimension, secret distribution, sigma,
-and unlimited-sample assumption. The two estimator modes use different attack
-sets and cost models, not merely different numerical precision:
-
-| Mode | Cost model | Attack set |
-| --- | --- | --- |
-| `rough` | ADPS16 / Core-SVP | `usvp`, `dual_hybrid`; conditional `arora-gb` |
-| `exact` | MATZOV (estimator default) | `arora-gb`, `bkw`, `usvp`, `bdd`, `bdd_hybrid`, `bdd_mitm_hybrid`, `dual`, `dual_hybrid` |
-
-The reports separately include PhantomFHE's pinned
-[HE Standard-derived ternary classical-128 table](https://github.com/encryptorion-lab/phantom-fhe/blob/1f4a198443b3af77118e51f53d5b8f332154b875/include/host/hestdparms.h).
-At `N = 8192`, its modulus limit is 218 bits. Both published BGV profiles have
-218-bit QP and match that table's nominal ternary/sigma-3.2 parameter conditions.
-Because the compared implementations use identical N/Q/P, the same table
-classification and nominal estimator request apply to both. The actual Phantom
-error-distribution difference is recorded separately below.
-
-A result of 94 bits under rough ADPS16/Core-SVP for `bgv-54` QP is not a
-contradiction of the HE Standard-derived classical-128 table classification.
-These are different security models. The report names both and keeps their
-results in separate fields.
-A table mismatch, such as a binary-secret Ring-GSW request, is recorded as a
-parameter mismatch rather than assigning that request a table-based security
-rating.
-
-The local estimator versions used for this work are:
-
-- CLI: `2d2980ddf7fba0d1fee407999fbb9adf26bf3368`.
-- Estimator: `e35f45b7976a90a79c3c6625a45bbc344c1abc67`.
-
-Every report records the detected revisions and estimator stdout/stderr. Cached
-estimates live in `test_data/fhe-round-trip/security`. The cache key includes the
-actual modulus, dimension, distributions, estimator mode, sample assumption, and
-both revisions. A cache hit requires the exact same request and known revisions.
-The requested security threshold is still checked when reading a cached result.
-Security bits are computational estimates; the correctness inequalities are
-separate obligations.
-
 ## Reproduce measurements
 
 Build integration targets once in release mode:
 
 ```bash
-cargo test -r -p mxx-fhe --features gpu --test gpu_bgv_round_trip --test gpu_ring_gsw_round_trip --no-run
+cargo test -r -p mxx-fhe --features gpu --test gpu_bgv --test gpu_ring_gsw --no-run
 ```
 
 Use the two exact executable paths printed by this command as `bgv_binary` and
@@ -160,24 +114,12 @@ mkdir -p test_data/fhe-round-trip/phantom
 "$phantom_checkout/build/bin/phantom_gpu_bgv" 36 test_data/fhe-round-trip/phantom/mxx-phantom-36.json 100 manifest-only
 ```
 
-Run the same plaintexts and parameter bases through each library. The BGV
-commands explicitly select rough ADPS16/Core-SVP estimates and a zero minimum
-threshold **within that estimator model**, while still computing and reporting
-those estimates. They retain the published parameters and their separate
-HE Standard-derived classical-128 classification. The `bgv-54` rough results are
-144 bits for Q and 94 bits for QP. Omitting the overrides selects the same
-`rough` mode and report-only threshold by default. `FHE_TEST_ESTIMATOR_MODE=exact`
-explicitly requests the full MATZOV-based estimator. No MATZOV result is inferred
-from a rough result. The Ring-GSW default has a rough estimate of 96 bits; this
-is reported with its binary-secret model, without assigning the ternary-table
-classification.
-
 ```bash
 CUDA_VISIBLE_DEVICES=0 "$phantom_checkout/build/bin/phantom_gpu_bgv" 54 test_data/fhe-round-trip/phantom/mxx-phantom-54.json 100 > test_data/fhe-round-trip/phantom/54-result.json 2> test_data/fhe-round-trip/phantom/54-summary.log
 CUDA_VISIBLE_DEVICES=0 "$phantom_checkout/build/bin/phantom_gpu_bgv" 36 test_data/fhe-round-trip/phantom/mxx-phantom-36.json 100 > test_data/fhe-round-trip/phantom/36-result.json 2> test_data/fhe-round-trip/phantom/36-summary.log
-CUDA_VISIBLE_DEVICES=0 FHE_TEST_ESTIMATOR_MODE=rough FHE_TEST_SECURITY_BITS=0 FHE_TEST_MANIFEST=test_data/fhe-round-trip/phantom/mxx-phantom-54.json FHE_BENCH_REPEATS=100 "$bgv_binary" --exact test_gpu_bgv_round_trip --nocapture
-CUDA_VISIBLE_DEVICES=0 FHE_TEST_ESTIMATOR_MODE=rough FHE_TEST_SECURITY_BITS=0 FHE_TEST_MANIFEST=test_data/fhe-round-trip/phantom/mxx-phantom-36.json FHE_BENCH_REPEATS=100 "$bgv_binary" --exact test_gpu_bgv_round_trip --nocapture
-CUDA_VISIBLE_DEVICES=0 FHE_BENCH_REPEATS=100 "$ring_binary" --exact test_gpu_ring_gsw_round_trip --nocapture
+CUDA_VISIBLE_DEVICES=0 FHE_TEST_MANIFEST=test_data/fhe-round-trip/phantom/mxx-phantom-54.json FHE_BENCH_REPEATS=100 "$bgv_binary" --exact test_gpu_bgv --nocapture
+CUDA_VISIBLE_DEVICES=0 FHE_TEST_MANIFEST=test_data/fhe-round-trip/phantom/mxx-phantom-36.json FHE_BENCH_REPEATS=100 "$bgv_binary" --exact test_gpu_bgv --nocapture
+CUDA_VISIBLE_DEVICES=0 FHE_BENCH_REPEATS=100 "$ring_binary" --exact test_gpu_ring_gsw --nocapture
 ```
 
 Repeat each identical mxx command 3–5 times and retain all logs and `FHE_REPORT=`
@@ -188,9 +130,12 @@ A dirty working tree must be identified when associating measurements with code.
 
 ## Timing and comparison scope
 
-mxx measures host elapsed time around production `execute`, GPU-resident output
-retrieval, and result-event completion. This includes runtime dispatch and
-operation allocations. Measured graphs keep their inputs and outputs on the
+mxx first performs the canonical measured warmup for each graph, freezes the
+resulting plan, and measures host elapsed time around the prepared production
+`run`, GPU-resident output retrieval, and result-event completion. This includes
+runtime dispatch and operation allocations. The same prepared value supplies a
+pure `GpuWarmupReport`; protocol predicted time is the sum of the reports for
+its prepared steps, with no reporting-only GPU execution. Measured graphs keep their inputs and outputs on the
 GPU; output serialization, transfers, and persisted-artifact round trips are
 excluded to match the Phantom measurement boundary. A backend release fence
 before starting the timer completes deferred cleanup from the preceding
@@ -204,8 +149,8 @@ remain queued after a default execution returns, and errors arising only during
 reclamation may be observed at a later explicit release fence. Persisted-output timings
 from earlier development runs are excluded from the primary comparison.
 Graph construction/validation, input generation, key generation, encryption,
-decryption, and correctness diagnostics are outside evaluation timing. A warmup
-precedes each series. mxx does not currently expose an aggregate CUDA-event time
+decryption, and correctness diagnostics are outside evaluation timing. The
+prepared plan is reused for every sample in a series. mxx does not currently expose an aggregate CUDA-event time
 for this runtime path: report `gpu_event_seconds` is null, not an estimate.
 
 PhantomFHE measures both host completion and CUDA-event elapsed time around its
@@ -551,7 +496,7 @@ The working tree reduces allocation and dispatch overhead for BGV multiplication
 ### Implementation
 
 - **Tensor row sums.** The runtime recognizes a Tensor whose consumers are all covered by one eligible row-sum plan. It captures both operands at the original Tensor position and evaluates the selected tensor rows directly, avoiding the materialized tensor and separate row-sum allocation. Traced execution, an exported or retained tensor, mixed consumers, and multiple plans sharing the tensor retain the original tensor boundary. Argument materialization order, original node progress and liveness processing, and output staging remain intact. See [runtime planning and dispatch](../crates/runtime/src/executor.rs), [generic matrix interface](../crates/primitives/src/matrix/mod.rs), and [CUDA arithmetic](../crates/primitives/cuda/src/matrix/MatrixArith.cu).
-- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/gpu_test_utils.rs).
+- **Independent calibration.** The fused operation has its own canonical identity covering both operand types, output type, and ordered row groups. The FHE test helper registers explicit output-column capacities for that identity. Production calibration does not borrow another operation's measured profile. See [calibration identities](../crates/runtime/src/gpu_calibration.rs), [cached operation preparation](../crates/runtime/src/executor/gpu_plan.rs), and [GPU fixture calibration](../crates/fhe/src/utils.rs).
 - **One allocation for data and auxiliary storage.** Each matrix partition allocates its coefficient data, aligned auxiliary pointer slots, and device descriptors together. The data buffer owns the allocation; the auxiliary pointer is a non-owning interior view. Accounting includes alignment padding, while peer copies retain the logical coefficient-data size and exclude auxiliary pointers. Existing completion dependencies protect the single asynchronous free. See [matrix allocation and destruction](../crates/primitives/cuda/src/matrix/MatrixData.cu).
 - **Less repeated host work.** The guarded root plan stores resolved argument WireRefs. Singleton execution borrows batch metadata instead of allocating singleton vectors and cloning parameter bindings; its calibration dispatch also avoids allocating group/index vectors. Private scratch production identity is initialized only when a streamed family is registered, once per execution. Public production identity remains unchanged. See [executor](../crates/runtime/src/executor.rs).
 - **Reuse of an existing completion event.** The grouped arithmetic path can supply its already-recorded output completion to consumer tracking, avoiding redundant temporary event records. Source producer-stream joins and source lifetime protection remain in place; this does not introduce a matrix allocation cache. See [consumer tracking](../crates/primitives/cuda/src/matrix/MatrixUtils.cu) and [grouped arithmetic dispatch](../crates/primitives/cuda/src/matrix/MatrixArith.cu).

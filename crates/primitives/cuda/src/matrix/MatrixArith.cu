@@ -1,8 +1,85 @@
 #include <cudaTypedefs.h>
+#include <cstddef>
+#include <initializer_list>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace
 {
+    // Launch-site schema helpers.  The native graph adapter only retains
+    // fields explicitly listed here; this is intentionally verbose so
+    // pointer fields embedded in by-value metadata and pointer tables cannot
+    // be mistaken for immutable scalar launch data.
+    MxxGraphPatch graph_kernel_pointer_patch(
+        uint32_t argument_index,
+        size_t byte_offset,
+        uint32_t binding_index,
+        size_t byte_count = sizeof(void *))
+    {
+        MxxGraphPatch patch{};
+        patch.node = nullptr;
+        patch.target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+        patch.argument_index = argument_index;
+        patch.byte_offset = static_cast<uint32_t>(byte_offset);
+        patch.byte_count = static_cast<uint32_t>(byte_count);
+        patch.binding_index = binding_index;
+        patch.address_addend = 0;
+        return patch;
+    }
+
+    int register_kernel_pointer_fields(
+        GpuContext *ctx,
+        cudaStream_t stream,
+        const size_t *argument_sizes,
+        size_t argument_count,
+        const MxxGraphPatch *patches,
+        size_t patch_count)
+    {
+        return mxx_graph_register_kernel_update_for_stream(
+            ctx,
+            reinterpret_cast<void *>(stream),
+            argument_sizes,
+            argument_count,
+            patches,
+            patch_count);
+    }
+
+    template <typename Metadata>
+    int register_all_limb_pointer_fields(
+        GpuContext *ctx,
+        cudaStream_t stream,
+        const size_t *argument_sizes,
+        size_t argument_count,
+        std::initializer_list<std::pair<size_t, size_t>> fields,
+        size_t limb_count,
+        uint32_t binding_base,
+        uint32_t binding_stride = 1)
+    {
+        std::vector<MxxGraphPatch> patches;
+        patches.reserve(fields.size() * limb_count);
+        uint32_t binding = binding_base;
+        for (const auto &[field_offset, stride] : fields)
+        {
+            for (size_t limb = 0; limb < limb_count; ++limb)
+            {
+                patches.push_back(graph_kernel_pointer_patch(
+                    0,
+                    field_offset + limb * stride,
+                    binding,
+                    sizeof(void *)));
+                if (binding_stride != 0) binding += binding_stride;
+            }
+        }
+        return mxx_graph_register_kernel_update_for_stream(
+            ctx,
+            reinterpret_cast<void *>(stream),
+            argument_sizes,
+            argument_count,
+            patches.data(),
+            patches.size());
+    }
+
     enum class BlockOp
     {
         Add,
@@ -113,7 +190,11 @@ namespace
 
     struct RowSumMetadata
     {
-        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *source;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *sources[16];
+        size_t source_columns[16];
+        size_t source_starts[16];
+        size_t widths[16];
+        size_t destination_starts[16];
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
         size_t indices[kArithMetadataLimbs];
         uint64_t moduli[kArithMetadataLimbs];
@@ -126,21 +207,27 @@ namespace
     __global__ void sum_rows_all_limbs_kernel(RowSumMetadata metadata, size_t cols, size_t count, size_t n)
     {
         const size_t limb = blockIdx.z;
-        const auto source = metadata.source[metadata.indices[limb]];
+        const size_t fragment = blockIdx.y;
+        const size_t width = metadata.widths[fragment];
+        const auto source = metadata.sources[fragment][metadata.indices[limb]];
         const auto out = metadata.out[metadata.indices[limb]];
         for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-             index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
+             index < count * width; index += static_cast<size_t>(gridDim.x) * blockDim.x)
         {
             const size_t poly = index / n;
-            const size_t row = poly / cols;
-            const size_t col = poly % cols;
+            const size_t row = poly / width;
+            const size_t col = poly % width;
             const size_t coefficient = index % n;
             uint64_t sum = 0;
             for (size_t term = metadata.offsets[row]; term < metadata.offsets[row + 1]; ++term)
                 sum = add_mod_u64(sum, matrix_load_limb_u64(source.base,
-                    metadata.rows[term] * cols + col, coefficient, source.stride, source.width),
+                    metadata.rows[term] * metadata.source_columns[fragment] +
+                        metadata.source_starts[fragment] + col,
+                    coefficient, source.stride, source.width),
                     metadata.moduli[limb]);
-            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width, sum);
+            matrix_store_limb_u64(out.base,
+                row * cols + metadata.destination_starts[fragment] + col,
+                coefficient, out.stride, out.width, sum);
         }
     }
 
@@ -149,7 +236,11 @@ namespace
     {
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *blocks[kRowAddMaxBlocks];
         size_t rows[kRowAddMaxBlocks];
-        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs[kRowAddMaxBlocks];
+        size_t lhs_columns[kRowAddMaxBlocks], rhs_columns[kRowAddMaxBlocks];
+        size_t lhs_column[kRowAddMaxBlocks], rhs_row[kRowAddMaxBlocks], rhs_column[kRowAddMaxBlocks];
+        size_t destination_row[kRowAddMaxBlocks], destination_column[kRowAddMaxBlocks];
+        size_t widths[kRowAddMaxBlocks];
         const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out;
         size_t indices[kArithMetadataLimbs];
         uint64_t moduli[kArithMetadataLimbs];
@@ -162,21 +253,29 @@ namespace
     {
         const size_t limb = blockIdx.z;
         const size_t descriptor = metadata.indices[limb];
-        const auto rhs = metadata.rhs[descriptor];
+        const size_t fragment = blockIdx.y;
+        const auto rhs = metadata.rhs[fragment][descriptor];
+        const auto lhs = metadata.blocks[fragment][descriptor];
         const auto out = metadata.out[descriptor];
+        const size_t width = metadata.widths[fragment];
+        count = metadata.rows[fragment] * width * n;
         for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
              index < count; index += static_cast<size_t>(gridDim.x) * blockDim.x)
         {
             const size_t poly = index / n;
             const size_t coefficient = index % n;
-            size_t row = poly / cols;
-            size_t block = 0;
-            while (row >= metadata.rows[block]) row -= metadata.rows[block++];
-            const auto lhs = metadata.blocks[block][descriptor];
-            const uint64_t a = matrix_load_limb_u64(lhs.base, row * cols + poly % cols,
+            const size_t row = poly / width;
+            const size_t column = poly % width;
+            const uint64_t a = matrix_load_limb_u64(lhs.base,
+                row * metadata.lhs_columns[fragment] + metadata.lhs_column[fragment] + column,
                                                   coefficient, lhs.stride, lhs.width);
-            const uint64_t b = matrix_load_limb_u64(rhs.base, poly, coefficient, rhs.stride, rhs.width);
-            matrix_store_limb_u64(out.base, poly, coefficient, out.stride, out.width,
+            const uint64_t b = matrix_load_limb_u64(rhs.base,
+                (row + metadata.rhs_row[fragment]) * metadata.rhs_columns[fragment] +
+                    metadata.rhs_column[fragment] + column, coefficient, rhs.stride, rhs.width);
+            matrix_store_limb_u64(out.base,
+                (row + metadata.destination_row[fragment]) * cols +
+                    metadata.destination_column[fragment] + column,
+                coefficient, out.stride, out.width,
                                  add_mod_u64(a, b, metadata.moduli[limb]));
         }
     }
@@ -248,11 +347,6 @@ namespace
         DescriptorProductMetadata product;
         size_t rows[32];
         size_t offsets[17];
-        uint8_t *output_base;
-        size_t output_stride;
-        size_t output_offsets[kArithMetadataLimbs];
-        uint8_t output_widths[kArithMetadataLimbs];
-        bool initialize_output_descriptors;
         GpuBarrettReciprocal reciprocals[kArithMetadataLimbs];
     };
     static_assert(sizeof(TensorRowSumMetadata) + 5 * sizeof(size_t) <= 4096,
@@ -267,16 +361,7 @@ namespace
         const size_t descriptor = metadata.product.indices[limb];
         const auto lhs = metadata.product.lhs[descriptor];
         const auto rhs = metadata.product.rhs[descriptor];
-        // Deferred output descriptors cannot be read by this launch: another
-        // block may not have written them yet. Arithmetic uses by-value layout.
-        const auto out = metadata.initialize_output_descriptors
-            ? GpuMatrix::SharedLimbBuffer::DeviceDescriptor{
-                metadata.output_base + metadata.output_offsets[limb],
-                metadata.output_stride, metadata.output_widths[limb]}
-            : metadata.product.out[descriptor];
-        if (metadata.initialize_output_descriptors && blockIdx.x == 0 &&
-            blockIdx.y == 0 && threadIdx.x == 0)
-            metadata.product.out[descriptor] = out;
+        const auto out = metadata.product.out[descriptor];
         const uint64_t modulus = metadata.product.moduli[limb];
         const auto reciprocal = metadata.reciprocals[limb];
         const size_t cols = lhs_cols * rhs_cols;
@@ -317,10 +402,149 @@ namespace
         }
     }
 
+    constexpr size_t kTensorRowSumMaxOutputs = 16;
+    struct TensorRowSumBatchMetadata
+    {
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *lhs;
+        const GpuMatrix::SharedLimbBuffer::DeviceDescriptor *rhs;
+        GpuMatrix::SharedLimbBuffer::DeviceDescriptor *out[kTensorRowSumMaxOutputs];
+        size_t indices[kArithMetadataLimbs];
+        uint64_t moduli[kArithMetadataLimbs];
+        size_t rows[32];
+        size_t offsets[17];
+        size_t output_offsets[17];
+        GpuBarrettReciprocal reciprocals[kArithMetadataLimbs];
+    };
+    static_assert(sizeof(TensorRowSumBatchMetadata) + 6 * sizeof(size_t) <= 4096,
+                  "batched tensor row sum exceeds portable CUDA parameter budget");
+
+    template <bool SeparatePolynomials>
+    __global__ void tensor_sum_rows_batch_all_limbs_kernel(
+        TensorRowSumBatchMetadata metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n, size_t output_count)
+    {
+        const size_t limb = blockIdx.z;
+        const size_t descriptor = metadata.indices[limb];
+        const auto lhs = metadata.lhs[descriptor];
+        const auto rhs = metadata.rhs[descriptor];
+        const uint64_t modulus = metadata.moduli[limb];
+        const auto reciprocal = metadata.reciprocals[limb];
+        const size_t cols = lhs_cols * rhs_cols;
+        const size_t thread = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+        if constexpr (SeparatePolynomials)
+            if (thread >= n) return;
+        const size_t end = SeparatePolynomials ? poly_count : poly_count * n;
+        const size_t step = SeparatePolynomials ? gridDim.y :
+            static_cast<size_t>(gridDim.x) * blockDim.x;
+        for (size_t work = SeparatePolynomials ? blockIdx.y : thread; work < end; work += step)
+        {
+            const size_t flat_poly = SeparatePolynomials ? work : work / n;
+            const size_t group = flat_poly / cols;
+            const size_t column = flat_poly % cols;
+            size_t output = 0;
+            while (output + 1 < output_count && group >= metadata.output_offsets[output + 1])
+                ++output;
+            const size_t output_row = group - metadata.output_offsets[output];
+            const size_t coefficient = SeparatePolynomials ? thread : work % n;
+            unsigned __int128 sum = 0;
+            for (size_t term = metadata.offsets[group]; term < metadata.offsets[group + 1]; ++term)
+            {
+                const size_t row = metadata.rows[term];
+                const uint64_t a = matrix_load_limb_u64(lhs.base,
+                    (row / rhs_rows) * lhs_cols + column / rhs_cols,
+                    coefficient, lhs.stride, lhs.width);
+                const uint64_t b = matrix_load_limb_u64(rhs.base,
+                    (row % rhs_rows) * rhs_cols + column % rhs_cols,
+                    coefficient, rhs.stride, rhs.width);
+                unsigned __int128 product = static_cast<unsigned __int128>(a) * b;
+                if (~static_cast<unsigned __int128>(0) - sum < product)
+                {
+                    sum = matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi);
+                    product = matrix_reduce_barrett_u128(product, modulus, reciprocal.lo, reciprocal.hi);
+                }
+                sum += product;
+            }
+            const auto out = metadata.out[output][descriptor];
+            matrix_store_limb_u64(out.base, output_row * cols + column, coefficient,
+                                 out.stride, out.width,
+                                 matrix_reduce_barrett_u128(sum, modulus, reciprocal.lo, reciprocal.hi));
+        }
+    }
+
+    template <bool SeparatePolynomials>
+    int launch_tensor_row_sum_batch_driver(
+        TensorRowSumBatchMetadata &metadata, size_t lhs_cols, size_t rhs_rows,
+        size_t rhs_cols, size_t poly_count, size_t n, size_t output_count, dim3 grid,
+        cudaStream_t stream, GpuContext *ctx)
+    {
+        thread_local void *launch_entry = nullptr;
+        thread_local void *context_id_entry = nullptr;
+        if (!launch_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuLaunchKernel", &launch_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!launch_entry) return set_error("cuLaunchKernel entry point unavailable");
+        }
+        if (!context_id_entry)
+        {
+            const cudaError_t error = cudaGetDriverEntryPointByVersion(
+                "cuCtxGetId", &context_id_entry, 12000, cudaEnableLegacyStream);
+            if (error != cudaSuccess) return set_error(error);
+            if (!context_id_entry) return set_error("cuCtxGetId entry point unavailable");
+        }
+        unsigned long long context_id = 0;
+        CUresult result = reinterpret_cast<PFN_cuCtxGetId_v12000>(context_id_entry)(
+            nullptr, &context_id);
+        if (result != CUDA_SUCCESS) return set_error("cuCtxGetId failed");
+        thread_local unsigned long long cached_context_id = 0;
+        thread_local cudaFunction_t function = nullptr;
+        if (!function || cached_context_id != context_id)
+        {
+            cudaFunction_t resolved = nullptr;
+            const cudaError_t error = cudaGetFuncBySymbol(&resolved,
+                reinterpret_cast<const void *>(tensor_sum_rows_batch_all_limbs_kernel<SeparatePolynomials>));
+            if (error != cudaSuccess) return set_error(error);
+            function = resolved;
+            cached_context_id = context_id;
+        }
+        void *arguments[] = {
+            &metadata, &lhs_cols, &rhs_rows, &rhs_cols, &poly_count, &n, &output_count,
+        };
+        result = reinterpret_cast<PFN_cuLaunchKernel_v4000>(launch_entry)(
+            reinterpret_cast<CUfunction>(function), grid.x, grid.y, grid.z,
+            256, 1, 1, 0, reinterpret_cast<CUstream>(stream), arguments, nullptr);
+        if (result != CUDA_SUCCESS)
+        {
+            cudaStreamSynchronize(stream);
+            return set_error(("cuLaunchKernel failed: " + std::to_string(result)).c_str());
+        }
+        const size_t argument_sizes[] = {
+            sizeof(TensorRowSumBatchMetadata), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        };
+        std::vector<MxxGraphPatch> patches;
+        patches.reserve(2 + output_count);
+        patches.push_back(graph_kernel_pointer_patch(
+            0, offsetof(TensorRowSumBatchMetadata, lhs), 0));
+        patches.push_back(graph_kernel_pointer_patch(
+            0, offsetof(TensorRowSumBatchMetadata, rhs), 1));
+        for (size_t output = 0; output < output_count; ++output)
+            patches.push_back(graph_kernel_pointer_patch(
+                0, offsetof(TensorRowSumBatchMetadata, out) +
+                    output * sizeof(TensorRowSumBatchMetadata::out[0]),
+                static_cast<uint32_t>(2 + output)));
+        const int registration_status = register_kernel_pointer_fields(
+            ctx, stream, argument_sizes, std::size(argument_sizes), patches.data(), patches.size());
+        if (registration_status != 0) return registration_status;
+        return 0;
+    }
+
     template <bool SeparatePolynomials>
     int launch_tensor_row_sum_driver(
         TensorRowSumMetadata &metadata, size_t lhs_cols, size_t rhs_rows,
-        size_t rhs_cols, size_t poly_count, size_t n, dim3 grid, cudaStream_t stream)
+        size_t rhs_cols, size_t poly_count, size_t n, dim3 grid, cudaStream_t stream,
+        GpuContext *ctx)
     {
         thread_local void *launch_entry = nullptr;
         thread_local void *context_id_entry = nullptr;
@@ -366,6 +590,36 @@ namespace
             cudaStreamSynchronize(stream);
             return set_error(("cuLaunchKernel failed: " + std::to_string(result)).c_str());
         }
+        const size_t argument_sizes[] = {
+            sizeof(TensorRowSumMetadata),
+            sizeof(size_t),
+            sizeof(size_t),
+            sizeof(size_t),
+            sizeof(size_t),
+            sizeof(size_t),
+        };
+        const MxxGraphPatch patches[] = {
+            graph_kernel_pointer_patch(
+                0,
+                offsetof(TensorRowSumMetadata, product) + offsetof(DescriptorProductMetadata, lhs),
+                0),
+            graph_kernel_pointer_patch(
+                0,
+                offsetof(TensorRowSumMetadata, product) + offsetof(DescriptorProductMetadata, rhs),
+                1),
+            graph_kernel_pointer_patch(
+                0,
+                offsetof(TensorRowSumMetadata, product) + offsetof(DescriptorProductMetadata, out),
+                2),
+        };
+        const int registration_status = register_kernel_pointer_fields(
+            ctx,
+            stream,
+            argument_sizes,
+            std::size(argument_sizes),
+            patches,
+            std::size(patches));
+        if (registration_status != 0) return registration_status;
         return 0;
     }
 
@@ -427,22 +681,11 @@ namespace
                             1, static_cast<unsigned int>(limb_count));
             if (rows)
             {
+                if (!out->descriptors_initialized)
+                    return set_error("tensor row sum requires initialized output descriptors");
                 TensorRowSumMetadata grouped{};
                 grouped.product = metadata;
                 std::copy_n(lhs->ctx->barrett_reciprocals.data(), limb_count, grouped.reciprocals);
-                grouped.initialize_output_descriptors = !out->descriptors_initialized;
-                if (grouped.initialize_output_descriptors)
-                {
-                    const auto &buffer = out->shared_limb_buffers[out->ctx->limb_gpu_ids[0].x];
-                    grouped.output_base = buffer.ptr;
-                    grouped.output_stride = buffer.bytes_per_poly;
-                    for (size_t limb = 0; limb < limb_count; ++limb)
-                    {
-                        const size_t local = metadata.indices[limb];
-                        grouped.output_offsets[limb] = buffer.limb_offsets_bytes[local];
-                        grouped.output_widths[limb] = buffer.limb_coeff_bytes[local];
-                    }
-                }
                 std::copy_n(rows, term_count, grouped.rows);
                 std::copy_n(offsets, group_count + 1, grouped.offsets);
                 const size_t poly_count = out->rows * out->cols;
@@ -452,14 +695,16 @@ namespace
                         static_cast<unsigned int>(std::min(poly_count, size_t{65535})),
                         static_cast<unsigned int>(limb_count));
                     status = launch_tensor_row_sum_driver<true>(
-                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grouped_grid, stream);
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grouped_grid, stream,
+                        lhs->ctx);
                     if (status != 0) return status;
                 }
                 else
                 {
                     // Pack tiny polynomials together to retain full thread blocks.
                     status = launch_tensor_row_sum_driver<false>(
-                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grid, stream);
+                        grouped, lhs->cols, rhs->rows, rhs->cols, poly_count, n, grid, stream,
+                        lhs->ctx);
                     if (status != 0) return status;
                 }
             }
@@ -467,6 +712,19 @@ namespace
             {
                 tensor_all_limbs_kernel<<<grid, 256, 0, stream>>>(
                     metadata, lhs->cols, rhs->rows, rhs->cols, count, n);
+                const size_t argument_sizes[] = {
+                    sizeof(DescriptorProductMetadata),
+                    sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+                };
+                const MxxGraphPatch patches[] = {
+                    graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, lhs), 0),
+                    graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, rhs), 1),
+                    graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, out), 2),
+                };
+                status = register_kernel_pointer_fields(
+                    lhs->ctx, stream, argument_sizes, std::size(argument_sizes), patches,
+                    std::size(patches));
+                if (status != 0) return status;
             }
         }
         else
@@ -475,6 +733,19 @@ namespace
                             static_cast<unsigned int>(rhs->cols), static_cast<unsigned int>(limb_count));
             small_dot_all_limbs_kernel<<<grid, 256, 0, stream>>>(
                 metadata, lhs->rows, lhs->cols, rhs->cols, n);
+            const size_t argument_sizes[] = {
+                sizeof(DescriptorProductMetadata),
+                sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            };
+            const MxxGraphPatch patches[] = {
+                graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, lhs), 0),
+                graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, rhs), 1),
+                graph_kernel_pointer_patch(0, offsetof(DescriptorProductMetadata, out), 2),
+            };
+            status = register_kernel_pointer_fields(
+                lhs->ctx, stream, argument_sizes, std::size(argument_sizes), patches,
+                std::size(patches));
+            if (status != 0) return status;
         }
         const cudaError_t error = cudaGetLastError();
         if (error != cudaSuccess) return set_error(error);
@@ -834,7 +1105,8 @@ namespace
         size_t n,
         BlockOp op,
         cudaStream_t stream,
-        int rhs_is_scalar)
+        int rhs_is_scalar,
+        GpuContext *ctx)
     {
         if (!lhs_bases || !rhs_bases || !out_bases ||
             !lhs_stride_bytes || !rhs_stride_bytes || !out_stride_bytes ||
@@ -872,6 +1144,23 @@ namespace
             n,
             static_cast<int>(op),
             rhs_is_scalar);
+        const size_t argument_sizes[] = {
+            sizeof(BlockElementwiseMetadata),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(int), sizeof(int),
+        };
+        const int registration_status = register_all_limb_pointer_fields<BlockElementwiseMetadata>(
+            ctx,
+            stream,
+            argument_sizes,
+            std::size(argument_sizes),
+            {
+                {offsetof(BlockElementwiseMetadata, lhs_bases), sizeof(const uint8_t *)},
+                {offsetof(BlockElementwiseMetadata, rhs_bases), sizeof(const uint8_t *)},
+                {offsetof(BlockElementwiseMetadata, out_bases), sizeof(uint8_t *)},
+            },
+            limb_count,
+            0);
+        if (registration_status != 0) return registration_status;
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -897,7 +1186,8 @@ namespace
         uint64_t modulus,
         cudaStream_t stream,
         const GpuMatrix *,
-        const dim3 *)
+        const dim3 *,
+        GpuContext *ctx)
     {
         if (!lhs_base || !rhs_base || !out_base)
         {
@@ -968,6 +1258,33 @@ namespace
                 modulus);
         }
 
+        const MxxGraphPatch patches[] = {
+            graph_kernel_pointer_patch(0, 0, 0),
+            graph_kernel_pointer_patch(1, 0, 1),
+            graph_kernel_pointer_patch(2, 0, 2),
+        };
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+        };
+        const size_t thin_argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+            sizeof(uint64_t), sizeof(bool),
+        };
+        const int registration_status = register_kernel_pointer_fields(
+            ctx,
+            stream,
+            use_thin_row_kernel ? thin_argument_sizes : argument_sizes,
+            use_thin_row_kernel ? std::size(thin_argument_sizes) : std::size(argument_sizes),
+            patches,
+            std::size(patches));
+        if (registration_status != 0) return registration_status;
+
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -993,7 +1310,10 @@ namespace
         size_t dst_col,
         size_t copy_rows,
         size_t copy_cols,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *ctx,
+        uint32_t source_binding_base = UINT32_MAX,
+        uint32_t destination_binding_base = UINT32_MAX)
     {
         if (!src_bases || !dst_bases || !src_stride_bytes || !dst_stride_bytes ||
             !src_coeff_bytes || !dst_coeff_bytes)
@@ -1035,6 +1355,50 @@ namespace
             src_col,
             dst_row,
             dst_col);
+        const size_t argument_sizes[] = {
+            sizeof(BlockCopyMetadata),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t),
+        };
+        if (matrix_stream_is_capturing(stream) &&
+            (source_binding_base == UINT32_MAX || destination_binding_base == UINT32_MAX))
+        {
+            return set_error("capture copy requires source and destination binding bases");
+        }
+        if (source_binding_base != UINT32_MAX || destination_binding_base != UINT32_MAX)
+        {
+            if ((source_binding_base != UINT32_MAX &&
+                 source_binding_base > UINT32_MAX - static_cast<uint32_t>(limb_count - 1)) ||
+                (destination_binding_base != UINT32_MAX &&
+                 destination_binding_base > UINT32_MAX - static_cast<uint32_t>(limb_count - 1)))
+            {
+                return set_error("capture copy binding base overflows limb range");
+            }
+            std::vector<MxxGraphPatch> patches;
+            patches.reserve(2 * limb_count);
+            for (size_t limb = 0; limb < limb_count; ++limb)
+            {
+                if (source_binding_base != UINT32_MAX)
+                    patches.push_back(graph_kernel_pointer_patch(
+                        0,
+                        offsetof(BlockCopyMetadata, src_bases) + limb * sizeof(const uint8_t *),
+                        source_binding_base + static_cast<uint32_t>(limb)));
+                if (destination_binding_base != UINT32_MAX)
+                    patches.push_back(graph_kernel_pointer_patch(
+                        0,
+                        offsetof(BlockCopyMetadata, dst_bases) + limb * sizeof(uint8_t *),
+                        destination_binding_base + static_cast<uint32_t>(limb)));
+            }
+            const int registration_status = register_kernel_pointer_fields(
+                ctx,
+                stream,
+                argument_sizes,
+                std::size(argument_sizes),
+                patches.data(),
+                patches.size());
+            if (registration_status != 0) return registration_status;
+        }
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1061,7 +1425,8 @@ namespace
         size_t dst_col,
         size_t add_rows,
         size_t add_cols,
-        cudaStream_t stream)
+        cudaStream_t stream,
+        GpuContext *ctx)
     {
         if (!src_bases || !dst_bases || !src_stride_bytes || !dst_stride_bytes ||
             !src_coeff_bytes || !dst_coeff_bytes || !moduli)
@@ -1104,6 +1469,24 @@ namespace
             src_col,
             dst_row,
             dst_col);
+        const size_t argument_sizes[] = {
+            sizeof(BlockAddMetadata),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t),
+        };
+        const int registration_status = register_all_limb_pointer_fields<BlockAddMetadata>(
+            ctx,
+            stream,
+            argument_sizes,
+            std::size(argument_sizes),
+            {
+                {offsetof(BlockAddMetadata, src_bases), sizeof(const uint8_t *)},
+                {offsetof(BlockAddMetadata, dst_bases), sizeof(uint8_t *)},
+            },
+            limb_count,
+            0);
+        if (registration_status != 0) return registration_status;
         const cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1408,7 +1791,8 @@ namespace
             modulus,
             stream,
             out,
-            &limb_id);
+            &limb_id,
+            out->ctx);
         if (status != 0)
         {
             return status;
@@ -1434,7 +1818,8 @@ namespace
         size_t count,
         size_t n,
         int level,
-        BlockOp op)
+        BlockOp op,
+        bool rhs_is_scalar)
     {
         if constexpr (!std::is_same_v<T, uint64_t>)
         {
@@ -1451,6 +1836,21 @@ namespace
         if (!lhs || !rhs || !out || !lhs->ctx)
         {
             return set_error("invalid matrix arguments in launch_matrix_elementwise_all_limbs");
+        }
+        if (rhs_is_scalar)
+        {
+            if (rhs->rows != 1 || rhs->cols != 1)
+            {
+                return set_error("scalar RHS required in launch_matrix_elementwise_all_limbs");
+            }
+        }
+        else if (lhs->rows != rhs->rows || lhs->cols != rhs->cols)
+        {
+            return set_error("size mismatch in launch_matrix_elementwise_all_limbs");
+        }
+        if (out->rows != lhs->rows || out->cols != lhs->cols)
+        {
+            return set_error("output size mismatch in launch_matrix_elementwise_all_limbs");
         }
 
         const size_t limb_count = static_cast<size_t>(level + 1);
@@ -1554,25 +1954,27 @@ namespace
             return set_error("invalid dispatch metadata in launch_matrix_elementwise_all_limbs");
         }
 
+        // Matrix streams are redirected to the active capture stream by
+        // matrix_limb_stream.  Capture stream order already joins the
+        // operands, so recording ordinary cross-stream waits/events here
+        // would ask CUDA to import uncaptured work into the graph and yields
+        // cudaErrorInvalidValue.  Keep the normal dependency bookkeeping for
+        // replay and ordinary execution below.
+        const bool capture_dispatch = matrix_stream_is_capturing(dispatch_stream);
+
         cudaError_t err = cudaSetDevice(dispatch_device);
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
-        if (status != 0)
+        if (!capture_dispatch)
         {
-            return status;
-        }
-        status = matrix_wait_all_limb_streams(rhs, dispatch_device, dispatch_stream, false, true);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_wait_all_limb_streams(lhs, dispatch_device, dispatch_stream, false, true);
+            if (status != 0) return status;
+            status = matrix_wait_all_limb_streams(rhs, dispatch_device, dispatch_stream, false, true);
+            if (status != 0) return status;
+            status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
         }
 
         status = launch_block_kernel_all_limbs(
@@ -1591,26 +1993,21 @@ namespace
             n,
             op,
             dispatch_stream,
-            0);
+            rhs_is_scalar ? 1 : 0,
+            lhs->ctx);
         if (status != 0)
         {
             return status;
         }
 
-        status = matrix_track_all_limb_consumers(lhs, dispatch_device, dispatch_stream);
-        if (status != 0)
+        if (!capture_dispatch)
         {
-            return status;
-        }
-        status = matrix_track_all_limb_consumers(rhs, dispatch_device, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_record_all_limb_writes(out, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_track_all_limb_consumers(lhs, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
+            status = matrix_track_all_limb_consumers(rhs, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
+            status = matrix_record_all_limb_writes(out, dispatch_stream);
+            if (status != 0) return status;
         }
 
         return 0;
@@ -1794,7 +2191,8 @@ namespace
             n,
             BlockOp::Mul,
             dispatch_stream,
-            1);
+            1,
+            lhs->ctx);
         if (status != 0)
         {
             return status;
@@ -1832,7 +2230,10 @@ namespace
         size_t src_cols,
         size_t dst_cols,
         size_t n,
-        int level)
+        int level,
+        cudaStream_t override_stream = nullptr,
+        uint32_t source_binding_base = UINT32_MAX,
+        uint32_t destination_binding_base = UINT32_MAX)
     {
         if constexpr (!std::is_same_v<T, uint64_t>)
         {
@@ -1928,9 +2329,23 @@ namespace
             src_bases[limb_idx] = src_base;
             dst_bases[limb_idx] = dst_base;
         }
+        if (override_stream)
+            dispatch_stream = override_stream;
         if (dispatch_device < 0 || !dispatch_stream)
         {
             return set_error("invalid dispatch metadata in launch_copy_for_all_limbs");
+        }
+
+        // A synchronous matrix copy can be reached while the owning graph
+        // stream is capturing.  Capture stream order already carries the
+        // producer/consumer dependency; attempting to replay the ordinary
+        // cross-stream event waits here is an invalid CUDA capture operation.
+        // Treat that stream as the explicit capture route for synchronization
+        // purposes; the launch-site registration below still records the
+        // pointer schema for replay.
+        if (!override_stream && matrix_stream_is_capturing(dispatch_stream))
+        {
+            override_stream = dispatch_stream;
         }
 
         cudaError_t err = cudaSetDevice(dispatch_device);
@@ -1938,15 +2353,12 @@ namespace
         {
             return set_error(err);
         }
-        status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
-        if (status != 0)
+        if (!override_stream)
         {
-            return status;
-        }
-        status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_wait_all_limb_streams(src, dispatch_device, dispatch_stream, false, true);
+            if (status != 0) return status;
+            status = matrix_wait_all_limb_streams(out, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
         }
 
         status = launch_copy_kernel_all_limbs(
@@ -1966,21 +2378,18 @@ namespace
             dst_col,
             copy_rows,
             copy_cols,
-            dispatch_stream);
-        if (status != 0)
-        {
-            return status;
-        }
+            dispatch_stream,
+            src->ctx,
+            source_binding_base,
+            destination_binding_base);
+        if (status != 0) return status;
 
-        status = matrix_track_all_limb_consumers(src, dispatch_device, dispatch_stream);
-        if (status != 0)
+        if (!override_stream)
         {
-            return status;
-        }
-        status = matrix_record_all_limb_writes(out, dispatch_stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_track_all_limb_consumers(src, dispatch_device, dispatch_stream);
+            if (status != 0) return status;
+            status = matrix_record_all_limb_writes(out, dispatch_stream);
+            if (status != 0) return status;
         }
 
         return 0;
@@ -2140,7 +2549,8 @@ namespace
             dst_col,
             add_rows,
             add_cols,
-            dispatch_stream);
+            dispatch_stream,
+            src->ctx);
         if (status != 0)
         {
             return status;
@@ -2349,12 +2759,70 @@ extern "C" int gpu_matrix_add(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         count,
         static_cast<size_t>(N),
         level,
-        BlockOp::Add);
+        BlockOp::Add,
+        false);
     if (status != 0)
     {
         return status;
     }
 
+    out->format = lhs->format;
+    return 0;
+}
+
+extern "C" int gpu_matrix_add_scalar(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
+{
+    if (!out || !lhs || !rhs)
+    {
+        return set_error("invalid gpu_matrix_add_scalar arguments");
+    }
+    if (rhs->rows != 1 || rhs->cols != 1)
+    {
+        return set_error("scalar RHS required in gpu_matrix_add_scalar");
+    }
+    if (out->rows != lhs->rows || out->cols != lhs->cols)
+    {
+        return set_error("output size mismatch in gpu_matrix_add_scalar");
+    }
+    if (lhs->ctx != rhs->ctx || lhs->ctx != out->ctx || lhs->level != rhs->level ||
+        lhs->level != out->level)
+    {
+        return set_error("context mismatch in gpu_matrix_add_scalar");
+    }
+    if (!lhs->ctx)
+    {
+        return set_error("null context in gpu_matrix_add_scalar");
+    }
+
+    const size_t count = lhs->rows * lhs->cols;
+    if (count == 0)
+    {
+        out->format = lhs->format;
+        return 0;
+    }
+    const int level = lhs->level;
+    if (level < 0)
+    {
+        return set_error("invalid level in gpu_matrix_add_scalar");
+    }
+    const int N = lhs->ctx->N;
+    if (N <= 0)
+    {
+        out->format = lhs->format;
+        return 0;
+    }
+    if (lhs->ctx->limb_gpu_ids.size() < static_cast<size_t>(level + 1) ||
+        lhs->ctx->moduli.size() < static_cast<size_t>(level + 1))
+    {
+        return set_error("unexpected limb metadata in gpu_matrix_add_scalar");
+    }
+
+    const int status = launch_matrix_elementwise_all_limbs<uint64_t>(
+        out, lhs, rhs, count, static_cast<size_t>(N), level, BlockOp::Add, true);
+    if (status != 0)
+    {
+        return status;
+    }
     out->format = lhs->format;
     return 0;
 }
@@ -2491,7 +2959,8 @@ extern "C" int gpu_matrix_sub(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
         count,
         static_cast<size_t>(N),
         level,
-        BlockOp::Sub);
+        BlockOp::Sub,
+        false);
     if (status != 0)
     {
         return status;
@@ -2552,6 +3021,17 @@ extern "C" int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source)
                     1, static_cast<unsigned int>(limb_count));
     transpose_all_limbs_kernel<<<grid, 256, 0, stream>>>(
         metadata, source->rows, source->cols, count, n);
+    const size_t argument_sizes[] = {
+        sizeof(TransposeMetadata), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+    };
+    const MxxGraphPatch patches[] = {
+        graph_kernel_pointer_patch(0, offsetof(TransposeMetadata, source), 0),
+        graph_kernel_pointer_patch(0, offsetof(TransposeMetadata, out), 1),
+    };
+    status = register_kernel_pointer_fields(
+        source->ctx, stream, argument_sizes, std::size(argument_sizes), patches,
+        std::size(patches));
+    if (status != 0) return status;
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) return set_error(error);
     status = matrix_track_all_limb_consumers(source, device, stream);
@@ -2560,16 +3040,44 @@ extern "C" int gpu_matrix_transpose(GpuMatrix *out, const GpuMatrix *source)
 }
 
 extern "C" int gpu_matrix_sum_rows(
-    GpuMatrix *out, const GpuMatrix *source, const size_t *rows, const size_t *offsets,
+    GpuMatrix *out, const GpuMatrix *const *sources, const size_t *source_starts,
+    const size_t *widths, const size_t *destination_starts, size_t source_count,
+    const size_t *rows, const size_t *offsets,
     size_t group_count, size_t term_count)
 {
+    if (!sources || !source_starts || !widths || !destination_starts ||
+        source_count == 0 || source_count > 16)
+        return set_error("invalid row sum fragments");
+    const GpuMatrix *source = sources[0];
     if (!out || !source || !source->ctx || out->ctx != source->ctx || source->level < 0 ||
         out->level != source->level || out->format != source->format ||
-        out->rows != group_count || out->cols != source->cols || !rows || !offsets ||
+        out->rows != group_count || !rows || !offsets ||
         group_count == 0 || group_count > 16 || term_count == 0 || term_count > 32 ||
         offsets[0] != 0 || offsets[group_count] != term_count)
         return set_error("invalid gpu_matrix_sum_rows arguments");
     RowSumMetadata metadata{};
+    size_t max_width = 0;
+    for (size_t fragment = 0; fragment < source_count; ++fragment)
+    {
+        const auto *input = sources[fragment];
+        if (!input || input->ctx != source->ctx || input->level != source->level ||
+            input->format != source->format || input->rows != source->rows ||
+            (widths[fragment] == 0 && (input->cols != 0 || out->cols != 0)) ||
+            source_starts[fragment] > input->cols ||
+            widths[fragment] > input->cols - source_starts[fragment] ||
+            destination_starts[fragment] > out->cols ||
+            widths[fragment] > out->cols - destination_starts[fragment])
+            return set_error("invalid row sum fragment range");
+        for (size_t previous = 0; previous < fragment; ++previous)
+            if (destination_starts[fragment] < destination_starts[previous] + widths[previous] &&
+                destination_starts[previous] < destination_starts[fragment] + widths[fragment])
+                return set_error("overlapping row sum destination fragments");
+        metadata.source_columns[fragment] = input->cols;
+        metadata.source_starts[fragment] = source_starts[fragment];
+        metadata.widths[fragment] = widths[fragment];
+        metadata.destination_starts[fragment] = destination_starts[fragment];
+        max_width = std::max(max_width, widths[fragment]);
+    }
     for (size_t group = 0; group < group_count; ++group)
     {
         if (offsets[group] >= offsets[group + 1] || offsets[group + 1] > term_count)
@@ -2596,63 +3104,116 @@ extern "C" int gpu_matrix_sum_rows(
     for (size_t limb = 0; limb < limb_count; ++limb)
     {
         const dim3 id = source->ctx->limb_gpu_ids[limb];
-        if (id.x >= source->shared_limb_buffers.size() || id.x >= out->shared_limb_buffers.size())
+        if (id.x >= out->shared_limb_buffers.size())
             return set_error("invalid row sum partition");
-        const auto &input = source->shared_limb_buffers[id.x];
         const auto &output = out->shared_limb_buffers[id.x];
-        if (!input.device_descriptors || !output.device_descriptors || id.y >= input.limb_count ||
-            id.y >= output.limb_count || input.device != output.device)
+        if (!output.device_descriptors || id.y >= output.limb_count)
             return set_error("invalid row sum descriptors");
         if (limb == 0)
         {
             device = output.device;
-            metadata.source = input.device_descriptors;
             metadata.out = output.device_descriptors;
             const cudaError_t error = cudaSetDevice(device);
             if (error != cudaSuccess) return set_error(error);
         }
-        else if (device != output.device || metadata.source != input.device_descriptors ||
-                 metadata.out != output.device_descriptors)
+        else if (device != output.device || metadata.out != output.device_descriptors)
             return set_error("row sum descriptors span partitions");
+        for (size_t fragment = 0; fragment < source_count; ++fragment)
+        {
+            if (id.x >= sources[fragment]->shared_limb_buffers.size())
+                return set_error("invalid row sum source partition");
+            const auto &input = sources[fragment]->shared_limb_buffers[id.x];
+            if (!input.device_descriptors || id.y >= input.limb_count || input.device != device)
+                return set_error("invalid row sum source descriptors");
+            if (limb == 0) metadata.sources[fragment] = input.device_descriptors;
+            else if (metadata.sources[fragment] != input.device_descriptors)
+                return set_error("row sum source descriptors span partitions");
+        }
         metadata.indices[limb] = id.y;
         metadata.moduli[limb] = source->ctx->moduli[limb];
     }
-    status = matrix_wait_all_limb_streams(source, device, stream, false, true);
-    if (status != 0) return status;
+    for (size_t fragment = 0; fragment < source_count; ++fragment)
+    {
+        status = matrix_wait_all_limb_streams(sources[fragment], device, stream, false, true);
+        if (status != 0) return status;
+    }
     status = matrix_wait_all_limb_streams(out, device, stream);
     if (status != 0) return status;
-    const size_t count = out->rows * out->cols * n;
-    const size_t blocks = count / 256 + (count % 256 != 0);
+    const size_t count = out->rows * n;
+    const size_t max_count = count * max_width;
+    const size_t blocks = max_count / 256 + (max_count % 256 != 0);
     const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
-                    1, static_cast<unsigned int>(limb_count));
-    sum_rows_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, source->cols, count, n);
+                    static_cast<unsigned int>(source_count), static_cast<unsigned int>(limb_count));
+    sum_rows_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, out->cols, count, n);
+    const size_t argument_sizes[] = {
+        sizeof(RowSumMetadata), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+    };
+    std::vector<MxxGraphPatch> patches;
+    for (size_t fragment = 0; fragment < source_count; ++fragment)
+        patches.push_back(graph_kernel_pointer_patch(0,
+            offsetof(RowSumMetadata, sources) + fragment * sizeof(void *), fragment));
+    patches.push_back(graph_kernel_pointer_patch(0, offsetof(RowSumMetadata, out), source_count));
+    status = register_kernel_pointer_fields(
+        source->ctx, stream, argument_sizes, std::size(argument_sizes), patches.data(), patches.size());
+    if (status != 0) return status;
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) return set_error(error);
-    status = matrix_track_all_limb_consumers(source, device, stream);
-    if (status != 0) return status;
+    for (size_t fragment = 0; fragment < source_count; ++fragment)
+    {
+        status = matrix_track_all_limb_consumers(sources[fragment], device, stream);
+        if (status != 0) return status;
+    }
     return matrix_record_all_limb_writes(out, stream);
 }
 
 extern "C" int gpu_matrix_add_row_blocks(
-    GpuMatrix *out, const GpuMatrix *const *lhs_blocks, size_t block_count, const GpuMatrix *rhs)
+    GpuMatrix *out, const MxxRowAddFragment *fragments, size_t block_count)
 {
-    if (!out || !rhs || !rhs->ctx || !lhs_blocks || block_count == 0 || block_count > kRowAddMaxBlocks ||
+    if (!fragments || block_count == 0 || block_count > kRowAddMaxBlocks)
+        return set_error("invalid row block add fragments");
+    const auto *rhs = fragments[0].rhs;
+    if (!out || !rhs || !rhs->ctx ||
         out->ctx != rhs->ctx || out->level != rhs->level || rhs->level < 0 ||
-        out->rows != rhs->rows || out->cols != rhs->cols || rhs->format != GPU_POLY_FORMAT_EVAL)
+        out->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
         return set_error("invalid gpu_matrix_add_row_blocks arguments");
     RowBlockAddMetadata metadata{};
-    size_t total_rows = 0;
+    size_t max_polynomials = 0;
     for (size_t block = 0; block < block_count; ++block)
     {
-        const auto *matrix = lhs_blocks[block];
+        const auto &fragment = fragments[block];
+        const auto *matrix = fragment.lhs;
+        const auto *right = fragment.rhs;
         if (!matrix || matrix->ctx != rhs->ctx || matrix->level != rhs->level ||
-            matrix->format != GPU_POLY_FORMAT_EVAL || matrix->cols != rhs->cols ||
-            matrix->rows > std::numeric_limits<size_t>::max() - total_rows)
+            matrix->format != GPU_POLY_FORMAT_EVAL || !right || right->ctx != rhs->ctx ||
+            right->level != rhs->level || right->format != GPU_POLY_FORMAT_EVAL ||
+            fragment.rows == 0 || fragment.columns == 0 || fragment.rows > matrix->rows ||
+            fragment.lhs_column > matrix->cols || fragment.columns > matrix->cols - fragment.lhs_column ||
+            fragment.rhs_row > right->rows || fragment.rows > right->rows - fragment.rhs_row ||
+            fragment.rhs_column > right->cols || fragment.columns > right->cols - fragment.rhs_column ||
+            fragment.destination_row > out->rows || fragment.rows > out->rows - fragment.destination_row ||
+            fragment.destination_column > out->cols || fragment.columns > out->cols - fragment.destination_column ||
+            fragment.rows > std::numeric_limits<size_t>::max() / fragment.columns)
             return set_error("invalid row block input");
-        metadata.rows[block] = matrix->rows;
-        total_rows += matrix->rows;
+        for (size_t previous = 0; previous < block; ++previous)
+        {
+            const auto &other = fragments[previous];
+            if (fragment.destination_row < other.destination_row + other.rows &&
+                other.destination_row < fragment.destination_row + fragment.rows &&
+                fragment.destination_column < other.destination_column + other.columns &&
+                other.destination_column < fragment.destination_column + fragment.columns)
+                return set_error("overlapping row block add fragments");
+        }
+        metadata.rows[block] = fragment.rows;
+        metadata.widths[block] = fragment.columns;
+        metadata.lhs_columns[block] = matrix->cols;
+        metadata.rhs_columns[block] = right->cols;
+        metadata.lhs_column[block] = fragment.lhs_column;
+        metadata.rhs_row[block] = fragment.rhs_row;
+        metadata.rhs_column[block] = fragment.rhs_column;
+        metadata.destination_row[block] = fragment.destination_row;
+        metadata.destination_column[block] = fragment.destination_column;
+        max_polynomials = std::max(max_polynomials, fragment.rows * fragment.columns);
     }
-    if (total_rows != rhs->rows) return set_error("row block sum differs from output rows");
     if (rhs->rows == 0 || rhs->cols == 0 || rhs->ctx->N <= 0)
     {
         out->format = GPU_POLY_FORMAT_EVAL;
@@ -2661,8 +3222,7 @@ extern "C" int gpu_matrix_add_row_blocks(
     const size_t n = static_cast<size_t>(rhs->ctx->N);
     const size_t limb_count = static_cast<size_t>(rhs->level) + 1;
     if (limb_count > kArithMetadataLimbs || rhs->ctx->limb_gpu_ids.size() < limb_count ||
-        rhs->ctx->moduli.size() < limb_count || rhs->rows > std::numeric_limits<size_t>::max() / rhs->cols ||
-        rhs->rows * rhs->cols > std::numeric_limits<size_t>::max() / n)
+        rhs->ctx->moduli.size() < limb_count || max_polynomials > std::numeric_limits<size_t>::max() / n)
         return set_error("invalid row block add shape or basis");
     int device = -1;
     cudaStream_t stream = nullptr;
@@ -2694,12 +3254,11 @@ extern "C" int gpu_matrix_add_row_blocks(
     };
     status = prepare(out, &metadata.out);
     if (status != 0) return status;
-    status = prepare(rhs, &metadata.rhs);
-    if (status != 0) return status;
     for (size_t block = 0; block < block_count; ++block)
     {
-        if (metadata.rows[block] == 0) continue;
-        status = prepare(lhs_blocks[block], &metadata.blocks[block]);
+        status = prepare(fragments[block].lhs, &metadata.blocks[block]);
+        if (status != 0) return status;
+        status = prepare(fragments[block].rhs, &metadata.rhs[block]);
         if (status != 0) return status;
     }
     for (size_t limb = 0; limb < limb_count; ++limb)
@@ -2707,21 +3266,41 @@ extern "C" int gpu_matrix_add_row_blocks(
         metadata.indices[limb] = rhs->ctx->limb_gpu_ids[limb].y;
         metadata.moduli[limb] = rhs->ctx->moduli[limb];
     }
-    const size_t count = rhs->rows * rhs->cols * n;
+    const size_t count = max_polynomials * n;
     const size_t blocks = count / 256 + (count % 256 != 0);
     const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
-                    1, static_cast<unsigned int>(limb_count));
-    add_row_blocks_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, rhs->cols, count, n);
+                    static_cast<unsigned int>(block_count), static_cast<unsigned int>(limb_count));
+    add_row_blocks_all_limbs_kernel<<<grid, 256, 0, stream>>>(metadata, out->cols, count, n);
+    const size_t argument_sizes[] = {
+        sizeof(RowBlockAddMetadata), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+    };
+    std::vector<MxxGraphPatch> block_patches;
+    block_patches.reserve(2 * block_count + 1);
+    for (size_t block = 0; block < block_count; ++block)
+    {
+        block_patches.push_back(graph_kernel_pointer_patch(
+            0,
+            offsetof(RowBlockAddMetadata, blocks) + block * sizeof(RowBlockAddMetadata::blocks[0]),
+            static_cast<uint32_t>(2 * block)));
+        block_patches.push_back(graph_kernel_pointer_patch(
+            0, offsetof(RowBlockAddMetadata, rhs) + block * sizeof(void *),
+            static_cast<uint32_t>(2 * block + 1)));
+    }
+    block_patches.push_back(graph_kernel_pointer_patch(
+        0, offsetof(RowBlockAddMetadata, out), static_cast<uint32_t>(2 * block_count)));
+    status = register_kernel_pointer_fields(
+        rhs->ctx, stream, argument_sizes, std::size(argument_sizes), block_patches.data(),
+        block_patches.size());
+    if (status != 0) return status;
     const cudaError_t error = cudaGetLastError();
     if (error != cudaSuccess) return set_error(error);
     for (size_t block = 0; block < block_count; ++block)
     {
-        if (metadata.rows[block] == 0) continue;
-        status = matrix_track_all_limb_consumers(lhs_blocks[block], device, stream);
+        status = matrix_track_all_limb_consumers(fragments[block].lhs, device, stream);
+        if (status != 0) return status;
+        status = matrix_track_all_limb_consumers(fragments[block].rhs, device, stream);
         if (status != 0) return status;
     }
-    status = matrix_track_all_limb_consumers(rhs, device, stream);
-    if (status != 0) return status;
     status = matrix_record_all_limb_writes(out, stream);
     if (status != 0) return status;
     out->format = GPU_POLY_FORMAT_EVAL;
@@ -2756,6 +3335,157 @@ extern "C" int gpu_matrix_tensor_sum_rows(
         lhs->ctx->limb_gpu_ids.size() <= static_cast<size_t>(lhs->level))
         return set_error("tensor row sum size overflow or invalid limb mapping");
     return launch_descriptor_product(out, lhs, rhs, true, rows, offsets, group_count, term_count);
+}
+
+extern "C" int gpu_matrix_tensor_sum_rows_batch(
+    GpuMatrix *const *outputs, size_t output_count,
+    const GpuMatrix *lhs, const GpuMatrix *rhs,
+    const size_t *rows, const size_t *offsets, const size_t *output_offsets,
+    size_t group_count, size_t term_count)
+{
+    if (!outputs || output_count == 0 || output_count > kTensorRowSumMaxOutputs ||
+        !lhs || !rhs || !lhs->ctx || rhs->ctx != lhs->ctx ||
+        lhs->level < 0 || lhs->format != GPU_POLY_FORMAT_EVAL ||
+        rhs->level != lhs->level || rhs->format != GPU_POLY_FORMAT_EVAL ||
+        !rows || !offsets || !output_offsets || group_count == 0 ||
+        group_count > 16 || term_count == 0 || term_count > 32 ||
+        offsets[0] != 0 || offsets[group_count] != term_count ||
+        output_offsets[0] != 0 || output_offsets[output_count] != group_count)
+        return set_error("invalid batched tensor row sum arguments");
+    const size_t maximum = std::numeric_limits<size_t>::max();
+    if ((rhs->rows != 0 && lhs->rows > maximum / rhs->rows) ||
+        (rhs->cols != 0 && lhs->cols > maximum / rhs->cols) ||
+        lhs->cols != 0 && rhs->cols > maximum / lhs->cols)
+        return set_error("invalid batched tensor row sum input shape");
+    const size_t tensor_rows = lhs->rows * rhs->rows;
+    const size_t tensor_cols = lhs->cols * rhs->cols;
+    for (size_t output = 0; output < output_count; ++output)
+    {
+        if (!outputs[output] || outputs[output]->ctx != lhs->ctx ||
+            outputs[output]->level != lhs->level ||
+            outputs[output]->format != GPU_POLY_FORMAT_EVAL ||
+            !outputs[output]->descriptors_initialized ||
+            output_offsets[output] >= output_offsets[output + 1] ||
+            output_offsets[output + 1] > group_count ||
+            outputs[output]->rows != output_offsets[output + 1] - output_offsets[output] ||
+            outputs[output]->cols != tensor_cols)
+            return set_error("invalid batched tensor row sum output shape");
+    }
+    for (size_t group = 0; group < group_count; ++group)
+        if (offsets[group] >= offsets[group + 1] || offsets[group + 1] > term_count)
+            return set_error("invalid batched tensor row sum offsets");
+    for (size_t term = 0; term < term_count; ++term)
+        if (rows[term] >= tensor_rows)
+            return set_error("batched tensor row sum index out of bounds");
+    if (tensor_cols == 0 || lhs->ctx->N <= 0) return 0;
+    const size_t n = static_cast<size_t>(lhs->ctx->N);
+    const size_t limb_count = static_cast<size_t>(lhs->level) + 1;
+    if (limb_count > kArithMetadataLimbs || lhs->ctx->limb_gpu_ids.size() < limb_count ||
+        lhs->ctx->moduli.size() < limb_count ||
+        group_count > maximum / tensor_cols ||
+        group_count * tensor_cols > maximum / n)
+        return set_error("batched tensor row sum size overflow or invalid limb mapping");
+
+    TensorRowSumBatchMetadata metadata{};
+    int device = -1;
+    cudaStream_t stream = nullptr;
+    int status = matrix_limb_stream(outputs[0], outputs[0]->ctx->limb_gpu_ids[0], &stream);
+    if (status != 0) return status;
+    for (size_t limb = 0; limb < limb_count; ++limb)
+    {
+        const dim3 id = lhs->ctx->limb_gpu_ids[limb];
+        if (id.x >= lhs->shared_limb_buffers.size() ||
+            id.x >= rhs->shared_limb_buffers.size())
+            return set_error("invalid batched tensor row sum input partition");
+        const auto &left = lhs->shared_limb_buffers[id.x];
+        const auto &right = rhs->shared_limb_buffers[id.x];
+        if (!left.device_descriptors || !right.device_descriptors ||
+            id.y >= left.limb_count || id.y >= right.limb_count ||
+            left.device != right.device)
+            return set_error("invalid batched tensor row sum input descriptors");
+        if (limb == 0)
+        {
+            device = left.device;
+            metadata.lhs = left.device_descriptors;
+            metadata.rhs = right.device_descriptors;
+            const cudaError_t error = cudaSetDevice(device);
+            if (error != cudaSuccess) return set_error(error);
+        }
+        else if (device != left.device || metadata.lhs != left.device_descriptors ||
+                 metadata.rhs != right.device_descriptors)
+            return set_error("batched tensor row sum input descriptors span partitions");
+        metadata.indices[limb] = id.y;
+        metadata.moduli[limb] = lhs->ctx->moduli[limb];
+        metadata.reciprocals[limb] = lhs->ctx->barrett_reciprocals[limb];
+    }
+    for (size_t output = 0; output < output_count; ++output)
+    {
+        for (size_t limb = 0; limb < limb_count; ++limb)
+        {
+            const dim3 id = outputs[output]->ctx->limb_gpu_ids[limb];
+            if (id.x >= outputs[output]->shared_limb_buffers.size())
+                return set_error("invalid batched tensor row sum output partition");
+            const auto &buffer = outputs[output]->shared_limb_buffers[id.x];
+            if (!buffer.device_descriptors || id.y >= buffer.limb_count || buffer.device != device ||
+                id.y != metadata.indices[limb])
+                return set_error("batched tensor row sum output descriptors are not replay-compatible");
+            if (limb == 0)
+                metadata.out[output] = buffer.device_descriptors;
+            else if (metadata.out[output] != buffer.device_descriptors)
+                return set_error("batched tensor row sum output descriptors span partitions");
+        }
+    }
+    status = matrix_wait_all_limb_streams(lhs, device, stream, true, true);
+    if (status != 0) return status;
+    status = matrix_wait_all_limb_streams(rhs, device, stream, true, true);
+    if (status != 0) return status;
+    for (size_t output = 0; output < output_count; ++output)
+    {
+        status = matrix_wait_all_limb_streams(outputs[output], device, stream, true);
+        if (status != 0) return status;
+    }
+    std::copy_n(rows, term_count, metadata.rows);
+    std::copy_n(offsets, group_count + 1, metadata.offsets);
+    std::copy_n(output_offsets, output_count + 1, metadata.output_offsets);
+    metadata.output_offsets[output_count] = group_count;
+    const size_t poly_count = group_count * tensor_cols;
+    const size_t count = poly_count * n;
+    const size_t blocks = count / 256 + (count % 256 != 0);
+    const dim3 grid(static_cast<unsigned int>(std::min(blocks, size_t{65535})),
+                    1, static_cast<unsigned int>(limb_count));
+    if (n >= 256)
+    {
+        const dim3 grouped_grid(static_cast<unsigned int>((n + 255) / 256),
+            static_cast<unsigned int>(std::min(poly_count, size_t{65535})),
+            static_cast<unsigned int>(limb_count));
+        status = launch_tensor_row_sum_batch_driver<true>(
+            metadata, lhs->cols, rhs->rows, rhs->cols, poly_count, n,
+            output_count, grouped_grid, stream, lhs->ctx);
+    }
+    else
+    {
+        status = launch_tensor_row_sum_batch_driver<false>(
+            metadata, lhs->cols, rhs->rows, rhs->cols, poly_count, n,
+            output_count, grid, stream, lhs->ctx);
+    }
+    if (status != 0) return status;
+    const cudaError_t error = cudaGetLastError();
+    if (error != cudaSuccess) return set_error(error);
+    // One output event dominates the kernel for the source-reader lifetime;
+    // each destination gets its own write event for later consumers.
+    status = matrix_record_all_limb_writes(outputs[0], stream, true);
+    if (status != 0) return status;
+    const dim3 first = outputs[0]->ctx->limb_gpu_ids[0];
+    const auto &states = outputs[0]->exec_limb_states[first.x];
+    const cudaEvent_t completion = states[states[first.y].completion_owner].write_done;
+    for (size_t output = 1; output < output_count; ++output)
+    {
+        status = matrix_record_all_limb_writes(outputs[output], stream, true);
+        if (status != 0) return status;
+    }
+    status = matrix_track_all_limb_consumers(lhs, device, stream, completion, true);
+    if (status != 0) return status;
+    return matrix_track_all_limb_consumers(rhs, device, stream, completion, true);
 }
 
 extern "C" int gpu_matrix_tensor(GpuMatrix *out, const GpuMatrix *lhs, const GpuMatrix *rhs)
@@ -2809,7 +3539,8 @@ extern "C" int gpu_matrix_mul(GpuMatrix *out, const GpuMatrix *lhs, const GpuMat
     }
     if (lhs->format != GPU_POLY_FORMAT_EVAL || rhs->format != GPU_POLY_FORMAT_EVAL)
     {
-        return set_error("gpu_matrix_mul requires Eval format");
+        return set_error(("gpu_matrix_mul requires Eval format; lhs=" + std::to_string(lhs->format) +
+            ", rhs=" + std::to_string(rhs->format)).c_str());
     }
 
     const int level = lhs->level;

@@ -7,21 +7,22 @@ description = "Ring-GSW and leveled BGV graph builders for the mxx DSL"
 autotests = false
 
 [[test]]
-name = "gpu_bgv_round_trip"
+name = "gpu_bgv"
 required-features = ["gpu"]
 
 [[test]]
-name = "gpu_ring_gsw_round_trip"
+name = "gpu_ring_gsw"
 required-features = ["gpu"]
 
 [features]
 default = []
-gpu = ["mxx-primitives/gpu", "mxx-runtime/gpu"]
+gpu = ["mxx-primitives/gpu", "dep:mxx-runtime", "mxx-runtime/gpu"]
 
 [dependencies]
 mxx-dsl.workspace = true
 mxx-ir-core.workspace = true
 mxx-primitives.workspace = true
+mxx-runtime = { workspace = true, optional = true }
 num-bigint.workspace = true
 num-integer.workspace = true
 num-traits.workspace = true

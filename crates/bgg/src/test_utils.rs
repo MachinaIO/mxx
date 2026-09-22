@@ -1,5 +1,9 @@
 use mxx_dsl::BuiltGraph;
-use mxx_ir_core::ParamEnv;
+use mxx_ir_core::{
+    ParamEnv,
+    node::NodeKind,
+    types::{NodeId, Port, WireRef},
+};
 use mxx_primitives::{
     matrix::{PolyMatrix, dcrt_poly::DCRTPolyMatrix},
     poly::{
@@ -8,7 +12,7 @@ use mxx_primitives::{
     },
 };
 use mxx_runtime::{
-    ExecutionResult, RuntimeValue,
+    ExecutionConfig, ExecutionResult, RuntimeValue,
     artifact::MemoryArtifactStore,
     backend::poly::{CpuDcrtBackend, cpu_backend},
     execute,
@@ -36,12 +40,25 @@ pub fn execute_graph(
     inputs: BTreeMap<String, RuntimeValue<CpuDcrtBackend>>,
 ) -> ExecutionResult<CpuDcrtBackend> {
     let validated = graph.validate(&ParamEnv::default()).expect("valid runtime graph");
+    for (index, node) in validated.root_scope().execution_order.iter().enumerate() {
+        let NodeKind::Input { name, artifact: None, .. } = node.kind() else {
+            continue;
+        };
+        let wire = WireRef { node: NodeId(index as u64), port: Port(0) };
+        let concrete = &validated.root_scope().wire_types[&wire];
+        let value = inputs.get(name).unwrap_or_else(|| panic!("missing test input {name}"));
+        assert!(
+            value.matches_wire_type(concrete),
+            "test input {name} has runtime kind incompatible with root wire {wire:?}: {concrete:?}"
+        );
+    }
     execute(
         &validated,
         &mut cpu_backend([parameters]),
         inputs,
         &mut MemoryArtifactStore::default(),
         SamplingMode::Fresh,
+        ExecutionConfig::default(),
     )
     .expect("graph execution")
 }

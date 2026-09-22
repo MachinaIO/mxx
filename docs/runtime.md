@@ -13,6 +13,16 @@ CPU-independent work uses Rayon where iterations are independent. GPU work may
 intentionally use a smaller wave size to respect VRAM limits. DAG construction,
 dependency-ordered traversal, and deterministic reductions remain ordered.
 
+Graph-level GPU execution has one lifecycle: `prepare` measures the production
+primitive routes during warmup, freezes their layouts, budgets, widths, and
+schedule into a plan, and returns a prepared value whose `run` method executes
+that exact plan. A GPU backend is rejected with the CPU plan, and a frozen GPU
+plan is rejected by a non-GPU backend before session or artifact state can be
+mutated. The warmup report on the prepared value is the timing and resource
+estimate for that graph execution. Applications form whole-protocol estimates
+by summing the reports of the prepared protocol steps; reading or serializing a
+report performs no measurement or additional GPU execution.
+
 Artifacts are supplied and returned through the runtime artifact interfaces.
 Final applications decide how artifact payloads are persisted.
 
@@ -40,7 +50,7 @@ the original inputs, not a correction of an incomplete invocation.
 Artifact stores and transcript providers must return intact payloads produced by the matching backend
 codec with the matching schema and parameters. Compact matrix decoding is not an untrusted-data
 parser: malformed or truncated payloads violate its contract and can panic rather than return an
-`ExecutionError`. Private-artifact manifests do not provide a content hash. Applications accepting
+`ExecutionError`. Artifact manifests do not authenticate payload integrity. Applications accepting
 untrusted or potentially damaged storage must establish integrity before passing data to the runtime;
 `Result` on the backend decoder is not a guarantee that all malformed byte strings are recoverable.
 Serialized graphs must originate from the graph serializer and pass graph validation before execution;

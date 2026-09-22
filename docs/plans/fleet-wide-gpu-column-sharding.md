@@ -117,10 +117,10 @@ meanings and remain independent of this percentage.
 ## Ownership and crate boundary
 
 `mxx-runtime` owns the fleet matrix representation, fleet scheduler, calibration
-signature and profile types, and the reusable calibration registry.
-`mxx-bench-estimator` depends on `mxx-runtime`, invokes these production APIs,
-and returns or shares the resulting registry. This preserves the dependency
-direction in `docs/architecture.md`; runtime must not depend on the estimator.
+signature and profile types, the reusable calibration registry, and the
+production-equivalent warmup that freezes an execution plan. The report returned
+by that warmup is the sole estimate for the planned run, preserving the dependency
+direction in `docs/architecture.md` without a separate estimator package.
 
 Native memory-pool high-water queries and reset operations belong to
 `mxx-primitives` and its CUDA implementation. CUDA headers expose only the
@@ -569,9 +569,9 @@ and host-to-device transfer.
 Import validates the complete expected concrete schema and semantic kind once,
 then decodes each global column interval directly into its destination shard.
 Artifact export is a host-visible operation and may wait for the relevant shard
-events. Device-only copies and imports remain asynchronous. Content hashes cover
-the same canonical bytes regardless of the number of devices or shard widths;
-calibration data and device placement never enter an artifact or transcript.
+events. Device-only copies and imports remain asynchronous. Artifact bytes are
+identical regardless of the number of devices or shard widths; calibration data
+and device placement never enter an artifact or transcript.
 
 ## Synchronization and lifetime invariants
 
@@ -720,7 +720,7 @@ Required focused tests include:
 - compact `mul_small_rhs` and preimage equivalence with no expanded all-column
   DCRT RHS;
 - shard-preserving artifact round trips and device-count-independent canonical
-  hashes; and
+  bytes; and
 - event-safe early drops and repeated execution without implicit synchronization.
 
 After focused tests, run CPU and GPU workspace unit-test builds with no new

@@ -340,7 +340,7 @@ mod tests {
     use mxx_ir_core::{ParamEnv, node::NodeKind};
     use mxx_primitives::poly::dcrt::params::DCRTPolyParams;
     use mxx_runtime::{
-        RuntimeValue,
+        ExecutionConfig, RuntimeValue,
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
         execute,
@@ -397,6 +397,7 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         matches!(result.outputs[output], RuntimeValue::Bool(true))

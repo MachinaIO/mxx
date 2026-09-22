@@ -370,7 +370,7 @@ mod public_key {
         Poly,
         circuit::{CircuitLoweringTypes, GateInstance, SlotOperationLowering},
     };
-    use mxx_ir_core::artifact::{ArtifactConfidentiality, ProductionId};
+    use mxx_ir_core::artifact::{ArtifactAvailability, ProductionId};
     use rayon::prelude::*;
 
     #[derive(Clone)]
@@ -418,7 +418,7 @@ mod public_key {
                         production.clone(),
                         super::slot_gate_public_key_name(reduction, &identity),
                         (self.public_key_type.rows.clone(), self.public_key_type.columns.clone()),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     )
                 },
             );
@@ -574,7 +574,7 @@ mod artifact {
     use mxx_dsl::{Bytes, DslContext, DslError, Family, HashTag, Mat, Preimage, Ring, Trapdoor};
     use mxx_ir_core::{
         IntExpr, RealExpr,
-        artifact::{ArtifactConfidentiality, ProductionId},
+        artifact::{ArtifactAvailability, ProductionId},
         node::{ConcatAxis, ConstantMatrix, IndexRange},
         types::MatrixType,
     };
@@ -702,10 +702,10 @@ mod artifact {
             base: BggSlotTransferBaseWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             Ok(context
-                .public_output(B0_PUBLIC, base.b0.public_matrix())?
-                .private_trapdoor_output(B0_TRAPDOOR, base.b0)?
-                .public_output(B1_PUBLIC, base.b1.public_matrix())?
-                .private_trapdoor_output(B1_TRAPDOOR, base.b1)?)
+                .transferred_output(B0_PUBLIC, base.b0.public_matrix())?
+                .transferred_trapdoor_output(B0_TRAPDOOR, base.b0)?
+                .transferred_output(B1_PUBLIC, base.b1.public_matrix())?
+                .transferred_trapdoor_output(B1_TRAPDOOR, base.b1)?)
         }
 
         pub fn import_base(
@@ -850,22 +850,20 @@ mod artifact {
             slots: BggSlotTransferSlotWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
             let context = context
-                .private_output(SLOT_SECRET, slots.secrets)?
-                .public_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
-            let context = slots
-                .b0_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.public_output(b0_preimage_name(chunk), family)
-                })?;
-            Ok(slots
-                .b1_preimage_chunks
-                .into_iter()
-                .enumerate()
-                .try_fold(context, |context, (chunk, family)| {
-                    context.public_output(b1_preimage_name(chunk), family)
-                })?)
+                .transferred_output(SLOT_SECRET, slots.secrets)?
+                .transferred_output(SLOT_PUBLIC_KEY, slots.public_keys)?;
+            let context = slots.b0_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b0_preimage_name(chunk), family)
+                },
+            )?;
+            Ok(slots.b1_preimage_chunks.into_iter().enumerate().try_fold(
+                context,
+                |context, (chunk, family)| {
+                    context.transferred_output(b1_preimage_name(chunk), family)
+                },
+            )?)
         }
 
         pub fn import_slots(
@@ -880,7 +878,10 @@ mod artifact {
                     SLOT_SECRET,
                     self.slot_count,
                     (self.secret_size, self.secret_size),
-                    ArtifactConfidentiality::Private,
+                    // Slot secrets are sampled during artifact production;
+                    // consumers receive the exact payload rather than
+                    // regenerating it from public context.
+                    ArtifactAvailability::Transferred,
                 ),
                 public_keys: public.public_keys,
                 b0_preimage_chunks: public.b0_preimage_chunks,
@@ -900,7 +901,7 @@ mod artifact {
                     SLOT_PUBLIC_KEY,
                     self.slot_count,
                     (self.secret_size, self.gadget_columns()),
-                    ArtifactConfidentiality::Public,
+                    ArtifactAvailability::Transferred,
                 ),
                 b0_preimage_chunks: self.import_slot_chunks(
                     &artifacts.production_id,
@@ -1006,10 +1007,9 @@ mod artifact {
             context: DslContext,
             gates: BggSlotTransferGateWires,
         ) -> Result<DslContext, BggSlotTransferArtifactError> {
-            Ok(gates
-                .preimage_chunks
-                .into_iter()
-                .try_fold(context, |context, (name, family)| context.public_output(name, family))?)
+            Ok(gates.preimage_chunks.into_iter().try_fold(context, |context, (name, family)| {
+                context.transferred_output(name, family)
+            })?)
         }
 
         /// Exports the exact public-key expressions used as gate-preimage targets.
@@ -1027,7 +1027,7 @@ mod artifact {
                         (true, identity, output_public_key)
                     }
                 };
-                Ok(context.public_output(
+                Ok(context.transferred_output(
                     super::slot_gate_public_key_name(reduction, identity),
                     output.clone(),
                 )?)
@@ -1060,7 +1060,7 @@ mod artifact {
                         count,
                         (self.b0_public_columns(), range_len(&columns)),
                         self.preimage_max_coefficient_bound.clone(),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     );
                     preimage_chunks.insert(name, family);
                 }
@@ -1216,7 +1216,7 @@ mod artifact {
                         self.slot_count,
                         (rows, range_len(&range)),
                         self.preimage_max_coefficient_bound.clone(),
-                        ArtifactConfidentiality::Public,
+                        ArtifactAvailability::Transferred,
                     )
                 })
                 .collect()
@@ -1285,12 +1285,12 @@ mod artifact {
         use num_bigint::BigInt;
         use std::collections::BTreeMap;
 
-        fn small_matrix_output(
+        fn preimage_output(
             result: &ExecutionResult<CpuDcrtBackend>,
             name: &str,
         ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-            let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-                panic!("{name} must be a compact matrix output")
+            let RuntimeValue::Preimage(value) = &result.outputs[name] else {
+                panic!("{name} must be a preimage output")
             };
             value.as_ref().clone()
         }
@@ -1445,7 +1445,7 @@ mod artifact {
                     let (start, end) = static_range(&range);
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b0_{chunk}_{slot}")
                             ))
@@ -1462,7 +1462,7 @@ mod artifact {
                         .concat_rows(&[&-(secret.clone() * &gadget.slice_columns(start, end))]);
                     assert_eq!(
                         b1.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("slot_b1_{chunk}_{slot}")
                             ))
@@ -1492,7 +1492,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_transfer_{chunk}_{destination}"),
                             ))
@@ -1515,7 +1515,7 @@ mod artifact {
                         &rhs;
                     assert_eq!(
                         b0.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("gate_reduce_{chunk}_{destination}"),
                             ))

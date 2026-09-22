@@ -62,8 +62,8 @@ mod graph_tests {
         },
     };
     use mxx_runtime::{
-        RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend, execute,
-        transcript::SamplingMode,
+        ExecutionConfig, RuntimeValue, artifact::MemoryArtifactStore, backend::poly::cpu_backend,
+        execute, transcript::SamplingMode,
     };
     use num_bigint::{BigInt, BigUint};
     use std::{collections::BTreeMap, convert::Infallible};
@@ -178,8 +178,9 @@ mod graph_tests {
         assert_eq!(outputs.len(), 3);
         let mut context = DslContext::new("noise-refresh-merge-template");
         for (index, output) in outputs.into_iter().enumerate() {
-            context =
-                context.public_output(format!("output_{index}"), output).expect("unique output");
+            context = context
+                .transferred_output(format!("output_{index}"), output)
+                .expect("unique output");
         }
         let built = context.build().expect("build merge Graph IR");
         let validated = built.validate(&ParamEnv::default()).expect("valid merge Graph IR");
@@ -203,6 +204,7 @@ mod graph_tests {
                 .collect::<BTreeMap<_, _>>(),
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .expect("execute merge Graph IR");
         for index in 0..3 {

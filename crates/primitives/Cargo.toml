@@ -8,8 +8,6 @@ description = "Polynomial, matrix, sampling, and GPU primitives for mxx"
 [features]
 default = []
 gpu = []
-# Internal feature enabled by workspace dev-dependencies to preserve test-only Drop synchronization.
-test-gpu-sync = []
 
 [dependencies]
 bigdecimal.workspace = true

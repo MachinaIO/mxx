@@ -11,8 +11,7 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-primitives` | Polynomial/matrix operations, CPU/GPU kernels, and concrete samplers. |
 | `mxx-ir-core` | Executable DAG, protocol declarations, structural validation, artifact manifests, and Lean claim generation. |
 | `mxx-dsl` | Typed graph construction and sampler-free ideal/predicate builders. |
-| `mxx-runtime` | CPU/GPU graph execution, transcripts, sessions, and in-memory artifacts. |
-| `mxx-bench-estimator` | Validated-graph cost and memory composition. |
+| `mxx-runtime` | CPU execution; measured GPU warmup, frozen planning and execution; transcripts, sessions, and artifacts. |
 | `mxx-gadgets` | BGG-independent circuits and reusable circuit gadgets. |
 | `mxx-bgg` | BGG+ keys, encodings, sampling, evaluation, decoding, lookup, slot transfer, and refresh. |
 | `mxx-fhe` | DSL-based Ring Regev/Ring-GSW and leveled BGV, SIMD, rotations, and ciphertext noise tracking. |

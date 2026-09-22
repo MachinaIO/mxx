@@ -4,6 +4,36 @@ using gpu_chacha::GpuRngSeed;
 
 namespace
 {
+MxxGraphPatch trapdoor_pointer_patch(uint32_t argument_index, uint32_t binding_index)
+{
+    MxxGraphPatch patch{};
+    patch.node = nullptr;
+    patch.target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+    patch.argument_index = argument_index;
+    patch.byte_offset = 0;
+    patch.byte_count = sizeof(void *);
+    patch.binding_index = binding_index;
+    patch.address_addend = 0;
+    return patch;
+}
+
+int register_trapdoor_kernel(
+    GpuContext *ctx,
+    cudaStream_t stream,
+    const size_t *argument_sizes,
+    size_t argument_count,
+    std::initializer_list<uint32_t> pointer_arguments)
+{
+    std::vector<MxxGraphPatch> patches;
+    patches.reserve(pointer_arguments.size());
+    uint32_t binding = 0;
+    for (const uint32_t argument : pointer_arguments)
+        patches.push_back(trapdoor_pointer_patch(argument, binding++));
+    return mxx_graph_register_kernel_update_for_stream(
+        ctx, reinterpret_cast<void *>(stream), argument_sizes, argument_count,
+        patches.data(), patches.size());
+}
+
     struct ThreadLocalOwnerLinkEventState
     {
         int device = -1;
@@ -87,9 +117,11 @@ struct GpuP1CovarianceCache
     double s = 0.0;
     int device = -1;
     cudaStream_t stream = nullptr;
+    bool owns_stream = true;
     cudaEvent_t ready_event = nullptr;
     double *sqrt_var = nullptr;      // [coeff][row]
     double *update_coeff = nullptr;  // [coeff][sampled_row][updated_row]
+    double *capture_workspace = nullptr;
 };
 
 namespace
@@ -691,7 +723,7 @@ __global__ void matrix_precompute_p1_covariance_kernel(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_small(
+__device__ __forceinline__ void matrix_sample_p1_integer_cached_kernel_small_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -770,7 +802,7 @@ __global__ void matrix_sample_p1_integer_cached_kernel_small(
     }
 }
 
-__global__ void matrix_sample_p1_integer_cached_kernel_large(
+__device__ __forceinline__ void matrix_sample_p1_integer_cached_kernel_large_body(
     const uint8_t *tp2_base,
     size_t tp2_stride_bytes,
     uint8_t tp2_coeff_bytes,
@@ -853,7 +885,7 @@ __global__ void matrix_sample_p1_integer_cached_kernel_large(
     }
 }
 
-__global__ void matrix_sample_p1_integer_kernel_small(
+__device__ __forceinline__ void matrix_sample_p1_integer_kernel_small_body(
     const uint8_t *a_base,
     const uint8_t *b_base,
     const uint8_t *d_base,
@@ -1005,7 +1037,7 @@ __global__ void matrix_sample_p1_integer_kernel_small(
     }
 }
 
-__global__ void matrix_sample_p1_integer_kernel_large(
+__device__ __forceinline__ void matrix_sample_p1_integer_kernel_large_body(
     const uint8_t *a_base,
     const uint8_t *b_base,
     const uint8_t *d_base,
@@ -1165,6 +1197,93 @@ __global__ void matrix_sample_p1_integer_kernel_large(
     }
 }
 
+// Thin global wrappers keep the allocating legacy launchers ABI-compatible,
+// while the device-seed variants below are safe to capture in a retry body.
+__global__ void matrix_sample_p1_integer_cached_kernel_small(
+    const uint8_t *tp2_base, size_t tp2_stride_bytes, uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base, const double *update_coeff_base, size_t d,
+    size_t cols, size_t n, int64_t *sampled_out, uint64_t modulus,
+    double c_scale, GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_small_body(
+        tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base,
+        update_coeff_base, d, cols, n, sampled_out, modulus, c_scale, seed);
+}
+
+__global__ void matrix_sample_p1_integer_cached_kernel_large(
+    const uint8_t *tp2_base, size_t tp2_stride_bytes, uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base, const double *update_coeff_base, size_t d,
+    size_t cols, size_t n, size_t sample_start, size_t sample_count,
+    double *mean_workspace, int64_t *sampled_workspace, int64_t *sampled_out,
+    uint64_t modulus, double c_scale, GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_cached_kernel_large_body(
+        tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base,
+        update_coeff_base, d, cols, n, sample_start, sample_count,
+        mean_workspace, sampled_workspace, sampled_out, modulus, c_scale, seed);
+}
+
+__global__ void matrix_sample_p1_integer_cached_kernel_small_device_seed(
+    const uint8_t *tp2_base, size_t tp2_stride_bytes, uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base, const double *update_coeff_base, size_t d,
+    size_t cols, size_t n, int64_t *sampled_out, uint64_t modulus,
+    double c_scale, const GpuRngSeed *device_seed)
+{
+    if (device_seed)
+        matrix_sample_p1_integer_cached_kernel_small_body(
+            tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base,
+            update_coeff_base, d, cols, n, sampled_out, modulus, c_scale,
+            *device_seed);
+}
+
+__global__ void matrix_sample_p1_integer_cached_kernel_large_device_seed(
+    const uint8_t *tp2_base, size_t tp2_stride_bytes, uint8_t tp2_coeff_bytes,
+    const double *sqrt_var_base, const double *update_coeff_base, size_t d,
+    size_t cols, size_t n, size_t sample_start, size_t sample_count,
+    double *mean_workspace, int64_t *sampled_workspace, int64_t *sampled_out,
+    uint64_t modulus, double c_scale, const GpuRngSeed *device_seed)
+{
+    if (device_seed)
+        matrix_sample_p1_integer_cached_kernel_large_body(
+            tp2_base, tp2_stride_bytes, tp2_coeff_bytes, sqrt_var_base,
+            update_coeff_base, d, cols, n, sample_start, sample_count,
+            mean_workspace, sampled_workspace, sampled_out, modulus, c_scale,
+            *device_seed);
+}
+
+__global__ void matrix_sample_p1_integer_kernel_small(
+    const uint8_t *a_base, const uint8_t *b_base, const uint8_t *d_base,
+    const uint8_t *tp2_base, size_t a_stride_bytes, size_t b_stride_bytes,
+    size_t d_stride_bytes, size_t tp2_stride_bytes, uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes, uint8_t d_coeff_bytes, uint8_t tp2_coeff_bytes,
+    size_t d, size_t cols, size_t n, int64_t *sampled_out, uint64_t modulus,
+    double sigma, double s, double dgg_stddev, GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_kernel_small_body(
+        a_base, b_base, d_base, tp2_base, a_stride_bytes, b_stride_bytes,
+        d_stride_bytes, tp2_stride_bytes, a_coeff_bytes, b_coeff_bytes,
+        d_coeff_bytes, tp2_coeff_bytes, d, cols, n, sampled_out, modulus,
+        sigma, s, dgg_stddev, seed);
+}
+
+__global__ void matrix_sample_p1_integer_kernel_large(
+    const uint8_t *a_base, const uint8_t *b_base, const uint8_t *d_base,
+    const uint8_t *tp2_base, size_t a_stride_bytes, size_t b_stride_bytes,
+    size_t d_stride_bytes, size_t tp2_stride_bytes, uint8_t a_coeff_bytes,
+    uint8_t b_coeff_bytes, uint8_t d_coeff_bytes, uint8_t tp2_coeff_bytes,
+    size_t d, size_t cols, size_t n, size_t sample_start, size_t sample_count,
+    double *cov_workspace, double *mean_workspace, double *col_workspace,
+    int64_t *sampled_workspace, int64_t *sampled_out, uint64_t modulus,
+    double sigma, double s, double dgg_stddev, GpuRngSeed seed)
+{
+    matrix_sample_p1_integer_kernel_large_body(
+        a_base, b_base, d_base, tp2_base, a_stride_bytes, b_stride_bytes,
+        d_stride_bytes, tp2_stride_bytes, a_coeff_bytes, b_coeff_bytes,
+        d_coeff_bytes, tp2_coeff_bytes, d, cols, n, sample_start, sample_count,
+        cov_workspace, mean_workspace, col_workspace, sampled_workspace,
+        sampled_out, modulus, sigma, s, dgg_stddev, seed);
+}
+
 __global__ void matrix_scatter_p1_integer_to_limb_kernel(
     const int64_t *sampled_in,
     uint8_t *out_base,
@@ -1192,7 +1311,7 @@ __global__ void matrix_scatter_p1_integer_to_limb_kernel(
         signed_mod_i64(sampled_in[idx], modulus));
 }
 
-__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+__device__ __forceinline__ void matrix_gauss_samp_gq_arb_base_sample_kernel_body(
     const uint8_t *src_base,
     int64_t *sampled_digits,
     size_t poly_count,
@@ -1326,6 +1445,31 @@ __global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
     }
 }
 
+__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel(
+    const uint8_t *src_base, int64_t *sampled_digits, size_t poly_count,
+    size_t n, size_t src_stride_bytes, uint8_t src_coeff_bytes,
+    uint64_t tower_modulus, uint32_t base_bits, uint32_t digits_per_tower,
+    double c, uint32_t tower_idx, GpuRngSeed seed)
+{
+    matrix_gauss_samp_gq_arb_base_sample_kernel_body(
+        src_base, sampled_digits, poly_count, n, src_stride_bytes,
+        src_coeff_bytes, tower_modulus, base_bits, digits_per_tower, c,
+        tower_idx, seed);
+}
+
+__global__ void matrix_gauss_samp_gq_arb_base_sample_kernel_device_seed(
+    const uint8_t *src_base, int64_t *sampled_digits, size_t poly_count,
+    size_t n, size_t src_stride_bytes, uint8_t src_coeff_bytes,
+    uint64_t tower_modulus, uint32_t base_bits, uint32_t digits_per_tower,
+    double c, uint32_t tower_idx, const GpuRngSeed *device_seed)
+{
+    if (device_seed)
+        matrix_gauss_samp_gq_arb_base_sample_kernel_body(
+            src_base, sampled_digits, poly_count, n, src_stride_bytes,
+            src_coeff_bytes, tower_modulus, base_bits, digits_per_tower, c,
+            tower_idx, *device_seed);
+}
+
 __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
     const int64_t *sampled_digits,
     uint8_t *const *dst_bases,
@@ -1392,6 +1536,7 @@ __global__ void matrix_gauss_samp_gq_arb_base_scatter_kernel(
 }
 
 int launch_gauss_samp_gq_arb_base_sample_kernel(
+    GpuContext *ctx,
     const uint8_t *src_base,
     int64_t *sampled_digits,
     size_t poly_count,
@@ -1451,10 +1596,19 @@ int launch_gauss_samp_gq_arb_base_sample_kernel(
     {
         return set_error(err);
     }
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(uint8_t), sizeof(uint64_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(double),
+        sizeof(uint32_t), sizeof(GpuRngSeed),
+    };
+    const int registration_status = register_trapdoor_kernel(
+        ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1});
+    if (registration_status != 0) return registration_status;
     return 0;
 }
 
 int launch_gauss_samp_gq_arb_base_scatter_kernel(
+    GpuContext *ctx,
     const int64_t *sampled_digits,
     uint8_t *const *dst_bases,
     const size_t *dst_stride_bytes,
@@ -1516,6 +1670,14 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
         log_base_q,
         src_digit_offset,
         digits_per_tower);
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(size_t), sizeof(size_t), sizeof(uint32_t),
+    };
+    const int registration_status = register_trapdoor_kernel(
+        ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1, 2, 3, 4});
+    if (registration_status != 0) return registration_status;
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
@@ -1526,6 +1688,7 @@ int launch_gauss_samp_gq_arb_base_scatter_kernel(
 
 
 int launch_sample_p1_integer_kernel(
+    GpuContext *ctx,
     const uint8_t *a_base,
     const uint8_t *b_base,
     const uint8_t *d_base,
@@ -1644,6 +1807,20 @@ int launch_sample_p1_integer_kernel(
             s,
             dgg_stddev,
             seed);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(void *), sizeof(uint64_t),
+            sizeof(double), sizeof(double), sizeof(double), sizeof(GpuRngSeed),
+        };
+        const int registration_status = register_trapdoor_kernel(
+            ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1, 2, 3, 15});
+        if (registration_status != 0)
+        {
+            free_all();
+            return registration_status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -1788,6 +1965,23 @@ int launch_sample_p1_integer_kernel(
                 s,
                 dgg_stddev,
                 seed);
+            const size_t argument_sizes[] = {
+                sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+                sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+                sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t),
+                sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+                sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+                sizeof(uint64_t), sizeof(double), sizeof(double), sizeof(double), sizeof(GpuRngSeed),
+            };
+            const int registration_status = register_trapdoor_kernel(
+                ctx, stream, argument_sizes, std::size(argument_sizes),
+                {0, 1, 2, 3, 17, 18, 19, 20, 21});
+            if (registration_status != 0)
+            {
+                free_workspace();
+                free_all();
+                return registration_status;
+            }
             err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -1816,6 +2010,7 @@ int launch_sample_p1_integer_kernel(
 }
 
 int launch_precompute_p1_covariance_kernel(
+    GpuContext *ctx,
     const uint8_t *a_base,
     const uint8_t *b_base,
     const uint8_t *d_base,
@@ -1888,6 +2083,20 @@ int launch_precompute_p1_covariance_kernel(
         cov_workspace,
         sqrt_var_out,
         update_coeff_out);
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t),
+        sizeof(size_t), sizeof(size_t), sizeof(uint64_t),
+        sizeof(double), sizeof(double), sizeof(double),
+        sizeof(void *), sizeof(void *), sizeof(void *),
+    };
+    const int registration_status = register_trapdoor_kernel(
+        ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1, 2, 15, 16, 17});
+    if (registration_status != 0)
+    {
+        return registration_status;
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
@@ -1987,6 +2196,18 @@ int launch_sample_p1_integer_cached_kernel(
             cache->modulus,
             c_scale,
             seed);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(size_t), sizeof(uint8_t), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(void *), sizeof(uint64_t),
+            sizeof(double), sizeof(GpuRngSeed),
+        };
+        const int registration_status = register_trapdoor_kernel(
+            cache->ctx, stream, argument_sizes, std::size(argument_sizes), {0, 3, 4, 8});
+        if (registration_status != 0)
+        {
+            free_all();
+            return registration_status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -2078,6 +2299,24 @@ int launch_sample_p1_integer_cached_kernel(
                 cache->modulus,
                 c_scale,
                 seed);
+            const size_t argument_sizes[] = {
+                sizeof(void *), sizeof(size_t), sizeof(uint8_t), sizeof(void *), sizeof(void *),
+                sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+                sizeof(void *), sizeof(void *), sizeof(void *), sizeof(uint64_t), sizeof(double),
+                sizeof(GpuRngSeed),
+            };
+            const int registration_status = register_trapdoor_kernel(
+                cache->ctx,
+                stream,
+                argument_sizes,
+                std::size(argument_sizes),
+                {0, 3, 4, 10, 11, 12});
+            if (registration_status != 0)
+            {
+                free_workspace();
+                free_all();
+                return registration_status;
+            }
             err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -2105,7 +2344,104 @@ int launch_sample_p1_integer_cached_kernel(
     return 0;
 }
 
+int launch_sample_p1_integer_cached_kernel_into(
+    const uint8_t *tp2_base,
+    size_t tp2_stride_bytes,
+    uint8_t tp2_coeff_bytes,
+    const GpuP1CovarianceCache *cache,
+    size_t cols,
+    int64_t *sampled_out,
+    void *workspace,
+    size_t workspace_bytes,
+    const GpuRngSeed *device_seed,
+    cudaStream_t stream,
+    uint32_t tp2_binding_index,
+    uint32_t seed_binding_index,
+    uint32_t sampled_binding_index,
+    uint32_t workspace_binding_index)
+{
+    if (!tp2_base || !cache || !cache->sqrt_var || !cache->update_coeff ||
+        !sampled_out || !device_seed || !stream)
+        return set_error("null pointer in allocation-free cached p1 sampler");
+    if (tp2_coeff_bytes == 0 || tp2_stride_bytes < cache->n * static_cast<size_t>(tp2_coeff_bytes))
+        return set_error("invalid stride in allocation-free cached p1 sampler");
+    if (cache->d_rows == 0 || cols == 0 || cache->n == 0)
+        return 0;
+    const size_t m = cache->m;
+    const size_t total_samples = cols * cache->n;
+    const size_t sampled_values = m * total_samples;
+    if (sampled_values > std::numeric_limits<size_t>::max() / sizeof(int64_t))
+        return set_error("sample byte overflow in allocation-free cached p1 sampler");
+    if (m > kSampleP1LocalMaxM)
+    {
+        const size_t required = total_samples * m * (sizeof(double) + sizeof(int64_t));
+        if (!workspace || workspace_bytes < required)
+            return set_error("insufficient fixed workspace in allocation-free cached p1 sampler");
+    }
+    const int device = cache->device;
+    if (device < 0 || cudaSetDevice(device) != cudaSuccess)
+        return set_error("invalid device in allocation-free cached p1 sampler");
+
+    const int threads = 256;
+    const int blocks = static_cast<int>((total_samples + threads - 1) / threads);
+    if (m <= kSampleP1LocalMaxM)
+    {
+        matrix_sample_p1_integer_cached_kernel_small_device_seed<<<blocks, threads, 0, stream>>>(
+            tp2_base, tp2_stride_bytes, tp2_coeff_bytes, cache->sqrt_var,
+            cache->update_coeff, cache->d_rows, cols, cache->n, sampled_out,
+            cache->modulus, -(cache->sigma * cache->sigma) /
+                (cache->s * cache->s - cache->sigma * cache->sigma), device_seed);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(size_t), sizeof(uint8_t), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(void *), sizeof(uint64_t),
+            sizeof(double), sizeof(void *),
+        };
+        const MxxGraphPatch patches[] = {
+            trapdoor_pointer_patch(0, tp2_binding_index),
+            trapdoor_pointer_patch(8, sampled_binding_index),
+            trapdoor_pointer_patch(11, seed_binding_index),
+        };
+        int status = mxx_graph_register_kernel_update_for_stream(
+            cache->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (status != 0) return status;
+    }
+    else
+    {
+        auto *workspace_base = reinterpret_cast<uint8_t *>(workspace);
+        auto *mean_workspace = reinterpret_cast<double *>(workspace_base);
+        auto *sampled_workspace = reinterpret_cast<int64_t *>(
+            workspace_base + total_samples * m * sizeof(double));
+        matrix_sample_p1_integer_cached_kernel_large_device_seed<<<blocks, threads, 0, stream>>>(
+            tp2_base, tp2_stride_bytes, tp2_coeff_bytes, cache->sqrt_var,
+            cache->update_coeff, cache->d_rows, cols, cache->n, 0, total_samples,
+            mean_workspace, sampled_workspace, sampled_out, cache->modulus,
+            -(cache->sigma * cache->sigma) /
+                (cache->s * cache->s - cache->sigma * cache->sigma), device_seed);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(size_t), sizeof(uint8_t), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(uint64_t), sizeof(double),
+            sizeof(void *),
+        };
+        const MxxGraphPatch patches[] = {
+            trapdoor_pointer_patch(0, tp2_binding_index),
+            trapdoor_pointer_patch(10, workspace_binding_index),
+            trapdoor_pointer_patch(11, workspace_binding_index),
+            trapdoor_pointer_patch(12, sampled_binding_index),
+            trapdoor_pointer_patch(15, seed_binding_index),
+        };
+        int status = mxx_graph_register_kernel_update_for_stream(
+            cache->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (status != 0) return status;
+    }
+    cudaError_t err = cudaGetLastError();
+    return err == cudaSuccess ? 0 : set_error(err);
+}
+
 int launch_scatter_p1_integer_to_limb_kernel_device(
+    GpuContext *ctx,
     const int64_t *sampled_in_device,
     uint8_t *out_base,
     size_t out_stride_bytes,
@@ -2154,6 +2490,16 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
         entry_count,
         n,
         modulus);
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(uint8_t),
+        sizeof(size_t), sizeof(size_t), sizeof(uint64_t),
+    };
+    const int registration_status = register_trapdoor_kernel(
+        ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1});
+    if (registration_status != 0)
+    {
+        return registration_status;
+    }
     err = cudaGetLastError();
     if (err != cudaSuccess)
     {
@@ -2163,11 +2509,12 @@ int launch_scatter_p1_integer_to_limb_kernel_device(
 }
 
 
-extern "C" int gpu_matrix_mul_vertical_pair(
+static int gpu_matrix_mul_vertical_pair_impl(
     GpuMatrix *out,
     const GpuMatrix *top,
     const GpuMatrix *bottom,
-    const GpuMatrix *rhs)
+    const GpuMatrix *rhs,
+    cudaStream_t override_stream)
 {
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !top || !bottom || !rhs)
@@ -2237,6 +2584,8 @@ extern "C" int gpu_matrix_mul_vertical_pair(
         {
             return status;
         }
+        if (override_stream)
+            stream = override_stream;
         status = preimage_const_limb_view(
             bottom,
             limb_id,
@@ -2280,20 +2629,14 @@ extern "C" int gpu_matrix_mul_vertical_pair(
         {
             return set_error("coefficient width mismatch in gpu_matrix_mul_vertical_pair");
         }
-        status = matrix_wait_limb_stream(top, limb_id, out_device, stream);
-        if (status != 0)
+        if (!override_stream)
         {
-            return status;
-        }
-        status = matrix_wait_limb_stream(bottom, limb_id, out_device, stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_wait_limb_stream(top, limb_id, out_device, stream);
+            if (status != 0) return status;
+            status = matrix_wait_limb_stream(bottom, limb_id, out_device, stream);
+            if (status != 0) return status;
+            status = matrix_wait_limb_stream(rhs, limb_id, out_device, stream);
+            if (status != 0) return status;
         }
 
         cudaError_t err = cudaSetDevice(out_device);
@@ -2325,42 +2668,66 @@ extern "C" int gpu_matrix_mul_vertical_pair(
             rhs_coeff_bytes,
             out_coeff_bytes,
             top->ctx->moduli[limb]);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+        };
+        status = register_trapdoor_kernel(
+            out->ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1, 2, 3});
+        if (status != 0)
+        {
+            return status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        status = matrix_track_limb_consumer(top, limb_id, out_device, stream);
-        if (status != 0)
+        if (!override_stream)
         {
-            return status;
-        }
-        status = matrix_track_limb_consumer(bottom, limb_id, out_device, stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_track_limb_consumer(rhs, limb_id, out_device, stream);
-        if (status != 0)
-        {
-            return status;
-        }
-        status = matrix_record_limb_write(out, limb_id, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_track_limb_consumer(top, limb_id, out_device, stream);
+            if (status != 0) return status;
+            status = matrix_track_limb_consumer(bottom, limb_id, out_device, stream);
+            if (status != 0) return status;
+            status = matrix_track_limb_consumer(rhs, limb_id, out_device, stream);
+            if (status != 0) return status;
+            status = matrix_record_limb_write(out, limb_id, stream);
+            if (status != 0) return status;
         }
     }
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
-extern "C" int gpu_matrix_preimage_residual(
+extern "C" int gpu_matrix_mul_vertical_pair(
+    GpuMatrix *out,
+    const GpuMatrix *top,
+    const GpuMatrix *bottom,
+    const GpuMatrix *rhs)
+{
+    return gpu_matrix_mul_vertical_pair_impl(out, top, bottom, rhs, nullptr);
+}
+
+extern "C" int gpu_matrix_mul_vertical_pair_on_stream(
+    GpuMatrix *out,
+    const GpuMatrix *top,
+    const GpuMatrix *bottom,
+    const GpuMatrix *rhs,
+    cudaStream_t stream)
+{
+    if (!stream) return set_error("null stream in gpu_matrix_mul_vertical_pair_on_stream");
+    return gpu_matrix_mul_vertical_pair_impl(out, top, bottom, rhs, stream);
+}
+
+static int gpu_matrix_preimage_residual_impl(
     GpuMatrix *out,
     const GpuMatrix *target,
     const GpuMatrix *public_matrix,
     const GpuMatrix *p1,
-    const GpuMatrix *p2)
+    const GpuMatrix *p2,
+    cudaStream_t override_stream)
 {
     if (out) out->host_observed_writer_ready.store(false, std::memory_order_release);
     if (!out || !target || !public_matrix || !p1 || !p2)
@@ -2440,20 +2807,18 @@ extern "C" int gpu_matrix_preimage_residual(
         {
             return status;
         }
+        if (override_stream)
+            stream = override_stream;
         for (size_t input_idx = 0; input_idx < 4; ++input_idx)
         {
             if (devices[input_idx] != out_device)
-            {
                 return set_error("device mismatch in gpu_matrix_preimage_residual");
-            }
             if (coeff_bytes[input_idx] != out_coeff_bytes)
-            {
                 return set_error("coefficient width mismatch in gpu_matrix_preimage_residual");
-            }
-            status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
-            if (status != 0)
+            if (!override_stream)
             {
-                return status;
+                status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
+                if (status != 0) return status;
             }
         }
 
@@ -2491,34 +2856,67 @@ extern "C" int gpu_matrix_preimage_residual(
             coeff_bytes[3],
             out_coeff_bytes,
             target->ctx->moduli[limb]);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+        };
+        status = register_trapdoor_kernel(
+            out->ctx, stream, argument_sizes, std::size(argument_sizes), {0, 1, 2, 3, 4});
+        if (status != 0)
+        {
+            return status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        for (const GpuMatrix *input : inputs)
+        if (!override_stream)
         {
-            status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
-            if (status != 0)
+            for (const GpuMatrix *input : inputs)
             {
-                return status;
+                status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
+                if (status != 0) return status;
             }
-        }
-        status = matrix_record_limb_write(out, limb_id, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_record_limb_write(out, limb_id, stream);
+            if (status != 0) return status;
         }
     }
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
 }
 
-extern "C" int gpu_matrix_preimage_add_correction(
+extern "C" int gpu_matrix_preimage_residual(
+    GpuMatrix *out,
+    const GpuMatrix *target,
+    const GpuMatrix *public_matrix,
+    const GpuMatrix *p1,
+    const GpuMatrix *p2)
+{
+    return gpu_matrix_preimage_residual_impl(out, target, public_matrix, p1, p2, nullptr);
+}
+
+extern "C" int gpu_matrix_preimage_residual_on_stream(
+    GpuMatrix *out,
+    const GpuMatrix *target,
+    const GpuMatrix *public_matrix,
+    const GpuMatrix *p1,
+    const GpuMatrix *p2,
+    cudaStream_t stream)
+{
+    if (!stream) return set_error("null stream in gpu_matrix_preimage_residual_on_stream");
+    return gpu_matrix_preimage_residual_impl(out, target, public_matrix, p1, p2, stream);
+}
+
+static int gpu_matrix_preimage_add_correction_impl(
     GpuMatrix *out,
     const GpuMatrix *r,
     const GpuMatrix *e,
-    const GpuMatrix *z)
+    const GpuMatrix *z,
+    cudaStream_t override_stream)
 {
     if (!out || !r || !e || !z)
     {
@@ -2596,10 +2994,12 @@ extern "C" int gpu_matrix_preimage_add_correction(
         {
             return status;
         }
-        status = matrix_wait_limb_stream(out, limb_id, out_device, stream);
-        if (status != 0)
+        if (override_stream)
+            stream = override_stream;
+        if (!override_stream)
         {
-            return status;
+            status = matrix_wait_limb_stream(out, limb_id, out_device, stream);
+            if (status != 0) return status;
         }
         for (size_t input_idx = 0; input_idx < 3; ++input_idx)
         {
@@ -2611,10 +3011,10 @@ extern "C" int gpu_matrix_preimage_add_correction(
             {
                 return set_error("coefficient width mismatch in gpu_matrix_preimage_add_correction");
             }
-            status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
-            if (status != 0)
+            if (!override_stream)
             {
-                return status;
+                status = matrix_wait_limb_stream(inputs[input_idx], limb_id, out_device, stream);
+                if (status != 0) return status;
             }
         }
 
@@ -2648,6 +3048,18 @@ extern "C" int gpu_matrix_preimage_add_correction(
             coeff_bytes[2],
             out_coeff_bytes,
             out->ctx->moduli[limb]);
+        const size_t top_argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+        };
+        status = register_trapdoor_kernel(
+            out->ctx, stream, top_argument_sizes, std::size(top_argument_sizes), {0, 1, 2, 3});
+        if (status != 0)
+        {
+            return status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
@@ -2671,27 +3083,59 @@ extern "C" int gpu_matrix_preimage_add_correction(
             coeff_bytes[2],
             out_coeff_bytes,
             out->ctx->moduli[limb]);
+        const size_t bottom_argument_sizes[] = {
+            sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(uint8_t), sizeof(uint8_t), sizeof(uint64_t),
+        };
+        status = register_trapdoor_kernel(
+            out->ctx,
+            stream,
+            bottom_argument_sizes,
+            std::size(bottom_argument_sizes),
+            {0, 1});
+        if (status != 0)
+        {
+            return status;
+        }
         err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             return set_error(err);
         }
-        for (const GpuMatrix *input : inputs)
+        if (!override_stream)
         {
-            status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
-            if (status != 0)
+            for (const GpuMatrix *input : inputs)
             {
-                return status;
+                status = matrix_track_limb_consumer(input, limb_id, out_device, stream);
+                if (status != 0) return status;
             }
-        }
-        status = matrix_record_limb_write(out, limb_id, stream);
-        if (status != 0)
-        {
-            return status;
+            status = matrix_record_limb_write(out, limb_id, stream);
+            if (status != 0) return status;
         }
     }
     out->format = GPU_POLY_FORMAT_EVAL;
     return 0;
+}
+
+extern "C" int gpu_matrix_preimage_add_correction(
+    GpuMatrix *out,
+    const GpuMatrix *r,
+    const GpuMatrix *e,
+    const GpuMatrix *z)
+{
+    return gpu_matrix_preimage_add_correction_impl(out, r, e, z, nullptr);
+}
+
+extern "C" int gpu_matrix_preimage_add_correction_on_stream(
+    GpuMatrix *out,
+    const GpuMatrix *r,
+    const GpuMatrix *e,
+    const GpuMatrix *z,
+    cudaStream_t stream)
+{
+    if (!stream) return set_error("null stream in gpu_matrix_preimage_add_correction_on_stream");
+    return gpu_matrix_preimage_add_correction_impl(out, r, e, z, stream);
 }
 
 extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
@@ -3100,6 +3544,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         }
 
         status = launch_gauss_samp_gq_arb_base_sample_kernel(
+            src->ctx,
             src_limb_bases[src_idx],
             sampled_digits_device,
             count,
@@ -3123,6 +3568,7 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
         const size_t src_digit_offset =
             static_cast<size_t>(src_limb) * static_cast<size_t>(digits_per_tower);
         status = launch_gauss_samp_gq_arb_base_scatter_kernel(
+            out->ctx,
             sampled_digits_device,
             out_limb_bases_device,
             out_limb_strides_device,
@@ -3181,6 +3627,63 @@ extern "C" int gpu_matrix_gauss_samp_gq_arb_base(
     return 0;
 }
 
+__global__ void initialize_preimage_retry_kernel(
+    MxxPreimageLaunchControl *device_control, MxxPreimageStatus *device_status,
+    MxxPreimageLaunchControl control)
+{
+    *device_control = control;
+    *device_status = MxxPreimageStatus{};
+}
+
+extern "C" int gpu_matrix_initialize_preimage_retry(
+    GpuP1CovarianceCache *cache, void *device_control, void *device_status,
+    const void *control, void *stream_raw)
+{
+    if (!cache || !device_control || !device_status || !control || !stream_raw)
+        return set_error("invalid preimage retry initialization");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    initialize_preimage_retry_kernel<<<1, 1, 0, stream>>>(
+        static_cast<MxxPreimageLaunchControl *>(device_control),
+        static_cast<MxxPreimageStatus *>(device_status),
+        *static_cast<const MxxPreimageLaunchControl *>(control));
+    const size_t sizes[] = {sizeof(void *), sizeof(void *), sizeof(MxxPreimageLaunchControl)};
+    const int status = register_trapdoor_kernel(cache->ctx, stream, sizes, std::size(sizes), {0, 1});
+    if (status != 0) return status;
+    const cudaError_t error = cudaGetLastError();
+    return error == cudaSuccess ? 0 : set_error(error);
+}
+
+extern "C" int gpu_preimage_status_reset(MxxPreimageStatus *device_status, cudaStream_t stream)
+{
+    if (!device_status)
+    {
+        return set_error("null preimage status in gpu_preimage_status_reset");
+    }
+    const cudaError_t err = cudaMemsetAsync(device_status, 0, sizeof(MxxPreimageStatus), stream);
+    return err == cudaSuccess ? 0 : set_error(err);
+}
+
+extern "C" int gpu_preimage_status_copy_async(
+    const MxxPreimageStatus *device_status,
+    MxxPreimageStatus *host_status,
+    cudaStream_t stream)
+{
+    if (!device_status || !host_status)
+    {
+        return set_error("null preimage status in gpu_preimage_status_copy_async");
+    }
+    // The caller owns the pinned host record and uses an existing event to
+    // establish the one D2H success-gate boundary. This wrapper deliberately
+    // does not synchronize or inspect the result on the host.
+    const cudaError_t err = cudaMemcpyAsync(
+        host_status,
+        device_status,
+        sizeof(MxxPreimageStatus),
+        cudaMemcpyDeviceToHost,
+        stream);
+    return err == cudaSuccess ? 0 : set_error(err);
+}
+
 extern "C" int gpu_matrix_create_p1_covariance_cache(
     const GpuMatrix *a_mat,
     const GpuMatrix *b_mat,
@@ -3188,8 +3691,10 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     double sigma,
     double s,
     double dgg_stddev,
+    void *capture_stream,
     GpuP1CovarianceCache **out_cache)
 {
+    const bool capture_owned = capture_stream != nullptr;
     if (!out_cache)
     {
         return set_error("null output in gpu_matrix_create_p1_covariance_cache");
@@ -3325,7 +3830,13 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     cache->sigma = sigma;
     cache->s = s;
     cache->device = ref_device;
-    err = cudaStreamCreateWithFlags(&cache->stream, cudaStreamNonBlocking);
+    if (capture_owned)
+    {
+        cache->stream = reinterpret_cast<cudaStream_t>(capture_stream);
+        cache->owns_stream = false;
+    }
+    else
+        err = cudaStreamCreateWithFlags(&cache->stream, cudaStreamNonBlocking);
     if (err != cudaSuccess)
     {
         delete cache;
@@ -3392,7 +3903,8 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
         return set_error(err);
     }
 
-    status = launch_precompute_p1_covariance_kernel(
+    if (!capture_owned) status = launch_precompute_p1_covariance_kernel(
+        a_mat->ctx,
         a_base,
         b_base,
         d_base,
@@ -3424,7 +3936,10 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
         cleanup();
         return set_error(err);
     }
-    cudaFreeAsync(cov_workspace, cache->stream);
+    if (capture_owned)
+        cache->capture_workspace = cov_workspace;
+    else
+        cudaFreeAsync(cov_workspace, cache->stream);
     cov_workspace = nullptr;
 
     status = matrix_track_limb_consumer(a_mat, ref_limb_id, ref_device, cache->stream);
@@ -3451,6 +3966,40 @@ extern "C" int gpu_matrix_create_p1_covariance_cache(
     return 0;
 }
 
+extern "C" int gpu_matrix_refresh_p1_covariance_cache(
+    GpuP1CovarianceCache *cache,
+    const GpuMatrix *a_mat,
+    const GpuMatrix *b_mat,
+    const GpuMatrix *d_mat,
+    double dgg_stddev,
+    void *body_stream)
+{
+    if (!cache || !cache->capture_workspace || !body_stream ||
+        !a_mat || !b_mat || !d_mat ||
+        a_mat->ctx != cache->ctx || b_mat->ctx != cache->ctx || d_mat->ctx != cache->ctx ||
+        a_mat->level != cache->level || b_mat->level != cache->level || d_mat->level != cache->level ||
+        a_mat->rows != cache->d_rows || a_mat->cols != cache->d_rows ||
+        b_mat->rows != cache->d_rows || b_mat->cols != cache->d_rows ||
+        d_mat->rows != cache->d_rows || d_mat->cols != cache->d_rows ||
+        a_mat->format != GPU_POLY_FORMAT_COEFF || b_mat->format != GPU_POLY_FORMAT_COEFF ||
+        d_mat->format != GPU_POLY_FORMAT_COEFF)
+        return set_error("invalid captured covariance cache refresh");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(body_stream);
+    const dim3 limb = cache->ctx->limb_gpu_ids[0];
+    size_t a_stride = 0, b_stride = 0, d_stride = 0;
+    uint8_t a_bytes = 0, b_bytes = 0, d_bytes = 0;
+    if (!matrix_limb_metadata_by_id(a_mat, limb, &a_stride, &a_bytes) ||
+        !matrix_limb_metadata_by_id(b_mat, limb, &b_stride, &b_bytes) ||
+        !matrix_limb_metadata_by_id(d_mat, limb, &d_stride, &d_bytes))
+        return set_error("invalid captured covariance limb metadata");
+    return launch_precompute_p1_covariance_kernel(
+        cache->ctx, matrix_limb_ptr_by_id(a_mat, 0, limb),
+        matrix_limb_ptr_by_id(b_mat, 0, limb), matrix_limb_ptr_by_id(d_mat, 0, limb),
+        a_stride, b_stride, d_stride, a_bytes, b_bytes, d_bytes,
+        cache->d_rows, cache->n, cache->modulus, cache->sigma, cache->s, dgg_stddev,
+        cache->device, stream, cache->capture_workspace, cache->sqrt_var, cache->update_coeff);
+}
+
 extern "C" void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cache)
 {
     if (!cache)
@@ -3460,6 +4009,8 @@ extern "C" void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cac
     if (cache->device >= 0)
     {
         cudaSetDevice(cache->device);
+        if (cache->capture_workspace)
+            cudaFreeAsync(cache->capture_workspace, cache->stream);
         if (cache->sqrt_var)
         {
             if (cache->stream)
@@ -3489,7 +4040,7 @@ extern "C" void gpu_matrix_destroy_p1_covariance_cache(GpuP1CovarianceCache *cac
             cudaEventDestroy(cache->ready_event);
             cache->ready_event = nullptr;
         }
-        if (cache->stream)
+        if (cache->stream && cache->owns_stream)
         {
             cudaStreamDestroy(cache->stream);
             cache->stream = nullptr;
@@ -3904,6 +4455,7 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
         }
 
         status = launch_scatter_p1_integer_to_limb_kernel_device(
+            out->ctx,
             sampled_for_device,
             out_base,
             out_stride,
@@ -3941,6 +4493,188 @@ extern "C" int gpu_matrix_sample_p1_full_cached(
     out->format = GPU_POLY_FORMAT_EVAL;
     cleanup();
     return 0;
+}
+
+extern "C" int gpu_matrix_sample_p1_full_cached_into(
+    const GpuP1CovarianceCache *cache,
+    const GpuMatrix *tp2,
+    const GpuRngSeed *device_seed,
+    int64_t *sampled_out,
+    void *workspace,
+    size_t workspace_bytes,
+    GpuMatrix *out,
+    void *body_stream,
+    uint32_t tp2_binding_index,
+    uint32_t seed_binding_index,
+    uint32_t sampled_binding_index,
+    uint32_t workspace_binding_index)
+{
+    if (!cache || !tp2 || !device_seed || !sampled_out || !out || !body_stream)
+        return set_error("invalid allocation-free cached p1 arguments");
+    if (cache->ctx != tp2->ctx || cache->ctx != out->ctx ||
+        cache->level != tp2->level || cache->level != out->level ||
+        tp2->format != GPU_POLY_FORMAT_COEFF || tp2->rows != 2 * cache->d_rows ||
+        out->rows != 2 * cache->d_rows || out->cols != tp2->cols)
+        return set_error("shape/context mismatch in allocation-free cached p1");
+    if (cache->level < 0 || cache->ctx->limb_gpu_ids.empty())
+        return set_error("invalid level in allocation-free cached p1");
+    const dim3 limb_id = cache->ctx->limb_gpu_ids[0];
+    int device = -1;
+    int status = matrix_limb_device(tp2, limb_id, &device);
+    if (status != 0 || device != cache->device)
+        return set_error("invalid reference device in allocation-free cached p1");
+    const uint8_t *tp2_base = matrix_limb_ptr_by_id(tp2, 0, limb_id);
+    size_t tp2_stride = 0;
+    uint8_t tp2_coeff_bytes = 0;
+    if (!tp2_base || !matrix_limb_metadata_by_id(tp2, limb_id, &tp2_stride, &tp2_coeff_bytes))
+        return set_error("invalid tp2 metadata in allocation-free cached p1");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(body_stream);
+    status = launch_sample_p1_integer_cached_kernel_into(
+        tp2_base, tp2_stride, tp2_coeff_bytes, cache, tp2->cols, sampled_out,
+        workspace, workspace_bytes, device_seed, stream, tp2_binding_index,
+        seed_binding_index, sampled_binding_index, workspace_binding_index);
+    if (status != 0) return status;
+
+    out->format = GPU_POLY_FORMAT_COEFF;
+    for (int limb = 0; limb <= cache->level; ++limb)
+    {
+        const dim3 out_limb_id = cache->ctx->limb_gpu_ids[static_cast<size_t>(limb)];
+        int out_device = -1;
+        status = matrix_limb_device(out, out_limb_id, &out_device);
+        if (status != 0 || out_device != device)
+            return set_error("allocation-free cached p1 requires one device");
+        uint8_t *out_base = matrix_limb_ptr_by_id(out, 0, out_limb_id);
+        size_t out_stride = 0;
+        uint8_t out_coeff_bytes = 0;
+        if (!out_base || !matrix_limb_metadata_by_id(out, out_limb_id, &out_stride, &out_coeff_bytes))
+            return set_error("invalid output metadata in allocation-free cached p1");
+        status = launch_scatter_p1_integer_to_limb_kernel_device(
+            out->ctx, sampled_out, out_base, out_stride, out_coeff_bytes,
+            2 * cache->d_rows * tp2->cols, cache->n,
+            cache->ctx->moduli[static_cast<size_t>(limb)], stream, device);
+        if (status != 0) return status;
+    }
+    status = gpu_matrix_ntt_all_on_stream(out, stream);
+    if (status != 0) return status;
+    return 0;
+}
+
+extern "C" int gpu_matrix_gauss_samp_gq_arb_base_into(
+    const GpuMatrix *src,
+    GpuMatrix *out,
+    const GpuRngSeed *device_seed,
+    int64_t *sampled_digits,
+    size_t sampled_capacity_bytes,
+    uint32_t base_bits,
+    double c,
+    uint8_t *const *dst_bases_device,
+    const size_t *dst_strides_device,
+    const uint8_t *dst_coeff_bytes_device,
+    const uint64_t *dst_moduli_device,
+    void *body_stream,
+    uint32_t src_binding_index,
+    uint32_t out_bases_binding_index,
+    uint32_t out_strides_binding_index,
+    uint32_t out_coeff_bytes_binding_index,
+    uint32_t out_moduli_binding_index,
+    uint32_t seed_binding_index,
+    uint32_t sampled_binding_index)
+{
+    if (!src || !out || !device_seed || !sampled_digits || !dst_bases_device ||
+        !dst_strides_device || !dst_coeff_bytes_device || !dst_moduli_device ||
+        !body_stream || !(c > 0.0))
+        return set_error("invalid allocation-free Gaussian sampler arguments");
+    if (src->ctx != out->ctx || src->format != GPU_POLY_FORMAT_COEFF || src->level < 0)
+        return set_error("invalid source/output in allocation-free Gaussian sampler");
+    const size_t depth = static_cast<size_t>(src->level + 1);
+    if (src->ctx->moduli.size() < depth || src->ctx->limb_gpu_ids.size() < depth)
+        return set_error("invalid context in allocation-free Gaussian sampler");
+    if (base_bits == 0 || base_bits >= 63)
+        return set_error("invalid base in allocation-free Gaussian sampler");
+    uint32_t crt_bits = 0;
+    for (size_t limb = 0; limb < depth; ++limb)
+        crt_bits = std::max(crt_bits, bit_width_u64(src->ctx->moduli[limb]));
+    const uint32_t digits = (crt_bits + base_bits - 1) / base_bits;
+    if (digits == 0 || digits > kGaussMaxDigits)
+        return set_error("invalid digits in allocation-free Gaussian sampler");
+    const size_t n = static_cast<size_t>(src->ctx->N);
+    const size_t count = src->rows * src->cols;
+    const size_t per_limb_bytes = count * n * static_cast<size_t>(digits) * sizeof(int64_t);
+    if (depth > 0 && per_limb_bytes > std::numeric_limits<size_t>::max() / depth)
+        return set_error("Gaussian scratch size overflow");
+    const size_t required = depth * per_limb_bytes;
+    if (sampled_capacity_bytes < required)
+        return set_error("insufficient fixed Gaussian scratch");
+    if (out->rows != src->rows * static_cast<size_t>(digits) * depth || out->cols != src->cols)
+        return set_error("Gaussian output shape mismatch");
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(body_stream);
+    out->format = GPU_POLY_FORMAT_COEFF;
+    for (size_t limb = 0; limb < depth; ++limb)
+    {
+        const dim3 limb_id = src->ctx->limb_gpu_ids[limb];
+        int device = -1;
+        int status = matrix_limb_device(src, limb_id, &device);
+        if (status != 0) return status;
+        const uint8_t *src_base = matrix_limb_ptr_by_id(src, 0, limb_id);
+        size_t src_stride = 0;
+        uint8_t src_coeff_bytes = 0;
+        if (!src_base || !matrix_limb_metadata_by_id(src, limb_id, &src_stride, &src_coeff_bytes))
+            return set_error("invalid Gaussian source metadata");
+        cudaError_t err = cudaSetDevice(device);
+        if (err != cudaSuccess) return set_error(err);
+        int64_t *limb_sampled = reinterpret_cast<int64_t *>(
+            reinterpret_cast<uint8_t *>(sampled_digits) + limb * per_limb_bytes);
+        const size_t total = count * n;
+        matrix_gauss_samp_gq_arb_base_sample_kernel_device_seed<<<
+            static_cast<int>((total + 255) / 256), 256, 0, stream>>>(
+            src_base, limb_sampled, count, n, src_stride, src_coeff_bytes,
+            src->ctx->moduli[limb], base_bits, digits, c,
+            static_cast<uint32_t>(limb), device_seed);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return set_error(err);
+        const size_t sample_args[] = {
+            sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(uint8_t), sizeof(uint64_t), sizeof(uint32_t), sizeof(uint32_t),
+            sizeof(double), sizeof(uint32_t), sizeof(void *),
+        };
+        MxxGraphPatch sample_patches[3] = {
+            trapdoor_pointer_patch(0, src_binding_index),
+            trapdoor_pointer_patch(1, sampled_binding_index),
+            trapdoor_pointer_patch(11, seed_binding_index),
+        };
+        sample_patches[1].address_addend = static_cast<uint64_t>(limb * per_limb_bytes);
+        status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), sample_args,
+            std::size(sample_args), sample_patches, std::size(sample_patches));
+        if (status != 0) return status;
+
+        const uint32_t blocks = static_cast<uint32_t>((total + 255) / 256);
+        matrix_gauss_samp_gq_arb_base_scatter_kernel<<<
+            dim3(blocks, static_cast<uint32_t>(depth), 1U), 256, 0, stream>>>(
+            limb_sampled, dst_bases_device, dst_strides_device, dst_coeff_bytes_device,
+            dst_moduli_device, depth, count, n, src->cols, out->cols,
+            static_cast<size_t>(digits) * depth, limb * static_cast<size_t>(digits), digits);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return set_error(err);
+        const size_t scatter_args[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t), sizeof(uint32_t),
+        };
+        MxxGraphPatch scatter_patches[5] = {
+            trapdoor_pointer_patch(0, sampled_binding_index),
+            trapdoor_pointer_patch(1, out_bases_binding_index),
+            trapdoor_pointer_patch(2, out_strides_binding_index),
+            trapdoor_pointer_patch(3, out_coeff_bytes_binding_index),
+            trapdoor_pointer_patch(4, out_moduli_binding_index),
+        };
+        scatter_patches[0].address_addend = static_cast<uint64_t>(limb * per_limb_bytes);
+        status = mxx_graph_register_kernel_update_for_stream(
+            out->ctx, reinterpret_cast<void *>(stream), scatter_args,
+            std::size(scatter_args), scatter_patches, std::size(scatter_patches));
+        if (status != 0) return status;
+    }
+    return gpu_matrix_ntt_all_on_stream(out, stream);
 }
 
 extern "C" int gpu_matrix_sample_p1_full(
@@ -4273,6 +5007,7 @@ extern "C" int gpu_matrix_sample_p1_full(
 
     int64_t *sampled_ref_device = nullptr;
     status = launch_sample_p1_integer_kernel(
+        a_mat->ctx,
         ref_a_base,
         ref_b_base,
         ref_d_base,
@@ -4517,6 +5252,7 @@ extern "C" int gpu_matrix_sample_p1_full(
         }
 
         status = launch_scatter_p1_integer_to_limb_kernel_device(
+            out->ctx,
             sampled_for_device,
             out_base,
             out_stride,

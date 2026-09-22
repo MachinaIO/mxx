@@ -508,11 +508,11 @@ fn validate_node(
                         artifact: artifact.artifact_name.clone(),
                     }
                 })?;
-                if artifact.confidentiality != stored.confidentiality {
+                if artifact.availability != stored.availability {
                     return node_error(
                         scope,
                         node.id,
-                        "artifact confidentiality does not match manifest",
+                        "artifact availability does not match manifest",
                     );
                 }
                 let (element, count) = family_element(&declared);
@@ -558,12 +558,14 @@ fn validate_node(
                 return node_error(scope, node.id, "invalid gadget trapdoor dimensions or base");
             }
             let digit_count = matrix.columns / matrix.rows;
+            let preimage_max_coefficient_bound = (&gadget_base + BigInt::one()) / 2;
             vec![ConcreteWireType::Trapdoor {
                 matrix,
-                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone())),
+                sigma: crate::RealExpr::FromInt(IntExpr::constant(gadget_base.clone()))
+                    .close(env)?,
                 gadget_base,
                 digit_count,
-                preimage_max_coefficient_bound: BigInt::zero(),
+                preimage_max_coefficient_bound,
             }]
         }
         NodeKind::TrapdoorPublic => {
@@ -691,24 +693,12 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
         }
-        NodeKind::ModulusSwitch { modulus } |
-        NodeKind::ModulusReduce { modulus } |
-        NodeKind::CenteredRebase { modulus } => {
+        NodeKind::ModulusSwitch { modulus } | NodeKind::ModulusReduce { modulus } => {
             require_arity(scope, node, 1)?;
-            let input = match argument(scope, values, node, 0)? {
-                ConcreteWireType::Matrix(matrix) => matrix.clone(),
-                _ => {
-                    return node_error(
-                        scope,
-                        node.id,
-                        "modulus conversion requires an ordinary matrix",
-                    )
-                }
-            };
+            let input = matrix_argument(scope, values, node, 0)?;
             let modulus = modulus.evaluate(env)?;
             if modulus <= BigInt::one() ||
-                (!matches!(node.kind, NodeKind::CenteredRebase { .. }) &&
-                    (&input.modulus % &modulus) != BigInt::zero()) ||
+                (&input.modulus % &modulus) != BigInt::zero() ||
                 (matches!(node.kind, NodeKind::ModulusSwitch { .. }) &&
                     ((&input.modulus % 2u8).is_zero() || (&modulus % 2u8).is_zero()))
             {
@@ -719,6 +709,106 @@ fn validate_node(
                 );
             }
             vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..input })]
+        }
+        NodeKind::CenteredRebase { modulus } => {
+            require_arity(scope, node, 1)?;
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::one() {
+                return node_error(scope, node.id, "centered rebase destination must exceed one");
+            }
+            let input = argument(scope, values, node, 0)?.clone();
+            match input {
+                ConcreteWireType::Matrix(matrix) => {
+                    vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus, ..matrix })]
+                }
+                ConcreteWireType::SmallMatrix { matrix, max_coefficient_bound } |
+                ConcreteWireType::Preimage { matrix, max_coefficient_bound } => {
+                    if (&modulus % &matrix.modulus) != BigInt::zero() &&
+                        max_coefficient_bound > (&modulus >> 1)
+                    {
+                        return node_error(
+                            scope,
+                            node.id,
+                            "compact centered rebase does not preserve canonical signed coefficients",
+                        );
+                    }
+                    vec![ConcreteWireType::SmallMatrix {
+                        matrix: ConcreteMatrixType { modulus, ..matrix },
+                        max_coefficient_bound,
+                    }]
+                }
+                _ => {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "centered rebase requires a matrix or bounded compact matrix",
+                    )
+                }
+            }
+        }
+        NodeKind::CenteredRoundDivide { divisor } => {
+            require_arity(scope, node, 1)?;
+            let divisor = divisor.evaluate(env)?;
+            if divisor <= BigInt::zero() {
+                return node_error(scope, node.id, "centered round divisor must be positive");
+            }
+            vec![ConcreteWireType::Matrix(matrix_argument(scope, values, node, 0)?)]
+        }
+        NodeKind::BlockModSwitch { modulus, source_moduli, plaintext_modulus } => {
+            require_arity(scope, node, 1)?;
+            let input = matrix_argument(scope, values, node, 0)?;
+            let destination = modulus.evaluate(env)?;
+            let plaintext = plaintext_modulus.evaluate(env)?;
+            if source_moduli.is_empty() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch requires a nonempty source basis",
+                );
+            }
+            let mut source_product = BigInt::one();
+            let mut destination_product = BigInt::one();
+            let mut destination_members = 0usize;
+            for prime in source_moduli {
+                let prime_value = BigInt::from(*prime);
+                if *prime <= 2 ||
+                    (*prime - 1) as u128 % (2 * input.ring_dimension as u128) != 0 ||
+                    !source_product.gcd(&prime_value).is_one()
+                {
+                    return node_error(
+                        scope,
+                        node.id,
+                        "block modulus switch requires distinct coprime NTT-compatible odd source moduli",
+                    );
+                }
+                source_product *= &prime_value;
+                if (&destination % &prime_value).is_zero() {
+                    destination_product *= &prime_value;
+                    destination_members += 1;
+                }
+            }
+            if source_product != input.modulus ||
+                destination <= BigInt::one() ||
+                destination_product != destination ||
+                destination_members == 0 ||
+                destination_members == source_moduli.len() ||
+                plaintext <= BigInt::zero()
+            {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch requires a strict nonempty CRT subset and positive correction factor",
+                );
+            }
+            let dropped_product = &source_product / &destination;
+            if !plaintext.gcd(&dropped_product).is_one() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "block modulus switch correction factor must be coprime to the dropped basis",
+                );
+            }
+            vec![ConcreteWireType::Matrix(ConcreteMatrixType { modulus: destination, ..input })]
         }
         NodeKind::RnsModUp { modulus, source_moduli, .. } |
         NodeKind::RnsModDown { modulus, source_moduli, .. } => {
@@ -1704,11 +1794,22 @@ fn validate_constant(
     node: NodeId,
 ) -> Result<(), ValidationError> {
     match value {
+        ConstantMatrix::Zero => Ok(()),
+        ConstantMatrix::Identity if matrix.rows != matrix.columns => {
+            node_error(scope, node, "identity constant requires a square matrix")
+        }
+        ConstantMatrix::Identity => Ok(()),
+        ConstantMatrix::UnitRow { .. } if matrix.rows != 1 => {
+            node_error(scope, node, "unit-row constant requires exactly one row")
+        }
         ConstantMatrix::UnitRow { index }
             if nonnegative_usize(index.evaluate(env)?, "unit-row index", scope, node)? >=
                 matrix.columns =>
         {
             node_error(scope, node, "unit-row index is out of range")
+        }
+        ConstantMatrix::UnitColumn { .. } if matrix.columns != 1 => {
+            node_error(scope, node, "unit-column constant requires exactly one column")
         }
         ConstantMatrix::UnitColumn { index }
             if nonnegative_usize(index.evaluate(env)?, "unit-column index", scope, node)? >=
@@ -1716,19 +1817,34 @@ fn validate_constant(
         {
             node_error(scope, node, "unit-column index is out of range")
         }
+        ConstantMatrix::Gadget { .. } if !matrix.columns.is_multiple_of(matrix.rows) => {
+            node_error(scope, node, "gadget constant columns must be a multiple of rows")
+        }
         ConstantMatrix::Gadget { base, .. } if base.evaluate(env)?.abs() <= BigInt::one() => {
             node_error(scope, node, "gadget base must exceed one")
+        }
+        ConstantMatrix::Gadget { .. } => Ok(()),
+        ConstantMatrix::PowerOfBase { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "power-of-base constant requires a 1x1 matrix")
         }
         ConstantMatrix::PowerOfBase { base, exponent }
             if base.evaluate(env)?.is_zero() || exponent.evaluate(env)?.is_negative() =>
         {
             node_error(scope, node, "invalid power-of-base constant")
         }
+        ConstantMatrix::PowerOfBase { .. } => Ok(()),
+        ConstantMatrix::Rotation { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "rotation constant requires a 1x1 matrix")
+        }
         ConstantMatrix::Rotation { exponent }
             if nonnegative_usize(exponent.evaluate(env)?, "rotation exponent", scope, node)? >=
                 matrix.ring_dimension =>
         {
             node_error(scope, node, "rotation exponent is out of range")
+        }
+        ConstantMatrix::Rotation { .. } => Ok(()),
+        ConstantMatrix::Polynomial { .. } if matrix.rows != 1 || matrix.columns != 1 => {
+            node_error(scope, node, "polynomial constant requires a 1x1 matrix")
         }
         ConstantMatrix::Polynomial { coefficients }
             if coefficients.len() > matrix.ring_dimension =>
@@ -1986,7 +2102,7 @@ mod tests {
                 artifact: Some(ArtifactInput {
                     production_id: production_id.clone(),
                     artifact_name: artifact_name.clone(),
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
+                    availability: crate::artifact::ArtifactAvailability::Transferred,
                 }),
             },
             Vec::new(),
@@ -2002,8 +2118,7 @@ mod tests {
                 ManifestArtifact {
                     artifact_type,
                     family_count: None,
-                    confidentiality: crate::artifact::ArtifactConfidentiality::Public,
-                    content_hash: None,
+                    availability: crate::artifact::ArtifactAvailability::Transferred,
                     layout: None,
                 },
             )]),
@@ -2073,7 +2188,7 @@ mod tests {
             Vec::new(),
             BTreeMap::from([(
                 "output".to_owned(),
-                GraphOutput { value: output, confidentiality: None },
+                GraphOutput { value: output, availability: None },
             )]),
             Vec::new(),
             Vec::new(),
@@ -2088,6 +2203,117 @@ mod tests {
             ValidationError::Node { message, .. } => message,
             ValidationError::ParameterConstraint(message) => message,
             other => panic!("expected node validation error, got {other:?}"),
+        }
+    }
+
+    fn validate_constant_matrix(matrix: MatrixType, value: ConstantMatrix) -> Result<(), String> {
+        let output = NodeHandle::new(
+            NodeKind::ConstantMatrix { matrix_type: matrix.clone(), value },
+            Vec::new(),
+            vec![WireType::Matrix(matrix)],
+        )
+        .output(0)
+        .expect("constant matrix output");
+        validate(&graph("constant-shape", output), &ParamEnv::default())
+            .map(|_| ())
+            .map_err(node_message)
+    }
+
+    #[test]
+    fn every_constant_matrix_variant_accepts_its_production_shape() {
+        assert!(validate_constant_matrix(matrix_type(17, 2, 3), ConstantMatrix::Zero).is_ok());
+        assert!(validate_constant_matrix(matrix_type(17, 2, 2), ConstantMatrix::Identity).is_ok());
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 3),
+                ConstantMatrix::UnitRow { index: IntExpr::constant(2) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 3, 1),
+                ConstantMatrix::UnitColumn { index: IntExpr::constant(2) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 2, 4),
+                ConstantMatrix::Gadget { base: IntExpr::constant(2), small: false },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::PowerOfBase {
+                    base: IntExpr::constant(2),
+                    exponent: IntExpr::constant(3),
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::Rotation { exponent: IntExpr::constant(7) },
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_constant_matrix(
+                matrix_type(17, 1, 1),
+                ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(1)] },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn constant_matrix_variants_reject_shapes_the_backend_cannot_execute() {
+        let invalid = [
+            (
+                matrix_type(17, 1, 2),
+                ConstantMatrix::Identity,
+                "identity constant requires a square matrix",
+            ),
+            (
+                matrix_type(17, 2, 3),
+                ConstantMatrix::UnitRow { index: IntExpr::constant(0) },
+                "unit-row constant requires exactly one row",
+            ),
+            (
+                matrix_type(17, 2, 2),
+                ConstantMatrix::UnitColumn { index: IntExpr::constant(0) },
+                "unit-column constant requires exactly one column",
+            ),
+            (
+                matrix_type(17, 2, 3),
+                ConstantMatrix::Gadget { base: IntExpr::constant(2), small: false },
+                "gadget constant columns must be a multiple of rows",
+            ),
+            (
+                matrix_type(17, 1, 2),
+                ConstantMatrix::PowerOfBase {
+                    base: IntExpr::constant(2),
+                    exponent: IntExpr::constant(1),
+                },
+                "power-of-base constant requires a 1x1 matrix",
+            ),
+            (
+                matrix_type(17, 2, 1),
+                ConstantMatrix::Rotation { exponent: IntExpr::constant(1) },
+                "rotation constant requires a 1x1 matrix",
+            ),
+            (
+                matrix_type(17, 2, 1),
+                ConstantMatrix::Polynomial { coefficients: vec![IntExpr::constant(1)] },
+                "polynomial constant requires a 1x1 matrix",
+            ),
+        ];
+        for (matrix, value, expected) in invalid {
+            assert_eq!(validate_constant_matrix(matrix, value).unwrap_err(), expected);
         }
     }
 
@@ -2609,6 +2835,106 @@ mod tests {
                 vec![WireType::Matrix(matrix_type(modulus, 2, 3))],
             );
             assert_eq!(validate(&graph("rebase", rebased), &ParamEnv::default()).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn centered_round_divide_requires_positive_divisor_and_preserves_shape() {
+        for (divisor, valid) in [(3, true), (1, true), (0, false), (-2, false)] {
+            let source = input("source", matrix_type(257, 2, 3));
+            let divided = value(
+                NodeKind::CenteredRoundDivide { divisor: IntExpr::constant(divisor) },
+                vec![source],
+                vec![WireType::Matrix(matrix_type(257, 2, 3))],
+            );
+            assert_eq!(
+                validate(&graph("centered-round-divide", divided), &ParamEnv::default()).is_ok(),
+                valid
+            );
+        }
+    }
+
+    #[test]
+    fn compact_centered_rebase_rejects_noncanonical_shrinking() {
+        for (bound, destination, valid) in [(40, 17, false), (8, 17, true), (40, 97 * 17, true)] {
+            for preimage in [false, true] {
+                let rebased = value(
+                    NodeKind::CenteredRebase { modulus: IntExpr::constant(destination) },
+                    vec![bounded_input("source", matrix_type(97, 2, 3), bound, preimage)],
+                    vec![WireType::SmallMatrix {
+                        matrix: matrix_type(destination, 2, 3),
+                        max_coefficient_bound: IntExpr::constant(bound),
+                    }],
+                );
+                assert_eq!(
+                    validate(&graph("compact-domain", rebased), &ParamEnv::default()).is_ok(),
+                    valid
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn centered_rebase_preserves_compact_bounds() {
+        for preimage in [false, true] {
+            let source = bounded_input("source", matrix_type(17, 2, 3), 7, preimage);
+            let rebased = value(
+                NodeKind::CenteredRebase { modulus: IntExpr::constant(257) },
+                vec![source],
+                vec![WireType::SmallMatrix {
+                    matrix: matrix_type(257, 2, 3),
+                    max_coefficient_bound: IntExpr::constant(7),
+                }],
+            );
+            let validated = validate(&graph("compact-rebase", rebased), &ParamEnv::default())
+                .expect("compact centered rebase should preserve its bound");
+            assert!(validated.root_scope().wire_types.values().any(|ty| {
+                matches!(
+                    ty,
+                    ConcreteWireType::SmallMatrix { max_coefficient_bound, .. } |
+                        ConcreteWireType::Preimage { max_coefficient_bound, .. }
+                        if max_coefficient_bound == &BigInt::from(7)
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn block_mod_switch_requires_strict_source_basis_subset_and_coprime_t() {
+        let source_basis = vec![17, 97];
+        let valid = value(
+            NodeKind::BlockModSwitch {
+                modulus: IntExpr::constant(97),
+                source_moduli: source_basis.clone(),
+                plaintext_modulus: IntExpr::constant(3),
+            },
+            vec![input("source", matrix_type(17 * 97, 2, 3))],
+            vec![WireType::Matrix(matrix_type(97, 2, 3))],
+        );
+        assert!(validate(&graph("block-mod-switch", valid), &ParamEnv::default()).is_ok());
+
+        for (destination, basis, plaintext, expected) in [
+            (17 * 97, vec![17, 97], 3, "strict nonempty CRT subset"),
+            (17, vec![17, 97], 97, "correction factor"),
+            (97, vec![17, 17], 3, "distinct coprime"),
+            (19, vec![17, 97], 3, "strict nonempty CRT subset"),
+        ] {
+            let candidate = value(
+                NodeKind::BlockModSwitch {
+                    modulus: IntExpr::constant(destination),
+                    source_moduli: basis,
+                    plaintext_modulus: IntExpr::constant(plaintext),
+                },
+                vec![input("source", matrix_type(17 * 97, 2, 3))],
+                vec![WireType::Matrix(matrix_type(destination, 2, 3))],
+            );
+            assert!(
+                node_message(
+                    validate(&graph("invalid-block-mod-switch", candidate), &ParamEnv::default())
+                        .unwrap_err()
+                )
+                .contains(expected)
+            );
         }
     }
 

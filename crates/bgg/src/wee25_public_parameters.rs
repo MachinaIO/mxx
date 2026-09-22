@@ -89,12 +89,12 @@ impl Wee25PublicParameterCompiler {
         mut context: DslContext,
         wires: Wee25PublicParameterPreprocessingWires,
     ) -> Result<DslContext, DslError> {
-        context = context.public_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
-        context = context.private_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
-        context = context.public_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
+        context = context.transferred_output(WEE25_PUBLIC_B, wires.public_parameters.b)?;
+        context = context.transferred_trapdoor_output(WEE25_PUBLIC_B_TRAPDOOR, wires.b_trapdoor)?;
+        context = context.transferred_output(WEE25_T_BOTTOM, wires.public_parameters.t_bottom)?;
         for (index, family) in wires.public_parameters.t_top.into_iter().enumerate() {
             let part_count = self.layout.public_parameter_part_count();
-            context = context.public_output(
+            context = context.transferred_output(
                 self.layout.public_parameter_top_name(index / part_count, index % part_count),
                 family,
             )?;
@@ -219,12 +219,12 @@ mod tests {
 
     type HashSampler = DCRTPolyHashSampler<keccak_asm::Keccak256>;
 
-    fn small_matrix_output(
+    fn preimage_output(
         result: &ExecutionResult<CpuDcrtBackend>,
         name: &str,
     ) -> CpuSmallMatrix<DCRTPolyMatrix> {
-        let RuntimeValue::SmallMatrix(value) = &result.outputs[name] else {
-            panic!("{name} must be a compact matrix output")
+        let RuntimeValue::Preimage(value) = &result.outputs[name] else {
+            panic!("{name} must be a preimage output")
         };
         value.as_ref().clone()
     }
@@ -343,7 +343,7 @@ mod tests {
                     let expected = gadget.clone() * &j - &(w * bottom);
                     assert_eq!(
                         b.clone()
-                            .multiply_small_rhs(&small_matrix_output(
+                            .multiply_small_rhs(&preimage_output(
                                 &result,
                                 &format!("top-{digit_row}-{part}-{block}"),
                             ))

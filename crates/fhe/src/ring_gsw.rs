@@ -1,8 +1,8 @@
 use crate::{
     FheCommonParams, FheError, FheScheme,
-    utils::{self, check_matrix, scalar},
+    utils::{check_matrix, scalar},
 };
-use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Int, Mat, MatType, parallel};
+use mxx_dsl::{DslError, GraphValue, GraphValueSchema, Mat, MatType};
 use mxx_ir_core::{
     IntExpr, ValueHandle,
     node::{ConcatAxis, IndexRange},
@@ -205,16 +205,8 @@ impl FheScheme for RingGswParams {
         for part in [secret, &ciphertext.a, &ciphertext.b] {
             check_matrix(p, part, 1, 1)?;
         }
-        // Center before rounding: a residue near q represents a small negative
-        // phase. Packing the decoded integers returns canonical R_q residues.
         let phase = &ciphertext.b - secret * &ciphertext.a;
-        let coefficients = utils::extract(p, &phase)?;
-        let delta = BigInt::from(self.scale.clone());
-        let decoded = parallel(p.ring_dimension(), |index| {
-            let value = utils::centered(coefficients.at(index), p.modulus().as_ref())?;
-            Ok(value.mul(2).add(Int::constant(delta.clone())).div(Int::constant(&delta * 2)))
-        })?;
-        utils::pack(p, &decoded)
+        Ok(phase.centered_round_divide(self.scale.clone()))
     }
     fn add(
         &self,
@@ -261,9 +253,9 @@ mod tests {
         let ct = scheme.encrypt(&ek, &common.ring().from_coefficients(&message)).unwrap();
         let doubled = scheme.add(&ct, &ct).unwrap();
         let mut ctx = ctx
-            .private_output("roundtrip", scheme.decrypt(&sk, &ct).unwrap().coefficients())
+            .transferred_output("roundtrip", scheme.decrypt(&sk, &ct).unwrap().coefficients())
             .unwrap()
-            .private_output("double", scheme.decrypt(&sk, &doubled).unwrap().coefficients())
+            .transferred_output("double", scheme.decrypt(&sk, &doubled).unwrap().coefficients())
             .unwrap();
         let mut inputs = BTreeMap::new();
         // Sample coefficients of m(X) within the declared plaintext bound of 2.
@@ -280,7 +272,7 @@ mod tests {
                 scheme.encrypt_gsw(&sk, &common.ring().from_coefficients(&multiplier)).unwrap();
             let result = scheme.mul(&ct, &gsw, &()).unwrap();
             ctx = ctx
-                .private_output(
+                .transferred_output(
                     format!("result-{name}"),
                     scheme.decrypt(&sk, &result).unwrap().coefficients(),
                 )
@@ -293,7 +285,7 @@ mod tests {
         let gsw = scheme.encrypt_gsw(&sk, &common.ring().from_coefficients(&polynomial)).unwrap();
         let product = scheme.mul(&ct, &gsw, &()).unwrap();
         ctx = ctx
-            .private_output(
+            .transferred_output(
                 "polynomial-product",
                 scheme.decrypt(&sk, &product).unwrap().coefficients(),
             )
@@ -457,11 +449,11 @@ mod tests {
         let residual =
             &sum.b - &secret * &sum.a - &expected * scalar(&common.ring, scheme.scale.clone());
         let graph = context
-            .private_output("decoded", scheme.decrypt(&secret, &sum).unwrap().coefficients())
+            .transferred_output("decoded", scheme.decrypt(&secret, &sum).unwrap().coefficients())
             .unwrap()
-            .private_output("expected", expected.coefficients())
+            .transferred_output("expected", expected.coefficients())
             .unwrap()
-            .private_output("residual", residual.coefficients())
+            .transferred_output("residual", residual.coefficients())
             .unwrap()
             .build()
             .unwrap();

@@ -82,8 +82,10 @@ pub enum ProtocolError {
     ArtifactNameMismatch,
     #[error("an artifact binding connects incompatible wire types")]
     ArtifactTypeMismatch,
-    #[error("an artifact binding connects incompatible confidentiality declarations")]
-    ArtifactConfidentialityMismatch,
+    #[error("an artifact binding connects incompatible availability declarations")]
+    ArtifactAvailabilityMismatch,
+    #[error("protocol stage IDs must be unique")]
+    DuplicateStageId,
     #[error("a workflow stage does not contribute to the entrypoint")]
     UnreachableStage,
     #[error("protocol parameter names must be unique")]
@@ -108,7 +110,7 @@ impl ProtocolDecl {
             .map(|stage| (stage.id.clone(), stage))
             .collect::<BTreeMap<_, _>>();
         self.validate_parameters()?;
-        self.validate_bindings(&stages)?;
+        validate_stage_artifact_bindings(&self.bundle.workflow.stages)?;
         self.validate_reachability(&stages)?;
         Ok(())
     }
@@ -173,65 +175,76 @@ impl ProtocolDecl {
             })
             .collect()
     }
+}
 
-    fn validate_bindings(
-        &self,
-        stages: &BTreeMap<StageId, &ProtocolStage>,
-    ) -> Result<(), ProtocolError> {
-        for stage in &self.bundle.workflow.stages {
-            let inputs = Self::stage_inputs(stage);
-            let artifact_inputs = inputs
-                .iter()
-                .filter_map(|(name, (_, artifact))| artifact.is_some().then_some(name.as_str()))
-                .collect::<BTreeSet<_>>();
-            let bound = stage
-                .bindings
-                .iter()
-                .map(|binding| binding.consumer_input.0.as_str())
-                .collect::<BTreeSet<_>>();
-            if bound.len() != stage.bindings.len() {
-                return Err(ProtocolError::DuplicateArtifactBinding);
+/// Validate artifact endpoints and bindings without requiring a complete
+/// protocol declaration (proof bundle, comparator, or ideal graph).
+///
+/// The stage slice is the sole source of truth: callers can validate a
+/// candidate workflow before publishing it, and `ProtocolDecl::validate`
+/// invokes this same entry point. No catalog or implicit binding conversion is
+/// performed here.
+pub fn validate_stage_artifact_bindings(stages: &[ProtocolStage]) -> Result<(), ProtocolError> {
+    let stage_map =
+        stages.iter().map(|stage| (stage.id.clone(), stage)).collect::<BTreeMap<_, _>>();
+    if stage_map.len() != stages.len() {
+        return Err(ProtocolError::DuplicateStageId);
+    }
+    for stage in stages {
+        let inputs = ProtocolDecl::stage_inputs(stage);
+        let artifact_inputs = inputs
+            .iter()
+            .filter_map(|(name, (_, artifact))| artifact.is_some().then_some(name.as_str()))
+            .collect::<BTreeSet<_>>();
+        let bound = stage
+            .bindings
+            .iter()
+            .map(|binding| binding.consumer_input.0.as_str())
+            .collect::<BTreeSet<_>>();
+        if bound.len() != stage.bindings.len() {
+            return Err(ProtocolError::DuplicateArtifactBinding);
+        }
+        if !artifact_inputs.is_subset(&bound) {
+            return Err(ProtocolError::MissingArtifactBinding);
+        }
+        if !bound.is_subset(&artifact_inputs) {
+            return Err(ProtocolError::InvalidArtifactConsumer);
+        }
+        for binding in &stage.bindings {
+            let producer = stage_map
+                .get(&binding.producer_stage)
+                .ok_or(ProtocolError::MissingProducerStage)?;
+            let output = producer
+                .graph
+                .outputs()
+                .get(&binding.producer_output.0)
+                .ok_or(ProtocolError::MissingProducerOutput)?;
+            let producer_node = producer
+                .graph
+                .root_scope()
+                .node(output.value.node)
+                .ok_or(ProtocolError::MissingProducerOutput)?;
+            let producer_type = &producer_node.output_types()[output.value.port.0 as usize];
+            let (consumer_type, consumer_artifact) = inputs
+                .get(&binding.consumer_input.0)
+                .ok_or(ProtocolError::InvalidArtifactConsumer)?;
+            let consumer_artifact =
+                consumer_artifact.ok_or(ProtocolError::InvalidArtifactConsumer)?;
+            if consumer_artifact.artifact_name != binding.producer_output.0 {
+                return Err(ProtocolError::ArtifactNameMismatch);
             }
-            if !artifact_inputs.is_subset(&bound) {
-                return Err(ProtocolError::MissingArtifactBinding);
+            if producer_type != *consumer_type {
+                return Err(ProtocolError::ArtifactTypeMismatch);
             }
-            if !bound.is_subset(&artifact_inputs) {
-                return Err(ProtocolError::InvalidArtifactConsumer);
-            }
-            for binding in &stage.bindings {
-                let producer = stages
-                    .get(&binding.producer_stage)
-                    .ok_or(ProtocolError::MissingProducerStage)?;
-                let output = producer
-                    .graph
-                    .outputs()
-                    .get(&binding.producer_output.0)
-                    .ok_or(ProtocolError::MissingProducerOutput)?;
-                let producer_node = producer
-                    .graph
-                    .root_scope()
-                    .node(output.value.node)
-                    .ok_or(ProtocolError::MissingProducerOutput)?;
-                let producer_type = &producer_node.output_types()[output.value.port.0 as usize];
-                let (consumer_type, consumer_artifact) = inputs
-                    .get(&binding.consumer_input.0)
-                    .ok_or(ProtocolError::InvalidArtifactConsumer)?;
-                let consumer_artifact =
-                    consumer_artifact.ok_or(ProtocolError::InvalidArtifactConsumer)?;
-                if consumer_artifact.artifact_name != binding.producer_output.0 {
-                    return Err(ProtocolError::ArtifactNameMismatch);
-                }
-                if producer_type != *consumer_type {
-                    return Err(ProtocolError::ArtifactTypeMismatch);
-                }
-                if output.confidentiality != Some(consumer_artifact.confidentiality) {
-                    return Err(ProtocolError::ArtifactConfidentialityMismatch);
-                }
+            if output.availability != Some(consumer_artifact.availability) {
+                return Err(ProtocolError::ArtifactAvailabilityMismatch);
             }
         }
-        Ok(())
     }
+    Ok(())
+}
 
+impl ProtocolDecl {
     fn validate_reachability(
         &self,
         stages: &BTreeMap<StageId, &ProtocolStage>,

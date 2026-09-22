@@ -27,6 +27,23 @@ namespace
     constexpr uint32_t kDecomposeThreads = 256;
     constexpr size_t kDecomposeMaxGridY = 65535;
     constexpr size_t kDecomposeMaxGridZ = 65535;
+
+    MxxGraphPatch decompose_pointer_patch(
+        uint32_t argument_index,
+        size_t byte_offset,
+        uint32_t binding_index,
+        size_t byte_count = sizeof(void *))
+    {
+        MxxGraphPatch patch{};
+        patch.node = nullptr;
+        patch.target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+        patch.argument_index = argument_index;
+        patch.byte_offset = static_cast<uint32_t>(byte_offset);
+        patch.byte_count = static_cast<uint32_t>(byte_count);
+        patch.binding_index = binding_index;
+        patch.address_addend = 0;
+        return patch;
+    }
 }
 
 __device__ __forceinline__ int64_t centered_lift_u64(uint64_t residue, uint64_t modulus)
@@ -186,6 +203,7 @@ __global__ void matrix_decompose_all_slots_kernel(
 }
 
 int launch_decompose_all_slots_kernel(
+    GpuContext *ctx,
     const uint8_t *src_base,
     uint8_t *const *dst_bases,
     const size_t *dst_stride_bytes,
@@ -275,6 +293,22 @@ int launch_decompose_all_slots_kernel(
                 src_digit_offset_base,
                 poly_offset,
                 slot_offset);
+            const size_t argument_sizes[] = {
+                sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+                sizeof(size_t), sizeof(uint8_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+                sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(uint32_t),
+                sizeof(uint64_t), sizeof(uint32_t), sizeof(uint32_t), sizeof(bool), sizeof(size_t),
+                sizeof(size_t), sizeof(size_t),
+            };
+            const MxxGraphPatch patches[] = {
+                decompose_pointer_patch(0, 0, 0), decompose_pointer_patch(1, 0, 1),
+                decompose_pointer_patch(2, 0, 2), decompose_pointer_patch(3, 0, 3),
+                decompose_pointer_patch(4, 0, 4),
+            };
+            const int registration_status = mxx_graph_register_kernel_update_for_stream(
+                ctx, reinterpret_cast<void *>(stream), argument_sizes, std::size(argument_sizes),
+                patches, std::size(patches));
+            if (registration_status != 0) return registration_status;
             const cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess)
             {
@@ -333,6 +367,7 @@ __global__ void matrix_fill_gadget_multi_limb_kernel(
 }
 
 static int launch_fill_gadget_multi_limb_kernel(
+    GpuContext *ctx,
     uint8_t *dst_base,
     size_t poly_count,
     size_t n,
@@ -379,6 +414,16 @@ static int launch_fill_gadget_multi_limb_kernel(
     {
         return set_error(err);
     }
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(uint8_t),
+        sizeof(uint64_t), sizeof(uint32_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(size_t), sizeof(uint32_t), sizeof(uint32_t),
+    };
+    const MxxGraphPatch patches[] = {decompose_pointer_patch(0, 0, 0)};
+    const int registration_status = mxx_graph_register_kernel_update_for_stream(
+        ctx, reinterpret_cast<void *>(stream), argument_sizes, std::size(argument_sizes),
+        patches, std::size(patches));
+    if (registration_status != 0) return registration_status;
     return 0;
 }
 
@@ -458,6 +503,17 @@ static int gpu_matrix_fill_sparse_constant_columns_impl(
                 global_column_start, unit_index, identity);
         err = cudaGetLastError();
         if (err != cudaSuccess) return set_error(err);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(uint8_t),
+            sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(bool),
+        };
+        const MxxGraphPatch patches[] = {
+            decompose_pointer_patch(0, 0, static_cast<uint32_t>(limb)),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            out->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0) return registration_status;
         if (matrix_record_limb_write(out, limb_id, stream) != 0) return 1;
     }
     out->format = GPU_POLY_FORMAT_EVAL;
@@ -596,6 +652,7 @@ static int gpu_matrix_fill_gadget_columns_impl(
             return set_error(err);
         }
         status = launch_fill_gadget_multi_limb_kernel(
+            out->ctx,
             dst_base,
             count,
             static_cast<size_t>(out->ctx->N),
@@ -1051,6 +1108,25 @@ extern "C" int gpu_matrix_fill_small_decomposed_identity_chunk(
         return set_error(err);
     }
 
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *), sizeof(void *),
+        sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(size_t),
+    };
+    const MxxGraphPatch patches[] = {
+        decompose_pointer_patch(0, 0, 0), decompose_pointer_patch(1, 0, 1),
+        decompose_pointer_patch(2, 0, 2), decompose_pointer_patch(3, 0, 3),
+        decompose_pointer_patch(4, 0, 4), decompose_pointer_patch(5, 0, 5),
+    };
+    const int registration_status = mxx_graph_register_kernel_update_for_stream(
+        out->ctx, reinterpret_cast<void *>(dispatch_stream), argument_sizes,
+        std::size(argument_sizes), patches, std::size(patches));
+    if (registration_status != 0)
+    {
+        cleanup_dispatch_allocs();
+        return registration_status;
+    }
+
     for (int limb = 0; limb <= level; ++limb)
     {
         const size_t idx = static_cast<size_t>(limb);
@@ -1181,6 +1257,22 @@ extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped
     if (err != cudaSuccess) return set_error(err);
     gadget_low_constants_kernel<<<(entries + 255) / 256, 256, 0, stream>>>(
         constants.moduli, weights, retained, dropped);
+    {
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t),
+        };
+        const MxxGraphPatch patches[] = {
+            decompose_pointer_patch(0, 0, 0), decompose_pointer_patch(1, 0, 1),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0)
+        {
+            cudaFreeAsync(weights, stream);
+            return registration_status;
+        }
+    }
     err = cudaGetLastError();
     if (err == cudaSuccess)
     {
@@ -1188,6 +1280,22 @@ extern "C" int gpu_matrix_correct_gadget_residues(GpuMatrix *src, size_t dropped
         gadget_correct_residues_kernel<<<grid, 256, 0, stream>>>(
             buffers.device_descriptors, constants.moduli, weights,
             retained, dropped, src->ctx->N, src->rows * src->cols);
+        const size_t argument_sizes[] = {
+            sizeof(void *), sizeof(void *), sizeof(void *), sizeof(size_t), sizeof(size_t),
+            sizeof(size_t), sizeof(size_t),
+        };
+        const MxxGraphPatch patches[] = {
+            decompose_pointer_patch(0, 0, 0), decompose_pointer_patch(1, 0, 1),
+            decompose_pointer_patch(2, 0, 2),
+        };
+        const int registration_status = mxx_graph_register_kernel_update_for_stream(
+            src->ctx, reinterpret_cast<void *>(stream), argument_sizes,
+            std::size(argument_sizes), patches, std::size(patches));
+        if (registration_status != 0)
+        {
+            cudaFreeAsync(weights, stream);
+            return registration_status;
+        }
         err = cudaGetLastError();
     }
     cudaFreeAsync(weights, stream);
@@ -1591,6 +1699,7 @@ static int gpu_matrix_decompose_base_impl(
             small ? 0 : (src_idx * static_cast<size_t>(digits_per_tower));
 
         status = launch_decompose_all_slots_kernel(
+            src->ctx,
             src_base,
             out_limb_bases_device,
             out_limb_stride_bytes_device,

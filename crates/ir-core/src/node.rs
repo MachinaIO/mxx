@@ -1,5 +1,5 @@
 use crate::{
-    artifact::{ArtifactConfidentiality, ProductionId},
+    artifact::{ArtifactAvailability, ProductionId},
     expr::{IntExpr, RealExpr},
     types::WireType,
 };
@@ -79,9 +79,14 @@ pub enum NodeKind {
     ModulusReduce {
         modulus: IntExpr,
     },
-    /// Re-encodes centered residues from a single native CRT limb.
+    /// Re-encodes the centered coefficients of a source CRT basis in another ring.
     CenteredRebase {
         modulus: IntExpr,
+    },
+    /// Divides centered coefficients by a positive compile-time divisor and rounds
+    /// to the nearest integer, preserving the matrix ring and shape.
+    CenteredRoundDivide {
+        divisor: IntExpr,
     },
     /// Fused centered CRT digit extension into a multiple modulus.
     RnsModUp {
@@ -92,6 +97,14 @@ pub enum NodeKind {
     },
     /// Fused BGV plaintext-preserving removal of the auxiliary CRT basis.
     RnsModDown {
+        modulus: IntExpr,
+        source_moduli: Vec<u64>,
+        plaintext_modulus: IntExpr,
+    },
+    /// Exact block CRT modulus switching. `source_moduli` is the complete
+    /// source basis; `modulus` is the product of a strict non-empty subset.
+    /// The plaintext modulus is the positive correction factor `t`.
+    BlockModSwitch {
         modulus: IntExpr,
         source_moduli: Vec<u64>,
         plaintext_modulus: IntExpr,
@@ -202,7 +215,7 @@ pub enum NodeKind {
 pub struct ArtifactInput {
     pub production_id: ProductionId,
     pub artifact_name: String,
-    pub confidentiality: ArtifactConfidentiality,
+    pub availability: ArtifactAvailability,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

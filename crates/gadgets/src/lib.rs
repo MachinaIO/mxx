@@ -22,8 +22,5 @@ mod test_utils_gpu;
 // BGG-specific lookup evaluation lives in `mxx-bgg`. The WEE25
 // commitment-backed lookup evaluator is not currently implemented.
 
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use mxx_primitives::rlwe_enc;
 pub use mxx_primitives::{element::PolyElem, impl_binop_with_refs, parallel_iter, poly::Poly};
 pub(crate) use mxx_primitives::{matrix, poly, sampler};

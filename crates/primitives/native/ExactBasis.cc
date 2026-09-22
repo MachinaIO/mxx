@@ -281,6 +281,44 @@ uint64_t rns_mul(uint64_t a, uint64_t b, uint64_t modulus) {
 uint64_t rns_inverse(uint64_t a, uint64_t modulus) {
     return lbcrypto::NativeInteger(a).ModInverse(lbcrypto::NativeInteger(modulus)).ConvertToInt();
 }
+
+// Shared exact mixed-radix primitive for centered CRT arithmetic.  `residues`
+// and `moduli` use the same ordered basis.  The helper deliberately operates
+// only on machine-word residues; callers may use it for a full source basis or
+// for an arbitrary dropped block without reconstructing a coefficient as a
+// BigInteger.
+std::vector<uint64_t> mixed_radix_prefix_inverses(const std::vector<uint64_t> &moduli) {
+    std::vector<uint64_t> inverses(moduli.size(), 1);
+    for (size_t current = 1; current < moduli.size(); ++current) {
+        uint64_t product = 1;
+        for (size_t previous = 0; previous < current; ++previous)
+            product = rns_mul(product, moduli[previous] % moduli[current], moduli[current]);
+        inverses[current] = rns_inverse(product, moduli[current]);
+    }
+    return inverses;
+}
+
+void mixed_radix_digits(
+    const std::vector<uint64_t> &residues,
+    const std::vector<uint64_t> &moduli,
+    const std::vector<uint64_t> &prefix_inverses,
+    std::vector<uint64_t> &digits) {
+    if (residues.size() != moduli.size() || prefix_inverses.size() != moduli.size())
+        throw std::invalid_argument("mixed-radix basis shape mismatch");
+    digits.resize(moduli.size());
+    for (size_t current = 0; current < moduli.size(); ++current) {
+        const uint64_t modulus = moduli[current];
+        uint64_t prefix = 0, weight = 1;
+        for (size_t previous = 0; previous < current; ++previous) {
+            prefix = static_cast<uint64_t>((static_cast<unsigned __int128>(prefix) +
+                static_cast<unsigned __int128>(digits[previous]) * weight) % modulus);
+            weight = rns_mul(weight, moduli[previous] % modulus, modulus);
+        }
+        const uint64_t residue = residues[current] % modulus;
+        const uint64_t difference = residue >= prefix ? residue - prefix : modulus - (prefix - residue);
+        digits[current] = rns_mul(difference, prefix_inverses[current], modulus);
+    }
+}
 }
 
 std::unique_ptr<openfhe::Matrix> exact_basis_rns(
@@ -393,7 +431,12 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
     const auto dimension = source.GetRingDimension();
     std::shared_ptr<lbcrypto::DCRTPoly::Params> parameters;
     std::vector<size_t> selected;
+    std::vector<uint64_t> source_moduli;
+    source_moduli.reserve(source.GetNumOfElements());
+    for (const auto &tower : source.GetAllElements())
+        source_moduli.push_back(tower.GetModulus().ConvertToInt());
     if (centered) {
+        if (moduli.empty()) throw std::invalid_argument("centered rebase requires a nonempty destination basis");
         parameters = parameters_for_basis(dimension, moduli);
     } else {
         std::vector<lbcrypto::NativeInteger> primes, roots;
@@ -410,20 +453,59 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
         parameters = std::make_shared<lbcrypto::ILDCRTParams<lbcrypto::BigInteger>>(
             2 * dimension, primes, roots);
     }
-    if (centered && source.GetNumOfElements() != 1)
-        throw std::invalid_argument("centered rebase requires one source CRT limb");
     if (centered) transform_format(source, Format::COEFFICIENT);
     lbcrypto::DCRTPoly output(parameters, source.GetFormat(), true);
+    const auto source_prefix_inverses = centered ? mixed_radix_prefix_inverses(source_moduli) : std::vector<uint64_t>{};
 #pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(moduli.size()))
     for (size_t index = 0; index < moduli.size(); ++index) {
         if (centered) {
-            const auto &tower = source.GetElementAtIndex(0);
-            const uint64_t p = tower.GetModulus().ConvertToInt(), q = moduli[index];
+            const uint64_t q = moduli[index];
             lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
-            for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
-                const uint64_t u = tower.GetValues()[coefficient].ConvertToInt();
-                const uint64_t magnitude = (u <= p / 2 ? u : p - u) % q;
-                values[coefficient] = u <= p / 2 || magnitude == 0 ? magnitude : q - magnitude;
+            const auto source_index = std::find(source_moduli.begin(), source_moduli.end(), q);
+            if (source_index != source_moduli.end()) {
+                // Copying a retained tower also preserves the exact source
+                // residue at q; this avoids an unnecessary reconstruction and
+                // handles the q == p_i modulus case without modular inverses.
+                values = source.GetElementAtIndex(source_index - source_moduli.begin()).GetValues();
+            } else if (source_moduli.size() == 1) {
+                const auto &tower = source.GetElementAtIndex(0);
+                const uint64_t p = source_moduli[0];
+                for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+                    const uint64_t u = tower.GetValues()[coefficient].ConvertToInt();
+                    const uint64_t magnitude = (u <= p / 2 ? u : p - u) % q;
+                    values[coefficient] = u <= p / 2 || magnitude == 0 ? magnitude : q - magnitude;
+                }
+            } else {
+                // Exact mixed-radix reconstruction.  This works entirely in
+                // native residues: no coefficient is interpolated through a
+                // BigInteger and no device/host round-trip is implied by the
+                // corresponding GPU implementation.
+                std::vector<uint64_t> digits(source_moduli.size());
+                for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+                    std::vector<uint64_t> residues(source_moduli.size());
+                    for (size_t limb = 0; limb < source_moduli.size(); ++limb)
+                        residues[limb] = source.GetElementAtIndex(limb).GetValues()[coefficient].ConvertToInt();
+                    mixed_radix_digits(residues, source_moduli, source_prefix_inverses, digits);
+                    bool negative = false;
+                    for (size_t limb = source_moduli.size(); limb-- > 0;) {
+                        const uint64_t half = (source_moduli[limb] - 1) / 2;
+                        if (digits[limb] != half) {
+                            negative = digits[limb] > half;
+                            break;
+                        }
+                    }
+                    uint64_t value = 0;
+                    for (size_t limb = source_moduli.size(); limb-- > 0;)
+                        value = static_cast<uint64_t>((static_cast<unsigned __int128>(value) *
+                            (source_moduli[limb] % q) + digits[limb] % q) % q);
+                    if (negative) {
+                        uint64_t source_product = 1;
+                        for (const auto p : source_moduli)
+                            source_product = static_cast<uint64_t>((static_cast<unsigned __int128>(source_product) * p) % q);
+                        value = value >= source_product ? value - source_product : q - (source_product - value);
+                    }
+                    values[coefficient] = value;
+                }
             }
             output.GetAllElements()[index].SetValues(std::move(values), Format::COEFFICIENT);
         } else {
@@ -432,6 +514,168 @@ std::unique_ptr<openfhe::DCRTPoly> exact_basis_convert(
         }
     }
     if (centered) transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_block_mod_switch(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> moduli,
+    rust::Slice<const uint64_t> plaintext_modulus_words) {
+    auto source = input.GetPoly();
+    if (moduli.empty() || plaintext_modulus_words.empty())
+        throw std::invalid_argument("BlockModSwitch requires a nonempty destination and positive t");
+    const auto dimension = source.GetRingDimension();
+    std::vector<uint64_t> source_moduli;
+    for (const auto &tower : source.GetAllElements())
+        source_moduli.push_back(tower.GetModulus().ConvertToInt());
+    std::vector<size_t> retained, dropped;
+    for (size_t target = 0; target < moduli.size(); ++target) {
+        const auto duplicate = std::find(moduli.begin(), moduli.begin() + target, moduli[target]);
+        if (duplicate != moduli.begin() + target)
+            throw std::invalid_argument("BlockModSwitch destination basis contains duplicates");
+        auto found = std::find(source_moduli.begin(), source_moduli.end(), moduli[target]);
+        if (found == source_moduli.end())
+            throw std::invalid_argument("BlockModSwitch destination basis is not a source subset");
+        retained.push_back(static_cast<size_t>(found - source_moduli.begin()));
+    }
+    for (size_t source_index = 0; source_index < source_moduli.size(); ++source_index)
+        if (std::find(retained.begin(), retained.end(), source_index) == retained.end())
+            dropped.push_back(source_index);
+    if (dropped.empty()) throw std::invalid_argument("BlockModSwitch requires a strict destination subset");
+    auto words_mod = [&](uint64_t modulus) {
+        uint64_t value = 0;
+        const uint64_t radix = static_cast<uint64_t>((static_cast<unsigned __int128>(1) << 64) % modulus);
+        for (size_t word = plaintext_modulus_words.size(); word-- > 0;)
+            value = static_cast<uint64_t>((static_cast<unsigned __int128>(value) * radix +
+                plaintext_modulus_words[word] % modulus) % modulus);
+        return value;
+    };
+    std::vector<uint64_t> t_target, p_inverse, dropped_t_inverse;
+    dropped_t_inverse.reserve(dropped.size());
+    for (const auto source_index : dropped) {
+        const uint64_t p = source_moduli[source_index];
+        const uint64_t residue = words_mod(p);
+        if (!residue) throw std::invalid_argument("BlockModSwitch t is not invertible modulo a dropped prime");
+        const uint64_t inverse = rns_inverse(residue, p);
+        dropped_t_inverse.push_back(inverse);
+    }
+    for (const auto q : moduli) {
+        const uint64_t t = words_mod(q);
+        uint64_t p = 1;
+        for (const auto source_index : dropped)
+            p = rns_mul(p, source_moduli[source_index] % q, q);
+        if (!p) throw std::invalid_argument("BlockModSwitch dropped product is not invertible in destination");
+        t_target.push_back(t);
+        p_inverse.push_back(rns_inverse(p, q));
+    }
+    // Inverting a prefix product in each mixed-radix modulus is public setup;
+    // coefficient work below remains native-residue-only.
+    std::vector<uint64_t> dropped_moduli;
+    dropped_moduli.reserve(dropped.size());
+    for (const auto source_index : dropped) dropped_moduli.push_back(source_moduli[source_index]);
+    const auto prefix_inverse = mixed_radix_prefix_inverses(dropped_moduli);
+    auto parameters = parameters_for_basis(dimension, moduli);
+    transform_format(source, Format::COEFFICIENT);
+    lbcrypto::DCRTPoly output(parameters, Format::COEFFICIENT, true);
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(moduli.size()))
+    for (size_t target = 0; target < moduli.size(); ++target) {
+        const uint64_t q = moduli[target];
+        lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+        for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+            std::vector<uint64_t> digits(dropped.size());
+            std::vector<uint64_t> residues(dropped.size());
+            for (size_t current = 0; current < dropped.size(); ++current) {
+                const uint64_t p = dropped_moduli[current];
+                const uint64_t z = source.GetElementAtIndex(dropped[current]).GetValues()[coefficient].ConvertToInt();
+                residues[current] = rns_mul(z, dropped_t_inverse[current], p);
+            }
+            mixed_radix_digits(residues, dropped_moduli, prefix_inverse, digits);
+            bool negative = false;
+            for (size_t current = dropped.size(); current-- > 0;) {
+                const uint64_t half = (source_moduli[dropped[current]] - 1) / 2;
+                if (digits[current] != half) {
+                    negative = digits[current] > half;
+                    break;
+                }
+            }
+            uint64_t centered = 0;
+            for (size_t current = dropped.size(); current-- > 0;)
+                centered = (static_cast<unsigned __int128>(centered) *
+                    (source_moduli[dropped[current]] % q) + digits[current] % q) % q;
+            uint64_t dropped_product = 1;
+            for (const auto source_index : dropped)
+                dropped_product = rns_mul(dropped_product, source_moduli[source_index] % q, q);
+            if (negative)
+                centered = centered >= dropped_product ? centered - dropped_product : q - (dropped_product - centered);
+            const auto retained_index = retained[target];
+            const uint64_t z = source.GetElementAtIndex(retained_index).GetValues()[coefficient].ConvertToInt();
+            const uint64_t correction = rns_mul(t_target[target], centered, q);
+            const uint64_t numerator = z >= correction ? z - correction : q - (correction - z);
+            values[coefficient] = rns_mul(numerator, p_inverse[target], q);
+        }
+        output.GetAllElements()[target].SetValues(std::move(values), Format::COEFFICIENT);
+    }
+    transform_format(output, Format::EVALUATION);
+    return std::make_unique<openfhe::DCRTPoly>(std::move(output));
+}
+
+std::unique_ptr<openfhe::DCRTPoly> exact_basis_centered_round_divide(
+    const openfhe::DCRTPoly &input, rust::Slice<const uint64_t> divisor_words) {
+    if (divisor_words.empty())
+        throw std::invalid_argument("CenteredRoundDivide divisor must be positive");
+    lbcrypto::BigInteger divisor(0);
+    for (size_t word = divisor_words.size(); word-- > 0;) {
+        divisor <<= 64;
+        divisor += lbcrypto::BigInteger(divisor_words[word]);
+    }
+    if (divisor <= 0)
+        throw std::invalid_argument("CenteredRoundDivide divisor must be positive");
+
+    auto source = input.GetPoly();
+    const auto format = source.GetFormat();
+    const auto dimension = source.GetRingDimension();
+    std::vector<uint64_t> moduli;
+    moduli.reserve(source.GetNumOfElements());
+    for (const auto &tower : source.GetAllElements())
+        moduli.push_back(tower.GetModulus().ConvertToInt());
+    if (moduli.empty()) throw std::invalid_argument("CenteredRoundDivide requires a nonempty CRT basis");
+    transform_format(source, Format::COEFFICIENT);
+
+    lbcrypto::BigInteger modulus_product(1);
+    for (const auto modulus : moduli) modulus_product *= lbcrypto::BigInteger(modulus);
+    const lbcrypto::BigInteger half = (modulus_product - 1).DividedBy(2);
+    lbcrypto::DCRTPoly output(source);
+#pragma omp parallel for num_threads(lbcrypto::OpenFHEParallelControls.GetThreadLimit(source.GetNumOfElements()))
+    for (size_t limb = 0; limb < moduli.size(); ++limb) {
+        const uint64_t q = moduli[limb];
+        lbcrypto::NativeVector values(dimension, lbcrypto::NativeInteger(q));
+        const auto q_big = lbcrypto::BigInteger(q);
+        for (size_t coefficient = 0; coefficient < dimension; ++coefficient) {
+            lbcrypto::BigInteger value(0);
+            for (size_t index = 0; index < moduli.size(); ++index) {
+                const auto residue = source.GetElementAtIndex(index).GetValues()[coefficient].ConvertToInt();
+                const auto q_i = lbcrypto::BigInteger(moduli[index]);
+                const auto q_over_qi = modulus_product / q_i;
+                const auto inverse = lbcrypto::NativeInteger(
+                    q_over_qi.Mod(q_i).ConvertToInt())
+                    .ModInverse(lbcrypto::NativeInteger(moduli[index])).ConvertToInt();
+                value += lbcrypto::BigInteger(residue) * q_over_qi * inverse;
+            }
+            value = value.Mod(modulus_product);
+            const bool negative = value > half;
+            const lbcrypto::BigInteger magnitude = negative ? modulus_product - value : value;
+            auto quotient = magnitude.DividedBy(divisor);
+            const auto remainder = magnitude.Mod(divisor);
+            const auto doubled_remainder = remainder * 2;
+            if ((!negative && doubled_remainder >= divisor) ||
+                (negative && doubled_remainder > divisor))
+                quotient += 1;
+            auto residue = quotient.Mod(q_big).ConvertToInt();
+            if (negative && residue) residue = q - residue;
+            values[coefficient] = residue;
+        }
+        output.GetAllElements()[limb].SetValues(std::move(values), Format::COEFFICIENT);
+    }
+    transform_format(output, format);
     return std::make_unique<openfhe::DCRTPoly>(std::move(output));
 }
 

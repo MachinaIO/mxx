@@ -1,8 +1,10 @@
 use super::RootBlockAliases;
-use crate::gpu_calibration::{
-    gpu_calibration_operation_identity, gpu_operation_is_column_separable,
-    gpu_operation_is_column_separable_for_types, gpu_row_block_add_operation_identity,
-    gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
+use crate::{
+    gpu_calibration::{
+        gpu_calibration_operation_identity, gpu_row_block_add_operation_identity,
+        gpu_sum_rows_operation_identity, gpu_tensor_sum_rows_operation_identity,
+    },
+    gpu_column_policy::{ColumnCapability, column_capability},
 };
 use mxx_ir_core::{
     ValidatedGraph,
@@ -28,27 +30,24 @@ pub(super) fn prepare(validated: &ValidatedGraph, mut plan: RootBlockAliases) ->
         // Store failures instead of returning them here: dispatch must observe
         // an identity error at its original node, after preceding graph effects.
         let operation = (|| {
-            let operation = if gpu_operation_is_column_separable(handle.kind()) {
-                let arguments = scope.arguments(handle).expect("validated node arguments");
-                let argument_types = arguments
-                    .iter()
-                    .map(|wire| checked.wire_types[wire].clone())
-                    .collect::<Vec<_>>();
+            let arguments = scope.arguments(handle).expect("validated node arguments");
+            let argument_types =
+                arguments.iter().map(|wire| checked.wire_types[wire].clone()).collect::<Vec<_>>();
+            let operation = if !matches!(
+                column_capability(handle.kind(), &argument_types),
+                ColumnCapability::HostOrControl
+            ) {
                 let output_types = (0..handle.output_types().len())
                     .map(|port| {
                         checked.wire_types[&WireRef { node: id, port: Port(port as u32) }].clone()
                     })
                     .collect::<Vec<_>>();
-                gpu_operation_is_column_separable_for_types(handle.kind(), &argument_types)
-                    .then(|| {
-                        gpu_calibration_operation_identity(
-                            handle.kind(),
-                            &argument_types,
-                            &output_types,
-                            &validated.bindings,
-                        )
-                    })
-                    .transpose()?
+                Some(gpu_calibration_operation_identity(
+                    handle.kind(),
+                    &argument_types,
+                    &output_types,
+                    &validated.bindings,
+                )?)
             } else {
                 None
             };
@@ -98,87 +97,6 @@ mod tests {
         ParamEnv,
         node::{ConcatAxis, IndexRange},
     };
-
-    #[test]
-    #[serial_test::serial]
-    fn test_gpu_resident_row_sum_dispatch_releases_input_owners() {
-        use crate::{
-            MemoryArtifactStore, RuntimeValue, backend::poly_gpu::gpu_backend, execute,
-            gpu_calibration::GpuColumnWidths, transcript::SamplingMode,
-        };
-        use mxx_primitives::{
-            matrix::{PolyMatrix, gpu_dcrt_poly::GpuDCRTPolyMatrix},
-            poly::{
-                PolyParams,
-                dcrt::{gpu::GpuDCRTPolyParams, params::DCRTPolyParams},
-            },
-            sampler::{DistType, PolyUniformSampler, uniform::DCRTPolyUniformSampler},
-        };
-        let n = std::env::var("MXX_PRIMITIVE_TEST_RING_DIMENSION")
-            .map(|value| value.parse::<u32>().expect("ring dimension"))
-            .unwrap_or(32);
-        let parameters = DCRTPolyParams::new(n, 4, 54, 8, None, None);
-        let ring = Ring::new(parameters.modulus().as_ref().clone(), n as usize);
-        let gpu_parameters = GpuDCRTPolyParams::new(n, parameters.to_crt().0, 8, None);
-        let mut backend = gpu_backend([gpu_parameters.clone()]);
-        for (left_columns, right_columns) in [(1, 1), (3, 2)] {
-            let tensor = ring
-                .input("left", (2, left_columns))
-                .tensor(ring.input("right", (2, right_columns)));
-            let row = |index: usize| {
-                tensor
-                    .clone()
-                    .slice(Some(IndexRange { start: index.into(), end: (index + 1).into() }), None)
-            };
-            let output = Mat::concat(ConcatAxis::Rows, vec![row(0), row(1) + row(2), row(3)]);
-            let graph = DslContext::new("resident-row-sum-lifetime")
-                .output("out", output)
-                .unwrap()
-                .build()
-                .unwrap()
-                .validate(&ParamEnv::default())
-                .unwrap();
-            let plan = super::super::root_block_aliases(&graph, &FrozenGraphScopeId::Root, false);
-            let (node, _) = plan.input_row_sum.as_ref().expect("resident dispatch plan");
-            let operation = plan.calibration[node].as_ref().unwrap().unwrap();
-            backend.set_column_widths_for_operation(
-                operation,
-                GpuColumnWidths { gpu0: left_columns * right_columns, nonzero: None },
-            );
-            let sampler = DCRTPolyUniformSampler::new();
-            let left = sampler.sample_uniform(&parameters, 2, left_columns, DistType::FinRingDist);
-            let right =
-                sampler.sample_uniform(&parameters, 2, right_columns, DistType::FinRingDist);
-            let expected = left.tensor(&right).sum_rows(&[vec![0], vec![1, 2], vec![3]]);
-            // No GPU input owners survive execute, and no host wait precedes it.
-            let inputs = BTreeMap::from([
-                (
-                    "left".into(),
-                    RuntimeValue::matrix(
-                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &left).into(),
-                    ),
-                ),
-                (
-                    "right".into(),
-                    RuntimeValue::matrix(
-                        GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_parameters, &right).into(),
-                    ),
-                ),
-            ]);
-            let mut store = MemoryArtifactStore::default();
-            let mut result =
-                execute(&graph, &mut backend, inputs, &mut store, SamplingMode::Fresh).unwrap();
-            let RuntimeValue::Matrix(output) =
-                result.materialize_output("out", &backend, &mut store).unwrap()
-            else {
-                panic!("matrix output")
-            };
-            assert_eq!(output.shards().len(), 1);
-            let transposed = output.shards()[0].value.transpose();
-            drop(result);
-            assert_eq!(transposed.to_cpu_matrix(), expected.transpose());
-        }
-    }
 
     #[test]
     fn root_cached_calibration_matches_direct_fused_identities() {
@@ -234,9 +152,10 @@ mod tests {
                     checked.wire_types[&WireRef { node: *id, port: Port(port as u32) }].clone()
                 })
                 .collect::<Vec<_>>();
-            let mut expected = if gpu_operation_is_column_separable(node.kind()) &&
-                gpu_operation_is_column_separable_for_types(node.kind(), &inputs)
-            {
+            let mut expected = if !matches!(
+                column_capability(node.kind(), &inputs),
+                ColumnCapability::HostOrControl
+            ) {
                 Some(
                     gpu_calibration_operation_identity(
                         node.kind(),

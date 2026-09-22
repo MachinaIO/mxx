@@ -8,7 +8,103 @@ int set_error(const char *msg)
 
 int set_error(cudaError_t err)
 {
-    return gpu_set_last_error(cudaGetErrorString(err));
+    return gpu_set_last_error_cuda(static_cast<int>(err));
+}
+
+bool matrix_stream_is_capturing(cudaStream_t stream)
+{
+    if (!stream)
+    {
+        return false;
+    }
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    const cudaError_t error = cudaStreamIsCapturing(stream, &status);
+    if (error != cudaSuccess)
+    {
+        // Querying capture state is diagnostic only. Preserve the existing
+        // error channel and conservatively report active so callers never
+        // introduce a host synchronization after an uncertain query.
+        set_error(error);
+        return true;
+    }
+    return status == cudaStreamCaptureStatusActive ||
+        status == cudaStreamCaptureStatusInvalidated;
+}
+
+cudaStream_t matrix_capture_stream_for_device(
+    const GpuContext *ctx,
+    int device,
+    cudaStream_t fallback)
+{
+    if (!ctx || !ctx->execution)
+    {
+        return fallback;
+    }
+    std::lock_guard<std::mutex> lock(ctx->execution->capture_mutex);
+    if (ctx->execution->capture_body_active &&
+        ctx->execution->capture_body_device == device &&
+        ctx->execution->capture_body_stream)
+    {
+        return ctx->execution->capture_body_stream;
+    }
+    if (ctx->execution->capture_active && ctx->execution->capture_device == device &&
+        ctx->execution->capture_stream)
+    {
+        return ctx->execution->capture_stream;
+    }
+    return fallback;
+}
+
+MxxGpuCaptureEvent *matrix_capture_event_for_owner(
+    GpuContext *ctx,
+    int device,
+    MxxGpuCaptureEvent **slot)
+{
+    if (!ctx || !ctx->execution || !slot)
+    {
+        set_error("invalid matrix capture event arguments");
+        return nullptr;
+    }
+    uint64_t capture_generation = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctx->execution->capture_mutex);
+        if (ctx->execution->capture_active)
+        {
+            capture_generation = ctx->execution->capture_generation;
+        }
+    }
+    if (capture_generation == 0)
+    {
+        set_error("matrix capture event requested outside graph capture");
+        return nullptr;
+    }
+    if (*slot && (*slot)->capture_generation == capture_generation)
+    {
+        return *slot;
+    }
+    if (*slot)
+    {
+        mxx_gpu_capture_event_release(*slot);
+        *slot = nullptr;
+    }
+    *slot = mxx_gpu_capture_event_create(ctx, device);
+    return *slot;
+}
+
+namespace
+{
+MxxGpuCaptureEvent *matrix_capture_event_for_state(
+    GpuMatrix *matrix,
+    GpuMatrix::LimbExecState *state)
+{
+    if (!matrix || !state)
+    {
+        set_error("invalid matrix capture event arguments");
+        return nullptr;
+    }
+    return matrix_capture_event_for_owner(
+        matrix->ctx, state->device, &state->capture_write_done);
+}
 }
 
 bool parse_format(int format, GpuPolyFormat &out)
@@ -170,7 +266,7 @@ int matrix_limb_stream(const GpuMatrix *mat, const dim3 &limb_id, cudaStream_t *
     {
         return 1;
     }
-    *out_stream = state->stream;
+    *out_stream = matrix_capture_stream_for_device(mat->ctx, state->device, state->stream);
     return *out_stream ? 0 : set_error("null stream in matrix_limb_stream");
 }
 
@@ -276,10 +372,6 @@ int matrix_wait_limb_stream(
         return 1;
     }
     const auto &completion = src->exec_limb_states[limb_id.x][state->completion_owner];
-    if (!completion.write_done || !completion.write_done_valid)
-    {
-        return 0;
-    }
     if (state->device != consumer_device)
     {
         return set_error("device mismatch in matrix_wait_limb_stream");
@@ -291,6 +383,48 @@ int matrix_wait_limb_stream(
     }
     if (read_only && src->host_observed_writer_ready.load(std::memory_order_acquire))
         return 0;
+    const bool consumer_capturing = matrix_stream_is_capturing(consumer_stream);
+    if (consumer_capturing)
+    {
+        if (!completion.capture_write_done)
+        {
+            // A producer may have run before capture began, or on a
+            // non-capturing stream while the consumer stream is being
+            // captured.  Its ordinary completion event is still the exact
+            // dependency needed by the captured consumer.  Dropping this
+            // edge makes a graph-local copy race a stream-ordered
+            // cudaMallocAsync allocation.
+            if (!completion.write_done || !completion.write_done_valid)
+            {
+                return 0;
+            }
+            if (completion.last_write_stream == consumer_stream)
+            {
+                return 0;
+            }
+            err = cudaStreamWaitEvent(consumer_stream, completion.write_done, 0);
+            return err == cudaSuccess ? 0 : set_error(err);
+        }
+        {
+            std::lock_guard<std::mutex> lock(src->ctx->execution->capture_mutex);
+            // A previous compiled region owns its own graph-local event.
+            // Cross-region ordering is supplied by replay completion; an
+            // unlaunched exemplar event cannot become a new graph dependency.
+            if (completion.capture_write_done->capture_generation != src->ctx->execution->capture_generation)
+                return 0;
+        }
+        if (completion.last_write_stream == consumer_stream)
+        {
+            return 0;
+        }
+        err = cudaStreamWaitEvent(
+            consumer_stream, completion.capture_write_done->event, 0);
+        return err == cudaSuccess ? 0 : set_error(err);
+    }
+    if (!completion.write_done || !completion.write_done_valid)
+    {
+        return 0;
+    }
     // Stream order already covers this event when its latest record was on
     // the consumer itself. The owning state->stream alone cannot establish it.
     if (completion.last_write_stream == consumer_stream)
@@ -338,6 +472,29 @@ int matrix_track_limb_consumer(
         return set_error(err);
     }
 
+    const bool consumer_capturing = matrix_stream_is_capturing(consumer_stream);
+    if (consumer_capturing)
+    {
+        // Capture stream order already covers the consumer and producer. Keep
+        // a capture-only event node for graph-local completion, but never
+        // overwrite the ordinary event used by replay and host observation.
+        const cudaStream_t producer_stream = consumer_stream;
+        MxxGpuCaptureEvent *capture_event = matrix_capture_event_for_state(
+            const_cast<GpuMatrix *>(src), state);
+        if (!capture_event)
+        {
+            return 1;
+        }
+        err = cudaEventRecord(capture_event->event, producer_stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        state->completion_owner = limb_id.y;
+        state->last_write_stream = producer_stream;
+        return 0;
+    }
+
     // A shared-stream matrix may still alias its partition's initial event.
     // Acquire this limb's owned event before recording a separate completion.
     if (!state->write_done)
@@ -347,13 +504,24 @@ int matrix_track_limb_consumer(
         {
             // The consumer kernel is already queued. Its old completion alias
             // cannot protect source cleanup when lazy event allocation fails.
-            cudaStreamSynchronize(consumer_stream);
+            if (!matrix_stream_is_capturing(consumer_stream))
+            {
+                cudaStreamSynchronize(consumer_stream);
+            }
             return set_error(err);
         }
     }
 
+    // During capture, the logical producer stream is routed to the active
+    // capture region.  Keeping the raw pool stream here would enqueue a wait
+    // from captured work onto an uncaptured stream, which CUDA rejects as a
+    // dependency on uncaptured work in another stream.
+    const cudaStream_t producer_stream = matrix_stream_is_capturing(consumer_stream)
+        ? consumer_stream
+        : matrix_capture_stream_for_device(src->ctx, state->device, state->stream);
+
     // Fast path: consumer already runs on the producer stream.
-    if (state->stream == consumer_stream)
+    if (producer_stream == consumer_stream)
     {
         err = cudaEventRecord(state->write_done, consumer_stream);
         if (err != cudaSuccess)
@@ -380,20 +548,20 @@ int matrix_track_limb_consumer(
             return set_error(err);
         }
     }
-    err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
+    err = cudaStreamWaitEvent(producer_stream, consumer_done, 0);
     if (err != cudaSuccess)
     {
         return set_error(err);
     }
 
     // Fold consumer completion into write_done so later waits/free use one event.
-    err = cudaEventRecord(state->write_done, state->stream);
+    err = cudaEventRecord(state->write_done, producer_stream);
     if (err != cudaSuccess)
     {
         return set_error(err);
     }
     state->completion_owner = limb_id.y;
-    state->last_write_stream = state->stream;
+    state->last_write_stream = producer_stream;
     state->write_done_valid = true;
     return 0;
 }
@@ -421,17 +589,27 @@ int matrix_track_limb_consumer_readonly(
     {
         return set_error("invalid source placement in matrix_track_limb_consumer_readonly");
     }
-    if (limb_id.x >= src->ctx->execution->release_streams_by_partition.size() ||
-        !src->ctx->execution->release_streams_by_partition[limb_id.x])
-    {
-        return set_error("missing source release stream in matrix_track_limb_consumer_readonly");
-    }
-
     cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
     if (err != cudaSuccess)
     {
         return set_error(err);
     }
+    if (matrix_stream_is_capturing(consumer_stream))
+    {
+        // Capture-time owner lifetime is covered by the graph's own event
+        // nodes. Replay attaches a fresh non-captured completion event below.
+        return 0;
+    }
+    const cudaStream_t producer_stream = matrix_stream_is_capturing(consumer_stream)
+        ? consumer_stream
+        : matrix_capture_stream_for_device(src->ctx, state->device, state->stream);
+    const cudaStream_t release_base =
+        limb_id.x < src->ctx->execution->release_streams_by_partition.size() &&
+                src->ctx->execution->release_streams_by_partition[limb_id.x]
+            ? src->ctx->execution->release_streams_by_partition[limb_id.x]
+            : state->stream;
+    const cudaStream_t release_stream = matrix_capture_stream_for_device(
+        src->ctx, consumer_device, release_base);
     cudaEvent_t consumer_done = completion;
     if (!consumer_done)
     {
@@ -440,18 +618,18 @@ int matrix_track_limb_consumer_readonly(
     }
     if (err == cudaSuccess)
     {
-        err = cudaStreamWaitEvent(
-            src->ctx->execution->release_streams_by_partition[limb_id.x],
-            consumer_done,
-            0);
+        if (release_stream != consumer_stream)
+        {
+            err = cudaStreamWaitEvent(release_stream, consumer_done, 0);
+        }
     }
-    if (err == cudaSuccess && state->stream != consumer_stream &&
-        state->stream != src->ctx->execution->release_streams_by_partition[limb_id.x])
+    if (err == cudaSuccess && producer_stream != consumer_stream &&
+        producer_stream != release_stream)
     {
         // Writes reuse the allocation on its producer stream. Join the read
         // there as well as on release, but leave write_done untouched: other
         // read-only consumers still wait only for the original input writer.
-        err = cudaStreamWaitEvent(state->stream, consumer_done, 0);
+        err = cudaStreamWaitEvent(producer_stream, consumer_done, 0);
     }
     const cudaError_t destroy_err = !completion && consumer_done ? cudaEventDestroy(consumer_done) : cudaSuccess;
     if (err == cudaSuccess)
@@ -463,7 +641,10 @@ int matrix_track_limb_consumer_readonly(
         // The caller may release the source immediately after an error.  A
         // synchronous error-path fence keeps that release safe without
         // changing the producer's write_done event.
-        cudaStreamSynchronize(consumer_stream);
+        if (!matrix_stream_is_capturing(consumer_stream))
+        {
+            cudaStreamSynchronize(consumer_stream);
+        }
         return set_error(err);
     }
     return 0;
@@ -487,6 +668,7 @@ int matrix_record_limb_write(
     {
         stream = state->stream;
     }
+    stream = matrix_capture_stream_for_device(dst->ctx, state->device, stream);
     if (!stream)
     {
         return set_error("invalid stream in matrix_record_limb_write");
@@ -496,6 +678,22 @@ int matrix_record_limb_write(
     {
         return set_error(err);
     }
+    if (matrix_stream_is_capturing(stream))
+    {
+        MxxGpuCaptureEvent *capture_event = matrix_capture_event_for_state(dst, state);
+        if (!capture_event)
+        {
+            return 1;
+        }
+        err = cudaEventRecord(capture_event->event, stream);
+        if (err != cudaSuccess)
+        {
+            return set_error(err);
+        }
+        state->completion_owner = limb_id.y;
+        state->last_write_stream = stream;
+        return 0;
+    }
     if (!state->write_done)
     {
         err = cudaEventCreateWithFlags(&state->write_done, cudaEventDisableTiming);
@@ -503,7 +701,10 @@ int matrix_record_limb_write(
         {
             // The write is already queued; protect immediate owner cleanup
             // when its new completion event cannot be allocated.
-            cudaStreamSynchronize(stream);
+            if (!matrix_stream_is_capturing(stream))
+            {
+                cudaStreamSynchronize(stream);
+            }
             return set_error(err);
         }
     }
@@ -600,14 +801,17 @@ int matrix_track_all_limb_consumers(
             const auto id = ids[static_cast<size_t>(limb)];
             const auto *state = matrix_limb_state_const(src, id, "missing read-only limb state");
             if (!state) return 1;
+            const cudaStream_t producer_stream = matrix_stream_is_capturing(consumer_stream)
+                ? consumer_stream
+                : matrix_capture_stream_for_device(src->ctx, state->device, state->stream);
             bool seen = false;
             for (size_t index = 0; index < partition_count; ++index)
-                if (partitions[index] == id.x && streams[index] == state->stream) seen = true;
+                if (partitions[index] == id.x && streams[index] == producer_stream) seen = true;
             if (seen) continue;
             const int status = matrix_track_limb_consumer_readonly(
                 src, id, consumer_device, consumer_stream, completion, device_already_selected);
             if (status != 0) return status;
-            streams[partition_count] = state->stream;
+            streams[partition_count] = producer_stream;
             partitions[partition_count++] = id.x;
         }
         return 0;

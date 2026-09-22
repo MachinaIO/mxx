@@ -318,15 +318,23 @@ int run_matrix_transform_batch(
             if (forward)
             {
                 if (n > kFusedNttCoefficients)
-                    status = launch_fused_top_stages<true>(layout, constants, count * limb_count, n, poly_count, stream);
+                    status = launch_fused_top_stages<true>(
+                        layout, constants, count * limb_count, n, poly_count, stream,
+                        first->ctx, UINT32_MAX);
                 if (status == 0)
-                    status = launch_fused_local_stages<true>(layout, constants, count * limb_count, n, poly_count, stream);
+                    status = launch_fused_local_stages<true>(
+                        layout, constants, count * limb_count, n, poly_count, stream,
+                        first->ctx, UINT32_MAX);
             }
             else
             {
-                status = launch_fused_local_stages<false>(layout, constants, count * limb_count, n, poly_count, stream);
+                status = launch_fused_local_stages<false>(
+                    layout, constants, count * limb_count, n, poly_count, stream,
+                    first->ctx, UINT32_MAX);
                 if (status == 0 && n > kFusedNttCoefficients)
-                    status = launch_fused_top_stages<false>(layout, constants, count * limb_count, n, poly_count, stream);
+                    status = launch_fused_top_stages<false>(
+                        layout, constants, count * limb_count, n, poly_count, stream,
+                        first->ctx, UINT32_MAX);
             }
             if (status != 0) return status;
         }

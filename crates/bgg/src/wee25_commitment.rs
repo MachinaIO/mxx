@@ -110,8 +110,8 @@ impl Wee25CommitmentCompiler {
         tree: Wee25CommitmentTreeWire,
     ) -> Result<DslContext, DslError> {
         context
-            .public_output("wee25_commitment", tree.root)?
-            .public_output("wee25_commitment_nodes", tree.cached_nodes)
+            .transferred_output("wee25_commitment", tree.root)?
+            .transferred_output("wee25_commitment_nodes", tree.cached_nodes)
     }
 
     fn commit_level(
@@ -226,7 +226,7 @@ mod tests {
         sampler::{DistType, PolyHashSampler, hash::DCRTPolyHashSampler},
     };
     use mxx_runtime::{
-        RuntimeValue,
+        ExecutionConfig, RuntimeValue,
         artifact::MemoryArtifactStore,
         backend::poly::{CpuDcrtBackend, cpu_backend},
         execute,
@@ -371,6 +371,7 @@ mod tests {
             inputs,
             &mut MemoryArtifactStore::default(),
             SamplingMode::Fresh,
+            ExecutionConfig::default(),
         )
         .unwrap();
         let values = blocks.into_iter().map(|(_, value)| value).collect::<Vec<_>>();

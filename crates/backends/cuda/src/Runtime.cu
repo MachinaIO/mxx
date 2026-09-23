@@ -9,6 +9,8 @@
 #include <deque>
 #include <exception>
 #include <limits>
+#include <mutex>
+#include <set>
 #include <map>
 #include <iterator>
 #include <stdexcept>
@@ -225,7 +227,7 @@ private:
 
     void process(Job &job)
     {
-        cudaError_t error = cudaSetDevice(job.device);
+        cudaError_t error = mxx_set_device(job.device);
         if (error == cudaSuccess)
         {
             error = cudaEventSynchronize(job.completion);
@@ -341,7 +343,7 @@ namespace
         }
         for (const auto &entry : events->entries)
         {
-            cudaSetDevice(entry.device);
+            mxx_set_device(entry.device);
             cudaEventDestroy(entry.event);
         }
         delete events;
@@ -361,7 +363,7 @@ namespace
             {
                 continue;
             }
-            cudaError_t err = cudaSetDevice(device);
+            cudaError_t err = mxx_set_device(device);
             if (err != cudaSuccess)
             {
                 return set_error(err);
@@ -439,7 +441,7 @@ namespace
         }
         for (size_t partition = 0; partition < owner->gpu_ids.size(); ++partition)
         {
-            cudaSetDevice(owner->gpu_ids[partition]);
+            mxx_set_device(owner->gpu_ids[partition]);
             if (partition < owner->release_streams_by_partition.size() &&
                 owner->release_streams_by_partition[partition])
             {
@@ -640,10 +642,9 @@ namespace
         }
 
         int device_count = 0;
-        cudaError_t err = cudaGetDeviceCount(&device_count);
-        if (err != cudaSuccess)
+        if (gpu_device_count(&device_count) != 0)
         {
-            throw std::runtime_error(cudaGetErrorString(err));
+            throw std::runtime_error("cannot query CUDA devices");
         }
         if (device_count <= 0)
         {
@@ -781,7 +782,7 @@ namespace
         for (int device : gpu_list)
         {
             cudaMemPool_t pool = nullptr;
-            cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+            cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, mxx_physical_device(device));
             if (err != cudaSuccess)
             {
                 throw std::runtime_error(cudaGetErrorString(err));
@@ -792,6 +793,52 @@ namespace
                 throw std::runtime_error(cudaGetErrorString(err));
             }
         }
+    }
+
+    // Cross-device graph copies go peer to peer where the hardware allows it:
+    // each context's GPU gets access to every other physical GPU and to its
+    // stream-ordered pool. Logical devices sharing one GPU need nothing.
+    void enable_peer_access(const std::vector<int> &gpu_list)
+    {
+        static std::mutex mutex;
+        static std::set<std::pair<int, int>> enabled;
+        std::lock_guard<std::mutex> lock(mutex);
+        int physical_count = 0;
+        if (cudaGetDeviceCount(&physical_count) != cudaSuccess)
+        {
+            cudaGetLastError();
+            return;
+        }
+        int current = 0;
+        if (cudaGetDevice(&current) != cudaSuccess) current = -1;
+        for (int device : gpu_list)
+        {
+            const int physical = mxx_physical_device(device);
+            for (int peer = 0; peer < physical_count; ++peer)
+            {
+                int accessible = 0;
+                if (peer == physical || enabled.count({physical, peer}) ||
+                    cudaDeviceCanAccessPeer(&accessible, physical, peer) != cudaSuccess ||
+                    !accessible)
+                    continue;
+                cudaMemPool_t pool = nullptr;
+                cudaMemAccessDesc access{};
+                access.location.type = cudaMemLocationTypeDevice;
+                access.location.id = physical;
+                access.flags = cudaMemAccessFlagsProtReadWrite;
+                if (cudaSetDevice(physical) == cudaSuccess)
+                {
+                    const cudaError_t err = cudaDeviceEnablePeerAccess(peer, 0);
+                    if (err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled)
+                        enabled.insert({physical, peer});
+                }
+                // The peer's pool becomes readable and writable from this GPU.
+                if (cudaDeviceGetDefaultMemPool(&pool, peer) == cudaSuccess)
+                    cudaMemPoolSetAccess(pool, &access, 1);
+                cudaGetLastError();
+            }
+        }
+        if (current >= 0) cudaSetDevice(current);
     }
 
     GpuNttDeviceConstants make_empty_ntt_device_constants(
@@ -819,7 +866,7 @@ namespace
         {
             return;
         }
-        if (cudaSetDevice(entry.device) != cudaSuccess)
+        if (mxx_set_device(entry.device) != cudaSuccess)
         {
             return;
         }
@@ -889,7 +936,7 @@ namespace
         {
             throw std::runtime_error("null output entry in upload_ntt_small_constants_to_device");
         }
-        cudaError_t err = cudaSetDevice(device);
+        cudaError_t err = mxx_set_device(device);
         if (err != cudaSuccess)
         {
             throw std::runtime_error(cudaGetErrorString(err));
@@ -942,7 +989,7 @@ namespace
             throw std::runtime_error("inconsistent twiddle constants in upload_ntt_twiddles_to_device");
         }
 
-        cudaError_t err = cudaSetDevice(device);
+        cudaError_t err = mxx_set_device(device);
         if (err != cudaSuccess)
         {
             throw std::runtime_error(cudaGetErrorString(err));
@@ -1052,6 +1099,7 @@ extern "C"
                 return set_error("related GPU rings must share device placement");
             }
             configure_default_mempool_release_threshold(gpu_list);
+            enable_peer_access(gpu_list);
             const uint32_t resolved_dnum =
                 dnum == 0 ? static_cast<uint32_t>(gpu_list.size()) : dnum;
             if (resolved_dnum == 0 || resolved_dnum > GPU_RUNTIME_MAX_DIGITS)
@@ -1186,7 +1234,7 @@ extern "C"
             for (size_t partition = 0; partition < gpu_ctx->gpu_ids.size(); ++partition)
             {
                 const int device = gpu_ctx->gpu_ids[partition];
-                cudaError_t err = cudaSetDevice(device);
+                cudaError_t err = mxx_set_device(device);
                 if (err != cudaSuccess)
                 {
                     throw std::runtime_error(cudaGetErrorString(err));
@@ -1354,7 +1402,7 @@ extern "C"
             return 0;
         }
 
-        cudaError_t error = cudaSetDevice(device);
+        cudaError_t error = mxx_set_device(device);
         cudaEvent_t completion = nullptr;
         if (error == cudaSuccess)
         {
@@ -1411,7 +1459,7 @@ extern "C"
             return set_error("invalid gpu_default_mempool_get_usage arguments");
         }
         cudaMemPool_t pool = nullptr;
-        cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, device);
+        cudaError_t err = cudaDeviceGetDefaultMemPool(&pool, mxx_physical_device(device));
         if (err != cudaSuccess)
         {
         return set_error(err);
@@ -1487,7 +1535,7 @@ extern "C"
             return set_error("invalid gpu_device_get_identity arguments");
         }
         cudaDeviceProp properties{};
-        cudaError_t err = cudaGetDeviceProperties(&properties, device);
+        cudaError_t err = cudaGetDeviceProperties(&properties, mxx_physical_device(device));
         if (err != cudaSuccess)
         {
         return set_error(err);
@@ -1533,7 +1581,7 @@ extern "C"
         }
         for (const auto &entry : events->entries)
         {
-            cudaError_t err = cudaSetDevice(entry.device);
+            cudaError_t err = mxx_set_device(entry.device);
             if (err != cudaSuccess)
             {
                 return set_error(err);
@@ -1550,6 +1598,68 @@ extern "C"
     void gpu_event_set_destroy(GpuEventSet *events)
     {
         destroy_event_set(events);
+    }
+
+    static std::vector<int> &logical_device_table()
+    {
+        static std::vector<int> table;
+        return table;
+    }
+
+    static thread_local int current_logical_device = -1;
+
+    int gpu_configure_logical_devices(const int *physical, size_t count)
+    {
+        if (!physical || count == 0)
+            return set_error("invalid logical device table");
+        int physical_count = 0;
+        cudaError_t err = cudaGetDeviceCount(&physical_count);
+        if (err != cudaSuccess) return set_error(err);
+        for (size_t index = 0; index < count; ++index)
+            if (physical[index] < 0 || physical[index] >= physical_count)
+                return set_error("logical device maps to an absent physical device");
+        auto &table = logical_device_table();
+        if (!table.empty())
+            return std::equal(table.begin(), table.end(), physical, physical + count) &&
+                table.size() == count ? 0 : set_error("logical device table is already configured");
+        table.assign(physical, physical + count);
+        return 0;
+    }
+
+    int mxx_physical_device(int logical)
+    {
+        const auto &table = logical_device_table();
+        if (table.empty() || logical < 0) return logical;
+        return static_cast<size_t>(logical) < table.size() ? table[logical] : -1;
+    }
+
+    cudaError_t mxx_set_device(int logical)
+    {
+        const int physical = mxx_physical_device(logical);
+        if (physical < 0) return cudaErrorInvalidDevice;
+        const cudaError_t err = cudaSetDevice(physical);
+        if (err == cudaSuccess) current_logical_device = logical;
+        return err;
+    }
+
+    cudaError_t mxx_get_device(int *logical)
+    {
+        int physical = 0;
+        const cudaError_t err = cudaGetDevice(&physical);
+        if (err != cudaSuccess) return err;
+        // The last logical device selected on this thread, when it is still
+        // current; otherwise the first logical device of that physical one.
+        if (current_logical_device >= 0 && mxx_physical_device(current_logical_device) == physical)
+        {
+            *logical = current_logical_device;
+            return cudaSuccess;
+        }
+        const auto &table = logical_device_table();
+        if (table.empty()) { *logical = physical; return cudaSuccess; }
+        const auto found = std::find(table.begin(), table.end(), physical);
+        if (found == table.end()) return cudaErrorInvalidDevice;
+        *logical = static_cast<int>(found - table.begin());
+        return cudaSuccess;
     }
 
     int gpu_device_count(int *out_count)
@@ -1569,7 +1679,8 @@ extern "C"
         {
             return set_error(err);
         }
-        *out_count = count;
+        const auto &table = logical_device_table();
+        *out_count = table.empty() ? count : static_cast<int>(table.size());
         return 0;
     }
 
@@ -1585,7 +1696,7 @@ extern "C"
         {
             return set_error(err);
         }
-        err = cudaSetDevice(device);
+        err = mxx_set_device(device);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -1672,7 +1783,7 @@ extern "C"
             return set_error("invalid export slot allocation arguments");
         *out_host = nullptr;
         *out_device = nullptr;
-        const cudaError_t device_error = cudaSetDevice(physical_device);
+        const cudaError_t device_error = mxx_set_device(physical_device);
         if (device_error != cudaSuccess) return set_error(device_error);
         void *host = nullptr;
         cudaError_t error = cudaHostAlloc(&host,
@@ -1724,7 +1835,7 @@ extern "C"
             return set_error("failed to allocate device buffer owner");
         buffer->allocation_stream = reinterpret_cast<cudaStream_t>(stream_raw);
         buffer->bytes = bytes;
-        cudaError_t status = cudaGetDevice(&buffer->device);
+        cudaError_t status = mxx_get_device(&buffer->device);
         if (status == cudaSuccess)
         {
             status = cudaMallocAsync(
@@ -1766,7 +1877,7 @@ extern "C"
     {
         if (!buffer)
             return 0;
-        cudaError_t status = cudaSetDevice(buffer->device);
+        cudaError_t status = mxx_set_device(buffer->device);
         if (status == cudaSuccess && buffer->producer_valid)
             status = cudaStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
         if (status == cudaSuccess)
@@ -1813,7 +1924,7 @@ extern "C"
         {
             return set_error("invalid gpu_device_buffer_download arguments");
         }
-        cudaError_t status = cudaSetDevice(buffer->device);
+        cudaError_t status = mxx_set_device(buffer->device);
         if (status == cudaSuccess && buffer->producer_valid)
             status = cudaStreamWaitEvent(buffer->allocation_stream, buffer->producer, 0);
         if (status == cudaSuccess)
@@ -1837,11 +1948,11 @@ extern "C"
         if (!ctx || !address || !destination || bytes == 0 ||
             std::find(ctx->gpu_ids.begin(), ctx->gpu_ids.end(), device) == ctx->gpu_ids.end())
             return set_error("invalid resident address download arguments");
-        cudaError_t status = cudaSetDevice(device);
+        cudaError_t status = mxx_set_device(device);
         cudaPointerAttributes attributes{};
         if (status == cudaSuccess) status = cudaPointerGetAttributes(&attributes, address);
         if (status != cudaSuccess) return set_error(status);
-        if (attributes.device != device || attributes.type != cudaMemoryTypeDevice)
+        if (attributes.device != mxx_physical_device(device) || attributes.type != cudaMemoryTypeDevice)
             return set_error("resident download address belongs to another device or memory type");
         if (bytes > UINTPTR_MAX - reinterpret_cast<uintptr_t>(address))
             return set_error("resident download address overflows");
@@ -1858,7 +1969,7 @@ extern "C"
         (void)read_only;
         if (!buffer || !consumer_stream_raw || consumer_device < 0)
             return set_error("invalid gpu_device_buffer_wait_compiled_inputs arguments");
-        cudaError_t status = cudaSetDevice(consumer_device);
+        cudaError_t status = mxx_set_device(consumer_device);
         if (status == cudaSuccess && buffer->producer_valid &&
             reinterpret_cast<cudaStream_t>(consumer_stream_raw) != buffer->allocation_stream)
         {
@@ -1872,7 +1983,7 @@ extern "C"
     {
         if (!buffer || !buffer->producer_valid)
             return buffer ? 0 : set_error("invalid gpu_device_buffer_wait arguments");
-        cudaError_t status = cudaSetDevice(buffer->device);
+        cudaError_t status = mxx_set_device(buffer->device);
         if (status == cudaSuccess)
             status = cudaEventSynchronize(buffer->producer);
         return status == cudaSuccess ? 0 : set_error(status);
@@ -2098,7 +2209,7 @@ extern "C"
             return set_error("invalid explicit CUDA graph builder arguments");
         *out_builder = nullptr;
         if (!stream && gpu_context_get_compute_stream(ctx, device, &stream) != 0) return 1;
-        if (cudaSetDevice(device) != cudaSuccess) return set_error(cudaGetLastError());
+        if (mxx_set_device(device) != cudaSuccess) return set_error(cudaGetLastError());
         auto *builder = new (std::nothrow) MxxGpuGraphBuilder();
         if (!builder) return set_error("failed to allocate graph builder");
         builder->context = ctx;
@@ -2109,6 +2220,14 @@ extern "C"
         builder->root_graph = builder->graph;
         *out_builder = builder;
         return 0;
+    }
+
+    // The explicit graph operation this thread is constructing, whatever
+    // device context its current operation targets.
+    static MxxGpuGraphBuilder *&thread_explicit_builder()
+    {
+        static thread_local MxxGpuGraphBuilder *builder = nullptr;
+        return builder;
     }
 
     int mxx_gpu_graph_builder_begin_operation(MxxGpuGraphBuilder *builder,
@@ -2132,6 +2251,7 @@ extern "C"
                     return set_error("another explicit graph operation is active");
                 owner.explicit_builder = builder;
             }
+            thread_explicit_builder() = builder;
             builder->frontier.clear();
             builder->operation_nodes.clear();
             builder->binding_map.clear();
@@ -2175,6 +2295,7 @@ extern "C"
             auto &owner = *builder->context->execution;
             std::lock_guard<std::mutex> lock(owner.graph_mutex);
             if (owner.explicit_builder == builder) owner.explicit_builder = nullptr;
+            if (thread_explicit_builder() == builder) thread_explicit_builder() = nullptr;
         }
         builder->frontier.clear();
         builder->operation_nodes.clear();
@@ -2686,17 +2807,27 @@ extern "C"
             std::lock_guard<std::mutex> lock(owner.graph_mutex);
             if (owner.explicit_builder == builder) owner.explicit_builder = nullptr;
         }
+        if (thread_explicit_builder() == builder) thread_explicit_builder() = nullptr;
         delete builder;
     }
 
     MxxGpuGraphBuilder *mxx_gpu_graph_builder_for_stream(GpuContext *ctx, void *stream)
     {
         if (!ctx || !ctx->execution || !stream) return nullptr;
-        auto &owner = *ctx->execution;
-        std::lock_guard<std::mutex> lock(owner.graph_mutex);
-        auto *builder = owner.explicit_builder;
-        return builder && builder->operation_active &&
-            builder->stream == reinterpret_cast<cudaStream_t>(stream) ? builder : nullptr;
+        const auto matches = [stream](MxxGpuGraphBuilder *builder) {
+            return builder && builder->operation_active &&
+                builder->stream == reinterpret_cast<cudaStream_t>(stream);
+        };
+        {
+            auto &owner = *ctx->execution;
+            std::lock_guard<std::mutex> lock(owner.graph_mutex);
+            if (matches(owner.explicit_builder)) return owner.explicit_builder;
+        }
+        // An operation of a multi-device graph emits through the stream of
+        // another device's context; its builder is the one this thread is
+        // constructing.
+        auto *builder = thread_explicit_builder();
+        return builder && builder->operation_active ? builder : nullptr;
     }
 
     int mxx_gpu_graph_dispatch_kernel(GpuContext *ctx, void *stream,
@@ -2731,7 +2862,7 @@ extern "C"
         {
             return set_error("invalid mxx_gpu_graph_upload arguments");
         }
-        cudaError_t error = cudaSetDevice(exec->device);
+        cudaError_t error = mxx_set_device(exec->device);
         if (error == cudaSuccess)
         {
             error = cudaGraphUpload(exec->exec, reinterpret_cast<cudaStream_t>(launch_stream));
@@ -2748,7 +2879,7 @@ extern "C"
         {
             return set_error("invalid mxx_gpu_graph_bind arguments");
         }
-        cudaError_t error = cudaSetDevice(exec->device);
+        cudaError_t error = mxx_set_device(exec->device);
         if (error != cudaSuccess)
         {
             return set_error(error);
@@ -2903,7 +3034,7 @@ extern "C"
             return set_error("invalid mxx_gpu_graph_launch arguments");
         }
         *out_event = nullptr;
-        cudaError_t error = cudaSetDevice(exec->device);
+        cudaError_t error = mxx_set_device(exec->device);
         const cudaStream_t stream = reinterpret_cast<cudaStream_t>(launch_stream);
         auto *event = new (std::nothrow) MxxGpuNativeEvent();
         if (!event)
@@ -2957,7 +3088,7 @@ extern "C"
     void mxx_gpu_graph_exec_destroy(MxxGpuGraphExec *exec)
     {
         if (!exec) return;
-        cudaSetDevice(exec->device);
+        mxx_set_device(exec->device);
         if (exec->exec)
         {
             const cudaError_t error = cudaGraphExecDestroy(exec->exec);
@@ -2973,10 +3104,31 @@ extern "C"
         delete exec;
     }
 
+    int mxx_gpu_stream_record_event(void *stream_raw, int device, MxxGpuNativeEvent **out_event)
+    {
+        if (!stream_raw || !out_event) return set_error("invalid stream event record arguments");
+        *out_event = nullptr;
+        auto *event = new (std::nothrow) MxxGpuNativeEvent();
+        if (!event) return set_error("failed to allocate stream event state");
+        event->device = device;
+        cudaError_t error = mxx_set_device(device);
+        if (error == cudaSuccess)
+            error = cudaEventCreateWithFlags(&event->event, cudaEventDisableTiming);
+        if (error == cudaSuccess)
+            error = cudaEventRecord(event->event, reinterpret_cast<cudaStream_t>(stream_raw));
+        if (error != cudaSuccess)
+        {
+            mxx_gpu_native_event_destroy(event);
+            return set_error(error);
+        }
+        *out_event = event;
+        return 0;
+    }
+
     int mxx_gpu_native_event_wait(MxxGpuNativeEvent *event)
     {
         if (!event || !event->event) return set_error("invalid CUDA graph event");
-        cudaError_t error = cudaSetDevice(event->device);
+        cudaError_t error = mxx_set_device(event->device);
         if (error == cudaSuccess) error = cudaEventSynchronize(event->event);
         return error == cudaSuccess ? 0 : set_error(error);
     }
@@ -2985,7 +3137,7 @@ extern "C"
     {
         if (!event || !event->event || !stream_raw)
             return set_error("invalid CUDA graph event wait arguments");
-        cudaError_t error = cudaSetDevice(event->device);
+        cudaError_t error = mxx_set_device(event->device);
         if (error == cudaSuccess)
         {
             error = cudaStreamWaitEvent(
@@ -3007,7 +3159,7 @@ extern "C"
     void mxx_gpu_native_event_destroy(MxxGpuNativeEvent *event)
     {
         if (!event) return;
-        cudaSetDevice(event->device);
+        mxx_set_device(event->device);
         if (event->event)
         {
             const cudaError_t error = cudaEventDestroy(event->event);
@@ -3034,7 +3186,7 @@ extern "C"
         if (!event) return set_error("failed to allocate device copy completion state");
         event->device = destination->device;
         const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
-        cudaError_t status = cudaSetDevice(destination->device);
+        cudaError_t status = mxx_set_device(destination->device);
         if (status == cudaSuccess)
             status = cudaEventCreateWithFlags(&event->event, cudaEventDisableTiming);
         if (status == cudaSuccess && destination->producer_valid &&
@@ -3044,11 +3196,13 @@ extern "C"
         }
         if (status == cudaSuccess)
         {
-            status = source_device == destination->device ?
+            const int source_physical = mxx_physical_device(source_device);
+            const int destination_physical = mxx_physical_device(destination->device);
+            status = source_physical == destination_physical ?
                 cudaMemcpyAsync(destination->address, source, bytes,
                     cudaMemcpyDeviceToDevice, stream) :
-                cudaMemcpyPeerAsync(destination->address, destination->device,
-                    source, source_device, bytes, stream);
+                cudaMemcpyPeerAsync(destination->address, destination_physical,
+                    source, source_physical, bytes, stream);
         }
         if (status == cudaSuccess) status = cudaEventRecord(destination->producer, stream);
         if (status == cudaSuccess) status = cudaEventRecord(event->event, stream);

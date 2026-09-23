@@ -90,7 +90,7 @@ namespace
             static_metadata_bytes > SIZE_MAX - descriptor_count * sizeof(RawCrtDescriptor))
             return set_error("raw CRT metadata allocation overflow");
         plan->metadata_bytes = static_metadata_bytes + descriptor_count * sizeof(RawCrtDescriptor);
-        cudaError_t error = cudaSetDevice(plan->device);
+        cudaError_t error = mxx_set_device(plan->device);
         if (error == cudaSuccess)
             error = cudaMallocAsync(&plan->device_metadata,
                 plan->metadata_bytes, plan->stream);
@@ -360,7 +360,7 @@ extern "C" int gpu_raw_conversion_plan_wait(
     if (!plan || !stream_raw)
         return set_error("invalid raw conversion plan wait");
     if (!plan->raw_ready) return 0;
-    cudaError_t error = cudaSetDevice(plan->device);
+    cudaError_t error = mxx_set_device(plan->device);
     if (error == cudaSuccess)
         error = cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(stream_raw),
             plan->raw_ready, 0);
@@ -383,7 +383,7 @@ extern "C" int gpu_raw_rns_conversion_emit(
         source->rows > SIZE_MAX / launch.group_count ||
         destination->rows != source->rows * launch.group_count)
         return set_error("invalid raw RNS physical views");
-    if (cudaSetDevice(plan->device) != cudaSuccess)
+    if (mxx_set_device(plan->device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     int result = raw_crt_emit_descriptors(plan, ctx, stream, source, destination,
@@ -417,7 +417,7 @@ extern "C" int gpu_raw_block_mod_switch_emit(
         !raw_crt_basis_matches(destination, metadata.output.moduli, plan->target_count, plan) ||
         source->rows != destination->rows || source->columns != destination->columns)
         return set_error("invalid raw BlockModSwitch physical views");
-    if (cudaSetDevice(plan->device) != cudaSuccess)
+    if (mxx_set_device(plan->device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     int result = raw_crt_emit_descriptors(plan, ctx, stream, source, destination,

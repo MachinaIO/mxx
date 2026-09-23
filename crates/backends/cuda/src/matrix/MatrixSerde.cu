@@ -47,7 +47,7 @@ namespace
         }
         for (const auto &entry : events->entries)
         {
-            cudaSetDevice(entry.device);
+            mxx_set_device(entry.device);
             cudaEventDestroy(entry.event);
         }
         delete events;
@@ -69,7 +69,7 @@ namespace
         event_set->entries.reserve(streams.size());
         for (const auto &entry : streams)
         {
-            cudaError_t err = cudaSetDevice(entry.device);
+            cudaError_t err = mxx_set_device(entry.device);
             if (err != cudaSuccess)
             {
                 serde_destroy_event_set(event_set);
@@ -442,7 +442,7 @@ extern "C" int gpu_matrix_load_rns_batch(
         }
         const uint8_t *src = bytes + limb * host_limb_bytes;
 
-        cudaError_t err = cudaSetDevice(device);
+        cudaError_t err = mxx_set_device(device);
         if (err != cudaSuccess)
         {
             return set_error(err);
@@ -611,7 +611,7 @@ extern "C" int gpu_poly_load_compact_bytes(
         limb_coeff_bytes[limb] = limb_bytes;
     }
 
-    cudaError_t err = cudaSetDevice(common_device);
+    cudaError_t err = mxx_set_device(common_device);
     if (err != cudaSuccess)
     {
         return set_error(err);

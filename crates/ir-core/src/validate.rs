@@ -398,17 +398,29 @@ fn validate_with_manifests_inner(
         bindings.clone(),
         &mut scope_bindings,
     )?;
+    // A named subgraph is one scope for every call, so it is validated under
+    // each distinct call binding; the first instantiation is the stored one.
     for (scope_id, scope) in graph.scopes() {
-        let scope_env = scope_bindings
+        let scope_envs = scope_bindings
             .get(scope_id)
             .ok_or_else(|| ValidationError::MissingScope { scope: scope_id.clone() })?;
-        let validated =
-            validate_scope(scope_id, scope, scope_env, manifests, &mut warnings, resolve_basis)?;
-        scopes.insert(scope_id.clone(), validated);
+        let mut stored = None;
+        for scope_env in scope_envs {
+            let validated = validate_scope(
+                scope_id,
+                scope,
+                scope_env,
+                manifests,
+                &mut warnings,
+                resolve_basis,
+            )?;
+            stored.get_or_insert(validated);
+        }
+        scopes.insert(scope_id.clone(), stored.expect("every scope has an instantiation"));
     }
     let mut resolved_rings = BTreeMap::new();
     for (scope_id, scope) in graph.scopes() {
-        let scope_env = &scope_bindings[scope_id];
+        let scope_envs = &scope_bindings[scope_id];
         let mut rings = BTreeSet::new();
         for node in scope.nodes() {
             let (_, node_entries) =
@@ -422,11 +434,17 @@ fn validate_with_manifests_inner(
             // Loop-dependent rings have no single concrete value for this scope.
             // Validation checks the template at index zero, but that value must
             // not be exported as though it held for every loop instance.
+            // A ring that differs between call bindings likewise has no
+            // single scope-wide value.
             if !ring.expression().contains_loop_index() {
-                resolved_rings.insert(
-                    (scope_id.clone(), ring.clone()),
-                    resolve_ring(&ring, scope_env, resolve_basis)?,
-                );
+                let mut resolved = scope_envs
+                    .iter()
+                    .map(|scope_env| resolve_ring(&ring, scope_env, resolve_basis))
+                    .collect::<Result<Vec<_>, _>>()?;
+                resolved.dedup();
+                if let [resolved] = resolved.as_slice() {
+                    resolved_rings.insert((scope_id.clone(), ring.clone()), resolved.clone());
+                }
             }
         }
     }
@@ -444,9 +462,13 @@ fn collect_scope_bindings(
     graph: &Graph,
     scope_id: &FrozenGraphScopeId,
     env: ParamEnv,
-    output: &mut BTreeMap<FrozenGraphScopeId, ParamEnv>,
+    output: &mut BTreeMap<FrozenGraphScopeId, Vec<ParamEnv>>,
 ) -> Result<(), ValidationError> {
-    output.insert(scope_id.clone(), env.clone());
+    let envs = output.entry(scope_id.clone()).or_default();
+    if envs.contains(&env) {
+        return Ok(());
+    }
+    envs.push(env.clone());
     let scope = graph
         .scope(scope_id)
         .ok_or_else(|| ValidationError::MissingScope { scope: scope_id.clone() })?;
@@ -3634,6 +3656,58 @@ mod tests {
             child_loop_dependencies(&parent, &[("i".to_owned(), IntExpr::Var("i".to_owned()))]),
             BTreeSet::from(["i".to_owned()])
         );
+    }
+
+    #[test]
+    fn every_subgraph_call_binding_is_validated() {
+        use crate::graph::{SubgraphHandle, with_new_construction_scope};
+        let child = with_new_construction_scope(|scope| {
+            let matrix = MatrixType {
+                ring: crate::ring::test_ring(17, 2),
+                rows: 1.into(),
+                columns: 2.into(),
+            };
+            let value = NodeHandle::new(
+                NodeKind::ConstantMatrix {
+                    matrix_type: matrix.clone(),
+                    value: ConstantMatrix::Gadget { base: IntExpr::Var("b".into()), small: false },
+                },
+                vec![],
+                vec![WireType::Matrix(matrix)],
+            )
+            .output(0)
+            .unwrap();
+            SubgraphHandle::new("bound_gadget", scope, vec![], vec![value]).unwrap()
+        });
+        let graph = |bases: [i64; 2]| {
+            let outputs = bases
+                .iter()
+                .enumerate()
+                .map(|(index, base)| {
+                    let value = NodeHandle::subgraph_call(
+                        child.clone(),
+                        vec![],
+                        vec![("b".into(), IntExpr::constant(*base))],
+                        vec![],
+                    )
+                    .output(0)
+                    .unwrap();
+                    (format!("call{index}"), GraphOutput { value, availability: None })
+                })
+                .collect();
+            Graph::freeze("two-call-bindings", vec![], outputs, vec![], vec![], BTreeMap::new())
+                .unwrap()
+                .0
+        };
+        let valid = crate::ring::test_validate(&graph([4, 4]), &ParamEnv::default());
+        assert!(valid.is_ok(), "{valid:?}");
+        // The rejected binding must be caught whichever call carries it.
+        for bases in [[1, 4], [4, 1]] {
+            assert!(
+                crate::ring::test_validate(&graph(bases), &ParamEnv::default()).is_err(),
+                "bases {bases:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -489,9 +489,9 @@ impl ClosedProtocolBundle {
                     .requirements
                     .get(*requirement)
                     .ok_or(BundleValidationError::MissingInputDestination)?;
-                (&requirement.graph, input.as_str())
+                (requirement.graph(), input.as_str())
             }
-            ProtocolInputDestination::Ideal { input } => (&self.ideal.graph, input.as_str()),
+            ProtocolInputDestination::Ideal { input } => (self.ideal.graph(), input.as_str()),
         };
         root_input_type(graph, name)
     }
@@ -506,11 +506,11 @@ impl ClosedProtocolBundle {
             })
         });
         let requirements = self.requirements.iter().enumerate().flat_map(|(index, requirement)| {
-            root_inputs(&requirement.graph).map(move |(name, _, _)| {
+            root_inputs(requirement.graph()).map(move |(name, _, _)| {
                 ProtocolInputDestination::Requirement { requirement: index, input: name.to_owned() }
             })
         });
-        let ideal = root_inputs(&self.ideal.graph)
+        let ideal = root_inputs(self.ideal.graph())
             .map(|(name, _, _)| ProtocolInputDestination::Ideal { input: name.to_owned() });
         workflow.chain(requirements).chain(ideal).collect()
     }
@@ -539,7 +539,7 @@ impl ClosedProtocolBundle {
             let stage = stages
                 .get(&endpoint.workflow_output.stage)
                 .ok_or(BundleValidationError::MissingEndpointBinding)?;
-            if !self.ideal.graph.outputs().contains_key(&endpoint.ideal_output) ||
+            if !self.ideal.graph().outputs().contains_key(&endpoint.ideal_output) ||
                 !stage.graph.outputs().contains_key(&endpoint.workflow_output.output)
             {
                 return Err(BundleValidationError::MissingEndpointBinding);
@@ -580,7 +580,7 @@ impl ClosedProtocolBundle {
             }
             ComparatorSpec::EqualityAfterMap { program, endpoints } => {
                 let comparator_inputs =
-                    root_inputs(&program.graph).map(|(name, _, _)| name).collect::<BTreeSet<_>>();
+                    root_inputs(program.graph()).map(|(name, _, _)| name).collect::<BTreeSet<_>>();
                 for endpoint in endpoints {
                     if !comparator_inputs.contains(endpoint.actual_input.as_str()) ||
                         (!endpoint.ideal_input.is_empty() &&
@@ -589,11 +589,11 @@ impl ClosedProtocolBundle {
                         return Err(BundleValidationError::MissingComparatorConnection);
                     }
                     let output = program
-                        .graph
+                        .graph()
                         .outputs()
                         .get(&endpoint.result_output)
                         .ok_or(BundleValidationError::MissingComparatorConnection)?;
-                    let output_type = output_type(&program.graph, output.value)
+                    let output_type = output_type(program.graph(), output.value)
                         .ok_or(BundleValidationError::MissingComparatorConnection)?;
                     if !matches!(output_type, WireType::Bool | WireType::ConstantBool) {
                         return Err(BundleValidationError::ComparatorResultTypeMismatch);
@@ -733,11 +733,11 @@ impl ClosedProtocolBundle {
             self.requirements.iter().zip(&self.precondition_spec.requirement_outputs)
         {
             let output = requirement
-                .graph
+                .graph()
                 .outputs()
                 .get(output_name)
                 .ok_or(BundleValidationError::InvalidPreconditionOutput)?;
-            let output_type = output_type(&requirement.graph, output.value)
+            let output_type = output_type(requirement.graph(), output.value)
                 .ok_or(BundleValidationError::InvalidPreconditionOutput)?;
             if !matches!(output_type, WireType::Bool | WireType::ConstantBool) {
                 return Err(BundleValidationError::InvalidPreconditionOutput);

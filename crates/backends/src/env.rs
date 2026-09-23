@@ -10,6 +10,30 @@ pub fn cuda_stream_pool_size() -> usize {
         .unwrap_or(32)
 }
 
+/// `MXX_GPU_LOGICAL_DEVICES`: comma-separated physical CUDA device ids, one per
+/// logical GPU device. `0,0` exposes two logical devices on physical GPU 0, so
+/// multi-device plans can be exercised on one GPU. Unset: every detected device
+/// is its own logical device.
+pub fn gpu_logical_devices() -> Result<Option<Vec<i32>>, String> {
+    let name = "MXX_GPU_LOGICAL_DEVICES";
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Ok(None),
+        Ok(value) => {
+            value
+                .split(',')
+                .map(|device| {
+                    device.trim().parse::<i32>().ok().filter(|device| *device >= 0).ok_or_else(
+                        || format!("{name} must list physical device ids, got {value:?}"),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Some)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not valid UTF-8")),
+    }
+}
+
 /// `BLOCK_SIZE`: generic processing block size used in utilities (default: 100).
 pub fn block_size() -> usize {
     std::env::var("BLOCK_SIZE").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(100)

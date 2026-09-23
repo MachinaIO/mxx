@@ -59,7 +59,7 @@ extern "C" int gpu_raw_polynomial_from_values(
         if (destination->limbs[limb].crt_limb_index != limb ||
             destination->limbs[limb].modulus != ctx->moduli[limb])
             return set_error("raw polynomial-from-values requires ordered CRT basis");
-    if (cudaSetDevice(destination->physical_device) != cudaSuccess)
+    if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const uint32_t grid = (destination->degree - 1) / 256 + 1;

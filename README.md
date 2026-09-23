@@ -18,9 +18,9 @@ and circuit gadgets, runtime backends, and application-specific Lean correctness
 | `mxx-func-enc`, `mxx-io` | Functional-encryption and iO interfaces; protocol implementations have been removed. |
 
 The retired symbolic IR and probabilistic noise simulator are not part of the workspace.
-Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU
-samplers implement the current runtime-correspondence contract; GPU cutoff enforcement is tracked
-as a follow-up. Lattice-security estimation intentionally continues to model the corresponding
+Correctness uses enforced integer coefficient cutoffs and deterministic worst-case bounds. CPU and
+GPU samplers enforce the same cutoffs: Gaussian draws are resampled until they meet the bound, and
+preimage sampling retries whole candidates that exceed it. Lattice-security estimation intentionally continues to model the corresponding
 ordinary untruncated distributions separately.
 
 See `docs/architecture.md` (the design entry point, covering the IR, DSL, CPU executor, and GPU

@@ -152,7 +152,7 @@ extern "C" int gpu_raw_preimage_cutoff_metadata_ranges(
 extern "C" void gpu_raw_preimage_cutoff_destroy(GpuRawPreimageCutoffPlan *plan)
 {
     if (!plan) return;
-    cudaSetDevice(plan->physical_device);
+    mxx_set_device(plan->physical_device);
     if (plan->moduli) cudaFreeAsync(plan->moduli, plan->stream);
     if (plan->garner_inverses) cudaFreeAsync(plan->garner_inverses, plan->stream);
     if (plan->subset_indices) cudaFreeAsync(plan->subset_indices, plan->stream);
@@ -168,7 +168,7 @@ extern "C" int gpu_raw_preimage_cutoff_plan_wait(
 {
     if (!plan || !plan->upload_ready || !consumer_stream)
         return set_error("invalid raw preimage cutoff upload wait");
-    cudaError_t error = cudaSetDevice(plan->physical_device);
+    cudaError_t error = mxx_set_device(plan->physical_device);
     if (error == cudaSuccess)
         error = cudaStreamWaitEvent(
             reinterpret_cast<cudaStream_t>(consumer_stream), plan->upload_ready, 0);
@@ -184,7 +184,7 @@ extern "C" int gpu_raw_preimage_cutoff_prepare(
         magnitude_bytes == 0 || magnitude_bytes > 64 || physical_device < 0)
         return set_error("invalid raw preimage cutoff preparation");
     *out_plan = nullptr;
-    cudaError_t error = cudaSetDevice(physical_device);
+    cudaError_t error = mxx_set_device(physical_device);
     if (error != cudaSuccess) return set_error(error);
     cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
     error = cudaStreamIsCapturing(
@@ -334,7 +334,7 @@ extern "C" int gpu_raw_preimage_add_correction(
         e_binding_base > UINT32_MAX - e->limb_count ||
         z_binding_base > UINT32_MAX - z->limb_count)
         return set_error("invalid packed raw preimage correction views");
-    if (cudaSetDevice(candidate->physical_device) != cudaSuccess)
+    if (mxx_set_device(candidate->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     size_t bottom_count = 0;
     if (!raw_preimage_coefficient_count(z->rows, z->columns, z->degree, &bottom_count))
@@ -570,7 +570,7 @@ extern "C" int gpu_raw_preimage_hard_cutoff(
     if (count > SIZE_MAX / (1 + plan->magnitude_bytes) ||
         staging_bytes != count * (1 + plan->magnitude_bytes))
         return set_error("raw preimage cutoff staging length disagrees with candidate");
-    if (cudaSetDevice(plan->physical_device) != cudaSuccess)
+    if (mxx_set_device(plan->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const MxxGraphPatch init_patches[] = {
@@ -650,7 +650,7 @@ extern "C" int gpu_raw_preimage_publish_accepted(
         return set_error("raw preimage publication owner extent overflows");
     const uint64_t grid = std::min<size_t>(
         (total_bytes - 1) / kSmallThreads + 1, 65535);
-    if (cudaSetDevice(plan->physical_device) != cudaSuccess)
+    if (mxx_set_device(plan->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const MxxGraphPatch patches[] = {
         raw_preimage_patch(0, 0, destination_binding),

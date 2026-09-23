@@ -3064,7 +3064,7 @@ fn lower_dynamic_trapdoor_member(
 fn allocate_integer_status(
     ctx: &mut PhysicalLoweringContext<'_>,
 ) -> Result<PhysicalValueId, String> {
-    if let Some(status) = *ctx.integer_status {
+    if let Some(&status) = ctx.integer_status.get(&ctx.device) {
         return Ok(status);
     }
     let params = ctx.backend.control_parameters_on_device(ctx.device)?;
@@ -3102,7 +3102,7 @@ fn allocate_integer_status(
     ctx.values.push(physical);
     ctx.owners.insert(status_id, owner);
     ctx.control_resets.push(ControlReset::IntegerStatus(status));
-    *ctx.integer_status = Some(status_id);
+    ctx.integer_status.insert(ctx.device, status_id);
     Ok(status_id)
 }
 
@@ -6135,9 +6135,7 @@ fn lower_sequential_loop(
         ctx.external_io_loops.truncate(mark.10);
         *ctx.crt_resource_next = mark.11;
         ctx.hash_resources.retain(|id, _| resource_keys.0.contains(id));
-        if ctx.integer_status.is_some_and(|id| id.0 as usize >= first_new) {
-            *ctx.integer_status = None;
-        }
+        ctx.integer_status.retain(|_, id| (id.0 as usize) < first_new);
         ctx.dynamic_export_resources.retain(|id, _| resource_keys.1.contains(id));
         carry_ranges = widened;
         widenings += 1;
@@ -6642,13 +6640,6 @@ fn lower_parallel_loop(
     } else {
         Vec::new()
     };
-    let body_start = u32::try_from(ctx.operations.len())
-        .map_err(|_| "too many GPU parallel body operations".to_owned())?;
-    let loop_site = if parent_template.is_some() {
-        GpuLoopSiteKey { instance_class: u64::from(body_start) + 1, ..choice_site }
-    } else {
-        choice_site
-    };
     let child_id = graph
         .child_scope_id(scope_id, node_id)
         .ok_or_else(|| "GPU parallel loop has no child scope".to_owned())?;
@@ -6741,6 +6732,39 @@ fn lower_parallel_loop(
     }
     let source_ids =
         arguments.iter().map(|wire| ctx.wire_ids.get(wire).copied()).collect::<Vec<_>>();
+    // The lanes of an outermost wave loop spread over every device, lane `l`
+    // on device `l mod G`. Values outside the loop stay on the home device: a
+    // remote lane computes on copies of its inputs and copies its results
+    // home. Broadcast inputs are copied once per loop, before the template.
+    let home = ctx.device;
+    let lane_devices = if ctx.device_body || parent_template.is_some() {
+        vec![home]
+    } else {
+        ctx.logical
+            .contract
+            .logical_to_physical_devices
+            .iter()
+            .map(|&device| i32::try_from(device).map_err(|_| "GPU device ID overflows"))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    let mut broadcast_replicas = BTreeMap::new();
+    for &device in lane_devices.iter().take(width).filter(|&&device| device != home) {
+        for (argument, (source, mode)) in source_ids.iter().zip(&loop_node.input_modes).enumerate()
+        {
+            if let (LoopInputMode::Broadcast, Some(source)) = (mode, source) {
+                let replica =
+                    crate::gpu_physical_lowering::replicate_to_device(ctx, *source, device)?;
+                broadcast_replicas.insert((argument, device), replica);
+            }
+        }
+    }
+    let body_start = u32::try_from(ctx.operations.len())
+        .map_err(|_| "too many GPU parallel body operations".to_owned())?;
+    let loop_site = if parent_template.is_some() {
+        GpuLoopSiteKey { instance_class: u64::from(body_start) + 1, ..choice_site }
+    } else {
+        choice_site
+    };
     // Root input families rebind by name per execute; families computed in the
     // graph rebind from their plan-owned members.
     let mut zip_lanes =
@@ -6750,6 +6774,16 @@ fn lower_parallel_loop(
     let mut index_lanes = Vec::with_capacity(width);
     let template_values_start = ctx.values.len();
     for lane in 0..width {
+        let lane_device = lane_devices[lane % lane_devices.len()];
+        ctx.device = lane_device;
+        let outer_indices = ctx.device_loop_indices.clone();
+        if lane_device != home {
+            for (slot, index) in &outer_indices {
+                let replica =
+                    crate::gpu_physical_lowering::replicate_to_device(ctx, *index, lane_device)?;
+                ctx.device_loop_indices.insert(*slot, replica);
+            }
+        }
         let initial =
             u64::try_from(lane).map_err(|_| "GPU parallel lane index exceeds u64".to_owned())?;
         let maximum = u64::try_from(count - 1)
@@ -6762,9 +6796,11 @@ fn lower_parallel_loop(
         {
             let offset = match mode {
                 LoopInputMode::Broadcast => {
-                    input_ids.push(source.ok_or_else(|| {
-                        "GPU broadcast argument has no physical value".to_owned()
-                    })?);
+                    let source = source
+                        .ok_or_else(|| "GPU broadcast argument has no physical value".to_owned())?;
+                    input_ids.push(
+                        broadcast_replicas.get(&(argument, lane_device)).copied().unwrap_or(source),
+                    );
                     continue;
                 }
                 LoopInputMode::Zip => 0,
@@ -6865,7 +6901,11 @@ fn lower_parallel_loop(
                     Arc::new(selected.deep_copy(ctx.backend)?)
                 };
                 ctx.owners.insert(id, template);
-                input_ids.push(id);
+                input_ids.push(if lane_device == home {
+                    id
+                } else {
+                    crate::gpu_physical_lowering::replicate_to_device(ctx, id, lane_device)?
+                });
                 zip_lanes.push((name.cloned(), offset, lane, id, source));
             }
         }
@@ -6895,7 +6935,14 @@ fn lower_parallel_loop(
         );
         ctx.active_parallel_template = previous_template;
         ctx.active_parallel_instances = previous_instances;
-        let outputs = lowered?;
+        ctx.device_loop_indices = outer_indices;
+        let mut outputs = lowered?;
+        if lane_device != home {
+            for id in &mut outputs {
+                *id = crate::gpu_physical_lowering::replicate_to_device(ctx, *id, home)?;
+            }
+        }
+        ctx.device = home;
         for (port, id) in outputs.iter().copied().enumerate() {
             let ConcreteWireType::IndexedFamily { element, .. } = &outputs_by_port[port].0 else {
                 return Err("GPU parallel output is not a family".into());
@@ -8078,6 +8125,102 @@ mod tests {
                         zero.entry(row, column).to_bytes()
                     );
                 }
+            }
+        }
+    }
+
+    /// Wave lanes run on every logical device (run with
+    /// `MXX_GPU_LOGICAL_DEVICES=0,0` on one GPU): broadcast inputs are copied
+    /// to each remote lane and every member is copied home, including the
+    /// tail wave's.
+    #[test]
+    #[ignore = "requires a CUDA GPU"]
+    #[serial_test::serial(gpu_context)]
+    fn test_gpu_direct_parallel_lanes_spread_over_devices() {
+        let devices = detected_gpu_device_ids();
+        let cpu_params = DCRTPolyParams::new(32, 2, 50, 8, None, None);
+        let gpu_params = GpuDCRTPolyParams::new(32, cpu_params.to_crt().0, 8, None);
+        let ring = Ring::from_crt_moduli(
+            gpu_params.to_crt().0.into_iter().map(IntExpr::from).collect(),
+            gpu_params.ring_dimension(),
+        );
+        let left = ring.input("left", (2, 2));
+        let right = ring.input("right", (2, 3));
+        let family =
+            parallel(5, move |_| Ok(left.clone() * right.clone() + left.clone() * right.clone()))
+                .unwrap();
+        let validated = DslContext::new("direct-parallel-device-lanes")
+            .output("product", family)
+            .unwrap()
+            .build()
+            .unwrap()
+            .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
+            .unwrap();
+        let entry = |value: u64| {
+            DCRTPoly::from_biguints(
+                &cpu_params,
+                &(0..32)
+                    .map(|index| num_bigint::BigUint::from(value * 7 + index))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let matrix = |rows: usize, columns: usize, base: u64| {
+            DCRTPolyMatrix::from_poly_vec(
+                &cpu_params,
+                (0..rows)
+                    .map(|row| {
+                        (0..columns)
+                            .map(|column| entry(base + (row * columns + column) as u64))
+                            .collect()
+                    })
+                    .collect(),
+            )
+        };
+        let (left, right) = (matrix(2, 2, 1), matrix(2, 3, 11));
+        let inputs = BTreeMap::from([("left", &left), ("right", &right)].map(|(name, value)| {
+            let ty = validated
+                .source
+                .root_scope()
+                .nodes()
+                .iter()
+                .enumerate()
+                .find_map(|(index, node)| match node.kind() {
+                    NodeKind::Input { name: actual, .. } if actual == name => {
+                        Some(WireRef { node: NodeId(index as u64), port: Port(0) })
+                    }
+                    _ => None,
+                })
+                .map(|wire| validated.root_scope().wire_types[&wire].clone())
+                .expect("matrix input");
+            let native = Arc::new(GpuDCRTPolyMatrix::from_cpu_matrix(&gpu_params, value));
+            (name.to_owned(), RuntimeValue::gpu_matrix(ty, native).unwrap())
+        }));
+        let mut runtime =
+            GpuRuntime::new(gpu_backend_on([gpu_params.clone()], devices.clone())).unwrap();
+        let mut plan = runtime.plan_with_fixed_geometry_for_test(validated, &inputs, 3, 4).unwrap();
+        let mut used = BTreeSet::new();
+        let mut pending =
+            plan.physical_frame_for_test().program.operations.iter().collect::<Vec<_>>();
+        while let Some(operation) = pending.pop() {
+            used.insert(operation.device);
+            pending.extend(operation.body.iter().flatten());
+        }
+        assert_eq!(used, devices.iter().copied().collect::<BTreeSet<_>>());
+        let expected = (left.clone() * &right) + &(left * &right);
+        for replay in 0..2u8 {
+            let result = runtime
+                .execute(
+                    &mut plan,
+                    inputs.clone(),
+                    &mut MemoryArtifactStore::default(),
+                    [replay; 32],
+                )
+                .unwrap();
+            for index in 0..5 {
+                let actual = runtime
+                    .download_matrix_member_output(&result.output("product").unwrap(), index)
+                    .unwrap();
+                assert_eq!(actual, expected, "member {index}");
             }
         }
     }

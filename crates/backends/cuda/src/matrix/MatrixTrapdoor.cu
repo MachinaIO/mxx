@@ -28,7 +28,7 @@ MxxGraphPatch trapdoor_pointer_patch(uint32_t argument_index, uint32_t binding_i
             {
                 return;
             }
-            cudaError_t err = cudaSetDevice(device);
+            cudaError_t err = mxx_set_device(device);
             if (err == cudaSuccess)
             {
                 cudaEventDestroy(event);
@@ -761,7 +761,7 @@ extern "C" int gpu_raw_p1_sample(
          total_samples * m > workspace_bytes / (sizeof(double) + sizeof(int64_t)) ||
          !workspace))
         return set_error("raw P1 workspace is too small");
-    if (cudaSetDevice(tp2->physical_device) != cudaSuccess)
+    if (mxx_set_device(tp2->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const auto *tp2_base = reinterpret_cast<const uint8_t *>(tp2->limbs[0].address);
@@ -904,7 +904,7 @@ extern "C" int gpu_raw_gq_sample(
         poly_count * source->degree * digits > sampled_bytes / sizeof(int64_t) ||
         poly_count * source->degree > static_cast<size_t>(UINT32_MAX) * 256)
         return set_error("raw GQ sampled workspace too small");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t count = poly_count * source->degree;

@@ -287,8 +287,10 @@ The steps are: structural validation (`validate_structure`: topological order, d
 variables, legal loop-index use, dynamic family access in loop-dependent reads, subgraph bound
 arity), manifest checks, parameter bindings and constraints, then per-scope concrete type
 checking of every node, ring resolution, and checks that call and loop boundaries agree with
-their child scopes. Each scope, including every loop and subgraph body, is checked once as a
-template rather than per instance. `execution_order` is the frozen postorder, and
+their child scopes. Each loop body is checked once as a template at loop index zero rather than
+per iteration. A named subgraph is one scope for all of its calls, so it is checked once under each
+distinct call binding; the stored `ValidatedScope` is the first call's, and a ring is recorded in
+`resolved_rings` only when every call resolves it to the same value. `execution_order` is the frozen postorder, and
 `LivenessSchedule::last_use` lets executors release intermediates after their last reader.
 
 Validation proves structural and type correctness under concrete parameters. It does not prove
@@ -321,7 +323,8 @@ cryptographic norm bounds; those are application-owned.
   comparator, endpoint bindings, operational decoder targets, input contracts
   (`InputValueContract`), and input bindings.
 - `IdealSpec::new(Graph)` and `PurePredicateSpec::new(Graph)` (`protocol/spec.rs`) reject every
-  sampler kind in every scope; a predicate must have exactly one Boolean output.
+  sampler kind in every scope; a predicate must have exactly one Boolean output. The graph is
+  private and read through `graph()`, so these checks cannot be bypassed.
 - `OutputRef { stage, output }` names an executable result. `OperationalDecoderKind` is
   `ThresholdDecode { plaintext_modulus }` or `BooleanInterval`; validation checks the decoder's
   executable node chain against the residual it names.
@@ -721,8 +724,11 @@ can be adjusted with `options_mut`:
 | `integer_input_ranges` | (set in code) | empty |
 
 `crates/backends/src/env.rs` also defines `MXX_CUDA_STREAM_POOL_SIZE` (compute streams per
-context and device, default 32) and `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS` (GPU preimage retry
-bound per column tile, default 64; zero or malformed values are errors).
+context and device, default 32), `MXX_GPU_PREIMAGE_MAX_TILE_ATTEMPTS` (GPU preimage retry
+bound per column tile, default 64; zero or malformed values are errors), and
+`MXX_GPU_LOGICAL_DEVICES` (`gpu_logical_devices`: one physical CUDA device id per logical device,
+for example `0,0`; unset or empty means one logical device per detected GPU, and an invalid value
+panics; see section 6.4).
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
@@ -743,7 +749,8 @@ Planning (`GpuRuntime::plan_with_payload_sizes` in `gpu_runtime_direct.rs`) choo
   largest candidate is the largest finite loop count found by a probe lowering, capped at
   `max_parallel_instances`.
 - **C**, the column tile width: the number of matrix columns processed per job, derived from the
-  widest matrix (or matrix-family) output.
+  widest matrix (or matrix-family) output. With several devices, each node freezes one width per
+  logical device (section 6.4); the trial grid itself does not depend on the device count.
 
 Both use a geometric grid (`geometric_candidates`): W in `1, 2, 4, ...` plus the maximum itself,
 and C in `ceil(columns / t)` for `t = 1, 2, 4, ...` plus `t = columns`, so both extremes are always
@@ -757,7 +764,9 @@ time only; device status words are data-dependent and are checked by `execute`.
 
 The frozen, value-only record of these choices is `FrozenGpuPlan { contract: GpuPlanContract,
 layouts, loops: Vec<GpuLoopChoice>, nodes: Vec<GpuNodeChoice> }`. It never owns device buffers,
-pointers, or command objects.
+pointers, or command objects. `GpuNodeChoice::columns_per_job` holds one column width per logical
+device (0 marks an inactive device), and the report's `columns_per_job` likewise has one entry per
+device.
 
 ### 6.3 Physical lowering
 
@@ -767,7 +776,8 @@ a `PhysicalFrame`: a `CompiledGpuProgram` plus the resident owners, export slots
 templates, control resets, and wave descriptors needed to run it.
 
 - **Physical values.** `PhysicalValue { ty, encodings, parts, integer_ranges }` describes a value
-  as one or more `PhysicalPart { leaf, storage: StorageRef, device, view: PhysicalView }`.
+  as one or more `PhysicalPart { leaf, storage: StorageRef, device, view: PhysicalView }`, where
+  `device` is a logical device id (section 6.4).
   `StorageRef` is `Input(i)`, `Output(i)`, or `Scratch(i)`: an allocation slot local to the plan
   or to a resident value. `PhysicalView` is an origin/extent/stride view into that allocation.
   `PhysicalEncoding` covers `FullCoeff` and `FullEval` matrices, compact bounded coefficients
@@ -780,7 +790,8 @@ templates, control resets, and wave descriptors needed to run it.
   RNS conversions, samplers, preimage stages, copies, exports, control, ...).
 - **Explicit CUDA Graph regions.** `DirectGraph::compile` splits the operation list into
   `GraphRegion`s at wave-body boundaries, import points, and external-I/O loop bodies, and builds
-  each region with `GpuNativeGraphBuilder` (`crates/backends/src/poly/dcrt/gpu.rs`). Unrelated
+  each region with `GpuNativeGraphBuilder` (`crates/backends/src/poly/dcrt/gpu.rs`). One region is
+  one CUDA Graph even when its operations run on several devices (section 6.4). Unrelated
   operations keep independent paths because each operation declares its predecessors. At bind
   time a region rejects any owner whose physical descriptor differs from the planned one.
 - **Waves.** A `ParallelLoop`, at the root or nested inside another loop body, lowers to a
@@ -796,7 +807,8 @@ templates, control resets, and wave descriptors needed to run it.
   overflow, invalid index, inexact division, invalid ring property; `MxxGpuControlStatus` in
   `crates/backends/cuda/include/Control.cuh`) into resident status words. Errors are first-wins, each
   replay resets a status word once, and status words are checked only after the launch joins,
-  instead of one host reset and readback per operation.
+  instead of one host reset and readback per operation. Each device has its own status word
+  (`PhysicalLoweringContext::integer_status` is a per-device map).
 - **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
   per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
@@ -812,7 +824,78 @@ templates, control resets, and wave descriptors needed to run it.
   so sharing adds no dependency and preserves the measured concurrency. Inputs, outputs,
   wave-bound members, imports, and values read before any write keep their own allocations.
 
-### 6.4 Artifact I/O
+### 6.4 Multiple GPUs
+
+A plan distributes selected work over every device of its backend. Everything the plan and the
+backend call a device (`PhysicalPart::device`, `CompiledGpuOp::device`, backend device ids) is a
+**logical** device id; the **home device** is the first logical device.
+
+- **Logical devices.** A process-wide native table maps logical to physical CUDA devices
+  (`gpu_configure_logical_devices`, `mxx_physical_device`, `mxx_set_device`, `mxx_get_device` in
+  `crates/backends/cuda/src/Runtime.cu`, declared in `crates/backends/cuda/include/Runtime.cuh`).
+  It is the identity unless `MXX_GPU_LOGICAL_DEVICES` is set; `ensure_logical_devices`
+  (`crates/backends/src/poly/dcrt/gpu.rs`) installs it once, before any device query, and
+  `detected_gpu_device_ids()` returns logical ids. `MXX_GPU_LOGICAL_DEVICES=0,0` gives two logical
+  devices on GPU 0, so multi-device plans run and are tested on one GPU. Native code selects
+  devices only through `mxx_set_device`, never raw `cudaSetDevice`. Logical devices sharing a
+  physical GPU each report that GPU's full memory budget, which is fine for tests but not for
+  capacity planning.
+- **Peer access.** `gpu_context_create` calls the native `enable_peer_access`, which enables CUDA
+  peer access and default-mempool access between distinct physical GPUs where the hardware allows
+  it.
+- **One Graph across devices.** `DirectGraph::compile` emits each operation through the launch
+  stream of its own device (`GpuNativeGraphBuilder::replace_launch_stream`; the native
+  `mxx_gpu_graph_builder_for_stream` falls back to the thread's active builder for another
+  device's stream, and conditional gate kernels select the stream's device). The graph launches on
+  the home device's stream, and `GraphRegion::peer_streams` holds one stream per other device of
+  the plan. Before each launch, every per-launch resource (reals, bytes inputs, seeds, indexed
+  tables, preimage attempt/status words, prepared workspaces) is prepared on its own device's
+  stream after the previous launch and joined into the launch stream with events
+  (`GpuNativeLaunchStream::record_event`, `GpuNativeEvent::enqueue_wait`); after the launch,
+  resources are protected per device.
+- **Copies only.** Cross-device data moves only through copy nodes; no kernel reads remote memory.
+  The `Copy` primitive (`compiled_span_part` in `crates/backends/src/backend/poly_gpu/fleet.rs`)
+  copies one contiguous span, runs on one of its two devices, and may cross to the other
+  (`cudaMemcpyDefault` when the devices differ). CUDA cannot update pitched (2D/3D) memcpy nodes
+  in an instantiated graph, so strided windows are first packed on their own device
+  (`MatrixCopyView`) and then moved as contiguous spans. `replicate_to_device`
+  (`crates/backends/src/gpu_physical_lowering.rs`) copies any value into same-layout storage on
+  another device with one contiguous copy per storage, covering only the bytes its parts view.
+- **Column ownership.** `GpuLayout::owner_intervals` assign contiguous column blocks to devices
+  (`balanced_owner_intervals`), and `GpuLayout::schedule` turns them into per-device column jobs
+  using the per-device widths of `GpuNodeChoice::columns_per_job`.
+
+What runs where:
+
+- **Matrix products** (`MatrixBinaryOp::Multiply` in `lower_matrix_node`) split output columns
+  evenly over all devices. A remote job computes on copies of the whole left operand and of its
+  right column window (windows are packed first by `matrix_columns_on_device`), cached per value,
+  column range, and device within the node; its output shard is copied home and packed into the
+  output's columns. Elementwise addition and subtraction stay on the home device, where copies
+  would cost more than they save.
+- **Preimage sampling** (`lower_preimage_sample_node`) assigns column tiles to devices in
+  contiguous blocks from the layout schedule. A remote tile runs its whole retry loop (the
+  `LoopWhile` body) on its device, with copies of the public matrix, the trapdoor leaves `r`, `e`,
+  and `re`, the inverse trapdoor, and its target window. Each device writes a compact output block
+  that `copy_compact_block_home` copies home row by row, because the compact payload is row-major.
+- **Parallel loops** (`lower_parallel_loop` in `crates/backends/src/gpu_physical_control.rs`)
+  spread the lanes of an outermost wave loop over the devices: lane `l` runs on device `l mod G`.
+  Broadcast inputs are copied once per loop to each remote device before the wave template; `Zip`
+  members bind the home placeholder per wave and are copied into the lane inside the template;
+  outer device-loop indices are copied into the lane; a remote lane's results are copied home, so
+  family members always live on the home device. Nested wave loops inside a lane and anything
+  inside a device body (conditional, retry, or sequential-loop body) stay on the current device;
+  products and preimages inside a remote lane run on that lane's device.
+- **Everything else** runs on the home device.
+
+Tests that assert work lands on every logical device when run with `MXX_GPU_LOGICAL_DEVICES=0,0`
+(or `0,0,0`): `matrix_products_shard_columns_over_devices`
+(`crates/backends/tests/gpu_direct_node_semantics.rs`),
+`test_gpu_direct_parallel_lanes_spread_over_devices` (`gpu_physical_control.rs`, using
+`plan_with_fixed_geometry_for_test`), and `direct_preimage_sample_tiled_columns_match_public_relation`
+(`gpu_physical_lowering.rs`). The whole GPU suite passes in identity, `0,0`, and `0,0,0` modes.
+
+### 6.5 Artifact I/O
 
 - **On-demand import.** An artifact input is not read at planning time. The plan records an
   `ImportTemplate` with the operation before which the payload is needed; at execution the region
@@ -831,22 +914,23 @@ templates, control resets, and wave descriptors needed to run it.
 - Producer executions open a session keyed by `ProductionId(spec_hash, nonce)` and a digest of
   the canonical inputs (`gpu_runtime_digest.rs`), mirroring CPU `execute_in_session`.
 
-### 6.5 Backend, fleet, and related contexts
+### 6.6 Backend, fleet, and related contexts
 
 - `GpuDcrtBackend` (`crates/backends/src/backend/poly_gpu/fleet.rs`) is the set of registered CUDA
-  contexts: one placement per physical device, each holding one `GpuDCRTPolyParams` per ring,
-  selected by ordered CRT basis and ring dimension. It carries a unique execution identity used to
-  bind plans to their backend.
-- `gpu_backend(params)` uses every device from `detected_gpu_device_ids()`
+  contexts: one placement per logical device, each holding one `GpuDCRTPolyParams` per ring,
+  selected by ordered CRT basis and ring dimension. Each fleet context is single-device and holds
+  every CRT limb of its matrices. The backend carries a unique execution identity used to bind
+  plans to their backend.
+- `gpu_backend(params)` uses every logical device from `detected_gpu_device_ids()`
   (`crates/backends/src/poly/dcrt/gpu.rs`); `gpu_backend_on(params, device_ids)` restricts the
-  fleet (`crates/backends/src/backend/poly_gpu.rs`).
+  fleet (`crates/backends/src/backend/poly_gpu.rs`). A plan uses every device of its backend.
 - **Related contexts.** On each device, the first registered ring is the anchor and the others
   are created as related contexts (`GpuDCRTPolyParams::params_for_device(device, related)`, native
   `gpu_context_create` in `crates/backends/cuda/src/Runtime.cu`). Related rings with different
   bases share one execution owner: identity, stream pool, release streams, and Graph builder, so
   operations mixing rings (for example RNS mod up/down) stay on one ordered execution.
 
-### 6.6 Native CUDA layer
+### 6.7 Native CUDA layer
 
 Native code lives in `crates/backends/cuda/`. Headers in `include/` declare only cross-file and
 Rust-facing functions; bodies live in `src/`.
@@ -868,15 +952,17 @@ sources as `MXX_NATIVE_KERNEL_BUILD_REVISION`. The matrix sources included by `M
 compiled on their own. GPU-specific Rust code lives in files whose names contain `gpu`, as
 required by `GPU.md`.
 
-### 6.7 Current limitations
+### 6.8 Current limitations
 
 These restrictions are explicit errors in the current code:
 
-- **One device per plan.** `single_root_physical_plan` rejects a backend with more than one
-  device ("root physical candidate needs one device and positive W/C"), and multi-device matrices
-  need a shard plan that does not exist yet ("GPU physical lowering needs an explicit
-  multi-device shard plan"). Use `gpu_backend_on(params, [device])` for planning on a multi-GPU
-  machine.
+- **Partial multi-device distribution.** Only matrix products, preimage column tiles, and the
+  lanes of outermost parallel loops are distributed (section 6.4); every other value lives on the
+  home device. Multi-physical-GPU execution uses the same code path but has been validated in this
+  repository only with logical devices on one physical GPU. The legacy native multi-partition
+  context (CRT limbs partitioned by `dnum`, `GpuDCRTPolyParams::new_with_gpu`) still exists for
+  native tests, but plans never use it; binding such a matrix fails ("GPU physical matrix needs an
+  explicit multi-device shard plan").
 - **Nested device loops.** A parallel loop inside a device body (a sequential-loop, retry, or
   branch body) runs all of its occurrences in one template. A sequential loop inside a device body
   restarts its index on the device, and it cannot read artifacts per iteration ("GPU

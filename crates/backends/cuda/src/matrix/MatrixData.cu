@@ -287,7 +287,7 @@ namespace
             {
                 continue;
             }
-            cudaSetDevice(device);
+            mxx_set_device(device);
 
             cudaStream_t free_stream =
                 partition_idx < mat->ctx->execution->release_streams_by_partition.size()
@@ -385,7 +385,7 @@ namespace
             }
             if (device >= 0)
             {
-                cudaSetDevice(device);
+                mxx_set_device(device);
             }
             for (auto &state : states)
             {
@@ -569,7 +569,7 @@ extern "C" int gpu_matrix_create(
 
         mat->exec_limb_states[partition_idx].resize(partition.local_limb_count);
 
-        cudaError_t err = cudaSetDevice(ctx->gpu_ids[partition_idx]);
+        cudaError_t err = mxx_set_device(ctx->gpu_ids[partition_idx]);
         if (err != cudaSuccess)
         {
             destroy_matrix_contents(mat);
@@ -800,7 +800,7 @@ extern "C" int gpu_matrix_wait(const GpuMatrix *mat)
             {
                 continue;
             }
-            cudaError_t err = cudaSetDevice(completion.device);
+            cudaError_t err = mxx_set_device(completion.device);
             if (err != cudaSuccess)
             {
                 return set_error(err);

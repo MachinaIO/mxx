@@ -535,7 +535,7 @@ extern "C" int gpu_raw_polynomial_values(GpuContext *ctx, void *stream_raw,
         source->degree > SIZE_MAX / ((output_magnitude_words + 1) * sizeof(uint64_t)) ||
         source_binding_base > UINT32_MAX - source->limb_count)
         return set_error("invalid raw polynomial-values physical view");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     MxxGraphPatch patches[kMaxLimbs + 1];
     size_t patch_count = 0;
@@ -571,7 +571,7 @@ extern "C" int gpu_raw_extract_coefficient(GpuContext *ctx, void *stream_raw,
         output_magnitude_words < static_cast<size_t>(metadata.word_count) ||
         source_binding_base > UINT32_MAX - source->limb_count)
         return set_error("invalid raw extract-coefficient physical view");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     MxxGraphPatch patches[kMaxLimbs + 3];
     size_t patch_count = 0;
@@ -633,7 +633,7 @@ extern "C" int gpu_raw_pack_polynomial_coefficients(GpuContext *ctx,
             ctx->gpu_ids[ctx->limb_gpu_ids[limb].x] != destination->physical_device)
             return set_error("invalid raw polynomial pack CRT limb");
     }
-    if (cudaSetDevice(destination->physical_device) != cudaSuccess)
+    if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const uint32_t grid = static_cast<uint32_t>(
@@ -694,7 +694,7 @@ extern "C" int gpu_raw_threshold_decode(GpuContext *ctx, void *stream_raw,
         output_count > SIZE_MAX / scratch_words / sizeof(uint64_t) ||
         workspace_bytes < output_count * scratch_words * sizeof(uint64_t))
         return set_error("raw threshold-decode workspace is too small");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     MxxGraphPatch patches[kMaxLimbs + 5];
     size_t patch_count = 0;

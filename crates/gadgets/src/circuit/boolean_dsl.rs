@@ -385,7 +385,7 @@ mod tests {
         output: &str,
     ) -> bool {
         let validated = mxx_ir_core::validate(
-            &predicate.graph,
+            predicate.graph(),
             bindings,
             mxx_backends::openfhe_guard::gen_modulus_and_warmup,
         )
@@ -452,13 +452,13 @@ mod tests {
             boolean_circuit_satisfaction_predicate(DslContext::new("symbolic-satisfaction"))
                 .unwrap();
         mxx_ir_core::validate(
-            &validity.graph,
+            validity.graph(),
             &bindings(),
             mxx_backends::openfhe_guard::gen_modulus_and_warmup,
         )
         .unwrap();
         mxx_ir_core::validate(
-            &satisfaction.graph,
+            satisfaction.graph(),
             &bindings(),
             mxx_backends::openfhe_guard::gen_modulus_and_warmup,
         )
@@ -470,13 +470,13 @@ mod tests {
             .integers
             .insert(BooleanCircuitFamilyParams::MAX_LAYER_WIDTH_PARAMETER.to_owned(), 5.into());
         mxx_ir_core::validate(
-            &validity.graph,
+            validity.graph(),
             &second,
             mxx_backends::openfhe_guard::gen_modulus_and_warmup,
         )
         .unwrap();
         mxx_ir_core::validate(
-            &satisfaction.graph,
+            satisfaction.graph(),
             &second,
             mxx_backends::openfhe_guard::gen_modulus_and_warmup,
         )

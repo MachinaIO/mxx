@@ -10,15 +10,16 @@ use crate::{
         PolyParams,
         dcrt::{
             gpu::{
-                GpuDCRTPolyParams, GpuDynamicExportBindings, GpuDynamicExportTable, GpuExportSlot,
-                GpuExportStatus, GpuGraphPatch, GpuHashSamplePlan, GpuIndexedMatrixTable,
-                GpuIntegerOperation, GpuModulusConversionPlan, GpuNativeEvent,
-                GpuNativeGraphBuilder, GpuNativeGraphError, GpuNativeLaunchStream,
-                GpuRawControlStatusView, GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb,
-                GpuRawMatrixView, GpuRawP1Bindings, GpuRawP1Workspace,
-                GpuRawPreimageCutoffBindings, GpuRawPreimageCutoffPlan, GpuRawSeedView,
-                GpuRawSmallMatrixView, GpuSignedValuesEncoding, gpu_device_identity,
-                gpu_device_memory_usage, gpu_device_sync,
+                CUDA_MEMCPY_DEFAULT, GpuDCRTPolyParams, GpuDynamicExportBindings,
+                GpuDynamicExportTable, GpuExportSlot, GpuExportStatus, GpuGraphPatch,
+                GpuHashSamplePlan, GpuIndexedMatrixTable, GpuIntegerOperation,
+                GpuModulusConversionPlan, GpuNativeEvent, GpuNativeGraphBuilder,
+                GpuNativeGraphError, GpuNativeLaunchStream, GpuRawControlStatusView,
+                GpuRawGqWorkspace, GpuRawIntegerView, GpuRawMatrixLimb, GpuRawMatrixView,
+                GpuRawP1Bindings, GpuRawP1Workspace, GpuRawPreimageCutoffBindings,
+                GpuRawPreimageCutoffPlan, GpuRawSeedView, GpuRawSmallMatrixView,
+                GpuSignedValuesEncoding, gpu_device_identity, gpu_device_memory_usage,
+                gpu_device_sync,
             },
             gpu_real::{GpuRawRealInput, GpuRawRealView, GpuRealOperation},
             params::DCRTPolyParams,
@@ -299,6 +300,36 @@ fn compiled_contiguous_part(
         .address
         .checked_add(part.view.byte_offset)
         .ok_or_else(|| invalid("compiled copy address overflows"))
+}
+
+/// The address of `bytes` contiguous bytes starting at a part's first
+/// element, all inside its storage. A replica copies the whole span its parts
+/// view this way, whatever their strides.
+fn compiled_span_part(
+    owner: &GpuResidentValue,
+    part_index: u32,
+    bytes: u64,
+) -> Result<(i32, u64), GpuNativeGraphError> {
+    let invalid = |message: &str| GpuNativeGraphError::Native(message.into());
+    let part = owner
+        .physical()
+        .parts
+        .get(part_index as usize)
+        .ok_or_else(|| invalid("compiled copy references an unknown physical part"))?;
+    let storage = owner
+        .storage(part.storage)
+        .ok_or_else(|| invalid("compiled copy part has no storage binding"))?;
+    if part.device != storage.device ||
+        bytes == 0 ||
+        part.view.byte_offset.checked_add(bytes).is_none_or(|end| end > storage.bytes)
+    {
+        return Err(invalid("compiled copy exceeds its physical storage"));
+    }
+    let address = storage
+        .address
+        .checked_add(part.view.byte_offset)
+        .ok_or_else(|| invalid("compiled copy address overflows"))?;
+    Ok((part.device, address))
 }
 
 fn compiled_raw_export_span(
@@ -1711,7 +1742,27 @@ pub(crate) fn emit_compiled_gpu_op(
             let destination_owner = owners
                 .get(destination_id)
                 .ok_or_else(|| invalid("compiled copy destination owner is missing"))?;
-            if source_owner.wire_type() != destination_owner.wire_type() ||
+            // A copy moves equal windows, which may sit at different columns
+            // of matrices that differ only in width, e.g. a device's column
+            // block and its place in the whole output.
+            let columns = |ty: &ConcreteWireType| match ty {
+                ConcreteWireType::Matrix(matrix) |
+                ConcreteWireType::SmallMatrix { matrix, .. } |
+                ConcreteWireType::Preimage { matrix, .. } => Some(matrix.columns),
+                _ => None,
+            };
+            let windowed = columns(source_owner.wire_type()).is_some();
+            let mut destination_type = destination_owner.wire_type().clone();
+            if let (
+                Some(width),
+                ConcreteWireType::Matrix(matrix) |
+                ConcreteWireType::SmallMatrix { matrix, .. } |
+                ConcreteWireType::Preimage { matrix, .. },
+            ) = (columns(source_owner.wire_type()), &mut destination_type)
+            {
+                matrix.columns = width;
+            }
+            if source_owner.wire_type() != &destination_type ||
                 source_owner.physical().encodings != destination_owner.physical().encodings
             {
                 return Err(invalid("compiled copy value types or encodings disagree"));
@@ -1728,40 +1779,27 @@ pub(crate) fn emit_compiled_gpu_op(
                 .get(*destination_part as usize)
                 .ok_or_else(|| invalid("compiled copy destination part is missing"))?
                 .view;
-            if source_layout.origin != destination_layout.origin ||
+            if source_layout.origin.len() != destination_layout.origin.len() ||
+                source_layout
+                    .origin
+                    .iter()
+                    .zip(destination_layout.origin.iter())
+                    .enumerate()
+                    .any(|(axis, (source, destination))| {
+                        source != destination && !(windowed && axis == 1)
+                    }) ||
                 source_layout.extent != destination_layout.extent ||
                 source_layout.element_bytes != destination_layout.element_bytes
             {
                 return Err(invalid("compiled copy physical windows disagree"));
             }
-            if matches!(
-                source_owner.wire_type(),
-                ConcreteWireType::SmallMatrix { .. } | ConcreteWireType::Preimage { .. }
-            ) {
-                let (_, source_view, source_bytes) =
-                    compiled_raw_small_matrix_part(source_owner, *source_part)?;
-                let (_, destination_view, destination_bytes) =
-                    compiled_raw_small_matrix_part(destination_owner, *destination_part)?;
-                if source_owner.physical().parts.len() != 1 ||
-                    destination_owner.physical().parts.len() != 1 ||
-                    source_layout.byte_offset != 0 ||
-                    destination_layout.byte_offset != 0 ||
-                    source_layout.origin.iter().any(|&coordinate| coordinate != 0) ||
-                    source_view.column_offset != 0 ||
-                    destination_view.column_offset != 0 ||
-                    source_view.storage_columns != source_view.columns ||
-                    destination_view.storage_columns != destination_view.columns ||
-                    source_view.crt_depth != destination_view.crt_depth ||
-                    source_view.bound_domain != destination_view.bound_domain ||
-                    source_bytes != destination_bytes ||
-                    *bytes != source_bytes as u64
-                {
-                    return Err(invalid("compiled compact copy requires complete packed owners"));
-                }
+            // A copy runs on one of its two devices and may cross to the other.
+            let (source_device, source) = compiled_span_part(source_owner, *source_part, *bytes)?;
+            let (destination_device, destination) =
+                compiled_span_part(destination_owner, *destination_part, *bytes)?;
+            if op.device != source_device && op.device != destination_device {
+                return Err(invalid("compiled copy runs on neither of its devices"));
             }
-            let source = compiled_contiguous_part(source_owner, *source_part, *bytes, op.device)?;
-            let destination =
-                compiled_contiguous_part(destination_owner, *destination_part, *bytes, op.device)?;
             let bytes = usize::try_from(*bytes)
                 .map_err(|_| invalid("compiled copy length exceeds usize"))?;
             builder.bind_resident_address(source, bytes, *source_binding)?;
@@ -1770,7 +1808,7 @@ pub(crate) fn emit_compiled_gpu_op(
                 destination,
                 source,
                 bytes,
-                3,
+                if source_device == destination_device { 3 } else { CUDA_MEMCPY_DEFAULT },
                 &[
                     GpuGraphPatch::memcpy_source(*source_binding),
                     GpuGraphPatch::memcpy_destination(*destination_binding),

@@ -59,9 +59,9 @@ pub fn export_claim(
             .requirements
             .iter()
             .enumerate()
-            .map(|(index, requirement)| (format!("Requirement_{index}"), &requirement.graph)),
+            .map(|(index, requirement)| (format!("Requirement_{index}"), requirement.graph())),
     );
-    graphs.push(("Ideal".into(), &declaration.bundle.ideal.graph));
+    graphs.push(("Ideal".into(), declaration.bundle.ideal.graph()));
     declaration.validate()?;
     let mut generated = BTreeMap::new();
     for (name, graph) in graphs {
@@ -212,14 +212,14 @@ pub fn assemble_claim(
         bundle.requirements.iter().zip(&roots.requirements).enumerate()
     {
         entries.push(ClaimRoot {
-            graph: &requirement.graph,
+            graph: requirement.graph(),
             artifact,
             field: format!("requirement_{index}"),
         });
     }
     let ideal_position = entries.len();
     entries.push(ClaimRoot {
-        graph: &bundle.ideal.graph,
+        graph: bundle.ideal.graph(),
         artifact: &roots.ideal,
         field: "ideal".into(),
     });

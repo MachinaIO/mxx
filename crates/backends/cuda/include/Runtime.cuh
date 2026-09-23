@@ -176,6 +176,15 @@ int gpu_defer_pinned_frees(
 int gpu_event_set_wait(GpuEventSet *events);
 void gpu_event_set_destroy(GpuEventSet *events);
 
+// Logical device ids name the devices of a GPU fleet. They map to physical
+// CUDA devices through one process-wide table, the identity until configured;
+// several logical devices may share one physical device. Configure the table
+// once, before any context or allocation exists.
+int gpu_configure_logical_devices(const int *physical, size_t count);
+int mxx_physical_device(int logical);
+cudaError_t mxx_set_device(int logical);
+cudaError_t mxx_get_device(int *logical);
+
 int gpu_device_count(int *out_count);
 int gpu_device_mem_info(int device, size_t *out_free, size_t *out_total);
 int gpu_device_synchronize();
@@ -578,6 +587,7 @@ int mxx_gpu_graph_launch(
     MxxGpuNativeEvent **out_event);
 void mxx_gpu_graph_exec_destroy(MxxGpuGraphExec *exec);
 
+int mxx_gpu_stream_record_event(void *stream, int device, MxxGpuNativeEvent **out_event);
 int mxx_gpu_native_event_wait(MxxGpuNativeEvent *event);
 int mxx_gpu_native_event_enqueue_wait(
     MxxGpuNativeEvent *event,

@@ -343,6 +343,20 @@ pub(super) fn root_matrix_operation_identity(
     .map_err(|error| error.to_string())
 }
 
+/// Contiguous column blocks of nearly equal width, one per device that gets
+/// any columns.
+fn balanced_owner_intervals(columns: usize, devices: usize) -> Vec<GpuColumnInterval> {
+    let mut start = 0;
+    (0..devices)
+        .filter_map(|device| {
+            let length = columns / devices + usize::from(device < columns % devices);
+            let interval = GpuColumnInterval { device, start, end: start + length };
+            start += length;
+            (length > 0).then_some(interval)
+        })
+        .collect()
+}
+
 fn append_matrix_candidate(
     validated: &ValidatedGraph,
     scope_id: &FrozenGraphScopeId,
@@ -351,12 +365,13 @@ fn append_matrix_candidate(
     node: &mxx_ir_core::graph::NodeHandle,
     types: &BTreeMap<WireRef, ConcreteWireType>,
     columns_per_job: usize,
+    devices: usize,
     instance_class: u64,
     loop_site: Option<GpuLoopSiteKey>,
     layouts: &mut Vec<GpuLayout>,
     nodes: &mut Vec<GpuNodeChoice>,
 ) -> Result<(), String> {
-    let NodeKind::MatrixBinary(_) = node.kind() else {
+    let NodeKind::MatrixBinary(kind) = node.kind() else {
         return Err("GPU candidate expected a matrix binary node".into());
     };
     let scope = validated
@@ -385,6 +400,18 @@ fn append_matrix_candidate(
     let identity = root_matrix_operation_identity(node.kind(), &argument_types, &output_type, env)?;
     let layout_id =
         u32::try_from(layouts.len()).map_err(|_| "too many GPU candidate layouts".to_owned())?;
+    // A product is compute-bound, so its output columns split evenly over
+    // every device, each shard computed next to copies of its operands. An
+    // elementwise operation would spend more on those copies than it saves
+    // and stays on the home device.
+    let (owner_intervals, columns_per_job) = if *kind == MatrixBinaryOp::Multiply {
+        (balanced_owner_intervals(matrix.columns, devices), vec![columns_per_job; devices])
+    } else {
+        (
+            vec![GpuColumnInterval { device: 0, start: 0, end: matrix.columns }],
+            vec![columns_per_job],
+        )
+    };
     layouts.push(GpuLayout {
         id: layout_id,
         rows: matrix.rows,
@@ -392,7 +419,7 @@ fn append_matrix_candidate(
         ring_dimension: matrix.ring.ring_dimension() as usize,
         representation: format!("{output_type:?}"),
         instance_device_stride: 0,
-        owner_intervals: vec![GpuColumnInterval { device: 0, start: 0, end: matrix.columns }],
+        owner_intervals,
     });
     let shape_class = scope_shape_class(validated, scope_id).map_err(|error| error.to_string())?;
     nodes.push(GpuNodeChoice {
@@ -400,7 +427,7 @@ fn append_matrix_candidate(
         loop_site,
         operation_identity: identity,
         output_layouts: vec![layout_id],
-        columns_per_job: vec![columns_per_job],
+        columns_per_job,
         implementation_variant: "direct".into(),
         preimage_max_attempts: None,
     });
@@ -413,6 +440,7 @@ fn append_preimage_candidate(
     node_id: mxx_ir_core::types::NodeId,
     types: &BTreeMap<WireRef, ConcreteWireType>,
     columns_per_job: usize,
+    devices: usize,
     instance_class: u64,
     loop_site: Option<GpuLoopSiteKey>,
     layouts: &mut Vec<GpuLayout>,
@@ -434,7 +462,7 @@ fn append_preimage_candidate(
         ring_dimension: matrix.ring.ring_dimension() as usize,
         representation: format!("{output:?}"),
         instance_device_stride: 0,
-        owner_intervals: vec![GpuColumnInterval { device: 0, start: 0, end: matrix.columns }],
+        owner_intervals: balanced_owner_intervals(matrix.columns, devices),
     });
     let max_attempts = crate::env::gpu_preimage_max_tile_attempts()?;
     let shape_class = scope_shape_class(validated, scope_id).map_err(|error| error.to_string())?;
@@ -448,7 +476,7 @@ fn append_preimage_candidate(
         ))
         .map_err(|error| error.to_string())?,
         output_layouts: vec![layout_id],
-        columns_per_job: vec![columns_per_job],
+        columns_per_job: vec![columns_per_job; devices],
         implementation_variant: "direct".into(),
         preimage_max_attempts: Some(max_attempts),
     });
@@ -460,6 +488,7 @@ fn append_fixed_child_candidates(
     scope_id: &FrozenGraphScopeId,
     env: &ParamEnv,
     columns_per_job: usize,
+    devices: usize,
     wave_instances: usize,
     instance_class: u64,
     loop_site: Option<GpuLoopSiteKey>,
@@ -561,6 +590,7 @@ fn append_fixed_child_candidates(
                 node_id,
                 &types,
                 columns_per_job,
+                devices,
                 instance_class,
                 loop_site,
                 layouts,
@@ -574,6 +604,7 @@ fn append_fixed_child_candidates(
                 node,
                 &types,
                 columns_per_job,
+                devices,
                 instance_class,
                 loop_site,
                 layouts,
@@ -590,6 +621,7 @@ fn append_fixed_child_candidates(
                     &child_id,
                     &child_env,
                     columns_per_job,
+                    devices,
                     wave_instances,
                     instance_class,
                     loop_site,
@@ -652,6 +684,7 @@ fn append_fixed_child_candidates(
                     &child_id,
                     &child_env,
                     columns_per_job,
+                    devices,
                     wave_instances,
                     instance_class,
                     Some(key),
@@ -723,6 +756,7 @@ fn append_fixed_child_candidates(
                     &child_id,
                     &child_env,
                     columns_per_job,
+                    devices,
                     wave_instances,
                     instance_class,
                     Some(key),
@@ -745,12 +779,13 @@ pub(crate) fn single_root_physical_plan(
     columns_per_job: usize,
     wave_instances: usize,
 ) -> Result<FrozenGpuPlan, String> {
-    if contract.logical_to_physical_devices.len() != 1 ||
+    if contract.logical_to_physical_devices.is_empty() ||
         columns_per_job == 0 ||
         wave_instances == 0
     {
-        return Err("root physical candidate needs one device and positive W/C".into());
+        return Err("root physical candidate needs a device and positive W/C".into());
     }
+    let devices = contract.logical_to_physical_devices.len();
     let mut layouts = Vec::new();
     let mut nodes = Vec::new();
     let mut loops = Vec::new();
@@ -759,6 +794,7 @@ pub(crate) fn single_root_physical_plan(
         &FrozenGraphScopeId::Root,
         &validated.bindings,
         columns_per_job,
+        devices,
         wave_instances,
         0,
         None,
@@ -767,6 +803,12 @@ pub(crate) fn single_root_physical_plan(
         &mut loops,
         &mut BTreeMap::new(),
     )?;
+    // Each choice freezes one tile width per logical device; a zero width
+    // marks a device inactive for it, and unsharded nodes run on the home
+    // device.
+    for node in &mut nodes {
+        node.columns_per_job.resize(devices, 0);
+    }
     Ok(FrozenGpuPlan { contract, layouts, loops, nodes })
 }
 
@@ -1218,10 +1260,10 @@ pub(super) struct PhysicalLoweringContext<'a> {
     /// A conversion is emitted once per value and shared by later consumers
     /// of the same operation list; a body context starts its own table.
     pub converted: &'a mut BTreeMap<PhysicalValueId, PhysicalValueId>,
-    /// The status word every direct integer operation reports into. Errors
-    /// are first-wins and each replay resets it once, instead of one host
-    /// reset and readback per operation.
-    pub integer_status: &'a mut Option<PhysicalValueId>,
+    /// The status word each device's direct integer operations report into.
+    /// Errors are first-wins and each replay resets it once, instead of one
+    /// host reset and readback per operation.
+    pub integer_status: &'a mut BTreeMap<i32, PhysicalValueId>,
 }
 
 /// Reserve one reusable lane input for a selected artifact member. The caller
@@ -1439,6 +1481,183 @@ pub(super) fn allocate_typed_import_destination(
     Ok((destination, destination, upload_owner, before_operation))
 }
 
+/// Copy `source` into new storage on `device` with the same layout, one
+/// contiguous copy per storage after the source's writers. Each allocation
+/// covers only the bytes the parts view, so a family member does not
+/// replicate its whole family.
+pub(super) fn replicate_to_device(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    device: i32,
+) -> Result<PhysicalValueId, String> {
+    let mut physical = ctx
+        .values
+        .get(source.0 as usize)
+        .ok_or_else(|| "GPU replica source has no physical metadata".to_owned())?
+        .clone();
+    let mut spans = BTreeMap::<StorageRef, (u64, u64)>::new();
+    for part in physical.parts.iter() {
+        let view = &part.view;
+        let last = view
+            .extent
+            .iter()
+            .zip(view.byte_strides.iter())
+            .try_fold(u64::from(view.element_bytes), |end, (&extent, &stride)| {
+                end.checked_add(extent.checked_sub(1)?.checked_mul(stride)?)
+            })
+            .and_then(|end| end.checked_add(view.byte_offset))
+            .ok_or_else(|| "GPU replica part exceeds its storage".to_owned())?;
+        let span = spans.entry(part.storage).or_insert((view.byte_offset, last));
+        *span = (span.0.min(view.byte_offset), span.1.max(last));
+    }
+    let parameters = ctx.backend.control_parameters_on_device(device)?;
+    let mut storage = BTreeMap::new();
+    for (&slot, &(start, end)) in &spans {
+        let bytes = usize::try_from(end - start)
+            .map_err(|_| "GPU replica exceeds host address space".to_owned())?;
+        let copy =
+            GpuDeviceBytes::new(&parameters, device, bytes).map_err(|error| error.to_string())?;
+        storage.insert(slot, BoundStorage::from_device_bytes(Arc::new(copy))?);
+    }
+    for part in physical.parts.iter_mut() {
+        part.device = device;
+        part.view.byte_offset -= spans[&part.storage].0;
+    }
+    let owner = GpuResidentValue::new(Arc::new(physical.clone()), storage, Box::new([]))
+        .map_err(str::to_owned)?;
+    let replica = value_id(ctx.values.len())?;
+    ctx.values.push(physical);
+    ctx.owners.insert(replica, Arc::new(owner));
+    let implementation =
+        ctx.implementations.register(GpuImplementation::copy()).map_err(str::to_owned)?;
+    let predecessors = all_predecessors(ctx.producer, source);
+    let mut copies = Vec::new();
+    for (slot, (start, end)) in spans {
+        // The part that starts the span anchors its one contiguous copy.
+        let part = ctx.values[source.0 as usize]
+            .parts
+            .iter()
+            .position(|part| part.storage == slot && part.view.byte_offset == start)
+            .and_then(|part| u32::try_from(part).ok())
+            .ok_or_else(|| "GPU replica span has no anchoring part".to_owned())?;
+        let binding = u32::try_from(ctx.bindings.len())
+            .map_err(|_| "too many GPU graph bindings".to_owned())?;
+        ctx.bindings.push(GpuBindingSource::PhysicalPart { value: source, part, limb: 0 });
+        ctx.bindings.push(GpuBindingSource::PhysicalPart { value: replica, part, limb: 0 });
+        let op = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU operations".to_owned())?;
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: Box::new([
+                KernelArg::Value(source),
+                KernelArg::U32(part),
+                KernelArg::Value(replica),
+                KernelArg::U32(part),
+                KernelArg::U64(end - start),
+                KernelArg::U32(binding),
+                KernelArg::U32(binding + 1),
+            ]),
+            outputs: Box::new([replica]),
+            device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors: predecessors.clone(),
+            body: None,
+        });
+        copies.push(op);
+    }
+    let columns = ctx.values[replica.0 as usize].ty.matrix_type().map_or(1, |ty| ty.columns);
+    let whole = ColumnRange { start: 0, end: columns };
+    ctx.producer.insert(replica, copies.into_iter().map(|copy| (whole, copy)).collect());
+    Ok(replica)
+}
+
+/// Allocate a full-Eval matrix on `device` with its physical metadata.
+fn allocate_device_matrix(
+    backend: &GpuDcrtBackend,
+    values: &mut Vec<PhysicalValue>,
+    owners: &mut BTreeMap<PhysicalValueId, Arc<GpuResidentValue>>,
+    ty: &ConcreteMatrixType,
+    device: i32,
+) -> Result<PhysicalValueId, String> {
+    let owner = backend.allocate_physical_matrix(ty, device, PhysicalEncoding::FullEval)?;
+    let storage = StorageRef::Scratch(
+        u32::try_from(values.len()).map_err(|_| "too many GPU scratch storages".to_owned())?,
+    );
+    let (physical, resident) = physical_matrix(ty, PhysicalEncoding::FullEval, storage, owner)?;
+    let id = value_id(values.len())?;
+    values.push(physical);
+    owners.insert(id, resident);
+    Ok(id)
+}
+
+/// Copy the equal-shape matrix view `source` into `destination` on `device`
+/// after `predecessors`, recording the copy as the destination's writer.
+fn copy_matrix_view(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    destination: PhysicalValueId,
+    predecessors: Box<[u32]>,
+) -> Result<u32, String> {
+    let source_binding = register_bindings(ctx.bindings, ctx.values, source)?;
+    let destination_binding = register_bindings(ctx.bindings, ctx.values, destination)?;
+    let implementation = ctx
+        .implementations
+        .register(GpuImplementation::matrix_copy_view())
+        .map_err(str::to_owned)?;
+    let index =
+        u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
+    ctx.operations.push(CompiledGpuOp {
+        implementation,
+        arguments: Box::new([
+            KernelArg::Value(source),
+            KernelArg::U32(0),
+            KernelArg::Value(destination),
+            KernelArg::U32(0),
+            KernelArg::U32(source_binding),
+            KernelArg::U32(destination_binding),
+        ]),
+        outputs: Box::new([destination]),
+        device: ctx.values[source.0 as usize].parts[0].device,
+        grid: [1; 3],
+        block: [1; 3],
+        shared_bytes: 0,
+        predecessors,
+        body: None,
+    });
+    Ok(index)
+}
+
+/// The `range` columns of a full-Eval matrix as a new matrix on `device`: a
+/// column window is first packed into a dense matrix on its own device, and
+/// the dense matrix then moves in one contiguous copy.
+fn matrix_columns_on_device(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    range: ColumnRange,
+    device: i32,
+) -> Result<PhysicalValueId, String> {
+    let ty = ctx.values[source.0 as usize]
+        .ty
+        .matrix_type()
+        .ok_or_else(|| "GPU device tile source is not a matrix".to_owned())?
+        .clone();
+    let dense = if range.start == 0 && range.end == ty.columns {
+        source
+    } else {
+        let window = matrix_column_view(ctx.values, ctx.owners, source, range)?;
+        let home = ctx.values[source.0 as usize].parts[0].device;
+        let ty = ConcreteMatrixType { columns: range.end - range.start, ..ty };
+        let dense = allocate_device_matrix(ctx.backend, ctx.values, ctx.owners, &ty, home)?;
+        let predecessors = predecessors_for(ctx.producer, source, range);
+        let copy = copy_matrix_view(ctx, window, dense, predecessors)?;
+        ctx.producer.insert(dense, vec![(ColumnRange { start: 0, end: ty.columns }, copy)]);
+        dense
+    };
+    replicate_to_device(ctx, dense, device)
+}
+
 pub(super) fn lower_matrix_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope: &mxx_ir_core::graph::GraphScope,
@@ -1471,9 +1690,6 @@ pub(super) fn lower_matrix_node(
         owners,
         wire_ids,
         implementations,
-        operations,
-        bindings,
-        producer,
         ..
     } = ctx;
     let device = *device;
@@ -1530,8 +1746,7 @@ pub(super) fn lower_matrix_node(
     if layout.rows != output_ty.rows ||
         layout.columns != output_ty.columns ||
         layout.ring_dimension != output_ty.ring.ring_dimension() as usize ||
-        choice.columns_per_job.len() != 1 ||
-        choice.columns_per_job[0] == 0
+        choice.columns_per_job.iter().all(|width| *width == 0)
     {
         return Err("GPU output layout or column width differs from the frozen plan".into());
     }
@@ -1542,14 +1757,23 @@ pub(super) fn lower_matrix_node(
         .matrix_type()
         .ok_or_else(|| "GPU matrix left operand is not a matrix".to_owned())?
         .columns;
+    let devices = logical
+        .contract
+        .logical_to_physical_devices
+        .iter()
+        .map(|&device| i32::try_from(device).map_err(|_| "GPU device ID overflows".to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if schedule.waves().flatten().any(|job| job.device >= devices.len()) {
+        return Err("GPU column job names an unknown device".into());
+    }
     let mut tile_producers = Vec::new();
-    for jobs in schedule.waves() {
-        let [job] = jobs.as_slice() else {
-            return Err("GPU single-device schedule has an empty or multiple-job wave".into());
-        };
-        if job.device != 0 {
-            return Err("GPU column job chose an unexpected device".into());
-        }
+    // Operand columns already copied to a device, shared by its later jobs.
+    let mut device_tiles = BTreeMap::new();
+    for job in schedule.waves().flatten() {
+        // A device-resident body replays on one device, and a lane already
+        // running on another device keeps its product there.
+        let job_device =
+            if ctx.device_body || device != devices[0] { device } else { devices[job.device] };
         let output_range = ColumnRange { start: job.start, end: job.end };
         // Output columns read the same columns of an elementwise operand, and
         // the whole left operand of a product.
@@ -1558,22 +1782,46 @@ pub(super) fn lower_matrix_node(
             MatrixBinaryOp::Multiply => ColumnRange { start: 0, end: left_columns },
         };
         let right_range = output_range;
-        let left_tile = matrix_column_view(values, owners, left, left_range)?;
-        let right_tile = matrix_column_view(values, owners, right, right_range)?;
-        let output_tile = matrix_column_view(values, owners, output, output_range)?;
-        let left_binding = register_bindings(bindings, values, left_tile)?;
-        let right_binding = register_bindings(bindings, values, right_tile)?;
-        let output_binding = register_bindings(bindings, values, output_tile)?;
-        let predecessors = predecessors_for(producer, left, left_range)
+        let mut operand = |ctx: &mut PhysicalLoweringContext<'_>, id, range: ColumnRange| {
+            if job_device == device {
+                let tile = matrix_column_view(ctx.values, ctx.owners, id, range)?;
+                return Ok::<_, String>((tile, predecessors_for(ctx.producer, id, range)));
+            }
+            let key = (id, range.start, range.end, job_device);
+            let tile = match device_tiles.get(&key) {
+                Some(&tile) => tile,
+                None => {
+                    let tile = matrix_columns_on_device(ctx, id, range, job_device)?;
+                    device_tiles.insert(key, tile);
+                    tile
+                }
+            };
+            Ok((tile, all_predecessors(ctx.producer, tile)))
+        };
+        let (left_tile, left_predecessors) = operand(ctx, left, left_range)?;
+        let (right_tile, right_predecessors) = operand(ctx, right, right_range)?;
+        let output_tile = if job_device == device {
+            matrix_column_view(ctx.values, ctx.owners, output, output_range)?
+        } else {
+            let ty = ConcreteMatrixType {
+                columns: output_range.end - output_range.start,
+                ..output_ty.clone()
+            };
+            allocate_device_matrix(ctx.backend, ctx.values, ctx.owners, &ty, job_device)?
+        };
+        let left_binding = register_bindings(ctx.bindings, ctx.values, left_tile)?;
+        let right_binding = register_bindings(ctx.bindings, ctx.values, right_tile)?;
+        let output_binding = register_bindings(ctx.bindings, ctx.values, output_tile)?;
+        let predecessors = left_predecessors
             .iter()
+            .chain(right_predecessors.iter())
             .copied()
-            .chain(predecessors_for(producer, right, right_range).iter().copied())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let op_index =
-            u32::try_from(operations.len()).map_err(|_| "too many GPU operations".to_owned())?;
-        operations.push(CompiledGpuOp {
+        let op_index = u32::try_from(ctx.operations.len())
+            .map_err(|_| "too many GPU operations".to_owned())?;
+        ctx.operations.push(CompiledGpuOp {
             implementation,
             arguments: Box::new([
                 KernelArg::Value(left_tile),
@@ -1587,19 +1835,30 @@ pub(super) fn lower_matrix_node(
                 KernelArg::U32(output_binding),
             ]),
             outputs: Box::new([output_tile]),
-            device,
+            device: job_device,
             grid: [1; 3],
             block: [1; 3],
             shared_bytes: 0,
             predecessors,
             body: None,
         });
-        tile_producers.push((output_range, op_index));
+        if job_device == device {
+            tile_producers.push((output_range, op_index));
+            continue;
+        }
+        // Gather the shard home, then into the output's columns.
+        let width = ColumnRange { start: 0, end: output_range.end - output_range.start };
+        ctx.producer.insert(output_tile, vec![(width, op_index)]);
+        let gathered = replicate_to_device(ctx, output_tile, device)?;
+        let home_tile = matrix_column_view(ctx.values, ctx.owners, output, output_range)?;
+        let predecessors = all_predecessors(ctx.producer, gathered);
+        let copy = copy_matrix_view(ctx, gathered, home_tile, predecessors)?;
+        tile_producers.push((output_range, copy));
     }
     if tile_producers.is_empty() {
         return Err("GPU matrix output has no planned column jobs".into());
     }
-    producer.insert(output, tile_producers);
+    ctx.producer.insert(output, tile_producers);
     Ok(())
 }
 
@@ -4089,6 +4348,73 @@ fn lower_public_gadget_preimage(
     Ok(())
 }
 
+/// Copy a device's compact column block into the `block` columns of the
+/// home owner `destination`, one contiguous copy per row of the row-major
+/// payload, after the block's writers.
+fn copy_compact_block_home(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    source: PhysicalValueId,
+    destination: PhysicalValueId,
+    block: ColumnRange,
+) -> Result<Vec<u32>, String> {
+    let implementation =
+        ctx.implementations.register(GpuImplementation::copy()).map_err(str::to_owned)?;
+    let predecessors = all_predecessors(ctx.producer, source);
+    let rows = ctx.values[source.0 as usize].parts[0].view.extent[0];
+    let mut copies = Vec::new();
+    for row in 0..rows {
+        let mut window =
+            |id: PhysicalValueId, column: usize| -> Result<(PhysicalValueId, u64), String> {
+                let mut physical = ctx.values[id.0 as usize].clone();
+                let [part] = physical.parts.as_mut() else {
+                    return Err("GPU compact block needs one physical part".into());
+                };
+                let view = &mut part.view;
+                let column = u64::try_from(column).map_err(|_| "GPU column exceeds u64")?;
+                view.byte_offset += row * view.byte_strides[0] + column * view.byte_strides[1];
+                view.origin[0] = row;
+                view.extent[0] = 1;
+                view.origin[1] = column;
+                view.extent[1] = (block.end - block.start) as u64;
+                let bytes = view.extent[1] * view.byte_strides[1];
+                let owner = ctx.owners.get(&id).ok_or("GPU compact block owner is absent")?;
+                let resident =
+                    owner.with_physical_view(Arc::new(physical.clone())).map_err(str::to_owned)?;
+                let window = value_id(ctx.values.len())?;
+                ctx.values.push(physical);
+                ctx.owners.insert(window, Arc::new(resident));
+                Ok((window, bytes))
+            };
+        let (from, bytes) = window(source, 0)?;
+        let (to, _) = window(destination, block.start)?;
+        let binding =
+            u32::try_from(ctx.bindings.len()).map_err(|_| "too many GPU graph bindings")?;
+        ctx.bindings.push(GpuBindingSource::PhysicalPart { value: from, part: 0, limb: 0 });
+        ctx.bindings.push(GpuBindingSource::PhysicalPart { value: to, part: 0, limb: 0 });
+        copies.push(u32::try_from(ctx.operations.len()).map_err(|_| "too many GPU operations")?);
+        ctx.operations.push(CompiledGpuOp {
+            implementation,
+            arguments: Box::new([
+                KernelArg::Value(from),
+                KernelArg::U32(0),
+                KernelArg::Value(to),
+                KernelArg::U32(0),
+                KernelArg::U64(bytes),
+                KernelArg::U32(binding),
+                KernelArg::U32(binding + 1),
+            ]),
+            outputs: Box::new([to]),
+            device: ctx.device,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_bytes: 0,
+            predecessors: predecessors.clone(),
+            body: None,
+        });
+    }
+    Ok(copies)
+}
+
 pub(super) fn lower_preimage_sample_node(
     ctx: &mut PhysicalLoweringContext<'_>,
     scope_id: &FrozenGraphScopeId,
@@ -4203,10 +4529,46 @@ pub(super) fn lower_preimage_sample_node(
         .and_then(|value| u32::try_from(value).ok())
         .filter(|value| *value > 0 && *value < u32::MAX)
         .ok_or("GPU preimage retry bound is absent or too large")?;
-    let tile_columns =
-        *choice.columns_per_job.first().ok_or("GPU preimage choice has no column width")?;
-    if tile_columns == 0 {
-        return Err("GPU preimage tile width must be positive".into());
+    let layout = ctx
+        .logical
+        .layouts
+        .iter()
+        .find(|layout| choice.output_layouts.first() == Some(&layout.id))
+        .ok_or("GPU preimage output layout is absent from the frozen plan")?;
+    if layout.columns != output_matrix.columns ||
+        choice.columns_per_job.iter().all(|width| *width == 0)
+    {
+        return Err("GPU preimage tile width or layout differs from the frozen plan".into());
+    }
+    // Tiles split the output columns into one contiguous block per device.
+    // A remote tile samples next to copies of the trapdoor and its target
+    // window, and its device's block is copied home row by row.
+    let devices = ctx
+        .logical
+        .contract
+        .logical_to_physical_devices
+        .iter()
+        .map(|&device| i32::try_from(device).map_err(|_| "GPU device ID overflows".to_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let home = ctx.device;
+    let tiles = layout
+        .schedule(&choice.columns_per_job, 0)
+        .map_err(|error| error.to_string())?
+        .waves()
+        .flatten()
+        .map(|job| {
+            let device = if ctx.device_body || home != devices[0] {
+                home
+            } else {
+                *devices.get(job.device).ok_or("GPU preimage tile names an unknown device")?
+            };
+            Ok((device, job.start, job.end - job.start))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut blocks = BTreeMap::<i32, ColumnRange>::new();
+    for &(device, start, width) in tiles.iter().filter(|tile| tile.0 != home) {
+        let block = blocks.entry(device).or_insert(ColumnRange { start, end: start + width });
+        *block = ColumnRange { start: block.start.min(start), end: block.end.max(start + width) };
     }
     let c = (gadget_base.to_f64().ok_or("GPU gadget base exceeds f64")? + 1.0) * sigma;
     let n = public_ty.ring.ring_dimension() as usize;
@@ -4228,8 +4590,25 @@ pub(super) fn lower_preimage_sample_node(
     let depth = public_ty.ring.crt_depth();
     let secret_coeff_bindings = register_all_parts(ctx.bindings, ctx.values, secret_coeff)?;
     let (full_output, magnitude_bytes) = allocate_compact_value(ctx, output_ty.clone(), false)?;
-    for tile_start in (0..t).step_by(tile_columns) {
-        let tile_width = tile_columns.min(t - tile_start);
+    // Per remote device: its copies of the trapdoor inputs, the coefficient
+    // bindings of its inverse trapdoor, and its output block.
+    let mut remote = BTreeMap::new();
+    for (&device, block) in &blocks {
+        let copies = [public, r, e, re, secret_coeff]
+            .into_iter()
+            .map(|id| replicate_to_device(ctx, id, device))
+            .collect::<Result<Vec<_>, _>>()?;
+        let coeff_bindings = register_all_parts(ctx.bindings, ctx.values, copies[4])?;
+        let mut block_ty = output_ty.clone();
+        if let ConcreteWireType::Preimage { matrix, .. } = &mut block_ty {
+            matrix.columns = block.end - block.start;
+        }
+        ctx.device = device;
+        let (block_output, _) = allocate_compact_value(ctx, block_ty, false)?;
+        ctx.device = home;
+        remote.insert(device, (copies, coeff_bindings, block_output, *block));
+    }
+    for &(tile_device, tile_start, tile_width) in &tiles {
         let target_source = target;
         let target = matrix_view(ctx, target_source, 0, d, tile_start, tile_width)?;
         let target_predecessors = all_predecessors(ctx.producer, target_source);
@@ -4240,7 +4619,6 @@ pub(super) fn lower_preimage_sample_node(
                 .map(|&op| (ColumnRange { start: 0, end: tile_width }, op))
                 .collect(),
         );
-        let output = compact_column_view(ctx, full_output, tile_start, tile_width)?;
         let output_matrix = shape(output_matrix.rows, tile_width);
         let t = tile_width;
         // Matrix arithmetic requires every operand in a tile to use the same
@@ -4248,9 +4626,25 @@ pub(super) fn lower_preimage_sample_node(
         // through its checked byte offset; copy it once into a tile-shaped
         // value whose origin is zero before the retry Graph reads it.
         let tile_target_ty = shape(d, t);
-        let target_local =
+        let mut target_local =
             allocate_scratch_matrix(ctx, &tile_target_ty, PhysicalEncoding::FullEval)?;
         emit_matrix_operation(ctx, GpuImplementation::matrix_copy_view(), &[target], target_local)?;
+        let (public, r, e, re, secret_coeff, secret_coeff_bindings, tile_owner, tile_column) =
+            match remote.get(&tile_device) {
+                Some((copies, coeff_bindings, block_output, block)) => {
+                    target_local = replicate_to_device(ctx, target_local, tile_device)?;
+                    ctx.device = tile_device;
+                    let [public, r, e, re, secret_coeff] = copies[..] else {
+                        return Err("GPU preimage device inputs are incomplete".into());
+                    };
+                    let column = tile_start - block.start;
+                    (public, r, e, re, secret_coeff, *coeff_bindings, *block_output, column)
+                }
+                None => {
+                    (public, r, e, re, secret_coeff, secret_coeff_bindings, full_output, tile_start)
+                }
+            };
+        let output = compact_column_view(ctx, tile_owner, tile_column, tile_width)?;
         let resource_base = u32::try_from(ctx.values.len())
             .ok()
             .and_then(|value| value.checked_mul(3))
@@ -4675,9 +5069,17 @@ pub(super) fn lower_preimage_sample_node(
         ctx.operations[loop_op as usize].body = Some(body.into_boxed_slice());
         ctx.producer.insert(output, vec![(ColumnRange { start: 0, end: t }, loop_op)]);
         ctx.producer
+            .entry(tile_owner)
+            .or_default()
+            .push((ColumnRange { start: tile_column, end: tile_column + t }, loop_op));
+        ctx.device = home;
+    }
+    for (_, _, block_output, block) in remote.into_values() {
+        let copies = copy_compact_block_home(ctx, block_output, full_output, block)?;
+        ctx.producer
             .entry(full_output)
             .or_default()
-            .push((ColumnRange { start: tile_start, end: tile_start + t }, loop_op));
+            .extend(copies.into_iter().map(|copy| (block, copy)));
     }
     let (returned, _) = allocate_compact_value(ctx, output_ty, true)?;
     let source_bytes = ctx.values[full_output.0 as usize]
@@ -5137,9 +5539,6 @@ pub(crate) fn plan_physical_graph(
             .ok_or_else(|| "GPU plan has no physical device".to_owned())?,
     )
     .map_err(|_| "GPU device ID exceeds i32".to_owned())?;
-    if logical.contract.logical_to_physical_devices.len() != 1 {
-        return Err("GPU physical lowering needs an explicit multi-device shard plan".into());
-    }
     let scope = validated.source.root_scope();
     let checked = validated
         .scope(&mxx_ir_core::graph::FrozenGraphScopeId::Root)
@@ -5596,7 +5995,7 @@ pub(crate) fn plan_physical_graph(
     let mut external_io_imports = Vec::<ExternalIoImport>::new();
     let mut crt_resource_next = 0u32;
     let mut converted = BTreeMap::new();
-    let mut integer_status = None;
+    let mut integer_status = BTreeMap::new();
     // Every root node lowers against the same plan tables.
     macro_rules! root_context {
         () => {
@@ -7371,7 +7770,10 @@ mod tests {
             .unwrap()
             .validate(&ParamEnv::default(), crate::openfhe_guard::gen_modulus_and_warmup)
             .unwrap();
-        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], [device])).unwrap();
+        // Each one-column tile runs on its own logical device when several
+        // exist (`MXX_GPU_LOGICAL_DEVICES=0,0`).
+        let devices = detected_gpu_device_ids();
+        let mut runtime = GpuRuntime::new(gpu_backend_on([parameters], devices.clone())).unwrap();
         let mut plan =
             runtime.plan_with_fixed_columns_for_test(validated, &BTreeMap::new(), 1).unwrap();
         assert_eq!(plan.physical_frame_for_test().preimage_replays.len(), 2);
@@ -7404,6 +7806,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(retries.len(), 2);
+        let tile_devices = retries.iter().map(|retry| retry.device).collect::<BTreeSet<_>>();
+        assert_eq!(tile_devices.len(), devices.len().min(2));
         for (column, retry) in retries.iter().enumerate() {
             let body = retry.body.as_ref().expect("preimage tile retry body");
             let correction = body

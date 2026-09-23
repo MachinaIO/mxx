@@ -1188,7 +1188,7 @@ mod tests {
         let predicate = diamond_parameter_validity_predicate(context, &circuit, &params).unwrap();
         let execute_with = |bindings: &ParamEnv| {
             let validated = mxx_ir_core::validate(
-                &predicate.graph,
+                predicate.graph(),
                 bindings,
                 mxx_backends::openfhe_guard::gen_modulus_and_warmup,
             )

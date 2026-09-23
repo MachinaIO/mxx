@@ -56,11 +56,12 @@ fn assert_same_matrix_values(label: &str, actual: &DCRTPolyMatrix, expected: &DC
     }
 }
 
+/// Returns the most devices any planned node runs on.
 fn run_shape_case(
     label: &str,
     expression: impl FnOnce(Mat) -> Mat,
     expected: impl FnOnce(&DCRTPolyMatrix) -> DCRTPolyMatrix,
-) {
+) -> usize {
     let parameters = DCRTPolyParams::new(8, 2, 20, 4, None, None);
     let gpu_parameters = GpuDCRTPolyParams::new(
         parameters.ring_dimension(),
@@ -94,10 +95,18 @@ fn run_shape_case(
     let bindings = BTreeMap::from([("source".to_owned(), value)]);
     let mut runtime = GpuRuntime::new(gpu_backend([gpu_parameters])).unwrap();
     let mut plan = runtime.plan(graph, &bindings).unwrap();
+    let devices = plan
+        .plan()
+        .nodes
+        .iter()
+        .map(|node| node.columns_per_job.iter().filter(|width| **width > 0).count())
+        .max()
+        .unwrap_or(0);
     let result =
         runtime.execute(&mut plan, bindings, &mut MemoryArtifactStore::default(), [7; 32]).unwrap();
     let actual = runtime.download_matrix_output(&result.output("result").unwrap()).unwrap();
     assert_same_matrix_values(label, &actual, &expected(&input));
+    devices
 }
 
 fn cpu_crt_input(parameters: &DCRTPolyParams) -> DCRTPolyMatrix {
@@ -327,6 +336,23 @@ fn matrix_mul_accumulate_matches_unfused_cpu() {
         },
         |a| a.clone() * a + a,
     );
+}
+
+/// Each product splits its output columns over every device; run with
+/// `MXX_GPU_LOGICAL_DEVICES=0,0` to shard over two logical devices of one GPU.
+#[test]
+#[serial_test::serial]
+fn matrix_products_shard_columns_over_devices() {
+    let devices = mxx_backends::poly::dcrt::gpu::detected_gpu_device_ids().len();
+    let active = run_shape_case(
+        "direct-sharded-products",
+        |a| {
+            let wide = Mat::concat(ConcatAxis::Columns, vec![a.clone(), a.clone()]);
+            a.clone() * (a * wide)
+        },
+        |a| a.clone() * (a.clone() * a.concat_columns(&[a])),
+    );
+    assert_eq!(active, devices);
 }
 
 #[test]

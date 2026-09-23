@@ -2,6 +2,13 @@
 
 ## Status and scope
 
+Status note (2026-09-23): this plan is not the implemented design. The current multi-GPU runtime
+(`docs/architecture.md`, section 6.4) shards matrix-product columns, preimage column tiles, and
+outermost parallel-loop lanes over logical devices inside one CUDA Graph per region, with widths
+chosen by the measured W/C trials. Per-device VRAM calibration, `MXX_GPU_VRAM_PERCENT`, and
+estimator calibration reuse described below are not implemented. The rule that every CRT limb of a
+shard stays on one device still holds. The text below is kept as a historical design record.
+
 This document is the normative design for executing and estimating GPU matrix
 operations across every configured GPU. It is self-contained: it defines the
 runtime representation, the estimator contract, dynamic per-device wave widths,

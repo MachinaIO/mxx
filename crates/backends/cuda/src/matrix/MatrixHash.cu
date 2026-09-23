@@ -343,7 +343,7 @@ extern "C" void gpu_raw_hash_plan_destroy(GpuRawHashPlan *plan)
     if (!plan) return;
     if (plan->allocation)
     {
-        cudaSetDevice(plan->device);
+        mxx_set_device(plan->device);
         cudaFreeAsync(plan->allocation, plan->stream);
     }
     void *pinned[2] = {plan->pinned_static, plan->pinned_operands};
@@ -450,7 +450,7 @@ extern "C" int gpu_raw_hash_plan_create(
     plan->static_bytes = static_byte_count;
     plan->max_tag_bytes = max_tag_bytes;
     plan->decimal_words = max_words;
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error == cudaSuccess)
         error = cudaMallocAsync(&plan->allocation, cursor, plan->stream);
     if (error == cudaSuccess)
@@ -508,7 +508,7 @@ extern "C" int gpu_raw_hash_plan_prepare_graph_launch(
         (operand_count && (!operand_addresses || !operand_encodings)))
         return set_error("invalid raw hash replay operand table");
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    cudaError_t error = cudaSetDevice(plan->device);
+    cudaError_t error = mxx_set_device(plan->device);
     if (error == cudaSuccess)
         error = cudaStreamWaitEvent(stream, plan->static_ready, 0);
     for (size_t operand = 0; operand < operand_count; ++operand)

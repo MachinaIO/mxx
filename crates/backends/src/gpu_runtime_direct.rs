@@ -34,7 +34,7 @@ use crate::{
     matrix::dcrt_poly::DCRTPolyMatrix,
     poly::dcrt::gpu::{
         GpuGraphBindingValue, GpuNativeEvent, GpuNativeGraphBuilder, GpuNativeGraphError,
-        GpuNativeGraphExec,
+        GpuNativeGraphExec, GpuNativeLaunchStream,
     },
     session::{ArtifactHandle, SessionDescriptor, SessionStore},
 };
@@ -151,6 +151,9 @@ struct GraphRegion {
     executable: GpuNativeGraphExec,
     resources: GpuPreparedNativeResources,
     device: i32,
+    /// Launch streams of the other devices this region's operations run on,
+    /// which prepare their devices' resources before each launch.
+    peer_streams: Vec<GpuNativeLaunchStream>,
 }
 
 struct DirectGraph {
@@ -512,6 +515,23 @@ impl DirectGraph {
                 "indexed matrix table resource ID is duplicated".into(),
             ));
         }
+        // Every device other than the home one that runs an operation or owns
+        // a per-launch resource; each region joins them all.
+        let mut peer_devices = BTreeSet::new();
+        let mut pending = frame.program.operations.iter().collect::<Vec<_>>();
+        while let Some(operation) = pending.pop() {
+            peer_devices.insert(operation.device);
+            pending.extend(operation.body.iter().flatten());
+        }
+        peer_devices.extend(frame.real_owners.iter().map(|real| real.physical_device()));
+        peer_devices.extend(frame.real_output_owners.values().map(|real| real.physical_device()));
+        peer_devices.extend(frame.bytes_input_owners.values().map(|bytes| bytes.physical_device()));
+        peer_devices
+            .extend(frame.indexed_tables.iter().map(|replay| replay.table.physical_device()));
+        peer_devices.extend(frame.sample_seeds.iter().map(|seed| seed.owner.physical_device()));
+        peer_devices
+            .extend(frame.preimage_replays.iter().map(|replay| replay.attempt.physical_device()));
+        peer_devices.remove(&frame.device);
         for (position, &start) in starts.iter().enumerate() {
             let end = starts.get(position + 1).copied().unwrap_or(length);
             let mut program = frame.program.clone();
@@ -549,12 +569,18 @@ impl DirectGraph {
             })?;
             let executable =
                 builder.finish().map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+            let peer_streams = peer_devices
+                .iter()
+                .map(|&device| device_launch_stream(backend, device))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
             regions.push(GraphRegion {
                 start_operation: start as u32,
                 end_operation: end as u32,
                 executable,
                 resources,
                 device: frame.device,
+                peer_streams,
             });
         }
         let graph = Self { regions };
@@ -636,7 +662,7 @@ impl DirectGraph {
                             "prepared workspace binding has no allocated owner".into(),
                         )
                     })?;
-                    if device != frame.device || address == 0 || bytes == 0 {
+                    if device < 0 || address == 0 || bytes == 0 {
                         return Err(GpuRuntimeError::Execution(
                             "prepared workspace has an invalid device or allocation".into(),
                         ));
@@ -661,14 +687,24 @@ impl DirectGraph {
             GpuRuntimeError::Execution("Graph region index is out of range".into())
         })?;
         let stream = region.executable.launch_stream().clone();
-        for real in &frame.real_owners {
-            real.prepare_graph_launch(&stream)?;
+        // Each device prepares its resources on its own stream, after the
+        // previous launch and before this one.
+        for peer in &region.peer_streams {
+            stream.record_event()?.enqueue_wait(peer)?;
         }
-        for real in frame.real_output_owners.values() {
-            real.prepare_graph_launch(&stream)?;
+        let device_stream = |device: i32| {
+            std::iter::once(&stream)
+                .chain(&region.peer_streams)
+                .find(|candidate| candidate.physical_device() == device)
+                .ok_or_else(|| {
+                    GpuRuntimeError::Execution("launch resource is on an unplanned GPU".into())
+                })
+        };
+        for real in frame.real_owners.iter().chain(frame.real_output_owners.values()) {
+            real.prepare_graph_launch(device_stream(real.physical_device())?)?;
         }
         for bytes in frame.bytes_input_owners.values() {
-            bytes.prepare_graph_launch(&stream)?;
+            bytes.prepare_graph_launch(device_stream(bytes.physical_device())?)?;
         }
         for replay in &frame.indexed_tables {
             let members = replay
@@ -684,27 +720,50 @@ impl DirectGraph {
                         .map_err(GpuRuntimeError::from)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
-            replay.table.prepare_graph_launch(&stream, &members)?;
+            replay
+                .table
+                .prepare_graph_launch(device_stream(replay.table.physical_device())?, &members)?;
         }
         for seed in &frame.sample_seeds {
-            seed.owner.prepare_graph_launch(&stream)?;
+            seed.owner.prepare_graph_launch(device_stream(seed.owner.physical_device())?)?;
         }
         for replay in &frame.preimage_replays {
-            replay.attempt.prepare_graph_launch(&stream)?;
-            replay.status.prepare_graph_launch(&stream)?;
+            let replay_stream = device_stream(replay.attempt.physical_device())?;
+            replay.attempt.prepare_graph_launch(replay_stream)?;
+            replay.status.prepare_graph_launch(replay_stream)?;
         }
-        region.resources.prepare_hash_graph_launch(&frame.owners, region.device, &stream)?;
-        region.resources.prepare_graph_launch(region.device, &stream)?;
+        for device_stream in std::iter::once(&stream).chain(&region.peer_streams) {
+            let device = device_stream.physical_device();
+            region.resources.prepare_hash_graph_launch(&frame.owners, device, device_stream)?;
+            region.resources.prepare_graph_launch(device, device_stream)?;
+        }
+        for peer in &region.peer_streams {
+            peer.record_event()?.enqueue_wait(&stream)?;
+        }
         let completion = region.executable.launch(&stream)?;
-        region.resources.protect_compiled_submission(region.device, &stream, &completion).map_err(
-            |error| {
-                GpuRuntimeError::LaunchUncertain(format!(
-                    "native graph launched but resources could not be retained: {error}"
-                ))
-            },
-        )?;
+        for (device, stream) in std::iter::once((region.device, &stream))
+            .chain(region.peer_streams.iter().map(|peer| (peer.physical_device(), peer)))
+        {
+            region.resources.protect_compiled_submission(device, stream, &completion).map_err(
+                |error| {
+                    GpuRuntimeError::LaunchUncertain(format!(
+                        "native graph launched but resources could not be retained: {error}"
+                    ))
+                },
+            )?;
+        }
         Ok(completion)
     }
+}
+
+fn device_launch_stream(
+    backend: &GpuDcrtBackend,
+    device: i32,
+) -> Result<GpuNativeLaunchStream, GpuNativeGraphError> {
+    backend
+        .control_parameters_on_device(device)
+        .map_err(GpuNativeGraphError::Native)?
+        .native_launch_stream(device)
 }
 
 fn control_address(
@@ -952,7 +1011,15 @@ fn emit_direct_operations(
         let implementation =
             frame.program.implementations.resolve(operation.implementation).map_err(invalid)?;
         let index = u32::try_from(index).map_err(|_| invalid("too many native operations"))?;
-        match implementation.primitive {
+        // An operation on another device adds its nodes to this graph through
+        // that device's stream.
+        let home = (operation.device != builder.launch_stream().physical_device())
+            .then(|| {
+                device_launch_stream(backend, operation.device)
+                    .map(|stream| builder.replace_launch_stream(stream))
+            })
+            .transpose()?;
+        let emitted = match implementation.primitive {
             GpuNativePrimitive::BranchIf => {
                 let [KernelArg::Value(predicate), KernelArg::U32(part), KernelArg::U32(binding)] =
                     operation.arguments.as_ref()
@@ -964,10 +1031,11 @@ fn emit_direct_operations(
                 let address = control_address(frame, *predicate, *part, 8)?;
                 builder.begin_operation(index, &operation.predecessors)?;
                 builder.bind_resident_address(address, 8, *binding)?;
-                builder.add_if_with_body(address, *binding, |body_builder| {
-                    emit_direct_operations(backend, body_builder, frame, resources, body)
-                })?;
-                builder.finish_operation()?;
+                builder
+                    .add_if_with_body(address, *binding, |body_builder| {
+                        emit_direct_operations(backend, body_builder, frame, resources, body)
+                    })
+                    .and_then(|()| builder.finish_operation().map(|_| ()))
             }
             GpuNativePrimitive::LoopWhile => {
                 let [
@@ -994,39 +1062,42 @@ fn emit_direct_operations(
                 builder.bind_resident_address(index_address, 8, *index_binding)?;
                 builder.bind_resident_address(limit_address, 8, *limit_binding)?;
                 builder.bind_resident_address(status_address, 4, *status_binding)?;
-                builder.add_while_with_body(
-                    index_address,
-                    limit_address,
-                    *max_iterations,
-                    status_address,
-                    *index_binding,
-                    *limit_binding,
-                    *status_binding,
-                    |body_builder| {
-                        emit_direct_operations(backend, body_builder, frame, resources, body)
-                    },
-                )?;
-                builder.finish_operation()?;
+                builder
+                    .add_while_with_body(
+                        index_address,
+                        limit_address,
+                        *max_iterations,
+                        status_address,
+                        *index_binding,
+                        *limit_binding,
+                        *status_binding,
+                        |body_builder| {
+                            emit_direct_operations(backend, body_builder, frame, resources, body)
+                        },
+                    )
+                    .and_then(|()| builder.finish_operation().map(|_| ()))
             }
-            _ => {
-                emit_compiled_gpu_op(
-                    backend,
-                    builder,
-                    index,
-                    operation,
-                    implementation,
-                    resources,
-                    &frame.owners,
-                    &frame.slots,
-                )
-                .map_err(|error| {
-                    GpuNativeGraphError::Native(format!(
-                        "operation {index} {:?} {:?}: {error}",
-                        implementation.primitive, operation.arguments
-                    ))
-                })?;
-            }
+            _ => emit_compiled_gpu_op(
+                backend,
+                builder,
+                index,
+                operation,
+                implementation,
+                resources,
+                &frame.owners,
+                &frame.slots,
+            )
+            .map_err(|error| {
+                GpuNativeGraphError::Native(format!(
+                    "operation {index} {:?} {:?}: {error}",
+                    implementation.primitive, operation.arguments
+                ))
+            }),
+        };
+        if let Some(home) = home {
+            builder.replace_launch_stream(home);
         }
+        emitted?;
     }
     Ok(())
 }
@@ -1404,7 +1475,25 @@ impl GpuRuntime {
         inputs: &BTreeMap<String, RuntimeValue>,
         columns_per_job: usize,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), Some(columns_per_job))
+        self.plan_with_payload_sizes(
+            validated,
+            inputs,
+            &BTreeMap::new(),
+            Some((columns_per_job, None)),
+        )
+    }
+
+    /// Like `plan_with_fixed_columns_for_test`, also fixing the wave width.
+    #[cfg(test)]
+    pub(crate) fn plan_with_fixed_geometry_for_test(
+        &mut self,
+        validated: ValidatedGraph,
+        inputs: &BTreeMap<String, RuntimeValue>,
+        columns_per_job: usize,
+        wave_instances: usize,
+    ) -> Result<GpuExecutionPlan, GpuPlanError> {
+        let fixed = Some((columns_per_job, Some(wave_instances)));
+        self.plan_with_payload_sizes(validated, inputs, &BTreeMap::new(), fixed)
     }
 
     /// Query only artifact metadata before allocating a reusable frame.
@@ -1469,7 +1558,7 @@ impl GpuRuntime {
         validated: ValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue>,
         artifact_payload_sizes: &BTreeMap<ArtifactKey, usize>,
-        fixed_columns: Option<usize>,
+        fixed_geometry: Option<(usize, Option<usize>)>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
         for (name, range) in &self.options.integer_input_ranges {
             if range.start() > range.end() {
@@ -1579,7 +1668,7 @@ impl GpuRuntime {
         let mut best = None::<(usize, usize, f64)>;
         let mut measured = GpuMeasuredCostCache::default();
         let mut rejected = Vec::new();
-        let candidate_columns = match fixed_columns {
+        let candidate_columns = match fixed_geometry.map(|(column, _)| column) {
             Some(column) if column > 0 && column <= columns.max(1) => vec![column],
             Some(_) => {
                 return Err(GpuPlanError::InvalidInput(
@@ -1588,7 +1677,10 @@ impl GpuRuntime {
             }
             None => geometric_candidates(columns.max(1), |tiles| columns.max(1).div_ceil(tiles)),
         };
-        let candidate_waves = geometric_candidates(maximum_w, |width| width);
+        let candidate_waves = match fixed_geometry.and_then(|(_, waves)| waves) {
+            Some(waves) => vec![waves.min(maximum_w)],
+            None => geometric_candidates(maximum_w, |width| width),
+        };
         for (candidate_w, candidate_c) in candidate_waves
             .iter()
             .flat_map(|&w| candidate_columns.iter().copied().map(move |c| (w, c)))
@@ -1708,7 +1800,7 @@ impl GpuRuntime {
             limiting_stage: None,
             stages: vec![crate::gpu_warmup::GpuStageReport {
                 wave_instances: selected_w,
-                columns_per_job: vec![selected_c],
+                columns_per_job: vec![selected_c; contract.logical_to_physical_devices.len()],
                 predicted_seconds: selected_seconds,
             }],
             reason: format!(

@@ -213,7 +213,7 @@ extern "C" int gpu_raw_ring_automorphism(GpuContext *ctx, void *stream_raw,
             source->limbs[limb].modulus != destination->limbs[limb].modulus ||
             source->limbs[limb].address == destination->limbs[limb].address)
             return set_error("raw ring automorphism requires distinct ordered CRT views");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const size_t count = source->rows * source->columns * source->degree;
     const uint32_t grid = static_cast<uint32_t>(std::min<size_t>((count + 255) / 256, 65535));
@@ -256,7 +256,7 @@ extern "C" int gpu_raw_lift_integer_constant(GpuContext *ctx, void *stream_raw,
         if (destination->limbs[limb].crt_limb_index != limb ||
             destination->limbs[limb].modulus != ctx->moduli[limb])
             return set_error("raw integer-to-polynomial requires ordered CRT basis");
-    if (cudaSetDevice(destination->physical_device) != cudaSuccess)
+    if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const uint32_t grid = std::min<uint32_t>((destination->degree + 255) / 256, 65535);
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
@@ -316,7 +316,7 @@ extern "C" int gpu_raw_matrix_dynamic_slice(GpuContext *ctx, void *stream_raw,
             source->limbs[limb].modulus != destination->limbs[limb].modulus ||
             source->limbs[limb].address == destination->limbs[limb].address)
             return set_error("raw dynamic slice requires distinct ordered CRT views");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const size_t count = destination->rows * destination->columns * destination->degree;
     const uint32_t grid = static_cast<uint32_t>(

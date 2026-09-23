@@ -153,7 +153,7 @@ static int raw_matrix_decompose_coeff_impl(GpuContext *ctx, void *stream_raw,
         destination->rows != source->rows * digits * retained ||
         destination->row_origin != source->row_origin * digits * retained)
         return set_error("raw coefficient decomposition output shape mismatch");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;

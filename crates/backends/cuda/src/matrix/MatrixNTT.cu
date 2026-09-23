@@ -390,7 +390,7 @@ extern "C" int gpu_raw_matrix_ntt(GpuContext *ctx, void *stream_raw,
         source_binding_base > UINT32_MAX - source->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("raw NTT views do not match");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t degree = source->degree;
@@ -495,7 +495,7 @@ extern "C" int gpu_raw_matrix_add_sub(GpuContext *ctx, void *stream_raw,
         right_binding_base > UINT32_MAX - right->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("raw arithmetic views do not match");
-    if (cudaSetDevice(left->physical_device) != cudaSuccess)
+    if (mxx_set_device(left->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = left->rows * left->columns;
@@ -538,7 +538,7 @@ extern "C" int gpu_raw_matrix_scale(GpuContext *ctx, void *stream_raw,
         source_binding_base > UINT32_MAX - source->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw matrix scale views or residues");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;
@@ -582,7 +582,7 @@ extern "C" int gpu_raw_matrix_scale_dynamic(GpuContext *ctx, void *stream_raw,
         source_binding_base > UINT32_MAX - source->limb_count ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid dynamic raw matrix scale views or scalar");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;
@@ -652,7 +652,7 @@ static int raw_matrix_mul_impl(GpuContext *ctx, void *stream_raw,
             left->limbs[limb].address == destination->limbs[limb].address ||
             right->limbs[limb].address == destination->limbs[limb].address)
             return set_error("raw matrix product limb mismatch or alias");
-    if (cudaSetDevice(left->physical_device) != cudaSuccess)
+    if (mxx_set_device(left->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = destination->rows * destination->columns;
@@ -727,7 +727,7 @@ extern "C" int gpu_raw_matrix_transpose(GpuContext *ctx, void *stream_raw,
             source->limbs[limb].modulus != destination->limbs[limb].modulus ||
             source->limbs[limb].address == destination->limbs[limb].address)
             return set_error("raw transpose CRT basis mismatch or alias");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = destination->rows * destination->columns;
@@ -786,7 +786,7 @@ extern "C" int gpu_raw_matrix_tensor(GpuContext *ctx, void *stream_raw,
             left->limbs[limb].address == destination->limbs[limb].address ||
             right->limbs[limb].address == destination->limbs[limb].address)
             return set_error("raw tensor CRT basis mismatch or alias");
-    if (cudaSetDevice(left->physical_device) != cudaSuccess)
+    if (mxx_set_device(left->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = destination->rows * destination->columns;
@@ -836,7 +836,7 @@ extern "C" int gpu_raw_matrix_copy(GpuContext *ctx, void *stream_raw,
                 destination->limbs[limb].crt_limb_index ||
             source->limbs[limb].modulus != destination->limbs[limb].modulus)
             return set_error("raw matrix copy CRT basis mismatch");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = source->rows * source->columns;
@@ -888,7 +888,7 @@ static int raw_matrix_fill_impl(GpuContext *ctx, void *stream_raw,
         destination->columns > rows * slots_per_row -
             (destination->column_origin - column_base))
         return set_error("raw structured fill window mismatch");
-    if (cudaSetDevice(destination->physical_device) != cudaSuccess)
+    if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const size_t poly_count = destination->rows * destination->columns;

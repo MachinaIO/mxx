@@ -22,8 +22,9 @@ Validation on the final tree: warning-free `cargo check --workspace --all-target
 `gpu_bgv`, and `gpu_ring_gsw`. Tall and WE GPU integration targets were compiled, not run. Lean
 verification was not run.
 
-Known remaining limitations: planning uses one device per plan (multi-device shard plans are not
-implemented, and only a single-GPU machine was available); non-vectorized parallel loops must
+Known remaining limitations: planning used one device per plan at that time (update: multi-device
+plans are now implemented through logical devices; see `docs/architecture.md`, sections 6.4 and
+6.8); non-vectorized parallel loops must
 return matrix families; plan time is dominated by full per-candidate trials (for example about 34 s
 for a 16384-degree trapdoor plus preimage); per-execute binding patch cost is not deduplicated.
 

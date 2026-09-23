@@ -344,7 +344,7 @@ extern "C" int gpu_matrix_modulus_conversion_plan_protect_compiled_submission(
     const auto launch_stream = reinterpret_cast<cudaStream_t>(launch_stream_raw);
     if (!context_owns_compute_stream(context, physical_device, launch_stream))
         return reject("modulus conversion plan protection stream mismatch");
-    cudaError_t error = cudaSetDevice(physical_device);
+    cudaError_t error = mxx_set_device(physical_device);
     if (error == cudaSuccess)
     {
         error = cudaStreamWaitEvent(
@@ -370,7 +370,7 @@ extern "C" void gpu_matrix_modulus_conversion_plan_destroy(GpuModulusConversionP
     }
     if (plan->device_metadata)
     {
-        cudaSetDevice(plan->device);
+        mxx_set_device(plan->device);
         cudaFreeAsync(plan->device_metadata, plan->stream);
     }
     if (plan->pinned_metadata)
@@ -449,7 +449,7 @@ extern "C" int gpu_raw_modulus_conversion_prepare(
             return set_error("raw modulus divisor is not invertible");
         metadata.division_inverses[limb] = inverse;
     }
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
     auto *plan = new (std::nothrow) GpuModulusConversionPlan();
     if (!plan) return set_error("failed to allocate raw modulus plan");
@@ -528,7 +528,7 @@ extern "C" int gpu_raw_centered_rebase_prepare(
         if (!mod_inverse_u64(prefix, modulus, metadata.prefix_inverses[limb]))
             return set_error("raw centered rebase basis is not invertible");
     }
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
     auto *plan = new (std::nothrow) GpuModulusConversionPlan();
     if (!plan) return set_error("failed to allocate raw centered rebase plan");
@@ -605,7 +605,7 @@ extern "C" int gpu_raw_centered_round_divide_prepare(
         return set_error("unsupported raw centered round divide modulus size");
     metadata.word_count = static_cast<int>(modulus_words.size());
     std::copy(modulus_words.begin(), modulus_words.end(), metadata.modulus_words);
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
     auto *plan = new (std::nothrow) GpuModulusConversionPlan();
     if (!plan) return set_error("failed to allocate raw centered round divide plan");
@@ -967,7 +967,7 @@ static int raw_modulus_conversion_emit_impl(
             target.row_stride_bytes < row_span)
             return set_error("raw modulus conversion target view changed");
     }
-    if (cudaSetDevice(plan->device) != cudaSuccess)
+    if (mxx_set_device(plan->device) != cudaSuccess)
         return set_error(cudaGetLastError());
     RawCrtSources sources{};
     for (size_t limb = 0; limb < source->limb_count; ++limb)
@@ -1347,7 +1347,7 @@ extern "C" int gpu_raw_crt_recompose_level_prepare(
         if (target_moduli[index] <= 1 ||
             reconstruction_residues[index] >= target_moduli[index])
             return set_error("raw CRT recomposition target residue is invalid");
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
     auto *plan = new (std::nothrow) GpuModulusConversionPlan();
     if (!plan) return set_error("failed to allocate raw CRT recomposition plan");
@@ -1414,7 +1414,7 @@ extern "C" int gpu_raw_crt_recompose_level_emit(
     if (!count || count > static_cast<size_t>(std::numeric_limits<int>::max() - 1) * 128)
         return set_error("raw CRT recomposition grid exceeds capacity");
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    cudaError_t error = cudaSetDevice(plan->device);
+    cudaError_t error = mxx_set_device(plan->device);
     if (error != cudaSuccess) return set_error(error);
     for (size_t index = 0; index < source->limb_count; ++index)
     {
@@ -1579,7 +1579,7 @@ extern "C" int gpu_raw_compact_pack_prepare(
                 metadata.prefix_inverses[index]))
             return set_error("raw compact source basis is not coprime");
     }
-    cudaError_t error = cudaSetDevice(device);
+    cudaError_t error = mxx_set_device(device);
     if (error != cudaSuccess) return set_error(error);
     auto *plan = new (std::nothrow) GpuModulusConversionPlan();
     if (!plan) return set_error("failed to allocate raw compact pack plan");
@@ -1646,7 +1646,7 @@ extern "C" int gpu_raw_compact_pack_emit(
     if (!count || count > static_cast<size_t>(std::numeric_limits<int>::max() - 1) * 128)
         return set_error("raw compact pack grid exceeds capacity");
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
-    cudaError_t error = cudaSetDevice(plan->device);
+    cudaError_t error = mxx_set_device(plan->device);
     if (error != cudaSuccess) return set_error(error);
     for (size_t index = 0; index < source->limb_count; ++index)
     {
@@ -1742,7 +1742,7 @@ extern "C" int gpu_raw_compact_pack_per_crt_limb(
         return set_error("per-CRT-limb compact pack coefficient count overflows");
     const size_t count = source->rows * source->columns * source->degree;
     if (!count) return set_error("empty per-CRT-limb compact pack view");
-    cudaError_t error = cudaSetDevice(source->physical_device);
+    cudaError_t error = mxx_set_device(source->physical_device);
     if (error != cudaSuccess) return set_error(error);
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     constexpr size_t maximum_chunk = 65535ULL * 256ULL;

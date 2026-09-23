@@ -53,7 +53,7 @@ bool small_add_size(size_t a, size_t b, size_t *out)
 int small_set_device(const GpuSmallMatrix *mat)
 {
     if (!mat || mat->device < 0) return set_error("invalid compact matrix device");
-    const cudaError_t err = cudaSetDevice(mat->device);
+    const cudaError_t err = mxx_set_device(mat->device);
     return err == cudaSuccess ? 0 : set_error(err);
 }
 
@@ -308,7 +308,7 @@ extern "C" int gpu_small_matrix_create(
         return set_error("missing compact matrix stream");
     }
     mat->stream = ctx->execution->compute_streams_by_partition.front().front();
-    cudaError_t err = cudaSetDevice(mat->device);
+    cudaError_t err = mxx_set_device(mat->device);
     if (err == cudaSuccess)
         err = cudaEventCreateWithFlags(&mat->write_done, cudaEventDisableTiming);
     if (err == cudaSuccess)
@@ -381,7 +381,7 @@ extern "C" int gpu_small_matrix_binding_descriptor(
 extern "C" void gpu_small_matrix_destroy(GpuSmallMatrix *mat)
 {
     if (!mat) return;
-    if (mat->device >= 0 && cudaSetDevice(mat->device) == cudaSuccess)
+    if (mat->device >= 0 && mxx_set_device(mat->device) == cudaSuccess)
     {
         cudaStream_t release_stream = mat->stream;
         const size_t partition = 0;
@@ -486,7 +486,7 @@ extern "C" int gpu_raw_small_rhs_expand(GpuContext *ctx, void *stream_raw,
         (source->bound_domain == 1 && source->crt_depth != destination->limb_count) ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw compact RHS expansion views");
-    if (cudaSetDevice(source->physical_device) != cudaSuccess)
+    if (mxx_set_device(source->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     if (source->rows > SIZE_MAX / source->columns ||

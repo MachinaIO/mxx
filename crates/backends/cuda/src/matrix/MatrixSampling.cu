@@ -321,7 +321,7 @@ extern "C" int gpu_raw_matrix_sample(GpuContext *ctx, void *stream_raw,
         destination->columns > full_columns - destination->column_origin ||
         destination_binding_base > UINT32_MAX - destination->limb_count)
         return set_error("invalid raw matrix sampler arguments");
-    if (cudaSetDevice(destination->physical_device) != cudaSuccess)
+    if (mxx_set_device(destination->physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
     const uint64_t chunks_per_poly = (destination->degree + 3) / 4;

@@ -79,7 +79,7 @@ extern "C" int gpu_indexed_matrix_table_create(GpuContext *ctx, void *stream_raw
         family_count * limb_count > SIZE_MAX / sizeof(MxxRawMatrixLimb))
         return set_error("invalid indexed matrix table allocation");
     *out_table = nullptr;
-    if (cudaSetDevice(physical_device) != cudaSuccess)
+    if (mxx_set_device(physical_device) != cudaSuccess)
         return set_error(cudaGetLastError());
     auto *table = new GpuIndexedMatrixTable;
     table->device = physical_device;
@@ -116,7 +116,7 @@ extern "C" int gpu_indexed_matrix_table_upload(GpuIndexedMatrixTable *table,
     if (!table || !stream_raw || !limbs ||
         limb_count != table->family_count * table->limb_count)
         return set_error("invalid indexed matrix table upload");
-    if (cudaSetDevice(table->device) != cudaSuccess)
+    if (mxx_set_device(table->device) != cudaSuccess)
         return set_error(cudaGetLastError());
     const size_t bytes = limb_count * sizeof(MxxRawMatrixLimb);
     std::memcpy(table->pinned_limbs, limbs, bytes);
@@ -137,7 +137,7 @@ extern "C" uint64_t gpu_indexed_matrix_table_address(
 extern "C" void gpu_indexed_matrix_table_destroy(GpuIndexedMatrixTable *table)
 {
     if (!table) return;
-    cudaSetDevice(table->device);
+    mxx_set_device(table->device);
     if (table->device_limbs)
         cudaFreeAsync(table->device_limbs, table->allocation_stream);
     if (table->allocation_ready) cudaEventDestroy(table->allocation_ready);

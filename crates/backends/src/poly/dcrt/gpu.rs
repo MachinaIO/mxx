@@ -330,7 +330,7 @@ struct MxxGraphPatchRaw {
 const GRAPH_PATCH_MEMCPY_1D_SRC: u32 = 1;
 const GRAPH_PATCH_MEMCPY_1D_DST: u32 = 2;
 const GRAPH_PATCH_MEMSET_1D_DST: u32 = 3;
-const CUDA_MEMCPY_DEFAULT: i32 = 4;
+pub(crate) const CUDA_MEMCPY_DEFAULT: i32 = 4;
 
 /// A native graph patch declaration. The node handle is resolved by native
 /// launch-site introspection; callers describe only the exact field layout
@@ -695,6 +695,7 @@ unsafe extern "C" {
         payload_len: usize,
     ) -> c_int;
     fn gpu_device_synchronize() -> c_int;
+    fn gpu_configure_logical_devices(physical: *const c_int, count: usize) -> c_int;
     fn gpu_device_count(out_count: *mut c_int) -> c_int;
     fn gpu_device_mem_info(device: c_int, out_free: *mut usize, out_total: *mut usize) -> c_int;
 
@@ -1278,6 +1279,7 @@ unsafe extern "C" {
         bytes: usize,
         binding: u32,
     ) -> c_int;
+    fn mxx_set_device(logical: c_int) -> c_int;
     fn mxx_gpu_graph_builder_add_memcpy(
         builder: *mut MxxGpuGraphBuilderOpaque,
         destination: *mut c_void,
@@ -1354,6 +1356,11 @@ unsafe extern "C" {
         out_event: *mut *mut MxxGpuNativeEventOpaque,
     ) -> c_int;
     fn mxx_gpu_graph_exec_destroy(exec: *mut MxxGpuGraphExecOpaque);
+    fn mxx_gpu_stream_record_event(
+        stream: *mut c_void,
+        device: c_int,
+        out_event: *mut *mut MxxGpuNativeEventOpaque,
+    ) -> c_int;
     fn mxx_gpu_native_event_wait(event: *mut MxxGpuNativeEventOpaque) -> c_int;
     fn mxx_gpu_native_event_enqueue_wait(
         event: *mut MxxGpuNativeEventOpaque,
@@ -1550,7 +1557,23 @@ pub fn gpu_device_memory_usage(device: i32) -> Result<GpuDeviceMemoryUsage, Stri
     Ok(GpuDeviceMemoryUsage { total: physical.total, resident, live_contexts, context_generation })
 }
 
+/// Install the logical device table before any device is queried or used.
+fn ensure_logical_devices() {
+    static CONFIGURED: OnceLock<()> = OnceLock::new();
+    CONFIGURED.get_or_init(|| {
+        let table = crate::env::gpu_logical_devices()
+            .unwrap_or_else(|error| panic!("invalid GPU logical device table: {error}"));
+        if let Some(table) = table {
+            let physical = table.iter().map(|device| *device as c_int).collect::<Vec<_>>();
+            if unsafe { gpu_configure_logical_devices(physical.as_ptr(), physical.len()) } != 0 {
+                panic!("invalid GPU logical device table: {}", last_error_string());
+            }
+        }
+    });
+}
+
 fn available_gpu_ids() -> Vec<i32> {
+    ensure_logical_devices();
     let mut count: c_int = 0;
     let status = unsafe { gpu_device_count(&mut count) };
     if status != 0 || count <= 0 {
@@ -4981,6 +5004,7 @@ impl GpuContext {
         dnum: u32,
         related: Option<&GpuContext>,
     ) -> Self {
+        ensure_logical_devices();
         info!(
             "{}",
             format!(
@@ -5101,6 +5125,18 @@ impl GpuNativeLaunchStream {
 
     pub(crate) fn physical_device(&self) -> i32 {
         self.physical_device
+    }
+
+    /// Mark the work enqueued on this stream so far; other streams may wait
+    /// on the returned event.
+    pub(crate) fn record_event(&self) -> Result<GpuNativeEvent, GpuNativeGraphError> {
+        let mut raw = ptr::null_mut();
+        if unsafe { mxx_gpu_stream_record_event(self.raw, self.physical_device, &mut raw) } != 0 ||
+            raw.is_null()
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(GpuNativeEvent { raw })
     }
 }
 
@@ -5763,6 +5799,23 @@ impl GpuNativeGraphBuilder {
         &self.stream
     }
 
+    fn select_device(&self) -> Result<(), GpuNativeGraphError> {
+        if unsafe { mxx_set_device(self.stream.physical_device) } != 0 {
+            return Err(GpuNativeGraphError::Native("cannot select the graph device".into()));
+        }
+        Ok(())
+    }
+
+    /// Emit the following operations for the device of `stream`, returning
+    /// the previous stream. Nodes join this builder's single graph whatever
+    /// device they run on.
+    pub fn replace_launch_stream(
+        &mut self,
+        stream: GpuNativeLaunchStream,
+    ) -> GpuNativeLaunchStream {
+        std::mem::replace(&mut self.stream, stream)
+    }
+
     pub fn begin_operation(
         &mut self,
         operation_index: u32,
@@ -6010,6 +6063,8 @@ impl GpuNativeGraphBuilder {
         if predicate_address == 0 {
             return Err(GpuNativeGraphError::Native("null IF predicate".into()));
         }
+        // A conditional's gate kernels run on the device of its stream.
+        self.select_device()?;
         let status = unsafe {
             mxx_gpu_graph_builder_begin_if(
                 self.raw,
@@ -6026,6 +6081,7 @@ impl GpuNativeGraphBuilder {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
         enqueue(self)?;
+        self.select_device()?;
         if unsafe { mxx_gpu_graph_builder_finish_generic_body(self.raw) } != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
@@ -6050,6 +6106,8 @@ impl GpuNativeGraphBuilder {
         if index_address == 0 || limit_address == 0 || status_address == 0 || max_iterations == 0 {
             return Err(GpuNativeGraphError::Native("invalid WHILE control".into()));
         }
+        // A conditional's gate kernels run on the device of its stream.
+        self.select_device()?;
         let status = unsafe {
             mxx_gpu_graph_builder_begin_while(
                 self.raw,
@@ -6071,6 +6129,7 @@ impl GpuNativeGraphBuilder {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
         enqueue(self)?;
+        self.select_device()?;
         if unsafe { mxx_gpu_graph_builder_finish_generic_body(self.raw) } != 0 {
             return Err(GpuNativeGraphError::Native(last_error_string()));
         }
@@ -6428,7 +6487,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn preimage_attempt_and_status_keep_addresses_across_replay_reset() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -6462,7 +6521,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_polynomial_from_signed_words_replays_and_checks_status() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -6567,7 +6626,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_threshold_decode_replays_modulus_and_checks_length() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -6730,7 +6789,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn device_bytes_keep_address_across_exact_length_imports() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -6757,7 +6816,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_dynamic_slice_replays_window_and_checks_bounds() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -6878,7 +6937,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_pack_values_and_extract_preserve_two_prime_coefficients() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7062,7 +7121,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_integer_lift_replays_multiword_signed_value_per_prime() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7167,7 +7226,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn indexed_matrix_table_replays_live_members_and_rejects_bad_index() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7286,7 +7345,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn preimage_graph_derives_distinct_deterministic_attempt_seeds() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7349,7 +7408,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_rns_and_block_graph_match_cpu_oracles() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7530,7 +7589,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_dynamic_centered_round_divide_replays_and_rejects_zero() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -7644,7 +7703,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_hash_sample_matches_cpu_tag_framing_and_column_subrange() {
         use crate::sampler::{PolyHashSampler, hash::DCRTPolyHashSampler};
         use keccak_asm::Keccak256;
@@ -7839,7 +7898,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_hash_sample_rejects_against_multi_block_crt_product() {
         use crate::sampler::{PolyHashSampler, hash::DCRTPolyHashSampler};
         use keccak_asm::Keccak256;
@@ -7953,7 +8012,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_dynamic_matrix_scale_reduces_signed_device_scalars() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -8077,7 +8136,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn raw_ring_automorphism_replays_device_index_and_rejects_even_index() {
         let Some(&device) = detected_gpu_device_ids().first() else {
             return;
@@ -8223,7 +8282,7 @@ mod tests {
     /// metadata, and the graph must not retain the exemplar Rust owners.
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn test_gpu_graph_binding_descriptors_cover_imported_and_compact_owners() {
         let devices = detected_gpu_device_ids();
         if devices.is_empty() {
@@ -8270,7 +8329,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn test_gpu_select_modulus_rejects_base_too_wide_for_selected_basis() {
         let (n, _, bits, _) = crate::env::modulus_conversion_test_parameters();
         let base_bits = u32::try_from((bits + 2) / 2).unwrap();
@@ -8294,7 +8353,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn test_gpu_related_rings_share_execution_and_preserve_async_lifetimes() {
         let devices = available_gpu_ids();
         let device = devices[0];
@@ -8377,7 +8436,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn test_gpu_matrix_allocation_query_is_stable_and_checked() {
         gpu_device_sync();
         let params = gpu_params_from_cpu(&gpu_test_params());
@@ -8422,7 +8481,7 @@ mod tests {
     }
 
     #[test]
-    #[sequential]
+    #[sequential(gpu_context)]
     fn test_gpu_matrix_allocation_query_uses_partition_decomposition_metadata() {
         let devices = detected_gpu_device_ids();
         if devices.len() < 2 {
@@ -8452,9 +8511,19 @@ mod tests {
         let matrix_count = 3 * 2;
         let per_partition_aux =
             RUNTIME_MAX_AUX_LIMBS * (4 + 4) * matrix_count * std::mem::size_of::<*mut u8>();
+        // Each partition's allocation also holds one device descriptor per
+        // local limb after its aux slab.
+        let descriptors =
+            crate::matrix::gpu_dcrt_poly::GpuDCRTPolyMatrix::zero_with_state(&params, 3, 2)
+                .unwrap()
+                .binding_components()
+                .unwrap()
+                .iter()
+                .map(|component| component.limb_count * component.device_descriptor_stride)
+                .sum::<usize>();
         assert_eq!(
             allocation.aux_bytes,
-            2 * per_partition_aux,
+            2 * per_partition_aux + descriptors,
             "each nonempty partition must query its complete no-fallback aux slab"
         );
     }

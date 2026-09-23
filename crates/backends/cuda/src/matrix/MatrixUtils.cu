@@ -33,7 +33,7 @@ namespace
             {
                 return;
             }
-            cudaError_t err = cudaSetDevice(device);
+            cudaError_t err = mxx_set_device(device);
             if (err == cudaSuccess)
             {
                 cudaEventDestroy(event);
@@ -217,7 +217,7 @@ int matrix_wait_limb_stream(
     {
         return set_error("device mismatch in matrix_wait_limb_stream");
     }
-    cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(consumer_device);
+    cudaError_t err = device_already_selected ? cudaSuccess : mxx_set_device(consumer_device);
     if (err != cudaSuccess)
     {
         return set_error(err);
@@ -264,7 +264,7 @@ int matrix_record_limb_write(
     {
         return set_error("invalid stream in matrix_record_limb_write");
     }
-    cudaError_t err = device_already_selected ? cudaSuccess : cudaSetDevice(state->device);
+    cudaError_t err = device_already_selected ? cudaSuccess : mxx_set_device(state->device);
     if (err != cudaSuccess)
     {
         return set_error(err);

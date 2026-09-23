@@ -1858,7 +1858,9 @@ impl GpuRuntime {
         if self.backend.execution_identity() != plan.backend_execution_identity {
             return Err(GpuRuntimeError::StalePlan);
         }
-        plan.frame.rebind_inputs(&inputs).map_err(|_| GpuRuntimeError::StalePlan)?;
+        plan.frame.rebind_inputs(&inputs).map_err(|error| {
+            GpuRuntimeError::Execution(format!("input rebinding failed: {error}"))
+        })?;
         upload_bytes_inputs(&plan.frame, &inputs).map_err(GpuRuntimeError::Execution)?;
         wait_for_bound_inputs(&plan.frame).map_err(GpuRuntimeError::Execution)?;
         plan.frame.bind_return_outputs(&self.backend).map_err(GpuRuntimeError::Execution)?;

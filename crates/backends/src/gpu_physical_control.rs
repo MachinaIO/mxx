@@ -19,12 +19,13 @@ use crate::{
     gpu_physical_lowering::{
         ExportTemplate, ImportDestination, ImportTemplate, IndexedMatrixTableReplay,
         PhysicalLoweringContext, all_predecessors, allocate_compact_value, allocate_scratch_matrix,
-        emit_matrix_operation, full_eval_value, lower_centered_rebase_node,
+        emit_matrix_operation, full_eval_value, hash_tag_resource, lower_centered_rebase_node,
         lower_crt_recompose_node, lower_gadget_trapdoor_node, lower_hash_sample_node,
         lower_matrix_node, lower_preimage_sample_node, lower_rns_conversion_node,
         lower_sample_matrix_node, lower_static_matrix_node, lower_trapdoor_sample_node,
-        pack_trapdoor_leaves, physical_matrix, register_bindings, root_matrix_operation_identity,
-        trapdoor_leaf_types, value_id,
+        pack_trapdoor_leaves, physical_matrix, push_hash_sample, register_bindings,
+        register_preimage_control_binding, root_matrix_operation_identity, trapdoor_leaf_types,
+        value_id,
     },
     poly::{
         PolyParams,
@@ -1807,6 +1808,9 @@ pub(super) fn lower_control_node(
             )?;
             Ok(())
         }
+        NodeKind::HashIntFamily { .. } => {
+            lower_hash_int_family(ctx, scope, scope_id, node_id, node, env)
+        }
         NodeKind::ParallelLoop(loop_node) => {
             lower_parallel_loop(ctx, graph, scope_id, node_id, node, loop_node, env)
         }
@@ -1833,6 +1837,54 @@ pub(super) fn lower_control_node(
     }
 }
 
+/// A hash-sampled integer family: one native sample of the tag stream into
+/// a resident family with the range `[0, modulus)`.
+fn lower_hash_int_family(
+    ctx: &mut PhysicalLoweringContext<'_>,
+    scope: &GraphScope,
+    scope_id: &FrozenGraphScopeId,
+    node_id: NodeId,
+    node: &NodeHandle,
+    env: &ParamEnv,
+) -> Result<(), String> {
+    let NodeKind::HashIntFamily { modulus, tag_prefix, tag_components, .. } = node.kind() else {
+        return Err("GPU hash family lowerer received another node".into());
+    };
+    let arguments = scope.arguments(node).ok_or("GPU hash family arguments are missing")?;
+    let key = *arguments
+        .first()
+        .and_then(|wire| ctx.wire_ids.get(wire))
+        .ok_or("GPU hash family key has no physical value")?;
+    let key_physical = &ctx.values[key.0 as usize];
+    if key_physical.ty != (ConcreteWireType::Bytes { length: 32 }) ||
+        key_physical.encodings.as_ref() != [PhysicalEncoding::Bytes] ||
+        key_physical.parts.len() != 1
+    {
+        return Err("GPU hash key must be resident Bytes32".into());
+    }
+    let ty = resolved_node_output_type(scope_id, node_id, node, env)?;
+    let output = WireRef { node: node_id, port: Port(0) };
+    if matches!(ty, ConcreteWireType::IndexedFamily { count: 0, .. }) {
+        let family = pack_resident_family(ty, &[], ctx.device)?;
+        let id = value_id(ctx.values.len())?;
+        ctx.values.push(family.physical().as_ref().clone());
+        ctx.owners.insert(id, family);
+        ctx.wire_ids.insert(output, id);
+        return Ok(());
+    }
+    let modulus = modulus
+        .evaluate_with_rings(env, crate::openfhe_guard::gen_modulus_and_warmup)
+        .map_err(|error| error.to_string())?;
+    let (resource_id, operands) =
+        hash_tag_resource(ctx, &arguments, tag_prefix, tag_components, env)?;
+    let family = allocate_integer_family_value(ctx, ty, BigInt::from(0u8)..=modulus - 1u8)?;
+    let binding = register_preimage_control_binding(ctx, family)?;
+    let sample = push_hash_sample(ctx, resource_id, key, family, binding, &operands)?;
+    ctx.producer.insert(family, vec![(ColumnRange { start: 0, end: 1 }, sample)]);
+    ctx.wire_ids.insert(output, family);
+    Ok(())
+}
+
 /// Conservative finite transfer shared by direct integer dispatch and loop
 /// carry reservation. Division and remainder include all signed operands; the
 /// native status reports an actual zero divisor at execution.
@@ -1853,6 +1905,13 @@ fn integer_binary_output_range(
                 a.end() * b.end(),
             ];
             products.iter().min().unwrap().clone()..=products.iter().max().unwrap().clone()
+        }
+        // A Euclidean remainder by a positive divisor lies in `[0, divisor)`.
+        IntBinaryOp::Remainder if b.start().is_positive() => {
+            let largest = b.end() - 1u8;
+            let largest =
+                if a.start().is_negative() { largest } else { largest.min(a.end().clone()) };
+            BigInt::from(0u8)..=largest
         }
         IntBinaryOp::Divide | IntBinaryOp::Remainder => {
             let magnitude = [a.start(), a.end(), b.start(), b.end()]
@@ -5585,6 +5644,33 @@ fn copy_matrix_to(
     Ok(vec![index])
 }
 
+/// An Int carry, scalar or a family of Ints, sized by its range over every
+/// iteration.
+fn is_integer_carry(ty: &ConcreteWireType) -> bool {
+    match ty {
+        ConcreteWireType::Int => true,
+        ConcreteWireType::IndexedFamily { element, count } => {
+            *count > 0 && element.as_ref() == &ConcreteWireType::Int
+        }
+        _ => false,
+    }
+}
+
+/// The range shared by every member of an Int carry.
+fn carry_range(
+    ctx: &PhysicalLoweringContext<'_>,
+    id: PhysicalValueId,
+) -> Result<RangeInclusive<BigInt>, String> {
+    if matches!(ctx.values[id.0 as usize].ty, ConcreteWireType::IndexedFamily { .. }) {
+        return ctx.values[id.0 as usize]
+            .integer_ranges
+            .get(&0)
+            .cloned()
+            .ok_or_else(|| "GPU integer family carry has no proven range".to_owned());
+    }
+    integer_range(ctx, id)
+}
+
 /// `range` is the closed interval of an Int carry over every iteration; the
 /// carry storage is sized for it rather than for the initial value.
 fn allocate_sequential_carry(
@@ -5594,6 +5680,9 @@ fn allocate_sequential_carry(
     range: Option<RangeInclusive<BigInt>>,
 ) -> Result<PhysicalValueId, String> {
     if let Some(range) = range {
+        if matches!(target, ConcreteWireType::IndexedFamily { .. }) {
+            return allocate_integer_family_value(ctx, target.clone(), range);
+        }
         return allocate_integer_value(ctx, target.clone(), range, None);
     }
     let planned = ctx.values[source.0 as usize].clone();
@@ -5706,15 +5795,17 @@ fn copy_carry_to(
     if ty.matrix_type().is_some() {
         return copy_matrix_to(ctx, source, destination, barrier);
     }
-    if matches!(
-        ty,
-        ConcreteWireType::Int |
-            ConcreteWireType::Bool |
-            ConcreteWireType::ConstantInt |
-            ConcreteWireType::ConstantBool |
-            ConcreteWireType::Real |
-            ConcreteWireType::ConstantReal
-    ) {
+    if is_integer_carry(&ty) ||
+        matches!(
+            ty,
+            ConcreteWireType::Int |
+                ConcreteWireType::Bool |
+                ConcreteWireType::ConstantInt |
+                ConcreteWireType::ConstantBool |
+                ConcreteWireType::Real |
+                ConcreteWireType::ConstantReal
+        )
+    {
         let operation = u32::try_from(ctx.operations.len())
             .map_err(|_| "too many GPU scalar carry operations".to_owned())?;
         if matches!(ty, ConcreteWireType::Real | ConcreteWireType::ConstantReal) {
@@ -5880,8 +5971,10 @@ fn lower_sequential_loop(
                 .wire_ids
                 .get(&arguments[position])
                 .ok_or_else(|| "GPU sequential input has no physical value".to_owned())?;
-            Ok(matches!(first_types.get(&child.inputs()[position]), Some(ConcreteWireType::Int))
-                .then(|| integer_range(ctx, source))
+            Ok(first_types
+                .get(&child.inputs()[position])
+                .is_some_and(is_integer_carry)
+                .then(|| carry_range(ctx, source))
                 .transpose()?)
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -6099,7 +6192,7 @@ fn lower_sequential_loop(
         let mut widened = carry_ranges.clone();
         for (position, range) in widened.iter_mut().enumerate() {
             if let Some(range) = range {
-                let output = integer_range(ctx, outputs[position])?;
+                let output = carry_range(ctx, outputs[position])?;
                 *range = range.start().min(output.start()).clone()..=
                     range.end().max(output.end()).clone();
             }

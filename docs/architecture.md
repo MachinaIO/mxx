@@ -22,7 +22,7 @@ Contents:
 `mxx` is a Rust and CUDA workspace for lattice-cryptography research. It provides polynomial and
 matrix arithmetic over RNS (CRT) rings `Z_q[X]/(X^N + 1)`, bounded samplers (uniform, Gaussian,
 hash-derived, lattice trapdoors and preimages), and constructions built from them: BGG+ encodings,
-circuit gadgets, leveled BGV and Ring-GSW, and Diamond witness encryption.
+circuit gadgets, TFHE NAND bootstrapping and leveled BGV, and Diamond witness encryption.
 
 Cryptographic algorithms are not written as eager function calls. They are written once as a
 typed dataflow graph and then interpreted by several consumers. The life of a computation is:
@@ -84,7 +84,7 @@ abstraction.
 | `crates/backends` | `mxx-backends` | Polynomial/matrix primitives (OpenFHE via cxx), samplers, runtime values, CPU executor, GPU runtime and native CUDA, artifacts, sessions, transcripts. |
 | `crates/gadgets` | `mxx-gadgets` | Reusable, BGG-independent circuits and circuit gadgets (nested RNS arithmetic, NTT, FHE gadgets, noise refresh, input injector). |
 | `crates/bgg` | `mxx-bgg` | BGG+ public keys, encodings, circuit lowering, lookups, slot transfer, Tall encodings, WEE25 commitments. |
-| `crates/fhe` | `mxx-fhe` | Ring Regev/Ring-GSW and leveled BGV graph builders. |
+| `crates/fhe` | `mxx-fhe` | TFHE (integer LWE with NAND bootstrapping) and leveled BGV graph builders. |
 | `crates/we` | `mxx-we` | Witness-encryption interfaces and Diamond WE with Lean-checked parameter search. |
 | `crates/func-enc` | `mxx-func-enc` | Functional-encryption interface trait only (`FuncEnc`). |
 | `crates/io` | `mxx-io` | Indistinguishability-obfuscation interface trait only (`Obfuscation`). |
@@ -198,7 +198,7 @@ of provenance.
 | Matrix arithmetic | `MatrixBinary(Add/Subtract/Multiply)`, `MatrixMulAccumulate { coefficients, has_bias }`, `MatrixMulSmallRhs`, `MatrixNegate`, `MatrixScale`, `RingAutomorphism { index }` |
 | Ring and modulus conversion | `ModulusSwitch`, `ModulusReduce`, `CenteredRebase` (each with a destination `RingRef`), `CenteredRoundDivide { divisor }`, `RnsModUp { destination, digit_size, normalize }`, `RnsModDown { destination, plaintext_modulus }`, `BlockModSwitch { destination, plaintext_modulus }` |
 | Shape | `Transpose`, `Slice { rows, columns }`, `Tensor`, `Concat { axis: Rows/Columns/Diagonal }` |
-| Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
+| Samplers | `UniformResidueSample`, `UniformIntervalSample`, `GaussianSample { sigma, max_coefficient_bound }`, `HashSample { variant: Plain/Decomposed/SmallDecomposed, tag_prefix, tag_components, base, digit_count }`, `HashIntFamily { count, modulus, tag_prefix, tag_components }`, `TrapdoorSample`, `PreimageSample { max_coefficient_bound }` |
 | Decomposition and coefficients | `GadgetDecompose { base, small, digit_count }`, `ExtractCoefficient`, `LiftIntegerToConstantPolynomial`, `PackPolynomialCoefficients`, `PolynomialFromValues { evaluation }`, `PolynomialValues { evaluation }` |
 | Decoding and CRT | `ThresholdDecode { plaintext_modulus, length, output_bool }`, `CrtRecompose` |
 | Control | `SubgraphCall`, `ParallelLoop`, `SequentialLoop`, `Select { count }` |
@@ -208,6 +208,13 @@ of provenance.
 `PowerOfBase`, `Rotation`, and `Polynomial`. Hash-tag components are typed
 (`HashTagComponent::{Bytes, Integer, Decimal, U64Le, Operand}`) so different framings cannot
 collide.
+
+`HashIntFamily` returns a `Family<Int>` of `count` integers uniform on `[0, modulus)`, where
+`modulus` is a power of two above one. It reuses the `HashSample` transcript: integer `i` is
+coefficient `i` of entry `(0, 0)`, truncated to `log2(modulus)` bits, so no candidate is
+rejected. Both hash samplers share key and tag validation (`validate_hash_key_and_tag` in
+`validate.rs`: a 32-byte key and integer tag operands). Like the other samplers, `HashIntFamily`
+is rejected in sampler-free protocol specifications and has no Lean sampler relation.
 
 The ring-conversion nodes are fused CRT operations with explicit destination rings. They are
 not a generic, implicit modulus-changing mechanism: nested-RNS level switching, for example,
@@ -383,10 +390,13 @@ types), and execution or analysis (a backend or the Lean exporter consumes the
 
 - `DslContext` (`crates/dsl/src/lib.rs`): `new(name)`, `int_parameter(name)`,
   `real_parameter(name)`, `input::<V>(name, schema)`, `evaluate_int(expr)`,
-  `int_family_input(name, count)`, `output(name, value)`, `transferred_output`, `cached_output`,
+  `int_family_input(name, count)`, `hash_int_family(key, tag, count, modulus)`,
+  `output(name, value)`, `transferred_output`, `cached_output`,
   `transferred_trapdoor_output`, `transferred_trapdoor_family_output`, and `build()`. Output
   methods consume and return the context. Composite outputs are flattened as `x.0`, `x.1`, ...;
-  names must be unique after flattening.
+  names must be unique after flattening. `hash_int_family` builds a `HashIntFamily` node and
+  prefixes the tag with the domain `mxx/hash-int-family/v1\0`, so its stream never coincides
+  with a `hash_matrix` stream under the same key and tag.
 - `BuiltGraph { graph }` has `validate(bindings, resolve_basis)` and
   `validate_with_manifests(bindings, manifests, resolve_basis)`.
 - `Ring` wraps a `RingRef`: `Ring::new(crt_bits, crt_depth, ring_dimension)` (generated basis),
@@ -545,6 +555,9 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
   magnitude exceeds the cutoff; it never clips.
 - `DCRTPolyHashSampler<H>` (`hash.rs`) derives matrices from `H(key || tag)` with per-entry and
   per-column framing, so column windows are consistent with whole-matrix sampling.
+  `sample_hash_integers` (same file) samples a `HashIntFamily` from the entry `(0, 0)`
+  coefficient streams of that transcript (`key || tag || row || column || coefficient ||
+  attempt || block`).
 - `DCRTPolyTrapdoorSampler` (`trapdoor/sampler.rs`) samples gadget trapdoors (`DCRTTrapdoor`) and
   preimages. CPU preimage sampling rejects and redraws a whole candidate that exceeds its cutoff,
   so the preimage equation always holds.
@@ -555,7 +568,8 @@ store)`; staged family members are removed with `ExecutionResult::cleanup_staged
 Correctness uses these enforced integer cutoffs and deterministic worst-case bounds. Lattice-
 security estimation separately models the ordinary untruncated distributions.
 
-The executor encodes `HashSample` tags as the fixed prefix followed by typed, length-framed
+The executor encodes `HashSample` and `HashIntFamily` tags (`hash_key_and_tag` in
+`crates/backends/src/executor/cpu.rs`) as the fixed prefix followed by typed, length-framed
 components, so tags such as `(1, 23)` and `(12, 3)` differ. Changing the tag encoding changes
 every hash-derived value: rebuild serialized graphs and hash-derived artifacts together.
 
@@ -696,7 +710,10 @@ let matrix = runtime.download_matrix_output(&out)?;   // or runtime.copy_output(
   typed-blob imports get fixed, pointer-stable destinations.
 - `GpuRuntime::execute(&mut plan, inputs, store, nonce)` rebinds new inputs and replays the frozen
   program. It does not plan, measure, or re-validate. A plan executes only on the backend
-  instance that planned it (`GpuRuntimeError::StalePlan` otherwise).
+  instance that planned it (`GpuRuntimeError::StalePlan` otherwise). A resident input produced by
+  another plan is moved into this plan's storage slots when it is rebound
+  (`with_planned_storage` in `gpu_physical_lowering.rs`), so outputs of one plan can feed
+  another plan regardless of which plan produced them.
 - The result, `GpuExecutionResult<'plan>`, borrows the plan mutably. Its outputs live in
   plan-owned storage and may be overwritten by the next execution, so Rust prevents executing the
   plan again while the result is alive. `result.output(name)` returns a non-cloneable
@@ -732,7 +749,9 @@ panics; see section 6.4).
 
 Errors: planning returns `GpuPlanError` (`InvalidInput`, `Resource`, `Measurement`,
 `GraphCompile`, `InvalidCompiledSchedule`). Execution returns `GpuRuntimeError`: `StalePlan`,
-`Execution`, `LaunchUncertain`, `DeviceStatus`, `Artifact`, `Session`. A data-dependent failure
+`Execution`, `LaunchUncertain`, `DeviceStatus`, `Artifact`, `Session`. `StalePlan` means only
+that the plan came from another backend instance; an input that does not match the planned
+layout fails as `Execution("input rebinding failed: ...")`. A data-dependent failure
 reported by a device status word after its launch joined (for example integer division by zero,
 an invalid selected index, or exhausted preimage retries) is `DeviceStatus`: outputs are
 suppressed and the plan remains reusable. An uncertain launch drains the device and poisons the
@@ -809,6 +828,19 @@ templates, control resets, and wave descriptors needed to run it.
   replay resets a status word once, and status words are checked only after the launch joins,
   instead of one host reset and readback per operation. Each device has its own status word
   (`PhysicalLoweringContext::integer_status` is a per-device map).
+- **Sequential-loop carries.** A sequential loop may carry matrices, scalars, and `Int` families
+  (`is_integer_carry` in `gpu_physical_control.rs`). An `Int` carry, scalar or family, is sized
+  by a range closed over every iteration (`carry_range`), not by its initial value. The integer
+  range analysis gives a Euclidean remainder by a positive divisor the exact range
+  `[0, divisor)` (capped by a nonnegative dividend's upper bound), so a carry reduced modulo a
+  constant each iteration keeps a finite range.
+- **Hash samplers.** `HashSample` and `HashIntFamily` share the `HashSample` native primitive:
+  `hash_tag_resource` registers the tag and `push_hash_sample` emits the sample
+  (`gpu_physical_lowering.rs`), and `lower_hash_int_family` (`gpu_physical_control.rs`) lowers
+  the integer family. An integer family uses a `GpuHashSamplePlan` without CRT moduli, and
+  `GpuHashSamplePlan::emit_raw_hash_integers` (`crates/backends/src/poly/dcrt/gpu_hash.rs`)
+  launches `raw_hash_integer_kernel` through `gpu_raw_hash_integers_emit`
+  (`crates/backends/cuda/src/matrix/MatrixHash.cu`). The output matches the CPU transcript.
 - **Preimage retry loop.** Each preimage column tile is a device `LoopWhile` body that derives a
   per-attempt seed (`crates/backends/cuda/src/matrix/MatrixPreimageSeed.cu`), samples a
   candidate, and checks its cutoff, repeating until acceptance or until the frozen
@@ -1046,18 +1078,34 @@ All application-level crates build graphs through `mxx-dsl` and execute them thr
 - `wee25_commitment.rs`, `wee25_opening.rs`, `wee25_public_parameters.rs`: WEE25 commitments and
   public parameters. The commitment-backed lookup evaluator is intentionally absent.
 
-### 7.3 `mxx-fhe`: BGV and Ring-GSW
+### 7.3 `mxx-fhe`: TFHE and BGV
 
-`crates/fhe/src/` builds FHE graphs; bootstrapping is not implemented. Graph handles are not
+`crates/fhe/src/` builds FHE graphs: TFHE with NAND bootstrapping and leveled BGV (BGV has no
+bootstrapping). Graph handles are not
 authenticated cryptographic objects, and key/ciphertext compatibility beyond ring and shape is the
 caller's responsibility.
 
 - `FheCommonParams { ring: DCRTPolyParams, secret_range, error_sigma, error_cutoff }`
   (`params.rs`). Level zero keeps the first CRT prime and higher levels keep longer prefixes.
-  `FheScheme` (`lib.rs`) is the shared `keygen`/`encrypt`/`decrypt`/`add`/`mul` interface.
-- **Ring Regev / Ring-GSW** (`ring_gsw.rs`): `RingGswParams::new(common, scale, plaintext_bound)`;
-  `RingCiphertext` (aliases `RingRegevCiphertext`, `RingGswCiphertext`) with phase
-  `b - s*a = scale*m + e`; `encrypt_gsw`, `external_product`, and `can_decrypt`.
+  `FheScheme` (`lib.rs`) is the shared matrix-plaintext `keygen`/`encrypt`/`decrypt`/`add`/`mul`
+  interface, implemented by BGV; TFHE has its own integer LWE API.
+- **TFHE** (`tfhe.rs`): `TfheParams::new(common, lwe_dimension, lwe_modulus, lwe_error_sigma,
+  lwe_error_cutoff)` pairs integer LWE over a power-of-two modulus `q` with the CRT ring `R_Q`;
+  secrets are binary and both Gaussian cutoffs must be at least 16 sigma.
+  `LweCiphertext { a, b, .. }` has phase `b - <a, s>` modulo `q` and encodes a bit as
+  `+floor(q/8)` (true) or `-floor(q/8)` (false). `RingCiphertext` holds ring-LWE `(1,1)` values and ring-GSW `(1,2L)` key entries.
+  `keygen(hash_key)` returns `TfheKeys { lwe_secret, ring_secret, bootstrapping_key,
+  key_switch_key }`: a `BootstrappingKey` of GSW encryptions of each LWE secret coordinate and a
+  flat `KeySwitchKey` (base 2, `log2(q)` digits). `encrypt`, `decrypt`, and `can_decrypt` work on
+  single bits. Bootstrapping is four public stages, `pre_blind_rotation`, `blind_rotation`
+  (external products), `sample_extract` (with rounded `Q -> q` modulus switching), and
+  `key_switch`; `bootstrap` chains them and `nand` applies them to `nand_input` (`floor(q/8) -
+  ct1 - ct2`) with the `nand_accumulator` sign LUT. LWE `a` vectors come from
+  `DslContext::hash_int_family` keyed by a fresh caller-supplied 32-byte key per ciphertext (and
+  per `keygen` for the KSK); secrets and errors are independent samples. KSK errors are sampled
+  as whole Gaussian polynomials outside the key loop and read by coefficient
+  (`lwe_error_sources`, `lwe_error_at`), and each KSK dot product accumulates one LWE coordinate
+  per `iterate` step, reduced modulo `q`, which bounds VRAM and lets the GPU carry range close.
 - **BGV** (`bgv.rs`): `BgvParams::new(common, plaintext_modulus, hybrid: Option<BgvHybridParams>)`
   and `BgvCiphertext { components, correction_factor, noise_bound }`. Messages are SIMD slots
   (`Family<Int>`, 1 to N values modulo a prime `t = 1 mod 2N`); encoding lifts the inverse NTT
@@ -1076,7 +1124,7 @@ caller's responsibility.
   cutoffs come from `mxx_backends::sampler::bounds::hard_cutoff_from_sigma_bound`.
 
 Execution follows the general pattern: build with `DslContext`, validate with the backend CRT
-resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV) with the
+resolver, register the exact ordered ciphertext bases (`runtime_parameters()` for BGV and TFHE) with the
 backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactStore`.
 `docs/plans/fhe.md` records the formulas and design, and `README.md` summarizes the FHE API.
 
@@ -1135,7 +1183,8 @@ backend, and call `execute` (CPU) or `GpuRuntime` (GPU) with a `MemoryArtifactSt
   | --- | --- |
   | `crates/backends/tests/gpu_control_resident.rs` | `#![cfg(feature = "gpu")]` |
   | `crates/backends/tests/gpu_direct_node_semantics.rs` | `#![cfg(feature = "gpu")]`; compares direct GPU nodes with the CPU backend |
-  | `crates/fhe/tests/gpu_bgv.rs`, `crates/fhe/tests/gpu_ring_gsw.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
+  | `crates/fhe/tests/gpu_bgv.rs` | `required-features = ["gpu"]` in `crates/fhe/Cargo.toml` |
+  | `crates/fhe/tests/gpu_tfhe.rs` | `required-features = ["gpu"]`; fixed 128-bit-target parameters (LWE `n = 1024`, `q = 2^32`, sigma 32768; ring `N = 2048`, `Q = 33550337 * 33538049`, sigma 1048576; gadget base `2^4`; KSK base 2 with 32 digits). Each bootstrap stage is its own plan and execute with keys kept resident; checks the NAND truth table and repeated gates (`FHE_TFHE_REPEATED_GATES`, default 4) |
   | `crates/gadgets/tests/test_gpu_tall_bgg_nested_rns_modq_arith.rs` | `#![cfg(feature = "gpu")]`; long modes are `#[ignore]` |
   | `crates/we/tests/test_gpu_diamond_we.rs` | `#![cfg(feature = "gpu")]` and `#[ignore]`; Lean-checked parameter search plus a GPU round trip |
 

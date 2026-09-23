@@ -51,6 +51,20 @@ unsafe extern "C" {
         destination_binding_base: u32,
         status_binding: u32,
     ) -> c_int;
+    fn gpu_raw_hash_integers_emit(
+        plan: *mut GpuRawHashPlanOpaque,
+        ctx: *mut GpuContextOpaque,
+        stream: *mut c_void,
+        key: *const u8,
+        destination: *mut u64,
+        count: u64,
+        words: usize,
+        bits: usize,
+        status: *mut u32,
+        key_binding: u32,
+        destination_binding: u32,
+        status_binding: u32,
+    ) -> c_int;
     fn gpu_raw_hash_plan_destroy(plan: *mut GpuRawHashPlanOpaque);
 }
 
@@ -135,8 +149,8 @@ impl GpuHashSamplePlan {
         parts: &[GpuHashTagPart],
         operand_encodings: &[GpuSignedValuesEncoding],
     ) -> Result<Self, GpuNativeGraphError> {
-        if moduli.is_empty() ||
-            moduli.len() > 64 ||
+        // Empty `moduli` plans an integer-family sample.
+        if moduli.len() > 64 ||
             !params.moduli.starts_with(moduli) ||
             !Arc::ptr_eq(&params.ctx, &stream._context)
         {
@@ -223,8 +237,8 @@ impl GpuHashSamplePlan {
         stream: &GpuNativeLaunchStream,
         operands: &[GpuRawIntegerView],
     ) -> Result<(), GpuNativeGraphError> {
-        if !Arc::ptr_eq(&self.context, &stream._context) ||
-            stream.physical_device != self.physical_device ||
+        // Any context's stream on the plan's device orders the refresh.
+        if stream.physical_device != self.physical_device ||
             operands.len() != self.operand_encodings.len() ||
             operands.iter().zip(self.operand_encodings.iter()).any(|(view, encoding)| {
                 view.address == 0 || view.count != 1 || view.encoding != *encoding
@@ -307,6 +321,59 @@ impl GpuHashSamplePlan {
                 status.address as *mut u32,
                 key_binding,
                 destination_binding_base,
+                status.binding,
+            )
+        } != 0
+        {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        Ok(())
+    }
+}
+
+impl GpuHashSamplePlan {
+    /// Emit tag construction and the `bits`-bit integers of a signed-word
+    /// family (one sign word, then `words` magnitude words per element)
+    /// into the active explicit CUDA Graph.
+    pub fn emit_raw_hash_integers(
+        &self,
+        stream: &GpuNativeLaunchStream,
+        key_address: u64,
+        destination: &GpuRawIntegerView,
+        bits: usize,
+        status: GpuRawControlStatusView,
+        key_binding: u32,
+    ) -> Result<(), GpuNativeGraphError> {
+        let GpuSignedValuesEncoding::SignedWords(words) = destination.encoding else {
+            return Err(GpuNativeGraphError::Native(
+                "raw hash integers need a signed-word family".into(),
+            ));
+        };
+        // An integer family has no ring, so the graph's stream may belong to
+        // another context of the same device.
+        if stream.physical_device != self.physical_device ||
+            !self.moduli.is_empty() ||
+            key_address == 0 ||
+            status.address == 0 ||
+            destination.address == 0
+        {
+            return Err(GpuNativeGraphError::Native(
+                "raw hash integer family owner/plan mismatch".into(),
+            ));
+        }
+        if unsafe {
+            gpu_raw_hash_integers_emit(
+                self.raw,
+                self.context.raw_ptr(),
+                stream.raw_ptr(),
+                key_address as *const u8,
+                destination.address as *mut u64,
+                destination.count as u64,
+                words,
+                bits,
+                status.address as *mut u32,
+                key_binding,
+                destination.binding,
                 status.binding,
             )
         } != 0

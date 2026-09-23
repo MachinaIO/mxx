@@ -15,7 +15,7 @@ pub enum HashTagComponent {
     Integer(IntExpr),
     Decimal(IntExpr),
     U64Le(IntExpr),
-    /// Index into HashSample arguments, including the key at index zero.
+    /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
 }
 
@@ -141,6 +141,16 @@ pub enum NodeKind {
         base: Option<IntExpr>,
         #[serde(default)]
         digit_count: Option<IntExpr>,
+    },
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two
+    /// `modulus`, keyed like `HashSample`: integer `i` is the first
+    /// `log2(modulus)` bits of the digest stream of coefficient `i` of entry
+    /// `(0, 0)`, so no candidate is ever rejected.
+    HashIntFamily {
+        count: IntExpr,
+        modulus: IntExpr,
+        tag_prefix: Vec<u8>,
+        tag_components: Vec<HashTagComponent>,
     },
     TrapdoorSample {
         matrix_type: crate::types::MatrixType,

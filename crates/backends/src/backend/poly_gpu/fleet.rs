@@ -1502,14 +1502,30 @@ pub(crate) fn prepare_compiled_gpu_program(
                 let destination_owner = owners
                     .get(destination_id)
                     .ok_or_else(|| invalid("hash destination owner is missing"))?;
-                let (destination_ty, destination, _) = compiled_raw_matrix_part(
-                    destination_owner,
-                    *destination_part,
-                    PhysicalEncoding::FullCoeff,
-                )?;
-                if destination.physical_device != operation.device {
-                    return Err(invalid("hash destination is on another device"));
-                }
+                // A matrix destination samples its CRT ring; an integer family
+                // plans without moduli.
+                let destination_ty = match destination_owner.wire_type() {
+                    ConcreteWireType::IndexedFamily { .. } => {
+                        compiled_raw_integer_part(
+                            destination_owner,
+                            *destination_part,
+                            0,
+                            operation.device,
+                        )?;
+                        None
+                    }
+                    _ => {
+                        let (ty, destination, _) = compiled_raw_matrix_part(
+                            destination_owner,
+                            *destination_part,
+                            PhysicalEncoding::FullCoeff,
+                        )?;
+                        if destination.physical_device != operation.device {
+                            return Err(invalid("hash destination is on another device"));
+                        }
+                        Some(ty)
+                    }
+                };
                 let mut encodings = Vec::with_capacity(spec.operands.len());
                 for &(value, part, binding) in spec.operands.iter() {
                     let owner = owners
@@ -1522,14 +1538,16 @@ pub(crate) fn prepare_compiled_gpu_program(
                     }
                     encodings.push(view.encoding);
                 }
-                let parameters = backend
-                    .parameters_on_physical_device(operation.device, &destination_ty)
-                    .map_err(GpuNativeGraphError::Native)?;
+                let parameters = match &destination_ty {
+                    Some(ty) => backend.parameters_on_physical_device(operation.device, ty),
+                    None => backend.parameters_on_device(operation.device),
+                }
+                .map_err(GpuNativeGraphError::Native)?;
                 let stream = parameters.native_launch_stream(operation.device)?;
                 let plan = GpuHashSamplePlan::new(
-                    &parameters,
+                    parameters,
                     &stream,
-                    destination_ty.ring.crt_moduli(),
+                    destination_ty.as_ref().map_or(&[][..], |ty| ty.ring.crt_moduli()),
                     &spec.parts,
                     &encodings,
                 )?;
@@ -3894,11 +3912,6 @@ pub(crate) fn emit_compiled_gpu_op(
             let destination_owner = owners
                 .get(destination_id)
                 .ok_or_else(|| invalid("hash destination owner is missing"))?;
-            let (_, destination, destination_bindings) = compiled_raw_matrix_part(
-                destination_owner,
-                *destination_part,
-                PhysicalEncoding::FullCoeff,
-            )?;
             let status_owner =
                 owners.get(status_id).ok_or_else(|| invalid("hash status owner is missing"))?;
             let status = compiled_raw_control_status(
@@ -3911,20 +3924,53 @@ pub(crate) fn emit_compiled_gpu_op(
                 .hash_samples
                 .get(resource_id)
                 .ok_or_else(|| invalid("compiled hash sample plan is missing"))?;
-            if *device != op.device || destination.physical_device != op.device {
+            if *device != op.device {
                 return Err(invalid("compiled hash sample device disagrees"));
             }
             builder.bind_resident_address(key_address, 32, *key_binding)?;
-            bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
             builder.bind_resident_address(status.address, 4, *status_binding)?;
-            plan.emit_raw_hash_sample(
-                builder.launch_stream(),
-                key_address,
-                &destination,
-                status,
-                *key_binding,
-                *destination_binding,
-            )?;
+            if matches!(destination_owner.wire_type(), ConcreteWireType::IndexedFamily { .. }) {
+                let (destination, bytes) = compiled_raw_integer_part(
+                    destination_owner,
+                    *destination_part,
+                    *destination_binding,
+                    op.device,
+                )?;
+                // The family's range is `[0, modulus)` for a power-of-two modulus.
+                let bits = destination_owner
+                    .physical()
+                    .integer_ranges
+                    .get(&0)
+                    .map(|range| range.end().bits() as usize)
+                    .ok_or_else(|| invalid("hash integer family has no planned range"))?;
+                builder.bind_resident_address(destination.address, bytes, *destination_binding)?;
+                plan.emit_raw_hash_integers(
+                    builder.launch_stream(),
+                    key_address,
+                    &destination,
+                    bits,
+                    status,
+                    *key_binding,
+                )?;
+            } else {
+                let (_, destination, destination_bindings) = compiled_raw_matrix_part(
+                    destination_owner,
+                    *destination_part,
+                    PhysicalEncoding::FullCoeff,
+                )?;
+                if destination.physical_device != op.device {
+                    return Err(invalid("compiled hash sample device disagrees"));
+                }
+                bind_raw_matrix_part(builder, *destination_binding, &destination_bindings)?;
+                plan.emit_raw_hash_sample(
+                    builder.launch_stream(),
+                    key_address,
+                    &destination,
+                    status,
+                    *key_binding,
+                    *destination_binding,
+                )?;
+            }
             builder.retain_owner(Arc::clone(plan));
             builder.retain_owner(Arc::clone(key_owner));
             builder.retain_owner(Arc::clone(destination_owner));

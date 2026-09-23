@@ -1922,6 +1922,44 @@ impl DslContext {
         Int { value: expression }.add(Int::constant(0))
     }
 
+    /// `count` integers uniform on `[0, modulus)` for a power-of-two `modulus`,
+    /// derived from the 32-byte key, the tag, and each element's index. The
+    /// tag is prefixed with a fixed integer-family domain, so the stream never
+    /// coincides with a `hash_matrix` stream under the same key and tag.
+    #[track_caller]
+    pub fn hash_int_family(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        modulus: impl Into<IntExpr>,
+    ) -> Family<Int> {
+        let count = count.into();
+        let tag = tag.into();
+        let mut tag_prefix = b"mxx/hash-int-family/v1\0".to_vec();
+        tag_prefix.extend(tag.prefix);
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let node = NodeHandle::new(
+            NodeKind::HashIntFamily {
+                count: count.clone(),
+                modulus: modulus.into(),
+                tag_prefix,
+                tag_components: tag.components,
+            },
+            arguments,
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("hash integer family")],
+            element_schema: IntType,
+            count,
+        }
+    }
+
     #[track_caller]
     pub fn int_family_input(
         &self,

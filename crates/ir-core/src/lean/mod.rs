@@ -1595,6 +1595,14 @@ impl<'a> Emitter<'a> {
                     &[sigma, bound],
                 );
             }
+            NodeKind::HashIntFamily { .. } => {
+                return self.unsupported(
+                    scope_id,
+                    node_id,
+                    kind,
+                    "integer hash families have no Lean sampler relation",
+                );
+            }
             NodeKind::HashSample { variant, tag_prefix, tag_components, .. } => {
                 if *variant != crate::node::HashVariant::Plain {
                     return self.unsupported(

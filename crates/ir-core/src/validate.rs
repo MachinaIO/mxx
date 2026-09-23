@@ -1074,37 +1074,31 @@ fn validate_node(
                 resolve_basis,
             )?)]
         }
+        NodeKind::HashIntFamily { count, modulus, tag_components, .. } => {
+            validate_hash_key_and_tag(scope, values, node, tag_components, env, resolve_basis)?;
+            let count = nonnegative_usize(
+                count.evaluate_with_rings(env, resolve_basis)?,
+                "hash integer family count",
+                scope,
+                node.id,
+            )?;
+            let modulus = modulus.evaluate_with_rings(env, resolve_basis)?;
+            if modulus <= BigInt::one() || !(&modulus & (&modulus - BigInt::one())).is_zero() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "hash integer family modulus must be a power of two above one",
+                );
+            }
+            vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count,
+            }]
+        }
         NodeKind::HashSample {
             matrix_type, variant, tag_components, base, digit_count, ..
         } => {
-            if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
-                return node_error(scope, node.id, "hash sampling requires a 32-byte key");
-            }
-            for index in 1..node.args.len() {
-                require_scalar(scope, values, node, index, is_integer, "integer")?;
-            }
-            for component in tag_components {
-                use crate::node::HashTagComponent;
-                match component {
-                    HashTagComponent::Bytes(_) => {}
-                    HashTagComponent::Integer(expression) |
-                    HashTagComponent::Decimal(expression) => {
-                        expression.evaluate_with_rings(env, resolve_basis)?;
-                    }
-                    HashTagComponent::U64Le(expression) => {
-                        if expression.evaluate_with_rings(env, resolve_basis)?.to_u64().is_none() {
-                            return node_error(
-                                scope,
-                                node.id,
-                                "little-endian hash tag must fit in u64",
-                            );
-                        }
-                    }
-                    HashTagComponent::Operand(index) => {
-                        require_scalar(scope, values, node, *index, is_integer, "integer")?;
-                    }
-                }
-            }
+            validate_hash_key_and_tag(scope, values, node, tag_components, env, resolve_basis)?;
             let matrix = concrete_matrix(matrix_type, env, scope, node.id, resolve_basis)?;
             let bound = match variant {
                 HashVariant::Plain if base.is_none() && digit_count.is_none() => None,
@@ -2136,6 +2130,42 @@ fn family_element(ty: &ConcreteWireType) -> (&ConcreteWireType, Option<usize>) {
         ConcreteWireType::IndexedFamily { element, count } => (element, Some(*count)),
         scalar => (scalar, None),
     }
+}
+
+/// A hash sampler's key is Bytes32 and every other argument and tag operand
+/// is an integer.
+fn validate_hash_key_and_tag(
+    scope: &FrozenGraphScopeId,
+    values: &BTreeMap<WireRef, ConcreteWireType>,
+    node: &NodeView<'_>,
+    tag_components: &[crate::node::HashTagComponent],
+    env: &ParamEnv,
+    resolve_basis: ResolveCrtBasis,
+) -> Result<(), ValidationError> {
+    use crate::node::HashTagComponent;
+    if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
+        return node_error(scope, node.id, "hash sampling requires a 32-byte key");
+    }
+    for index in 1..node.args.len() {
+        require_scalar(scope, values, node, index, is_integer, "integer")?;
+    }
+    for component in tag_components {
+        match component {
+            HashTagComponent::Bytes(_) => {}
+            HashTagComponent::Integer(expression) | HashTagComponent::Decimal(expression) => {
+                expression.evaluate_with_rings(env, resolve_basis)?;
+            }
+            HashTagComponent::U64Le(expression) => {
+                if expression.evaluate_with_rings(env, resolve_basis)?.to_u64().is_none() {
+                    return node_error(scope, node.id, "little-endian hash tag must fit in u64");
+                }
+            }
+            HashTagComponent::Operand(index) => {
+                require_scalar(scope, values, node, *index, is_integer, "integer")?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn positive_usize(

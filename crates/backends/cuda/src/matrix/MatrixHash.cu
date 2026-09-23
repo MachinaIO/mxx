@@ -328,6 +328,38 @@ namespace
         }
     }
 
+    // Integer i of a hash family is coefficient i of entry (0, 0) of the
+    // matrix transcript, truncated to `bits` bits. Each element is one sign
+    // word (always zero) followed by `words` little-endian magnitude words.
+    __global__ void raw_hash_integer_kernel(
+        const uint8_t *key, const uint64_t *tag_length, const uint8_t *tag,
+        size_t tag_capacity, uint64_t *destination, uint64_t count, size_t words,
+        size_t bits, uint32_t *status)
+    {
+        if (*status != 0 || *tag_length > tag_capacity) return;
+        const size_t bytes = (bits + 7) / 8;
+        const uint64_t stride = static_cast<uint64_t>(gridDim.x) * blockDim.x;
+        for (uint64_t index = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+             index < count; index += stride)
+        {
+            uint64_t *element = destination + index * (words + 1);
+            for (size_t word = 0; word <= words; ++word) element[word] = 0;
+            for (size_t block = 0; block < (bytes + 31) / 32; ++block)
+            {
+                uint8_t digest[32];
+                hash_digest(key, tag, *tag_length, 0, 0, index, 0, block, digest);
+                for (size_t byte = 0; byte < 32 && block * 32 + byte < bytes; ++byte)
+                {
+                    const size_t output = block * 32 + byte;
+                    uint8_t value = digest[byte];
+                    if (output + 1 == bytes && (bits & 7))
+                        value &= static_cast<uint8_t>((1U << (bits & 7)) - 1);
+                    element[1 + output / 8] |= uint64_t(value) << (8 * (output % 8));
+                }
+            }
+        }
+    }
+
     __global__ void raw_hash_descriptor_kernel(MxxRawMatrixLimb limb,
         MxxRawMatrixLimb *output)
     {
@@ -367,7 +399,8 @@ extern "C" int gpu_raw_hash_plan_create(
     const int32_t *operand_encodings, size_t operand_count,
     GpuRawHashPlan **out_plan)
 {
-    if (!ctx || !stream_raw || !out_plan || !moduli || !limb_count ||
+    // Without CRT moduli the plan samples integer families instead.
+    if (!ctx || !stream_raw || !out_plan || (limb_count && !moduli) ||
         limb_count > 64 || (segment_count && !segments) ||
         (static_byte_count && !static_bytes) ||
         (operand_count && !operand_encodings) ||
@@ -375,7 +408,8 @@ extern "C" int gpu_raw_hash_plan_create(
         return set_error("invalid raw hash sample plan");
     *out_plan = nullptr;
     std::vector<uint64_t> q_words;
-    if (!hash_product_words(moduli, limb_count, q_words) || q_words.size() > 64)
+    if (limb_count &&
+        (!hash_product_words(moduli, limb_count, q_words) || q_words.size() > 64))
         return set_error("invalid raw hash CRT product");
     for (size_t limb = 0; limb < limb_count; ++limb)
         if (ctx->moduli[limb] != moduli[limb])
@@ -440,11 +474,11 @@ extern "C" int gpu_raw_hash_plan_create(
     plan->device = device;
     plan->stream = reinterpret_cast<cudaStream_t>(stream_raw);
     plan->allocation_bytes = cursor;
-    plan->moduli.assign(moduli, moduli + limb_count);
+    if (limb_count) plan->moduli.assign(moduli, moduli + limb_count);
     if (operand_count)
         plan->operand_encodings.assign(operand_encodings, operand_encodings + operand_count);
     plan->q_word_count = q_words.size();
-    plan->q_bits = (q_words.size() - 1) * 64 +
+    plan->q_bits = q_words.empty() ? 0 : (q_words.size() - 1) * 64 +
         (64 - __builtin_clzll(q_words.back()));
     plan->segment_count = segment_count;
     plan->static_bytes = static_byte_count;
@@ -479,8 +513,11 @@ extern "C" int gpu_raw_hash_plan_create(
         base + descriptors_offset);
     std::memset(plan->pinned_static, 0, static_region_bytes);
     auto *host = static_cast<uint8_t *>(plan->pinned_static);
-    std::memcpy(host + q_offset, q_words.data(), q_words.size() * 8);
-    std::memcpy(host + moduli_offset, moduli, limb_count * 8);
+    if (limb_count)
+    {
+        std::memcpy(host + q_offset, q_words.data(), q_words.size() * 8);
+        std::memcpy(host + moduli_offset, moduli, limb_count * 8);
+    }
     if (segment_count)
         std::memcpy(host + segments_offset, segments,
             segment_count * sizeof(MxxRawHashTagSegment));
@@ -610,4 +647,44 @@ extern "C" int gpu_raw_hash_sample_emit(
         plan->device_descriptors, destination->row_origin,
         destination->column_origin, destination->rows, destination->columns,
         destination->degree, status);
+}
+
+extern "C" int gpu_raw_hash_integers_emit(
+    GpuRawHashPlan *plan, GpuContext *ctx, void *stream_raw,
+    const uint8_t *key, uint64_t *destination, uint64_t count, size_t words,
+    size_t bits, uint32_t *status, uint32_t key_binding,
+    uint32_t destination_binding, uint32_t status_binding)
+{
+    if (!plan || plan->context != ctx || !plan->moduli.empty() || !stream_raw || !key ||
+        !destination || !status || !count || !words || !bits || bits > words * 64 ||
+        count > UINT64_MAX / (words + 1) ||
+        !mxx_gpu_graph_builder_for_stream(ctx, stream_raw))
+        return set_error("invalid raw hash integer family view");
+    const auto stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    const MxxGraphPatch tag_status_patch{nullptr,
+        MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 10, 0,
+        sizeof(void *), status_binding, 0};
+    int result = mxx_gpu_launch_kernel(ctx, stream,
+        raw_hash_tag_build_kernel, dim3(1), dim3(1), 0,
+        &tag_status_patch, 1,
+        plan->device_segments, plan->segment_count,
+        plan->device_static, plan->device_operands,
+        plan->operand_encodings.size(), plan->device_tag_length,
+        plan->device_tag, plan->max_tag_bytes,
+        plan->device_decimal_scratch, plan->decimal_words, status);
+    if (result != 0) return result;
+    const uint32_t blocks = static_cast<uint32_t>(std::min<uint64_t>(
+        65535, (count + 127) / 128));
+    const MxxGraphPatch sample_patches[] = {
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 0, 0,
+            sizeof(void *), key_binding, 0},
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 4, 0,
+            sizeof(void *), destination_binding, 0},
+        {nullptr, MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD, 8, 0,
+            sizeof(void *), status_binding, 0},
+    };
+    return mxx_gpu_launch_kernel(ctx, stream,
+        raw_hash_integer_kernel, dim3(blocks), dim3(128), 0,
+        sample_patches, 3, key, plan->device_tag_length, plan->device_tag,
+        plan->max_tag_bytes, destination, count, words, bits, status);
 }

@@ -1,24 +1,28 @@
-//! Executable DSL graphs for Ring Regev, Ring-GSW, and leveled BGV.
+//! Executable DSL graphs for TFHE and leveled BGV.
 //!
 //! Methods construct graphs; randomness and cryptographic arithmetic run in
-//! `mxx-runtime`. Parameters do not imply a security level. Bootstrapping is not
-//! provided. Ciphertext/key compatibility beyond ring and shape is the caller's
-//! responsibility: graph handles are not authenticated cryptographic objects.
-//! Runtime inputs are passed directly; staged FHE artifacts use
-//! `mxx_runtime::MemoryArtifactStore`, with no file persistence.
+//! `mxx-runtime`. Parameters do not imply a security level. TFHE provides
+//! integer LWE encryption, blind rotation, sample extraction, key switching,
+//! and NAND; BGV provides leveled arithmetic. Ciphertext/key compatibility
+//! beyond ring and shape is the caller's responsibility: graph handles are not
+//! authenticated cryptographic objects. Runtime inputs are passed directly;
+//! staged FHE artifacts use `mxx_runtime::MemoryArtifactStore`, with no file
+//! persistence.
 
 mod bgv;
 mod params;
-mod ring_gsw;
 #[cfg(all(test, feature = "gpu"))]
 mod tests_gpu;
+mod tfhe;
 pub mod utils;
 
 pub use bgv::{BgvCiphertext, BgvCiphertextSchema, BgvHybridParams, BgvParams};
 use mxx_dsl::{DslError, GraphValue, Mat};
 pub use params::FheCommonParams;
-pub use ring_gsw::{
-    RingCiphertext, RingCiphertextSchema, RingGswCiphertext, RingGswParams, RingRegevCiphertext,
+pub use tfhe::{
+    BootstrappingKey, BootstrappingKeySchema, KeySwitchKey, KeySwitchKeySchema, LweCiphertext,
+    LweCiphertextSchema, RingCiphertext, RingCiphertextSchema, TfheKeys, TfheKeysSchema,
+    TfheParams,
 };
 use thiserror::Error;
 
@@ -40,8 +44,8 @@ pub enum FheError {
     Dsl(#[from] DslError),
 }
 
-/// Shared graph construction operations. Multiplication may be asymmetric:
-/// Ring Regev times Ring-GSW, versus BGV times BGV with a relinearization key.
+/// Shared matrix-plaintext graph operations. TFHE uses its dedicated integer
+/// LWE API; BGV multiplication uses a relinearization key.
 pub trait FheScheme {
     type Plaintext: GraphValue;
     type Ciphertext: GraphValue;

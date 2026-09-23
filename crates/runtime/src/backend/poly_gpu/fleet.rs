@@ -228,6 +228,22 @@ fn set_resident_integer_binding_map(
     set_capture_binding_sources(capture, &program.bindings, &sources)
 }
 
+fn resident_int_binary_capture_outputs(
+    operation: IntBinaryOp,
+    output_zero: ValueSlot,
+    output_one: Option<ValueSlot>,
+) -> Result<(ValueSlot, Option<ValueSlot>), GpuResidentControlAdapterError> {
+    match operation {
+        IntBinaryOp::Divide => output_one
+            .map(|output_one| (output_zero, Some(output_one)))
+            .ok_or(GpuResidentControlAdapterError::MissingOutput),
+        IntBinaryOp::Remainder => output_one
+            .map(|output_one| (output_one, Some(output_zero)))
+            .ok_or(GpuResidentControlAdapterError::MissingOutput),
+        IntBinaryOp::Add | IntBinaryOp::Subtract | IntBinaryOp::Multiply => Ok((output_zero, None)),
+    }
+}
+
 fn capture_schema_sources(
     bindings: &[RegionBinding],
     access: BindingAccess,
@@ -1017,7 +1033,8 @@ struct ResidentNativeCapturePreparation {
 }
 
 struct ResidentLaneCapturePreparation {
-    request: GpuCaptureRequest,
+    request: Option<GpuCaptureRequest>,
+    materialized_constants: Option<Vec<GpuFleetMatrix>>,
     output_storage: Vec<GpuCaptureOwnedOwner>,
     protocol: Option<GpuCaptureProtocolOwners>,
     bindings: Box<[RegionBinding]>,
@@ -2094,6 +2111,167 @@ fn resident_integer_arc(
     }
 }
 
+fn resident_lane_integer_arc(
+    program: &GpuResidentCaptureProgram,
+    payload: &ResidentNativeInstruction,
+    owners: &GpuResidentCaptureOwners<'_>,
+    wire: WireRef,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+) -> Result<Arc<GpuFleetSignedValues>, GpuResidentControlAdapterError> {
+    let layout = payload
+        .source_bindings
+        .iter()
+        .find(|binding| binding.wire == wire)
+        .map(|binding| &binding.physical)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane integer source has no physical layout".into(),
+            )
+        })?;
+    let component = layout
+        .components
+        .iter()
+        .find(|component| component.component == NativeValueComponent::IntegerValues)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane integer layout has no integer-values component".into(),
+            )
+        })?;
+    let owner = resident_wire_owner(program, payload, owners, wire)?;
+    resident_lane_integer_owner_arc(
+        owner,
+        component.selection,
+        lane,
+        wave_base,
+        physical_device,
+        &format!("node {:?} {:?}, source wire {wire:?}", payload.node, payload.kind),
+    )
+}
+
+fn resident_lane_integer_output_arc(
+    owners: &GpuResidentCaptureOwners<'_>,
+    slot: ValueSlot,
+    layout: &crate::gpu_compiled::ResidentPhysicalSlotLayout,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+    payload: &ResidentNativeInstruction,
+) -> Result<Arc<GpuFleetSignedValues>, GpuResidentControlAdapterError> {
+    let component = layout
+        .components
+        .iter()
+        .find(|component| component.component == NativeValueComponent::IntegerValues)
+        .ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane integer output layout has no integer-values component".into(),
+            )
+        })?;
+    resident_lane_integer_owner_arc(
+        owners.resolve(slot)?,
+        component.selection,
+        lane,
+        wave_base,
+        physical_device,
+        &format!("node {:?} {:?}, output slot {slot:?}", payload.node, payload.kind),
+    )
+}
+
+fn resident_lane_integer_owner_arc(
+    owner: GpuResidentOwnerRef<'_>,
+    selection: crate::gpu_compiled::ResidentLaneSelection,
+    lane: usize,
+    wave_base: usize,
+    physical_device: i32,
+    context: &str,
+) -> Result<Arc<GpuFleetSignedValues>, GpuResidentControlAdapterError> {
+    let owner_is_family = matches!(&owner, GpuResidentOwnerRef::Family(_));
+    // Integer owners are reusable wave buffers, so their lane selection is
+    // relative to the current wave. Indexed families own the complete logical
+    // sequence and must also include the wave base.
+    let index = resident_lane_integer_index(selection, lane, wave_base, owner_is_family)?;
+    let select_packed_lane = |value: &GpuFleetSignedValues| {
+        if value.device_id() != physical_device {
+            return Err(GpuResidentControlAdapterError::WrongOwner { expected: physical_device });
+        }
+        let end = index.checked_add(1).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane integer range overflows".into(),
+            )
+        })?;
+        if end > value.count() {
+            return Err(GpuResidentControlAdapterError::Unsupported(format!(
+                "resident lane integer slice is out of bounds ({context}, owner {}, selection {selection:?}, lane {lane}, wave_base {wave_base}, range {index}..{end}, count {})",
+                if owner_is_family { "indexed family" } else { "integer wave" },
+                value.count(),
+            )));
+        }
+        value.slice(index..end).map(Arc::new).map_err(|error| {
+            GpuResidentControlAdapterError::Unsupported(format!(
+                "resident lane integer slice failed ({context}, range {index}..{end}, count {}): {error}",
+                value.count(),
+            ))
+        })
+    };
+    match owner {
+        GpuResidentOwnerRef::Integer(value) => select_packed_lane(value),
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
+            packed_integer: Some(value),
+            ..
+        }) => select_packed_lane(value),
+        GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily { elements, .. }) => {
+            match elements.get(index) {
+                Some(ResidentOwner::Integer(value)) if value.device_id() == physical_device => {
+                    Ok(Arc::clone(value))
+                }
+                Some(_) => Err(GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident lane family element is not an integer owner ({context}, element {index})"
+                ))),
+                None => Err(GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident integer lane is outside the indexed family ({context}, element {index}, count {})",
+                    elements.len(),
+                ))),
+            }
+        }
+        GpuResidentOwnerRef::Matrix(_) |
+        GpuResidentOwnerRef::SmallMatrix(_) |
+        GpuResidentOwnerRef::Trapdoor { .. } => Err(GpuResidentControlAdapterError::Unsupported(
+            format!("resident lane integer source is not an integer owner ({context})"),
+        )),
+        GpuResidentOwnerRef::Family(_) => Err(GpuResidentControlAdapterError::Unsupported(
+            format!("resident lane family is not an indexed integer family ({context})"),
+        )),
+    }
+}
+
+fn resident_lane_integer_index(
+    selection: crate::gpu_compiled::ResidentLaneSelection,
+    lane: usize,
+    wave_base: usize,
+    full_family_owner: bool,
+) -> Result<usize, GpuResidentControlAdapterError> {
+    match selection {
+        crate::gpu_compiled::ResidentLaneSelection::Broadcast => Ok(0),
+        crate::gpu_compiled::ResidentLaneSelection::Strided { lane_stride } => {
+            let lane_offset = lane.checked_mul(lane_stride).ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(
+                    "resident lane integer index overflows".into(),
+                )
+            })?;
+            if full_family_owner {
+                wave_base.checked_add(lane_offset).ok_or_else(|| {
+                    GpuResidentControlAdapterError::Unsupported(
+                        "resident lane integer index overflows".into(),
+                    )
+                })
+            } else {
+                Ok(lane_offset)
+            }
+        }
+    }
+}
+
 /// Resolve one matrix lane from the frozen physical owner schema.  A matrix
 /// value is a broadcast owner; an indexed family is the only representation
 /// that may provide distinct lane allocations.  Treating a widened matrix as
@@ -2304,6 +2482,72 @@ fn resident_lane_generic_request(
         resident_lane_matrix_arc(program, payload, owners, wire, lane, wave_base, physical_device)
     };
     let request = match &payload.prepared {
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::Constant {
+            ty,
+            value,
+            env,
+            single_device,
+        }) => Some(GpuCaptureRequest::Ordinary(vec![if *single_device {
+            FixedOperationBatchRequest::SingleDeviceConstant {
+                metadata,
+                ty: ty.clone(),
+                value: value.clone(),
+                env: env.clone(),
+            }
+        } else {
+            FixedOperationBatchRequest::GeneratedConstant {
+                metadata,
+                ty: ty.clone(),
+                value: value.clone(),
+                env: env.clone(),
+            }
+        }])),
+        ResidentNativePrepared::Ordinary(
+            ResidentNativeOrdinary::LiftIntegerToConstantPolynomial { ty, coefficient },
+        ) => Some(GpuCaptureRequest::Ordinary(vec![
+            FixedOperationBatchRequest::LiftIntegerToConstantPolynomial {
+                metadata,
+                ty: ty.clone(),
+                coefficient: resident_lane_integer_arc(
+                    program,
+                    payload,
+                    owners,
+                    *coefficient,
+                    lane,
+                    wave_base,
+                    physical_device,
+                )?,
+            },
+        ])),
+        ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::ExtractCoefficient {
+            value,
+            position,
+        }) => Some(GpuCaptureRequest::Ordinary(vec![
+            FixedOperationBatchRequest::ExtractCoefficient {
+                metadata,
+                value: matrix(*value)?,
+                position: *position,
+            },
+        ])),
+        ResidentNativePrepared::Generation(ResidentNativeGeneration::Uniform {
+            ty,
+            minimum,
+            maximum,
+        }) => Some(GpuCaptureRequest::Generation(vec![FixedGenerationRequest::Uniform {
+            metadata,
+            ty: ty.clone(),
+            range: SampleRange { minimum: minimum.clone(), maximum: maximum.clone() },
+        }])),
+        ResidentNativePrepared::Generation(ResidentNativeGeneration::Gaussian {
+            ty,
+            sigma_bits,
+            max_coefficient_bound,
+        }) => Some(GpuCaptureRequest::Generation(vec![FixedGenerationRequest::Gaussian {
+            metadata,
+            ty: ty.clone(),
+            sigma: f64::from_bits(*sigma_bits),
+            max_coefficient_bound: max_coefficient_bound.clone(),
+        }])),
         ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::MatrixMulSmallRhs {
             left,
             right,
@@ -2395,8 +2639,13 @@ fn resident_lane_binary_operation(
 fn resident_lane_native_dispatch(prepared: &ResidentNativePrepared) -> bool {
     matches!(
         prepared,
-        ResidentNativePrepared::Ordinary(
-            ResidentNativeOrdinary::MatrixBinary { .. } |
+        ResidentNativePrepared::Generation(
+            ResidentNativeGeneration::Uniform { .. } | ResidentNativeGeneration::Gaussian { .. }
+        ) | ResidentNativePrepared::Ordinary(
+            ResidentNativeOrdinary::Constant { .. } |
+                ResidentNativeOrdinary::LiftIntegerToConstantPolynomial { .. } |
+                ResidentNativeOrdinary::ExtractCoefficient { .. } |
+                ResidentNativeOrdinary::MatrixBinary { .. } |
                 ResidentNativeOrdinary::MatrixMulSmallRhs { .. } |
                 ResidentNativeOrdinary::MatrixMulAccumulate { .. } |
                 ResidentNativeOrdinary::Negate { .. } |
@@ -2556,6 +2805,30 @@ fn resident_lane_selection(
 /// distinct scope/job/selection keys look like duplicate `RegionBinding`s.
 /// Native capture must retain only this payload's scope and representative
 /// job, while preserving the key's shard and component identity for replay.
+fn resident_native_phase_binding(
+    native: &ResidentPhysicalBinding,
+    phase: &ResidentPhysicalBinding,
+    base: u32,
+) -> Result<RegionBinding, GpuResidentControlAdapterError> {
+    Ok(RegionBinding {
+        index: base.checked_add(phase.index).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident physical binding index overflows".into(),
+            )
+        })?,
+        source: BindingSource::ValueComponent {
+            slot: phase.key.slot,
+            shard: phase.key.shard,
+            component: phase.key.component,
+            address_addend: phase.key.address_addend,
+        },
+        // The phase binding may be merged to InOut because sibling leaves
+        // both consume and produce this slot. The fixed leaf ABI needs this
+        // instruction's original role so inputs and outputs remain distinct.
+        access: native.access,
+    })
+}
+
 fn resident_native_lane_region_bindings(
     bindings: &[ResidentPhysicalBinding],
     native_bindings: &[ResidentPhysicalBinding],
@@ -2607,20 +2880,7 @@ fn resident_native_lane_region_bindings(
                     )));
                 }
             };
-            Ok(RegionBinding {
-                index: base.checked_add(binding.index).ok_or_else(|| {
-                    GpuResidentControlAdapterError::Unsupported(
-                        "resident physical binding index overflows".into(),
-                    )
-                })?,
-                source: BindingSource::ValueComponent {
-                    slot: binding.key.slot,
-                    shard: binding.key.shard,
-                    component: binding.key.component,
-                    address_addend: binding.key.address_addend,
-                },
-                access: binding.access,
-            })
+            resident_native_phase_binding(native, binding, base)
         })
         .collect::<Result<Vec<_>, GpuResidentControlAdapterError>>()
         .map(Vec::into_boxed_slice)
@@ -2952,6 +3212,68 @@ fn resident_physical_binding_address(
     ))
 }
 
+fn resident_lane_input_physical_bindings<'a>(
+    leaf_bindings: &'a [RegionBinding],
+    phase_bindings: &'a [ResidentPhysicalBinding],
+    phase_binding_base: u32,
+) -> Result<Vec<(&'a RegionBinding, &'a ResidentPhysicalBinding)>, GpuResidentControlAdapterError> {
+    let mut projected = Vec::new();
+    for leaf in leaf_bindings {
+        if leaf.access != BindingAccess::Input {
+            continue;
+        }
+        let BindingSource::ValueComponent {
+            slot,
+            shard,
+            component: NativeValueComponent::MatrixData,
+            address_addend,
+        } = &leaf.source
+        else {
+            continue;
+        };
+        let physical_index = leaf.index.checked_sub(phase_binding_base).ok_or_else(|| {
+            GpuResidentControlAdapterError::Unsupported(
+                "resident lane input binding precedes the phase binding range".into(),
+            )
+        })?;
+        let physical = phase_bindings
+            .iter()
+            .find(|binding| {
+                binding.index == physical_index &&
+                    binding.key.slot == *slot &&
+                    binding.key.shard == *shard &&
+                    binding.key.component == NativeValueComponent::MatrixData &&
+                    binding.key.address_addend == *address_addend
+            })
+            .ok_or_else(|| {
+                GpuResidentControlAdapterError::Unsupported(format!(
+                    "resident lane input {:?} has no matching phase physical binding",
+                    leaf.source
+                ))
+            })?;
+        projected.push((leaf, physical));
+    }
+    Ok(projected)
+}
+
+fn resident_lane_source_addresses(
+    program: &GpuResidentCaptureProgram,
+    owners: &GpuResidentCaptureOwners<'_>,
+    leaf_bindings: &[RegionBinding],
+    phase_bindings: &[ResidentPhysicalBinding],
+    phase_binding_base: u32,
+    wave_base: usize,
+) -> Result<Vec<(u64, usize, u32)>, GpuResidentControlAdapterError> {
+    resident_lane_input_physical_bindings(leaf_bindings, phase_bindings, phase_binding_base)?
+        .into_iter()
+        .map(|(leaf, physical)| {
+            let (address, bytes) =
+                resident_physical_binding_address(program, owners, physical, wave_base)?;
+            Ok((address, bytes, leaf.index))
+        })
+        .collect()
+}
+
 fn resident_capture_owned_owner(
     owner: GpuResidentOwnerRef<'_>,
 ) -> Result<GpuCaptureOwnedOwner, GpuResidentControlAdapterError> {
@@ -3039,7 +3361,23 @@ fn resident_native_request(
     owners: &GpuResidentCaptureOwners<'_>,
 ) -> Result<GpuCaptureRequest, GpuResidentControlAdapterError> {
     let metadata = &payload.metadata;
-    let matrix = |wire| resident_matrix_arc(resident_wire_owner(program, payload, owners, wire)?);
+    let matrix = |wire| {
+        let slot = payload
+            .source_bindings
+            .iter()
+            .find(|binding| binding.wire == wire)
+            .map(|binding| binding.child.slot);
+        let owner = resident_wire_owner(program, payload, owners, wire)?;
+        resident_matrix_arc(owner).map_err(|error| {
+            GpuResidentControlAdapterError::Unsupported(format!(
+                "resident non-lane matrix request: node {:?}, kind {:?}, operation {:?}, wire {wire:?}, slot {slot:?}, dispatch_geometry={}, owner error: {error}",
+                payload.node,
+                payload.kind,
+                payload.operation,
+                payload.dispatch_geometry.is_some(),
+            ))
+        })
+    };
     let compact = |wire| resident_small_arc(resident_wire_owner(program, payload, owners, wire)?);
     let integer = |wire| resident_integer_arc(resident_wire_owner(program, payload, owners, wire)?);
     let ordinary = |request| {
@@ -3911,14 +4249,20 @@ impl GpuDcrtBackend {
                         "signed arithmetic requires a preallocated status owner".into(),
                     )
                 })?;
+                let output_zero = output_slot(0)?;
+                let output_one = matches!(operation, IntBinaryOp::Divide | IntBinaryOp::Remainder)
+                    .then(|| output_slot(1))
+                    .transpose()?;
+                let (primary_output, auxiliary_output) =
+                    resident_int_binary_capture_outputs(*operation, output_zero, output_one)?;
                 set_resident_integer_binding_map(
                     capture,
                     program,
-                    output_slot(0)?,
+                    primary_output,
                     Some(input_slot(0)?),
                     Some(input_slot(1)?),
                     status_slot,
-                    None,
+                    auxiliary_output,
                 )?;
                 match operation {
                     IntBinaryOp::Add => output(0)?.native().integer_operation(
@@ -5241,6 +5585,14 @@ impl GpuDcrtBackend {
                 let GpuResidentOwnerRef::Integer(source) = source else {
                     return Err(GpuResidentControlAdapterError::SlotOwnerCount);
                 };
+                if lane_count > source.count() {
+                    return Err(GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident integer export slice is out of bounds: region {region_id:?}, source slot {:?}, destination slot {:?}, wave_base {wave_base}, lane_count {lane_count}, source count {}",
+                        source_slot.slot,
+                        destination_slot.slot,
+                        source.count(),
+                    )));
+                }
                 let GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
                     packed_integer: Some(destination),
                     ..
@@ -5261,7 +5613,14 @@ impl GpuDcrtBackend {
                 // The source is one reusable wave, while the destination is
                 // the whole logical family. Export only the active lanes to
                 // this wave's range, including a shorter final wave.
-                let active_source = source.slice(0..lane_count)?;
+                let active_source = source.slice(0..lane_count).map_err(|error| {
+                    GpuResidentControlAdapterError::Unsupported(format!(
+                        "resident integer export slice failed: region {region_id:?}, source slot {:?}, destination slot {:?}, range 0..{lane_count}, source count {}: {error}",
+                        source_slot.slot,
+                        destination_slot.slot,
+                        source.count(),
+                    ))
+                })?;
                 destination.native().integer_operation(
                     GpuIntegerOperation::Pack,
                     active_source.native(),
@@ -5534,6 +5893,67 @@ impl GpuDcrtBackend {
         Ok(())
     }
 
+    fn materialize_resident_lane_constant_request(
+        &mut self,
+        request: GpuCaptureRequest,
+        physical_device: i32,
+    ) -> Result<
+        (Option<GpuCaptureRequest>, Option<Vec<GpuFleetMatrix>>),
+        GpuResidentControlAdapterError,
+    > {
+        let requests = match request {
+            GpuCaptureRequest::Ordinary(requests)
+                if !requests.is_empty() &&
+                    requests.iter().all(|request| {
+                        matches!(
+                            request,
+                            FixedOperationBatchRequest::SingleDeviceConstant { .. } |
+                                FixedOperationBatchRequest::GeneratedConstant { .. }
+                        )
+                    }) =>
+            {
+                requests
+            }
+            request => return Ok((Some(request), None)),
+        };
+        let request = GpuCaptureRequest::Ordinary(requests);
+        self.prepare_capture_request(&request)
+            .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string()))?;
+        let GpuCaptureRequest::Ordinary(requests) = request else {
+            unreachable!("resident constant request classification changed")
+        };
+        let outputs = <Self as Backend>::fixed_operation_batch(self, requests)
+            .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string()))?;
+        let mut captured = outputs
+            .into_iter()
+            .map(|output| match output {
+                FixedOperationBatchOutput::Matrix(value) => Ok(value),
+                FixedOperationBatchOutput::IntegerValues(_) => {
+                    Err(GpuResidentControlAdapterError::Unsupported(
+                        "materialized resident constant produced integer values".into(),
+                    ))
+                }
+                FixedOperationBatchOutput::IntegerValuesMany(_) => {
+                    Err(GpuResidentControlAdapterError::Unsupported(
+                        "materialized resident constant produced multi-port integer values".into(),
+                    ))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for source in &mut captured {
+            if source.shards.len() > 1 {
+                *source =
+                    self.materialize_capture_matrix_on_device(source, physical_device).map_err(
+                        |error| GpuResidentControlAdapterError::Unsupported(error.to_string()),
+                    )?;
+            }
+            source
+                .prepare_external_for_capture()
+                .map_err(|error| GpuResidentControlAdapterError::Unsupported(error.to_string()))?;
+        }
+        Ok((None, Some(captured)))
+    }
+
     fn prepare_resident_native_captures(
         &mut self,
         parameters: &GpuDCRTPolyParams,
@@ -5733,7 +6153,8 @@ impl GpuDcrtBackend {
                                 }
                             }
                             lane_requests.push(ResidentLaneCapturePreparation {
-                                request,
+                                request: Some(request),
+                                materialized_constants: None,
                                 output_storage,
                                 protocol,
                                 bindings: resident_native_lane_region_bindings(
@@ -5813,30 +6234,68 @@ impl GpuDcrtBackend {
                             "resident native operation has no lane capture request".into(),
                         )
                     })?;
-                    let output = resident_lane_matrix(
-                        &output_owner,
-                        output_layout,
-                        lane,
-                        wave_base,
-                        physical_device,
-                    )?;
-                    let mut lane_output = vec![GpuCaptureOwnedOwner::Matrix(
-                        GpuFleetMatrix::from_matrix(output.clone_shallow()),
-                    )];
+                    let (request, materialized_constants) =
+                        self.materialize_resident_lane_constant_request(request, physical_device)?;
+                    let mut lane_output = if matches!(
+                        &payload.prepared,
+                        ResidentNativePrepared::Ordinary(
+                            ResidentNativeOrdinary::ExtractCoefficient { .. }
+                        )
+                    ) {
+                        vec![GpuCaptureOwnedOwner::IntegerValues(
+                            resident_lane_integer_output_arc(
+                                owners,
+                                output_slot,
+                                output_layout,
+                                lane,
+                                wave_base,
+                                physical_device,
+                                payload,
+                            )?
+                            .as_ref()
+                            .clone(),
+                        )]
+                    } else {
+                        let output = resident_lane_matrix(
+                            &output_owner,
+                            output_layout,
+                            lane,
+                            wave_base,
+                            physical_device,
+                        )?;
+                        vec![GpuCaptureOwnedOwner::Matrix(GpuFleetMatrix::from_matrix(
+                            output.clone_shallow(),
+                        ))]
+                    };
                     for owner in &mut lane_output {
                         let mut destination = match owner {
                             GpuCaptureOwnedOwner::Matrix(value) => GpuCaptureOwner::Matrix(value),
-                            _ => unreachable!("generic lane output is a matrix"),
+                            GpuCaptureOwnedOwner::IntegerValues(value) => {
+                                GpuCaptureOwner::IntegerValues(value)
+                            }
+                            GpuCaptureOwnedOwner::SmallMatrix(_) |
+                            GpuCaptureOwnedOwner::TrapdoorPair { .. } => {
+                                unreachable!("generic lane output has an unsupported owner kind")
+                            }
                         };
                         prepare_capture_owner(&mut destination).map_err(|error| {
                             GpuResidentControlAdapterError::Unsupported(error.to_string())
                         })?;
                     }
-                    let protocol = self
-                        .allocate_capture_protocol_owners(&request, parameters, physical_device)
+                    let protocol = request
+                        .as_ref()
+                        .map(|request| {
+                            self.allocate_capture_protocol_owners(
+                                request,
+                                parameters,
+                                physical_device,
+                            )
+                        })
+                        .transpose()
                         .map_err(|error| {
                             GpuResidentControlAdapterError::Unsupported(error.to_string())
-                        })?;
+                        })?
+                        .flatten();
                     if let Some(protocol) = &protocol {
                         protocol.status.native().prepare_external_for_capture()?;
                         if let Some(scratch) = &protocol.scratch {
@@ -5848,6 +6307,7 @@ impl GpuDcrtBackend {
                     }
                     lane_requests.push(ResidentLaneCapturePreparation {
                         request,
+                        materialized_constants,
                         output_storage: lane_output,
                         protocol,
                         bindings: resident_native_lane_region_bindings(
@@ -6712,6 +7172,49 @@ impl GpuDcrtBackend {
                         },
                     };
                     for mut lane in lane_requests {
+                        if let Some(constants) = lane.materialized_constants.take() {
+                            if constants.len() != lane.output_storage.len() ||
+                                constants.len() != instruction.outputs.len()
+                            {
+                                return Err(GpuResidentControlAdapterError::Unsupported(
+                                    "resident lane constant output count disagrees with destinations"
+                                        .into(),
+                                ));
+                            }
+                            let stream = capture.launch_stream().clone();
+                            for ((source, owner), output) in constants
+                                .iter()
+                                .zip(lane.output_storage.iter_mut())
+                                .zip(instruction.outputs.iter())
+                            {
+                                let destination_slot =
+                                    GpuResidentCaptureProgram::output_slot(output);
+                                let mut destination = owner.destination(destination_slot);
+                                Self::copy_materialized_constant_into_capture_destination(
+                                    source,
+                                    &mut destination.owner,
+                                    destination.slot,
+                                    &stream,
+                                    capture,
+                                    &lane.bindings,
+                                )
+                                .map_err(|error| {
+                                    GpuResidentControlAdapterError::Unsupported(error.to_string())
+                                })?;
+                            }
+                            self.capture_resident_resources
+                                .push(GpuCompiledRegionResource::MatrixConstants(constants));
+                            if let Some(protocol) = lane.protocol {
+                                self.capture_resident_resources.push(
+                                    GpuCompiledRegionResource::ProtocolValues {
+                                        status: protocol.status,
+                                        scratch: protocol.scratch,
+                                        threshold: protocol.threshold,
+                                    },
+                                );
+                            }
+                            continue;
+                        }
                         let mut destination_owners = lane
                             .output_storage
                             .iter_mut()
@@ -6720,15 +7223,31 @@ impl GpuDcrtBackend {
                                 owner.destination(GpuResidentCaptureProgram::output_slot(output))
                             })
                             .collect::<Vec<_>>();
+                        let phase_bindings = resident_phase_schema(program, current_phase)?;
+                        let phase_binding_base = resident_binding_count(&program.bindings)?;
+                        let source_addresses = resident_lane_source_addresses(
+                            program,
+                            owners,
+                            &lane.bindings,
+                            phase_bindings,
+                            phase_binding_base,
+                            wave_base,
+                        )?;
                         let protocol_ref = lane.protocol.as_ref();
+                        let request = lane.request.take().ok_or_else(|| {
+                            GpuResidentControlAdapterError::Unsupported(
+                                "resident lane capture has neither a request nor a materialized constant"
+                                    .into(),
+                            )
+                        })?;
                         let submission = self
                             .submit_capture_step(
                                 &step,
-                                lane.request,
+                                request,
                                 &mut destination_owners,
                                 &lane.bindings,
                                 physical_device,
-                                &[],
+                                &source_addresses,
                                 capture,
                                 protocol_ref,
                             )
@@ -7388,20 +7907,25 @@ impl GpuDcrtBackend {
                 }
             };
             let BindingSource::ValueComponent { shard, component, .. } = binding.source;
-            let retain_packed_integer_family =
+            let retain_root_integer_owner =
                 matches!(component, NativeValueComponent::IntegerValues) &&
-                    matches!(
-                        &owner,
+                    match &owner {
+                        GpuResidentOwnerRef::Integer(_) => true,
                         GpuResidentOwnerRef::Family(ResidentOwner::IndexedFamily {
                             element_type,
                             packed_integer: Some(_),
                             ..
-                        }) if matches!(
+                        }) => matches!(
                             element_type.as_ref(),
                             ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. }
-                        )
-                    );
-            if phase_binding_slots.contains(&slot) && !retain_packed_integer_family {
+                        ),
+                        _ => false,
+                    };
+            // Scalar resident-control operations map their local pointers to
+            // root owner identities. Keep that full Integer owner registered
+            // even when this slot also has phase lane bindings; the explicit
+            // identity disambiguates those overlapping wave-relative views.
+            if phase_binding_slots.contains(&slot) && !retain_root_integer_owner {
                 continue;
             }
             let (native_address, owner_bytes) = resident_binding_address(owner, shard, component)
@@ -8094,6 +8618,7 @@ impl GpuDcrtBackend {
                     } |
                     FixedOperationBatchRequest::PolynomialFromValues { metadata, .. } |
                     FixedOperationBatchRequest::PolynomialValues { metadata, .. } |
+                    FixedOperationBatchRequest::HashIntFamily { metadata, .. } |
                     FixedOperationBatchRequest::ExtractCoefficient { metadata, .. } |
                     FixedOperationBatchRequest::ThresholdDecode { metadata, .. } |
                     FixedOperationBatchRequest::PackPolynomialCoefficients { metadata, .. } |
@@ -8301,6 +8826,7 @@ impl GpuDcrtBackend {
                         Some(FixedOperationBatchRequest::PolynomialValues { .. }) |
                         Some(FixedOperationBatchRequest::PolynomialFromValues { .. }) |
                         Some(FixedOperationBatchRequest::LiftIntegerToConstantPolynomial { .. }) |
+                        Some(FixedOperationBatchRequest::HashIntFamily { .. }) |
                         Some(FixedOperationBatchRequest::ExtractCoefficient { .. }) |
                         Some(FixedOperationBatchRequest::ThresholdDecode { .. }) |
                         Some(FixedOperationBatchRequest::PackPolynomialCoefficients { .. })
@@ -12149,6 +12675,81 @@ impl GpuDcrtBackend {
         if matches!(
             &request,
             GpuCaptureRequest::Ordinary(requests)
+                if matches!(
+                    requests.as_slice(),
+                    [FixedOperationBatchRequest::HashIntFamily { .. }]
+                )
+        ) {
+            let GpuCaptureRequest::Ordinary(requests) = &request else {
+                unreachable!("hash integer-family request classification changed");
+            };
+            let [FixedOperationBatchRequest::HashIntFamily { key, tag, count, modulus, .. }] =
+                requests.as_slice()
+            else {
+                unreachable!("hash integer-family request shape changed");
+            };
+            let destination = destination_owners
+                .iter_mut()
+                .find(|destination| matches!(&destination.owner, GpuCaptureOwner::IntegerValues(_)))
+                .ok_or(GpuCaptureAdapterError::EmptyDestinations)?;
+            let GpuCaptureOwner::IntegerValues(destination_values) = &mut destination.owner else {
+                unreachable!("integer-family destination classification changed");
+            };
+            let bits = (modulus - num_bigint::BigUint::from(1u8)).bits() as usize;
+            let expected_words = bits.div_ceil(64).max(1);
+            if destination_values.device_id() != physical_device ||
+                destination_values.count() != *count ||
+                destination_values.encoding() !=
+                    GpuSignedValuesEncoding::SignedWords(expected_words)
+            {
+                return Err(GpuCaptureAdapterError::UnsupportedOperation(
+                    "hash integer-family output owner does not match the frozen count or modulus width".into(),
+                ));
+            }
+            let output_binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.access == BindingAccess::Output &&
+                        matches!(
+                            binding.source,
+                            BindingSource::ValueComponent {
+                                component: NativeValueComponent::IntegerValues,
+                                ..
+                            }
+                        )
+                })
+                .ok_or(GpuCaptureAdapterError::EmptyDestinations)?
+                .index;
+            let key_binding = binding_schema
+                .iter()
+                .find(|binding| {
+                    binding.access == BindingAccess::Input &&
+                        matches!(
+                            binding.source,
+                            BindingSource::ValueComponent {
+                                component: NativeValueComponent::Bytes32,
+                                ..
+                            }
+                        )
+                })
+                .ok_or_else(|| {
+                    GpuCaptureAdapterError::UnsupportedOperation(
+                        "hash integer-family capture has no Bytes32 key binding".into(),
+                    )
+                })?
+                .index;
+            capture.set_binding_map(&[(0, output_binding), (1, key_binding)])?;
+            let tag_digest = mxx_primitives::sampler::hash::hash_integer_family_tag_digest(tag);
+            destination_values.native().sample_hash_integer_family(*key, tag_digest, bits)?;
+            return Ok(GpuCaptureSubmission {
+                bindings: binding_schema.to_vec().into_boxed_slice(),
+                resource: None,
+            });
+        }
+
+        if matches!(
+            &request,
+            GpuCaptureRequest::Ordinary(requests)
                 if requests.len() == 1 &&
                     matches!(requests.first(), Some(FixedOperationBatchRequest::PolynomialValues { .. }))
         ) {
@@ -13609,23 +14210,41 @@ impl GpuDcrtBackend {
         self.devices.iter().map(|(device, _)| *device).collect()
     }
 
+    /// Return a native CUDA context registered for one physical device.
+    /// Integer-only captured operations need a stream-owning context even
+    /// though their validated graph carries no DCRT matrix type.
+    pub(crate) fn registered_parameter_context_on_device(
+        &self,
+        device_id: i32,
+    ) -> Result<&GpuDCRTPolyParams, PolyBackendError> {
+        self.devices
+            .iter()
+            .find(|(device, _)| *device == device_id)
+            .and_then(|(_, backend)| {
+                backend.parameters.iter().flat_map(|parameters| parameters.values()).next()
+            })
+            .ok_or(PolyBackendError::UnsupportedPlacement)
+    }
+
+    /// Return one registered native context per physical device for planning
+    /// graphs whose values do not contain matrices. Integer-family kernels
+    /// still need an owning CUDA context for resident allocations, but their
+    /// graph contract has no matrix type from which to collect one.
+    pub(crate) fn registered_parameter_contexts(
+        &self,
+    ) -> Result<Vec<GpuDCRTPolyParams>, PolyBackendError> {
+        self.devices
+            .iter()
+            .map(|(device_id, _)| self.registered_parameter_context_on_device(*device_id).cloned())
+            .collect()
+    }
+
     pub(crate) fn integer_values_from_host_on_device(
         &mut self,
         device_id: i32,
         values: &[BigInt],
     ) -> Result<GpuFleetSignedValues, PolyBackendError> {
-        let device = self
-            .devices
-            .iter()
-            .find(|(device, _)| *device == device_id)
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
-        let parameters = device
-            .1
-            .parameters
-            .iter()
-            .flat_map(|parameters| parameters.values())
-            .next()
-            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        let parameters = self.registered_parameter_context_on_device(device_id)?;
         if let Some(small) = values.iter().map(ToPrimitive::to_i64).collect::<Option<Vec<_>>>() {
             GpuFleetSignedValues::from_i64(parameters, device_id, &small)
                 .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))
@@ -13634,6 +14253,38 @@ impl GpuDcrtBackend {
                 .map(|values| GpuFleetSignedValues::new(device_id, values))
                 .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))
         }
+    }
+
+    pub(crate) fn sample_hash_int_values_on_device(
+        &mut self,
+        device_id: i32,
+        count: usize,
+        modulus: &num_bigint::BigUint,
+        key: [u8; 32],
+        tag: &[u8],
+    ) -> Result<GpuFleetSignedValues, PolyBackendError> {
+        if modulus == &num_bigint::BigUint::from(0u8) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let maximum = modulus - num_bigint::BigUint::from(1u8);
+        if (modulus & &maximum) != num_bigint::BigUint::from(0u8) {
+            return Err(PolyBackendError::InvalidInteger);
+        }
+        let parameters = self.registered_parameter_context_on_device(device_id)?;
+        let bits = maximum.bits() as usize;
+        let values = GpuFleetSignedValues::allocate(
+            parameters,
+            device_id,
+            count,
+            GpuSignedValuesEncoding::SignedWords(bits.div_ceil(64).max(1)),
+        )
+        .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        let tag_digest = mxx_primitives::sampler::hash::hash_integer_family_tag_digest(tag);
+        values
+            .values
+            .sample_hash_integer_family(key, tag_digest, bits)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        Ok(values)
     }
 
     /// Upload boolean boundaries in the encoding required by Boolean slots.
@@ -16137,6 +16788,7 @@ impl GpuDcrtBackend {
             Domain::ConstantReal |
             Domain::ConstantBool |
             Domain::TrapdoorPublic |
+            Domain::HashIntFamily |
             Domain::IntBinary |
             Domain::IntCompare |
             Domain::BitExtract |
@@ -19676,6 +20328,142 @@ mod tests {
             Err(GpuResidentControlAdapterError::DuplicateBinding(0))
         ));
         assert!(matches!(resident_binding_count(&[binding(0), binding(2)]), Ok(3)));
+    }
+
+    #[test]
+    fn resident_native_leaf_keeps_leaf_access_when_phase_binding_is_inout() {
+        let key = crate::gpu_compiled::PhysicalBindingKey {
+            scope: mxx_ir_core::graph::FrozenGraphScopeId::Root,
+            slot: ValueSlot(12),
+            lane: 0,
+            device: 0,
+            shard: 0,
+            component: NativeValueComponent::MatrixData,
+            job: 0,
+            address_addend: 0,
+            selection: ResidentPhysicalBindingSelection::WaveRelativeLane(0),
+        };
+        let native =
+            ResidentPhysicalBinding { key: key.clone(), index: 2, access: BindingAccess::Output };
+        let phase = ResidentPhysicalBinding { key, index: 9, access: BindingAccess::InOut };
+
+        let projected = resident_native_phase_binding(&native, &phase, 4).unwrap();
+        assert_eq!(projected.index, 13);
+        assert_eq!(projected.access, BindingAccess::Output);
+        assert!(matches!(
+            projected.source,
+            BindingSource::ValueComponent {
+                slot: ValueSlot(12),
+                component: NativeValueComponent::MatrixData,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn resident_integer_lane_index_respects_owner_scope() {
+        let strided = crate::gpu_compiled::ResidentLaneSelection::Strided { lane_stride: 2 };
+        assert_eq!(resident_lane_integer_index(strided, 3, 32, false).unwrap(), 6);
+        assert_eq!(resident_lane_integer_index(strided, 3, 32, true).unwrap(), 38);
+        assert_eq!(
+            resident_lane_integer_index(
+                crate::gpu_compiled::ResidentLaneSelection::Broadcast,
+                3,
+                32,
+                true,
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn resident_extract_coefficient_uses_lane_capture_dispatch() {
+        let value = mxx_ir_core::types::WireRef {
+            node: mxx_ir_core::types::NodeId(1),
+            port: mxx_ir_core::types::Port(0),
+        };
+        let prepared =
+            ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::ExtractCoefficient {
+                value,
+                position: 0,
+            });
+        assert!(resident_lane_native_dispatch(&prepared));
+    }
+
+    #[test]
+    fn resident_division_maps_both_output_binding_identities() {
+        let output_zero = ValueSlot(10);
+        let output_one = ValueSlot(11);
+        assert_eq!(
+            resident_int_binary_capture_outputs(
+                IntBinaryOp::Divide,
+                output_zero,
+                Some(output_one),
+            )
+            .unwrap(),
+            (output_zero, Some(output_one))
+        );
+        assert_eq!(
+            resident_int_binary_capture_outputs(
+                IntBinaryOp::Remainder,
+                output_zero,
+                Some(output_one),
+            )
+            .unwrap(),
+            (output_one, Some(output_zero))
+        );
+        assert!(
+            resident_int_binary_capture_outputs(IntBinaryOp::Divide, output_zero, None).is_err()
+        );
+    }
+
+    #[test]
+    fn resident_lane_concat_sources_project_to_exact_phase_bindings() {
+        let scope = mxx_ir_core::graph::FrozenGraphScopeId::Root;
+        let make_physical = |index, selection| ResidentPhysicalBinding {
+            key: crate::gpu_compiled::PhysicalBindingKey {
+                scope: scope.clone(),
+                slot: ValueSlot(12),
+                lane: 1,
+                device: 0,
+                shard: 0,
+                component: NativeValueComponent::MatrixData,
+                job: 0,
+                address_addend: 0,
+                selection,
+            },
+            index,
+            access: BindingAccess::InOut,
+        };
+        let phase_bindings = [
+            make_physical(1, ResidentPhysicalBindingSelection::WaveRelativeLane(0)),
+            make_physical(4, ResidentPhysicalBindingSelection::WaveRelativeLane(1)),
+        ];
+        let leaf_binding = RegionBinding {
+            index: 14,
+            source: BindingSource::ValueComponent {
+                slot: ValueSlot(12),
+                shard: 0,
+                component: NativeValueComponent::MatrixData,
+                address_addend: 0,
+            },
+            access: BindingAccess::Input,
+        };
+
+        let projected = resident_lane_input_physical_bindings(
+            std::slice::from_ref(&leaf_binding),
+            &phase_bindings,
+            10,
+        )
+        .unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].0.index, 14);
+        assert_eq!(projected[0].1.index, 4);
+        assert_eq!(
+            projected[0].1.key.selection,
+            ResidentPhysicalBindingSelection::WaveRelativeLane(1)
+        );
     }
 
     #[test]
@@ -24399,6 +25187,21 @@ impl Backend for GpuDcrtBackend {
         self.integer_values_from_host_on_device(device_id, values)
     }
 
+    fn sample_hash_int_values(
+        &mut self,
+        count: usize,
+        modulus: &num_bigint::BigUint,
+        key: [u8; 32],
+        tag: &[u8],
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        let device_id = self
+            .devices
+            .first()
+            .map(|(device, _)| *device)
+            .ok_or(PolyBackendError::UnsupportedPlacement)?;
+        self.sample_hash_int_values_on_device(device_id, count, modulus, key, tag)
+    }
+
     fn polynomial_from_integer_values(
         &mut self,
         ty: &ConcreteMatrixType,
@@ -24496,6 +25299,43 @@ impl Backend for GpuDcrtBackend {
 
     fn integer_values_len(&self, values: &Self::IntegerValues) -> usize {
         values.count()
+    }
+
+    fn integer_values_get(
+        &self,
+        values: &Self::IntegerValues,
+        index: usize,
+    ) -> Result<Option<BigInt>, Self::Error> {
+        if index >= values.count() {
+            return Ok(None);
+        }
+        values
+            .wait_until_ready()
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        let scalar = values
+            .native()
+            .slice(index..index + 1)
+            .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?;
+        let value = match values.encoding() {
+            GpuSignedValuesEncoding::SignedWords(_) => scalar
+                .download_bigints()
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
+                .into_iter()
+                .next(),
+            GpuSignedValuesEncoding::SignedI64 => scalar
+                .download_i64()
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
+                .into_iter()
+                .next()
+                .map(BigInt::from),
+            GpuSignedValuesEncoding::CanonicalU64 => scalar
+                .download_u64()
+                .map_err(|error| PolyBackendError::GpuCalibration(error.to_string()))?
+                .into_iter()
+                .next()
+                .map(BigInt::from),
+        };
+        Ok(value)
     }
 
     fn select_gpu_operation(&mut self, operation: [u8; 32]) -> Result<(), Self::Error> {
@@ -25333,6 +26173,7 @@ impl Backend for GpuDcrtBackend {
                     } |
                     FixedOperationBatchRequest::PolynomialFromValues { metadata, .. } |
                     FixedOperationBatchRequest::PolynomialValues { metadata, .. } |
+                    FixedOperationBatchRequest::HashIntFamily { metadata, .. } |
                     FixedOperationBatchRequest::ExtractCoefficient { metadata, .. } |
                     FixedOperationBatchRequest::ThresholdDecode { metadata, .. } |
                     FixedOperationBatchRequest::PackPolynomialCoefficients { metadata, .. } |
@@ -25369,6 +26210,49 @@ impl Backend for GpuDcrtBackend {
             return Err(PolyBackendError::UnsupportedPlacement);
         }
         self.fixed_instance_slots = slots.clone();
+
+        if matches!(requests.first(), Some(FixedOperationBatchRequest::HashIntFamily { .. })) {
+            let count = match requests.first() {
+                Some(FixedOperationBatchRequest::HashIntFamily { count, .. }) => *count,
+                _ => unreachable!("hash integer-family batch classification changed"),
+            };
+            let schedules = match self.fixed_batch_schedules_checked(count, &slots) {
+                Ok(schedules) => schedules,
+                Err(error) => return Err(error),
+            };
+            let results = requests
+                .into_iter()
+                .zip(schedules)
+                .map(|(request, schedule)| {
+                    let FixedOperationBatchRequest::HashIntFamily {
+                        key, tag, count, modulus, ..
+                    } = request
+                    else {
+                        return Err(PolyBackendError::FixedOperationBatchVariantMismatch {
+                            expected: "hash integer family",
+                        });
+                    };
+                    let owner = schedule
+                        .intervals()
+                        .first()
+                        .map(|interval| interval.device)
+                        .or_else(|| (!self.devices.is_empty()).then_some(0))
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                    if schedule.intervals().iter().any(|interval| interval.device != owner) {
+                        return Err(PolyBackendError::UnsupportedPlacement);
+                    }
+                    let device_id = self
+                        .devices
+                        .get(owner)
+                        .map(|(device, _)| *device)
+                        .ok_or(PolyBackendError::UnsupportedPlacement)?;
+                    self.sample_hash_int_values_on_device(device_id, count, &modulus, key, &tag)
+                        .map(FixedOperationBatchOutput::IntegerValues)
+                })
+                .collect::<Result<Vec<_>, _>>();
+            self.clear_fixed_batch_state();
+            return results;
+        }
 
         if matches!(requests.first(), Some(FixedOperationBatchRequest::PolynomialValues { .. })) {
             let inputs = requests
@@ -25534,6 +26418,9 @@ impl Backend for GpuDcrtBackend {
                 }
                 FixedOperationBatchRequest::PolynomialValues { .. } => {
                     unreachable!("polynomial values are handled before matrix fixed dispatch")
+                }
+                FixedOperationBatchRequest::HashIntFamily { .. } => {
+                    unreachable!("hash integer families are handled before matrix fixed dispatch")
                 }
                 FixedOperationBatchRequest::ExtractCoefficient { .. } |
                 FixedOperationBatchRequest::ThresholdDecode { .. } |

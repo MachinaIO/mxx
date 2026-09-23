@@ -27,6 +27,10 @@ int gpu_control_integer_operation(
     GpuContext *ctx, void *out, const void *lhs, const void *rhs, void *aux, uint32_t *status,
     size_t count, size_t lhs_count, size_t rhs_count, int output_encoding, int lhs_encoding, int rhs_encoding,
     unsigned operation, uint64_t argument, void *stream_raw);
+int gpu_control_hash_integer_family(
+    GpuContext *ctx, void *destination, size_t count,
+    size_t modulus_bits, size_t words, const uint8_t key[32], const uint8_t tag_digest[32],
+    void *stream_raw);
 int gpu_control_wait_input(
     const MxxGpuDeviceBuffer *buffer, int device, void *stream, bool read_only);
 int gpu_control_record_compiled_write(MxxGpuDeviceBuffer *buffer, void *stream);

@@ -1,6 +1,6 @@
 //! GPU execution of the production FHE graphs; all artifacts stay in memory.
 use crate::{
-    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme, RingGswParams,
+    BgvCiphertext, BgvHybridParams, BgvParams, FheCommonParams, FheScheme,
     utils::{common, gpu::configure_widths},
 };
 use mxx_dsl::{DslContext, Ring};
@@ -158,78 +158,6 @@ fn test_gpu_compiled_matrix_product_rebinds_sources() {
         expected[0] = BigInt::from(coefficient * coefficient);
         assert_eq!(values(&mut result, "product", runtime.backend_mut(), &mut store), expected);
     }
-}
-
-#[test]
-fn test_gpu_fhe_ring_gsw_runtime() {
-    let common = common();
-    let n = common.ring.ring_dimension() as usize;
-    let scheme =
-        RingGswParams::new(common.clone(), BigUint::from(1u64 << 22), BigUint::from(2u8)).unwrap();
-    let context = DslContext::new("gpu-ring-gsw");
-    let message = context.int_family_input("message", n);
-    let multiplier = context.int_family_input("multiplier", n);
-    let (secret, key) = scheme.keygen().unwrap();
-    let ct = scheme.encrypt(&key, &common.ring().from_coefficients(&message)).unwrap();
-    let gsw = scheme.encrypt_gsw(&secret, &common.ring().from_coefficients(&multiplier)).unwrap();
-    let product = scheme.mul(&ct, &gsw, &()).unwrap();
-    let sum = scheme.add(&ct, &ct).unwrap();
-    let graph = context
-        .transferred_output("roundtrip", scheme.decrypt(&secret, &ct).unwrap().coefficients())
-        .unwrap()
-        .transferred_output("sum", scheme.decrypt(&secret, &sum).unwrap().coefficients())
-        .unwrap()
-        .transferred_output("product", scheme.decrypt(&secret, &product).unwrap().coefficients())
-        .unwrap()
-        .build()
-        .unwrap()
-        .validate(&ParamEnv::default())
-        .unwrap();
-    let message = (0..n).map(|i| i as i64 % 5 - 2).collect::<Vec<_>>();
-    let mut multiplier = vec![0; n];
-    multiplier[1] = 1;
-    let mut backend = backend(&common, None);
-    let mut store = MemoryArtifactStore::default();
-    configure_widths(&mut backend, &graph);
-    let mut runtime = GpuRuntime::new(backend).expect("construct FHE GPU runtime");
-    let mut result = prepare_and_run(
-        graph,
-        &mut runtime,
-        BTreeMap::from([
-            ("message".into(), input(&message)),
-            ("multiplier".into(), input(&multiplier)),
-        ]),
-        &mut store,
-    );
-    assert_eq!(
-        values(&mut result, "roundtrip", runtime.backend_mut(), &mut store),
-        message
-            .iter()
-            .map(|v| BigInt::from(*v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        values(&mut result, "sum", runtime.backend_mut(), &mut store),
-        message
-            .iter()
-            .map(|v| BigInt::from(2 * v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
-    // Multiplication by X shifts coefficients, with a negated wrapped term
-    // because this is R_q = Z_q[X]/(X^N + 1), not a cyclic polynomial ring.
-    let mut expected = message;
-    expected.rotate_right(1);
-    expected[0] = -expected[0];
-    assert_eq!(
-        values(&mut result, "product", runtime.backend_mut(), &mut store),
-        expected
-            .into_iter()
-            .map(|v| BigInt::from(v)
-                .mod_floor(&BigInt::from(common.ring.modulus().as_ref().clone())))
-            .collect::<Vec<_>>()
-    );
 }
 
 #[test]

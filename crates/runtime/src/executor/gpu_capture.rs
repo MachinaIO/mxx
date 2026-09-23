@@ -55,7 +55,7 @@ use mxx_ir_core::{
     types::InstantiationFrame,
 };
 use num_bigint::BigInt;
-use num_traits::{Signed, ToPrimitive};
+use num_traits::{Signed, ToPrimitive, Zero};
 use std::{collections::BTreeMap, sync::Arc};
 #[cfg(feature = "gpu")]
 use std::{collections::BTreeSet, num::NonZeroUsize};
@@ -872,6 +872,25 @@ fn resident_family_count(value: &ResidentTypedSlot) -> Option<usize> {
 }
 
 #[cfg(feature = "gpu")]
+fn resident_imported_broadcast_layout(
+    imports: &[ResidentTypedImportBinding],
+    regions: &[CompiledResidentControlRegion],
+    scope: &FrozenGraphScopeId,
+    slot: ValueSlot,
+) -> Option<ResidentPhysicalSlotLayout> {
+    imports
+        .iter()
+        .find(|import| {
+            matches!(&import.selection, ResidentImportSelection::Broadcast) &&
+                import.child.slot == slot &&
+                regions
+                    .get(import.region.0 as usize)
+                    .is_some_and(|region| &region.scope == scope)
+        })
+        .map(|import| import.child_physical.clone())
+}
+
+#[cfg(feature = "gpu")]
 fn resident_append_import_edge_bindings(
     import: &ResidentLoopImport,
     typed_imports: &[ResidentTypedImportBinding],
@@ -1102,6 +1121,17 @@ fn resident_integer_encoding(
             } else {
                 NativeIntegerEncoding::SignedWords(modulus.bits().div_ceil(64) as usize)
             })
+        }
+        NodeKind::HashIntFamily { modulus, .. } => {
+            let modulus = modulus
+                .evaluate(&validated.bindings)
+                .map_err(|error| lowering_invalid(node, error.to_string()))?
+                .to_biguint()
+                .ok_or_else(|| {
+                    lowering_invalid(node, "hash integer-family modulus must be positive")
+                })?;
+            let bits = (&modulus - num_bigint::BigUint::from(1u8)).bits();
+            Ok(signed_words(words_for_bits(bits)))
         }
         NodeKind::FamilyGetStatic { .. } | NodeKind::FamilyGetDynamic => {
             let arguments = graph
@@ -1581,6 +1611,7 @@ fn lower_resident_control_operation(
         NodeKind::UniformIntervalSample { .. } |
         NodeKind::GaussianSample { .. } |
         NodeKind::HashSample { .. } |
+        NodeKind::HashIntFamily { .. } |
         NodeKind::TrapdoorSample { .. } |
         NodeKind::PreimageSample { .. } |
         NodeKind::GadgetDecompose { .. } |
@@ -2636,6 +2667,7 @@ impl ResidentArenaBuilder {
                 NodeKind::UniformIntervalSample { .. } |
                 NodeKind::GaussianSample { .. } |
                 NodeKind::HashSample { .. } |
+                NodeKind::HashIntFamily { .. } |
                 NodeKind::TrapdoorSample { .. } |
                 NodeKind::PreimageSample { .. } |
                 NodeKind::GadgetDecompose { .. } |
@@ -3067,12 +3099,26 @@ impl ResidentArenaBuilder {
                         node: payload.node,
                         message: format!("native source wire {wire:?} has no typed slot"),
                     })?;
+                // A broadcast import gets a child-scoped physical layout
+                // when its typed import is built above. `slot_layouts`
+                // contains the canonical slot layout and can still describe
+                // that child as strided, which makes lane selection reject a
+                // valid shared parent owner in later waves.
+                let imported_broadcast_layout = resident_imported_broadcast_layout(
+                    &typed_imports,
+                    &self.regions,
+                    &payload.scope,
+                    child.slot,
+                );
                 source_bindings.push(ResidentNativeSourceBinding {
                     wire,
-                    physical: slot_layouts
-                        .values()
-                        .find(|layout| layout.identity.slot == child.slot)
-                        .cloned()
+                    physical: imported_broadcast_layout
+                        .or_else(|| {
+                            slot_layouts
+                                .values()
+                                .find(|layout| layout.identity.slot == child.slot)
+                                .cloned()
+                        })
                         .unwrap_or_else(|| {
                             ResidentPhysicalSlotLayout::for_slot(
                                 payload.scope.clone(),
@@ -3539,6 +3585,11 @@ fn prepare_resident_native_request(
                 evaluation: *evaluation,
             })
         }
+        NodeKind::HashIntFamily { .. } => {
+            return Err(invalid(
+                "HashIntFamily is unsupported inside resident loop/subgraph bodies; compile it as a top-level captured node so its Bytes32 key can be rebound".into(),
+            ));
+        }
         NodeKind::ExtractCoefficient { position, .. } => {
             ResidentNativePrepared::Ordinary(ResidentNativeOrdinary::ExtractCoefficient {
                 value: argument(0)?,
@@ -3910,7 +3961,12 @@ fn collect_resident_native_templates(
         // dispatch. Warmup deliberately omits their plan entries; requesting
         // one here would make template collection diverge from fixed capture
         // lowering and fail with a missing frozen site.
+        // Root HashIntFamily nodes are lowered as ordinary typed requests,
+        // where their Bytes seed is rebound per execution. Resident templates
+        // exist only for body execution and cannot carry that host binding.
         if matches!(handle.kind(), NodeKind::Input { .. }) ||
+            (matches!(scope_id, FrozenGraphScopeId::Root) &&
+                matches!(handle.kind(), NodeKind::HashIntFamily { .. })) ||
             lowering.is_fused_follower(node) ||
             is_row_sum_interior(lowering, node).unwrap_or(false)
         {
@@ -4341,6 +4397,71 @@ fn lower_hash_tag<B: Backend>(
         }
     }
     Ok((key, tag))
+}
+
+fn lower_hash_integer_family_tag<B: Backend>(
+    input: &GpuRequestLoweringInput<'_, '_, B>,
+    tag_prefix: &[u8],
+    components: &[mxx_ir_core::node::HashTagComponent],
+) -> Result<([u8; 32], Vec<u8>), GpuRequestLoweringError> {
+    let key = bytes_operand(
+        input.operands.values,
+        *input.arguments.first().ok_or_else(|| {
+            lowering_invalid(input.node, "hash integer family has no key operand")
+        })?,
+    )?;
+    let mut tag = tag_prefix.to_vec();
+    for component in components {
+        use mxx_ir_core::node::HashTagComponent;
+        match component {
+            HashTagComponent::Bytes(bytes) => {
+                tag.push(0);
+                tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                tag.extend_from_slice(bytes);
+            }
+            HashTagComponent::Integer(expression) => {
+                tag.push(1);
+                let value = expression
+                    .evaluate(input.env)
+                    .map_err(|error| lowering_invalid(input.node, error.to_string()))?;
+                append_hash_integer_tag(&mut tag, &value);
+            }
+            HashTagComponent::Decimal(expression) => {
+                let decimal = expression
+                    .evaluate(input.env)
+                    .map_err(|error| lowering_invalid(input.node, error.to_string()))?
+                    .to_string();
+                tag.push(2);
+                tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                tag.extend_from_slice(decimal.as_bytes());
+            }
+            HashTagComponent::U64Le(expression) => {
+                let value = expression
+                    .evaluate(input.env)
+                    .map_err(|error| lowering_invalid(input.node, error.to_string()))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        lowering_invalid(input.node, "little-endian hash tag must fit u64")
+                    })?;
+                tag.push(3);
+                tag.extend_from_slice(&value.to_le_bytes());
+            }
+            HashTagComponent::Operand(_) => {
+                return Err(lowering_invalid(
+                    input.node,
+                    "GPU hash integer-family capture requires a static tag; dynamic tag operands are unsupported",
+                ));
+            }
+        }
+    }
+    Ok((key, tag))
+}
+
+fn append_hash_integer_tag(tag: &mut Vec<u8>, value: &BigInt) {
+    let (sign, bytes) = value.to_bytes_be();
+    tag.push(u8::from(sign == num_bigint::Sign::Minus));
+    tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+    tag.extend_from_slice(&bytes);
 }
 
 /// Lower one node into a typed request.  This is deliberately the only place
@@ -4959,6 +5080,43 @@ pub(crate) fn lower_gpu_request<'scope, 'data, B: Backend>(
                     Err(lowering_invalid(input.node, "hash variant and gadget layout do not match"))
                 }
             }
+        }
+        NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
+            let (key, tag) = lower_hash_integer_family_tag(&input, tag_prefix, tag_components)?;
+            let count = count
+                .evaluate(input.env)
+                .map_err(|error| lowering_invalid(input.node, error.to_string()))?
+                .to_usize()
+                .ok_or_else(|| {
+                    lowering_invalid(input.node, "hash integer family count is invalid")
+                })?;
+            let modulus = modulus
+                .evaluate(input.env)
+                .map_err(|error| lowering_invalid(input.node, error.to_string()))?
+                .to_biguint()
+                .ok_or_else(|| {
+                    lowering_invalid(input.node, "hash integer family modulus must be positive")
+                })?;
+            if modulus.is_zero() {
+                return Err(lowering_invalid(
+                    input.node,
+                    "hash integer family modulus must be positive",
+                ));
+            }
+            let maximum = &modulus - num_bigint::BigUint::from(1u8);
+            if (&modulus & &maximum) != num_bigint::BigUint::from(0u8) {
+                return Err(lowering_invalid(
+                    input.node,
+                    "hash integer family modulus must be a power of two",
+                ));
+            }
+            Ok(GpuCaptureRequest::Ordinary(vec![FixedOperationBatchRequest::HashIntFamily {
+                metadata: input.metadata.clone(),
+                key,
+                tag,
+                count,
+                modulus,
+            }]))
         }
         NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
             Ok(GpuCaptureRequest::Trapdoor(FixedTrapdoorRequest {
@@ -5944,6 +6102,7 @@ impl CaptureProgram {
                     EffectiveGpuOperation::PackPolynomialCoefficients |
                     EffectiveGpuOperation::PolynomialFromValues |
                     EffectiveGpuOperation::PolynomialValues |
+                    EffectiveGpuOperation::HashIntFamily |
                     EffectiveGpuOperation::MatrixScale |
                     EffectiveGpuOperation::MatrixNegate |
                     EffectiveGpuOperation::RingAutomorphism |
@@ -6202,6 +6361,84 @@ mod tests {
             source.nodes().iter().find_map(|node| source.arguments(node)).unwrap_or_default();
         let _ = capture_release_wires(&graph, &scope, 2, &args);
         assert!(args.len() <= 2);
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn resident_native_source_resolves_child_broadcast_layout() {
+        let scope = FrozenGraphScopeId::ParallelBody {
+            parent: Box::new(FrozenGraphScopeId::Root),
+            owner: NodeId(41),
+        };
+        let child = ResidentTypedSlot::new(
+            ValueSlot(7),
+            ResidentSlotType::Integer {
+                wire_type: mxx_ir_core::types::ConcreteWireType::Int,
+                encoding: NativeIntegerEncoding::SignedWord,
+            },
+        );
+        let parent = ResidentTypedSlot::new(
+            ValueSlot(3),
+            ResidentSlotType::Integer {
+                wire_type: mxx_ir_core::types::ConcreteWireType::Int,
+                encoding: NativeIntegerEncoding::SignedWord,
+            },
+        );
+        let child_physical = ResidentPhysicalSlotLayout::broadcast(
+            scope.clone(),
+            &child,
+            NonZeroUsize::new(4).unwrap(),
+            3,
+            [2],
+            [NativeValueComponent::IntegerValues],
+        );
+        let parent_physical = ResidentPhysicalSlotLayout::broadcast(
+            scope.clone(),
+            &parent,
+            NonZeroUsize::new(4).unwrap(),
+            3,
+            [2],
+            [NativeValueComponent::IntegerValues],
+        );
+        let import = ResidentTypedImportBinding {
+            region: ResidentRegionId(0),
+            parent,
+            child: child.clone(),
+            selection: ResidentImportSelection::Broadcast,
+            parent_physical,
+            child_physical,
+            parent_components: vec![NativeValueComponent::IntegerValues].into_boxed_slice(),
+            child_components: vec![NativeValueComponent::IntegerValues].into_boxed_slice(),
+        };
+        let region = CompiledResidentControlRegion {
+            id: ResidentRegionId(0),
+            scope: scope.clone(),
+            physical_device: 0,
+            instance_count: 4,
+            wave_width: NonZeroUsize::new(4).unwrap(),
+            phases: Box::new([]),
+            tail: None,
+            inputs: Box::new([]),
+            outputs: Box::new([]),
+            imports: Box::new([]),
+            exports: Box::new([]),
+            wave: None,
+        };
+
+        let resolved = resident_imported_broadcast_layout(
+            std::slice::from_ref(&import),
+            std::slice::from_ref(&region),
+            &scope,
+            child.slot,
+        )
+        .expect("child broadcast layout");
+        assert_eq!(resolved.identity.slot, child.slot);
+        assert_eq!(resolved.active_lanes, 3);
+        assert_eq!(resolved.batch_axes.as_ref(), &[2]);
+        assert_eq!(
+            resolved.components[0].selection,
+            crate::gpu_compiled::ResidentLaneSelection::Broadcast
+        );
     }
 
     #[cfg(feature = "gpu")]

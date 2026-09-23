@@ -977,6 +977,57 @@ fn validate_node(
             }
             vec![ConcreteWireType::Matrix(matrix_type)]
         }
+        NodeKind::HashIntFamily { count, modulus, tag_components, .. } => {
+            if argument(scope, values, node, 0)? != &(ConcreteWireType::Bytes { length: 32 }) {
+                return node_error(scope, node.id, "hash sampling requires a 32-byte key");
+            }
+            for index in 1..node.args.len() {
+                require_scalar(scope, values, node, index, is_integer, "integer")?;
+            }
+            for component in tag_components {
+                use crate::node::HashTagComponent;
+                match component {
+                    HashTagComponent::Bytes(_) => {}
+                    HashTagComponent::Integer(expression) |
+                    HashTagComponent::Decimal(expression) => {
+                        expression.evaluate(env)?;
+                    }
+                    HashTagComponent::U64Le(expression) => {
+                        if expression.evaluate(env)?.to_u64().is_none() {
+                            return node_error(
+                                scope,
+                                node.id,
+                                "little-endian hash tag must fit in u64",
+                            );
+                        }
+                    }
+                    HashTagComponent::Operand(index) => {
+                        require_scalar(scope, values, node, *index, is_integer, "integer")?;
+                    }
+                }
+            }
+            let count = nonnegative_usize(
+                count.evaluate(env)?,
+                "hash integer family count",
+                scope,
+                node.id,
+            )?;
+            let modulus = modulus.evaluate(env)?;
+            if modulus <= BigInt::zero() {
+                return node_error(scope, node.id, "hash integer family modulus must be positive");
+            }
+            if !(&modulus & (&modulus - BigInt::from(1u8))).is_zero() {
+                return node_error(
+                    scope,
+                    node.id,
+                    "hash integer family modulus must be a power of two",
+                );
+            }
+            vec![ConcreteWireType::IndexedFamily {
+                element: Box::new(ConcreteWireType::Int),
+                count,
+            }]
+        }
         NodeKind::GaussianSample { matrix_type, sigma, max_coefficient_bound } => {
             require_arity(scope, node, 0)?;
             require_nonnegative_real(sigma.evaluate_f64(env)?, scope, node.id, "Gaussian sigma")?;

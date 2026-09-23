@@ -1769,6 +1769,16 @@ unsafe extern "C" {
         argument: u64,
         stream: *mut c_void,
     ) -> c_int;
+    fn gpu_control_hash_integer_family(
+        ctx: *mut GpuContextOpaque,
+        output: *mut c_void,
+        count: usize,
+        modulus_bits: usize,
+        words: usize,
+        key: *const u8,
+        tag_digest: *const u8,
+        stream: *mut c_void,
+    ) -> c_int;
     fn gpu_control_gather_i64(
         ctx: *mut GpuContextOpaque,
         destination: *mut c_void,
@@ -3231,6 +3241,50 @@ impl Debug for GpuSignedValues {
 }
 
 impl GpuSignedValues {
+    /// Fill this resident integer owner from the keyed, indexed Keccak
+    /// transcript used by `sampler::hash::sample_hash_integer_family`.
+    /// `tag_digest` is the shared 32-byte digest of the typed tag encoding.
+    pub fn sample_hash_integer_family(
+        &self,
+        key: [u8; 32],
+        tag_digest: [u8; 32],
+        modulus_bits: usize,
+    ) -> Result<(), GpuNativeGraphError> {
+        let GpuSignedValuesEncoding::SignedWords(words) = self.encoding else {
+            return Err(GpuNativeGraphError::Native(
+                "hash integer family requires signed multiword output encoding".into(),
+            ));
+        };
+        let words = words.max(1);
+        if modulus_bits > words.saturating_mul(64) ||
+            (modulus_bits != 0 && modulus_bits <= (words - 1).saturating_mul(64))
+        {
+            return Err(GpuNativeGraphError::Native(
+                "hash integer family output width does not match the modulus".into(),
+            ));
+        }
+        if self.count == 0 {
+            return Ok(());
+        }
+        let stream = self.launch_stream().control_launch_stream();
+        let status = unsafe {
+            gpu_control_hash_integer_family(
+                self.control_context(),
+                self.device_address().cast_mut(),
+                self.count,
+                modulus_bits,
+                words,
+                key.as_ptr(),
+                tag_digest.as_ptr(),
+                stream.raw_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(GpuNativeGraphError::Native(last_error_string()));
+        }
+        self.record_compiled_write(&stream)
+    }
+
     pub fn integer_operation(
         &self,
         operation: GpuIntegerOperation,
@@ -6608,6 +6662,31 @@ mod tests {
             vec![30, 0, 20, 0]
         );
         assert_eq!(status.download_i64().expect("invalid gather status download"), vec![3]);
+    }
+
+    #[test]
+    #[sequential]
+    fn test_gpu_hash_integer_family_matches_cpu_transcript() {
+        let Some(&device) = detected_gpu_device_ids().first() else {
+            return;
+        };
+        let gpu_params = gpu_params_from_cpu(&gpu_test_params());
+        let key = [0x91; 32];
+        let tag = b"tfhe/keygen/ksk-a/v1";
+        let modulus = BigUint::from(1u8) << 129;
+        let expected = crate::sampler::hash::sample_hash_integer_family(key, tag, 11, &modulus);
+        let output = GpuSignedValues::allocate(
+            &gpu_params,
+            device,
+            expected.len(),
+            GpuSignedValuesEncoding::SignedWords(3),
+        )
+        .expect("hash family output allocation");
+        let tag_digest = crate::sampler::hash::hash_integer_family_tag_digest(tag);
+
+        output.sample_hash_integer_family(key, tag_digest, 129).expect("GPU hash integer sampling");
+        output.wait_until_ready().expect("hash family output ready");
+        assert_eq!(output.download_bigints().expect("hash family download"), expected);
     }
 
     #[test]

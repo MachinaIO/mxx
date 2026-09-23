@@ -48,6 +48,7 @@ pub struct PrimitiveNames {
     pub trapdoor_sample: String,
     pub preimage_sample: String,
     pub uniform_residue_sample: String,
+    pub hash_int_family: String,
     pub uniform_interval_sample: String,
     pub gaussian_sample: String,
     pub hash_sample: String,
@@ -102,6 +103,7 @@ impl Default for PrimitiveNames {
             trapdoor_sample: "MxxRuntime.trapdoorSample".into(),
             preimage_sample: "MxxRuntime.preimageRunsDispatched".into(),
             uniform_residue_sample: "MxxRuntime.uniformResidueSample".into(),
+            hash_int_family: "MxxRuntime.hashIntFamily".into(),
             uniform_interval_sample: "MxxRuntime.uniformIntervalSample".into(),
             gaussian_sample: "MxxRuntime.gaussianSample".into(),
             hash_sample: "MxxRuntime.hashSample".into(),
@@ -1358,6 +1360,58 @@ impl<'a> Emitter<'a> {
                     relations,
                     &self.options.primitives.uniform_interval_sample,
                     &[lo, hi],
+                );
+            }
+            NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
+                append_expression_guards(count, env, relations);
+                append_expression_guards(modulus, env, relations);
+                let key = arg(0)?;
+                self.current_uses_hash_model = true;
+                let components = tag_components
+                    .iter()
+                    .map(|component| {
+                        use crate::node::HashTagComponent;
+                        match component {
+                            HashTagComponent::Bytes(bytes) => format!(
+                                ".bytes [{}]",
+                                bytes.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+                            ),
+                            HashTagComponent::Integer(expression) |
+                            HashTagComponent::Decimal(expression) |
+                            HashTagComponent::U64Le(expression) => {
+                                append_expression_guards(expression, env, relations);
+                                let constructor = match component {
+                                    HashTagComponent::Integer(_) => "integer",
+                                    HashTagComponent::Decimal(_) => "decimal",
+                                    _ => "u64Le",
+                                };
+                                format!(".{constructor} ({})", env.expr(expression))
+                            }
+                            HashTagComponent::Operand(index) => {
+                                format!(".integer {}", wire_name(args[*index]))
+                            }
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let prefix = format!(
+                    "[{}]",
+                    tag_prefix.iter().map(u8::to_string).collect::<Vec<_>>().join(", ")
+                );
+                self.sample_one(
+                    scope,
+                    node_id,
+                    existentials,
+                    relations,
+                    &self.options.primitives.hash_int_family,
+                    &[
+                        "hashModel".into(),
+                        prefix,
+                        format!("[{components}]"),
+                        key,
+                        env.expr(count),
+                        env.expr(modulus),
+                    ],
                 );
             }
             NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {

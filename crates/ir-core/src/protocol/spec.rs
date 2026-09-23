@@ -28,6 +28,7 @@ fn require_sampler_free(graph: &Graph) -> Result<(), SpecificationError> {
                 node.kind(),
                 NodeKind::UniformResidueSample { .. } |
                     NodeKind::UniformIntervalSample { .. } |
+                    NodeKind::HashIntFamily { .. } |
                     NodeKind::GaussianSample { .. } |
                     NodeKind::HashSample { .. } |
                     NodeKind::TrapdoorSample { .. } |

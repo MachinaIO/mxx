@@ -85,6 +85,14 @@ pub fn derive_param_constraints(graph: &Graph) -> Result<Vec<ParamConstraint>, V
                         label: format!("{prefix}: uniform range must be nonempty"),
                     })
                 }
+                NodeKind::HashIntFamily { count, modulus, .. } => {
+                    nonnegative(&mut constraints, count, format!("{prefix}: integer family count"));
+                    positive(
+                        &mut constraints,
+                        modulus,
+                        format!("{prefix}: integer family modulus"),
+                    );
+                }
                 NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                     nonnegative_real(&mut constraints, sigma, format!("{prefix}: Gaussian sigma"));
                     nonnegative(

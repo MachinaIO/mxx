@@ -6,8 +6,9 @@ use crate::{
     sampler::{DistType, PolyHashSampler},
 };
 use bitvec::prelude::*;
-use digest::OutputSizeUser;
-use num_bigint::BigUint;
+use digest::{Digest, OutputSizeUser};
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
 use rayon::prelude::*;
 use std::{marker::PhantomData, ops::Range};
 
@@ -48,6 +49,77 @@ where
         }
         attempt = attempt.wrapping_add(1);
     }
+}
+
+/// Samples a flat family from `Z/(2^k)`, where `modulus` is `2^k`.
+///
+/// The transcript is shared with the GPU integer-family sampler.  First
+/// derive a fixed-width tag digest, then derive one family seed from the key
+/// and tag digest.  Each value is expanded as
+/// `Keccak256(seed || index_le || block_le)`.
+/// Each global family index has an independent byte stream, so slicing or
+/// batching a family does not change any output. Since the modulus is a power
+/// of two, masking the high unused bits produces an exact uniform sample with
+/// no rejection loop.
+pub fn hash_integer_family_tag_digest(tag: &[u8]) -> [u8; 32] {
+    let mut hasher = keccak_asm::Keccak256::new();
+    hasher.update(b"mxx/hash-int-family/tag/v1");
+    hasher.update(tag);
+    hasher.finalize().into()
+}
+
+pub fn hash_integer_family_seed(key: [u8; 32], tag: &[u8]) -> [u8; 32] {
+    hash_integer_family_seed_from_digest(key, hash_integer_family_tag_digest(tag))
+}
+
+pub fn hash_integer_family_seed_from_digest(key: [u8; 32], tag_digest: [u8; 32]) -> [u8; 32] {
+    let mut hasher = keccak_asm::Keccak256::new();
+    hasher.update(b"mxx/hash-int-family/key/v1");
+    hasher.update(key);
+    hasher.update(tag_digest);
+    hasher.finalize().into()
+}
+
+pub fn sample_hash_integer_family(
+    key: [u8; 32],
+    tag: &[u8],
+    count: usize,
+    modulus: &BigUint,
+) -> Vec<BigInt> {
+    assert!(!modulus.is_zero(), "hash integer family modulus must be positive");
+    let maximum = modulus - BigUint::from(1u8);
+    assert!((modulus & &maximum).is_zero(), "hash integer family modulus must be a power of two");
+    let bits = maximum.bits() as usize;
+    if bits == 0 {
+        return vec![BigInt::from(0u8); count];
+    }
+
+    let bytes_per_value = bits.div_ceil(8);
+    let high_mask = if bits.is_multiple_of(8) { u8::MAX } else { ((1u16 << (bits % 8)) - 1) as u8 };
+    let seed = hash_integer_family_seed(key, tag);
+
+    (0..count)
+        .map(|index| {
+            let mut output = vec![0u8; bytes_per_value];
+            let mut filled = 0usize;
+            let mut block = 0u64;
+            while filled < bytes_per_value {
+                let mut hasher = keccak_asm::Keccak256::new();
+                hasher.update(seed);
+                hasher.update((index as u64).to_le_bytes());
+                hasher.update(block.to_le_bytes());
+                let digest = hasher.finalize();
+                let take = (bytes_per_value - filled).min(digest.len());
+                output[filled..filled + take].copy_from_slice(&digest[..take]);
+                filled += take;
+                block = block.checked_add(1).expect("hash integer stream block overflow");
+            }
+            if !bits.is_multiple_of(8) {
+                output[bytes_per_value - 1] &= high_mask;
+            }
+            BigInt::from(BigUint::from_bytes_le(&output))
+        })
+        .collect()
 }
 
 pub struct DCRTPolyHashSampler<H: OutputSizeUser + digest::Digest> {
@@ -202,6 +274,31 @@ mod tests {
     use super::*;
     use crate::poly::dcrt::params::DCRTPolyParams;
     use keccak_asm::Keccak256;
+
+    #[test]
+    fn hash_integer_family_is_indexed_deterministic_and_multiword() {
+        let key = [0x5au8; 32];
+        let modulus = BigUint::from(1u8) << 129;
+        let first = sample_hash_integer_family(key, b"tfhe/keygen/ksk-a/v1", 12, &modulus);
+        let replay = sample_hash_integer_family(key, b"tfhe/keygen/ksk-a/v1", 12, &modulus);
+        let other_domain = sample_hash_integer_family(key, b"tfhe/lwe-encrypt/a/v1", 12, &modulus);
+
+        assert_eq!(first, replay);
+        assert_ne!(first, other_domain);
+        assert_ne!(first[0], first[1]);
+        assert!(first.iter().all(|value| {
+            value.sign() != num_bigint::Sign::Minus &&
+                value.to_biguint().is_some_and(|value| value < modulus)
+        }));
+    }
+
+    #[test]
+    fn hash_integer_family_modulus_one_is_zero() {
+        assert_eq!(
+            sample_hash_integer_family([7u8; 32], b"zero", 4, &BigUint::from(1u8)),
+            vec![BigInt::from(0u8); 4],
+        );
+    }
 
     #[test]
     fn test_poly_hash_sampler() {

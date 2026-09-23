@@ -16,7 +16,7 @@ use mxx_ir_core::{
     types::{ConcreteMatrixType, ConcreteWireType, InstantiationFrame, NodeId, WireRef},
 };
 use mxx_primitives::matrix::{PolyMatrix, PolyMatrixColumnSource};
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -466,6 +466,16 @@ pub enum FixedOperationBatchRequest<M, S, I> {
         metadata: PlannedNodeBatchRequest,
         value: Arc<M>,
         evaluation: bool,
+    },
+    /// Hash a flat integer family directly into a backend-owned value buffer.
+    /// The key is a runtime Bytes32 binding; `tag` is the canonical typed-tag
+    /// serialization shared by the CPU and GPU samplers.
+    HashIntFamily {
+        metadata: PlannedNodeBatchRequest,
+        key: [u8; 32],
+        tag: Vec<u8>,
+        count: usize,
+        modulus: BigUint,
     },
     /// Extract one canonical coefficient into a backend-owned scalar integer
     /// owner. GPU implementations keep this owner resident; CPU
@@ -2804,6 +2814,15 @@ pub trait Backend {
                     self.polynomial_values_resident(&value, evaluation)
                         .map(FixedOperationBatchOutput::IntegerValues)
                 }
+                FixedOperationBatchRequest::HashIntFamily {
+                    key,
+                    tag,
+                    count,
+                    modulus,
+                    metadata: _,
+                } => self
+                    .sample_hash_int_values(count, &modulus, key, &tag)
+                    .map(FixedOperationBatchOutput::IntegerValues),
                 FixedOperationBatchRequest::PolynomialFromValues {
                     ty,
                     values,
@@ -2974,6 +2993,7 @@ pub trait Backend {
                     ),
                     FixedOperationBatchRequest::PolynomialFromValues { .. } |
                     FixedOperationBatchRequest::PolynomialValues { .. } |
+                    FixedOperationBatchRequest::HashIntFamily { .. } |
                     FixedOperationBatchRequest::ExtractCoefficient { .. } |
                     FixedOperationBatchRequest::ThresholdDecode { .. } |
                     FixedOperationBatchRequest::PackPolynomialCoefficients { .. } => unreachable!(),
@@ -3081,6 +3101,22 @@ pub trait Backend {
         values: &[BigInt],
     ) -> Result<Self::IntegerValues, Self::Error>;
 
+    /// Hash-samples an indexed integer family uniformly from `[0, modulus)`.
+    /// `modulus` must be a positive power of two. The transcript binds each
+    /// output to its global family index so chunks and backend placements agree.
+    /// GPU backends override this to keep the output resident on the device.
+    fn sample_hash_int_values(
+        &mut self,
+        count: usize,
+        modulus: &num_bigint::BigUint,
+        key: [u8; 32],
+        tag: &[u8],
+    ) -> Result<Self::IntegerValues, Self::Error> {
+        let values =
+            mxx_primitives::sampler::hash::sample_hash_integer_family(key, tag, count, modulus);
+        self.integer_values_from_host(&values)
+    }
+
     /// Imports one polynomial from a backend-resident integer-value owner.
     fn polynomial_from_integer_values(
         &mut self,
@@ -3103,6 +3139,15 @@ pub trait Backend {
     ) -> Result<Vec<BigInt>, Self::Error>;
 
     fn integer_values_len(&self, values: &Self::IntegerValues) -> usize;
+
+    /// Read one indexed integer from a resident integer family. Backends with
+    /// packed or device-resident storage should implement this without
+    /// exporting the whole family to host memory.
+    fn integer_values_get(
+        &self,
+        values: &Self::IntegerValues,
+        index: usize,
+    ) -> Result<Option<BigInt>, Self::Error>;
 
     /// Selects the setup-time GPU calibration for the next primitive. CPU and
     /// non-fleet backends ignore this hook.

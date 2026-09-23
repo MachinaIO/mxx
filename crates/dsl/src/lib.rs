@@ -1701,6 +1701,45 @@ impl DslContext {
         }
     }
 
+    /// Hash-samples `count` integers uniformly from `[0, modulus)` for a positive
+    /// power-of-two modulus.
+    ///
+    /// Each family index has its own stream derived from the 32-byte key, the
+    /// length-framed typed tag, and the global element index. A zero count produces an empty
+    /// family; the modulus must be positive.
+    #[track_caller]
+    pub fn hash_int_family(
+        &self,
+        key: Bytes,
+        tag: impl Into<HashTag>,
+        count: impl Into<IntExpr>,
+        modulus: impl Into<IntExpr>,
+    ) -> Family<Int> {
+        let count = count.into();
+        let modulus = modulus.into();
+        let tag = tag.into();
+        let mut arguments = vec![key.value];
+        arguments.extend(tag.dynamic);
+        let node = NodeHandle::new(
+            NodeKind::HashIntFamily {
+                count: count.clone(),
+                modulus,
+                tag_prefix: tag.prefix,
+                tag_components: tag.components,
+            },
+            arguments,
+            vec![WireType::IndexedFamily {
+                element: Box::new(WireType::Int),
+                count: count.clone(),
+            }],
+        );
+        Family {
+            values: vec![node.output(0).expect("hash integer family")],
+            element_schema: IntType,
+            count,
+        }
+    }
+
     pub fn output<V: GraphValue>(
         mut self,
         name: impl Into<String>,

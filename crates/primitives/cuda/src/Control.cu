@@ -1267,7 +1267,186 @@ __global__ void integer_operation_kernel(
         integer_normalize(result, words);
     }
 }
+
+struct HashIntegerBytes32
+{
+    uint8_t bytes[32];
+};
+
+__device__ __forceinline__ uint64_t hash_integer_rotl64(uint64_t value, int count)
+{
+    return count == 0 ? value : (value << count) | (value >> (64 - count));
 }
+
+__device__ __forceinline__ void hash_integer_keccak_f(uint64_t state[25])
+{
+    constexpr uint64_t round_constants[24] = {
+        0x0000000000000001ULL, 0x0000000000008082ULL,
+        0x800000000000808aULL, 0x8000000080008000ULL,
+        0x000000000000808bULL, 0x0000000080000001ULL,
+        0x8000000080008081ULL, 0x8000000000008009ULL,
+        0x000000000000008aULL, 0x0000000000000088ULL,
+        0x0000000080008009ULL, 0x000000008000000aULL,
+        0x000000008000808bULL, 0x800000000000008bULL,
+        0x8000000000008089ULL, 0x8000000000008003ULL,
+        0x8000000000008002ULL, 0x8000000000000080ULL,
+        0x000000000000800aULL, 0x800000008000000aULL,
+        0x8000000080008081ULL, 0x8000000000008080ULL,
+        0x0000000080000001ULL, 0x8000000080008008ULL,
+    };
+    constexpr int rotation[25] = {
+        0, 1, 62, 28, 27,
+        36, 44, 6, 55, 20,
+        3, 10, 43, 25, 39,
+        41, 45, 15, 21, 8,
+        18, 2, 61, 56, 14,
+    };
+    for (int round = 0; round < 24; ++round)
+    {
+        uint64_t column_parity[5];
+        for (int x = 0; x < 5; ++x)
+            column_parity[x] = state[x] ^ state[x + 5] ^ state[x + 10] ^
+                               state[x + 15] ^ state[x + 20];
+        uint64_t theta[5];
+        for (int x = 0; x < 5; ++x)
+            theta[x] = column_parity[(x + 4) % 5] ^
+                       hash_integer_rotl64(column_parity[(x + 1) % 5], 1);
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y) state[x + 5 * y] ^= theta[x];
+        uint64_t rho_pi[25];
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y)
+            {
+                const int destination_x = y;
+                const int destination_y = (2 * x + 3 * y) % 5;
+                rho_pi[destination_x + 5 * destination_y] =
+                    hash_integer_rotl64(state[x + 5 * y], rotation[x + 5 * y]);
+            }
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y)
+                state[x + 5 * y] = rho_pi[x + 5 * y] ^
+                    ((~rho_pi[(x + 1) % 5 + 5 * y]) & rho_pi[(x + 2) % 5 + 5 * y]);
+        state[0] ^= round_constants[round];
+    }
+}
+
+__device__ __forceinline__ void hash_integer_keccak256(
+    const uint8_t *message, size_t length, uint64_t digest[4])
+{
+    uint8_t block[136] = {};
+    for (size_t index = 0; index < length; ++index) block[index] = message[index];
+    block[length] ^= 0x01U;
+    block[135] ^= 0x80U;
+    uint64_t state[25] = {};
+    for (size_t lane = 0; lane < 17; ++lane)
+    {
+        uint64_t word = 0;
+        for (int byte = 0; byte < 8; ++byte)
+            word |= static_cast<uint64_t>(block[lane * 8 + byte]) << (8 * byte);
+        state[lane] = word;
+    }
+    hash_integer_keccak_f(state);
+    for (int word = 0; word < 4; ++word) digest[word] = state[word];
+}
+
+__global__ void hash_integer_family_kernel(
+    uint64_t *output,
+    size_t count,
+    size_t modulus_bits,
+    size_t words,
+    HashIntegerBytes32 key,
+    HashIntegerBytes32 tag_digest)
+{
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count;
+         index += static_cast<size_t>(gridDim.x) * blockDim.x) {
+        const size_t value_base = index * (words + 1);
+        output[value_base] = 0;
+        for (size_t word = 0; word < words; ++word) output[value_base + word + 1] = 0;
+        if (modulus_bits == 0) continue;
+
+        constexpr char key_prefix[] = "mxx/hash-int-family/key/v1";
+        uint8_t seed_message[sizeof(key_prefix) - 1 + 64];
+        size_t offset = 0;
+        for (size_t byte = 0; byte < sizeof(key_prefix) - 1; ++byte)
+            seed_message[offset++] = static_cast<uint8_t>(key_prefix[byte]);
+        for (int byte = 0; byte < 32; ++byte) seed_message[offset++] = key.bytes[byte];
+        for (int byte = 0; byte < 32; ++byte) seed_message[offset++] = tag_digest.bytes[byte];
+        uint64_t seed[4];
+        hash_integer_keccak256(seed_message, offset, seed);
+
+        for (size_t word = 0; word < words; ++word)
+        {
+            if (word % 4 == 0)
+            {
+                uint8_t draw_message[48];
+                for (int seed_word = 0; seed_word < 4; ++seed_word)
+                    for (int byte = 0; byte < 8; ++byte)
+                        draw_message[seed_word * 8 + byte] =
+                            static_cast<uint8_t>(seed[seed_word] >> (8 * byte));
+                for (int byte = 0; byte < 8; ++byte)
+                    draw_message[32 + byte] = static_cast<uint8_t>(index >> (8 * byte));
+                const size_t block = word / 4;
+                for (int byte = 0; byte < 8; ++byte)
+                    draw_message[40 + byte] = static_cast<uint8_t>(block >> (8 * byte));
+                uint64_t draw[4];
+                hash_integer_keccak256(draw_message, sizeof(draw_message), draw);
+                for (int limb = 0; limb < 4 && word + limb < words; ++limb)
+                {
+                    const size_t output_word = word + limb;
+                    uint64_t value = draw[limb];
+                    if (output_word + 1 == words && modulus_bits % 64 != 0)
+                        value &= (uint64_t(1) << (modulus_bits % 64)) - 1;
+                    output[value_base + output_word + 1] = value;
+                }
+            }
+        }
+    }
+}
+}
+
+extern "C" int gpu_control_hash_integer_family(
+    GpuContext *ctx,
+    void *out,
+    size_t count,
+    size_t modulus_bits,
+    size_t words,
+    const uint8_t key_bytes[32],
+    const uint8_t tag_digest_bytes[32],
+    void *stream_raw)
+{
+    if (!ctx || !out || !key_bytes || !tag_digest_bytes || !stream_raw || words == 0 ||
+        words > (SIZE_MAX / 8 - 1) || count > SIZE_MAX / (words + 1) / 8 ||
+        modulus_bits > words * 64 || (modulus_bits != 0 && modulus_bits <= (words - 1) * 64))
+        return gpu_set_last_error_cuda(cudaErrorInvalidValue);
+    if (count == 0) return 0;
+
+    HashIntegerBytes32 key{};
+    HashIntegerBytes32 tag_digest{};
+    for (int byte = 0; byte < 32; ++byte)
+    {
+        key.bytes[byte] = key_bytes[byte];
+        tag_digest.bytes[byte] = tag_digest_bytes[byte];
+    }
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_raw);
+    hash_integer_family_kernel<<<control_blocks(count), CONTROL_THREADS, 0, stream>>>(
+        static_cast<uint64_t *>(out), count, modulus_bits, words, key, tag_digest);
+    const cudaError_t launch = cudaGetLastError();
+    if (launch != cudaSuccess) return gpu_set_last_error_cuda(launch);
+
+    const size_t argument_sizes[] = {
+        sizeof(void *), sizeof(size_t), sizeof(size_t), sizeof(size_t),
+        sizeof(HashIntegerBytes32), sizeof(HashIntegerBytes32)};
+    MxxGraphPatch patches[2]{};
+    patches[0] = control_kernel_patch(0, 0);
+    patches[1].target = MXX_GRAPH_PATCH_KERNEL_ARGUMENT_FIELD;
+    patches[1].argument_index = 4;
+    patches[1].byte_offset = 0;
+    patches[1].byte_count = sizeof(HashIntegerBytes32);
+    patches[1].binding_index = 1;
+    return mxx_graph_register_kernel_update_for_stream(ctx, stream_raw, argument_sizes, 6, patches, 2);
+}
+
 extern "C" int gpu_control_integer_operation(
     GpuContext *ctx, void *out, const void *lhs, const void *rhs, void *aux, uint32_t *status,
     size_t count, size_t lhs_count, size_t rhs_count, int output_encoding, int lhs_encoding, int rhs_encoding,

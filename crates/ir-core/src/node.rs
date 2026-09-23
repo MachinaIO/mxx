@@ -14,7 +14,7 @@ pub enum HashTagComponent {
     Integer(IntExpr),
     Decimal(IntExpr),
     U64Le(IntExpr),
-    /// Index into HashSample arguments, including the key at index zero.
+    /// Index into hash sampler arguments, including the key at index zero.
     Operand(usize),
 }
 
@@ -129,6 +129,13 @@ pub enum NodeKind {
     UniformIntervalSample {
         matrix_type: crate::types::MatrixType,
         range: SampleRange,
+    },
+    /// Samples a family of integers from a keyed hash stream, uniformly on `[0, modulus)`.
+    HashIntFamily {
+        count: IntExpr,
+        modulus: IntExpr,
+        tag_prefix: Vec<u8>,
+        tag_components: Vec<HashTagComponent>,
     },
     GaussianSample {
         matrix_type: crate::types::MatrixType,

@@ -730,6 +730,14 @@ where
         values.len()
     }
 
+    fn integer_values_get(
+        &self,
+        values: &Self::IntegerValues,
+        index: usize,
+    ) -> Result<Option<BigInt>, Self::Error> {
+        Ok(values.get(index).cloned())
+    }
+
     fn placement_count(&self) -> usize {
         self.parameters.len()
     }

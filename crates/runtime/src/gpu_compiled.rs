@@ -1220,6 +1220,9 @@ pub(crate) enum NativeValueComponent {
     TrapdoorCovarianceD,
     TrapdoorPublic,
     IntegerValues,
+    /// A fixed-size Bytes32 value passed by value to a captured native kernel.
+    /// It is a graph scalar binding, not a device pointer.
+    Bytes32,
 }
 
 /// Source of a fixed native graph binding.  Values are frame slots and

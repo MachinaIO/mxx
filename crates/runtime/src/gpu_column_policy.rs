@@ -42,6 +42,7 @@ pub enum EffectiveGpuOperation {
     UniformIntervalSample,
     GaussianSample,
     HashSample,
+    HashIntFamily,
     TrapdoorSample,
     GadgetTrapdoor,
     LiftIntegerToConstantPolynomial,
@@ -92,6 +93,7 @@ impl EffectiveGpuOperation {
         Self::UniformIntervalSample,
         Self::GaussianSample,
         Self::HashSample,
+        Self::HashIntFamily,
         Self::TrapdoorSample,
         Self::GadgetTrapdoor,
         Self::LiftIntegerToConstantPolynomial,
@@ -144,6 +146,7 @@ impl EffectiveGpuOperation {
             Self::UniformIntervalSample |
             Self::GaussianSample |
             Self::HashSample |
+            Self::HashIntFamily |
             Self::TrapdoorSample |
             Self::GadgetTrapdoor |
             Self::LiftIntegerToConstantPolynomial |
@@ -238,6 +241,7 @@ pub enum CanonicalWarmupProfileDomain {
     UniformIntervalSample,
     GaussianSample,
     HashSample,
+    HashIntFamily,
     TrapdoorSample,
     PreimageSample,
     GadgetDecompose,
@@ -375,6 +379,7 @@ impl CanonicalWarmupProfileDomain {
         Self::UniformIntervalSample,
         Self::GaussianSample,
         Self::HashSample,
+        Self::HashIntFamily,
         Self::TrapdoorSample,
         Self::PreimageSample,
         Self::GadgetDecompose,
@@ -466,6 +471,7 @@ impl CanonicalWarmupProfileDomain {
             Self::UniformIntervalSample => "uniform_interval_sample",
             Self::GaussianSample => "gaussian_sample",
             Self::HashSample => "hash_sample",
+            Self::HashIntFamily => "hash_int_family",
             Self::TrapdoorSample => "trapdoor_sample",
             Self::PreimageSample => "preimage_sample",
             Self::GadgetDecompose => "gadget_decompose",
@@ -543,6 +549,7 @@ impl CanonicalWarmupProfileDomain {
             Self::UniformIntervalSample |
             Self::GaussianSample |
             Self::HashSample |
+            Self::HashIntFamily |
             Self::TrapdoorSample |
             Self::PreimageSample |
             Self::GadgetDecompose |
@@ -616,6 +623,7 @@ impl CanonicalWarmupProfileDomain {
             Self::UniformIntervalSample |
             Self::GaussianSample |
             Self::HashSample |
+            Self::HashIntFamily |
             Self::TrapdoorSample |
             Self::PreimageSample |
             Self::GadgetDecompose |
@@ -729,6 +737,7 @@ pub fn canonical_warmup_profile_domain(kind: &NodeKind) -> CanonicalWarmupProfil
         }
         NodeKind::GaussianSample { .. } => CanonicalWarmupProfileDomain::GaussianSample,
         NodeKind::HashSample { .. } => CanonicalWarmupProfileDomain::HashSample,
+        NodeKind::HashIntFamily { .. } => CanonicalWarmupProfileDomain::HashIntFamily,
         NodeKind::TrapdoorSample { .. } => CanonicalWarmupProfileDomain::TrapdoorSample,
         NodeKind::PreimageSample { .. } => CanonicalWarmupProfileDomain::PreimageSample,
         NodeKind::GadgetDecompose { .. } => CanonicalWarmupProfileDomain::GadgetDecompose,
@@ -1351,6 +1360,7 @@ pub fn gpu_execution_range(
         NodeKind::UniformIntervalSample { .. } |
         NodeKind::GaussianSample { .. } |
         NodeKind::HashSample { .. } |
+        NodeKind::HashIntFamily { .. } |
         NodeKind::TrapdoorSample { .. } |
         NodeKind::GadgetDecompose { .. } |
         NodeKind::ExtractCoefficient { .. } |
@@ -1582,6 +1592,9 @@ pub fn gpu_node_disposition(kind: &NodeKind) -> GpuNodeDisposition {
         NodeKind::HashSample { .. } => {
             GpuNodeDisposition::Native(EffectiveGpuOperation::HashSample)
         }
+        NodeKind::HashIntFamily { .. } => {
+            GpuNodeDisposition::Native(EffectiveGpuOperation::HashIntFamily)
+        }
         NodeKind::TrapdoorSample { .. } => {
             GpuNodeDisposition::Native(EffectiveGpuOperation::TrapdoorSample)
         }
@@ -1780,6 +1793,7 @@ pub fn capability_for_effective_operation(
         EffectiveGpuOperation::UniformIntervalSample |
         EffectiveGpuOperation::GaussianSample |
         EffectiveGpuOperation::HashSample => ColumnCapability::GeneratedColumns,
+        EffectiveGpuOperation::HashIntFamily => ColumnCapability::SingleDevice,
         EffectiveGpuOperation::SingleDeviceConstant |
         EffectiveGpuOperation::TrapdoorSample |
         EffectiveGpuOperation::GadgetTrapdoor |
@@ -1907,6 +1921,7 @@ pub fn map_output_range_to_inputs_with_output(
         EffectiveGpuOperation::UniformIntervalSample |
         EffectiveGpuOperation::GaussianSample |
         EffectiveGpuOperation::HashSample |
+        EffectiveGpuOperation::HashIntFamily |
         EffectiveGpuOperation::TrapdoorSample |
         EffectiveGpuOperation::GadgetTrapdoor |
         EffectiveGpuOperation::LiftIntegerToConstantPolynomial |
@@ -1981,6 +1996,7 @@ pub fn map_output_range_to_inputs_with_output(
         NodeKind::UniformIntervalSample { .. } |
         NodeKind::GaussianSample { .. } |
         NodeKind::HashSample { .. } |
+        NodeKind::HashIntFamily { .. } |
         NodeKind::LiftIntegerToConstantPolynomial { .. } |
         NodeKind::PackPolynomialCoefficients { .. } |
         NodeKind::PolynomialFromValues { .. } => {}

@@ -17,10 +17,10 @@ use crate::{
         PreimageCacheIdentity, PreimageRequest, RuntimeValue, SampleRange,
         poly::PolyBackendError,
         poly_gpu::{
-            GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEvidenceKind,
-            GpuDcrtBackend, GpuFleetMatrix, GpuFleetSignedValues, GpuFleetSmallMatrix,
-            GpuFleetTrapdoor, GpuLocalProductionInput, GpuLocalProductionJobRequest,
-            GpuLocalProductionSource, GpuProductionCompletion,
+            GpuAffectedResourceEnvelope, GpuAllocationComponents, GpuAllocationEnvelope,
+            GpuAllocationEvidenceKind, GpuDcrtBackend, GpuFleetMatrix, GpuFleetSignedValues,
+            GpuFleetSmallMatrix, GpuFleetTrapdoor, GpuLocalProductionInput,
+            GpuLocalProductionJobRequest, GpuLocalProductionSource, GpuProductionCompletion,
         },
     },
     executor::ExecutionConfig,
@@ -71,7 +71,7 @@ use mxx_primitives::{
         PreimageCacheState,
     },
 };
-use num_bigint::BigInt;
+use num_bigint::{BigInt, BigUint};
 use num_traits::{One, ToPrimitive};
 use serde::Serialize;
 use std::{
@@ -285,6 +285,91 @@ impl fmt::Display for GpuMeasurementError {
 }
 
 impl std::error::Error for GpuMeasurementError {}
+
+fn hash_int_family_spec(
+    kind: &NodeKind,
+    bindings: &ParamEnv,
+) -> Result<Option<(usize, BigUint, Vec<u8>)>, GpuMeasurementError> {
+    let NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } = kind else {
+        return Ok(None);
+    };
+    let count = count
+        .evaluate(bindings)
+        .map_err(|error| GpuMeasurementError(error.to_string()))?
+        .to_usize()
+        .ok_or_else(|| GpuMeasurementError("hash integer-family count is invalid".into()))?;
+    let modulus = modulus
+        .evaluate(bindings)
+        .map_err(|error| GpuMeasurementError(error.to_string()))?
+        .to_biguint()
+        .ok_or_else(|| {
+            GpuMeasurementError("hash integer-family modulus must be positive".into())
+        })?;
+    let mut tag = tag_prefix.clone();
+    for component in tag_components {
+        use mxx_ir_core::node::HashTagComponent;
+        match component {
+            HashTagComponent::Bytes(bytes) => {
+                tag.push(0);
+                tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                tag.extend_from_slice(bytes);
+            }
+            HashTagComponent::Integer(expression) => {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                let (sign, bytes) = value.to_bytes_be();
+                tag.push(1);
+                tag.push(u8::from(sign == num_bigint::Sign::Minus));
+                tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                tag.extend_from_slice(&bytes);
+            }
+            HashTagComponent::Decimal(expression) => {
+                let decimal = expression
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    .to_string();
+                tag.push(2);
+                tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                tag.extend_from_slice(decimal.as_bytes());
+            }
+            HashTagComponent::U64Le(expression) => {
+                let value = expression
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    .to_u64()
+                    .ok_or_else(|| {
+                        GpuMeasurementError("hash integer-family tag does not fit u64".into())
+                    })?;
+                tag.push(3);
+                tag.extend_from_slice(&value.to_le_bytes());
+            }
+            HashTagComponent::Operand(_) => {
+                return Err(GpuMeasurementError(
+                    "hash integer-family warmup requires a static typed tag".into(),
+                ));
+            }
+        }
+    }
+    Ok(Some((count, modulus, tag)))
+}
+
+fn hash_int_family_owner_bytes(
+    count: usize,
+    modulus: &BigUint,
+) -> Result<usize, GpuMeasurementError> {
+    let bits = if modulus == &BigUint::from(1u8) {
+        0
+    } else {
+        (modulus - BigUint::from(1u8)).bits() as usize
+    };
+    let words = bits.div_ceil(64).max(1);
+    count
+        .checked_mul(words.checked_add(1).and_then(|words| words.checked_mul(8)).ok_or_else(
+            || GpuMeasurementError("hash integer-family word size overflows usize".into()),
+        )?)
+        .ok_or_else(|| GpuMeasurementError("hash integer-family owner size overflows usize".into()))
+}
 
 impl GpuMeasurementError {
     fn out_of_memory(message: impl Into<String>) -> Self {
@@ -1611,7 +1696,30 @@ impl ProductionGpuWarmupProvider {
         let first_input = mapped_inputs
             .iter()
             .find_map(|mapped| prepared.arguments.get(mapped.operand).and_then(Option::as_ref));
-        let envelope = if let Some(input) = first_input {
+        let envelope = if let Some((count, modulus, _tag)) =
+            hash_int_family_spec(&representative.kind, bindings)?
+        {
+            // HashIntFamily has no resident matrix input and its output is a
+            // packed SignedWords owner. The kernel allocates the full family
+            // on one device, so use the exact owner size instead of asking the
+            // matrix allocation path to infer a nonexistent modulus/shape.
+            GpuAllocationEnvelope {
+                input_resident_bytes: 0,
+                output_bytes: hash_int_family_owner_bytes(count, &modulus)?,
+                auxiliary_bytes: 0,
+                scratch_bytes: 0,
+                transfer_bytes: 0,
+                assembly_bytes: 0,
+                replica_bytes: 0,
+                source_device_bytes: 0,
+                destination_device_bytes: 0,
+                host_bytes: 0,
+                pinned_host_bytes: 0,
+                per_device_bytes: BTreeMap::new(),
+                output_inclusive: true,
+                evidence: GpuAllocationEvidenceKind::CertifiedAllocationEnvelope,
+            }
+        } else if let Some(input) = first_input {
             let mapped =
                 mapped_inputs
                     .iter()
@@ -4031,6 +4139,101 @@ impl ProductionGpuWarmupProvider {
         binding_port: Option<usize>,
         transfer_only: bool,
     ) -> Result<GpuMeasurementOutputs, GpuMeasurementError> {
+        if let NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } = node.kind {
+            if fused.is_some() || binding_port.is_some() || transfer_only {
+                return Err(GpuMeasurementError(
+                    "hash integer-family warmup requires an ordinary native launch".into(),
+                ));
+            }
+            let count = count
+                .evaluate(bindings)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                .to_usize()
+                .ok_or_else(|| {
+                    GpuMeasurementError("hash integer-family count is invalid".into())
+                })?;
+            let modulus = modulus
+                .evaluate(bindings)
+                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                .to_biguint()
+                .ok_or_else(|| {
+                    GpuMeasurementError("hash integer-family modulus must be positive".into())
+                })?;
+            if representative
+                .output_range
+                .as_ref()
+                .is_some_and(|range| range.start != 0 || (range.end != 1 && range.end != count))
+            {
+                return Err(GpuMeasurementError(
+                    "hash integer-family warmup cannot measure a partial family".into(),
+                ));
+            }
+            let mut tag = tag_prefix.clone();
+            for component in tag_components {
+                use mxx_ir_core::node::HashTagComponent;
+                match component {
+                    HashTagComponent::Bytes(bytes) => {
+                        tag.push(0);
+                        tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                        tag.extend_from_slice(bytes);
+                    }
+                    HashTagComponent::Integer(expression) => {
+                        let value = expression
+                            .evaluate(bindings)
+                            .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                        let (sign, bytes) = value.to_bytes_be();
+                        tag.push(1);
+                        tag.push(u8::from(sign == num_bigint::Sign::Minus));
+                        tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                        tag.extend_from_slice(&bytes);
+                    }
+                    HashTagComponent::Decimal(expression) => {
+                        let decimal = expression
+                            .evaluate(bindings)
+                            .map_err(|error| GpuMeasurementError(error.to_string()))?
+                            .to_string();
+                        tag.push(2);
+                        tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                        tag.extend_from_slice(decimal.as_bytes());
+                    }
+                    HashTagComponent::U64Le(expression) => {
+                        let value = expression
+                            .evaluate(bindings)
+                            .map_err(|error| GpuMeasurementError(error.to_string()))?
+                            .to_u64()
+                            .ok_or_else(|| {
+                                GpuMeasurementError(
+                                    "hash integer-family tag does not fit u64".into(),
+                                )
+                            })?;
+                        tag.push(3);
+                        tag.extend_from_slice(&value.to_le_bytes());
+                    }
+                    HashTagComponent::Operand(_) => {
+                        return Err(GpuMeasurementError(
+                            "hash integer-family warmup requires a static typed tag".into(),
+                        ));
+                    }
+                }
+            }
+            worker.last_production_job = None;
+            let outputs = (0..batch_size)
+                .map(|_| {
+                    worker
+                        .backend
+                        .sample_hash_int_values_on_device(
+                            worker.device_id,
+                            count,
+                            &modulus,
+                            [0x53; 32],
+                            &tag,
+                        )
+                        .map(GpuMeasurementOutput::IntegerValues)
+                        .map_err(|error| GpuMeasurementError(error.to_string()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(GpuMeasurementOutputs(outputs));
+        }
         let output_columns = representative
             .concrete_output_types
             .iter()
@@ -5645,6 +5848,80 @@ impl ProductionGpuWarmupProvider {
                     )),
                 }
             }
+            NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
+                let count = evaluate_usize(count)?;
+                let modulus = modulus
+                    .evaluate(bindings)
+                    .map_err(|error| GpuMeasurementError(error.to_string()))?
+                    .to_biguint()
+                    .ok_or_else(|| {
+                        GpuMeasurementError(
+                            "hash integer-family modulus must be positive".to_owned(),
+                        )
+                    })?;
+                if output_range.is_some_and(|range| range.start != 0 || range.end != count) {
+                    return Err(GpuMeasurementError(
+                        "hash integer-family warmup requires the complete single-device family"
+                            .to_owned(),
+                    ));
+                }
+                let mut tag = tag_prefix.clone();
+                for component in tag_components {
+                    use mxx_ir_core::node::HashTagComponent;
+                    match component {
+                        HashTagComponent::Bytes(bytes) => {
+                            tag.push(0);
+                            tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(bytes);
+                        }
+                        HashTagComponent::Integer(expression) => {
+                            let value = expression
+                                .evaluate(bindings)
+                                .map_err(|error| GpuMeasurementError(error.to_string()))?;
+                            let (sign, bytes) = value.to_bytes_be();
+                            tag.push(1);
+                            tag.push(u8::from(sign == num_bigint::Sign::Minus));
+                            tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(&bytes);
+                        }
+                        HashTagComponent::Decimal(expression) => {
+                            let decimal = expression
+                                .evaluate(bindings)
+                                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                                .to_string();
+                            tag.push(2);
+                            tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(decimal.as_bytes());
+                        }
+                        HashTagComponent::U64Le(expression) => {
+                            let value = expression
+                                .evaluate(bindings)
+                                .map_err(|error| GpuMeasurementError(error.to_string()))?
+                                .to_u64()
+                                .ok_or_else(|| {
+                                    GpuMeasurementError(
+                                        "hash integer-family tag does not fit u64".to_owned(),
+                                    )
+                                })?;
+                            tag.push(3);
+                            tag.extend_from_slice(&value.to_le_bytes());
+                        }
+                        HashTagComponent::Operand(_) => {
+                            return Err(GpuMeasurementError(
+                                "hash integer-family warmup requires a static typed tag".to_owned(),
+                            ));
+                        }
+                    }
+                }
+                (0..batch_size)
+                    .map(|_| {
+                        backend
+                            .sample_hash_int_values(count, &modulus, [0x53; 32], &tag)
+                            .map(GpuMeasurementOutput::IntegerValues)
+                            .map_err(backend_error)
+                    })
+                    .collect()
+            }
             NodeKind::TrapdoorSample { sigma, gadget_base, digit_count, .. } => {
                 let ty = output_matrix_type()?;
                 let sigma = sigma
@@ -6173,7 +6450,15 @@ pub(crate) fn prepare_gpu_setup(
             "GPU preparation requires at least one native parameter set".into(),
         ));
     }
-    if request.parameters.iter().any(|parameters| parameters.device_ids() != device_ids) {
+    let device_set = device_ids.iter().copied().collect::<BTreeSet<_>>();
+    let parameter_devices = request
+        .parameters
+        .iter()
+        .flat_map(|parameters| parameters.device_ids())
+        .collect::<BTreeSet<_>>();
+    if request.parameters.iter().any(|parameters| parameters.device_ids().is_empty()) ||
+        parameter_devices != device_set
+    {
         return Err(GpuPreparationError::InvalidInput(
             "native parameter device ownership disagrees with the production fleet".into(),
         ));
@@ -6313,8 +6598,8 @@ mod tests {
         GpuMeasuredCostCache, GpuMeasuredCostKey, GpuMeasuredCostPoint, GpuMeasurementOutput,
         GpuMeasurementTransportClass, MeasurementNode, PendingMeasurement, PreparedMeasurement,
         ProductionGpuWarmupProvider, authoritative_production_route, compact_matrix_bytes,
-        harness::GpuWarmupMeasurementConfig, matrix_bytes, select_worker_index_for_physical,
-        tensor_row_sum_allocation_groups,
+        harness::GpuWarmupMeasurementConfig, hash_int_family_owner_bytes, matrix_bytes,
+        select_worker_index_for_physical, tensor_row_sum_allocation_groups,
     };
     use crate::{
         backend::{
@@ -7104,6 +7389,20 @@ mod tests {
                 vec![matrix.clone()],
             ),
             (
+                CanonicalWarmupProfileDomain::HashIntFamily,
+                NodeKind::HashIntFamily {
+                    count: mxx_ir_core::IntExpr::constant(1),
+                    modulus: mxx_ir_core::IntExpr::constant(256),
+                    tag_prefix: vec![7],
+                    tag_components: vec![],
+                },
+                vec![],
+                vec![ConcreteWireType::IndexedFamily {
+                    element: Box::new(ConcreteWireType::Int),
+                    count: 1,
+                }],
+            ),
+            (
                 CanonicalWarmupProfileDomain::MatrixAdd,
                 NodeKind::MatrixBinary(MatrixBinaryOp::Add),
                 vec![matrix.clone(), matrix.clone()],
@@ -7534,6 +7833,15 @@ mod tests {
 
         // 257 needs two magnitude bytes; every coefficient also carries one sign byte.
         assert_eq!(compact_matrix_bytes(&matrix, &BigInt::from(257u16)), 2 * 3 * 8 * 3);
+    }
+
+    #[test]
+    fn hash_integer_family_allocation_matches_signed_words_owner() {
+        let count = 12;
+        assert_eq!(hash_int_family_owner_bytes(count, &BigUint::from(1u8)).unwrap(), 192);
+        assert_eq!(hash_int_family_owner_bytes(count, &(BigUint::from(1u8) << 32)).unwrap(), 192);
+        assert_eq!(hash_int_family_owner_bytes(count, &(BigUint::from(1u8) << 129)).unwrap(), 384);
+        assert!(hash_int_family_owner_bytes(usize::MAX, &(BigUint::from(1u8) << 65)).is_err());
     }
 
     #[test]

@@ -5162,6 +5162,76 @@ where
                 })?;
                 self.put(values, node.id, 0, RuntimeValue::matrix(value));
             }
+            NodeKind::HashIntFamily { count, modulus, tag_prefix, tag_components } => {
+                let count = self.eval_usize(node.id, count, env)?;
+                let modulus =
+                    modulus.evaluate(env).map_err(|error| self.expression_error(node.id, error))?;
+                let Some(positive_modulus) = modulus.to_biguint() else {
+                    return Err(self
+                        .expression_error(node.id, "hash integer family modulus must be positive"));
+                };
+                if (&positive_modulus & (&positive_modulus - num_bigint::BigUint::from(1u8))) !=
+                    num_bigint::BigUint::from(0u8)
+                {
+                    return Err(self.expression_error(
+                        node.id,
+                        "hash integer family modulus must be a power of two",
+                    ));
+                }
+                let key: [u8; 32] = self
+                    .bytes(values, node.args[0])?
+                    .try_into()
+                    .map_err(|_| ExecutionError::ValueKind(node.args[0]))?;
+                let mut tag = tag_prefix.clone();
+                for component in tag_components {
+                    use mxx_ir_core::node::HashTagComponent;
+                    match component {
+                        HashTagComponent::Bytes(bytes) => {
+                            tag.push(0);
+                            tag.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(bytes);
+                        }
+                        HashTagComponent::Integer(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?;
+                            tag.push(1);
+                            append_tag_integer(&mut tag, &value);
+                        }
+                        HashTagComponent::Decimal(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?;
+                            let decimal = value.to_string();
+                            tag.push(2);
+                            tag.extend_from_slice(&(decimal.len() as u64).to_be_bytes());
+                            tag.extend_from_slice(decimal.as_bytes());
+                        }
+                        HashTagComponent::U64Le(expression) => {
+                            let value = expression
+                                .evaluate(env)
+                                .map_err(|error| self.expression_error(node.id, error))?
+                                .to_u64()
+                                .ok_or_else(|| ExecutionError::Expression {
+                                    node: node.id,
+                                    message: "little-endian hash tag component must fit in u64"
+                                        .to_owned(),
+                                })?;
+                            tag.push(3);
+                            tag.extend_from_slice(&value.to_le_bytes());
+                        }
+                        HashTagComponent::Operand(index) => {
+                            tag.push(1);
+                            append_tag_integer(&mut tag, &self.int(values, node.args[*index])?);
+                        }
+                    }
+                }
+                let sampled = self
+                    .backend
+                    .sample_hash_int_values(count, &positive_modulus, key, &tag)
+                    .map_err(Self::backend_error)?;
+                self.put(values, node.id, 0, RuntimeValue::integer_values(sampled));
+            }
             NodeKind::GaussianSample { sigma, max_coefficient_bound, .. } => {
                 let wire = WireRef { node: node.id, port: Port(0) };
                 let ty = self.matrix_type(scope_id, path, wire)?;
@@ -6009,6 +6079,9 @@ where
                 descriptor.family_count.ok_or(ExecutionError::ValueKind(wire))
             }
             RuntimeValue::IndexedFamily(values) => Ok(values.len()),
+            RuntimeValue::IntegerValues(values) => {
+                Ok(self.backend.integer_values_len(values.as_ref()))
+            }
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -6062,6 +6135,12 @@ where
             RuntimeValue::IndexedFamily(values) => {
                 values.get(index).cloned().ok_or(ExecutionError::ValueKind(wire))
             }
+            RuntimeValue::IntegerValues(values) => self
+                .backend
+                .integer_values_get(values.as_ref(), index)
+                .map_err(Self::backend_error)?
+                .map(RuntimeValue::Int)
+                .ok_or(ExecutionError::ValueKind(wire)),
             _ => Err(ExecutionError::ValueKind(wire)),
         }
     }
@@ -10282,6 +10361,14 @@ mod tests {
             values.len()
         }
 
+        fn integer_values_get(
+            &self,
+            values: &Self::IntegerValues,
+            index: usize,
+        ) -> Result<Option<BigInt>, Self::Error> {
+            Ok(values.get(index).cloned())
+        }
+
         fn placement_count(&self) -> usize {
             2
         }
@@ -11313,6 +11400,53 @@ mod tests {
         assert_ne!(first[0], first[1]);
         assert_ne!(first[0], first[2]);
         assert_ne!(first[1], first[2]);
+    }
+
+    #[test]
+    fn hash_integer_family_cpu_execution_is_indexed_and_replay_stable() {
+        let count = 16usize;
+        let modulus = BigInt::from(1u8) << 129usize;
+        let key = Ring::new(1, 1).bytes_input("key", 32);
+        let context = DslContext::new("runtime-hash-integer-family");
+        let values = context.hash_int_family(
+            key,
+            HashTag::from(b"tfhe/keygen/ksk-a/v1".as_slice()),
+            count,
+            modulus.clone(),
+        );
+        let graph = context
+            .output("values", values)
+            .expect("family output")
+            .build()
+            .expect("build")
+            .validate(&ParamEnv::default())
+            .expect("validate");
+        let parameters = DCRTPolyParams::default();
+        let run = |key: [u8; 32]| {
+            let mut backend = cpu_backend([parameters.clone()]);
+            let result = execute(
+                &graph,
+                &mut backend,
+                BTreeMap::from([("key".to_owned(), RuntimeValue::Bytes(key.to_vec()))]),
+                &mut MemoryArtifactStore::default(),
+                SamplingMode::Fresh,
+                ExecutionConfig::default(),
+            )
+            .expect("execute hash family");
+            let RuntimeValue::IntegerValues(values) = &result.outputs["values"] else {
+                panic!("hash integer family must retain packed integer values")
+            };
+            backend.integer_values_to_host(values).expect("materialize integer family")
+        };
+
+        let first = run([0x35; 32]);
+        let replay = run([0x35; 32]);
+        let other_key = run([0x36; 32]);
+        assert_eq!(first, replay);
+        assert_ne!(first, other_key);
+        assert_eq!(first.len(), count);
+        assert!(first.iter().all(|value| { !value.is_negative() && value < &modulus }));
+        assert!(first.windows(2).all(|pair| pair[0] != pair[1]));
     }
 
     #[test]

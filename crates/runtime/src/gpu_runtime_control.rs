@@ -151,16 +151,12 @@ impl ResidentOwner {
             });
         }
         let backing = Arc::new(value);
-        let mut elements = Vec::with_capacity(count);
-        for index in 0..count {
-            let view = backing
-                .slice(index..index + 1)
-                .map_err(|error| ResidentControlFrameError::Allocation(error.to_string()))?;
-            elements.push(Self::Integer(Arc::new(view)));
-        }
         Ok(Self::IndexedFamily {
             element_type: Box::new(element_type.clone()),
-            elements: elements.into(),
+            // A flat KSK family can contain tens of millions of integers.
+            // Keep its packed GPU owner authoritative and materialize scalar
+            // views only when an indexed operation actually requests one.
+            elements: Arc::from([]),
             packed_integer: Some(backing),
         })
     }
@@ -170,9 +166,22 @@ impl ResidentOwner {
         slot: ValueSlot,
         index: usize,
     ) -> Result<ResidentOwner, ResidentControlFrameError> {
-        let Self::IndexedFamily { elements, .. } = self else {
+        let Self::IndexedFamily { elements, packed_integer, .. } = self else {
             return Err(ResidentControlFrameError::NotFamily(slot));
         };
+        if let Some(packed) = packed_integer {
+            if index >= packed.count() {
+                return Err(ResidentControlFrameError::FamilyIndexOutOfBounds {
+                    slot,
+                    index,
+                    count: packed.count(),
+                });
+            }
+            let view = packed
+                .slice(index..index + 1)
+                .map_err(|error| ResidentControlFrameError::Allocation(error.to_string()))?;
+            return Ok(Self::Integer(Arc::new(view)));
+        }
         elements.get(index).cloned().ok_or(ResidentControlFrameError::FamilyIndexOutOfBounds {
             slot,
             index,
@@ -408,11 +417,20 @@ impl ResidentControlFrame {
                     Self::physical_family_matches(owner, ty)
             }
             ResidentSlotType::IndexedFamily { element, count, .. } => {
-                let ResidentOwner::IndexedFamily { element_type, elements, .. } = owner else {
+                let ResidentOwner::IndexedFamily { element_type, elements, packed_integer } = owner
+                else {
                     return false;
                 };
-                element_type.as_ref() == element.as_ref() &&
-                    elements.len() == *count &&
+                if element_type.as_ref() != element.as_ref() {
+                    return false;
+                }
+                if let Some(packed) = packed_integer {
+                    return matches!(
+                        element.as_ref(),
+                        ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. }
+                    ) && packed.count() == *count;
+                }
+                elements.len() == *count &&
                     elements.iter().all(|owner| Self::owner_matches_type(owner, element))
             }
             ResidentSlotType::Real { .. } |

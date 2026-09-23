@@ -902,8 +902,13 @@ fn resident_owner_runtime_value(
         },
         ResidentOwner::Integer(value) => Ok(RuntimeValue::IntegerValues(value.clone())),
         ResidentOwner::IndexedFamily { packed_integer: Some(value), .. }
-            if matches!(ty, ResidentSlotType::IndexedFamily { .. }) =>
+            if let ResidentSlotType::IndexedFamily { count, .. } = ty =>
         {
+            if value.count() != *count {
+                return Err(GpuRuntimeError::Execution(
+                    "indexed resident owner has the wrong packed element count".into(),
+                ));
+            }
             // Keep the packed family backing intact across a resident output
             // boundary. Rebuilding scalar views here loses the packed owner,
             // so the next program would re-materialize the family with
@@ -968,13 +973,18 @@ fn resident_output_runtime_value(
             "indexed resident output is not backed by a typed indexed-family owner".into(),
         ));
     };
+    if let Some(value) = packed_integer {
+        if value.count() != *count {
+            return Err(GpuRuntimeError::Execution(
+                "indexed resident output owner has the wrong packed element count".into(),
+            ));
+        }
+        return Ok(RuntimeValue::IntegerValues(value.clone()));
+    }
     if elements.len() != *count {
         return Err(GpuRuntimeError::Execution(
             "indexed resident output owner has the wrong element count".into(),
         ));
-    }
-    if let Some(value) = packed_integer {
-        return Ok(RuntimeValue::IntegerValues(value.clone()));
     }
     elements
         .iter()
@@ -1555,9 +1565,22 @@ fn bind_resident_broadcast_aliases(
             .map_err(|error| GpuRuntimeError::Execution(error.to_string()))?
             .clone();
         if !resident_owner_matches_type_ignoring_encoding(&owner, &import.child.ty) {
+            let owner_shape = match &owner {
+                ResidentOwner::Matrix(_) => "matrix".to_owned(),
+                ResidentOwner::SmallMatrix(_) => "small matrix".to_owned(),
+                ResidentOwner::Trapdoor { .. } => "trapdoor".to_owned(),
+                ResidentOwner::Integer(values) => format!("integer(count={})", values.count()),
+                ResidentOwner::IndexedFamily { element_type, elements, packed_integer } => {
+                    format!(
+                        "indexed family(element_type={element_type:?}, elements={}, packed_integer_count={:?})",
+                        elements.len(),
+                        packed_integer.as_ref().map(|values| values.count()),
+                    )
+                }
+            };
             return Err(GpuRuntimeError::Execution(format!(
-                "broadcast import owner type does not match child slot {:?}",
-                import.child.slot
+                "broadcast import owner type mismatch: parent slot {:?} type {:?}, child slot {:?} type {:?}, actual owner {owner_shape}",
+                import.parent.slot, import.parent.ty, import.child.slot, import.child.ty,
             )));
         }
         frame
@@ -1582,15 +1605,68 @@ fn resident_owner_matches_type_ignoring_encoding(
             ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. },
         ) => true,
         (
-            ResidentOwner::IndexedFamily { elements, .. },
+            ResidentOwner::IndexedFamily { element_type, elements, packed_integer },
             ResidentSlotType::IndexedFamily { element, count, .. },
-        ) => {
-            elements.len() == *count &&
-                elements.iter().all(|element_owner| {
-                    resident_owner_matches_type_ignoring_encoding(element_owner, element)
-                })
-        }
+        ) => resident_indexed_family_matches_type_ignoring_encoding(
+            element_type,
+            elements,
+            packed_integer.as_ref().map(|values| values.count()),
+            element,
+            *count,
+        ),
         _ => ResidentControlFrame::owner_matches_type(owner, ty),
+    }
+}
+
+fn resident_indexed_family_matches_type_ignoring_encoding(
+    owner_element_type: &ResidentSlotType,
+    elements: &[ResidentOwner],
+    packed_count: Option<usize>,
+    expected_element_type: &ResidentSlotType,
+    expected_count: usize,
+) -> bool {
+    if !resident_slot_type_matches_ignoring_encoding(owner_element_type, expected_element_type) {
+        return false;
+    }
+    if let Some(packed_count) = packed_count {
+        return elements.is_empty() &&
+            resident_integer_slot_type(owner_element_type) &&
+            resident_integer_slot_type(expected_element_type) &&
+            packed_count == expected_count;
+    }
+    elements.len() == expected_count &&
+        elements.iter().all(|element_owner| {
+            resident_owner_matches_type_ignoring_encoding(element_owner, expected_element_type)
+        })
+}
+
+fn resident_integer_slot_type(ty: &ResidentSlotType) -> bool {
+    matches!(ty, ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. })
+}
+
+fn resident_slot_type_matches_ignoring_encoding(
+    actual: &ResidentSlotType,
+    expected: &ResidentSlotType,
+) -> bool {
+    match (actual, expected) {
+        (
+            ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. },
+            ResidentSlotType::Integer { .. } | ResidentSlotType::Boolean { .. },
+        ) => true,
+        (
+            ResidentSlotType::IndexedFamily {
+                element: actual_element, count: actual_count, ..
+            },
+            ResidentSlotType::IndexedFamily {
+                element: expected_element,
+                count: expected_count,
+                ..
+            },
+        ) => {
+            actual_count == expected_count &&
+                resident_slot_type_matches_ignoring_encoding(actual_element, expected_element)
+        }
+        _ => actual == expected,
     }
 }
 
@@ -3400,10 +3476,16 @@ impl GpuRuntime {
         validated: ValidatedGraph,
         inputs: &BTreeMap<String, RuntimeValue<GpuDcrtBackend>>,
     ) -> Result<GpuExecutionPlan, GpuPlanError> {
-        let parameters = collect_parameters(&validated, &self.backend)?;
+        let mut parameters = collect_parameters(&validated, &self.backend)?;
+        if parameters.is_empty() {
+            parameters = self
+                .backend
+                .registered_parameter_contexts()
+                .map_err(|error| GpuPlanError::InvalidInput(error.to_string()))?;
+        }
         if parameters.is_empty() {
             return Err(GpuPlanError::InvalidInput(
-                "GPU graph has no concrete matrix parameter set".to_owned(),
+                "GPU graph has no registered native parameter context".to_owned(),
             ));
         }
         let execution_config = ExecutionConfig {
@@ -4463,18 +4545,32 @@ impl GpuRuntime {
                 .find_map(|wire| checked.wire_types.get(wire).and_then(|ty| ty.matrix_type()))
                 .or_else(|| {
                     output_spec.outputs.iter().find_map(|output| output.wire_type.matrix_type())
-                })
-                .ok_or_else(|| {
-                    GpuPlanError::GraphCompile(format!(
-                        "region {} has no concrete matrix parameter",
-                        region.id.0
-                    ))
-                })?;
-            let parameters = self
-                .backend
-                .parameters_on_device(matrix_type, region.physical_device)
-                .map(Clone::clone)
-                .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?;
+                });
+            let parameters = if let Some(matrix_type) = matrix_type {
+                self.backend
+                    .parameters_on_device(matrix_type, region.physical_device)
+                    .map(Clone::clone)
+                    .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?
+            } else if matches!(step.kind, mxx_ir_core::node::NodeKind::HashIntFamily { .. }) {
+                // Integer-family sampling has no matrix operand or output,
+                // but its native capture still needs the registered CUDA
+                // context for this device. The sampler's integer modulus
+                // determines its output encoding independently of DCRT.
+                self.backend
+                    .registered_parameter_context_on_device(region.physical_device)
+                    .map(Clone::clone)
+                    .map_err(|error| {
+                        GpuPlanError::GraphCompile(format!(
+                            "region {} has no registered CUDA context on device {}: {error}",
+                            region.id.0, region.physical_device
+                        ))
+                    })?
+            } else {
+                return Err(GpuPlanError::GraphCompile(format!(
+                    "region {} has no concrete matrix parameter",
+                    region.id.0
+                )));
+            };
             let preimage_target = if matches!(step.operation, CaptureOperation::Preimage { .. }) {
                 step.original_arguments
                     .get(2)
@@ -6960,22 +7056,45 @@ fn compile_protocol(
                                     mxx_ir_core::types::ConcreteWireType::Bool
                             ) =>
                         {
+                            let encoding = if matches!(
+                                step.kind,
+                                mxx_ir_core::node::NodeKind::HashIntFamily { .. }
+                            ) {
+                                let mxx_ir_core::node::NodeKind::HashIntFamily { modulus, .. } =
+                                    &step.kind
+                                else {
+                                    unreachable!("hash integer-family output kind changed")
+                                };
+                                let modulus = modulus
+                                    .evaluate(&validated.bindings)
+                                    .map_err(|error| GpuPlanError::GraphCompile(error.to_string()))?
+                                    .to_biguint()
+                                    .ok_or_else(|| {
+                                        GpuPlanError::GraphCompile(
+                                            "hash integer-family modulus must be positive".into(),
+                                        )
+                                    })?;
+                                let bits = (&modulus - num_bigint::BigUint::from(1u8)).bits();
+                                crate::gpu_compiled::NativeIntegerEncoding::SignedWords(
+                                    bits.div_ceil(64).max(1) as usize,
+                                )
+                            } else if matches!(
+                                step.kind,
+                                mxx_ir_core::node::NodeKind::PolynomialValues { .. }
+                            ) {
+                                crate::gpu_compiled::NativeIntegerEncoding::SignedWords(
+                                    polynomial_words.ok_or_else(|| {
+                                        GpuPlanError::GraphCompile(
+                                            "polynomial values have no modulus".into(),
+                                        )
+                                    })?,
+                                )
+                            } else {
+                                crate::gpu_compiled::NativeIntegerEncoding::SignedWord
+                            };
                             Some(IntegerValuesOutputSpec {
                                 count: *count,
-                                encoding: if matches!(
-                                    step.kind,
-                                    mxx_ir_core::node::NodeKind::PolynomialValues { .. }
-                                ) {
-                                    crate::gpu_compiled::NativeIntegerEncoding::SignedWords(
-                                        polynomial_words.ok_or_else(|| {
-                                            GpuPlanError::GraphCompile(
-                                                "polynomial values have no modulus".into(),
-                                            )
-                                        })?,
-                                    )
-                                } else {
-                                    crate::gpu_compiled::NativeIntegerEncoding::SignedWord
-                                },
+                                encoding,
                                 device: capture_device(
                                     &step.operation,
                                     &logical_plan.contract.logical_to_physical_devices,
@@ -7373,6 +7492,9 @@ fn native_components_for_type(
         mxx_ir_core::types::ConcreteWireType::Bool |
         mxx_ir_core::types::ConcreteWireType::ConstantBool => {
             vec![NativeValueComponent::IntegerValues].into_boxed_slice()
+        }
+        mxx_ir_core::types::ConcreteWireType::Bytes { length: 32 } => {
+            vec![NativeValueComponent::Bytes32].into_boxed_slice()
         }
         mxx_ir_core::types::ConcreteWireType::Matrix(_) => vec![
             NativeValueComponent::MatrixData,
@@ -7836,6 +7958,39 @@ mod tests {
             element: Box::new(ResidentSlotType::Matrix { wire_type: matrix_wire() }),
             count: 2,
         }));
+    }
+
+    #[test]
+    fn packed_integer_family_broadcast_matches_count_and_element_type() {
+        let source_element = ResidentSlotType::Integer {
+            wire_type: mxx_ir_core::types::ConcreteWireType::Int,
+            encoding: NativeIntegerEncoding::SignedWords(4),
+        };
+        let target_element = ResidentSlotType::Integer {
+            wire_type: mxx_ir_core::types::ConcreteWireType::Int,
+            encoding: NativeIntegerEncoding::SignedWord,
+        };
+        assert!(resident_indexed_family_matches_type_ignoring_encoding(
+            &source_element,
+            &[],
+            Some(3),
+            &target_element,
+            3,
+        ));
+        assert!(!resident_indexed_family_matches_type_ignoring_encoding(
+            &source_element,
+            &[],
+            Some(2),
+            &target_element,
+            3,
+        ));
+        assert!(!resident_indexed_family_matches_type_ignoring_encoding(
+            &source_element,
+            &[],
+            Some(3),
+            &ResidentSlotType::Matrix { wire_type: matrix_wire() },
+            3,
+        ));
     }
 
     #[test]

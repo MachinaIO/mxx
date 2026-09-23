@@ -1065,7 +1065,9 @@ fn needs_storage_tracking(ty: &ConcreteWireType) -> bool {
         ConcreteWireType::Int |
         ConcreteWireType::ConstantBool |
         ConcreteWireType::Bool => true,
-        ConcreteWireType::Bytes { length } => *length > 0,
+        // Bytes are by-value host bindings (including Bytes32 sampler keys),
+        // not device-resident owners in the compiled graph ABI.
+        ConcreteWireType::Bytes { .. } => false,
         ConcreteWireType::IndexedFamily { element, .. } => needs_storage_tracking(element),
         _ => false,
     }
@@ -5435,9 +5437,12 @@ fn warmup_input_for_owner_placement(
     if devices == 0 {
         return Err(GpuWarmupError::EmptyFleet);
     }
-    if config.active_crt_towers == 0 || config.crt_limb_bytes == 0 {
+    let has_matrix_storage = validated_storage_wire_types(validated)
+        .iter()
+        .any(|wire_type| wire_type.matrix_type().is_some());
+    if has_matrix_storage && (config.active_crt_towers == 0 || config.crt_limb_bytes == 0) {
         return Err(GpuWarmupError::ValidatedGraph(
-            "validated warmup requires an ordered active CRT descriptor".into(),
+            "validated matrix warmup requires an ordered active CRT descriptor".into(),
         ));
     }
     if config.storage_descriptors.values().any(|descriptor| !valid_storage_descriptor(descriptor)) {
@@ -5492,9 +5497,6 @@ fn warmup_input_for_owner_placement(
         .unwrap_or(0)
         .checked_add(1)
         .ok_or(GpuWarmupError::ArithmeticOverflow)?;
-    let fallback_layout = layouts.first().map(|layout| layout.id).ok_or_else(|| {
-        GpuWarmupError::ValidatedGraph("validated warmup requires one output layout".into())
-    })?;
     let mut loops = BTreeMap::<GpuLoopSiteKey, GpuWarmupLoop>::new();
     let mut nodes = Vec::new();
     let mut value_strides = BTreeMap::<(u64, WireRef), usize>::new();
@@ -5982,7 +5984,9 @@ fn warmup_input_for_owner_placement(
             let input_transfer_bytes = input_transfer_allocations
                 .iter()
                 .fold(0u64, |total, (_, bytes, _)| total.saturating_add(*bytes));
-            let layout_id = profile.map(|profile| profile.output_layout).unwrap_or(fallback_layout);
+            let layout_id = profile
+                .map(|profile| profile.output_layout)
+                .or_else(|| layout_indices.keys().next().copied());
             let columns = output_types
                 .iter()
                 .filter_map(|ty| ty.matrix_type().map(|matrix| matrix.columns))
@@ -6000,16 +6004,26 @@ fn warmup_input_for_owner_placement(
                     argument_types.iter().find_map(|ty| resident_control_wire(ty).then_some(1))
                 })
                 .unwrap_or_else(|| {
-                    layout_indices.get(&layout_id).map_or(0, |index| layouts[*index].columns)
+                    layout_id
+                        .and_then(|layout_id| layout_indices.get(&layout_id))
+                        .map_or(0, |index| layouts[*index].columns)
                 });
             let capability =
                 capability_for_effective_operation(effective_operation, &argument_types);
             // Each output has its own concrete layout. A profile layout supplies
             // placement only when its width matches; it cannot supply the shape.
-            let template = layout_indices
-                .get(&layout_id)
+            let template = layout_id
+                .and_then(|layout_id| layout_indices.get(&layout_id))
                 .map(|index| layouts[*index].clone())
-                .ok_or_else(|| GpuWarmupError::InvalidPlan("missing profile layout".into()))?;
+                .unwrap_or(GpuLayout {
+                    id: 0,
+                    columns,
+                    rows: 0,
+                    ring_dimension: 0,
+                    representation: "resident_control_template".into(),
+                    instance_device_stride: 0,
+                    owner_intervals: Vec::new(),
+                });
             let mut output_layouts = Vec::new();
             for (port, ty) in output_types.iter().enumerate() {
                 let matrix = ty.matrix_type();
@@ -6051,9 +6065,12 @@ fn warmup_input_for_owner_placement(
                     source_layout
                 } else {
                     source_layout.or_else(|| {
-                        layout_indices.get(&layout_id).and_then(|index| {
-                            (layouts[*index].columns == port_columns).then_some(&layouts[*index])
-                        })
+                        layout_id.and_then(|layout_id| layout_indices.get(&layout_id)).and_then(
+                            |index| {
+                                (layouts[*index].columns == port_columns)
+                                    .then_some(&layouts[*index])
+                            },
+                        )
                     })
                 };
                 // A source owner map can be clipped for a narrower matrix
@@ -6075,7 +6092,11 @@ fn warmup_input_for_owner_placement(
                         resident_control_wire(ty) &&
                         source_layout.is_some());
                 let id = if preserve_owners && same_contract {
-                    source_layout.map_or(layout_id, |layout| layout.id)
+                    source_layout
+                        .map(|layout| layout.id)
+                        .or_else(|| owner_source_layout.map(|layout| layout.id))
+                        .or(layout_id)
+                        .unwrap_or(0)
                 } else {
                     let id = next_layout_id;
                     next_layout_id =
@@ -8184,8 +8205,8 @@ mod tests {
         assert_eq!(validated_wire_bytes(&ConcreteWireType::Int, &BTreeMap::new(), 1, 8), 8);
         assert_eq!(validated_wire_bytes(&scalar, &BTreeMap::new(), 1, 8), 64);
         let bytes = ConcreteWireType::Bytes { length: 7 };
-        assert!(needs_storage_tracking(&bytes));
-        assert!(needs_storage_tracking(&ConcreteWireType::IndexedFamily {
+        assert!(!needs_storage_tracking(&bytes));
+        assert!(!needs_storage_tracking(&ConcreteWireType::IndexedFamily {
             element: Box::new(bytes.clone()),
             count: 2,
         }));
